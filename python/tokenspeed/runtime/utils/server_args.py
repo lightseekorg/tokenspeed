@@ -3172,15 +3172,33 @@ class ServerArgs:
             ("--tokenizer", self.tokenizer),
             ("--speculative-draft-model-path", self.speculative_draft_model_path),
         ):
-            if (
-                isinstance(value, str)
-                and is_object_store_uri(value)
-                and self.load_format != "runai_streamer"
-            ):
+            if not (isinstance(value, str) and is_object_store_uri(value)):
+                continue
+            if self.load_format != "runai_streamer":
                 raise ValueError(
                     f"{flag}={value!r} is an object-store URI and requires "
                     f"--load-format runai_streamer, got {self.load_format!r}"
                 )
+            if flag in ("--model", "--tokenizer") and self.revision is not None:
+                raise ValueError(
+                    f"--revision={self.revision!r} is not supported with "
+                    f"object-store URI {flag}={value!r}; object-store "
+                    "checkpoints always stream live bucket state"
+                )
+            if flag == "--speculative-draft-model-path":
+                if self.speculative_draft_model_revision is not None:
+                    raise ValueError(
+                        "--speculative-draft-model-revision="
+                        f"{self.speculative_draft_model_revision!r} is not "
+                        f"supported with object-store URI {flag}={value!r}; "
+                        "object-store checkpoints always stream live bucket state"
+                    )
+                if self.draft_model_path_use_base and self.revision is not None:
+                    raise ValueError(
+                        f"--revision={self.revision!r} is not supported with "
+                        f"object-store URI {flag}={value!r}; object-store "
+                        "checkpoints always stream live bucket state"
+                    )
 
     def _parse_model_loader_extra_config(self) -> None:
         raw = self.model_loader_extra_config

@@ -689,14 +689,14 @@ def get_generation_config(
     **kwargs,
 ):
     """Load generation metadata from one revision-pinned local snapshot."""
-    try:
-        from tokenspeed.runtime.model_loader.object_store import (
-            resolve_checkpoint_metadata_dir,
-        )
+    from tokenspeed.runtime.model_loader.object_store import (
+        resolve_checkpoint_metadata_dir,
+    )
 
-        resolved_dir = resolve_checkpoint_metadata_dir(
-            model, download_dir=download_dir, sync=True
-        )
+    resolved_dir = resolve_checkpoint_metadata_dir(
+        model, download_dir=download_dir, sync=True
+    )
+    try:
         if resolved_dir is not None:
             model_path = resolved_dir
         else:

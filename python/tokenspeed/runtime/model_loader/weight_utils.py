@@ -1098,7 +1098,7 @@ def runai_streamer_weights_iterator(
     )
 
     stream_files: list[str] = []
-    range_read_shards: list[tuple[str, list[str]]] = []
+    range_read_shards: list[str] = []
 
     if weight_name_filter is not None and index_weight_map is not None:
         by_shard: dict[str, list[str]] = {}
@@ -1112,7 +1112,7 @@ def runai_streamer_weights_iterator(
                     accepted = [w for w in shard_weights if weight_name_filter(w)]
                     if len(accepted) < len(shard_weights):
                         if accepted:
-                            range_read_shards.append((path, accepted))
+                            range_read_shards.append(path)
                         continue
             stream_files.append(path)
     else:
@@ -1197,12 +1197,20 @@ def runai_streamer_weights_iterator(
     open_remote_file = (
         RemoteSafetensorsFile if remote_file_factory is None else remote_file_factory
     )
-    for path, accepted_names in range_read_shards:
+    for path in range_read_shards:
+        remote_file = open_remote_file(path)
+        # Derive accepted tensor names from the shard header rather than the
+        # index alone so tensors omitted from model.safetensors.index.json are
+        # never dropped relative to full-shard streaming or local loading.
+        accepted_names = [
+            name
+            for name in remote_file.keys()
+            if weight_name_filter is None or weight_name_filter(name)
+        ]
         logger.info(
             f"Reading {len(accepted_names)} filtered tensor(s) from {path} "
             "via byte-range requests instead of full-shard streaming."
         )
-        remote_file = open_remote_file(path)
         for name in accepted_names:
             yield name, remote_file.get_tensor(name)
 
@@ -1212,12 +1220,17 @@ def open_safetensors_slice(
     checkpoint_dir: str,
     shard_name: str,
     tensor_name: str,
+    *,
+    remote_file_cache: dict[str, Any] | None = None,
 ):
     """Yield a lazy CPU slice handle for ``tensor_name`` in ``shard_name``.
 
     Uses local ``safetensors.safe_open`` when the shard exists on disk; falls back
     to byte-range object-store reads when ``checkpoint_dir`` is an object-store
-    URI or a synced metadata directory carrying its source URI.
+    URI or a synced metadata directory carrying its source URI. When
+    ``remote_file_cache`` is supplied, open ``RemoteSafetensorsFile`` handles are
+    reused by shard URI so repeated slice reads from the same shard download its
+    header only once.
     """
     from tokenspeed.runtime.model_loader.object_store import (
         RemoteSafetensorsFile,
@@ -1226,9 +1239,18 @@ def open_safetensors_slice(
         read_source_uri,
     )
 
+    def _get_remote_file(remote_uri: str) -> RemoteSafetensorsFile:
+        if remote_file_cache is not None:
+            cached = remote_file_cache.get(remote_uri)
+            if cached is None:
+                cached = RemoteSafetensorsFile(remote_uri)
+                remote_file_cache[remote_uri] = cached
+            return cached
+        return RemoteSafetensorsFile(remote_uri)
+
     if is_object_store_uri(checkpoint_dir):
         remote_uri = join_object_store_uri(checkpoint_dir, shard_name)
-        yield RemoteSafetensorsFile(remote_uri).get_slice(tensor_name)
+        yield _get_remote_file(remote_uri).get_slice(tensor_name)
         return
 
     local_shard = os.path.join(checkpoint_dir, shard_name)
@@ -1240,7 +1262,7 @@ def open_safetensors_slice(
     source_uri = read_source_uri(checkpoint_dir)
     if source_uri is not None:
         remote_uri = join_object_store_uri(source_uri, shard_name)
-        yield RemoteSafetensorsFile(remote_uri).get_slice(tensor_name)
+        yield _get_remote_file(remote_uri).get_slice(tensor_name)
         return
 
     raise FileNotFoundError(

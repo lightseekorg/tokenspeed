@@ -708,7 +708,7 @@ class RemoteSafetensorsSlice:
         self._buf_start = 0
         self._buf_end = 0
         self._last_read_end = end
-        return self._range_reader(start, end)
+        return self._read_parallel(start, end)
 
     def get_shape(self) -> list[int]:
         return list(self._shape)

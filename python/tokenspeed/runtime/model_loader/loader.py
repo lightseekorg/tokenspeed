@@ -1028,6 +1028,12 @@ class RunaiModelStreamerLoader(DefaultModelLoader):
             return super()._prepare_weights(
                 model_name_or_path, revision, fall_back_to_pt, weight_files
             )
+        if revision is not None:
+            raise ValueError(
+                f"revision={revision!r} is not supported for object-store URI "
+                f"{model_name_or_path!r}; object-store checkpoints always stream "
+                "live bucket state"
+            )
 
         hf_folder = sync_object_store_metadata(
             model_name_or_path, cache_dir=self.load_config.download_dir

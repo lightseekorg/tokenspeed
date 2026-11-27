@@ -3698,6 +3698,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         with open(index_path) as handle:
             weight_map = json.load(handle)["weight_map"]
         targets = self._checkpoint_targets()
+        remote_file_cache: dict[str, object] = {}
         for raw in pending:
             mapped = None
             for key in (raw, "model." + raw, raw.removeprefix("model.")):
@@ -3713,7 +3714,10 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             embed = self.get_submodule(param_name.rsplit(".", 1)[0])
             field = param_name.rsplit(".", 1)[1]
             with open_safetensors_slice(
-                checkpoint_dir, weight_map[mapped], mapped
+                checkpoint_dir,
+                weight_map[mapped],
+                mapped,
+                remote_file_cache=remote_file_cache,
             ) as tensor_slice:
                 embed.load_sharded(field, tensor_slice, 65536)
             loaded.add(raw)

@@ -1373,5 +1373,256 @@ class TestRunaiStreamerDistributedContract:
                 )
 
 
+class TestRunaiStreamerReviewRegressions:
+    """Behavioral regression tests for review feedback on object-store loading."""
+
+    def test_get_generation_config_propagates_object_store_network_error(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        from tokenspeed.runtime.model_loader import object_store
+        from tokenspeed.runtime.utils import hf_transformers_utils
+
+        hf_transformers_utils.get_generation_config.cache_clear()
+
+        def fail_with_connection_error(uri: str, cache_dir: str | None = None) -> str:
+            raise ConnectionError(f"transient reset while listing {uri}")
+
+        monkeypatch.setattr(
+            object_store, "sync_object_store_metadata", fail_with_connection_error
+        )
+        with pytest.raises(ConnectionError, match="transient reset"):
+            hf_transformers_utils.get_generation_config(
+                "gs://example-bucket/org/model",
+                trust_remote_code=False,
+                download_dir=str(tmp_path),
+            )
+
+        # When metadata sync succeeds but generation_config.json is absent,
+        # get_generation_config still returns None.
+        hf_transformers_utils.get_generation_config.cache_clear()
+        empty_meta = tmp_path / "synced"
+        empty_meta.mkdir()
+        monkeypatch.setattr(
+            object_store,
+            "sync_object_store_metadata",
+            lambda uri, cache_dir=None: str(empty_meta),
+        )
+        assert (
+            hf_transformers_utils.get_generation_config(
+                "gs://example-bucket/org/model-no-gen",
+                trust_remote_code=False,
+                download_dir=str(tmp_path),
+            )
+            is None
+        )
+
+    def test_mixed_shard_range_read_yields_unindexed_header_tensor(
+        self, monkeypatch
+    ) -> None:
+        shard_tensors = {
+            "layer1.proj.weight": torch.randn((4, 8), dtype=torch.bfloat16),
+            "layer1.unindexed.bias": torch.randn((4,), dtype=torch.bfloat16),
+            "layer1.engram.embed.weight": torch.randint(
+                0, 255, (16, 8), dtype=torch.uint8
+            ),
+        }
+        shard_raw = safetensors.torch.save(shard_tensors)
+        uri = "gs://example-bucket/model/model-00001-of-00001.safetensors"
+        # Intentionally omit layer1.unindexed.bias from index_weight_map.
+        index_weight_map = {
+            "layer1.proj.weight": "model-00001-of-00001.safetensors",
+            "layer1.engram.embed.weight": "model-00001-of-00001.safetensors",
+        }
+
+        fake_mod = types.ModuleType("runai_model_streamer")
+        fake_mod.__version__ = "0.16.1"  # type: ignore[attr-defined]
+        fake_mod.SafetensorsStreamer = object  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "runai_model_streamer", fake_mod)
+
+        recorded_ranges: list[tuple[int, int]] = []
+
+        def fake_remote_file_factory(target_uri: str) -> RemoteSafetensorsFile:
+            assert target_uri == uri
+
+            def reader(start: int, end: int) -> bytes:
+                recorded_ranges.append((start, end))
+                return shard_raw[start:end]
+
+            return RemoteSafetensorsFile(target_uri, range_reader=reader)
+
+        yielded = dict(
+            runai_streamer_weights_iterator(
+                [uri],
+                distributed=False,
+                distributed_scope=None,
+                weight_name_filter=lambda name: "engram.embed" not in name,
+                index_weight_map=index_weight_map,
+                remote_file_factory=fake_remote_file_factory,
+            )
+        )
+        assert set(yielded.keys()) == {"layer1.proj.weight", "layer1.unindexed.bias"}
+        assert torch.equal(
+            yielded["layer1.proj.weight"], shard_tensors["layer1.proj.weight"]
+        )
+        assert torch.equal(
+            yielded["layer1.unindexed.bias"], shard_tensors["layer1.unindexed.bias"]
+        )
+
+        # Rejected tensor's byte range must never be touched.
+        hdr_len = struct.unpack("<Q", shard_raw[:8])[0]
+        hdr = json.loads(shard_raw[8 : 8 + hdr_len].decode("utf-8"))
+        data_base = 8 + hdr_len
+        rej_start = data_base + hdr["layer1.engram.embed.weight"]["data_offsets"][0]
+        rej_end = data_base + hdr["layer1.engram.embed.weight"]["data_offsets"][1]
+        for start, end in recorded_ranges:
+            assert end <= rej_start or start >= rej_end
+
+    def test_remote_safetensors_slice_large_read_uses_parallel_parts(
+        self, monkeypatch
+    ) -> None:
+        from tokenspeed.runtime.model_loader.object_store import RemoteSafetensorsSlice
+
+        # 64 rows x 16 bytes = 1024 bytes; force small part/window thresholds so
+        # one read exceeds _prefetch_window_bytes and splits into 4 parallel parts.
+        table = torch.randint(0, 255, (64, 16), dtype=torch.uint8)
+        raw = safetensors.torch.save({"embed.weight": table})
+        ranges: list[tuple[int, int]] = []
+
+        def reader(start: int, end: int) -> bytes:
+            ranges.append((start, end))
+            return raw[start:end]
+
+        monkeypatch.setattr(RemoteSafetensorsSlice, "_PREFETCH_PART_BYTES", 256)
+
+        remote = RemoteSafetensorsFile(
+            "gs://example-bucket/model/shard.safetensors", range_reader=reader
+        )
+        ranges.clear()
+        tensor_slice = remote.get_slice("embed.weight")
+        tensor_slice._prefetch_window_bytes = 512
+        got = tensor_slice[0:64, :]
+
+        assert torch.equal(got, table)
+        assert len(ranges) == 4
+        assert [end - start for start, end in ranges] == [256, 256, 256, 256]
+
+    def test_open_safetensors_slice_reuses_remote_file_cache(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        from tokenspeed.runtime.model_loader import object_store
+
+        t0 = torch.randint(0, 255, (8, 16), dtype=torch.uint8)
+        t1 = torch.randint(0, 255, (8, 4), dtype=torch.uint8)
+        raw = safetensors.torch.save({"a.weight": t0, "a.scale": t1})
+        header_reads = 0
+
+        def fake_read_range(uri: str, start: int, end: int) -> bytes:
+            nonlocal header_reads
+            if start == 0 and end == 8:
+                header_reads += 1
+            return raw[start:end]
+
+        monkeypatch.setattr(object_store, "read_object_store_range", fake_read_range)
+
+        cache: dict[str, object] = {}
+        uri = "gs://example-bucket/model"
+        with open_safetensors_slice(
+            uri, "model-00001-of-00001.safetensors", "a.weight", remote_file_cache=cache
+        ) as s0:
+            assert torch.equal(s0[:], t0)
+        with open_safetensors_slice(
+            uri, "model-00001-of-00001.safetensors", "a.scale", remote_file_cache=cache
+        ) as s1:
+            assert torch.equal(s1[:], t1)
+        assert header_reads == 1
+
+        # Also works through a synced metadata directory carrying its source URI.
+        meta_dir = tmp_path / "meta"
+        meta_dir.mkdir()
+        (meta_dir / object_store._SOURCE_URI_FILENAME).write_text(
+            uri + "\n", encoding="utf-8"
+        )
+        with open_safetensors_slice(
+            str(meta_dir),
+            "model-00001-of-00001.safetensors",
+            "a.scale",
+            remote_file_cache=cache,
+        ) as s2:
+            assert torch.equal(s2[:], t1)
+        assert header_reads == 1
+
+    def test_object_store_rejects_revision_flags(self, monkeypatch) -> None:
+        from tokenspeed.runtime.utils import server_args as server_args_mod
+        from tokenspeed.runtime.utils.server_args import ServerArgs
+
+        monkeypatch.setattr(
+            server_args_mod, "get_amdgpu_memory_capacity", lambda: 80000
+        )
+        monkeypatch.setattr(server_args_mod, "get_nvgpu_memory_capacity", lambda: 80000)
+
+        with pytest.raises(ValueError, match="--revision.*not supported"):
+            ServerArgs(
+                model="gs://example-bucket/org/model",
+                load_format="runai_streamer",
+                revision="abc123",
+            )
+
+        with pytest.raises(ValueError, match="--revision.*not supported"):
+            ServerArgs(
+                model="/local/model",
+                tokenizer="s3://example-bucket/org/tok",
+                load_format="runai_streamer",
+                revision="abc123",
+            )
+
+        with pytest.raises(
+            ValueError, match="--speculative-draft-model-revision.*not supported"
+        ):
+            ServerArgs(
+                model="/local/model",
+                load_format="runai_streamer",
+                speculative_algorithm="dspark",
+                speculative_draft_model_path="gs://example-bucket/org/draft",
+                speculative_draft_model_revision="def456",
+            )
+
+        # --revision for a non-object-store base model stays allowed when paired
+        # with an independent object-store draft path.
+        args = ServerArgs(
+            model="/local/model",
+            load_format="runai_streamer",
+            revision="abc123",
+            speculative_algorithm="dspark",
+            speculative_draft_model_path="gs://example-bucket/org/draft",
+        )
+        assert args.revision == "abc123"
+
+        loader = RunaiModelStreamerLoader(LoadConfig(load_format="runai_streamer"))
+        with pytest.raises(ValueError, match="revision=.*not supported"):
+            loader._prepare_weights(
+                "gs://example-bucket/org/model", "abc123", False, None
+            )
+
+    def test_modelscope_local_paths_do_not_import_modelscope(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        from tokenspeed.runtime.utils.common import prepare_model_and_tokenizer
+
+        monkeypatch.setenv("TOKENSPEED_USE_MODELSCOPE", "1")
+        monkeypatch.setitem(sys.modules, "modelscope", None)
+        local_model = str(tmp_path / "model")
+        local_tok = str(tmp_path / "tok")
+        os.makedirs(local_model)
+        os.makedirs(local_tok)
+
+        assert prepare_model_and_tokenizer(local_model, local_tok) == (
+            local_model,
+            local_tok,
+        )
+        assert prepare_model_and_tokenizer(
+            "gs://example-bucket/org/model", local_tok
+        ) == ("gs://example-bucket/org/model", local_tok)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

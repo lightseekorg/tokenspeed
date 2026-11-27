@@ -263,8 +263,6 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
     from tokenspeed.runtime.utils.env import envs
 
     if envs.TOKENSPEED_USE_MODELSCOPE.get():
-        from modelscope import snapshot_download
-
         from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
@@ -273,6 +271,8 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
         # id must be downloaded here rather than left to the Hugging Face hub.
         model_is_remote = is_object_store_uri(model_path)
         if not model_is_remote and not os.path.exists(model_path):
+            from modelscope import snapshot_download
+
             with get_lock(model_path):
                 model_path = snapshot_download(model_path)
             model_is_remote = True
@@ -281,6 +281,8 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
             and not is_object_store_uri(tokenizer_path)
             and not os.path.exists(tokenizer_path)
         ):
+            from modelscope import snapshot_download
+
             with get_lock(tokenizer_path):
                 tokenizer_path = snapshot_download(
                     tokenizer_path, ignore_patterns=["*.bin", "*.safetensors"]
