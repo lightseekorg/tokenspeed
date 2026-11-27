@@ -1691,6 +1691,89 @@ class TestNarrowingPrefillGraphTest:
             else:
                 assert len(events_by_rank[r]) == 4
 
+    def test_execute_idle_forward_replays_inference_tensor_buffers_outside_inference_mode(
+        self,
+    ):
+        """execute_idle_forward must enter inference mode before replay_idle touches
+        inference-tensor input buffers and BreakableCapture _land_in handoffs."""
+        from contextlib import nullcontext
+
+        from tokenspeed.runtime.execution.breakable_cuda_graph import _land_in
+        from tokenspeed.runtime.execution.model_executor import ModelExecutor
+        from tokenspeed.runtime.execution.types import DpForwardMetadata
+
+        events: list[object] = []
+        rank_graph = self._make_dp_rank(3, 4, 0, events)
+
+        # Allocate static input and handoff destination buffers inside inference_mode,
+        # matching PrefillGraph.capture() (which runs under maybe_inference_mode()).
+        with self.torch.inference_mode():
+            rank_graph._input_embeds_buf = self.torch.full(
+                (256, 8), float("nan"), dtype=self.torch.float32
+            )
+            handoff_dst = self.torch.zeros((256, 8), dtype=self.torch.float32)
+
+        assert rank_graph._input_embeds_buf.is_inference()
+        assert handoff_dst.is_inference()
+        assert not self.torch.is_inference_mode_enabled()
+
+        orig_replay = rank_graph._encoders[256].capture.replay
+        saw_inference_mode: list[bool] = []
+
+        def _replay_with_land_in(*args, **kwargs):
+            saw_inference_mode.append(self.torch.is_inference_mode_enabled())
+            _land_in(handoff_dst, self.torch.ones((1, 8), dtype=self.torch.float32))
+            return orig_replay(*args, **kwargs)
+
+        rank_graph._encoders[256].capture.replay = _replay_with_land_in
+
+        executor = ModelExecutor.__new__(ModelExecutor)
+        executor.device = self.torch.device("cpu")
+        executor.device_module = SimpleNamespace(stream=lambda _s: nullcontext())
+        executor.default_stream = object()
+        executor.execution_stream = SimpleNamespace(wait_stream=lambda _s: None)
+        executor.config = SimpleNamespace(output_length=1)
+        executor.input_buffers = SimpleNamespace(
+            req_pool_indices_buf=self.torch.zeros(8, dtype=self.torch.int32),
+            extend_prefix_lens_buf=self.torch.zeros(8, dtype=self.torch.int32),
+            extend_prefix_lens_cpu=self.torch.zeros(8, dtype=self.torch.int32),
+            extend_seq_lens_buf=self.torch.zeros(8, dtype=self.torch.int32),
+            extend_seq_lens_cpu=self.torch.zeros(8, dtype=self.torch.int32),
+            extend_replay_lens_cpu=self.torch.zeros(8, dtype=self.torch.int32),
+            extend_prompt_lens_cpu=self.torch.zeros(8, dtype=self.torch.int32),
+        )
+        executor.runtime_states = SimpleNamespace(
+            valid_cache_lengths=self.torch.zeros(8, dtype=self.torch.int32),
+            vocab_size=32,
+        )
+        executor.attn_backend = rank_graph.attn_backend
+        executor.token_to_kv_pool = rank_graph.token_to_kv_pool
+        executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
+        executor.prefill_graph = rank_graph
+        executor.dspark_context_producer = None
+        executor.drafter = None
+        executor.model_runner = SimpleNamespace(
+            forward=lambda *a, **k: (_ for _ in ()).throw(
+                AssertionError("idle rank must replay prefill graph, not eager")
+            )
+        )
+
+        meta = DpForwardMetadata.from_ranks(
+            global_num_tokens=[120, 80, 250, 0],
+            global_batch_size=[1, 1, 1, 0],
+            global_num_extends=[1, 1, 1, 0],
+            global_decoder_rows=[64, 192, 0, 0],
+            need_idle_forward=True,
+        )
+        # Called strictly outside inference_mode; must not raise on inference-tensor
+        # in-place updates (.zero_() or _land_in()).
+        executor.execute_idle_forward(meta)
+        assert saw_inference_mode == [True]
+        assert self.torch.count_nonzero(rank_graph._input_embeds_buf[:256]) == 0
+        assert self.torch.equal(
+            handoff_dst[:1], self.torch.ones((1, 8), dtype=self.torch.float32)
+        )
+
     def test_dp_multi_rank_decoder_rows_above_max_bucket_or_all_zero_agree(self):
         """Heterogeneous decoder_rows with any rank > max_bucket, or all ranks == 0,
         both keep all ranks in lockstep on encoder bucket + eager/skip decoder."""

@@ -2364,6 +2364,7 @@ class ModelExecutor:
             else CaptureHiddenMode.NULL
         )
 
+    @maybe_inference_mode()
     def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
