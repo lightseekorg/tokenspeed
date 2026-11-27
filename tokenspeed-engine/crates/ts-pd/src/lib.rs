@@ -121,25 +121,43 @@ impl Copy {
 const DESCRIPTOR_BATCH: usize = 4096;
 
 /// Default maximum descriptors per sub-page `Copy::Spans` WRITE batch (override
-/// via `TOKENSPEED_PD_SPAN_BATCH`). Splitting large bursts of tiny RDMA WRITE
-/// WQEs (e.g. DFLASH SWA 256B head-sharded slices) avoids overflowing shallow
-/// RoCE switch egress buffers without changing `Copy::Pages` or large-span
-/// transfers.
+/// via `TOKENSPEED_PD_SPAN_BATCH`; `0` disables sub-page splitting and uses
+/// `DESCRIPTOR_BATCH`). Splitting large bursts of tiny RDMA WRITE WQEs (e.g.
+/// DFLASH SWA 256B head-sharded slices) avoids overflowing shallow RoCE switch
+/// egress buffers without changing `Copy::Pages` or large-span transfers.
 const DEFAULT_SPAN_DESCRIPTOR_BATCH: usize = 512;
 
 /// Span byte length at or below which a descriptor counts as a small sub-page
 /// span when deciding whether to apply `DEFAULT_SPAN_DESCRIPTOR_BATCH`.
 const SMALL_SPAN_MAX_BYTES: u64 = 4096;
 
-fn span_descriptor_batch_override() -> Option<usize> {
-    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *OVERRIDE.get_or_init(|| {
-        std::env::var("TOKENSPEED_PD_SPAN_BATCH")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .map(|n| n.clamp(1, DESCRIPTOR_BATCH))
-    })
+fn parse_span_descriptor_batch_value(raw: &str) -> Result<usize, String> {
+    let parsed = raw.trim().parse::<usize>().map_err(|_| {
+        format!(
+            "TOKENSPEED_PD_SPAN_BATCH must be 0 (disable) or an integer in 1..={DESCRIPTOR_BATCH}, got {raw:?}"
+        )
+    })?;
+    if parsed == 0 {
+        return Ok(DESCRIPTOR_BATCH);
+    }
+    if parsed > DESCRIPTOR_BATCH {
+        return Err(format!(
+            "TOKENSPEED_PD_SPAN_BATCH must be 0 (disable) or an integer in 1..={DESCRIPTOR_BATCH}, got {parsed}"
+        ));
+    }
+    Ok(parsed)
+}
+
+fn span_descriptor_batch_override_from_env() -> Result<Option<usize>, StartError> {
+    match std::env::var("TOKENSPEED_PD_SPAN_BATCH") {
+        Ok(raw) => parse_span_descriptor_batch_value(&raw)
+            .map(Some)
+            .map_err(StartError::Config),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(StartError::Config(format!(
+            "TOKENSPEED_PD_SPAN_BATCH: {error}"
+        ))),
+    }
 }
 
 fn span_descriptor_batch_for(lengths: &[u64], override_batch: Option<usize>) -> usize {
@@ -235,6 +253,9 @@ pub enum StartError {
     /// The rank's cache transfer contract is malformed.
     #[error(transparent)]
     Layout(#[from] LayoutError),
+    /// An environment-configured PD transport knob is malformed or out of range.
+    #[error("invalid PD configuration: {0}")]
+    Config(String),
 }
 
 /// What both roles start from.
@@ -263,6 +284,7 @@ struct Transport {
     protocol: String,
     ib_device: String,
     roce_transport: bool,
+    span_batch_override: Option<usize>,
     /// The device ranges registered with the engine.
     regions: Vec<(usize, usize)>,
     /// Replaced when a sleeping Decode rank wakes under a fresh session.
@@ -284,6 +306,7 @@ impl Transport {
         config: &PeerConfig,
         incoming: std::sync::mpsc::Sender<Vec<bytes::Bytes>>,
     ) -> Result<Arc<Self>, StartError> {
+        let span_batch_override = span_descriptor_batch_override_from_env()?;
         let library = ts_mooncake::Library::load(&config.library)?;
         let engine = Engine::start(
             library.clone(),
@@ -313,6 +336,7 @@ impl Transport {
             protocol: config.protocol.clone(),
             ib_device: config.ib_device.clone(),
             roce_transport,
+            span_batch_override,
             regions: config.regions.clone(),
             engine: RwLock::new(engine.clone()),
             cache_sender: Mutex::new(CacheSender {
@@ -489,7 +513,7 @@ impl Transport {
     /// Run one transfer's copies to `session`.
     fn write(&self, session: &str, copies: &[Copy]) -> Result<(), ts_mooncake::Error> {
         let engine = self.engine();
-        Self::write_on_engine(&engine, session, copies)
+        Self::write_on_engine(&engine, session, copies, self.span_batch_override)
     }
 
     /// Address one cache incarnation without retaining the native keys of
@@ -528,13 +552,14 @@ impl Transport {
                 .insert(session.to_owned(), cache_id.to_owned());
             sender.engine.clone()
         };
-        Self::write_on_engine(&engine, session, copies)
+        Self::write_on_engine(&engine, session, copies, self.span_batch_override)
     }
 
     fn write_on_engine(
         engine: &Engine,
         session: &str,
         copies: &[Copy],
+        span_batch_override: Option<usize>,
     ) -> Result<(), ts_mooncake::Error> {
         for copy in copies {
             match copy {
@@ -544,8 +569,7 @@ impl Transport {
                     destinations,
                     lengths,
                 } => {
-                    let batch =
-                        span_descriptor_batch_for(lengths, span_descriptor_batch_override());
+                    let batch = span_descriptor_batch_for(lengths, span_batch_override);
                     for start in (0..sources.len()).step_by(batch) {
                         let end = (start + batch).min(sources.len());
                         engine.write(
@@ -635,6 +659,21 @@ mod tests {
             span_descriptor_batch_for(&small_burst, Some(99_999)),
             DESCRIPTOR_BATCH
         );
+
+        // Env parsing: 0 disables splitting (DESCRIPTOR_BATCH); malformed/out-of-range fails.
+        assert_eq!(
+            parse_span_descriptor_batch_value("0").unwrap(),
+            DESCRIPTOR_BATCH
+        );
+        assert_eq!(parse_span_descriptor_batch_value("512").unwrap(), 512);
+        assert_eq!(
+            parse_span_descriptor_batch_value("4096").unwrap(),
+            DESCRIPTOR_BATCH
+        );
+        assert!(parse_span_descriptor_batch_value("").is_err());
+        assert!(parse_span_descriptor_batch_value("abc").is_err());
+        assert!(parse_span_descriptor_batch_value("-1").is_err());
+        assert!(parse_span_descriptor_batch_value("4097").is_err());
     }
 
     #[test]

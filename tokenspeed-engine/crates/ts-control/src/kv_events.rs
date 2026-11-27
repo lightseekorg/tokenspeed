@@ -63,6 +63,9 @@ pub enum KvEventsError {
     /// The endpoint is not one this publisher serves.
     #[error("KV event publisher: unsupported endpoint {0}")]
     Endpoint(String),
+    /// An environment-configured KV event knob is malformed or out of range.
+    #[error("KV event publisher configuration: {0}")]
+    Config(String),
 }
 
 /// `KVEventsConfig`'s publishing fields.
@@ -109,19 +112,33 @@ const MEDIUM_DISK: &str = "DISK";
 /// Default maximum blocks merged into one wire `BlockStored` or `BlockRemoved`
 /// event (aligned with Dynamo's `DEFAULT_MAX_BATCH_BLOCKS = 128`).
 ///
-/// Override via `TOKENSPEED_KV_EVENT_COALESCE_MAX_BLOCKS` (`1` disables coalescing).
+/// Override via `TOKENSPEED_KV_EVENT_COALESCE_MAX_BLOCKS` (`0` or `1` disables
+/// coalescing; valid range `0..=1024`).
 pub const DEFAULT_KV_EVENT_COALESCE_MAX_BLOCKS: usize = 128;
 const MAX_KV_EVENT_COALESCE_MAX_BLOCKS: usize = 1024;
 
-fn kv_event_coalesce_max_blocks() -> usize {
-    static MAX_BLOCKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MAX_BLOCKS.get_or_init(|| {
-        std::env::var("TOKENSPEED_KV_EVENT_COALESCE_MAX_BLOCKS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .map(|n| n.clamp(1, MAX_KV_EVENT_COALESCE_MAX_BLOCKS))
-            .unwrap_or(DEFAULT_KV_EVENT_COALESCE_MAX_BLOCKS)
-    })
+fn parse_kv_event_coalesce_max_blocks_value(raw: &str) -> Result<usize, String> {
+    let parsed = raw.trim().parse::<usize>().map_err(|_| {
+        format!(
+            "TOKENSPEED_KV_EVENT_COALESCE_MAX_BLOCKS must be an integer in 0..={MAX_KV_EVENT_COALESCE_MAX_BLOCKS} (0 or 1 disables coalescing), got {raw:?}"
+        )
+    })?;
+    if parsed > MAX_KV_EVENT_COALESCE_MAX_BLOCKS {
+        return Err(format!(
+            "TOKENSPEED_KV_EVENT_COALESCE_MAX_BLOCKS must be an integer in 0..={MAX_KV_EVENT_COALESCE_MAX_BLOCKS} (0 or 1 disables coalescing), got {parsed}"
+        ));
+    }
+    Ok(parsed.max(1))
+}
+
+fn kv_event_coalesce_max_blocks_from_env() -> Result<usize, KvEventsError> {
+    match std::env::var("TOKENSPEED_KV_EVENT_COALESCE_MAX_BLOCKS") {
+        Ok(raw) => parse_kv_event_coalesce_max_blocks_value(&raw).map_err(KvEventsError::Config),
+        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_KV_EVENT_COALESCE_MAX_BLOCKS),
+        Err(error) => Err(KvEventsError::Config(format!(
+            "TOKENSPEED_KV_EVENT_COALESCE_MAX_BLOCKS: {error}"
+        ))),
+    }
 }
 
 fn encode_medium(encoder: &mut ts_wire::msgpack::Encoder, medium: KvEventMedium) {
@@ -454,6 +471,7 @@ pub struct KvEventPublisher {
 impl KvEventPublisher {
     /// Start publishing for attention-DP rank `dp_rank`.
     pub fn start(config: &KvEventsConfig, dp_rank: i64) -> Result<Self, KvEventsError> {
+        let coalesce_max_blocks = kv_event_coalesce_max_blocks_from_env()?;
         let endpoint = offset_endpoint_port(&config.endpoint, dp_rank)?;
         let replay_endpoint = config
             .replay_endpoint
@@ -496,6 +514,7 @@ impl KvEventPublisher {
             buffer_steps: config.buffer_steps,
             dp_rank,
             next_seq: 0,
+            coalesce_max_blocks,
         };
         thread::Builder::new()
             .name("ts-kv-events".to_owned())
@@ -558,6 +577,7 @@ struct PublisherState {
     buffer_steps: usize,
     dp_rank: i64,
     next_seq: u64,
+    coalesce_max_blocks: usize,
 }
 
 impl PublisherState {
@@ -573,7 +593,7 @@ impl PublisherState {
                                 timestamp,
                                 &events,
                                 self.dp_rank,
-                                kv_event_coalesce_max_blocks(),
+                                self.coalesce_max_blocks,
                             )
                         };
                         {
@@ -997,5 +1017,23 @@ mod tests {
         assert!(matches!(coalesced[2], WireEvent::Removed { ref hashes, .. } if hashes == &[2]));
         assert!(matches!(coalesced[3], WireEvent::Stored { ref hashes, .. } if hashes == &[5]));
         assert!(matches!(coalesced[4], WireEvent::Stored { ref hashes, .. } if hashes == &[5]));
+    }
+
+    #[test]
+    fn kv_event_coalesce_env_parser_validates_bounds_and_zero_disable() {
+        assert_eq!(parse_kv_event_coalesce_max_blocks_value("0").unwrap(), 1);
+        assert_eq!(parse_kv_event_coalesce_max_blocks_value("1").unwrap(), 1);
+        assert_eq!(
+            parse_kv_event_coalesce_max_blocks_value("128").unwrap(),
+            128
+        );
+        assert_eq!(
+            parse_kv_event_coalesce_max_blocks_value("1024").unwrap(),
+            1024
+        );
+        assert!(parse_kv_event_coalesce_max_blocks_value("").is_err());
+        assert!(parse_kv_event_coalesce_max_blocks_value("abc").is_err());
+        assert!(parse_kv_event_coalesce_max_blocks_value("-1").is_err());
+        assert!(parse_kv_event_coalesce_max_blocks_value("1025").is_err());
     }
 }
