@@ -214,6 +214,7 @@ def prepare_mha_decode(
             solution=request.solution,
             override=request.registration,
             block_draft=False,
+            batch_invariant=False,
         )
 
     return PreparedBenchmark(

@@ -839,6 +839,11 @@ class ServerArgs:
     # target distribution; this one trades a sampled proposal for a higher
     # acceptance rate under sampling temperatures.
     enable_speculative_sampling: bool = False
+    # DFLASH draft whose rows do not move with the batch: the draft's GQA
+    # decode takes a leaf with no key split and its context K|V write takes a
+    # batch-invariant GEMM plan. Off: the draft keeps the adaptive leaf and the
+    # library GEMM.
+    enable_draft_forward_batch_invariant: bool = False
     # Verify rule, named as vLLM's rejection_sample_method. "standard" is the
     # existing token-wise rule; "block" is block verification of a sampled
     # DSpark or EAGLE3 topk=1 chain; "synthetic" forces benchmark acceptance
@@ -2578,6 +2583,14 @@ class ServerArgs:
                 "numerics; --numerics rl-bitwise needs bf16"
             )
         resolve_numerics_envelope(self)
+        if (
+            self.enable_draft_forward_batch_invariant
+            and self.speculative_algorithm != "DFLASH"
+        ):
+            raise ValueError(
+                "--enable-draft-forward-batch-invariant applies to --speculative-algorithm "
+                f"DFLASH, not {self.speculative_algorithm!r}"
+            )
         _require_choice(
             "--dense-fp8-small-m",
             self.dense_fp8_small_m,
@@ -5383,6 +5396,20 @@ class ServerArgs:
             "role of a disaggregated deployment. Every drafter but a DFlash2 "
             "draft costs a per-request fp32 draft distribution buffer; see "
             "docs/configuration/server.md.",
+        )
+        parser.add_argument(
+            "--enable-draft-forward-batch-invariant",
+            action="store_true",
+            default=ServerArgs.enable_draft_forward_batch_invariant,
+            help="Make a DFLASH draft's rows independent of the batch they run "
+            "in: its decode attention folds a row's keys in index order (the "
+            "default leaf splits them by batch size and SM count) and its "
+            "context K|V write uses a batch-invariant GEMM plan. Supported and "
+            "verified only for a DFLASH GQA draft whose layers all use a "
+            "sliding window, unquantized; any other draft "
+            "fails at startup. The attention leaf costs time where the batch "
+            "leaves the device underfilled. Off by default, also under "
+            "--numerics rl-bitwise.",
         )
         parser.add_argument(
             "--speculative-rejection-sample-method",

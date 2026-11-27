@@ -166,6 +166,7 @@ def test_decode_mxfp8_matches_bf16(window_left: int):
         window_left=window_left,
         solution="fa4",
         block_draft=False,
+        batch_invariant=False,
     )
     out = mha_decode_with_kvcache(
         q=q_fp8,
@@ -181,6 +182,7 @@ def test_decode_mxfp8_matches_bf16(window_left: int):
         v_scale=cache["v_scale"],
         solution="fa4",
         block_draft=False,
+        batch_invariant=False,
     )
     _check(out, ref)
 
