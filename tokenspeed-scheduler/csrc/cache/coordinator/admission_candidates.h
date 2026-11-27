@@ -29,6 +29,7 @@
 
 #include "cache/coordinator/cache_store.h"
 #include "cache/coordinator/eviction_candidates.h"
+#include "cache/coordinator/publication_preview.h"
 #include "cache/core/cache_types.h"
 
 namespace tokenspeed {
@@ -37,11 +38,13 @@ namespace tokenspeed {
 // feasibility checks, candidate selection and victim-set expansion.
 struct AdmissionCandidateConstraints {
     explicit AdmissionCandidateConstraints(std::pmr::memory_resource* resource)
-        : protected_locations{resource}, request_reclaim_locations{resource} {}
+        : protected_locations{resource}, host_protected_locations{resource}, request_reclaim_locations{resource} {}
 
     CacheEvictionCandidates::LocationSet protected_locations;
+    CacheEvictionCandidates::LocationSet host_protected_locations;
     CacheEvictionCandidates::LocationSet request_reclaim_locations;
     std::vector<CacheEvictionCandidates::Candidate> request_reclaim_candidates;
+    std::unique_ptr<PublicationPreview> publication;
 };
 
 // Read the request and cache without changing either. The returned sets use
@@ -49,7 +52,7 @@ struct AdmissionCandidateConstraints {
 inline AdmissionCandidateConstraints BuildAdmissionCandidateConstraints(
     const CacheStore& store, std::span<const GroupDemand> demands, std::optional<std::int32_t> num_computed_tokens,
     const PrefixProbe& prefix, std::span<const std::pair<std::uint32_t, CacheBlockLocation>> planned_claim_locations,
-    std::pmr::memory_resource* resource) {
+    std::pmr::memory_resource* resource, const CheckpointPublication* publication) {
     const auto& groups = store.Groups();
     const auto geometry = store.Geometry();
     const BlockPool& pool = store.DevicePool();
@@ -73,10 +76,36 @@ inline AdmissionCandidateConstraints BuildAdmissionCandidateConstraints(
                 groups[i].Index().MatchedLocations(pool, state->group_keys[i], /*begin_block=*/0, state->per_group[i]));
         }
     }
+    // commitAdmission acquires the probe before committing evictions. These
+    // Host sources are future pins, just like the Device prefix above.
+    if (store.UsesGds() && store.HostPool() && !prefix.host.per_group.empty()) {
+        const auto protect_host = [&](std::span<const CacheBlockLocation> locations) {
+            for (auto location : locations) constraints.host_protected_locations.insert(location);
+        };
+        for (std::size_t i = 0; i < groups.size(); ++i) {
+            if (store.GroupIsReplayable(static_cast<std::int32_t>(i))) continue;
+            const auto first =
+                store.GroupIsState(i) ? 0 : prefix.device.full_page_tokens / geometry[i].BlockGranularity();
+            protect_host(groups[i].Index().MatchedLocations(*store.HostPool(), (*prefix.group_keys)[i], first,
+                                                            prefix.host.per_group[i]));
+            if (const auto& tail = prefix.host.tail; tail && !tail->group_keys[i].empty())
+                protect_host(
+                    groups[i].Index().MatchedLocations(*store.HostPool(), tail->group_keys[i], 0, tail->per_group[i]));
+        }
+    }
     constraints.protected_locations.reserve(constraints.protected_locations.size() + planned_claim_locations.size());
     for (const auto& [group_id, location] : planned_claim_locations) {
         (void)group_id;
         constraints.protected_locations.insert(location);
+    }
+
+    if (store.UsesGds() && publication) {
+        constraints.publication = std::make_unique<PublicationPreview>(store, demands, *publication);
+        for (const auto& [tier, location] : constraints.publication->Protected()) {
+            auto& protected_locations =
+                tier == CacheTier::kDevice ? constraints.protected_locations : constraints.host_protected_locations;
+            protected_locations.insert(location);
+        }
     }
 
     // A released State input and expired window slots are still table-pinned.

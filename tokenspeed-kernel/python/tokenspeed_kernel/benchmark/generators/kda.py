@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -580,7 +580,32 @@ def _require_state_pages(state_pages: int, required: int) -> None:
         )
 
 
-def _retained_benchmark_layer(common, window, generator, reads, live, metadata, stamps):
+_DEFAULT_HISTORY_CAPACITY = 16
+
+
+def _history_capacity(parameters: Mapping[str, Any], window: int) -> int:
+    # Match the runtime default (--kda-history-capacity = 16); a window wider
+    # than 16 must pass history_capacity explicitly.
+    raw = parameters.get("history_capacity")
+    capacity = _DEFAULT_HISTORY_CAPACITY if raw is None else raw
+    if type(capacity) is not int or capacity < window:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"KDA history_capacity must be an integer at least draft_token_num ({window})",
+        )
+    return capacity
+
+
+def _retained_benchmark_layer(
+    common, window, capacity, generator, reads, live, metadata, stamps, count, verified
+):
+    """One layer's verify inputs over the request slots' shared counts.
+
+    ``count`` is the INT32 [slots, 1] accepted count every layer shares and
+    ``verified`` the count its verify reads: the same tensor when no commit
+    follows, else a copy of the round's starting count, which the timed
+    commits leave as it is.
+    """
     from tokenspeed_kernel.ops.attention import kda as kda_ops
 
     profile = common["profile"]
@@ -598,14 +623,12 @@ def _retained_benchmark_layer(common, window, generator, reads, live, metadata, 
         common["conv_kernel_size"],
     )
     _fill_state_pages(conv, state, reads.long(), generator=generator)
-    capacity = max(16, window)
     shape = (reads.numel(), profile.heads, capacity, profile.head_dim)
     history = kda_ops.KdaRetainedHistory(
         torch.zeros(shape, device="cuda"),
         torch.zeros(shape, device="cuda"),
         torch.zeros(shape, device="cuda"),
-        # One accepted-record count per request slot, beside its records.
-        torch.zeros(reads.numel(), 1, device="cuda", dtype=torch.int32),
+        verified,
         live,
         metadata[:, 0],
     )
@@ -622,6 +645,7 @@ def _retained_benchmark_layer(common, window, generator, reads, live, metadata, 
         conv=conv,
         state=state,
         records=records,
+        count=count,
         reads=reads,
         window=window,
     )
@@ -695,7 +719,7 @@ def prepare_kda_fused_paged_verify(
     common = _fused_common(request)
     profile, batch = common["profile"], common["batch"]
     window = _positive_parameter(request.parameters, "draft_token_num")
-    capacity = max(16, window)
+    capacity = _history_capacity(request.parameters, window)
     history_length = request.parameters.get("history_length", 0)
     if type(history_length) is not int or not 0 <= history_length <= capacity - window:
         raise BenchmarkCaseError(
@@ -723,8 +747,19 @@ def prepare_kda_fused_paged_verify(
     metadata[:, 2] = history_length
     stamps = torch.full((batch, window, 2), -1, device="cuda", dtype=torch.int64)
     generator = _generator(request.seed)
+    # No commit follows, so the verify reads the count itself.
+    count = torch.zeros(batch, 1, device="cuda", dtype=torch.int32)
     layer = _retained_benchmark_layer(
-        common, window, generator, reads, reads.clone(), metadata, stamps
+        common,
+        window,
+        capacity,
+        generator,
+        reads,
+        reads.clone(),
+        metadata,
+        stamps,
+        count,
+        count,
     )
     initial_conv, initial_state = layer["conv"].clone(), layer["state"].clone()
     history = layer["records"].history
@@ -771,6 +806,7 @@ def prepare_kda_retained_commit(
     common = _fused_common(request)
     profile, batch = common["profile"], common["batch"]
     window = _positive_parameter(request.parameters, "draft_token_num")
+    capacity = _history_capacity(request.parameters, window)
     take = _positive_parameter(request.parameters, "accepted_length")
     layers = _positive_parameter(request.parameters, "layers")
     groups = _positive_parameter(request.parameters, "state_groups")
@@ -801,23 +837,33 @@ def prepare_kda_retained_commit(
         (layers, batch, window, 2), -1, device="cuda", dtype=torch.int64
     )
     generator = _generator(request.seed)
+    # Every layer shares a request's count; its verify read the round's start.
+    replay_length = torch.zeros(batch, 1, device="cuda", dtype=torch.int32)
+    verified = replay_length.clone()
     layer_inputs, descriptors, before = [], [], []
     for layer_idx in range(layers):
         layer = _retained_benchmark_layer(
-            common, window, generator, reads, live, metadata, stamps[layer_idx]
+            common,
+            window,
+            capacity,
+            generator,
+            reads,
+            live,
+            metadata,
+            stamps[layer_idx],
+            replay_length,
+            verified,
         )
         _invoke_retained_layer(layer, common, override=None, solution=None)
-        conv, history = layer["conv"], layer["records"].history
+        conv = layer["conv"]
         qkv, state = layer["records"].original_qkv, layer["state"]
         descriptors.append(
             [
                 qkv.data_ptr(),
                 conv.data_ptr(),
-                history.length.data_ptr(),
                 conv.shape[0],
                 qkv.stride(0),
                 conv.stride(0),
-                history.length.stride(0),
                 conv.stride(1),
                 conv.stride(2),
                 state.data_ptr(),
@@ -825,8 +871,9 @@ def prepare_kda_retained_commit(
             ]
         )
         layer_inputs.append(layer)
-        before.append((conv.clone(), history.length.clone()))
+        before.append(conv.clone())
     descriptors = torch.tensor(descriptors, device="cuda", dtype=torch.uint64)
+    initial_count = replay_length.clone()
     group_indices = torch.arange(layers, device="cuda", dtype=torch.int32) // (
         layers // groups
     )
@@ -845,9 +892,9 @@ def prepare_kda_retained_commit(
     request_ends = torch.zeros(batch, device="cuda", dtype=torch.int32)
 
     def reset():
-        for layer, (conv, length) in zip(layer_inputs, before):
+        for layer, conv in zip(layer_inputs, before):
             layer["conv"].copy_(conv)
-            layer["records"].history.length.copy_(length)
+        replay_length.copy_(initial_count)
 
     def invoke():
         # Keep the layers' tensors alive while descriptors contain their addresses.
@@ -866,10 +913,11 @@ def prepare_kda_retained_commit(
             retained_correction=records[0],
             retained_key=records[1],
             retained_decay=records[2],
+            replay_length=replay_length,
             request_stopped=request_stopped,
             request_ends=request_ends,
             draft_token_num=window,
-            history_capacity=max(16, window),
+            history_capacity=capacity,
             num_heads=profile.heads,
             head_dim=profile.head_dim,
             conv_width=common["conv_kernel_size"],
@@ -887,7 +935,7 @@ def prepare_kda_retained_commit(
             "accepted_length": take,
             "layers": layers,
             "state_groups": groups,
-            "history_capacity": max(16, window),
+            "history_capacity": capacity,
             "write_page_relation": "distinct",
         },
         validation=None,

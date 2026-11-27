@@ -115,6 +115,7 @@ private:
         bool detached{false};
         bool quarantined{false};
         bool retained_after_clear{false};
+        CacheCoordinator::RecoveryMetadata recovery_metadata;
 
         // Every admitted L3 operation has keys. Even an all-failed completion
         // supplies one result per key; no results means the operation is pending.

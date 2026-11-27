@@ -266,7 +266,7 @@ from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E
     },
 )
 def triton_nvidia_kda_batched_retained_commit(**kwargs) -> None:
-    """Commit packed convolution windows across layers, then publish lengths."""
+    """Commit packed convolution windows across layers, then publish counts."""
     from tokenspeed_kernel.ops.attention.kda._retained import batched_commit
 
     batched_commit(**kwargs)
@@ -287,7 +287,7 @@ def triton_nvidia_kda_batched_retained_commit(**kwargs) -> None:
     },
 )
 def triton_kda_batched_retained_prepare(**kwargs) -> None:
-    """Fold accepted records into live pages across layers, then clear lengths."""
+    """Ready every layer's live pages for verify; the counts stay as they are."""
     from tokenspeed_kernel.ops.attention.kda._retained import batched_prepare
 
     batched_prepare(**kwargs)

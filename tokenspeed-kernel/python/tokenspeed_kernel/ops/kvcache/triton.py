@@ -934,17 +934,18 @@ def copy_state_rows_compact(
     )
 
 
+# The slab block count changes with the pool size and the destination vector is
+# often an offset slice of a larger buffer, so neither may key a new
+# specialization.
 @triton.jit(
-    **(
-        {"do_not_specialize_on_alignment": ["blocks"]}
-        if current_platform().is_npu
-        else {}
-    ),
+    do_not_specialize=["num_blocks"],
+    do_not_specialize_on_alignment=["blocks"],
 )
 def _store_state_rows_kernel(
     states,
     slab,
     blocks,
+    num_blocks,
     state_width: tl.constexpr,
     state_dim_2: tl.constexpr,
     state_dim_3: tl.constexpr,
@@ -961,7 +962,10 @@ def _store_state_rows_kernel(
     row = tl.program_id(0).to(tl.int64)
     feature = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     destination = tl.load(blocks + row).to(tl.int64)
-    live = (feature < state_width) & (destination >= 0)
+    # Block 0 is the null block, and padding (-1) or ids at or past the slab's
+    # block count name no block, so masked lanes of such a row touch no state
+    # or slab memory.
+    live = (feature < state_width) & (destination > 0) & (destination < num_blocks)
     # int64 element offsets: a slab block id times its stride, or a late row of
     # a wide state, exceeds int32 on large pools.
     dim_1_index = feature // (state_dim_2 * state_dim_3)
@@ -997,10 +1001,12 @@ def store_state_rows(
             slab's dtype on store.
         slab: ``[blocks, *state_shape]`` recurrent-state slab, updated in
             place; strides are honoured (page-interleaved arena views).
-        blocks: ``[rows]`` int32/int64 destination block per request. A
-            negative block skips the row: capacity-shaped prefill metadata
-            pads the request dimension with ``-1`` rows whose dummy scan
-            result must reach no block.
+        blocks: ``[rows]`` int32/int64 destination block per request. Only
+            blocks in ``(0, slab.shape[0])`` are written; any other id skips
+            the row and leaves the slab untouched. Block ``0`` is the null
+            block, capacity-shaped prefill metadata pads the request
+            dimension with ``-1`` rows whose dummy scan result must reach no
+            block, and ids at or past the slab's block count name no block.
     """
     if blocks.numel() == 0:
         return
@@ -1015,8 +1021,11 @@ def store_state_rows(
     ):
         raise ValueError("blocks must be a unit-stride int32/int64 vector")
     if states.device.type not in ("cuda", "npu"):
-        live = blocks >= 0
-        slab.index_copy_(0, blocks[live].to(torch.int64), states[live].to(slab.dtype))
+        # Widen first: comparing int32 ids against a block count past INT32_MAX
+        # would narrow the count and reject valid destinations.
+        blocks_i64 = blocks.to(torch.int64)
+        live = (blocks_i64 > 0) & (blocks_i64 < slab.shape[0])
+        slab.index_copy_(0, blocks_i64[live], states[live].to(slab.dtype))
         return
     state_width = states[0].numel()
     block = 512
@@ -1024,6 +1033,7 @@ def store_state_rows(
         states,
         slab,
         blocks,
+        slab.shape[0],
         state_width,
         states.shape[2],
         states.shape[3],

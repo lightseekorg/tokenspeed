@@ -420,6 +420,7 @@ def get_config(
     model_override_args: dict | None = None,
     is_draft_worker: bool | None = False,
     speculative_algorithm: str | None = None,
+    download_dir: str | None = None,
     **kwargs,
 ):
     """Load one config from one revision-pinned metadata snapshot.
@@ -455,7 +456,14 @@ def get_config(
     config = None
     raw_config = None
     raw_config_converted = False
-    is_remote_model = not os.path.isdir(model)
+    from tokenspeed.runtime.model_loader.object_store import (
+        resolve_checkpoint_metadata_dir,
+    )
+
+    resolved_dir = resolve_checkpoint_metadata_dir(
+        model, download_dir=download_dir, sync=True
+    )
+    is_remote_model = resolved_dir is None
     if is_remote_model:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
@@ -514,7 +522,7 @@ def get_config(
                         "Remote-code sibling imports may fail in this layout.",
                     )
     else:
-        model_path = model
+        model_path = resolved_dir
 
     if raw_config is None:
         raw_config, raw_config_converted = load_raw_config(model_path)
@@ -677,12 +685,21 @@ def get_generation_config(
     model: str,
     trust_remote_code: bool,
     revision: str | None = None,
+    download_dir: str | None = None,
     **kwargs,
 ):
     """Load generation metadata from one revision-pinned local snapshot."""
+    from tokenspeed.runtime.model_loader.object_store import (
+        resolve_checkpoint_metadata_dir,
+    )
+
+    resolved_dir = resolve_checkpoint_metadata_dir(
+        model, download_dir=download_dir, sync=True
+    )
     try:
-        model_path = model
-        if not os.path.isdir(model):
+        if resolved_dir is not None:
+            model_path = resolved_dir
+        else:
             from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
             def download_generation_config() -> str:
@@ -867,6 +884,7 @@ def get_tokenizer(
     tokenizer_revision: str | None = None,
     revision: str | None = None,
     architectures: list[str] | None = None,
+    download_dir: str | None = None,
     **kwargs,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
     """Gets a tokenizer for the given model name via Huggingface.
@@ -967,7 +985,16 @@ def get_tokenizer(
             )
         return loaded_tokenizer
 
-    if not os.path.isdir(tokenizer_name):
+    from tokenspeed.runtime.model_loader.object_store import (
+        resolve_checkpoint_metadata_dir,
+    )
+
+    resolved_dir = resolve_checkpoint_metadata_dir(
+        tokenizer_name, download_dir=download_dir, sync=True
+    )
+    if resolved_dir is not None:
+        tokenizer_path = resolved_dir
+    else:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
         def download_tokenizer_files() -> str:

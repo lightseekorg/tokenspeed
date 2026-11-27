@@ -261,9 +261,13 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
     // cache here. Evict what is already free, then slide the request tables and
     // retry the blocks whose request reference has just been released.
     const std::vector<CacheEvictor::UnevictedVictim> prospective_victims = [&] {
+        // GDS can commit logical decisions without removing Device blocks.
+        if (plan.eviction.victims.empty() && !plan.eviction.gds) {
+            return std::vector<CacheEvictor::UnevictedVictim>{};
+        }
         ProfileSpan evicting{"CacheCoordinator::commitAdmission (evict)"};
         return evictor_.EvictPlanned(
-            plan.victims, write_back_evictions_,
+            plan.eviction, write_back_evictions_,
             CacheEvictor::VictimReasons{.victim = &CacheEvictor::DeviceEvictionStats::admission,
                                         .stranded_suffix = &CacheEvictor::DeviceEvictionStats::stranded_suffix,
                                         .request_reclaim = &CacheEvictor::DeviceEvictionStats::request_reclaim});
@@ -317,8 +321,11 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
         recordCheckpoints(completed, access_epoch);
         recordPublishedTail(completed);
     }
-    for (const auto& [group_id, location, reason, segment] : prospective_victims) {
-        if (!evictor_.EvictCachedBlock(group_id, location, reason, segment)) {
+    for (const auto& [group_id, location, reason, segment, exact_removal] : prospective_victims) {
+        const bool evicted = exact_removal
+                                 ? evictor_.EvictCachedBlockAlone(group_id, location, reason, segment).has_value()
+                                 : evictor_.EvictCachedBlock(group_id, location, reason, segment);
+        if (!evicted) {
             FatalCheck(!store_.DevicePool().IsOccupied(location), "admission victim changed before acquisition");
         }
     }
@@ -598,7 +605,7 @@ std::optional<AdmissionResult> CacheCoordinator::restore(const RetractionImage& 
     // checkpoint an earlier victim's cascade already took). Under the
     // write-back policy each set is recorded whole as one segment for this
     // plan's drain, as Admit does.
-    for (const VictimSet& set : candidate->victims) {
+    for (const VictimSet& set : candidate->eviction.victims) {
         _assert(std::ranges::none_of(set.members, &VictimSet::Member::is_request_reclaim),
                 "a restore rebuilds empty tables and reclaims nothing of its own");
     }
@@ -606,7 +613,7 @@ std::optional<AdmissionResult> CacheCoordinator::restore(const RetractionImage& 
                                                       .stranded_suffix = &CacheEvictor::DeviceEvictionStats::restore,
                                                       .request_reclaim = &CacheEvictor::DeviceEvictionStats::restore};
     for (const CacheEvictor::UnevictedVictim& victim :
-         evictor_.EvictPlanned(candidate->victims, write_back_evictions_, restore_reasons)) {
+         evictor_.EvictPlanned(candidate->eviction, write_back_evictions_, restore_reasons)) {
         FatalCheck(!store_.DevicePool().IsOccupied(victim.location), "restore victim changed before acquisition");
     }
     // A set whose every block was dropped records nothing: this restore's

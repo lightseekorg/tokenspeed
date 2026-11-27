@@ -448,6 +448,7 @@ class RebalanceExpertsReqOutput(BaseReq, kw_only=True):
 class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Memory regions to release. None ⇒ all ("weights" and "kv_cache").
     tags: list[str] | None = None
+    transition_id: str | None = None
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
@@ -458,6 +459,7 @@ class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Memory regions to resume. None ⇒ all previously released tags.
     tags: list[str] | None = None
+    transition_id: str | None = None
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):

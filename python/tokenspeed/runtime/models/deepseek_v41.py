@@ -3685,8 +3685,9 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         checkpoint_dir = self._checkpoint_dir
         if checkpoint_dir is None:
             return
-        from safetensors import safe_open
         from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
+
+        from tokenspeed.runtime.model_loader.weight_utils import open_safetensors_slice
 
         index_path = os.path.join(checkpoint_dir, SAFE_WEIGHTS_INDEX_NAME)
         if not os.path.isfile(index_path):
@@ -3697,6 +3698,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         with open(index_path) as handle:
             weight_map = json.load(handle)["weight_map"]
         targets = self._checkpoint_targets()
+        remote_file_cache: dict[str, object] = {}
         for raw in pending:
             mapped = None
             for key in (raw, "model." + raw, raw.removeprefix("model.")):
@@ -3710,10 +3712,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 )
             param_name, _ = targets[raw]
             embed = self.get_submodule(param_name.rsplit(".", 1)[0])
-            shard = os.path.join(checkpoint_dir, weight_map[mapped])
             field = param_name.rsplit(".", 1)[1]
-            with safe_open(shard, framework="pt", device="cpu") as handle:
-                embed.load_sharded(field, handle.get_slice(mapped), 65536)
+            with open_safetensors_slice(
+                checkpoint_dir,
+                weight_map[mapped],
+                mapped,
+                remote_file_cache=remote_file_cache,
+            ) as tensor_slice:
+                embed.load_sharded(field, tensor_slice, 65536)
             loaded.add(raw)
         if torch.distributed.is_initialized():
             torch.distributed.barrier()

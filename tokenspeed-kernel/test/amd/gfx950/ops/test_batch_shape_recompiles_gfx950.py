@@ -300,7 +300,13 @@ def test_mha_prefill_token_stride_and_request_count(window):
 # FP8 caches run the products on the F8F6F4 MFMA, a separate set of variants.
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("window", [-1, 127, 2047])
-def test_mha_extend_startup_warmup_covers_every_variant(window, dtype):
+# Head dim 256 (24 query heads over 4 KV heads) runs single-buffered.
+@pytest.mark.parametrize(
+    "heads,kv_heads,dim", [(16, 2, 64), (24, 4, 256)], ids=["hd64", "hd256"]
+)
+def test_mha_extend_startup_warmup_covers_every_variant(
+    window, dtype, heads, kv_heads, dim
+):
     from tokenspeed_kernel.numerics.torch.attention.mha import (
         gather_pages,
         torch_dense_attention,
@@ -309,7 +315,7 @@ def test_mha_extend_startup_warmup_covers_every_variant(window, dtype):
     from tokenspeed_kernel.ops.tuning import kernel_warmup
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
 
-    heads, kv_heads, dim, page, width, slots = 16, 2, 64, 64, 160, 80
+    page, width, slots = 64, 160, 80
     generator = torch.Generator(device=DEVICE).manual_seed(3)
     cache_shape = (1 + slots * width, page, kv_heads, dim)
     k_cache = torch.randn(cache_shape, device=DEVICE, generator=generator).to(dtype)

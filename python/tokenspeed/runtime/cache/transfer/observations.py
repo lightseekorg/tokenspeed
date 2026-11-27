@@ -27,7 +27,7 @@ remain control-plane responsibilities.
 
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, NamedTuple
 
 from tokenspeed.runtime.cache.transfer.ops import PrefixLoadTelemetry, RestoreTelemetry
@@ -75,6 +75,67 @@ def count_owned_rows(
 
 
 @dataclass(frozen=True, slots=True)
+class CopyBatchTiming:
+    """One local copy-stream sample shared by every operation in the batch.
+
+    Group counts identify the State/history mix through the run's cache layout.
+    An unsupported device reports a missing duration, never CPU ACK latency.
+    """
+
+    batch_id: int
+    backend: str
+    group_ids: tuple[str, ...]
+    rows_by_group: tuple[int, ...]
+    bytes: int
+    elapsed_ms: float | None
+    status: str
+
+
+class PendingCopyTiming:
+    """Timing events owned by the normal copy ACK, without an extra wait."""
+
+    def __init__(
+        self, *, batch_id, backend, groups, rows, device_kind, device_module, stream
+    ):
+        counts = [0] * len(groups)
+        for group, _device, _host in rows:
+            counts[group] += 1
+        self.batch_id = batch_id
+        self.backend = backend
+        self.group_ids = tuple(group.group_id for group in groups)
+        self.rows_by_group = tuple(counts)
+        self.bytes = count_owned_rows(rows, groups).bytes
+        supported = device_kind in ("cuda", "npu")
+        self.start = device_module.Event(enable_timing=True) if supported else None
+        self.finish = device_module.Event(enable_timing=True) if supported else None
+        if self.start is not None:
+            self.start.record(stream)
+
+    def complete(self, batch: "ObservationBatch") -> "ObservationBatch":
+        """Read a retired sample once; the ACK queue has already queried finish."""
+        timing = CopyBatchTiming(
+            self.batch_id,
+            self.backend,
+            self.group_ids,
+            self.rows_by_group,
+            self.bytes,
+            self.start.elapsed_time(self.finish) if self.start is not None else None,
+            "measured" if self.start is not None else "unsupported",
+        )
+        return ObservationBatch(
+            tuple(
+                replace(
+                    record,
+                    copy_batch_id=self.batch_id,
+                    h2d_batch_timing=timing if i == 0 else None,
+                )
+                for i, record in enumerate(batch.records)
+            ),
+            batch.dropped + (not batch.records),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class CopyObservation:
     """Immutable local physical-copy metadata carried by one operation's ACK.
 
@@ -101,6 +162,8 @@ class CopyObservation:
     l2: CopyCounts
     pool: CopyCounts
     slot_state_image_bytes: int
+    copy_batch_id: int | None = None
+    h2d_batch_timing: CopyBatchTiming | None = None
 
     def payload(self) -> dict[str, object]:
         """Return scalar CPU metadata for the host's bounded export queue."""
@@ -115,6 +178,12 @@ class CopyObservation:
             "pool_rows": self.pool.rows,
             "pool_bytes": self.pool.bytes,
             "slot_state_image_bytes": self.slot_state_image_bytes,
+            "copy_batch_id": self.copy_batch_id,
+            "h2d_batch_timing": (
+                asdict(self.h2d_batch_timing)
+                if self.h2d_batch_timing is not None
+                else None
+            ),
         }
 
 
