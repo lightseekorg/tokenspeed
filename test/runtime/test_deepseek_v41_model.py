@@ -1166,7 +1166,7 @@ def test_scale_expansion_then_tp_and_merged_sharding():
 
 def _complete_layer(layer, *args):
     """Materialize a standalone layer so tests compare its full HC output."""
-    residual, pre, pending, tap = DeepseekV41DecoderLayer.forward(
+    residual, pre, pending, tap, _ = DeepseekV41DecoderLayer.forward(
         layer,
         *args,
         pending_post=None,
@@ -2281,8 +2281,8 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     assert [call[0] for call in backend.calls] == list(range(40))
     assert sorted(backend.global_writes) == [2, 8, 14, 20]
     assert all(torch.isfinite(actual).flatten())
-    h, last_pre, pending, tap = captured[0]
-    assert tap is None and pending.reduce_group is None
+    h, last_pre, pending, tap, prefetched = captured[0]
+    assert tap is None and prefetched is None and pending.reduce_group is None
     h = pending.finish(h)
     torch.testing.assert_close(
         actual, _norm(v41_hc_pre(h, last_pre), model.norm.weight, 1e-20), rtol=0, atol=0

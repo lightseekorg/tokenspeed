@@ -1377,7 +1377,7 @@ class EngramPeerWeightsController:
             embed.close_peer_storage()
 
 
-@dataclass
+@dataclass(frozen=True)
 class EngramPrefetchTask:
     """Explicit next-layer Engram MXFP8 gather launched on a dedicated stream."""
 
@@ -1386,7 +1386,6 @@ class EngramPrefetchTask:
     stream: torch.cuda.Stream
     fork_event: torch.cuda.Event
     join_event: torch.cuda.Event
-    prefetched: EngramPrefetchedRows | None = None
 
 
 @dataclass(frozen=True)
