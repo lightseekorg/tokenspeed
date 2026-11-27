@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -33,8 +34,15 @@ enum class PrefillPolicyKind : std::uint8_t;
 
 enum class PrefillCompletion : std::uint8_t { kAllowPartial, kRequireComplete };
 
-struct PrefillAllocation {
+// A borrowed request and its position in this round's stable candidate span.
+// The context checks both before peer landing or admission.
+struct PrefillCandidate {
+    std::size_t index;
     Request* request;
+};
+
+struct PrefillAllocation {
+    PrefillCandidate candidate;
     // Total forward input budget, including replay. Admission may shorten it
     // at a cache junction or checkpoint; it never exceeds this quota.
     std::int32_t max_tokens;
@@ -81,7 +89,7 @@ public:
     // Resolve peer work before probing local carry candidates. True means
     // this candidate must be skipped by the local prefill phase. False still
     // requires the prefill gate and local admission checks.
-    virtual bool TryPeerLanding(Request& request) = 0;
+    virtual bool TryPeerLanding(PrefillCandidate candidate) = 0;
     virtual bool PrefillAllowed(const Request& request) const = 0;
     virtual std::int32_t EstimateRemaining(Request& request) = 0;
     virtual std::optional<std::int32_t> WholePromptTokens(Request& request, Request* resident_holder) = 0;

@@ -18,13 +18,17 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <span>
 #include <ostream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "integration_test_helper.h"
@@ -253,9 +257,11 @@ public:
     AlternatingQuotaPrefillPolicy() : next_quota_{4096} {}
 
     void Schedule(PrefillSchedulingContext& context) override {
-        for (Request* request : context.Candidates()) {
+        const auto candidates = context.Candidates();
+        for (std::size_t index = 0; index < candidates.size(); ++index) {
+            Request* request = candidates[index];
             if (!context.Eligible(*request)) continue;
-            const auto admitted = context.Admit(PrefillAllocation{.request = request,
+            const auto admitted = context.Admit(PrefillAllocation{.candidate = {index, request},
                                                                   .max_tokens = next_quota_,
                                                                   .yield_tokens = 0,
                                                                   .completion = PrefillCompletion::kAllowPartial});
@@ -277,12 +283,14 @@ public:
     void Schedule(PrefillSchedulingContext& context) override {
         // A policy may compute its candidate order before admitting anything.
         // Admission must still enforce the existing incomplete-prefill barrier.
-        std::vector<Request*> pending;
-        for (Request* request : context.Candidates()) {
-            if (context.Eligible(*request)) pending.push_back(request);
+        std::vector<PrefillCandidate> pending;
+        const auto candidates = context.Candidates();
+        for (std::size_t index = 0; index < candidates.size(); ++index) {
+            Request* request = candidates[index];
+            if (context.Eligible(*request)) pending.push_back({index, request});
         }
-        for (Request* request : pending) {
-            context.Admit(PrefillAllocation{.request = request,
+        for (const PrefillCandidate candidate : pending) {
+            context.Admit(PrefillAllocation{.candidate = candidate,
                                             .max_tokens = 4096,
                                             .yield_tokens = 0,
                                             .completion = PrefillCompletion::kAllowPartial});
@@ -299,6 +307,207 @@ protected:
         scheduler_ = std::make_unique<Scheduler>(config_, std::make_unique<AlternatingQuotaPrefillPolicy>());
     }
 };
+
+class CheckingPrefillPolicy final : public PrefillPolicy {
+public:
+    explicit CheckingPrefillPolicy(std::function<void(PrefillSchedulingContext&)> check) : check_{std::move(check)} {}
+
+    void Schedule(PrefillSchedulingContext& context) override { check_(context); }
+    void FirstAdmissionSucceeded(std::span<Request* const>, const Request&) override {}
+
+private:
+    std::function<void(PrefillSchedulingContext&)> check_;
+};
+
+void ExpectSameBudget(const PrefillBudget& actual, const PrefillBudget& expected) {
+    EXPECT_EQ(actual.tokens, expected.tokens);
+    EXPECT_EQ(actual.kv_pages, expected.kv_pages);
+    EXPECT_EQ(actual.request_slots, expected.request_slots);
+    EXPECT_EQ(actual.batch_slots, expected.batch_slots);
+    EXPECT_EQ(actual.stopped, expected.stopped);
+}
+
+class PrefillCandidateMembershipTest : public PrefillPolicyTest {};
+
+TEST_P(PrefillCandidateMembershipTest, RejectsInvalidCandidatesWithoutSpendingAdmissionBudget) {
+    Request outside{RequestSpec{.request_id = "outside", .tokens = MakeTokens(128, 500000)}, 128, false};
+    scheduler_ = std::make_unique<Scheduler>(
+        config_, std::make_unique<CheckingPrefillPolicy>([&](PrefillSchedulingContext& context) {
+            const auto candidates = context.Candidates();
+            ASSERT_EQ(candidates.size(), 2u);
+            const PrefillBudget before = context.Budget();
+            const std::vector<PrefillCandidate> invalid{
+                {0, nullptr},
+                {0, &outside},
+                {candidates.size(), candidates.front()},
+                {std::numeric_limits<std::size_t>::max(), candidates.front()},
+                {1, candidates.front()},
+                {0, candidates.back()},
+            };
+            for (const PrefillCandidate candidate : invalid) {
+                SCOPED_TRACE(::testing::Message()
+                             << "candidate index " << candidate.index << ", request " << candidate.request);
+                EXPECT_THROW(context.Admit(PrefillAllocation{.candidate = candidate,
+                                                             .max_tokens = 128,
+                                                             .yield_tokens = 0,
+                                                             .completion = PrefillCompletion::kAllowPartial}),
+                             std::invalid_argument);
+                EXPECT_THROW(context.TryPeerLanding(candidate), std::invalid_argument);
+                ExpectSameBudget(context.Budget(), before);
+            }
+            for (std::size_t index = 0; index < candidates.size(); ++index) {
+                const PrefillCandidate candidate{index, candidates[index]};
+                EXPECT_FALSE(context.TryPeerLanding(candidate));
+                const auto admitted = context.Admit(PrefillAllocation{.candidate = candidate,
+                                                                      .max_tokens = 128,
+                                                                      .yield_tokens = 0,
+                                                                      .completion = PrefillCompletion::kAllowPartial});
+                EXPECT_EQ(admitted.status, PrefillAdmissionStatus::kScheduled);
+            }
+        }));
+    Prompt("A", 128, 10000);
+    Prompt("B", 128, 100000);
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"A", "B"}));
+    EXPECT_EQ(batch->input_lengths, (std::vector<std::int32_t>{128, 128}));
+}
+
+class PrefillPreviousRoundCandidateTest : public PrefillPolicyTest {};
+
+TEST_P(PrefillPreviousRoundCandidateTest, RejectsALiveRequestMissingFromTheCurrentRound) {
+    PrefillCandidate previous{0, nullptr};
+    scheduler_ = std::make_unique<Scheduler>(
+        config_, std::make_unique<CheckingPrefillPolicy>([&](PrefillSchedulingContext& context) {
+            const auto candidates = context.Candidates();
+            ASSERT_EQ(candidates.size(), 1u);
+            const PrefillCandidate candidate{0, candidates.front()};
+            if (previous.request != nullptr) {
+                ASSERT_TRUE(previous.request->Is<fsm::PrefillAwaitingResult>());
+                const PrefillBudget before = context.Budget();
+                EXPECT_THROW(context.Admit(PrefillAllocation{.candidate = previous,
+                                                             .max_tokens = 128,
+                                                             .yield_tokens = 0,
+                                                             .completion = PrefillCompletion::kAllowPartial}),
+                             std::invalid_argument);
+                EXPECT_THROW(context.TryPeerLanding(previous), std::invalid_argument);
+                ExpectSameBudget(context.Budget(), before);
+            } else {
+                previous = candidate;
+            }
+            EXPECT_FALSE(context.TryPeerLanding(candidate));
+            const auto admitted = context.Admit(PrefillAllocation{.candidate = candidate,
+                                                                  .max_tokens = 128,
+                                                                  .yield_tokens = 0,
+                                                                  .completion = PrefillCompletion::kAllowPartial});
+            EXPECT_EQ(admitted.status, PrefillAdmissionStatus::kScheduled);
+        }));
+    Prompt("A", 128, 10000);
+    const ExecutionPlan first = PlanOnce();
+    const ForwardBatch* first_batch = FindForwardBatch(first);
+    ASSERT_NE(first_batch, nullptr);
+    EXPECT_EQ(first_batch->request_ids, (std::vector<std::string>{"A"}));
+    // Keep A alive with its result in flight while B becomes the next candidate.
+    Prompt("B", 128, 100000);
+    const ExecutionPlan second = PlanOnce();
+    const ForwardBatch* second_batch = FindForwardBatch(second);
+    ASSERT_NE(second_batch, nullptr);
+    EXPECT_EQ(second_batch->request_ids, (std::vector<std::string>{"B"}));
+    EXPECT_EQ(second_batch->input_lengths, (std::vector<std::int32_t>{128}));
+}
+
+class PrefillDeepQueueCapacityTest : public SchedulerTestSuite {
+protected:
+    static void ExpectNoPrefill(const ExecutionPlan& plan) {
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        EXPECT_TRUE(batch == nullptr || batch->NumExtends() == 0);
+    }
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.role = Role::kP;
+        cfg.prefix_granularity = 128;
+        cfg.device_allocator.total_pages = 5;
+        cfg.disable_l2_cache = true;
+        cfg.max_scheduled_tokens = 512;
+        cfg.max_batch_size = 8;
+        cfg.max_resident_requests = 8;
+        cfg.prefill_policy = PrefillPolicyKind::kFifo;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = cfg.device_allocator.total_pages,
+            .attn_kind = AttnKind::kFull,
+            .transfer_policy = CacheTransferPolicy::FullSuffix,
+        });
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    void Prompt(const std::string& id, std::int32_t first) {
+        Submit(RequestSpec{.request_id = id, .tokens = MakeTokens(128, first)});
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    void AckTransfer(const std::string& id) {
+        ExecutionEvent event;
+        event.With(pd::SucceededEvent{id});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(PrefillDeepQueueCapacityTest, TransferAcknowledgementsResumeADeepQueueInFifoOrder) {
+    Prompt("holder-A", 10000);
+    Prompt("holder-B", 20000);
+    const ExecutionPlan holders = PlanOnce();
+    const ForwardBatch* holders_batch = FindForwardBatch(holders);
+    ASSERT_NE(holders_batch, nullptr);
+    ASSERT_EQ(holders_batch->request_ids, (std::vector<std::string>{"holder-A", "holder-B"}));
+    SendForwardDone("holder-A", {900});
+    SendForwardDone("holder-B", {900});
+    const ExecutionPlan transfers = PlanOnce();
+    ASSERT_TRUE(transfers.remote_decode);
+    EXPECT_EQ(transfers.remote_decode->request_ids, (std::vector<std::string>{"holder-A", "holder-B"}));
+
+    constexpr std::int32_t kQueueSize = 257;
+    for (std::int32_t i = 0; i < kQueueSize; ++i) {
+        Prompt("queued-" + std::to_string(i), 100000 + i * 256);
+    }
+    ExpectNoPrefill(PlanOnce());
+    AckTransfer("holder-A");
+    const ExecutionPlan first = PlanOnce();
+    const ForwardBatch* first_batch = FindForwardBatch(first);
+    ASSERT_NE(first_batch, nullptr);
+    ASSERT_EQ(first_batch->request_ids, (std::vector<std::string>{"queued-0"}));
+    SendForwardDone("queued-0", {900});
+    const ExecutionPlan first_transfer = PlanOnce();
+    ASSERT_TRUE(first_transfer.remote_decode);
+    EXPECT_EQ(first_transfer.remote_decode->request_ids, (std::vector<std::string>{"queued-0"}));
+    ExpectNoPrefill(first_transfer);
+    AckTransfer("holder-B");
+    AckTransfer("queued-0");
+
+    for (std::int32_t next = 1; next < kQueueSize;) {
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr) << "next queued request " << next;
+        ASSERT_EQ(batch->NumExtends(), 2u);
+        EXPECT_EQ(batch->request_ids,
+                  (std::vector<std::string>{"queued-" + std::to_string(next), "queued-" + std::to_string(next + 1)}));
+        EXPECT_EQ(batch->input_lengths, (std::vector<std::int32_t>{128, 128}));
+        for (const std::string& id : batch->request_ids) SendForwardDone(id, {900});
+        const ExecutionPlan transfer = PlanOnce();
+        ASSERT_TRUE(transfer.remote_decode);
+        EXPECT_EQ(transfer.remote_decode->request_ids, batch->request_ids);
+        ExpectNoPrefill(transfer);
+        for (const std::string& id : transfer.remote_decode->request_ids) AckTransfer(id);
+        next += 2;
+    }
+    ExpectNoPrefill(PlanOnce());
+}
 
 TEST_P(InjectedPrefillPolicyTest, AStatefulPolicyKeepsItsQuotaAcrossSerialRounds) {
     Prompt("A", 16384, 10000);
@@ -323,6 +532,10 @@ INSTANTIATE_TEST_SUITE_P(LocalRoles, ExplicitPrefillPolicyTest,
                          ::testing::Combine(::testing::Values(Role::kP, Role::kFused), ::testing::Bool()));
 INSTANTIATE_TEST_SUITE_P(LocalRoles, InjectedPrefillPolicyTest,
                          ::testing::Combine(::testing::Values(Role::kP, Role::kFused), ::testing::Values(false)));
+INSTANTIATE_TEST_SUITE_P(LocalRoles, PrefillCandidateMembershipTest,
+                         ::testing::Combine(::testing::Values(Role::kP, Role::kFused), ::testing::Values(false)));
+INSTANTIATE_TEST_SUITE_P(PrefillWorker, PrefillPreviousRoundCandidateTest,
+                         ::testing::Combine(::testing::Values(Role::kP), ::testing::Values(false)));
 
 }  // namespace
 }  // namespace tokenspeed::test

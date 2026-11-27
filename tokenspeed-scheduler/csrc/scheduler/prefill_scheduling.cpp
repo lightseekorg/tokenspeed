@@ -62,10 +62,16 @@ bool Scheduler::PrefillContext::Eligible(const Request& request) const {
     return request.Is<fsm::Submitted>() && !new_prompts_sealed_ && Budget().request_slots > 0;
 }
 
-bool Scheduler::PrefillContext::TryPeerLanding(Request& request) {
-    if (std::ranges::find(Candidates(), &request) == Candidates().end()) {
+bool Scheduler::PrefillContext::containsCandidate(PrefillCandidate candidate) const {
+    return candidate.request != nullptr && candidate.index < candidates_.size() &&
+           candidates_[candidate.index] == candidate.request;
+}
+
+bool Scheduler::PrefillContext::TryPeerLanding(PrefillCandidate candidate) {
+    if (!containsCandidate(candidate)) {
         throw std::invalid_argument("peer landing must name a round candidate");
     }
+    Request& request = *candidate.request;
     if (Budget().stopped || !Eligible(request) || serial_holder_ ||
         (blocked_resident_ && blocked_resident_ != &request)) {
         return true;
@@ -73,8 +79,8 @@ bool Scheduler::PrefillContext::TryPeerLanding(Request& request) {
     const auto* submitted = request.GetIf<fsm::Submitted>();
     if (submitted == nullptr || !submitted->admission.peer_hit) return false;
     if (!scheduler_.adaptive_device_peer_) return true;
-    Request* candidate = &request;
-    scheduler_.schedulePeerLandings(feedback_, build_, std::span(&candidate, 1), new_prompts_sealed_);
+    Request* request_ptr = &request;
+    scheduler_.schedulePeerLandings(feedback_, build_, std::span(&request_ptr, 1), new_prompts_sealed_);
     return build_.Scheduled(request);
 }
 
@@ -99,7 +105,7 @@ std::optional<std::int32_t> Scheduler::PrefillContext::WholePromptTokens(Request
 }
 
 PrefillAdmission Scheduler::PrefillContext::Admit(const PrefillAllocation& allocation) {
-    if (allocation.request == nullptr || std::ranges::find(Candidates(), allocation.request) == Candidates().end()) {
+    if (!containsCandidate(allocation.candidate)) {
         throw std::invalid_argument("prefill allocation must name a round candidate");
     }
     if (allocation.max_tokens < 0 || allocation.max_tokens > build_.token_budget || allocation.yield_tokens < 0) {
@@ -110,7 +116,7 @@ PrefillAdmission Scheduler::PrefillContext::Admit(const PrefillAllocation& alloc
         throw std::invalid_argument("unknown prefill completion constraint");
     }
     if (Budget().stopped) return {PrefillAdmissionStatus::kStopped};
-    Request& request = *allocation.request;
+    Request& request = *allocation.candidate.request;
     if (!Eligible(request) || allocation.max_tokens == 0) return {PrefillAdmissionStatus::kUnavailable};
     const bool first = request.Is<fsm::Submitted>();
     const bool must_complete = allocation.completion == PrefillCompletion::kRequireComplete;

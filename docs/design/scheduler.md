@@ -331,7 +331,11 @@ for new configurations and migrate existing uses to it. Omitting both
 selectors preserves the existing default; supplying both is rejected.
 These are the two production policies. Their Schedule methods
 run one shared serial template, and PrefillSchedulingContext reuses the
-scheduler's existing admission operations. Peer selection and the prefill
+scheduler's existing admission operations. Policies carry the request pointer
+and its position in the round's stable candidate span together. The context
+checks both in constant time before peer landing or admission, rejecting
+out-of-range positions and mismatched requests without rescanning the queue.
+Peer selection and the prefill
 gate run before carry probes, preserving the bounded probe window. Head-of-line stopping,
 oldest-request protection and P-role carry/fill retain the rules below.
 

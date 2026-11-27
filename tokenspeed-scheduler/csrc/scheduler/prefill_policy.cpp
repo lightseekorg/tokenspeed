@@ -102,7 +102,8 @@ CarryResult carryWholePrompts(PrefillSchedulingContext& context, std::span<const
         if (!prompt.request->Is<fsm::Submitted>() || !context.Eligible(*prompt.request) ||
             prompt.tokens > budget.tokens)
             continue;
-        const auto admission = context.Admit({prompt.request, budget.tokens, 0, PrefillCompletion::kRequireComplete});
+        const auto admission =
+            context.Admit({{prompt.index, prompt.request}, budget.tokens, 0, PrefillCompletion::kRequireComplete});
         if (admission.status == PrefillAdmissionStatus::kScheduled)
             ++result.admitted;
         else if (admission.status == PrefillAdmissionStatus::kCapacityBlocked ||
@@ -115,11 +116,11 @@ CarryResult carryWholePrompts(PrefillSchedulingContext& context, std::span<const
 class FifoSelection {
 public:
     explicit FifoSelection(PrefillSchedulingContext& context) : pending_{context.Candidates()} {}
-    Request* Next(PrefillSchedulingContext&) {
-        if (pending_.empty()) return nullptr;
+    std::optional<PrefillCandidate> Next(PrefillSchedulingContext&) {
+        if (pending_.empty()) return std::nullopt;
         Request* request = pending_.front();
         pending_ = pending_.subspan(1);
-        return request;
+        return PrefillCandidate{next_index_++, request};
     }
     void Fill(PrefillSchedulingContext& context, std::optional<std::vector<WholePrompt>>& whole_prompts,
               std::size_t from) {
@@ -131,17 +132,18 @@ public:
 
 private:
     std::span<Request* const> pending_;
+    std::size_t next_index_{0};
 };
 
 class ShortPrefillSelection {
 public:
     explicit ShortPrefillSelection(PrefillSchedulingContext&) {}
-    Request* Next(PrefillSchedulingContext& context) {
+    std::optional<PrefillCandidate> Next(PrefillSchedulingContext& context) {
         Load(context);
         std::erase_if(pending_, [&context](const auto& prompt) {
             return !prompt.request->template Is<fsm::Submitted>() || !context.Eligible(*prompt.request);
         });
-        if (pending_.empty()) return nullptr;
+        if (pending_.empty()) return std::nullopt;
         // Stable ties and protected requests retain submission order. Age is
         // read after every successful first admission, including within a batch.
         const auto selected = std::min_element(pending_.begin(), pending_.end(), [](const auto& a, const auto& b) {
@@ -152,20 +154,20 @@ public:
             if (aged_a != aged_b) return aged_a;
             return !aged_a && a.remaining_tokens < b.remaining_tokens;
         });
-        Request* request = selected->request;
+        const PrefillCandidate candidate{selected->index, selected->request};
         pending_.erase(selected);
-        return request;
+        return candidate;
     }
     void Fill(PrefillSchedulingContext& context, std::optional<std::vector<WholePrompt>>&, std::size_t) {
         Load(context);  // A resident's admission has now published its progress.
         while (!context.Budget().stopped && context.Budget().request_slots > 0) {
             std::erase_if(pending_,
                           [&context](const auto& prompt) { return prompt.remaining_tokens > context.Budget().tokens; });
-            Request* request = Next(context);
-            if (!request) return;
+            const auto candidate = Next(context);
+            if (!candidate) return;
             ProfileSpan profile_span{"Scheduler::carryWholePrompts"};
             const auto result =
-                context.Admit({request, context.Budget().tokens, 0, PrefillCompletion::kRequireComplete});
+                context.Admit({*candidate, context.Budget().tokens, 0, PrefillCompletion::kRequireComplete});
             if (result.status == PrefillAdmissionStatus::kCapacityBlocked ||
                 result.status == PrefillAdmissionStatus::kStopped)
                 return;
@@ -175,14 +177,17 @@ public:
 private:
     struct Candidate {
         Request* request;
+        std::size_t index;
         std::int32_t remaining_tokens;
     };
     void Load(PrefillSchedulingContext& context) {
         if (loaded_) return;
         loaded_ = true;
-        for (Request* request : context.Candidates()) {
+        const auto candidates = context.Candidates();
+        for (std::size_t index = 0; index < candidates.size(); ++index) {
+            Request* request = candidates[index];
             if (request->Is<fsm::Submitted>() && context.Eligible(*request)) {
-                pending_.push_back({request, context.EstimateRemaining(*request)});
+                pending_.push_back({request, index, context.EstimateRemaining(*request)});
             }
         }
     }
@@ -200,12 +205,13 @@ bool scheduleTier(PrefillSchedulingContext& context, Selection& selection, NewPr
     while (true) {
         const auto budget = context.Budget();
         if (budget.stopped || (!resident && budget.request_slots == 0)) return false;
-        Request* request = selection.Next(context);
-        if (!request) return true;
+        const auto candidate = selection.Next(context);
+        if (!candidate) return true;
+        Request* request = candidate->request;
         if ((resident ? !request->Is<fsm::Prefilling>() : !request->Is<fsm::Submitted>()) ||
             !context.Eligible(*request))
             continue;
-        if (context.TryPeerLanding(*request)) continue;
+        if (context.TryPeerLanding(*candidate)) continue;
         if (!context.PrefillAllowed(*request)) return false;
         std::size_t from = 0;
         if (config.role == Role::kP && !resident) {
@@ -226,7 +232,7 @@ bool scheduleTier(PrefillSchedulingContext& context, Selection& selection, NewPr
             carried = carriedPrompts(context, *whole_prompts, from, !resident, holder_pages);
             for (const auto& prompt : carried) yield_tokens += prompt.tokens;
         }
-        const auto result = context.Admit({request, budget.tokens, yield_tokens, PrefillCompletion::kAllowPartial});
+        const auto result = context.Admit({*candidate, budget.tokens, yield_tokens, PrefillCompletion::kAllowPartial});
         if (result.status == PrefillAdmissionStatus::kStopped) return false;
         if (result.status == PrefillAdmissionStatus::kCapacityBlocked && resident) return false;
         if (result.status != PrefillAdmissionStatus::kScheduled || !result.incomplete) continue;

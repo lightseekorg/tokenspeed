@@ -844,13 +844,15 @@ private:
         const SchedulerConfig& Config() const override;
         PrefillBudget Budget() const override;
         bool Eligible(const Request& request) const override;
-        bool TryPeerLanding(Request& request) override;
+        bool TryPeerLanding(PrefillCandidate candidate) override;
         bool PrefillAllowed(const Request& request) const override;
         std::int32_t EstimateRemaining(Request& request) override;
         std::optional<std::int32_t> WholePromptTokens(Request& request, Request* resident_holder) override;
         PrefillAdmission Admit(const PrefillAllocation& allocation) override;
 
     private:
+        bool containsCandidate(PrefillCandidate candidate) const;
+
         Scheduler& scheduler_;
         AdmissionFeedback& feedback_;
         PlanBuild& build_;
