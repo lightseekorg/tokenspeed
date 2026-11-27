@@ -2909,7 +2909,18 @@ class ServerArgs:
         unsupported = [
             setting
             for setting, refused in (
-                ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                (
+                    "--disable-kvstore (device-only peer sharing requires decode "
+                    "TP1/KVP1 with --peer-prefix-landing-tier device)",
+                    not self.enable_kvstore
+                    # Match the Decode transfer-contract topology in build_device_side.
+                    and not (
+                        self.disaggregation_mode == "decode"
+                        and self.peer_prefix_landing_tier == "device"
+                        and self.mapping.attn.tp_size == 1
+                        and self.mapping.attn.kvp_size == 1
+                    ),
+                ),
                 ("--disable-prefix-caching", not self.enable_prefix_caching),
                 (
                     "--kvstore-storage-backend",
