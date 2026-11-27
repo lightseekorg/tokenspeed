@@ -1687,7 +1687,16 @@ Its responsibilities:
   helpers, even when the weights reside in an immutable hub snapshot. The
   definition path uses the loader's process-working-directory resolution.
 
-  The isolated S13 startup validation adds an explicit identity policy via
+  `TOKENSPEED_SKIP_CHECKPOINT_HASH=1` explicitly opts out of checkpoint content
+  fingerprinting and hub resolution. It derives a separate, unchecked identity
+  from the configured model identifier and revision; no path-to-release map is
+  needed. Load format, loader options and extensible code remain part of the
+  checkpoint identity, and the deployment/weight namespace still isolates cache
+  layouts, quantization and weight versions. Replacing weights in place is not
+  detected: operators must change the weight version or clear persistent caches.
+  The switch takes precedence over the policies below; unset or `0` keeps them.
+
+  The existing explicit identity policy uses
   `TOKENSPEED_CHECKPOINT_IDENTITY_MODE`: `content` keeps the algorithm above;
   `release` uses a publisher-guaranteed immutable release id from the JSON
   object `TOKENSPEED_CHECKPOINT_RELEASES`, keyed by absolute model path.

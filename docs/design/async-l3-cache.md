@@ -874,6 +874,18 @@ The scheduler wait is a soft deadline: native SDK I/O can finish later and its
 stale reply is ignored. No network call holds the scheduler lock.
 
 Checkpoint identity preserves the existing content/snapshot scheme by default.
+To skip startup weight scanning with one environment variable, set
+`TOKENSPEED_SKIP_CHECKPOINT_HASH=1`. No path mapping or release ID is required.
+The identity then trusts the configured model identifier and revision, while
+load format, loader options, extensible code, cache layout, quantization and
+weight-version isolation remain in effect. This does not skip model loading.
+It does not detect in-place weight replacement: change `--weight-version` or
+clear persistent caches when replacing weights under the same model/revision.
+Set the flag consistently across replicas sharing L3; enabling it changes the
+namespace, so existing content/release-mode objects are not reused. Unset or
+`0` preserves the existing policies; other values fail startup. The flag takes
+precedence over the release settings below, including leftover path mappings.
+
 Deployments with immutable publisher IDs may explicitly select
 `TOKENSPEED_CHECKPOINT_IDENTITY_MODE=release` and supply
 `TOKENSPEED_CHECKPOINT_RELEASES` as a JSON mapping from absolute model paths to

@@ -177,9 +177,16 @@ def l3_checkpoint_id(
     model_loader_extra_config: dict,
     ext_yaml: str,
 ) -> str:
-    """Return an immutable identity for the loaded checkpoint bytes.
+    """Return the checkpoint identity selected by the deployment policy.
 
-    ``--revision`` may be a moving branch or omitted. Two instances that
+    ``TOKENSPEED_SKIP_CHECKPOINT_HASH=1`` trusts the configured model and
+    revision without scanning weights or resolving a hub snapshot. This
+    opt-in takes precedence over the existing content/release policies.
+    In-place weight changes then require a new weight version or clearing
+    persistent caches; the resulting identity is not a content digest.
+
+    Under the default content policy, ``--revision`` may be a moving branch
+    or omitted. Two instances that
     resolve different commits (or local trees) must not share Mooncake
     keys. A local directory is identified from a Hugging Face hub cache
     snapshot (``.../(models|datasets|spaces)--<repo>/snapshots/<commit>``
@@ -219,6 +226,25 @@ def l3_checkpoint_id(
     )
     fmt = _normalize_load_format(load_format)
     ext_digest = _extensible_fingerprint(ext_yaml, load_format=fmt)
+    skip_hash = os.environ.get("TOKENSPEED_SKIP_CHECKPOINT_HASH", "0")
+    if skip_hash not in {"0", "1"}:
+        raise ValueError("TOKENSPEED_SKIP_CHECKPOINT_HASH must be 0 or 1")
+    if skip_hash == "1":
+        # Keep models/revisions distinct without reading or resolving their paths.
+        # Layout, quantization and weight-version isolation are applied separately.
+        declared = json.dumps([str(model_path), str(revision or "")])
+        identity = _checkpoint_id_with_load_format(
+            "unchecked-" + hashlib.sha256(declared.encode()).hexdigest(),
+            load_format=fmt,
+            extra_config=model_loader_extra_config,
+            ext_digest=ext_digest,
+        )
+        logging.getLogger(__name__).warning(
+            "Checkpoint weight scan skipped (TOKENSPEED_SKIP_CHECKPOINT_HASH=1); "
+            "identity trusts the configured model/revision. Change --weight-version "
+            "or clear persistent caches when replacing weights in place."
+        )
+        return identity
     # Preserve the existing content identity unless the deployment explicitly
     # supplies an immutable publisher release id.
     mode = os.environ.get("TOKENSPEED_CHECKPOINT_IDENTITY_MODE", "content")
