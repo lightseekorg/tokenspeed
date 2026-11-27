@@ -2356,6 +2356,14 @@ class ModelExecutor:
             device=self.device,
         )
 
+    def _target_capture_hidden_mode(self) -> CaptureHiddenMode:
+        """Hidden-state capture mode shared by active and idle target forwards."""
+        return (
+            CaptureHiddenMode.FULL
+            if self.drafter is not None and self.dspark_context_producer is None
+            else CaptureHiddenMode.NULL
+        )
+
     def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
@@ -2436,11 +2444,7 @@ class ModelExecutor:
             ctx.all_extend = dp_metadata.all_extend
             ctx.all_extend_or_idle = dp_metadata.all_extend_or_idle
             ctx.global_decoder_rows = dp_metadata.global_decoder_rows
-            ctx.capture_hidden_mode = (
-                CaptureHiddenMode.FULL
-                if self.drafter is not None and self.dspark_context_producer is None
-                else CaptureHiddenMode.NULL
-            )
+            ctx.capture_hidden_mode = self._target_capture_hidden_mode()
             if self.prefill_graph.can_run_idle(ctx):
                 with nvtx_range("prefill_graph idle", color="blue"):
                     self.prefill_graph.replay_idle(ctx)
@@ -2983,12 +2987,7 @@ class ModelExecutor:
                     num_extends=num_extends,
                     input_num_tokens=total_tokens,
                     forward_mode=forward_mode,
-                    capture_hidden_mode=(
-                        CaptureHiddenMode.FULL
-                        if self.drafter is not None
-                        and self.dspark_context_producer is None
-                        else CaptureHiddenMode.NULL
-                    ),
+                    capture_hidden_mode=self._target_capture_hidden_mode(),
                     gather_ids=gather_ids,
                     input_logprob_rows=self._input_logprob_rows(
                         input_logprob_plan, num_extends, total_tokens, query_shard

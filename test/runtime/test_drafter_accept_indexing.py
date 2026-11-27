@@ -194,6 +194,8 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
             all_decode_or_idle=True,
             all_extend=False,
             need_idle_forward=True,
+            all_extend_or_idle=False,
+            global_decoder_rows=[0, 8],
         )
     )
     return target_calls

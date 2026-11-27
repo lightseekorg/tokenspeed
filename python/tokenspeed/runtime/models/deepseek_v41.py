@@ -2903,6 +2903,18 @@ class DeepseekV41Model(nn.Module):
         if not self.mapping.attn.has_dp or self.ced_decoder_start >= len(self.layers):
             return None
         if ctx.global_decoder_rows is not None:
+            if len(ctx.global_decoder_rows) <= self.mapping.rank:
+                raise RuntimeError(
+                    f"DP global_decoder_rows length {len(ctx.global_decoder_rows)} "
+                    f"does not cover rank {self.mapping.rank}"
+                )
+            published = ctx.global_decoder_rows[self.mapping.rank]
+            if published != num_rows:
+                raise RuntimeError(
+                    f"V4.1 decoder rows disagree with DP metadata: rank "
+                    f"{self.mapping.rank} computed {num_rows} rows, control plane "
+                    f"gathered {published}"
+                )
             return ctx.global_decoder_rows
         if self.layers[self.ced_decoder_start].ffn.owns_ep_communication:
             return None

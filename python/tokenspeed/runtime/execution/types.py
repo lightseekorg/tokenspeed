@@ -50,8 +50,8 @@ class DpForwardMetadata:
     all_decode_or_idle: bool
     all_extend: bool
     need_idle_forward: bool
-    all_extend_or_idle: bool = False
-    global_decoder_rows: list[int] | None = None
+    all_extend_or_idle: bool
+    global_decoder_rows: list[int] | None
 
     @classmethod
     def from_ranks(

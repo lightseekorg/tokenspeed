@@ -1728,6 +1728,14 @@ class PrefillGraph:
         bucket = self._select_bucket(ctx)
         if bucket is None or not self._has_bucket(bucket):
             return None
+        if self._narrowing is not None:
+            # Narrowing models never capture inline (tokens, bs) variants, so
+            # active and idle DP ranks always pick the identical bucket without
+            # consulting rank-local ctx.bs.
+            assert (
+                not self._captures
+            ), "narrowing prefill graphs never capture inline (tokens, bs) variants"
+            return bucket
         # A full token bucket may have no room for padded native scan slots.
         # Reuse the next existing token bucket; never capture while serving.
         for candidate in sorted(

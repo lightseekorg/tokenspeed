@@ -317,6 +317,8 @@ def test_idle_rank_hands_history_drafts_an_empty_view() -> None:
             all_decode_or_idle=True,
             all_extend=False,
             need_idle_forward=True,
+            all_extend_or_idle=False,
+            global_decoder_rows=[0, 4],
         )
     )
     assert len(draft_calls) == 2

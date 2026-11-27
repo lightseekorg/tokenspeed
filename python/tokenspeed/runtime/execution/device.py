@@ -341,8 +341,8 @@ class DeviceSpecs:
     host_cache_block_bytes: tuple[int, ...]
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
+    narrowing_decoder_window: int | None
     cache_observation_capacity: int = 0
-    narrowing_decoder_window: int | None = None
 
 
 def speculative_widths(
@@ -2287,6 +2287,24 @@ def build_device_side(
         executor.config.spec_num_steps,
         executor.config.spec_num_tokens,
     )
+    narrowing = narrowing_prefill_model(target.model)
+    narrowing_decoder_window: int | None = None
+    if narrowing is not None:
+        model_window = int(narrowing.max_decoder_rows_per_request)
+        backend_window = executor.attn_backend.narrowing_decoder_window
+        if backend_window is None:
+            raise RuntimeError(
+                f"narrowing model declares max_decoder_rows_per_request={model_window} "
+                f"but {type(executor.attn_backend).__name__} does not declare "
+                "narrowing_decoder_window"
+            )
+        if int(backend_window) != model_window:
+            raise RuntimeError(
+                f"narrowing decoder window mismatch: model declares {model_window}, "
+                f"attention backend uses {int(backend_window)}"
+            )
+        narrowing_decoder_window = int(backend_window)
+
     specs = DeviceSpecs(
         cache_observation_capacity=cache_observation_capacity,
         cache_geometry=views.cache_geometry,
@@ -2339,11 +2357,7 @@ def build_device_side(
             if target.expert_location_updater is not None
             else None
         ),
-        narrowing_decoder_window=(
-            int(narrowing.max_decoder_rows_per_request)
-            if (narrowing := narrowing_prefill_model(target.model)) is not None
-            else None
-        ),
+        narrowing_decoder_window=narrowing_decoder_window,
     )
 
     def encoder_model_facts() -> EncoderModelFacts:

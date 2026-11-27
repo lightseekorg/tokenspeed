@@ -1139,6 +1139,8 @@ def test_execute_idle_forward_passes_empty_engram_views(buffers):
             all_decode_or_idle=True,
             all_extend=False,
             need_idle_forward=True,
+            all_extend_or_idle=False,
+            global_decoder_rows=[0],
         )
     )
     assert len(seen) == 1

@@ -414,6 +414,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._prefill_kv_batch: V41PrefillBatch | None = None
         self._local_decode_selections: dict[tuple, tuple] = {}
         self._partitioned_index_layers: set[int] = set()
+        self.narrowing_decoder_window: int = int(spec.sliding_window_tokens)
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)

@@ -225,6 +225,8 @@ class TestIdleReplayScrubTest:
                 all_decode_or_idle=True,
                 all_extend=False,
                 need_idle_forward=True,
+                all_extend_or_idle=False,
+                global_decoder_rows=[0],
             ),
         )
         _pytest_expr_3 = (captured["rows"] == 0).all()

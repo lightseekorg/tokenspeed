@@ -162,13 +162,17 @@ def test_forward_context_preserves_supplied_dp_metadata(required):
         all_decode_or_idle=False,
         all_extend=True,
         need_idle_forward=False,
+        all_extend_or_idle=True,
+        global_decoder_rows=[17, 29],
     )
     ctx.apply_dp_metadata(metadata, required=required)
     assert ctx.global_num_tokens == [17, 29]
     assert ctx.global_bs == [1, 2]
     assert ctx.global_num_decodes == [0, 0]
+    assert ctx.global_decoder_rows == [17, 29]
     assert not ctx.all_decode_or_idle
     assert ctx.all_extend
+    assert ctx.all_extend_or_idle
 
 
 def test_forward_context_requires_metadata_for_collective_execution():

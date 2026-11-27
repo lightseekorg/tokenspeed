@@ -1592,8 +1592,11 @@ class TestNarrowingPrefillGraphTest:
         from tokenspeed.runtime.execution.types import DpForwardMetadata
 
         tokens = [120, 80, 200, 0]
-        batch_sizes = [1, 1, 1, 0]
-        num_extends = [1, 1, 1, 0]
+        # Heterogeneous per-rank batch sizes (bs=1, 3, 2, 0) plus heterogeneous
+        # decoder rows (including 0 incomplete and an idle rank) must all select
+        # the identical encoder and decoder bucket from the shared DpForwardMetadata.
+        batch_sizes = [1, 3, 2, 0]
+        num_extends = [1, 3, 2, 0]
         dec_rows = [100, 0, 64, 0]
         events_by_rank = [[] for _ in range(4)]
         ranks = [
@@ -1613,14 +1616,17 @@ class TestNarrowingPrefillGraphTest:
                 ctx = ForwardContext(
                     attn_backend=ranks[r].attn_backend,
                     token_to_kv_pool=ranks[r].token_to_kv_pool,
-                    bs=1,
-                    num_extends=1,
-                    output_layout=ForwardOutputLayout(1, 1, 0, 1),
+                    bs=batch_sizes[r],
+                    num_extends=num_extends[r],
+                    output_layout=ForwardOutputLayout(
+                        batch_sizes[r], num_extends[r], 0, 1
+                    ),
                     input_num_tokens=tokens[r],
                     forward_mode=ForwardMode.EXTEND,
                 )
                 ctx.apply_dp_metadata(meta, required=True)
                 assert ranks[r].can_run(ctx)
+                assert ranks[r]._replay_bucket(ctx) == 256
                 ranks[r].replay(
                     ctx,
                     self.torch.ones(tokens[r], dtype=self.torch.int64),
@@ -1650,6 +1656,18 @@ class TestNarrowingPrefillGraphTest:
                         AssertionError("idle rank must replay prefill graph, not eager")
                     )
                 )
+                idle_probe_ctx = ForwardContext(
+                    attn_backend=ranks[r].attn_backend,
+                    token_to_kv_pool=ranks[r].token_to_kv_pool,
+                    bs=0,
+                    num_extends=0,
+                    output_layout=ForwardOutputLayout(0, 0, 0, 1),
+                    input_num_tokens=0,
+                    forward_mode=ForwardMode.IDLE,
+                    capture_hidden_mode=executor._target_capture_hidden_mode(),
+                )
+                idle_probe_ctx.apply_dp_metadata(meta, required=True)
+                assert ranks[r]._replay_idle_bucket(idle_probe_ctx) == 256
                 executor.execute_idle_forward(meta)
                 assert not self.torch.isnan(ranks[r]._input_embeds_buf[:256]).any()
                 assert self.torch.count_nonzero(ranks[r]._input_embeds_buf[:256]) == 0

@@ -882,11 +882,16 @@ def test_decoder_counts_preserve_decode_and_fused_ep_boundaries(
     ctx.all_decode_or_idle = True
     assert model.decoder_collective_counts(ctx, 3) is ctx.global_num_tokens
     ctx.all_decode_or_idle = False
-    # Control-plane global_decoder_rows serves both ordinary and fused EP directly.
+    # Control-plane global_decoder_rows serves both ordinary and fused EP directly,
+    # and fails fast if local num_rows disagrees with the gathered rank count.
     ctx.global_decoder_rows = [5, 0]
-    assert model.decoder_collective_counts(ctx, 3) == [5, 0]
+    assert model.decoder_collective_counts(ctx, 5) == [5, 0]
+    with pytest.raises(RuntimeError, match="decoder rows disagree"):
+        model.decoder_collective_counts(ctx, 3)
     model.layers[model.ced_decoder_start].ffn.owns_ep_communication = True
-    assert model.decoder_collective_counts(ctx, 3) == [5, 0]
+    assert model.decoder_collective_counts(ctx, 5) == [5, 0]
+    with pytest.raises(RuntimeError, match="decoder rows disagree"):
+        model.decoder_collective_counts(ctx, 3)
     ctx.global_decoder_rows = None
     assert model.decoder_collective_counts(ctx, 3) is None
 
