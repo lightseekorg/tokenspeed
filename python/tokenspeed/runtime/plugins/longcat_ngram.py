@@ -60,6 +60,20 @@ captured graph always records reads of an already-fixed staging address and
 the eager baseline never silently falls back to the host lookup inside a
 graph (the fallback is what 910B3 rejects as 107030).
 
+**Prefill graph seam (HistoryEmbeddingModel protocol).** The official
+runtime keeps request-token history in a graph-stable persistent view
+(``RequestTokenHistoryView``) and hands a model with
+``model_profile.request_token_history=True`` the choice of staying eager or
+lifting ``PrefillGraph.disable`` by implementing ``compute_input_embeddings``.
+:class:`_RuntimeLongcatNgramModel` implements the protocol: the prefill graph
+calls it eagerly *before* padding, it embeds the live packed batch from the
+view (``NgramEmbedding.embed_packed_view``) and appends the forward's inputs
+past the committed frontier (``append_request_token_history``); the replayed
+inner forward starts from the landed ``input_embeds`` buffer and touches
+neither the view nor the host tables.  The view-derived embedding is
+numerically identical (maxdiff=0) to the decode window path, because both
+fold the same committed history into the same per-token predecessor window.
+
 The module is an in-tree runtime plugin: importing it runs ``register()``,
 which calls :func:`tokenspeed.runtime.plugins.registry.register_model`. The
 model registry's ``import_model_classes`` imports the in-tree plugin modules
@@ -321,6 +335,117 @@ class NgramEmbedding(nn.Module):
         # 以 host 表 dtype 分配，H2D 预载逐位一致。
         self._ensure_staging()
         return result
+
+    def history_pad(self, input_ids: torch.Tensor, view) -> torch.Tensor:
+        """Per-row committed history, left-padded to width ``n - 1``.
+
+        Returns a ``[bs, n - 1]`` tensor whose row ``r`` holds the last
+        ``min(committed, n - 1)`` committed tokens of request ``r`` right-
+        justified (missing predecessors are zero). A zero predecessor
+        contributes zero to the polynomial hash, identical to the reference
+        implementation's "no predecessor" behavior. Vectorized: one ragged
+        gather, no per-row loop.
+        """
+        n_1 = self.n - 1
+        bs = view.req_pool_indices.shape[0]
+        if bs == 0:
+            return torch.zeros((0, n_1), dtype=input_ids.dtype, device=input_ids.device)
+        history = view.history_token_ids  # [pool, max_committed]
+        committed = view.committed_lengths
+        slots = view.req_pool_indices
+        hl = committed[slots]  # [bs]
+        # Gather the last ``min(committed, n - 1)`` committed tokens
+        # right-justified: row ``r`` holds history[slot, hl - n_1 .. hl) at the
+        # row's trailing columns and zeros in the leading ones, so
+        # ``_window_from_context`` reads the most recent committed token at
+        # column ``n - 2`` exactly as the decode window path does (the shared
+        # ngram-history machinery's tail is also newest-first).
+        idx = (
+            torch.arange(n_1, device=input_ids.device, dtype=torch.int64)[None, :]
+            + hl[:, None]
+            - n_1
+        )
+        valid = (idx >= 0) & (idx < hl[:, None])
+        flat = slots.to(input_ids.device).unsqueeze(-1) * history.size(
+            -1
+        ) + idx.clamp_min(0)
+        gathered = history.reshape(-1)[flat]  # [bs, n-1]
+        hist = gathered.masked_fill(~valid, 0).to(
+            device=input_ids.device, dtype=input_ids.dtype
+        )
+        return hist
+
+    def embed_packed_view(
+        self,
+        input_ids: torch.Tensor,
+        view,
+        *,
+        query_shard=None,
+    ) -> torch.Tensor:
+        """Embed a 1-D packed serving batch (``[T]`` ids, per-request rows).
+
+        Assembles the packed ids into a padded ``[bs, max_seq]`` batch with
+        the per-request committed history, runs the N-gram embedding and
+        flattens the rows back to ``[T, hidden_size]``.
+        """
+        bs = view.req_pool_indices.shape[0]
+        starts = view.input_start_offsets  # [bs + 1]
+        dev = input_ids.device
+        dtype = input_ids.dtype
+        lengths = [int(starts[r + 1]) - int(starts[r]) for r in range(bs)]
+        max_seq = max(lengths) if lengths else 0
+        rows = torch.zeros((bs, max_seq), dtype=dtype, device=dev)
+        for r in range(bs):
+            s = int(starts[r])
+            rows[r, : lengths[r]] = input_ids[s : s + lengths[r]]
+
+        hist = self.history_pad(rows, view)  # [bs, n - 1]
+        out = self(rows, ngram_context=hist, query_shard=query_shard)
+        if not lengths:
+            return torch.empty((0, out.size(-1)), dtype=out.dtype, device=out.device)
+        out_rows = [out[r, : lengths[r]] for r in range(bs)]
+        return torch.cat(out_rows, dim=0)
+
+    def append_request_token_history(
+        self,
+        input_ids: torch.Tensor,
+        view,
+    ) -> None:
+        """Append this forward's live input rows past each active slot's frontier.
+
+        The official ``HistoryEmbeddingModel`` contract: the model appends the
+        forward's inputs past ``committed_lengths``; the executor advances the
+        frontier after the forward (the view's ``committed_lengths`` stays
+        read-only here).  Only rows whose ``active_request_mask`` is True
+        append — graph padding rows must neither read nor write history.
+        Writes clamp to the history capacity, dropping any overflow tokens
+        rather than corrupting a neighbour row. Vectorized: one
+        ``searchsorted`` mapping tokens to their request rows and one scatter.
+        """
+        history = view.history_token_ids
+        num_tokens = input_ids.numel()
+        if num_tokens == 0:
+            return
+        capacity = history.size(1)
+        offsets = view.input_start_offsets.to(torch.int64)
+        token_rows = torch.searchsorted(
+            offsets[1:],
+            torch.arange(num_tokens, device=input_ids.device, dtype=torch.int64),
+            right=True,
+        )
+        slots = view.req_pool_indices.to(torch.int64)[token_rows]
+        starts = offsets[token_rows]
+        committed = view.committed_lengths.to(torch.int64)[slots]
+        columns = committed + (
+            torch.arange(num_tokens, device=input_ids.device, dtype=torch.int64)
+            - starts
+        )
+        active = view.active_request_mask[token_rows]
+        valid = active & (columns >= 0) & (columns < capacity)
+        flat = slots * capacity + columns
+        history.reshape(-1).index_put_(
+            (flat[valid],), input_ids[valid].to(history.dtype)
+        )
 
     def _window_from_context(
         self, context: torch.Tensor, committed: int
@@ -651,66 +776,49 @@ class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
         self.ngram_embeddings.preload_staging(input_ids, predecessor_window)
 
     def _history_pad(self, input_ids: torch.Tensor, view) -> torch.Tensor:
-        """Per-row committed history, left-padded to width ``n - 1``.
-
-        Returns a ``[bs, n - 1]`` tensor whose row ``r`` holds the last
-        ``min(committed, n - 1)`` committed tokens of request ``r`` right-
-        justified (missing predecessors are zero). A zero predecessor
-        contributes zero to the polynomial hash, identical to the reference
-        implementation's "no predecessor" behavior. Vectorized: one ragged
-        gather, no per-row loop.
-        """
-        n_1 = self.ngram_embeddings.n - 1
-        bs = view.req_pool_indices.shape[0]
-        if bs == 0:
-            return torch.zeros((0, n_1), dtype=input_ids.dtype, device=input_ids.device)
-        history = view.history_token_ids  # [pool, max_committed]
-        committed = view.committed_lengths
-        slots = view.req_pool_indices
-        hl = committed[slots]  # [bs]
-        take = hl.clamp(max=n_1)  # [bs]
-        # Gather the last ``take`` committed tokens right-justified.
-        idx = (
-            torch.arange(n_1, device=input_ids.device, dtype=torch.int64)[None, :]
-            - take[:, None]
-            + hl[:, None]
-        )
-        valid = (idx >= 0) & (idx < hl[:, None])
-        flat = slots.to(input_ids.device).unsqueeze(-1) * history.size(
-            -1
-        ) + idx.clamp_min(0)
-        gathered = history.reshape(-1)[flat]  # [bs, n-1]
-        hist = gathered.masked_fill(~valid, 0).to(
-            device=input_ids.device, dtype=input_ids.dtype
-        )
-        return hist
+        """Per-row committed history, left-padded to width ``n - 1`` (delegates)."""
+        return self.ngram_embeddings.history_pad(input_ids, view)
 
     def _ngram_embed_packed(self, input_ids: torch.Tensor, view, ctx) -> torch.Tensor:
-        """Embed a 1-D packed serving batch (``[T]`` ids, per-request rows).
-
-        Assembles the packed ids into a padded ``[bs, max_seq]`` batch with
-        the per-request committed history, runs the N-gram embedding and
-        flattens the rows back to ``[T, hidden_size]``.
-        """
-        bs = view.req_pool_indices.shape[0]
-        starts = view.input_start_offsets  # [bs + 1]
-        dev = input_ids.device
-        dtype = input_ids.dtype
-        lengths = [int(starts[r + 1]) - int(starts[r]) for r in range(bs)]
-        max_seq = max(lengths) if lengths else 0
-        rows = torch.zeros((bs, max_seq), dtype=dtype, device=dev)
-        for r in range(bs):
-            s = int(starts[r])
-            rows[r, : lengths[r]] = input_ids[s : s + lengths[r]]
-
-        hist = self._history_pad(rows, view)  # [bs, n - 1]
-        out = self.ngram_embeddings(
-            rows, ngram_context=hist, query_shard=ctx.query_shard
+        """Embed a 1-D packed serving batch from the history view (delegates)."""
+        return self.ngram_embeddings.embed_packed_view(
+            input_ids, view, query_shard=ctx.query_shard
         )
-        if not lengths:
-            return torch.empty((0, out.size(-1)), dtype=out.dtype, device=out.device)
-        out_rows = [out[r, : lengths[r]] for r in range(bs)]
-        return torch.cat(out_rows, dim=0)
+
+    def _append_request_token_history(
+        self,
+        input_ids: torch.Tensor,
+        view,
+    ) -> None:
+        """Append this forward's inputs past each active slot's frontier."""
+        self.ngram_embeddings.append_request_token_history(input_ids, view)
+
+    def compute_input_embeddings(
+        self,
+        input_ids: torch.Tensor,
+        ctx,
+        *,
+        request_token_history,
+    ) -> torch.Tensor:
+        """Implement the official ``HistoryEmbeddingModel`` protocol.
+
+        Graph replay calls this eagerly, before padding: it embeds the live
+        1-D packed batch from the runtime-owned request-token history (the
+        view) and appends the forward's inputs past the committed frontier.
+        The inner forward is then replayed with ``input_embeds``, so it never
+        reads or appends history again.  This is the seam that lifts
+        ``PrefillGraph.disable`` (a history model without the seam stays
+        eager), restoring the LongCat prefill graph.
+        """
+        if request_token_history is None:
+            # No runtime history (unsupported defensive path): embed the
+            # packed ids as one row, as the eager fallback does.
+            return self.ngram_embeddings(
+                input_ids.unsqueeze(0), query_shard=ctx.query_shard
+            ).squeeze(0)
+        embeds = self._ngram_embed_packed(input_ids, request_token_history, ctx)
+        self._append_request_token_history(input_ids, request_token_history)
+        return embeds
 
     def _ngram_embed(self, input_ids: torch.Tensor, ctx, kwargs) -> torch.Tensor:
         """Compute the N-gram input embeddings for this forward."""
