@@ -264,27 +264,33 @@ StorageReservation StorageQueries::reserveStoragePrefix(const PromptPrefix& prom
         if (probe.num_common_tokens <= device_only.num_common_tokens ||
             (exact_retry && probe.num_common_tokens != prompt.max_tokens))
             return {};
+        bool missing_source = false;
         const auto pin = [&](const CacheKey& key, std::int32_t logical_block) {
+            if (missing_source) return;
             auto ref = store_.AcquireHostCachedBlock(key);
             if (ref) {
                 warm_blocks.push_back(std::move(ref));
             } else {
+                std::int32_t bucket = logical_block % store_.Groups()[key.group_id].Spec().shard_count;
+                if (source_pool != nullptr) {
+                    auto source = store_.Groups()[key.group_id].Index().Find(*source_pool, key);
+                    if (!source) {
+                        missing_source = true;
+                        return;
+                    }
+                    bucket = store_.Groups()[key.group_id].Allocator().BucketOf(source->Location());
+                    result.sources.push_back(std::move(source));
+                }
                 result.keys.push_back(key);
                 result.logical_blocks.push_back(logical_block);
                 groups.push_back(key.group_id);
-                std::int32_t bucket = logical_block % store_.Groups()[key.group_id].Spec().shard_count;
-                if (source_pool != nullptr) {
-                    const std::optional<CacheBlockLocation> source_loc =
-                        store_.LocationOf(*source_pool, key.group_id, key);
-                    _assert(source_loc.has_value(), "a storage reservation hit must exist in its source pool");
-                    bucket = store_.Groups()[key.group_id].Allocator().BucketOf(*source_loc);
-                }
                 buckets.push_back(bucket);
             }
         };
         // Protect warm dependencies only while allocating destinations. They
         // stay evictable during I/O; ordinary admission matches the cache again.
         forEachStorageDependency(probe, group_keys, suffix.device.full_page_tokens, pin);
+        if (missing_source) return {};
         if (probe.tail) {
             result.tail_prior =
                 probe.full_page_tokens == 0
@@ -296,13 +302,6 @@ StorageReservation StorageQueries::reserveStoragePrefix(const PromptPrefix& prom
         const auto needed = result.keys.size() + warm_blocks.size();
         if (exact_retry && needed > limit) return {};
         if (needed <= max_blocks) {
-            if (source_pool) {
-                for (const auto& key : result.keys) {
-                    auto source = store_.Groups()[key.group_id].Index().Find(*source_pool, key);
-                    if (!source) return {};
-                    result.sources.push_back(std::move(source));
-                }
-            }
             auto allocation = host_.AcquireHostLanding(groups, buckets);
             if (allocation.stats.allocated == groups.size()) {
                 result.num_tokens = probe.num_common_tokens;

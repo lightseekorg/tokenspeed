@@ -38,7 +38,7 @@ use ts_scheduler::{
 // Group 0 ("draft"): sliding_window, block_granularity = 2 (2 draft blocks per prefix page),
 //   sliding_window = 8 (4 draft blocks), sink_tokens = 2 (slot 0), shard_count = 1,
 //   head-partitioned on axis=1 across 8 KV heads (shape [2, heads, 64]).
-//   Wait: on TP1 (width=1), 1 draft block = 2 * 8 * 64 = 1024 bytes, packing = 4 -> 4096 B/parent.
+//   Sizing: on TP1 (width=1), 1 draft block = 2 * 8 * 64 = 1024 bytes, packing = 4 -> 4096 B/parent.
 //   On TP8 (width=8), 1 draft block = 2 * 1 * 64 = 128 bytes, packing = 4 -> 512 B/parent (padded to 4096 B LCM).
 // Group 1 ("full"): full_history, block_granularity = 4, shard_count = width, 4096 B/block.
 // Group 2 ("state"): state, shard_count = 1, head-partitioned on axis=0 across 8 heads (512 B/head).

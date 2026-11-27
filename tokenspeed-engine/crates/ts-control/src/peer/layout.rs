@@ -221,7 +221,13 @@ impl ReadEndpoint<'_> {
             .map_err(|e| LayoutError::new(e.to_string()))
     }
 
-    fn span(&self, base: u64, offset: i128, length: u64, payload: u64) -> Result<u64, LayoutError> {
+    fn span(
+        &self,
+        base: u64,
+        offset: i128,
+        length: u64,
+        payload: u64,
+    ) -> Result<(u64, usize), LayoutError> {
         let start = u64::try_from(offset)
             .ok()
             .filter(|n| n.checked_add(length).is_some_and(|end| end <= payload))
@@ -230,14 +236,12 @@ impl ReadEndpoint<'_> {
         let end = start
             .checked_add(length)
             .ok_or_else(|| LayoutError::new("peer span overflow"))?;
-        if !self
+        let region_idx = self
             .regions
             .iter()
-            .any(|&(lo, len)| lo <= start && lo.checked_add(len).is_some_and(|hi| end <= hi))
-        {
-            return Err(LayoutError::new("peer span outside registered memory"));
-        }
-        Ok(start)
+            .position(|&(lo, len)| lo <= start && lo.checked_add(len).is_some_and(|hi| end <= hi))
+            .ok_or_else(|| LayoutError::new("peer span outside registered memory"))?;
+        Ok((start, region_idx))
     }
 }
 
@@ -336,7 +340,10 @@ impl<'a> PeerReadPlan<'a> {
         let mut blocks = BTreeSet::new();
         let mut destinations = Vec::new();
         let mut batches = BTreeMap::<usize, Spans>::new();
-        let mut push_spans = BTreeMap::<(usize, u32, i32), Vec<PushSpan>>::new();
+        // Partition Disk push items by `(rank, group, block, dst_region_idx)` so
+        // every `PushItem` lies strictly inside one registered reader MR and
+        // holder-side destination coalescing can never merge across adjacent MRs.
+        let mut push_spans = BTreeMap::<(usize, u32, i32, usize), Vec<PushSpan>>::new();
         for &(src, dst) in pages {
             if (src.group_id, src.slot) != (dst.group_id, dst.slot)
                 || dst.tier != PeerTier::Device
@@ -367,9 +374,6 @@ impl<'a> PeerReadPlan<'a> {
                     }
                     let (field_offset, block_bytes) =
                         source.disk_field_offset(self.source, src, &f.field_id)?;
-                    let item_spans = push_spans
-                        .entry((*rank, src.group_id, src.block_id))
-                        .or_default();
                     for row in 0..i128::from(f.rows_per_page) {
                         let rel = u64::try_from(
                             i128::from(f.src_byte_offset)
@@ -382,7 +386,7 @@ impl<'a> PeerReadPlan<'a> {
                             .checked_add(rel)
                             .filter(|n| n.checked_add(len).is_some_and(|end| end <= block_bytes))
                             .ok_or_else(|| LayoutError::new("peer Disk span exceeds its block"))?;
-                        let to = dest.span(
+                        let (to, dst_region) = dest.span(
                             dst_base,
                             i128::from(f.dst_byte_offset)
                                 + row * i128::from(f.dst_row_stride_bytes),
@@ -393,11 +397,14 @@ impl<'a> PeerReadPlan<'a> {
                             .entry(&f.field_id)
                             .or_default()
                             .push((to - dst_base, len));
-                        item_spans.push(PushSpan {
-                            offset: block_offset,
-                            address: to,
-                            length: len,
-                        });
+                        push_spans
+                            .entry((*rank, src.group_id, src.block_id, dst_region))
+                            .or_default()
+                            .push(PushSpan {
+                                offset: block_offset,
+                                address: to,
+                                length: len,
+                            });
                         destinations.push((to, to + len));
                     }
                     continue;
@@ -405,13 +412,13 @@ impl<'a> PeerReadPlan<'a> {
                 let src_base = source.base(self.source, src, src_page, &f.field_id)?;
                 let spans = batches.entry(*rank).or_default();
                 for row in 0..i128::from(f.rows_per_page) {
-                    let from = source.span(
+                    let (from, _) = source.span(
                         src_base,
                         i128::from(f.src_byte_offset) + row * i128::from(f.src_row_stride_bytes),
                         len,
                         src_bytes,
                     )?;
-                    let to = dest.span(
+                    let (to, _) = dest.span(
                         dst_base,
                         i128::from(f.dst_byte_offset) + row * i128::from(f.dst_row_stride_bytes),
                         len,
@@ -458,7 +465,7 @@ impl<'a> PeerReadPlan<'a> {
             ));
         }
         let mut pushes = BTreeMap::<usize, Vec<PushItem>>::new();
-        for ((rank, group, block), spans) in push_spans {
+        for ((rank, group, block, _dst_region), spans) in push_spans {
             if !spans.is_empty() {
                 pushes.entry(rank).or_default().push(PushItem {
                     group,
@@ -1160,6 +1167,114 @@ mod tests {
                 assert_eq!(actual, expected);
             }
         }
+    }
+
+    #[test]
+    fn adjacent_reader_regions_split_disk_push_items() {
+        use crate::peer::geometry::{HostGroup, HostPool};
+
+        // Two adjacent registered reader MRs touching at `k_end == v_base`
+        // (`[1024, 1152)` and `[1152, 1280)`) for the two fields of draft group 2.
+        // Even though `layer.2.k` and `layer.2.v` have touching virtual addresses
+        // for block 0 (`1024..1028` and `1152..1156`, or contiguous when block 0
+        // sits right at the boundary), `plan()` must emit separate `PushItem`s so
+        // holder coalescing can never merge across distinct reader registrations.
+        let src = with_draft(1);
+        let dst = with_draft(8);
+        let mut sg = geometry(1);
+        let src_field_bytes = 4 * 8u64;
+        for (id, base) in [("layer.2.k", 1024), ("layer.2.v", 2048)] {
+            sg.device.push(DeviceField {
+                group_id: 2,
+                field_id: id.into(),
+                address: base,
+                bytes: src_field_bytes,
+                page_stride: src_field_bytes,
+            });
+        }
+        sg.push = Some("127.0.0.1:9000".into());
+        sg.host = Some(HostPool {
+            address: 0x10000,
+            groups: vec![
+                HostGroup {
+                    parent_bytes: 256,
+                    packing: 1,
+                    block_bytes: 4,
+                    field_offsets: vec![("layer.0.kv".into(), 0)],
+                },
+                HostGroup {
+                    parent_bytes: 256,
+                    packing: 1,
+                    block_bytes: 8,
+                    field_offsets: vec![("layer.1.recurrent_state".into(), 0)],
+                },
+                HostGroup {
+                    parent_bytes: 256,
+                    packing: 1,
+                    block_bytes: 16 + 2 * src_field_bytes,
+                    field_offsets: vec![
+                        ("layer.2.k".into(), 16),
+                        ("layer.2.v".into(), 16 + src_field_bytes),
+                    ],
+                },
+            ],
+        });
+        let src_ep = ReadEndpoint {
+            geometry: &sg,
+            host_virtual_bounds: &[1 + 16, 17, 17],
+            disk_virtual_bounds: &[1 + 32, 33, 33],
+            regions: &[(0, 1 << 20)],
+        };
+
+        // Place reader `layer.2.k` block 1 at `[2004, 2008)` in MR 0 (`[0, 2008)`)
+        // and `layer.2.v` block 1 at `[2008, 2012)` in touching MR 1 (`[2008, 4096)`).
+        let mut dg = geometry(8);
+        dg.device.push(DeviceField {
+            group_id: 2,
+            field_id: "layer.2.k".into(),
+            address: 2000,
+            bytes: 4,
+            page_stride: 4,
+        });
+        dg.device.push(DeviceField {
+            group_id: 2,
+            field_id: "layer.2.v".into(),
+            address: 2004,
+            bytes: 4,
+            page_stride: 4,
+        });
+        let dst_regions = [(0u64, 2008u64), (2008u64, 2088u64)];
+        let dst_ep = ReadEndpoint {
+            geometry: &dg,
+            host_virtual_bounds: &[],
+            disk_virtual_bounds: &[],
+            regions: &dst_regions,
+        };
+
+        let plan = PeerReadPlan::new(&src, &dst, 1, 8, 0).unwrap();
+        let src_page = PeerPageView {
+            group_id: 2,
+            slot: 0,
+            tier: PeerTier::Disk,
+            block_id: 1,
+        };
+        let dst_page = PeerPageView {
+            group_id: 2,
+            slot: 0,
+            tier: PeerTier::Device,
+            block_id: 1,
+        };
+        let planned = plan
+            .plan(&[src_ep], &dst_ep, &[(src_page, dst_page)])
+            .unwrap();
+        let items = &planned.pushes[&0];
+        assert_eq!(
+            items.len(),
+            2,
+            "spans touching across two distinct reader MRs must be split into separate PushItems"
+        );
+        assert!(items[0].spans.iter().all(|s| s.address + s.length <= 2008));
+        assert!(items[1].spans.iter().all(|s| s.address >= 2008));
     }
 
     #[test]

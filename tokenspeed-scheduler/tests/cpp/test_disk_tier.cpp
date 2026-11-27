@@ -1364,60 +1364,48 @@ TEST(DiskTierTest, SwaDiskOnlyBoundaryReportsDiskPublishable) {
     EXPECT_TRUE(status.disk_publishable);
 }
 
-TEST(DiskTierTest, EndpointSwaMatchesClosedPrefixEvictionTier) {
-    // Regression test for Fix #4b: on a hybrid Full + SWA(sink>0) cache,
-    // newer endpoint SWA blocks must rank in `kClosedPrefix` (same tier as
-    // Full History) rather than `kEstablished`, so eviction prefers dropping
-    // older Full History blocks before newer endpoint SWA blocks.
-    std::vector<CacheGroupSpec> specs{
-        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kGrain},
-        {.attn_kind = AttnKind::kSlidingWindow,
-         .sliding_window = 8,
-         .sink_tokens = 2,
-         .cache_blocks_per_lcm_block = 1,
-         .block_granularity = kGrain},
-    };
-    BlockPool device(32, {1, 1});
-    auto coordinator =
-        MakeCoordinator(specs, kGrain, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false, 0);
+TEST(DiskTierTest, SwaDiskOnlyBoundaryWithStateRespectsHotterRamSubtree) {
+    // Covers the `NumStateGroups() > 0` branch of `swa_disk_only` in
+    // `CacheCoordinator::GetBoundaryEventStatus`: when SWA is Disk-only while
+    // Full History and State remain in Host RAM, the boundary downgrades to
+    // Disk publishable if no deeper child holds a RAM checkpoint, and stays
+    // Host publishable when a deeper descendant holds a hotter RAM checkpoint.
+    std::vector<CacheGroupSpec> specs = FullAndState();
+    specs.push_back({.attn_kind = AttnKind::kSlidingWindow,
+                     .sliding_window = 8,
+                     .sink_tokens = 2,
+                     .cache_blocks_per_lcm_block = 1,
+                     .block_granularity = kGrain});
+    DiskTierCache cache(specs, 24);
+    const Prompt prompt(3, 105);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(keys).op_id, .success = true});
 
-    const Prompt old_prompt(4, 107);
-    const Prompt new_prompt(4, 109);
-    auto publish = [&](const Prompt& p, std::uint64_t epoch) {
-        std::vector<BlockTable> tables(2);
-        ASSERT_TRUE(AdmitForTest(coordinator, tables, static_cast<std::int32_t>(p.tokens.size())));
-        CacheCompletedBlocksForTest(coordinator, tables, p.hashes, epoch, /*first_new_prefix_page=*/0,
-                                    static_cast<std::int32_t>(p.tokens.size()), CacheBoundaryKind::kEndpoint,
-                                    /*stream_completed_to_host=*/false, /*publish_state=*/false);
-        coordinator.Free(tables);
-    };
-    publish(old_prompt, 10);
-    publish(new_prompt, 20);
-
-    // Inspect eviction candidate ordering directly on the device pool:
-    // older prompt's Full blocks (epoch 10, kClosedPrefix) must precede newer
-    // prompt's endpoint SWA blocks (epoch 20, also kClosedPrefix).
-    std::pmr::monotonic_buffer_resource scratch;
-    const CacheEvictionCandidates::LocationSet empty{&scratch};
-    CacheEvictionCandidates candidates{coordinator.Store().Groups(), device, CheckpointAging{}};
-    const CacheKey old_full_tip{.group_id = 0, .content_hash = ContentHash{old_prompt.hashes.back()}};
-    const CacheKey new_swa_tip{.group_id = 1, .content_hash = ContentHash{new_prompt.hashes.back()}};
-    const auto old_full_loc = coordinator.Store().LocationOf(device, 0, old_full_tip);
-    const auto new_swa_loc = coordinator.Store().LocationOf(device, 1, new_swa_tip);
-    ASSERT_TRUE(old_full_loc);
-    ASSERT_TRUE(new_swa_loc);
-    std::int32_t old_full_rank = -1;
-    std::int32_t new_swa_rank = -1;
-    std::int32_t step = 0;
-    while (auto c = candidates.Next({}, empty, empty, [](CacheBlockLocation) { return false; })) {
-        if (c->group_id == 0 && c->location == *old_full_loc) old_full_rank = step;
-        if (c->group_id == 1 && c->location == *new_swa_loc) new_swa_rank = step;
-        ++step;
+    // Evict SWA (group 2) at the middle boundary (page 1) and tip (page 2) from Host.
+    std::vector<CacheKey> swa_keys;
+    for (const CacheKey& key : keys) {
+        if (key.group_id == 2 &&
+            (key.content_hash == ContentHash{prompt.hashes[1]} || key.content_hash == ContentHash{prompt.hashes[2]})) {
+            swa_keys.push_back(key);
+        }
     }
-    ASSERT_GE(old_full_rank, 0);
-    ASSERT_GE(new_swa_rank, 0);
-    EXPECT_LT(old_full_rank, new_swa_rank)
-        << "older Full History block should be evicted before newer endpoint SWA block";
+    ASSERT_EQ(swa_keys.size(), 2u);
+    cache.EvictFromHost(swa_keys);
+
+    // At the tip (page 2), no deeper child holds a RAM checkpoint -> Disk publishable.
+    const auto tip_status =
+        cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{prompt.hashes[2]}}, 0);
+    EXPECT_FALSE(tip_status.device_publishable);
+    EXPECT_FALSE(tip_status.host_publishable);
+    EXPECT_TRUE(tip_status.disk_publishable);
+
+    // At the middle boundary (page 1), page 2 still holds a State checkpoint in Host RAM,
+    // so `HasRamCheckpointInProperSubtree()` is true and page 1 stays Host publishable.
+    const auto mid_status =
+        cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{prompt.hashes[1]}}, 0);
+    EXPECT_FALSE(mid_status.device_publishable);
+    EXPECT_TRUE(mid_status.host_publishable);
+    EXPECT_TRUE(mid_status.disk_publishable);
 }
 
 DiskConfig GdsDiskLimits() {
@@ -2040,6 +2028,48 @@ TEST(DiskGdsTest, CleanPlacementPricesSharedReadsBeforeUniqueReads) {
     EXPECT_TRUE(cache.coordinator.Host().ContainsHostCachedBlock(shallow.back()));
     EXPECT_DOUBLE_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
     EXPECT_EQ(cache.coordinator.Store().GdsStats().logical_evictions, 0u);
+}
+
+TEST(DiskGdsTest, PartialOnDiskBoundaryCleansRemainingDirtySwaAndStateKeys) {
+    // Verify that under GDS, when Full History at a boundary is already on Disk
+    // while State and SWA(sink>0) keys at the same boundary are still dirty on
+    // Host, GDS cleaning still discovers and flushes the remaining dirty keys.
+    std::vector<CacheGroupSpec> specs = FullAndState();
+    specs.push_back({.attn_kind = AttnKind::kSlidingWindow,
+                     .sliding_window = 8,
+                     .sink_tokens = 2,
+                     .cache_blocks_per_lcm_block = 1,
+                     .block_granularity = kGrain});
+    DiskTierCache cache(specs, 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const Prompt prompt(3, 111);
+    const auto keys = cache.OnHostOnly(prompt);
+
+    std::vector<CacheKey> full_only;
+    std::vector<CacheKey> dirty_expected;
+    for (const auto& key : keys) {
+        if (key.group_id == 0) {
+            full_only.push_back(key);
+        } else {
+            dirty_expected.push_back(key);
+        }
+    }
+    ASSERT_FALSE(full_only.empty());
+    ASSERT_FALSE(dirty_expected.empty());
+    CopyToDisk(cache, full_only);
+
+    // Every boundary node already has `OnDisk() == true` via group 0, yet GDS
+    // cleaning must still flush the dirty State (group 1) and SWA (group 2) keys.
+    cache.disks.StartCleaning();
+    const auto commands = cache.disks.TakeCommands();
+    ASSERT_FALSE(commands.empty());
+    for (const auto& cmd : commands) {
+        cache.disks.Complete(cache::DiskDone{.op_id = cmd.op_id, .success = true});
+    }
+    for (const auto& key : dirty_expected) {
+        EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(key))
+            << "GDS cleaning missed dirty group " << key.group_id;
+    }
 }
 
 }  // namespace

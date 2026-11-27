@@ -1327,6 +1327,11 @@ impl HolderState {
     /// head-sharded 256B DFLASH SWA slices) into already-registered staging
     /// memory, collapsing `1,536 x 256B` RDMA WRITE WQEs into `12 x 32KB`
     /// without changing the wire protocol.
+    ///
+    /// Safety across reader memory regions: `PeerReadPlan::plan` partitions
+    /// `PushItem`s by destination registered memory region, so every
+    /// `batch_spans` lies strictly inside a single reader MR and coalescing
+    /// contiguous destinations can never span adjacent reader registrations.
     fn build_write_spans<'a>(
         &'a self,
         ring: usize,

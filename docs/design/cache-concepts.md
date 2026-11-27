@@ -87,6 +87,17 @@ unset preserves `0` (granted sources remain pinned pending explicit closure).
 A timeout for polling one Mooncake batch alone does not establish the bound. No
 heartbeats extend it.
 
+For Disk-tier peer pushes, the holder coalesces consecutive strided slices
+targeting contiguous remote addresses inside the same reader registered memory
+region (for example, head-sharded sliding-window draft slices pushed from TP1
+to TP8) into its own already-registered staging memory before issuing the RDMA
+WRITE, without changing the wire protocol. Reader planning partitions push
+items by destination memory region so a coalesced WRITE never crosses adjacent
+reader registrations. `TOKENSPEED_PEER_PUSH_COALESCE` controls this kill switch
+on the holder (enabled by default; set to `0` or `false` to emit uncoalesced
+spans). It is read once per process via `OnceLock`, so toggling it requires a
+process restart.
+
 After all reader members have retired their reads (or finished quarantining an
 unknown retirement), a missing RELEASE reply
 can still force the request to recompute. Once its closing deadline passes,
