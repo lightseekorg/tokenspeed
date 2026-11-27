@@ -351,7 +351,7 @@ class DeepseekV41DSpark(BaseDrafter):
         self, ctx: ForwardContext, *, actual_bs: int, padded_bs: int
     ) -> int:
         if (
-            self.draft_model.mapping.attn.dp_size > 1
+            self.draft_model.mapping.requires_forward_coordination
             and ctx.global_bs != ctx.global_num_decodes
         ):
             return padded_bs * self.spec_num_tokens
@@ -370,7 +370,7 @@ class DeepseekV41DSpark(BaseDrafter):
             return self._prepare_calibrated_budget(
                 actual_bs=actual_bs, padded_bs=padded_bs
             )
-        if self.draft_model.mapping.attn.dp_size > 1:
+        if self.draft_model.mapping.requires_forward_coordination:
             # Admission must use global metadata before entering collectives.
             # Pure decode peers share physical capacity, not actual occupancy.
             if (
@@ -566,16 +566,20 @@ class DeepseekV41DSpark(BaseDrafter):
 
     @property
     def _verification_group(self) -> tuple[int, ...]:
-        mapping = self.draft_model.mapping.attn
-        if mapping.dp_size > 1:
-            # PP1 is required: every attention rank participates in shared MoE.
-            return tuple(range(mapping.world_size))
+        mapping = self.draft_model.mapping
+        if mapping.requires_forward_coordination:
+            # PP1 is required: forwards and verification share the DP group.
+            return tuple(range(mapping.attn.world_size))
         return self.tp_group
 
     @property
     def _verification_rank(self) -> int:
-        mapping = self.draft_model.mapping.attn
-        return int(mapping.rank if mapping.dp_size > 1 else mapping.tp_rank)
+        mapping = self.draft_model.mapping
+        return int(
+            mapping.rank
+            if mapping.requires_forward_coordination
+            else mapping.attn.tp_rank
+        )
 
     @property
     def _verification_host_group(self):
@@ -1068,10 +1072,15 @@ class DeepseekV41DSpark(BaseDrafter):
             or graph_bs is None
             or graph_bs < ctx.bs
             or ctx.bs == 0
-            or (ctx.bs if self.dp_local_graph else max(ctx.global_bs or (ctx.bs,)))
+            or (
+                max(ctx.global_bs or (ctx.bs,))
+                if self.draft_model.mapping.requires_forward_coordination
+                and not self.dp_local_graph
+                else ctx.bs
+            )
             < self.adaptive_min_batch_size
             or (
-                self.draft_model.mapping.attn.dp_size == 1
+                not self.draft_model.mapping.requires_forward_coordination
                 and not self.dp_local_graph
                 and (graph_bs != ctx.bs or ctx.bs < self.adaptive_min_batch_size)
             )

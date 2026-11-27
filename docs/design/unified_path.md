@@ -27,6 +27,13 @@ the scheduler publishes no global counts. Layouts requiring forward
 coordination retain the global Decode/idle agreement and peer-count checks;
 missing metadata never implies that a coordinated layout is independent.
 
+Adaptive DSpark follows the same contract for verification budgets and their
+calibration and feedback. Independent replicas use local budgets and calibration
+groups, ignoring peer counts and phases even when shared cache control publishes
+them. A locally padded or small batch retains the single-replica budget policy.
+Coordinated layouts keep the shared budget agreement on globally padded graphs;
+the explicit DP-local graph scope retains its local budget policy.
+
 For models with reduce-scattered MoE input, the scheduler already supplies the
 live token count for every attention DP group. Before decode graph replay the
 runner intersects each fixed TP shard with its group's live prefix and copies
