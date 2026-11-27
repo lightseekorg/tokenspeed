@@ -547,7 +547,8 @@ void Scheduler::preparePeer(Request& request) {
                                               .holder = holder,
                                               .prefix_hashes = {hashes.begin(), hashes.end()},
                                               .tokens = {tokens.begin(), tokens.end()},
-                                              .max_tokens = max_tokens});
+                                              .max_tokens = max_tokens,
+                                              .local_tokens = local});
     spdlog::debug("[Peer] rid={} lookup {} to {} local_tokens={} bound_tokens={}", request.Id(), lease.id, holder,
                   local, max_tokens);
     const bool grant_host = async_host_peer_;
