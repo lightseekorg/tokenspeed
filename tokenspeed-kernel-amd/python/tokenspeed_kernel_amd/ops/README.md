@@ -1398,37 +1398,66 @@ register-resident Q forced the allocator to reuse gather destinations behind
 `vmcnt(0)` waits.
 
 Gathering is L2-bandwidth bound (prefill rows of one request re-read the same
-slots). Batches with fewer than about 1024 (row, head-block) workgroups split
-the compacted tiles over up to 32 workgroups that store FP32 partials and
-base-2 LSE; `gluon_qsa_sparse_attention_merge_gfx950` merges all splits of a
-(row, head) in one pass.
+slots). Batches with fewer than 1024 (row, KV head, head-block) workgroups,
+the number LDS keeps resident at once (four per CU), split the compacted tiles
+over up to 32 workgroups that store FP32 partials and base-2 LSE;
+`gluon_qsa_sparse_attention_merge_gfx950` merges all splits of a (row, head) in
+one pass. The split count rounds down: a grid just over one resident round
+(48 or 80 four-row decode requests) ran its second, partial round with most
+CUs idle and took up to 25% longer.
 
 ### gfx950 QSA indexer
 
 The `qsa_block_scores` and `qsa_block_topk_select` ops, which the `logits`
-algorithm of `qwen4_exp_qsa_block_topk` composes, select these Gluon kernels on
-gfx950. They return the same blocks as the portable Triton registrations; the
-selected ids come out in increasing order rather than by score.
+algorithm of `qwen4_exp_qsa_block_topk` composes, and the `qsa_block_topk_stream`
+op select these Gluon kernels on gfx950. They return the same blocks as the
+portable Triton registrations up to ties and near-ties at the threshold (the
+FP32 head sums associate differently); the selected ids come out in
+increasing order rather than by score.
 
 - `gluon_qsa_block_scores_gfx950` writes `sum_h relu(q_h . k)` for each valid
   compressed block below each row's `complete_blocks`, leaving the tail
   unwritten. Each request run stops at its current maximum frontier.
   A program owns 16 query rows (prefill) or 4 rows (decode) whose index heads
   form the 64- or 16-row MFMA M dimension, and loops over its share of
-  128-block tiles, prefetching the next key tile. Rows of one request are
-  contiguous; a tile spanning requests scores one request run at a time, so
-  ragged batches need no query grouping. Keys are gathered with 64-bit
-  pointers (the compressed cache may exceed 2 GiB). Page ids, request ids and
-  complete-block counts accept int32 or int64. Query and page-table buffers
-  must fit within 2 GiB; their buffer-load offsets remain 32-bit.
-- `gluon_qsa_block_topk_select_gfx950` radix-selects the `topk` largest
-  finite scores per row: four 8-bit passes build LDS-atomic histograms, then
-  one pass writes the ids above the threshold and the first ids equal to it in
-  increasing column order (ties keep the smaller id, like the portable
-  selection). Rows with at most 4096 scores stay in registers; the chunk is a
-  power-of-two bucket of the score width, and wider rows stream in 4096-score
-  chunks. Supplied per-row lengths bound every scan and load; columns beyond
-  them may be uninitialized. Passing `None` scans the full score row.
+  128-block tiles, gathering the next tile's keys and the page ids of the one
+  after while scoring the current tile. Programs go round-robin to the eight
+  XCDs, so a split's key tiles are read by the programs of one XCD and stay in
+  its L2. Rows of one request are contiguous; a tile spanning requests scores
+  one request run at a time, so ragged batches need no query grouping. Keys
+  are gathered with 64-bit pointers (the compressed cache may exceed 2 GiB).
+  Page ids, request ids and complete-block counts accept int32 or int64.
+  Query and page-table buffers must fit within 2 GiB; their buffer-load
+  offsets remain 32-bit.
+- `gluon_qsa_block_topk_select_gfx950` selects the `topk` largest finite
+  scores of a row in one 8-warp program. Its cost follows the per-score
+  instruction count, so each full-row pass is kept short:
+  1. Each lane's `GROUP` consecutive scores form a group (4 for top-512).
+     The `topk`-th largest group maximum bounds the `topk`-th largest score
+     from below; an 11-bit LDS histogram of the group maxima finds the low
+     edge of its bucket.
+  2. The scores at or above that bound are compacted, in column order, into
+     a 4032-entry LDS list (typically `topk` plus a few hundred).
+  3. 8-bit radix passes over the list find the threshold, stopping once the
+     bucket holding the `topk`-th score is taken whole. Digit searches stay
+     within a wave (DPP prefix sums), and masked-off lanes of the LDS
+     histograms and scatters write per-lane spare slots instead of branching.
+  4. The ids above the threshold and the first ids equal to it are written in
+     increasing column order (ties keep the smaller id, like the portable
+     selection).
+
+  Rows whose candidates overflow the list (many equal scores) take four
+  8-bit radix passes over the whole row instead. Rows of at most
+  `GROUP * topk` scores list every finite score. `-inf` and NaN scores are
+  never selected. Supplied per-row lengths bound every load (a buffer
+  descriptor sized to the live prefix); columns beyond them may be
+  uninitialized. Passing `None` scans the full score row. No constexpr
+  depends on the score width or the batch.
+- `launch_gluon_qsa_block_topk_stream_gfx950` (the `qsa_block_topk_stream`
+  registration) scores and selects row chunks whose FP32 scores fit
+  `max_partial_bytes`, reusing one scratch buffer, so it selects exactly what
+  the two kernels above select over all rows. Chunks use the 16-row score
+  tile. A budget below one row of scores is an error.
 
 ### gfx1250 MLA decode
 

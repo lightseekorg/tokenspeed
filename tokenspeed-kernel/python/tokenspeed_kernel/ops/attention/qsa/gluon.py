@@ -35,6 +35,7 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.qsa import (
         launch_gluon_qsa_block_scores_gfx950,
         launch_gluon_qsa_block_topk_select_gfx950,
+        launch_gluon_qsa_block_topk_stream_gfx950,
         launch_gluon_qsa_sparse_attention_gfx950,
     )
 
@@ -138,9 +139,58 @@ if current_platform().is_amd:
         del enable_pdl
         return launch_gluon_qsa_block_topk_select_gfx950(logits, topk, lengths=lengths)
 
+    @register_kernel(
+        "attention",
+        "qsa_block_topk_stream",
+        name="gluon_qsa_block_topk_stream_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    query=dense_tensor_format(torch.bfloat16),
+                    key_cache=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        features=frozenset({"stream"}),
+    )
+    def gluon_qsa_block_topk_stream_gfx950(
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        request_indices: torch.Tensor,
+        complete_blocks: torch.Tensor,
+        *,
+        page_size: int,
+        block_topk: int,
+        queries_per_request: int | None,
+        max_partial_bytes: int,
+        enable_pdl: bool,
+    ) -> torch.Tensor:
+        # Score tiles find their request runs themselves, and GFX950 has no
+        # programmatic dependent launch.
+        del queries_per_request, enable_pdl
+        return launch_gluon_qsa_block_topk_stream_gfx950(
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            page_size=page_size,
+            block_topk=block_topk,
+            max_partial_bytes=max_partial_bytes,
+        )
+
     __all__ = [
         "gluon_qsa_block_scores_gfx950",
         "gluon_qsa_block_topk_select_gfx950",
+        "gluon_qsa_block_topk_stream_gfx950",
         "gluon_qsa_sparse_attention_gfx950",
     ]
 else:

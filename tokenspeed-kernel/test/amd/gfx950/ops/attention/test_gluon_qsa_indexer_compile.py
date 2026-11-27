@@ -40,6 +40,7 @@ def test_gluon_qsa_scores_compile_with_integer_metadata(
         "HEAD_DIM_PAD": max(32, head_dim),
         "BLOCK_Q": block_q,
         "BLOCK_N": 128,
+        "NUM_XCDS": 8,
         "num_warps": 4,
     }
     signature = {name: "i32" for name in fn.arg_names if name not in constants}
