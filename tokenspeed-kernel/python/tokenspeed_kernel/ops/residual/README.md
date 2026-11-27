@@ -35,3 +35,10 @@ Token counts are runtime scalars of the kernels.
 Source count, hidden width, query count, and normalization policy are model properties.
 CPU tests cover equations, boundary transitions, and rounding against an FP64 host reference.
 Shared GPU tests compare the kernels with the CPU equations.
+
+# Shifted mHC boundary (`mhc_shifted_post_pre_boundary`, `mega_mhc`)
+
+`try_mhc_shifted_post_pre_boundary` implements the Blackwell SM100-family 16-CTA DSMEM cluster shifted mHC boundary for 4-stream BF16 residuals whose prepacked TF32->BF16-hi+lo mixer weights come from `prepare_mhc_boundary_weight(weight)` (updated in place after checkpoint reloads).
+- Weights stream directly through shared memory/TMEM via 16-CTA DSMEM cluster reductions and Sinkhorn normalization with zero global split barriers, making every replay deterministic under CUDA graphs and allowing all 14 co-resident clusters (`TILE <= 24`, up to `336` tokens) to finish in a single wave.
+- `warmup_mhc_boundary` compiles all bucketed token tiles `{1, 2, 3, 4, 6, 8, 12, 16, 24}` eagerly before graph capture; uncompiled shapes decline cleanly (`None`) during capture rather than compiling mid-graph.
+- Under `deep_gemm >= 2.8.2`, `try_mhc_shifted_post_pre_norm` and `try_mhc_shifted_post_pre_norm_quantize_fp8` (`mega_mhc`) use per-stream epoch/split-barrier state (`get_split_barriers`), so callers must warm up the eventual capture stream eagerly before CUDA graph / `PrefillGraph` capture.

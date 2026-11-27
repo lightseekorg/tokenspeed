@@ -323,10 +323,13 @@ def test_residual_family_exports_and_modes():
         "post_norm_residual_pre_norm",
         "post_norm_residual_pre_norm_bf16",
         "post_norm_residual_pre_norm_bf16_fp8",
+        "prepare_mhc_boundary_weight",
         "residual_gate_coefficients",
         "set_gated_residual_workspace_region",
+        "try_mhc_shifted_post_pre_boundary",
         "try_mhc_shifted_post_pre_norm",
         "try_mhc_shifted_post_pre_norm_quantize_fp8",
+        "warmup_mhc_boundary",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     residual_modes = {
@@ -344,6 +347,7 @@ def test_residual_family_exports_and_modes():
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "mhc_shifted_post_pre_boundary",
         "mhc_shifted_post_pre_norm",
         "mhc_shifted_post_pre_norm_quantize_fp8",
         "normalized_dot_gate",

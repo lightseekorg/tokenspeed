@@ -920,6 +920,109 @@ def try_mhc_shifted_post_pre_norm_quantize_fp8(
     )
 
 
+def prepare_mhc_boundary_weight(weight: _torch.Tensor) -> _torch.Tensor | None:
+    """Pack FP32 ``[24, 4 * hidden]`` mHC weights for Blackwell ``mhc_boundary``.
+
+    Returns the packed ``int32`` CUDA buffer when the platform and shape match
+    the 16-CTA DSMEM cluster contract, or ``None`` otherwise.
+    """
+    from tokenspeed_kernel.ops.residual._cute_dsl.mhc_boundary import (
+        prepare_boundary_weight_cute_dsl,
+    )
+
+    return prepare_boundary_weight_cute_dsl(weight)
+
+
+def warmup_mhc_boundary(
+    hidden: int,
+    sinkhorn_iters: int,
+    *,
+    device: _torch.device | str = "cuda",
+) -> None:
+    """Pre-compile all bucketed ``mhc_boundary`` tiles before graph capture."""
+    from tokenspeed_kernel.ops.residual._cute_dsl.mhc_boundary import (
+        warmup_boundary_cute_dsl,
+    )
+
+    warmup_boundary_cute_dsl(hidden, sinkhorn_iters, device=device)
+
+
+def try_mhc_shifted_post_pre_boundary(
+    x: _torch.Tensor,
+    residual: _torch.Tensor,
+    pre: _torch.Tensor,
+    post: _torch.Tensor,
+    comb: _torch.Tensor,
+    boundary_weight: _torch.Tensor,
+    scale: _torch.Tensor,
+    base: _torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_weight: _torch.Tensor,
+    norm_eps: float,
+) -> (
+    tuple[
+        _torch.Tensor,
+        _torch.Tensor,
+        _torch.Tensor,
+        _torch.Tensor,
+        _torch.Tensor,
+    ]
+    | None
+):
+    """Run Blackwell DSMEM cluster shifted mHC boundary with prepacked weights.
+
+    Takes the same operands as ``try_mhc_shifted_post_pre_norm`` except
+    ``boundary_weight`` comes from ``prepare_mhc_boundary_weight(weight)``.
+    Returns ``(new_residual, layer_input, new_pre, new_post, new_comb)``, or
+    ``None`` when ineligible or capture-time JIT compilation is avoided.
+    """
+    from tokenspeed_kernel.ops.residual._cute_dsl.mhc_boundary import (
+        mhc_boundary_eligible,
+    )
+
+    if not mhc_boundary_eligible(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        boundary_weight,
+        scale,
+        base,
+        sinkhorn_iters,
+        norm_weight,
+    ):
+        return None
+    try:
+        kernel = select_kernel(
+            "residual",
+            "mhc_shifted_post_pre_boundary",
+            format_signature(residual=dense_tensor_format(residual.dtype)),
+            traits=None,
+            override=None,
+            solution=None,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        boundary_weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+    )
+
+
 def mhc_apply_pre(
     residual: _torch.Tensor,
     pre: _torch.Tensor,
@@ -1219,6 +1322,7 @@ def mhc_fused_hc(
 # isort: off
 import tokenspeed_kernel.ops.residual.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual._cute_dsl.gated_boundary  # noqa: E402,F401
+import tokenspeed_kernel.ops.residual._cute_dsl.mhc_boundary  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual._triton.gated_boundary  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual._triton.gated_boundary_fp8  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.cute_fused  # noqa: E402,F401
@@ -1257,10 +1361,13 @@ __all__ = [
     "post_norm_residual_pre_norm",
     "post_norm_residual_pre_norm_bf16",
     "post_norm_residual_pre_norm_bf16_fp8",
+    "prepare_mhc_boundary_weight",
     "residual_gate_coefficients",
     "set_gated_residual_workspace_region",
+    "try_mhc_shifted_post_pre_boundary",
     "try_mhc_shifted_post_pre_norm",
     "try_mhc_shifted_post_pre_norm_quantize_fp8",
+    "warmup_mhc_boundary",
 ]
 
 

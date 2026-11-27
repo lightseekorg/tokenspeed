@@ -1018,8 +1018,14 @@ same uniform padded decode counts as their target batches.
 
 V4.1 completes deferred HC posts and reductions before stage handoffs or
 Engram updates. The fixed graph input state contains only completed residuals.
-Prefill warmup runs on the eventual capture stream because MegaMHC initializes
-per-stream barriers. Allocation observers wrap capture alone, leaving eager
+Decode replaces its 80 stream-forked sublayer boundaries with the single-wave
+Blackwell DSMEM cluster kernel (`try_mhc_shifted_post_pre_boundary`, up to 336
+tokens) using weights prepacked in place inside the `weights` memory-saver
+region and pre-warmed per `(hidden, sinkhorn_iters, device)`. Prefill warmup
+runs on the eventual capture stream because MegaMHC (`deep_gemm >= 2.8.2`)
+initializes per-stream epoch split barriers on first call, allowing both
+`PrefillGraph` and eager prefill boundaries (including FP8 quantization for
+`wq_a_wkv`) to share one fused kernel. Allocation observers wrap capture alone, leaving eager
 warmup allocations in utilization headroom. Fused HC all-reduce admission
 respects both deterministic and batch-invariant collective settings. Empty
 consumer rows carry no deferred post. Cache-only narrowing completes the incoming

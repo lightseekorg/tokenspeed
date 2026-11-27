@@ -213,3 +213,49 @@ def test_shifted_mhc_unsupported_returns_none(monkeypatch, case):
             SimpleNamespace(is_nvidia=True, arch_version=SimpleNamespace(major=9)),
         )
     assert try_mhc_shifted_post_pre_norm(**args) is None
+
+
+@pytest.mark.parametrize("quantize_fp8", [False, True])
+@pytest.mark.parametrize("tokens", [48, 1024])
+def test_shifted_mhc_cudagraph_replay_after_stream_warmup(tokens, quantize_fp8):
+    args = _inputs(tokens, 5120, 20)
+    call = (
+        try_mhc_shifted_post_pre_norm_quantize_fp8
+        if quantize_fp8
+        else try_mhc_shifted_post_pre_norm
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # First eager call on ``stream`` initializes DeepGEMM per-stream barriers.
+        for _ in range(2):
+            assert call(**args) is not None
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = call(**args)
+    assert captured is not None
+
+    for _ in range(3):
+        args["x"].normal_()
+        args["residual"].normal_()
+        args["pre"].uniform_()
+        args["post"].uniform_()
+        args["comb"].copy_(torch.rand_like(args["comb"]).softmax(-2))
+        graph.replay()
+        torch.cuda.synchronize(stream)
+        for got, ref in zip(captured[:5], _reference(args), strict=True):
+            torch.testing.assert_close(got, ref, atol=0.02, rtol=0.01)
+        if quantize_fp8:
+            exp_sf, exp_codes = _group32_reference(captured[1])
+            packed = captured[6]
+            shifts = torch.arange(4, device=packed.device) * 8
+            got_sf = ((packed[..., None] >> shifts) & 255).flatten(-2).to(torch.int32)
+            torch.testing.assert_close(got_sf, exp_sf, atol=0, rtol=0)
+            torch.testing.assert_close(
+                captured[5].view(torch.uint8),
+                exp_codes.view(torch.uint8),
+                atol=0,
+                rtol=0,
+            )
