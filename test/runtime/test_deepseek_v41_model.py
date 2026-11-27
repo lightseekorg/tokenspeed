@@ -5052,7 +5052,9 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
     )
     monkeypatch.setattr(v41, "current_platform", lambda: platform)
-    moe = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    moe = v41.DeepseekV41MoE(
+        config, mapping, v41.v41_mxfp8_config(_quant()), 0, "ffn", None
+    )
     shared = moe.shared_experts
     assert shared.gate_up_proj.weight.dtype == torch.float8_e4m3fn
     if case == "limit_differs":
@@ -5110,7 +5112,9 @@ def test_mega_moe_pads_unaligned_shared_expert_losslessly(monkeypatch, accept):
         current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
     )
     monkeypatch.setattr(v41, "current_platform", lambda: platform)
-    moe = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    moe = v41.DeepseekV41MoE(
+        config, mapping, v41.v41_mxfp8_config(_quant()), 0, "ffn", None
+    )
     assert moe.experts.intermediate_size == 640
     shared = moe.shared_experts
     gate_up, down = shared.gate_up_proj, shared.down_proj
@@ -5222,7 +5226,9 @@ def test_mega_moe_declines_fusing_dense_tp_sharded_shared_expert(
         current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
     )
     monkeypatch.setattr(v41, "current_platform", lambda: platform)
-    moe = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    moe = v41.DeepseekV41MoE(
+        config, mapping, v41.v41_mxfp8_config(_quant()), 0, "ffn", None
+    )
     shared = moe.shared_experts
     gate_up, down = shared.gate_up_proj, shared.down_proj
     assert gate_up.weight.shape == (intermediate, 256)
