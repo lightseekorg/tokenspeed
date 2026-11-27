@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -6032,9 +6033,9 @@ class HybridFullAndStateRequestAwareSuite : public SchedulerTestSuite {
 protected:
     static constexpr std::int32_t kP = 128;
 
-    SchedulerConfig MakeHybridConfig(std::int32_t total_lcm_pages, std::int32_t full_packing,
-                                     std::int32_t full_shards = 1, bool disable_prefix_cache = false,
-                                     bool enable_host_and_snapshot = false, std::int32_t state_packing = 1) {
+    SchedulerConfig MakeHybridConfig(std::int32_t total_lcm_pages, std::int32_t full_packing, std::int32_t full_shards,
+                                     bool disable_prefix_cache, bool enable_host_and_snapshot,
+                                     std::int32_t state_packing = 1) {
         SchedulerConfig cfg{};
         cfg.prefix_granularity = kP;
         cfg.device_allocator.total_pages = total_lcm_pages + 1;
@@ -6075,7 +6076,10 @@ protected:
         return WithHostPackingFromDevice(cfg);
     }
 
-    SchedulerConfig MakeConfig() override { return MakeHybridConfig(/*total_lcm_pages=*/64, /*full_packing=*/12); }
+    SchedulerConfig MakeConfig() override {
+        return MakeHybridConfig(/*total_lcm_pages=*/64, /*full_packing=*/12, /*full_shards=*/1,
+                                /*disable_prefix_cache=*/false, /*enable_host_and_snapshot=*/false);
+    }
 
     static std::int32_t ParentOf(std::int32_t page, std::int32_t packing) { return (page - 1) / packing + 1; }
 
@@ -6119,7 +6123,8 @@ protected:
 TEST_F(HybridFullAndStateRequestAwareSuite, InterleavedDecodeIsolatesParentsAndReclaimsWholeParentsForState) {
     for (const std::int32_t packing : {12, 6}) {
         SCOPED_TRACE(::testing::Message() << "packing=" << packing);
-        config_ = MakeHybridConfig(/*total_lcm_pages=*/36, packing, /*full_shards=*/1, /*disable_prefix_cache=*/true);
+        config_ = MakeHybridConfig(/*total_lcm_pages=*/36, packing, /*full_shards=*/1, /*disable_prefix_cache=*/true,
+                                   /*enable_host_and_snapshot=*/false);
         scheduler_ = std::make_unique<Scheduler>(config_);
 
         // Four concurrent requests start with a 1-page prompt and decode
@@ -6181,7 +6186,7 @@ TEST_F(HybridFullAndStateRequestAwareSuite, TightCapacityReservesEmptyParentsFor
     // reserved_empty_parents, so full must fall back to existing holes instead
     // of stealing empty parents needed by state0/state1/state2.
     config_ = MakeHybridConfig(/*total_lcm_pages=*/17, /*full_packing=*/12, /*full_shards=*/1,
-                               /*disable_prefix_cache=*/false);
+                               /*disable_prefix_cache=*/false, /*enable_host_and_snapshot=*/false);
     scheduler_ = std::make_unique<Scheduler>(config_);
 
     Submit(RequestSpec{.request_id = "seed", .tokens = MakeTokens(kP, 100), .max_new_tokens = 1});
@@ -6243,7 +6248,8 @@ TEST_F(HybridFullAndStateRequestAwareSuite, TightCapacityReservesEmptyParentsFor
 
 TEST_F(HybridFullAndStateRequestAwareSuite, MidPageStateCheckpointHitPrivatizeTailClustersWithGrowthAndDecode) {
     constexpr std::int32_t kPacking = 12;
-    config_ = MakeHybridConfig(/*total_lcm_pages=*/32, kPacking, /*full_shards=*/1, /*disable_prefix_cache=*/false);
+    config_ = MakeHybridConfig(/*total_lcm_pages=*/32, kPacking, /*full_shards=*/1, /*disable_prefix_cache=*/false,
+                               /*enable_host_and_snapshot=*/false);
     scheduler_ = std::make_unique<Scheduler>(config_);
 
     // Seed finishes at 150 tokens (1 full page + 22-token tail), publishing
@@ -6360,7 +6366,8 @@ TEST_F(HybridFullAndStateRequestAwareSuite, KvParallelShardedHybridBalancesShard
     constexpr std::int32_t kPacking = 12;
     for (const std::int32_t shards : {2, 4}) {
         SCOPED_TRACE(::testing::Message() << "shards=" << shards);
-        config_ = MakeHybridConfig(/*total_lcm_pages=*/32, kPacking, shards, /*disable_prefix_cache=*/true);
+        config_ = MakeHybridConfig(/*total_lcm_pages=*/32, kPacking, shards, /*disable_prefix_cache=*/true,
+                                   /*enable_host_and_snapshot=*/false);
         scheduler_ = std::make_unique<Scheduler>(config_);
 
         const std::vector<std::string> ids{"r0", "r1", "r2"};
@@ -6718,7 +6725,7 @@ TEST_F(HybridFullAndStateRequestAwareSuite, HighPackingGroupStaysCompactHoleFirs
         constexpr std::int32_t kFullPacking = 12;
         constexpr std::int32_t kBoundaryPacking = CacheStore::kMaxRequestAwarePacking;
         SchedulerConfig cfg = MakeHybridConfig(kTotalLcmPages, kFullPacking, /*full_shards=*/1,
-                                               /*disable_prefix_cache=*/true);
+                                               /*disable_prefix_cache=*/true, /*enable_host_and_snapshot=*/false);
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "boundary_full",
             .block_granularity = kP,
@@ -6782,7 +6789,8 @@ TEST_F(HybridFullAndStateRequestAwareSuite, SmallWindowSlidingGroupStaysCompactH
     constexpr std::int32_t kExactWindowPacking = 5;  // G=64, W=256 -> ceil(255/64) + 1 = 5
     constexpr std::int32_t kJustBelowPacking = 6;    // G=64, W=256, no sink -> 5 < 6
     constexpr std::int32_t kSinkBoostPacking = 6;    // G=64, W=256, sink=64 -> 5 + 1 = 6
-    config_ = MakeHybridConfig(kTotalLcmPages, kFullPacking, /*full_shards=*/1, /*disable_prefix_cache=*/true);
+    config_ = MakeHybridConfig(kTotalLcmPages, kFullPacking, /*full_shards=*/1, /*disable_prefix_cache=*/true,
+                               /*enable_host_and_snapshot=*/false);
     // Keep one state group so 3 concurrent requests across all test groups fit easily.
     config_.cache_groups.resize(2);
     // Small tail window (G=128, W=8 -> steady-state 2 < 16): hole-first.
