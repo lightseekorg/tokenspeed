@@ -40,8 +40,11 @@ from tokenspeed_kernel.ops.attention.gdn import (  # noqa: E402
 )
 from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm  # noqa: E402
 from tokenspeed_kernel.selection import select_kernel  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode import (  # noqa: E402
-    gluon_gdn_decode_gfx950,
+from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode_mtp import (  # noqa: E402
+    gluon_gdn_decode_mtp_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode_step import (  # noqa: E402
+    gluon_gdn_decode_step_gfx950,
 )
 
 DEVICE = "cuda"
@@ -96,7 +99,7 @@ def _reference(q, k, v, a, b, A_log, dt_bias, state):
     [
         ("gdn_decode_step", 128, "gluon_gdn_decode_step_gfx950"),
         ("gdn_decode_step", 256, "gluon_gdn_decode_step_gfx950"),
-        ("gdn_decode_step", 272, "triton_gdn_decode_step"),
+        ("gdn_decode_step", 272, "gluon_gdn_decode_step_gfx950"),
         ("gdn_decode_step", 136, "triton_gdn_decode_step"),
         ("gdn_decode_mtp", 128, "gluon_gdn_decode_mtp_gfx950"),
         ("gdn_decode_mtp", 256, "gluon_gdn_decode_mtp_gfx950"),
@@ -105,8 +108,9 @@ def _reference(q, k, v, a, b, A_log, dt_bias, state):
     ],
 )
 def test_value_heads_the_launcher_rejects_select_triton(op, value_head_dim, expected):
-    """Value heads outside the launcher's multiples of 16 up to 256 route to
-    the Triton solution instead of failing in the gfx950 launcher."""
+    """Value heads outside a launcher's multiples of 16 (up to 256 for the
+    verify) route to the Triton solution instead of failing in the gfx950
+    launcher."""
     probe = torch.empty(0, dtype=torch.bfloat16, device="meta")
     traits = {
         "head_dim": D,
@@ -124,6 +128,41 @@ def test_value_heads_the_launcher_rejects_select_triton(op, value_head_dim, expe
         traits=traits,
     )
     assert kernel.name == expected
+
+
+def test_decode_step_bf16_pool_far_rows():
+    """TP1 decode on a BF16 pool with rows past 2^31 elements: the row offset
+    is computed in int64, a negative read row starts from a zero state, the
+    state goes to the write rows, and a negative write row is skipped."""
+    batch, row_elements = 4, HV_TP1 * D * D
+    rows = (2**31) // row_elements + 4
+    pool = torch.zeros(rows, HV_TP1, D, D, device=DEVICE, dtype=torch.bfloat16)
+    gen = torch.Generator(device=DEVICE).manual_seed(21)
+    reads = torch.tensor([rows - 1, -1, rows - 4, 0], device=DEVICE, dtype=torch.int32)
+    writes = torch.tensor([rows - 2, rows - 3, -1, 1], device=DEVICE, dtype=torch.int32)
+    live = reads >= 0
+    pool[reads[live].long()] = (
+        torch.randn(int(live.sum()), HV_TP1, D, D, device=DEVICE, generator=gen) * 0.3
+    ).bfloat16()
+    initial = pool[reads.clamp(min=0).long()].double()
+    initial[~live] = 0
+    read_rows = pool[reads[live].long()].clone()
+    q, k, v, a, b, A_log, dt_bias = _packed_inputs(
+        batch, 1, seed=22, heads=H_TP1, value_heads=HV_TP1
+    )
+    out = gdn_decode_step(
+        q=q, k=k, v=v, a=a, b=b, A_log=A_log, dt_bias=dt_bias,
+        initial_state=pool, initial_state_indices=reads,
+        output_state_indices=writes,
+    )  # fmt: skip
+    expected, states = _reference(q, k, v, a, b, A_log, dt_bias, initial)
+    torch.testing.assert_close(out.double(), expected, rtol=4e-3, atol=2e-5)
+    for n in (0, 1, 3):
+        torch.testing.assert_close(
+            pool[int(writes[n])].double(), states[0, n], rtol=8e-3, atol=1e-4
+        )
+    # Read rows are not written (request 2's write row is skipped).
+    assert torch.equal(pool[reads[live].long()], read_rows)
 
 
 def test_verify_reads_committed_pool_and_stages_scratch():
@@ -187,7 +226,9 @@ def test_decode_and_verify_compile_once_across_batch_sizes():
 
     run(1)
     run(16)
-    with assert_no_triton_compile(gluon_gdn_decode_gfx950):
+    with assert_no_triton_compile(
+        gluon_gdn_decode_step_gfx950, gluon_gdn_decode_mtp_gfx950
+    ):
         for batch in (2, 3, 5, 8, 13, 17):
             run(batch)
 
@@ -256,7 +297,7 @@ def test_verify_compiles_once_per_token_bucket():
         )  # fmt: skip
 
     run(1, 4)
-    with assert_no_triton_compile(gluon_gdn_decode_gfx950):
+    with assert_no_triton_compile(gluon_gdn_decode_mtp_gfx950):
         for batch, tokens in ((2, 3), (7, 4), (5, 3)):
             run(batch, tokens)
 

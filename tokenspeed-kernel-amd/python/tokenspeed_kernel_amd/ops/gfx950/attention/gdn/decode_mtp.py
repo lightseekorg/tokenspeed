@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GFX950 Gluon GDN decode / MTP-verify recurrence over a K-last state pool."""
+"""GFX950 Gluon GDN MTP-verify recurrence (chunk form) over a K-last state pool."""
 
 from __future__ import annotations
 
@@ -28,19 +28,19 @@ from tokenspeed_kernel_amd._triton import gl, gluon, triton
 cdna4 = gl.amd.cdna4
 
 # Where each token's post-update state goes (STEP_MODE).
-GDN_DECODE_STEPS_NONE = 0
+GDN_DECODE_MTP_STEPS_NONE = 0
 # Row ``step_indices[n, t]`` of ``step_states``.
-GDN_DECODE_STEPS_INDEXED = 1
+GDN_DECODE_MTP_STEPS_INDEXED = 1
 # Row ``n * T + t`` of a dense ``step_states`` buffer.
-GDN_DECODE_STEPS_DENSE = 2
+GDN_DECODE_MTP_STEPS_DENSE = 2
 
 # Tokens of one launch: the WY form solves all of them at once.
-GDN_DECODE_MAX_TOKENS = 8
+GDN_DECODE_MTP_MAX_TOKENS = 8
 # Head dims the launcher accepts; the registrations declare the same sets so
 # selection routes other shapes to another solution.
-GDN_DECODE_KEY_DIM = 128
-GDN_DECODE_VALUE_DIMS = frozenset(range(16, 257, 16))
-GDN_DECODE_STATE_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float32})
+GDN_DECODE_MTP_KEY_DIM = 128
+GDN_DECODE_MTP_VALUE_DIMS = frozenset(range(16, 257, 16))
+GDN_DECODE_MTP_STATE_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float32})
 # Waves per (request, value head), by state element bytes. A BF16 head
 # (128 VGPRs per lane in one wave) stays in one wave, so the T x T algebra
 # runs once per head; an FP32 head would take all 256 VGPRs of one wave, so
@@ -48,7 +48,7 @@ GDN_DECODE_STATE_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float3
 _NUM_WARPS_BY_STATE_BYTES = {2: 1, 4: 4}
 
 
-def _gdn_decode_launch_metadata(grid, kernel, args):
+def _gdn_decode_mtp_launch_metadata(grid, kernel, args):
     """Report the recurrence's state traffic and FLOPs to Proton."""
     q, v = args["q"], args["v"]
     batch, tokens = q.shape[0], args["T"]
@@ -269,8 +269,8 @@ def _gdn_decode_write_states(state_raw, k_head, v_head, a_head, b_head, neg_a, b
         )
 
 
-@gluon.jit(launch_metadata=_gdn_decode_launch_metadata, do_not_specialize=("T",))
-def gluon_gdn_decode_gfx950(
+@gluon.jit(launch_metadata=_gdn_decode_mtp_launch_metadata, do_not_specialize=("T",))
+def gluon_gdn_decode_mtp_gfx950(
     q,
     k,
     v,
@@ -534,7 +534,7 @@ def gluon_gdn_decode_gfx950(
         )  # fmt: skip
 
 
-def launch_gluon_gdn_decode_gfx950(
+def launch_gluon_gdn_decode_mtp_gfx950(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -558,7 +558,7 @@ def launch_gluon_gdn_decode_gfx950(
 
     Args:
         q, k: ``[B, T, H, 128]`` with contiguous heads (any batch/token
-            strides), ``T <= GDN_DECODE_MAX_TOKENS``.
+            strides), ``T <= GDN_DECODE_MTP_MAX_TOKENS``.
         v: ``[B, T, HV, V]`` with contiguous heads, V a multiple of 16 up
             to 256.
         a, b: ``[B, T, HV]`` decay and beta logits (any strides).
@@ -585,11 +585,11 @@ def launch_gluon_gdn_decode_gfx950(
     """
     batch, tokens, heads, key_dim = q.shape
     value_heads, value_dim = v.shape[2], v.shape[3]
-    if key_dim != GDN_DECODE_KEY_DIM or value_dim not in GDN_DECODE_VALUE_DIMS:
+    if key_dim != GDN_DECODE_MTP_KEY_DIM or value_dim not in GDN_DECODE_MTP_VALUE_DIMS:
         raise ValueError(f"unsupported GDN head dims K={key_dim} V={value_dim}")
-    if not 1 <= tokens <= GDN_DECODE_MAX_TOKENS:
+    if not 1 <= tokens <= GDN_DECODE_MTP_MAX_TOKENS:
         raise ValueError(
-            f"the gfx950 GDN decode runs 1..{GDN_DECODE_MAX_TOKENS} tokens, got {tokens}"
+            f"the gfx950 GDN verify runs 1..{GDN_DECODE_MTP_MAX_TOKENS} tokens, got {tokens}"
         )
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if tensor.stride(3) != 1 or tensor.stride(2) != tensor.shape[3]:
@@ -605,7 +605,7 @@ def launch_gluon_gdn_decode_gfx950(
             or not pool[0].is_contiguous()
         ):
             raise ValueError(f"{name} must be a K-last [rows, HV, V, K] pool")
-        if pool.dtype not in GDN_DECODE_STATE_DTYPES:
+        if pool.dtype not in GDN_DECODE_MTP_STATE_DTYPES:
             raise ValueError(f"unsupported GDN {name} dtype {pool.dtype}")
     output_norm = norm_gate is not None
     if output_norm != (norm_weight is not None) or output_norm != (
@@ -626,15 +626,17 @@ def launch_gluon_gdn_decode_gfx950(
     if batch == 0:
         return out
 
-    step_mode = GDN_DECODE_STEPS_NONE
+    step_mode = GDN_DECODE_MTP_STEPS_NONE
     if step_states is not None:
         step_mode = (
-            GDN_DECODE_STEPS_DENSE if step_indices is None else GDN_DECODE_STEPS_INDEXED
+            GDN_DECODE_MTP_STEPS_DENSE
+            if step_indices is None
+            else GDN_DECODE_MTP_STEPS_INDEXED
         )
     # Tokens solved together, bucketed so a server's fixed T compiles once.
     token_block = triton.next_power_of_2(tokens)
     num_warps = _NUM_WARPS_BY_STATE_BYTES[state.element_size()]
-    gluon_gdn_decode_gfx950[(batch * value_heads,)](
+    gluon_gdn_decode_mtp_gfx950[(batch * value_heads,)](
         q,
         k,
         v,

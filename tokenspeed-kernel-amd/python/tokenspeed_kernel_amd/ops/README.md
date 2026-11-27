@@ -2057,14 +2057,30 @@ scheduler, which is 3–5% faster there.
 
 ### gfx950 GDN decode and MTP verify
 
-`gluon_gdn_decode_gfx950` runs the sigmoid-gated delta-rule recurrence for
-`gdn_decode_step` (one token) and chain `gdn_decode_mtp` (T tokens) over the
-K-last recurrent-state pool. Draft trees, chains longer than 8 tokens, and
-head dims or pool dtypes outside the contract below stay on the Triton kernel:
-the registrations declare these limits as traits, so selection routes around
-them instead of reaching the launcher's checks.
+Two kernels run the sigmoid-gated delta-rule recurrence over the K-last
+recurrent-state pool: `gluon_gdn_decode_step_gfx950` for `gdn_decode_step`
+(one token) and `gluon_gdn_decode_mtp_gfx950` for chain `gdn_decode_mtp` (T
+tokens). Draft trees, chains longer than 8 tokens, and head dims or pool
+dtypes outside the contracts below stay on the Triton kernel: the
+registrations declare these limits as traits, so selection routes around them
+instead of reaching the launchers' checks.
 
-#### Contract
+#### Decode step
+
+One token needs no chunk algebra, and the chunk form's T x T setup and
+one-program-per-head grid made it slower than the per-token update at T = 1.
+Each one-wave program owns 16 value rows of one (request, value head): each
+lane holds a `[2, 16]` patch of the FP32 `[16, 128]` state tile (four 4-wide K
+runs, 32 apart), so every 16-byte state access fills whole 128-byte lines and
+a reduction over K is 16 in-register FMAs plus a three-step butterfly. The
+step decays the state, applies the rank-1 delta update, writes the output and
+stores the state to the write row (a negative row is skipped). q/k are
+`[B, 1, H, 128]`, v is `[B, 1, HV, V]` with V any multiple of 16 (the trait
+enumerates up to 1024), heads contiguous with any batch stride; the pool is
+BF16, FP16 or FP32 with any row stride. No value derived from the batch is a
+constexpr.
+
+#### Verify contract
 
 - q/k are `[B, T, H, 128]` and v is `[B, T, HV, V]` (V a multiple of 16, at
   most 256), with contiguous heads and any batch/token strides, so packed
@@ -2083,7 +2099,7 @@ them instead of reaching the launcher's checks.
   away. The gate is loaded behind the state so it holds no registers through
   the algebra.
 
-#### Algorithm
+#### Verify algorithm
 
 One wave owns one (request, value head). The outputs use the chunk (WY)
 form: with normalized q/k, cumulative decays `G`, `D[t, i] = G_t / G_i`,
@@ -2101,8 +2117,8 @@ needed about 16 vector FLOPs per state entry for T = 4 and was VALU bound.
 
 All activation loads are issued before the state loads and the algebra's
 results are parked in LDS before the state MFMA, so the algebra overlaps the
-state's latency instead of following it. State writes (decode steps,
-non-ReplaySSM verify) replay the tokens on the FP32 state in a blocked
+state's latency instead of following it. State writes (non-ReplaySSM
+verify) replay the tokens on the FP32 state in a blocked
 layout; the ReplaySSM verify writes none.
 
 ### KDA chunked prefill (gfx950 / gfx1250)

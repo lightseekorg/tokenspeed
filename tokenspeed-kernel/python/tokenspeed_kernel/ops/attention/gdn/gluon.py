@@ -37,12 +37,18 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
 
 if current_platform().is_amd:
-    from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode import (
-        GDN_DECODE_KEY_DIM,
-        GDN_DECODE_MAX_TOKENS,
-        GDN_DECODE_STATE_DTYPES,
-        GDN_DECODE_VALUE_DIMS,
-        launch_gluon_gdn_decode_gfx950,
+    from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode_mtp import (
+        GDN_DECODE_MTP_KEY_DIM,
+        GDN_DECODE_MTP_MAX_TOKENS,
+        GDN_DECODE_MTP_STATE_DTYPES,
+        GDN_DECODE_MTP_VALUE_DIMS,
+        launch_gluon_gdn_decode_mtp_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode_step import (
+        GDN_DECODE_STEP_KEY_DIM,
+        GDN_DECODE_STEP_STATE_DTYPES,
+        GDN_DECODE_STEP_VALUE_DIMS,
+        launch_gluon_gdn_decode_step_gfx950,
     )
 
     _GFX950 = CapabilityRequirement(
@@ -62,9 +68,9 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "head_dim": frozenset({GDN_DECODE_KEY_DIM}),
-            "value_head_dim": GDN_DECODE_VALUE_DIMS,
-            "state_dtype": GDN_DECODE_STATE_DTYPES,
+            "head_dim": frozenset({GDN_DECODE_STEP_KEY_DIM}),
+            "value_head_dim": GDN_DECODE_STEP_VALUE_DIMS,
+            "state_dtype": GDN_DECODE_STEP_STATE_DTYPES,
             "padding_safe": frozenset({False, True}),
             "strided_qkv": frozenset({False, True}),
             "strided_state": frozenset({False, True}),
@@ -86,8 +92,11 @@ if current_platform().is_amd:
         use_qk_l2norm: bool,
     ) -> torch.Tensor:
         """gfx950 ``gdn_decode_step``: the state goes to ``output_state_indices``
-        when given, else back to ``initial_state_indices``."""
-        return launch_gluon_gdn_decode_gfx950(
+        when given, else back to ``initial_state_indices``.
+
+        One token needs no chunk algebra, so the step keeps its own per-token
+        kernel rather than the verify's chunk form."""
+        return launch_gluon_gdn_decode_step_gfx950(
             q,
             k,
             v,
@@ -97,18 +106,13 @@ if current_platform().is_amd:
             dt_bias,
             state=initial_state,
             read_indices=initial_state_indices,
-            final_indices=(
+            write_indices=(
                 initial_state_indices
                 if output_state_indices is None
                 else output_state_indices
             ),
-            step_states=None,
-            step_indices=None,
             scale=q.shape[-1] ** -0.5 if scale is None else scale,
             use_qk_l2norm=use_qk_l2norm,
-            norm_gate=None,
-            norm_weight=None,
-            norm_eps=None,
         )
 
     @register_kernel(
@@ -122,13 +126,13 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "head_dim": frozenset({GDN_DECODE_KEY_DIM}),
-            "value_head_dim": GDN_DECODE_VALUE_DIMS,
-            "state_dtype": GDN_DECODE_STATE_DTYPES,
+            "head_dim": frozenset({GDN_DECODE_MTP_KEY_DIM}),
+            "value_head_dim": GDN_DECODE_MTP_VALUE_DIMS,
+            "state_dtype": GDN_DECODE_MTP_STATE_DTYPES,
             "padding_safe": frozenset({False, True}),
             "tree": frozenset({False}),
             # The chunk (WY) form solves all tokens of a request at once.
-            "verify_tokens": frozenset(range(1, GDN_DECODE_MAX_TOKENS + 1)),
+            "verify_tokens": frozenset(range(1, GDN_DECODE_MTP_MAX_TOKENS + 1)),
             "output_norm": frozenset({False, True}),
             "separate_output_state": frozenset({False, True}),
             "strided_qkv": frozenset({False, True}),
@@ -172,7 +176,7 @@ if current_platform().is_amd:
         elif intermediate_states_buffer is not None:
             step_states = intermediate_states_buffer.view(-1, *initial_state.shape[1:])
         write_back = not disable_state_update and output_state_indices is None
-        return launch_gluon_gdn_decode_gfx950(
+        return launch_gluon_gdn_decode_mtp_gfx950(
             q,
             k,
             v,
