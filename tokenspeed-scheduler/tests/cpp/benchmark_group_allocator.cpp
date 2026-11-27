@@ -88,8 +88,9 @@ Sample Advance(GroupAllocator& allocator, BlockPool& pool, std::vector<BlockTabl
     const auto cpu_start = ThreadCpuNs();
     const auto start = Clock::now();
     for (auto& table : tables) {
-        success &= allocator.Acquire(pool, table, AcquirePlan{.num_blocks = append},
-                                     /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{});
+        success &= allocator.Acquire(
+            pool, table, AcquirePlan{.num_blocks = append}, /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{},
+            ParentAffinity{.preferred_parent = GroupAllocator::PreferredParent(table), .reserved_empty_parents = 0});
         allocator.ReclaimExpired(pool, table, table.NumBlocks() - kRetained);
     }
     const auto end = Clock::now();
@@ -139,7 +140,9 @@ Result Measure(int batch, int initial_slots, int append, int shards) {
                                   AcquirePlan{.num_blocks = kRetained,
                                               .suffix_start = initial_slots - kRetained,
                                               .table_blocks_after = initial_slots},
-                                  /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{}),
+                                  /*first_placed_slot=*/table.NumBlocks(), /*placed=*/{},
+                                  ParentAffinity{.preferred_parent = GroupAllocator::PreferredParent(table),
+                                                 .reserved_empty_parents = 0}),
                 "sparse setup failed");
     }
     Verify(allocator, pool, tables, initial_slots);

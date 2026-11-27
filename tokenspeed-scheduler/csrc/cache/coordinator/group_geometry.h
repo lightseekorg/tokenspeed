@@ -130,6 +130,22 @@ public:
         return skipped <= 0 ? 0 : skipped / BlockGranularity();
     }
 
+    // Steady-state blocks a single request retains in a sliding-window group at
+    // decode_input_tokens == 1: ceil((W - 1) / G) + 1 active window blocks plus
+    // its pinned sink blocks. Widening to int64 avoids int32 overflow when
+    // sliding_window approaches INT32_MAX. This is a placement heuristic rather
+    // than a strict peak (in-flight prefill chunks and speculative verify width
+    // can transiently hold more blocks).
+    std::int64_t SteadyStateWindowBlocks(const CacheGroupSpec& spec, std::int32_t sink_blocks) const {
+        _assert(spec.attn_kind == AttnKind::kSlidingWindow, "only sliding-window groups have a window size");
+        _assert(spec.sliding_window > 0, "retention window must be > 0");
+        _assert(sink_blocks >= 0, "sink block count must be non-negative");
+        const std::int64_t lookback = static_cast<std::int64_t>(spec.sliding_window) - 1;
+        const std::int64_t granularity = BlockGranularity();
+        return lookback / granularity + (lookback % granularity != 0 ? 1 : 0) + 1 +
+               static_cast<std::int64_t>(sink_blocks);
+    }
+
     // The planner supplies the post-match table length before the hit is
     // installed; execution supplies the live table length. Both count the
     // same fresh head and suffix blocks.

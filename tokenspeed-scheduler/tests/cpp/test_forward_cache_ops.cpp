@@ -1144,7 +1144,8 @@ TEST(BlockTablePageIdsExport, ASwappedSlotExportsTheFreshBlock) {
     const std::vector<std::int32_t> before = allocator.BlockTablePageIds(table);
 
     const CacheBlockRef replaced =
-        allocator.SwapInFreshBlock(pool, table, /*slot=*/1, /*available_tokens=*/0, /*destination=*/std::nullopt);
+        allocator.SwapInFreshBlock(pool, table, /*slot=*/1, /*available_tokens=*/0, /*destination=*/std::nullopt,
+                                   /*affinity=*/std::nullopt);
 
     ASSERT_TRUE(replaced);
     EXPECT_EQ(allocator.ResolveCacheBlockId(*replaced), before[1]);
@@ -1167,7 +1168,8 @@ TEST(BlockTablePageIdsExport, AFilledLeadingHoleExportsItsBlock) {
     ASSERT_EQ(allocator.BlockTablePageIds(table), (std::vector<std::int32_t>{0}));
 
     const CacheBlockRef replaced =
-        allocator.SwapInFreshBlock(pool, table, /*slot=*/0, /*available_tokens=*/2, /*destination=*/std::nullopt);
+        allocator.SwapInFreshBlock(pool, table, /*slot=*/0, /*available_tokens=*/2, /*destination=*/std::nullopt,
+                                   /*affinity=*/std::nullopt);
 
     EXPECT_FALSE(replaced);
     EXPECT_EQ(table.ReclaimedPrefixBlocks(), 0);
@@ -1186,7 +1188,8 @@ TEST(BlockTablePageIdsExport, AHostExtensionExportsItsDeviceDestinations) {
     host_blocks.emplace_back();
     std::vector<BlockTransfer> loads;
 
-    allocator.AppendHostExtension(device, table, std::move(host_blocks), loads, /*tail_available_tokens=*/0);
+    allocator.AppendHostExtension(device, table, std::move(host_blocks), loads, /*tail_available_tokens=*/0,
+                                  /*affinity=*/std::nullopt);
 
     ASSERT_EQ(loads.size(), 1u);
     EXPECT_EQ(allocator.BlockTablePageIds(table),

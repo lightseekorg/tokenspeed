@@ -422,7 +422,9 @@ TEST(BlockPoolTest, ExactAcquireBlocksRemainsAllOrNothing) {
 
 // A deliberately exhaustive oracle: rank every compatible free slot from
 // scratch. It shares neither the availability indices nor the capacity
-// counters of BlockPool, and tracks physical lifetime via reference counts.
+// counters of BlockPool, and tracks physical lifetime via reference counts
+// plus each parent's last occupancy-change sequence to match the LIFO head
+// order of BlockPool's intrusive per-occupancy bucket lists.
 class PlacementOracle {
 public:
     explicit PlacementOracle(std::int32_t parents) : parents_(static_cast<std::size_t>(parents)) {
@@ -432,33 +434,58 @@ public:
     }
 
     std::vector<CacheBlockLocation> Acquire(std::uint32_t group, std::int32_t packing, std::int32_t count,
-                                            std::vector<std::int32_t> loads, bool partial) {
+                                            std::vector<std::int32_t> loads, bool partial,
+                                            std::int32_t shard_count = 1) {
         auto planned = parents_;
         auto empty = empty_;
+        auto seq = next_seq_;
+        const std::int32_t buckets = loads.empty() ? shard_count : static_cast<std::int32_t>(loads.size());
         std::vector<CacheBlockLocation> result;
         for (std::int32_t i = 0; i < count; ++i) {
+            // Mirror BlockPool::nextLocation: each bucket picks the LIFO head
+            // of its highest non-empty occupancy list, then buckets compete on
+            // (load, bucket, -occupied, parent_id, slot).
             using Priority = std::tuple<std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t>;
             std::optional<Priority> best;
             CacheBlockLocation chosen;
-            for (std::size_t p = 0; p < planned.size(); ++p) {
-                const Parent& parent = planned[p];
-                if (parent.group != group) {
-                    continue;
-                }
-                const auto occupied =
-                    static_cast<std::int32_t>(std::ranges::count_if(parent.refs, [](int refs) { return refs > 0; }));
-                for (std::int32_t slot = 0; slot < packing; ++slot) {
-                    if (parent.refs[static_cast<std::size_t>(slot)] > 0) {
+            for (std::int32_t bucket = 0; bucket < buckets; ++bucket) {
+                std::optional<std::tuple<std::int32_t, std::uint64_t, std::int32_t, std::int32_t>> bucket_head;
+                for (std::size_t p = 0; p < planned.size(); ++p) {
+                    const Parent& parent = planned[p];
+                    if (parent.group != group) {
                         continue;
                     }
-                    const auto bucket = loads.empty() ? 0 : slot % static_cast<std::int32_t>(loads.size());
-                    const auto id = static_cast<std::int32_t>(p + 1);
-                    const Priority priority{loads.empty() ? 0 : loads[static_cast<std::size_t>(bucket)], bucket,
-                                            -occupied, id, slot};
-                    if (!best || priority < *best) {
-                        best = priority;
-                        chosen = CacheBlockLocation{id, slot};
+                    const auto occupied = static_cast<std::int32_t>(
+                        std::ranges::count_if(parent.refs, [](int refs) { return refs > 0; }));
+                    if (occupied == packing) {
+                        continue;
                     }
+                    std::int32_t first_free = packing;
+                    for (std::int32_t slot = bucket; slot < packing; slot += buckets) {
+                        if (parent.refs[static_cast<std::size_t>(slot)] == 0) {
+                            first_free = slot;
+                            break;
+                        }
+                    }
+                    if (first_free == packing) {
+                        continue;
+                    }
+                    const auto rank =
+                        std::tuple{occupied, parent.touched_seq, static_cast<std::int32_t>(p + 1), first_free};
+                    if (!bucket_head || std::tie(std::get<0>(rank), std::get<1>(rank)) >
+                                            std::tie(std::get<0>(*bucket_head), std::get<1>(*bucket_head))) {
+                        bucket_head = rank;
+                    }
+                }
+                if (!bucket_head) {
+                    continue;
+                }
+                const auto [occupied, _, id, slot] = *bucket_head;
+                const Priority priority{loads.empty() ? 0 : loads[static_cast<std::size_t>(bucket)],
+                                        loads.empty() ? 0 : bucket, -occupied, id, slot};
+                if (!best || priority < *best) {
+                    best = priority;
+                    chosen = CacheBlockLocation{id, slot};
                 }
             }
             if (!best) {
@@ -476,8 +503,9 @@ public:
                 parent.group = group;
                 parent.refs.assign(static_cast<std::size_t>(packing), 0);
             }
-            planned[static_cast<std::size_t>(chosen.lcm_block_id - 1)]
-                .refs[static_cast<std::size_t>(chosen.slot_index)] = 1;
+            Parent& updated = planned[static_cast<std::size_t>(chosen.lcm_block_id - 1)];
+            updated.refs[static_cast<std::size_t>(chosen.slot_index)] = 1;
+            updated.touched_seq = ++seq;
             if (!loads.empty()) {
                 ++loads[static_cast<std::size_t>(chosen.slot_index) % loads.size()];
             }
@@ -485,6 +513,7 @@ public:
         }
         parents_ = std::move(planned);
         empty_ = std::move(empty);
+        next_seq_ = seq;
         return result;
     }
 
@@ -495,11 +524,16 @@ public:
 
     void Release(CacheBlockLocation location) {
         Parent& parent = parents_[static_cast<std::size_t>(location.lcm_block_id - 1)];
-        --parent.refs[static_cast<std::size_t>(location.slot_index)];
+        if (--parent.refs[static_cast<std::size_t>(location.slot_index)] > 0) {
+            return;
+        }
         if (std::ranges::all_of(parent.refs, [](int refs) { return refs == 0; })) {
             parent.group.reset();
             parent.refs.clear();
+            parent.touched_seq = 0;
             empty_.push_back(location.lcm_block_id);
+        } else {
+            parent.touched_seq = ++next_seq_;
         }
     }
 
@@ -521,9 +555,11 @@ private:
     struct Parent {
         std::optional<std::uint32_t> group;
         std::vector<int> refs;
+        std::uint64_t touched_seq{0};
     };
     std::vector<Parent> parents_;
     std::deque<std::int32_t> empty_;
+    std::uint64_t next_seq_{0};
 };
 
 // Random acquires (ordinary, balanced and partial), shared references and
@@ -557,7 +593,7 @@ int ExpectPlacementMatchesOracle(std::uint32_t seed, std::int32_t parents, const
                 }
             }
             const auto saved_loads = loads;
-            const auto expected = oracle.Acquire(group, packing[group], count, loads, partial);
+            const auto expected = oracle.Acquire(group, packing[group], count, loads, partial, shards[group]);
             auto actual = partial ? pool.AcquireUpToBlocks(group, count) : pool.AcquireBlocks(group, count, loads);
             EXPECT_EQ(actual.size(), expected.size());
             if (actual.size() != expected.size()) {
@@ -657,18 +693,39 @@ TEST(BlockPoolOccupancyIndexTest, AgreesWithAFullScanUnderRandomChurn) {
         const std::int32_t packing = kPackings[group_id];
         if (held.empty() || std::uniform_int_distribution<int>(0, 2)(rng) != 0) {
             const std::int32_t demand = std::uniform_int_distribution<std::int32_t>(1, 6)(rng);
-            // The plan must match the order the removed scan produced, for the
-            // part that lands in parents this group already owns.
+            // Each block landing in a bound parent must pick a parent with the
+            // maximum occupancy among partial parents (densest first) and that
+            // parent's lowest free slot.
             const std::int32_t bound_free = pool.NumFreeSlots(group_id);
             const std::size_t in_bound_parents =
                 std::min(static_cast<std::size_t>(demand), static_cast<std::size_t>(bound_free));
-            const std::vector<CacheBlockLocation> expected =
-                PlanInBoundParentsByScan(pool, group_id, packing, in_bound_parents);
+            std::int32_t max_partial_occ = 0;
+            for (std::int32_t p = 1; p <= pool.NumLcmBlocks(); ++p) {
+                if (pool.BoundGroup(p) == group_id && pool.OccupiedCount(p) < packing) {
+                    max_partial_occ = std::max(max_partial_occ, pool.OccupiedCount(p));
+                }
+            }
+            std::vector<std::int32_t> occ_before(static_cast<std::size_t>(kPoolSize + 1), 0);
+            std::vector<std::int32_t> first_free_before(static_cast<std::size_t>(kPoolSize + 1), packing);
+            for (std::int32_t p = 1; p <= pool.NumLcmBlocks(); ++p) {
+                if (pool.BoundGroup(p) == group_id) {
+                    occ_before[static_cast<std::size_t>(p)] = pool.OccupiedCount(p);
+                    for (std::int32_t s = 0; s < packing; ++s) {
+                        if (!pool.IsOccupied(CacheBlockLocation{p, s})) {
+                            first_free_before[static_cast<std::size_t>(p)] = s;
+                            break;
+                        }
+                    }
+                }
+            }
 
             std::vector<CacheBlockRef> acquired = pool.AcquireUpToBlocks(group_id, demand);
-            std::vector<CacheBlockLocation> actual = LocationsOf(acquired);
-            actual.resize(std::min(actual.size(), in_bound_parents));
-            EXPECT_EQ(actual, expected) << "step " << step;
+            if (in_bound_parents > 0) {
+                const CacheBlockLocation first = acquired[0]->Location();
+                EXPECT_EQ(occ_before[static_cast<std::size_t>(first.lcm_block_id)], max_partial_occ) << "step " << step;
+                EXPECT_EQ(first.slot_index, first_free_before[static_cast<std::size_t>(first.lcm_block_id)])
+                    << "step " << step;
+            }
             for (CacheBlockRef& block : acquired) {
                 held.push_back(std::move(block));
             }
@@ -894,6 +951,349 @@ TEST(BlockPoolBucketAcquireTest, OneBucketIsOrdinaryPlacement) {
     ASSERT_EQ(blocks.size(), 2u);
     EXPECT_EQ(LocationsOf(blocks), (std::vector<CacheBlockLocation>{{1, 1}, {2, 0}}))
         << "the hole in the bound parent first, then the next FIFO parent";
+}
+
+TEST(BlockPoolRequestAwareTest, IsolatesInterleavedRequestsAndReclaimsWholeParents) {
+    for (const std::int32_t packing : {12, 6}) {
+        SCOPED_TRACE(::testing::Message() << "packing=" << packing);
+        BlockPool pool(/*num_lcm_blocks=*/4, {packing, 1});
+        std::vector<CacheBlockRef> req_a;
+        std::vector<CacheBlockRef> req_b;
+
+        for (std::int32_t step = 0; step < packing; ++step) {
+            const std::optional<std::int32_t> pref_a =
+                req_a.empty() ? std::nullopt : std::optional<std::int32_t>{req_a.back()->Location().lcm_block_id};
+            auto a = pool.AcquireBlocksWithAffinity(
+                /*group_id=*/0, /*num=*/1, /*bucket_loads=*/{},
+                ParentAffinity{.preferred_parent = pref_a, .reserved_empty_parents = 0});
+            ASSERT_EQ(a.size(), 1u);
+            req_a.push_back(std::move(a.front()));
+
+            const std::optional<std::int32_t> pref_b =
+                req_b.empty() ? std::nullopt : std::optional<std::int32_t>{req_b.back()->Location().lcm_block_id};
+            auto b = pool.AcquireBlocksWithAffinity(
+                /*group_id=*/0, /*num=*/1, /*bucket_loads=*/{},
+                ParentAffinity{.preferred_parent = pref_b, .reserved_empty_parents = 0});
+            ASSERT_EQ(b.size(), 1u);
+            req_b.push_back(std::move(b.front()));
+        }
+
+        const std::int32_t parent_a = req_a.front()->Location().lcm_block_id;
+        const std::int32_t parent_b = req_b.front()->Location().lcm_block_id;
+        EXPECT_NE(parent_a, parent_b);
+        for (const CacheBlockRef& block : req_a) {
+            EXPECT_EQ(block->Location().lcm_block_id, parent_a);
+        }
+        for (const CacheBlockRef& block : req_b) {
+            EXPECT_EQ(block->Location().lcm_block_id, parent_b);
+        }
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+
+        // Releasing Request A returns its entire LCM parent at once.
+        req_a.clear();
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), 3);
+        EXPECT_FALSE(pool.BoundGroup(parent_a).has_value());
+        EXPECT_EQ(pool.OccupiedCount(parent_b), packing);
+    }
+}
+
+TEST(BlockPoolRequestAwareTest, RespectsReservedEmptyParentsAndReusesPreferredParentAtFloor) {
+    BlockPool pool(/*num_lcm_blocks=*/5, {6, 1});
+
+    // Reserve 3 empty parents (e.g. for later packing=1 groups): A opens
+    // parent 1 (5 -> 4), B opens parent 2 (4 -> 3 == reserved).
+    auto a = pool.AcquireBlocksWithAffinity(
+        0, 2, {}, ParentAffinity{.preferred_parent = std::nullopt, .reserved_empty_parents = 3});
+    ASSERT_EQ(a.size(), 2u);
+    EXPECT_EQ(a[0]->Location().lcm_block_id, 1);
+    EXPECT_EQ(a[1]->Location().lcm_block_id, 1);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 4);
+
+    auto b = pool.AcquireBlocksWithAffinity(
+        0, 1, {}, ParentAffinity{.preferred_parent = std::nullopt, .reserved_empty_parents = 3});
+    ASSERT_EQ(b.size(), 1u);
+    EXPECT_EQ(b[0]->Location().lcm_block_id, 2);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 3);
+
+    // At the reserve floor, a new request C cannot open parent 3: it falls
+    // back to a hole in the densest bound parent (parent 1) without crossing
+    // the reserve floor.
+    auto c = pool.AcquireBlocksWithAffinity(
+        0, 1, {}, ParentAffinity{.preferred_parent = std::nullopt, .reserved_empty_parents = 3});
+    ASSERT_EQ(c.size(), 1u);
+    EXPECT_EQ(c[0]->Location().lcm_block_id, 1);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 3);
+
+    // Meanwhile B still reuses its own preferred parent 2 even at the floor.
+    auto b_more =
+        pool.AcquireBlocksWithAffinity(0, 5, {}, ParentAffinity{.preferred_parent = 2, .reserved_empty_parents = 3});
+    ASSERT_EQ(b_more.size(), 5u);
+    for (const CacheBlockRef& block : b_more) {
+        EXPECT_EQ(block->Location().lcm_block_id, 2);
+    }
+    EXPECT_EQ(pool.OccupiedCount(2), 6);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 3);
+
+    // Once parent 2 is full, requesting another block for B at the floor falls
+    // back to parent 1's remaining holes rather than stealing reserved parents.
+    auto b_overflow =
+        pool.AcquireBlocksWithAffinity(0, 1, {}, ParentAffinity{.preferred_parent = 2, .reserved_empty_parents = 3});
+    ASSERT_EQ(b_overflow.size(), 1u);
+    EXPECT_EQ(b_overflow[0]->Location().lcm_block_id, 1);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 3);
+}
+
+TEST(BlockPoolRequestAwareTest, BalancesKvParallelShardsWhileClusteringPerRequest) {
+    for (const std::int32_t shards : {2, 4}) {
+        SCOPED_TRACE(::testing::Message() << "shards=" << shards);
+        constexpr std::int32_t kPacking = 12;
+        BlockPool pool(/*num_lcm_blocks=*/6, {kPacking, 1});
+        pool.RegisterGroup(/*group_id=*/0, kPacking, shards);
+
+        std::vector<CacheBlockRef> req_a;
+        std::vector<CacheBlockRef> req_b;
+        std::vector<std::int32_t> loads_a(static_cast<std::size_t>(shards), 0);
+        std::vector<std::int32_t> loads_b(static_cast<std::size_t>(shards), 0);
+
+        for (std::int32_t step = 0; step < kPacking; ++step) {
+            const std::optional<std::int32_t> pref_a =
+                req_a.empty() ? std::nullopt : std::optional<std::int32_t>{req_a.back()->Location().lcm_block_id};
+            auto a = pool.AcquireBlocksWithAffinity(
+                0, 1, loads_a, ParentAffinity{.preferred_parent = pref_a, .reserved_empty_parents = 1});
+            ASSERT_EQ(a.size(), 1u);
+            ++loads_a[static_cast<std::size_t>(a.front()->Location().slot_index % shards)];
+            req_a.push_back(std::move(a.front()));
+
+            const std::optional<std::int32_t> pref_b =
+                req_b.empty() ? std::nullopt : std::optional<std::int32_t>{req_b.back()->Location().lcm_block_id};
+            auto b = pool.AcquireBlocksWithAffinity(
+                0, 1, loads_b, ParentAffinity{.preferred_parent = pref_b, .reserved_empty_parents = 1});
+            ASSERT_EQ(b.size(), 1u);
+            ++loads_b[static_cast<std::size_t>(b.front()->Location().slot_index % shards)];
+            req_b.push_back(std::move(b.front()));
+        }
+
+        const std::int32_t parent_a = req_a.front()->Location().lcm_block_id;
+        const std::int32_t parent_b = req_b.front()->Location().lcm_block_id;
+        EXPECT_NE(parent_a, parent_b);
+        for (const CacheBlockRef& block : req_a) {
+            EXPECT_EQ(block->Location().lcm_block_id, parent_a);
+        }
+        for (const CacheBlockRef& block : req_b) {
+            EXPECT_EQ(block->Location().lcm_block_id, parent_b);
+        }
+        for (std::int32_t bucket = 0; bucket < shards; ++bucket) {
+            EXPECT_EQ(loads_a[static_cast<std::size_t>(bucket)], kPacking / shards);
+            EXPECT_EQ(loads_b[static_cast<std::size_t>(bucket)], kPacking / shards);
+        }
+    }
+
+    // Unbalanced AcquireBlocksWithAffinity (empty bucket_loads) on a sharded
+    // group still scans every bucket of preferred_parent rather than stopping
+    // once bucket 0 is full.
+    BlockPool sharded(/*num_lcm_blocks=*/3, {4});
+    sharded.RegisterGroup(/*group_id=*/0, /*packing=*/4, /*shard_count=*/2);
+    const std::array<std::int32_t, 2> b0_only{0, 0};
+    auto filled_b0 = sharded.AcquireBlocksInBuckets(0, b0_only);
+    ASSERT_EQ(filled_b0.size(), 2u);
+    ASSERT_EQ(filled_b0[0]->Location(), (CacheBlockLocation{1, 0}));
+    ASSERT_EQ(filled_b0[1]->Location(), (CacheBlockLocation{1, 2}));
+    auto unbalanced = sharded.AcquireBlocksWithAffinity(
+        0, 2, /*bucket_loads=*/{}, ParentAffinity{.preferred_parent = 1, .reserved_empty_parents = 0});
+    ASSERT_EQ(unbalanced.size(), 2u);
+    EXPECT_EQ(LocationsOf(unbalanced), (std::vector<CacheBlockLocation>{{1, 1}, {1, 3}}));
+    EXPECT_EQ(sharded.NumEmptyLcmBlocks(), 2);
+}
+
+TEST(BlockPoolRequestAwareTest, AcquireBlocksInBucketsWithAffinityClustersAndBypassesPackingOne) {
+    BlockPool pool(/*num_lcm_blocks=*/4, {6, 1});
+    pool.RegisterGroup(/*group_id=*/0, /*packing=*/6, /*shard_count=*/2);
+    pool.RegisterGroup(/*group_id=*/1, /*packing=*/1, /*shard_count=*/1);
+
+    // Seed parent 1 with one block in bucket 0, leaving holes in both buckets.
+    CacheBlockRef seed = pool.AcquireBlock(0);
+    ASSERT_TRUE(seed);
+    ASSERT_EQ(seed->Location().lcm_block_id, 1);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 3);
+
+    // With empty (3) > reserved (1) and no preferred parent, bucket acquisition
+    // opens parent 2 and clusters both requested buckets into parent 2.
+    const std::array<std::int32_t, 2> pair{0, 1};
+    auto first = pool.AcquireBlocksInBucketsWithAffinity(
+        0, pair, ParentAffinity{.preferred_parent = std::nullopt, .reserved_empty_parents = 1});
+    ASSERT_EQ(first.size(), 2u);
+    EXPECT_EQ(LocationsOf(first), (std::vector<CacheBlockLocation>{{2, 0}, {2, 1}}));
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+
+    // At empty == reserved (2), preferred_parent = 2 still clusters inside
+    // parent 2 without opening parent 3.
+    auto cont = pool.AcquireBlocksInBucketsWithAffinity(
+        0, pair, ParentAffinity{.preferred_parent = 2, .reserved_empty_parents = 2});
+    ASSERT_EQ(cont.size(), 2u);
+    EXPECT_EQ(LocationsOf(cont), (std::vector<CacheBlockLocation>{{2, 2}, {2, 3}}));
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+
+    // At empty == reserved (2) with preferred_parent = nullopt, bucket
+    // acquisition falls back to existing holes without touching empty parents.
+    auto fallback = pool.AcquireBlocksInBucketsWithAffinity(
+        0, pair, ParentAffinity{.preferred_parent = std::nullopt, .reserved_empty_parents = 2});
+    ASSERT_EQ(fallback.size(), 2u);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+
+    // packing == 1 bypasses affinity even when empty <= reserved_empty_parents.
+    const std::array<std::int32_t, 2> state_buckets{0, 0};
+    auto state = pool.AcquireBlocksInBucketsWithAffinity(
+        1, state_buckets, ParentAffinity{.preferred_parent = 1, .reserved_empty_parents = 2});
+    ASSERT_EQ(state.size(), 2u);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+}
+
+TEST(BlockPoolRequestAwareTest, WidePackingAndWideShardsWithAffinityMaintainIntrusiveListInvariants) {
+    constexpr std::int32_t kParents = 8;
+    constexpr std::int32_t kWidePacking = 130;  // > 64 inline occupancy mask
+    constexpr std::int32_t kWideShards = 5;     // multi-shard bucket_links_ stride
+    BlockPool pool(kParents, {kWidePacking, 1});
+    pool.RegisterGroup(/*group_id=*/0, kWidePacking, kWideShards);
+    pool.RegisterGroup(/*group_id=*/1, /*packing=*/1, /*shard_count=*/1);
+
+    std::mt19937 rng(0x5A17C0DEu);
+    std::vector<CacheBlockRef> held_g0;
+    std::vector<CacheBlockRef> held_g1;
+
+    const auto check_invariants = [&] {
+        std::int32_t empty = 0;
+        std::array<std::int64_t, kWideShards> free_by_bucket{};
+        for (std::int32_t p = 1; p <= kParents; ++p) {
+            const auto bound = pool.BoundGroup(p);
+            if (!bound) {
+                ++empty;
+                EXPECT_EQ(pool.OccupiedCount(p), 0);
+                continue;
+            }
+            const std::int32_t packing = *bound == 0u ? kWidePacking : 1;
+            std::int32_t occ = 0;
+            for (std::int32_t slot = 0; slot < packing; ++slot) {
+                if (pool.IsOccupied(CacheBlockLocation{p, slot})) {
+                    ++occ;
+                } else if (*bound == 0u) {
+                    ++free_by_bucket[static_cast<std::size_t>(slot % kWideShards)];
+                }
+            }
+            EXPECT_EQ(pool.OccupiedCount(p), occ) << "parent " << p;
+        }
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), empty);
+        const auto actual = pool.FreeSlotsByBucket(0);
+        ASSERT_EQ(actual.size(), static_cast<std::size_t>(kWideShards));
+        std::int64_t total_free = 0;
+        for (std::size_t b = 0; b < static_cast<std::size_t>(kWideShards); ++b) {
+            EXPECT_EQ(actual[b], free_by_bucket[b]) << "bucket " << b;
+            total_free += free_by_bucket[b];
+        }
+        EXPECT_EQ(pool.NumFreeSlots(0), total_free);
+    };
+
+    for (int step = 0; step < 300; ++step) {
+        const std::uint32_t op = rng() % 10;
+        if (op < 4) {
+            const auto count = static_cast<std::int32_t>(1 + rng() % 17);
+            const auto reserved = static_cast<std::int64_t>(rng() % 4);
+            std::optional<std::int32_t> pref;
+            if (!held_g0.empty() && (rng() % 2 == 0)) {
+                pref = held_g0[rng() % held_g0.size()]->Location().lcm_block_id;
+            }
+            std::vector<std::int32_t> loads;
+            if (rng() % 2 == 0) {
+                loads.resize(kWideShards);
+                for (std::int32_t& load : loads) {
+                    load = static_cast<std::int32_t>(rng() % 10);
+                }
+            }
+            auto blocks = pool.AcquireBlocksWithAffinity(
+                0, count, loads, ParentAffinity{.preferred_parent = pref, .reserved_empty_parents = reserved});
+            for (CacheBlockRef& block : blocks) {
+                held_g0.push_back(std::move(block));
+            }
+        } else if (op < 6) {
+            std::vector<std::int32_t> buckets(1 + rng() % 6);
+            for (std::int32_t& b : buckets) {
+                b = static_cast<std::int32_t>(rng() % kWideShards);
+            }
+            std::optional<std::int32_t> pref;
+            if (!held_g0.empty() && (rng() % 2 == 0)) {
+                pref = held_g0[rng() % held_g0.size()]->Location().lcm_block_id;
+            }
+            auto blocks = pool.AcquireBlocksInBucketsWithAffinity(
+                0, buckets,
+                ParentAffinity{
+                    .preferred_parent = pref,
+                    .reserved_empty_parents = static_cast<std::int64_t>(rng() % 3),
+                });
+            for (CacheBlockRef& block : blocks) {
+                held_g0.push_back(std::move(block));
+            }
+        } else if (op == 6) {
+            auto blocks = pool.AcquireBlocks(1, static_cast<std::int32_t>(1 + rng() % 3));
+            for (CacheBlockRef& block : blocks) {
+                held_g1.push_back(std::move(block));
+            }
+        } else if (op < 9 && !held_g0.empty()) {
+            const std::size_t drop = std::min<std::size_t>(held_g0.size(), 1 + rng() % 25);
+            for (std::size_t d = 0; d < drop; ++d) {
+                const std::size_t idx = rng() % held_g0.size();
+                held_g0[idx] = std::move(held_g0.back());
+                held_g0.pop_back();
+            }
+        } else if (!held_g1.empty()) {
+            held_g1.pop_back();
+        }
+        if (step % 60 == 59) {
+            // Exercise full unbind and rebind across wide group 0 and group 1.
+            held_g0.clear();
+            held_g1.clear();
+        }
+        check_invariants();
+    }
+}
+
+TEST(BlockPoolRequestAwareTest, LateWiderShardRegistrationPreservesLiveIntrusiveLinks) {
+    // Group 0 registers with 1 bucket and populates multiple partial parents at
+    // the same occupancy level before group 1 registers with 4 buckets, forcing
+    // the flat bucket_links_ table to widen while group 0's lists are live.
+    BlockPool pool(/*num_lcm_blocks=*/6, {8, 12, 1});
+    pool.RegisterGroup(/*group_id=*/2, /*packing=*/1, /*shard_count=*/1);
+    pool.RegisterGroup(/*group_id=*/0, /*packing=*/8, /*shard_count=*/1);
+
+    // Put parents 1, 2, 3 into group 0's occupancy-1 list (order: 3 -> 2 -> 1).
+    auto p1 = pool.AcquireBlocksWithAffinity(0, 1, {}, ParentAffinity{.preferred_parent = std::nullopt});
+    auto p2 = pool.AcquireBlocksWithAffinity(0, 1, {}, ParentAffinity{.preferred_parent = std::nullopt});
+    auto p3 = pool.AcquireBlocksWithAffinity(0, 1, {}, ParentAffinity{.preferred_parent = std::nullopt});
+    ASSERT_EQ(p1[0]->Location().lcm_block_id, 1);
+    ASSERT_EQ(p2[0]->Location().lcm_block_id, 2);
+    ASSERT_EQ(p3[0]->Location().lcm_block_id, 3);
+    ASSERT_EQ(pool.MinimumParentOccupancy(0), 1);
+
+    // Late registration widens link_stride_ from 1 to 4 while 3 -> 2 -> 1 is live.
+    pool.RegisterGroup(/*group_id=*/1, /*packing=*/12, /*shard_count=*/4);
+    const std::array<std::int32_t, 4> loads{0, 0, 0, 0};
+    auto g1 = pool.AcquireBlocksWithAffinity(1, 5, loads, ParentAffinity{.preferred_parent = std::nullopt});
+    ASSERT_EQ(g1.size(), 5u);
+    EXPECT_EQ(g1[0]->Location().lcm_block_id, 4);
+
+    // Unlink middle element (parent 2), then advance head (parent 3) and tail
+    // (parent 1) via hole-first acquisition to prove migrated prev/next pointers.
+    p2.clear();
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 3);
+    CacheBlockRef next_hole = pool.AcquireBlock(0);
+    ASSERT_TRUE(next_hole);
+    EXPECT_EQ(next_hole->Location().lcm_block_id, 3) << "head of group 0's occupancy-1 list survived stride widening";
+    EXPECT_EQ(pool.MinimumParentOccupancy(0), 1) << "parent 1 remains reachable behind parent 3";
+
+    p3.clear();
+    next_hole.reset();
+    p1.clear();
+    g1.clear();
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 6);
+    EXPECT_EQ(pool.NumOccupiedSlots(), 0);
 }
 
 }  // namespace

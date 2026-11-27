@@ -127,20 +127,44 @@ A fourth quantity lives outside the logical world entirely:
   (as a state slot). The view is defined by the consumer, not by the block.
 
 `BlockPool` owns the physical placement indexes: the FIFO of empty LCM blocks,
-the free child-slot count **per bucket** for each cache group, and per-bucket
-ordered sets of partially filled LCM blocks. C++ group ids are dense scheduler
-indices, so the scheduler supplies the complete packing vector when it
-constructs each pool. The per-group placement records form a vector indexed by
-group id, and each `GroupAvailability` stores immutable slots-per-parent
-geometry. The coordinator registers each group's shard count in every pool it
-owns — Device, Host L2, and the snapshot pool alike — before allocation, so a
-block's bucket means the same owner on every tier; an ordinary standalone pool
-fixes a single bucket on first use. Registration cannot change the geometry
-after it is fixed, including after all blocks are freed. The pool updates its
-per-bucket free-slot counts and bucket indexes together on every occupancy
-transition. A parent with zero occupants is unbound, so its capacity belongs
-to the global empty-parent FIFO rather than any group. An allocated block
-never moves, with one exception: a lone request's compaction
+the free child-slot count **per bucket** for each cache group, and
+deterministic O(1) per-bucket occupancy indexes of partially filled LCM blocks.
+Per-occupancy ordering is deterministic across mirrored ranks replaying the
+same operation sequence, though placement depends on operation history rather
+than instantaneous occupancy alone.
+
+C++ group ids are dense scheduler indices, so the scheduler supplies the
+complete packing vector when constructing each pool, and the coordinator
+registers every group's shard count across Device, Host L2, and snapshot pools
+before allocation (an ordinary standalone pool fixes a single bucket on first
+use; geometry is immutable once fixed). Free-slot counts and bucket indexes
+update together on every occupancy transition, and a parent with zero occupants
+is unbound and returned to the global empty-parent FIFO.
+
+For packed non-State Device groups whose virtual packing
+(`physical_packing * shard_count`) lies in `(1, 64]`, admission and restore
+apply **request-aware placement** (`ParentAffinity`) so concurrent requests do
+not interleave private pages across the same LCM parents and block whole-parent
+reclamation when a request finishes. Affinity is derived from the request's
+private tail without extra per-request state, and never reuses shared or cached
+prefix parents. Each allocation step tries:
+
+* **Preferred parent** — a free slot in the request's current private parent,
+  preserving KV-parallel bucket balance.
+* **Fresh empty parent** — the next empty FIFO parent while empty parents
+  remain above the reserve held for later groups in the same admission step,
+  becoming the new preferred parent.
+* **Hole-first fallback** — the densest partial parent once empty parents reach
+  that reserve floor.
+
+`State` groups, `packing == 1` groups, and compact Host/snapshot tiers always
+bypass affinity and stay hole-first. As a placement heuristic, wider virtual
+packing groups and small-window `sliding_window` groups whose steady-state
+single-request retention (`ceil((W - 1) / G) + 1 + sink blocks`, at
+`decode_input_tokens = 1`) cannot fill one parent also stay hole-first so
+concurrent requests do not each pin a nearly empty parent.
+
+An allocated block never moves, with one exception: a lone request's compaction
 (`LoneRequestAdmission::Compact`, `scheduler.md` §1.4) gathers the
 request's own blocks of a packed group into fewer of its parents, naming
 the free slot each one takes (`AcquireBlockAt`, the one placement that

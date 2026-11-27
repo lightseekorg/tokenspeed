@@ -137,14 +137,14 @@ def _fragment(scheduler, prompts: int, shards: int) -> None:
 
 # 28 parents, two history blocks per parent: eight prompts leave eight holes;
 # a 126-token prompt (the bound is 128) holds 16 history blocks and the
-# copy-in block of its prompt end, which fill the holes first, so after its
-# first 64-token chunk they span 13 history parents instead of 9; its second
-# chunk needs eight sliding parents and the sliding copy-in block's, which
-# seven cached sliding pages cannot fund. The compaction re-places the block
-# alone in a fresh parent (slot 14, page 5) and the copy-in block (page 8)
-# into the slots of the cached pages beside the request's own blocks (pages 13
-# and 19, cleared; page 13 zeroed, page 19 left to the copy-in that fills it
-# whole), and the two parents they leave fund the retry.
+# copy-in block of its prompt end. Request-aware placement pairs the prompt-end
+# and copy-in blocks in parent 25 (49, 50) and packs slots 0-7 into four fresh
+# parents (51-56, 5-6), then falls back to cached holes for slots 8-14 once
+# empty parents reach the sliding group's reserve. Its second chunk needs eight
+# sliding parents and the sliding copy-in block's, which seven cached sliding
+# pages cannot fund. Compaction re-places one unwritten block (slot 8, page 44)
+# into the cleared slot of a cached page beside the request's own block (page
+# 7, zeroed), and the vacated parent funds the retry.
 def test_lone_request_within_the_bound_completes_on_a_fragmented_pool() -> None:
     scheduler = ts.Scheduler(_config(parents=28, chunk=64, packing=2, shards=1))
     assert scheduler.max_single_request_tokens() == 128
@@ -158,7 +158,8 @@ def test_lone_request_within_the_bound_completes_on_a_fragmented_pool() -> None:
     assert list(op.request_ids) == ["R"]
     assert list(op.input_lengths) == [64]
     row = [page for page in op.block_tables[HISTORY][0] if page != -1]
-    assert row == [14, 20, 26, 32, 38, 44, 49, 50, 51, 52, 53, 54, 55, 56, 5, 2]
+    before = [51, 52, 53, 54, 55, 56, 5, 6, 44, 38, 32, 26, 20, 14, 8, 49]
+    assert row == before
     assert scheduler.empty_lcm_blocks() == 0
     assert scheduler.host_cache_stats().lone_compactions == 0
 
@@ -167,13 +168,15 @@ def test_lone_request_within_the_bound_completes_on_a_fragmented_pool() -> None:
     assert list(op.request_ids) == ["R"]
     assert list(op.extend_prefix_lens) == [64]
     row = [page for page in op.block_tables[HISTORY][0] if page != -1]
-    assert row == [14, 20, 26, 32, 38, 44, 49, 50, 51, 52, 53, 54, 55, 56, 13, 2]
-    assert second.pages_to_zero[HISTORY] == [13]
+    after = list(before)
+    after[8] = 7
+    assert row == after
+    assert second.pages_to_zero[HISTORY] == [7]
     assert all(not copies for copies in second.pages_to_copy.values())
     stats = scheduler.host_cache_stats()
     assert stats.lone_compactions == 1
-    assert stats.lone_compaction_moves == 2
-    assert stats.device_evictions.compaction.blocks == 2
+    assert stats.lone_compaction_moves == 1
+    assert stats.device_evictions.compaction.blocks == 1
 
     _step(scheduler, shards=1)
     assert scheduler.request_token_size("R") == -1
@@ -195,14 +198,13 @@ def test_lone_request_on_an_empty_pool_never_compacts() -> None:
 
 
 # Two KV-parallel shards, one block of each per parent: the twelve prompts'
-# holes all sit in bucket 1, where the prompt end's block (slot 31, page 20)
-# and its copy-in block land first and the balanced allocator fills seven
-# more before opening fresh parents. Those two keep their bucket: each
-# re-places within bucket 1 into a slot one of the request's free unwritten
-# blocks gives up (pages 82 and 6), and those blocks move to the bucket-0
-# slots of cached pages beside the request's own blocks (pages 31 and 37,
-# cleared): only an unwritten block without a copy-in block beside it may
-# change bucket, and nothing is copied.
+# holes all sit in bucket 1. Under request-aware placement the prompt-end and
+# copy-in pair plus chunk-1 blocks open fresh parents until reaching the sliding
+# group's reserve, then unwritten blocks spill into the bucket-1 cached holes.
+# Compaction moves two free unwritten blocks from bucket 1 (pages 68 and 62)
+# into the bucket-0 slots of cached pages beside the request's own blocks
+# (pages 19 and 25, cleared and zeroed): only an unwritten block without a
+# copy-in block beside it may change bucket, and nothing is copied.
 def test_unwritten_blocks_re_place_across_buckets_under_kv_parallelism() -> None:
     scheduler = ts.Scheduler(_config(parents=44, chunk=128, packing=2, shards=2))
     assert scheduler.max_single_request_tokens() == 256
@@ -213,28 +215,44 @@ def test_unwritten_blocks_re_place_across_buckets_under_kv_parallelism() -> None
     first = _step(scheduler, shards=2)
     (op,) = first.forward
     before = [page for page in op.block_tables[HISTORY][0] if page != -1]
-    holes, fresh, late = (
-        [32, 38, 44, 50, 56, 62, 68],
-        list(range(73, 89)),
-        [5, 6, 11, 12, 17, 18, 23, 24, 20],
-    )
-    assert before == holes + fresh + late
+    assert before == [
+        73,
+        *range(77, 89),
+        5,
+        6,
+        11,
+        12,
+        17,
+        18,
+        23,
+        24,
+        75,
+        68,
+        62,
+        56,
+        50,
+        44,
+        38,
+        32,
+        26,
+        20,
+        74,
+    ]
     second = _step(scheduler, shards=2)
     (op,) = second.forward
     assert list(op.extend_prefix_lens) == [128]
     after = [page for page in op.block_tables[HISTORY][0] if page != -1]
     expected = list(before)
-    expected[16], expected[24], expected[31] = 31, 37, 6
+    expected[22], expected[23] = 19, 25
     assert after == expected
-    # A page's bucket is (page - 1) % shards: the prompt end's block stays in
-    # bucket 1 (20 -> 6), the displaced free blocks leave it (82 -> 31, 6 -> 37).
-    assert [(page - 1) % 2 for page in (20, 6, 82, 31, 37)] == [1, 1, 1, 0, 0]
-    # Page 82, the copy-in block's new place, is not zeroed.
-    assert second.pages_to_zero[HISTORY] == [31, 37, 6]
+    # A page's bucket is (page - 1) % shards: the two free unwritten blocks
+    # move from bucket 1 (68, 62) to bucket 0 (19, 25) without a copy.
+    assert [(page - 1) % 2 for page in (68, 62, 74, 19, 25)] == [1, 1, 1, 0, 0]
+    assert second.pages_to_zero[HISTORY] == [19, 25]
     assert all(not copies for copies in second.pages_to_copy.values())
     stats = scheduler.host_cache_stats()
     assert stats.lone_compactions == 1
-    assert stats.lone_compaction_moves == 4
+    assert stats.lone_compaction_moves == 2
     assert stats.device_evictions.compaction.blocks == 2
     _step(scheduler, shards=2)
     assert scheduler.request_token_size("R") == -1
@@ -243,22 +261,39 @@ def test_unwritten_blocks_re_place_across_buckets_under_kv_parallelism() -> None
 # Under KV parallelism a lone first admission whose probe hits a Device tail
 # can fail every plan with nothing to move (docs/design/scheduler.md §1.4):
 # three parents of one block of each of two buckets, the history group alone.
-# X (17 tokens) leaves its two pages in bucket 1 and its one-token tail in
-# bucket 0. R, X plus 14 tokens, needs the tail's private copy beside the
-# tail and its prompt end's block with that block's copy-in block in one
-# bucket, which neither bucket has room for. On the fused role R is aborted
-# with AbortReason.NoProgress at the 4096th consecutive empty plan
-# (Scheduler::kNoProgressAbortPlans), and the runtime fails it toward its
-# client.
+# Holding one parent via a live request while X (17 tokens) is admitted places
+# X's two pages in bucket 1 and its one-token tail in bucket 0. R, X plus 14
+# tokens, needs the tail's private copy beside the tail and its prompt end's
+# block with that block's copy-in block in one bucket, which neither bucket has
+# room for. On the fused role R is aborted with AbortReason.NoProgress at the
+# 4096th consecutive empty plan (Scheduler::kNoProgressAbortPlans), and the
+# runtime fails it toward its client.
 def test_lone_first_admission_that_can_never_fit_is_aborted() -> None:
     cfg = _config(parents=3, chunk=16, packing=2, shards=2)
     cfg.cache_groups = cfg.cache_groups[:1]
     scheduler = ts.Scheduler(cfg)
     assert scheduler.max_single_request_tokens() == 32
+    # Hold one parent live while X is admitted so X's two full pages take the
+    # bucket-1 holes beside its prompt-end and copy-in blocks in bucket 0.
+    holder = _spec("D", list(range(10000, 10008)))
+    holder.max_new_tokens = 2
+    scheduler.submit_requests([holder])
+    hold_plan = scheduler.next_execution_plan()
+    assert [op.request_ids for op in hold_plan.forward] == [["D"]]
+    hold_events = ts.ExecutionEvent()
+    hold_events.add_event(_event("ExtendResult", "D", tokens=[7]))
+    scheduler.advance(hold_events)
+
     prompt = list(range(20000, 20017))
     _submit(scheduler, "X", prompt)
     for _ in range(4):
+        if (
+            scheduler.request_token_size("D") == -1
+            and scheduler.request_token_size("X") == -1
+        ):
+            break
         _step(scheduler, shards=2)
+    assert scheduler.request_token_size("D") == -1
     assert scheduler.request_token_size("X") == -1
 
     _submit(scheduler, "R", prompt + list(range(50000, 50014)))

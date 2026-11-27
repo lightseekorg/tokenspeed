@@ -602,8 +602,9 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
                 } else {
                     // The block the slot gives up is the entry's until the
                     // entry has followed the copy; it leaves with `replaced`.
-                    const CacheBlockRef replaced = allocator.SwapInFreshBlock(
-                        store.DevicePool(), table, member.slot, table.AvailableTokens(), move.destination);
+                    const CacheBlockRef replaced = allocator.SwapInFreshBlock(store.DevicePool(), table, member.slot,
+                                                                              table.AvailableTokens(), move.destination,
+                                                                              /*affinity=*/std::nullopt);
                     const CacheBlockRef& moved = table.Blocks()[static_cast<std::size_t>(member.slot)];
                     _assert(!member.in_bucket ||
                                 allocator.BucketOf(moved->Location()) == allocator.BucketOf(member.location),

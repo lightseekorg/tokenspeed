@@ -47,8 +47,8 @@ TEST(CacheDataFlow, OneConstAllocatorPlacesIndependentTablesInTheirSuppliedPools
     BlockTable second;
     const AcquirePlan first_plan = geometry.PlanAcquire(first, /*num_tokens=*/7, /*reserve_tokens=*/3);
     const AcquirePlan second_plan = geometry.PlanAcquire(second, /*num_tokens=*/2, /*reserve_tokens=*/0);
-    ASSERT_TRUE(allocator.Acquire(first_pool, first, first_plan, /*first_placed_slot=*/0, {}));
-    ASSERT_TRUE(allocator.Acquire(second_pool, second, second_plan, /*first_placed_slot=*/0, {}));
+    ASSERT_TRUE(allocator.Acquire(first_pool, first, first_plan, /*first_placed_slot=*/0, {}, std::nullopt));
+    ASSERT_TRUE(allocator.Acquire(second_pool, second, second_plan, /*first_placed_slot=*/0, {}, std::nullopt));
     EXPECT_EQ(first.NumBlocks(), 3);
     EXPECT_EQ(first.AvailableTokens(), 5);
     EXPECT_EQ(second.NumBlocks(), 1);
