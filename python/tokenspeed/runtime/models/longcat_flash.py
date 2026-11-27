@@ -39,6 +39,9 @@ from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping as _Mapping
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    is_breakable_capture_active as _is_breakable_capture_active,
+)
 from tokenspeed.runtime.execution.context import ForwardContext as _ForwardContext
 from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode as _get_is_capture_mode,
@@ -419,9 +422,14 @@ class _RuntimeLongcatMoE(nn.Module):
         # NPU has no device-side ``_assert_async``: the op falls back to the
         # CPU, whose D2H sync is rejected under an active stream capture
         # (aclrtMemcpy 107030). Skip the assert when recording a graph on NPU
-        # (the eager path still checks); on CUDA the assert is device-side and
-        # stays graph-safe.
-        if not (_get_is_capture_mode() and _longcat_platform.is_npu):
+        # — the decode graph (``_get_is_capture_mode``) and the breakable
+        # prefill graph (``_is_breakable_capture_active``) — the eager path
+        # still checks; on CUDA the assert is device-side and stays
+        # graph-safe.
+        if not (
+            (_get_is_capture_mode() or _is_breakable_capture_active())
+            and _longcat_platform.is_npu
+        ):
             torch._assert_async(
                 (topk_ids < self.experts.num_experts).all(),
                 f"LongCat top-k id at or beyond the {self.experts.num_experts} "
