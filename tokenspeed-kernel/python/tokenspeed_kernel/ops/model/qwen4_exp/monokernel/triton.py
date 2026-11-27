@@ -27,8 +27,11 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-# Rows of one launch of the fused MTP draft input: a decode step's rows.
-MTP_FUSE_INPUTS_MAX_ROWS = 4
+# Rows of one launch of the fused MTP draft input: a decode step's rows (the
+# draft's first step of 2 requests verifies 2 x 4 rows).
+MTP_FUSE_INPUTS_MAX_ROWS = 8
+# Rows of one 16-row MFMA tile: 4 streams of each.
+_TILE_ROWS = 4
 _STREAMS = 4  # hyper-connection streams of the hidden row
 
 
@@ -50,18 +53,20 @@ def _qwen4_exp_mtp_fuse_inputs_kernel(
     H: tl.constexpr,
     BN: tl.constexpr,
     BK: tl.constexpr,
+    TILES: tl.constexpr,
 ):
     """Columns ``BN pid ..`` of every row's MTP draft input.
 
-    MFMA row ``m`` is stream ``m // 4`` of row ``m % 4``. Rows at or past
+    MFMA row ``m`` of tile ``t`` (``TILES`` 16-row tiles, a power of two)
+    is stream ``(m % 16) // 4`` of row ``4 t + m % 4``. Rows at or past
     ``rows`` are padding. Each row's sums and products do not depend on
-    ``rows``, so a row's result equals its one-row launch.
+    ``rows`` or ``TILES``, so a row's result equals its one-row launch.
     """
     pid = tl.program_id(0)
     n = pid * BN + tl.arange(0, BN)
-    m = tl.arange(0, 16)
-    r = m % 4
-    s = m // 4
+    m = tl.arange(0, 16 * TILES)
+    r = (m // 16) * 4 + m % 4
+    s = (m % 16) // 4
     live = r < rows
     token = tl.load(ids + r, mask=live, other=0).to(tl.int64)
     e_row = emb + token * emb_stride
@@ -70,8 +75,8 @@ def _qwen4_exp_mtp_fuse_inputs_kernel(
 
     # The rows' sums of squares: the embedding row, and each stream's part
     # of the hidden row (its norm spans all 4 streams).
-    sum_e = tl.zeros([16], tl.float32)
-    sum_h = tl.zeros([16], tl.float32)
+    sum_e = tl.zeros([16 * TILES], tl.float32)
+    sum_h = tl.zeros([16 * TILES], tl.float32)
     for k0 in range(0, H, BK):
         k = k0 + kk
         xe = tl.load(e_row[:, None] + k[None, :], mask=live[:, None], other=0.0)
@@ -81,15 +86,17 @@ def _qwen4_exp_mtp_fuse_inputs_kernel(
         sum_e += tl.sum(xe * xe, 1)
         sum_h += tl.sum(xh * xh, 1)
     # Each row's total over its 4 streams, back on all 4 of its MFMA rows.
-    per_row = tl.sum(tl.reshape(sum_h, [4, 4]), 0)
-    total_h = tl.reshape(tl.broadcast_to(per_row[None, :], [4, 4]), [16])
+    per_row = tl.sum(tl.reshape(sum_h, [TILES, 4, 4]), 1)
+    total_h = tl.reshape(
+        tl.broadcast_to(per_row[:, None, :], [TILES, 4, 4]), [16 * TILES]
+    )
     inv_e = tl.rsqrt(sum_e * (1.0 / H) + EPS)
     inv_h = tl.rsqrt(total_h * (1.0 / (4 * H)) + EPS)
 
     # Gemma RMSNorm (FP32 rows times rsqrt, times the FP32 1 + weight, one
     # BF16 cast), then the two BF16 linears with FP32 accumulation.
-    acc_e = tl.zeros([16, BN], tl.float32)
-    acc_h = tl.zeros([16, BN], tl.float32)
+    acc_e = tl.zeros([16 * TILES, BN], tl.float32)
+    acc_h = tl.zeros([16 * TILES, BN], tl.float32)
     for k0 in range(0, H, BK):
         k = k0 + kk
         xe = tl.load(e_row[:, None] + k[None, :], mask=live[:, None], other=0.0)
@@ -147,6 +154,8 @@ def triton_qwen4_exp_mtp_fuse_inputs(
         EPS=eps,
         H=size,
         BN=16,
+        # Tiles of 4 rows, bucketed: 4 rows share one compile, 8 another.
+        TILES=triton.next_power_of_2(-(-rows // _TILE_ROWS)),
         # 512 measured 4 us faster than 256 cold (fewer, longer weight runs).
         BK=512,
         num_warps=4,
