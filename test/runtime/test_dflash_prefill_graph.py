@@ -337,5 +337,230 @@ def test_a_replay_drafts_from_the_rounds_staged_inputs(monkeypatch) -> None:
     assert refresh["forward_mode"] == ForwardMode.DECODE
 
 
+# ----------------------------------------------------------------------
+# Fused MLA prefill KV write + DFlash2 prefill graph integration.
+# ----------------------------------------------------------------------
+
+
+def _mla_dflash2_model(dtype: torch.dtype = torch.bfloat16):
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.dflash2 import DFlash2DraftModel
+
+    config = PretrainedConfig(
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=64,
+        q_lora_rank=32,
+        kv_lora_rank=64,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=16,
+        v_head_dim=32,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=256,
+        rope_theta=10000.0,
+        layer_types=["sliding_attention", "full_attention"],
+        sliding_window=128,
+        decode_monokernel=False,
+        dflash_config={
+            "attention_mode": "mla",
+            "block_size": 16,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "selector_rank": 8,
+            "selector_top_k": 4,
+            "target_layer_ids": [0],
+        },
+    )
+    torch.manual_seed(0)
+    model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1)).to(dtype=dtype)
+    for param in model.parameters():
+        torch.nn.init.normal_(param, std=0.05)
+    # Run RMSNorm via pure PyTorch on CPU where Triton norm kernels are absent.
+    if not torch.cuda.is_available():
+        hidden_norm = model.hidden_norm
+        hidden_norm.forward = lambda x: torch.nn.functional.rms_norm(
+            x,
+            (hidden_norm.weight.shape[0],),
+            hidden_norm.weight,
+            hidden_norm.variance_epsilon,
+        )
+    return model
+
+
+def _cpu_mla_pool(n_layers: int, slots: int, width: int, dtype: torch.dtype):
+    from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
+
+    pool = object.__new__(MLATokenToKVPool)
+    pool.quant_method = "none"
+    pool.dtype = dtype
+    pool.store_dtype = dtype
+    pool.latent_write_sanitizes = False
+    pool.layerwise_load_tracker = None
+    pool.kv_buffer = [
+        torch.zeros(slots, 1, width, dtype=dtype) for _ in range(n_layers)
+    ]
+    return pool
+
+
+def test_fused_mla_helper_declines_sharded_placement_and_chunks_prefill(
+    monkeypatch,
+) -> None:
+    """Prefill context writes use chunked fused MLA when cache_placement is None."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
+
+    model = _mla_dflash2_model(dtype=torch.bfloat16)
+    kv_width = 64 + 16
+    pool = _cpu_mla_pool(
+        len(model.layers), slots=16, width=kv_width, dtype=torch.bfloat16
+    )
+
+    drafter = object.__new__(DFlash2)
+    drafter.model = model
+    drafter.attention_kind = model.attention_kind
+    drafter.device = torch.device("cpu")
+    drafter.spec_num_tokens = 1
+    drafter.input_buffers = SimpleNamespace(max_bs=2)
+    drafter.draft_model_runner = SimpleNamespace(
+        model=model, mapping=Mapping(rank=0, world_size=1)
+    )
+    drafter.token_to_kv_pool = pool
+    drafter._fused_kv_enabled = False
+    drafter._fused_kv_is_mla = False
+    drafter._fused_kv_proj_workspace = None
+    drafter._fused_kv_workspace_capacity = 0
+    drafter._fused_kv_workspace_dtype = None
+
+    # Sharded placement must decline fused scatter cleanly.
+    drafter.attn_backend = SimpleNamespace(cache_placement=lambda _mqa: object())
+    drafter._init_fused_kv_helper_mla(model.layers)
+    assert not drafter._fused_kv_enabled
+
+    # Unsharded DRAFT_SLIDING_ATTENTION (placement None) enables it cleanly.
+    drafter.attn_backend = SimpleNamespace(cache_placement=lambda _mqa: None)
+    drafter._init_fused_kv_helper_mla(model.layers)
+    assert drafter._fused_kv_enabled and drafter._fused_kv_is_mla
+
+    ws_before = drafter._fused_kv_proj_workspace
+    ws_ptr_before = ws_before.data_ptr()
+    assert drafter._fused_kv_workspace_capacity == 2
+
+    buf_by_ptr = {buf.data_ptr(): buf for buf in pool.kv_buffer}
+    calls: list[tuple[int, int, tuple[int, ...], tuple[int, ...]]] = []
+
+    def fake_scatter(
+        latent,
+        norm_weight,
+        eps,
+        cos_sin_cache,
+        positions,
+        loc,
+        planes,
+        *,
+        write_mask=None,
+        is_neox=True,
+        sanitize=False,
+    ) -> None:
+        del norm_weight, eps, cos_sin_cache, write_mask, is_neox, sanitize
+        assert positions.stride(0) == 1
+        assert loc.stride(0) == 1
+        calls.append(
+            (
+                int(latent.shape[0]),
+                int(latent.shape[1]),
+                tuple(int(x) for x in positions.tolist()),
+                tuple(int(x) for x in loc.tolist()),
+            )
+        )
+        for layer_idx, ptr in enumerate(planes.ptrs.tolist()):
+            buf_by_ptr[ptr][loc.long(), 0, :] = latent[:, layer_idx, :]
+
+    monkeypatch.setattr(dflash, "mla_latent_norm_rope_scatter", fake_scatter)
+    monkeypatch.setattr(drafter, "_PREFILL_FUSED_KV_CHUNK_ROWS", 3)
+
+    # Empty write is a safe no-op.
+    drafter._write_native_cache(
+        torch.empty(0, model.context_in_features, dtype=torch.bfloat16),
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int64),
+        decode_only=False,
+    )
+    assert calls == []
+
+    # Prefill write of 7 rows chunks cleanly into 3 + 3 + 1 without growing workspace.
+    hidden = torch.randn(7, model.context_in_features, dtype=torch.bfloat16)
+    positions = torch.arange(10, 17, dtype=torch.int32)
+    cache_locs = torch.tensor([2, 5, 1, 9, 4, 11, 7], dtype=torch.int64)
+    drafter._write_native_cache(hidden, positions, cache_locs, decode_only=False)
+
+    assert [c[0] for c in calls] == [3, 3, 1]
+    assert drafter._fused_kv_proj_workspace is ws_before
+    assert drafter._fused_kv_proj_workspace.data_ptr() == ws_ptr_before
+
+    with torch.inference_mode():
+        ctx_hidden = model.project_target_hidden(hidden)
+    for layer_idx, layer in enumerate(model.layers):
+        attn = layer.self_attn
+        expected_latents = torch.matmul(
+            ctx_hidden,
+            attn.fused_qkv_a_proj_with_mqa.weight[
+                attn.q_lora_rank : attn.q_lora_rank + kv_width
+            ].t(),
+        )
+        torch.testing.assert_close(
+            pool.kv_buffer[layer_idx][cache_locs, 0, :], expected_latents
+        )
+
+    # Over-capacity calls under stream capture still fail loudly instead of allocating.
+    monkeypatch.setattr(dflash, "is_current_stream_capturing", lambda _dev: True)
+    with pytest.raises(RuntimeError, match="workspace too small"):
+        drafter._write_native_cache(hidden, positions, cache_locs, decode_only=False)
+
+
+def test_dflash2_draft_native_uses_zero_extends_for_mla() -> None:
+    """DFlash2 with MLA passes num_extends=0 to attention metadata refresh."""
+    from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
+
+    model = _mla_dflash2_model()
+    drafter = _drafter(attention_kind=model.attention_kind)
+    hidden_size = int(model.config.hidden_size)
+    dflash2_drafter = object.__new__(DFlash2)
+    dflash2_drafter.__dict__.update(drafter.__dict__)
+    dflash2_drafter.model = model
+    dflash2_drafter.attention_kind = model.attention_kind
+    dflash2_drafter.hidden_size = hidden_size
+    dflash2_drafter._first_layer_input = "full"
+    dflash2_drafter.mask_embedding_partial = None
+    dflash2_drafter.embed_tokens = lambda flat_ids, reduce_results=True: torch.zeros(
+        (flat_ids.shape[0], hidden_size), dtype=torch.bfloat16
+    )
+    dflash2_drafter.draft_model_runner = SimpleNamespace(
+        mapping=drafter.draft_model_runner.mapping,
+        forward=lambda **kw: SimpleNamespace(
+            hidden_states=torch.zeros(
+                (kw["positions"].shape[0], hidden_size), dtype=torch.bfloat16
+            )
+        ),
+    )
+    dflash2_drafter._sample_block = (
+        lambda draft_hidden, block_ids, next_tokens: next_tokens.zero_()
+    )
+
+    anchors = torch.tensor([11, 12], dtype=torch.int32)
+    out = dflash2_drafter._draft_native(anchors)
+
+    assert out.shape == (2, WIDTH)
+    assert len(dflash2_drafter.attn_backend.refreshes) == 1
+    refresh = dflash2_drafter.attn_backend.refreshes[0]
+    assert refresh["num_extends"] == 0
+    assert refresh["forward_mode"] == ForwardMode.DECODE
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -486,6 +486,9 @@ class DFlash2DraftModel(DFlashDraftModel):
             _dflash2_config_value(config, "input_embedding_scale", 1.0)
         )
         self.block_size = int(_dflash2_config_value(config, "block_size"))
+        # Expose MLA identity so DFlash activates block-draft prefill graphs
+        # (metadata_num_extends=0) instead of inheriting qwen_mha.
+        self.attention_kind = "kimi_mla" if self._uses_mla else "qwen_mha"
         nested = getattr(config, "dflash_config", {}) or {}
         # The candidate logits' scale and softcap (0: none): the drafter
         # applies them, and the head monokernel bakes them in.

@@ -208,6 +208,7 @@ def test_mla_draft_layers_build_windowed_mla_attention() -> None:
         assert layer.self_attn.attn_mqa.sliding_window_size == window
         assert layer.self_attn.attn_mha.sliding_window_size == window
         assert layer.comm_manager is not None
+    assert model.attention_kind == "kimi_mla"
 
 
 @_CUDA_ONLY
@@ -1139,3 +1140,73 @@ def test_draft_capture_does_not_replace_persistent_residual(monkeypatch, initial
     assert not residual.any()
     if buffer is not None:
         assert torch.all(buffer == 3)
+
+
+@pytest.mark.parametrize(
+    ("attention_mode", "expected_kind", "expects_plan"),
+    (
+        ("mla", "kimi_mla", True),
+        ("gqa", "qwen_mha", False),
+    ),
+)
+def test_dflash2_draft_model_sets_attention_kind_for_prefill_graphs(
+    attention_mode: str, expected_kind: str, expects_plan: bool
+) -> None:
+    """DFlash2DraftModel exposes kimi_mla for MLA drafts so prefill block graphs engage."""
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.drafter.base import EXTEND_DECODE_SERIES
+
+    extra_mla = (
+        {
+            "q_lora_rank": 64,
+            "kv_lora_rank": 64,
+            "qk_nope_head_dim": 32,
+            "qk_rope_head_dim": 16,
+            "v_head_dim": 32,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": 1024,
+        }
+        if attention_mode == "mla"
+        else {}
+    )
+    config = PretrainedConfig(
+        vocab_size=64,
+        hidden_size=256,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=64,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+        decode_monokernel=False,
+        dflash_config={
+            "attention_mode": attention_mode,
+            "block_size": 16,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "selector_rank": 8,
+            "selector_top_k": 4,
+            "target_layer_ids": [0],
+        },
+        **extra_mla,
+    )
+    mapping = Mapping(rank=0, world_size=1)
+    model = DFlash2DraftModel(config, mapping)
+    assert model.attention_kind == expected_kind
+
+    drafter = object.__new__(DFlash2)
+    drafter.model = model
+    drafter.attention_kind = model.attention_kind
+    drafter.draft_model_runner = SimpleNamespace(mapping=mapping)
+    drafter.input_buffers = SimpleNamespace(max_bs=4)
+    drafter.spec_num_tokens = 16
+    drafter.draft_sampler = None
+    plan = drafter.extend_graph_plan([16])
+    if expects_plan:
+        assert plan == {EXTEND_DECODE_SERIES: [(4, 4), (3, 3), (2, 2), (1, 1)]}
+    else:
+        assert plan == {}
