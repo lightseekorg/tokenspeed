@@ -1248,7 +1248,16 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
         events.append("tokenizer")
         return tokenizer
 
-    monkeypatch.setattr(weight_loader, "get_model", load)
+    class FixtureLoader:
+        def __init__(self):
+            self.checkpoint_shapes = {}
+
+        def load_model(self, **kwargs):
+            return load(**kwargs)
+
+    monkeypatch.setattr(
+        weight_loader, "get_model_loader", lambda config: FixtureLoader()
+    )
     monkeypatch.setattr(weight_loader, "get_tokenizer", get_tokenizer)
     monkeypatch.setattr(weight_loader, "get_available_gpu_memory", lambda *args: 1.0)
     monkeypatch.setattr(weight_loader, "set_cuda_arch", lambda: None)

@@ -1443,6 +1443,16 @@ class HostBootstrap:
                 )
             else:
                 draft_model_config = None
+            # Read source-directory metadata before post-model-init hooks run.
+            tokenizer = get_tokenizer(
+                server_args.tokenizer,
+                tokenizer_mode=server_args.tokenizer_mode,
+                trust_remote_code=server_args.trust_remote_code,
+                revision=server_args.revision,
+                architectures=model_config.hf_config.architectures,
+                download_dir=server_args.download_dir,
+                **model_config.tokenizer_kwargs,
+            )
             ngram_context_len = engram_context_len(model_config.hf_text_config)
             in_flight_depth = host_in_flight_depth(server_args)
             if ngram_context_len and in_flight_depth > 1:
@@ -1666,15 +1676,6 @@ class HostBootstrap:
                 )
             # The tokens that end every request not ignoring EOS: the model's EOS
             # ids and the tokenizer's, as the request handler resolves them.
-            tokenizer = get_tokenizer(
-                server_args.tokenizer,
-                tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
-                revision=server_args.revision,
-                architectures=model_config.hf_config.architectures,
-                download_dir=server_args.download_dir,
-                **model_config.tokenizer_kwargs,
-            )
             eos_token_ids = resolve_stop_token_ids(
                 SamplingParams(), model_config.hf_eos_token_id, tokenizer
             )

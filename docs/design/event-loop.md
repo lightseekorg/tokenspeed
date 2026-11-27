@@ -70,6 +70,39 @@ encode requests.
 The launcher snapshots each rank's environment inside its start context so
 allocator preload hooks reach the child along with the native logging defaults.
 
+Runtime plugins may register `register_post_model_init_hook(name, hook)` through
+`tokenspeed.runtime.plugins.registry`. Each language-model engine rank invokes
+an immutable snapshot of these synchronous callbacks in name order, once during startup,
+after target and local draft loading, multimodal preparation and communication
+preparation, and before the first cache profile or allocation. Cache rebuilds
+do not invoke them again. Encode-only engines do not run these hooks.
+`PostModelInitContext` exposes launch parameters, model configurations, mapping,
+the local device and the world CPU process group; it exposes no device model. The group includes pipeline stages without
+a draft. Hooks own their synchronization, must run in the same order on every
+rank, and propagate failures to startup. Registration joins the plugin loader's
+normal recording and rollback.
+
+The host reads its tokenizer and preserves safetensors shapes from the selected
+files while loading weights, before this boundary. Dummy/config-only startup
+snapshots already-local safetensors headers if present, without downloading a
+checkpoint for this metadata. Unreadable optional dummy headers are warned
+about and leave an empty snapshot, so an incomplete checkpoint cannot prevent
+a weights-free startup. Later disk updates validate against the saved
+shapes rather than reopening the initial source. Rank-local state and custom
+loaders must supply canonical checkpoint shapes to support this comparison;
+their storage layouts need not match a regular checkpoint. Without a snapshot,
+new shards are still validated before loading. Explicit reload requests require
+the new checkpoint they name.
+
+Plugins must prepare their own metadata before retiring a source. The world
+CPU group coordinates one engine only: a source shared by independently
+starting engines (including prefill/decode or external frontends and encode
+services) requires cross-engine coordination owned by the plugin, or a separate
+copy for each engine. A barrier on this group alone cannot protect that source.
+Hooks must not retain GPU allocations after startup except in the memory
+saver's CPU-backed named regions, preserving zero occupancy on weights release
+and restoration on resume.
+
 What an engine registers with tells its frontend what it serves: the
 request types it takes (an encode server takes encode requests only), the
 field order of the positional structs on its wire, its role and, for a

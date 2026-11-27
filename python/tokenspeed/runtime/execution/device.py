@@ -1925,6 +1925,33 @@ def build_device_side(
     if communication_first:
         prepare_multimodal()
 
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.plugins.registry import (
+        PostModelInitContext,
+        get_post_model_init_hooks,
+    )
+
+    hooks = get_post_model_init_hooks()
+    if hooks:
+        with startup_phase("model.post_init"):
+            mapping = server_args.mapping
+            context = PostModelInitContext(
+                server_args=server_args,
+                model_config=model_config,
+                draft_model_config=draft_model_config,
+                mapping=mapping,
+                device=torch.device(server_args.device, gpu_id),
+                world_cpu_group=(
+                    pg_manager.get_process_group("gloo", mapping.world_group)
+                    if mapping.world_size > 1
+                    else None
+                ),
+            )
+            for hook in hooks:
+                hook(context)
+
     post_profile_bytes = recv_pool_bytes(server_args, model_config.is_multimodal_active)
     if post_profile_bytes:
         logger.info(

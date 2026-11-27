@@ -20,7 +20,9 @@
 
 """Checkpoint loading must not require or use write access to the source."""
 
+import json
 import os
+import struct
 import sys
 
 import pytest
@@ -84,11 +86,13 @@ def test_checkpoint_loading_preserves_source_bytes(
             )
         )
         model = model_type()
-        loaded = dict(
-            loader.get_checkpoint_weights(
-                str(tmp_path), None, model, Mapping(rank=0, world_size=1)
-            )
+        [prepared] = loader._get_checkpoint_sources(
+            str(tmp_path), None, model, Mapping(rank=0, world_size=1)
         )
+        loaded = dict(prepared.weights)
+        assert prepared.read_shapes() == {
+            name: tuple(tensor.shape) for name, tensor in expected.items()
+        }
         expected_names = set(expected)
         if model_type is _FilteredHostWeights:
             expected_names.remove("skip")
@@ -107,3 +111,46 @@ def test_checkpoint_loading_preserves_source_bytes(
             torch.testing.assert_close(tensor, expected[name], rtol=0, atol=0)
     finally:
         path.chmod(0o600)
+
+
+@pytest.mark.skipif(
+    not hasattr(torch, "float4_e2m1fn_x2"), reason="requires packed FP4 tensor support"
+)
+def test_checkpoint_metadata_keeps_logical_subbyte_shapes(tmp_path):
+    header = {"packed": {"dtype": "F4", "shape": [2, 2048], "data_offsets": [0, 2048]}}
+    blob = json.dumps(header).encode()
+    blob += b" " * (-len(blob) % 8)
+    (tmp_path / "model.safetensors").write_bytes(
+        struct.pack("<Q", len(blob)) + blob + b"\x11" * 2048
+    )
+    loader = DefaultModelLoader(LoadConfig(weight_loader_prefetch_checkpoints=False))
+    # Packed tensors have a different materialized shape; reloads compare headers.
+    [prepared] = loader._get_checkpoint_sources(
+        str(tmp_path), None, _HostWeights(), Mapping(rank=0)
+    )
+    list(prepared.weights)
+    assert prepared.read_shapes() == {"packed": (2, 2048)}
+
+
+def test_checkpoint_metadata_ignores_unselected_shards(tmp_path):
+    expected = {"host.table": torch.arange(6).reshape(2, 3)}
+    save_file(expected, str(tmp_path / "kept.safetensors"))
+    (tmp_path / "ignored.safetensors").write_bytes(b"not a readable shard")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "host.table": "kept.safetensors",
+                    "skip": "ignored.safetensors",
+                }
+            }
+        )
+    )
+    loader = DefaultModelLoader(LoadConfig(weight_loader_prefetch_checkpoints=False))
+    [prepared] = loader._get_checkpoint_sources(
+        str(tmp_path), None, _FilteredHostWeights(), Mapping(rank=0)
+    )
+    loaded = dict(prepared.weights)
+    assert loaded.keys() == expected.keys()
+    torch.testing.assert_close(loaded["host.table"], expected["host.table"])
+    assert prepared.read_shapes() == {"host.table": (2, 3)}

@@ -68,6 +68,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     pt_weights_iterator,
     runai_streamer_weights_iterator,
     safetensors_filtered_weights_iterator,
+    safetensors_tensor_shapes,
     safetensors_weights_iterator,
     split_kv_cache_scales,
 )
@@ -194,6 +195,16 @@ class CheckpointFileSelection(Protocol):
 
 
 @runtime_checkable
+class CheckpointShapeProvider(Protocol):
+    """A loader retaining canonical shapes from its selected checkpoint files."""
+
+    @property
+    def checkpoint_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Source shapes, including an empty snapshot when no headers exist."""
+        ...
+
+
+@runtime_checkable
 class KVCacheScaleLoader(Protocol):
     """A model that puts its checkpoint's KV-cache scales on its attention layers."""
 
@@ -237,6 +248,24 @@ class BaseModelLoader(ABC):
         raise NotImplementedError
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class _PreparedWeights:
+    """A weight stream and the selected local files supplying its metadata."""
+
+    weights: Generator[tuple[str, torch.Tensor], None, None]
+    safetensors_files: tuple[str, ...]
+    prefix: str
+
+    def read_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Read canonical shapes only when the caller needs a snapshot."""
+        return {
+            self.prefix + name: shape
+            for name, shape in safetensors_tensor_shapes(
+                list(self.safetensors_files)
+            ).items()
+        }
+
+
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
@@ -261,6 +290,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig) -> None:
         super().__init__(load_config)
+        self.checkpoint_shapes: dict[str, tuple[int, ...]] = {}
         if load_config.model_loader_extra_config:
             raise ValueError(
                 f"Model loader extra config is not supported for "
@@ -425,8 +455,8 @@ class DefaultModelLoader(BaseModelLoader):
         weight_name_filter: Callable[[str], bool] | None,
         checkpoint_load_group: tuple[int, ...] | None,
         mapping: Mapping,
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights based on the load format.
+    ) -> _PreparedWeights:
+        """Prepare the weight stream and its selected metadata files based on the load format.
 
         When ``weight_name_filter`` is given, safetensors shards whose index
         entries contain no accepted weight name are skipped entirely (not
@@ -514,15 +544,12 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
 
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
-
-    def _get_all_weights(
-        self,
-        model_config: ModelConfig,
-        model: nn.Module,
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        yield from self.get_checkpoint_weights(
-            model_config.model_path, model_config.revision, model, model_config.mapping
+        return _PreparedWeights(
+            weights=(
+                (source.prefix + name, tensor) for name, tensor in weights_iterator
+            ),
+            safetensors_files=tuple(hf_weights_files) if use_safetensors else (),
+            prefix=source.prefix,
         )
 
     def get_checkpoint_weights(
@@ -538,6 +565,18 @@ class DefaultModelLoader(BaseModelLoader):
         through here too, so a reloaded model binds the new checkpoint
         directory and picks its load group exactly as at startup.
         """
+        for prepared in self._get_checkpoint_sources(
+            model_path, revision, model, mapping
+        ):
+            yield from prepared.weights
+
+    def _get_checkpoint_sources(
+        self,
+        model_path: str,
+        revision: str | None,
+        model: nn.Module,
+        mapping: Mapping,
+    ) -> Generator[_PreparedWeights, None, None]:
         # Draft (NextN/MTP) models embedded in the target checkpoint expose
         # ``checkpoint_weight_name_filter`` so only the shards holding their
         # weights are read instead of the whole checkpoint.
@@ -569,7 +608,7 @@ class DefaultModelLoader(BaseModelLoader):
             prefix="",
             fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", False),
         )
-        yield from self._get_weights_iterator(
+        yield self._get_weights_iterator(
             primary_weights,
             weight_name_filter,
             checkpoint_load_group,
@@ -580,7 +619,7 @@ class DefaultModelLoader(BaseModelLoader):
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
         )
         for source in secondary_weights:
-            yield from self._get_weights_iterator(
+            yield self._get_weights_iterator(
                 source, weight_name_filter, checkpoint_load_group, mapping
             )
 
@@ -598,6 +637,7 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
+        self.checkpoint_shapes.clear()
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with startup_phase("weights.allocate"):
@@ -609,11 +649,22 @@ class DefaultModelLoader(BaseModelLoader):
 
             with startup_phase("weights.read_copy"):
                 kv_cache_scales: dict[str, torch.Tensor] = {}
+                checkpoint_shapes: dict[str, tuple[int, ...]] = {}
+
+                def startup_weights():
+                    for prepared in self._get_checkpoint_sources(
+                        model_config.model_path,
+                        model_config.revision,
+                        model,
+                        model_config.mapping,
+                    ):
+                        checkpoint_shapes.update(prepared.read_shapes())
+                        yield from prepared.weights
+
                 model.load_weights(
-                    split_kv_cache_scales(
-                        self._get_all_weights(model_config, model), kv_cache_scales
-                    )
+                    split_kv_cache_scales(startup_weights(), kv_cache_scales)
                 )
+                self.checkpoint_shapes = checkpoint_shapes
                 if kv_cache_scales:
                     _load_kv_cache_scales(model, kv_cache_scales)
 
@@ -722,6 +773,10 @@ class ExtensibleModelLoader:
         load_config.load_format = LoadFormat.AUTO
         self.base_lm_loader = DefaultModelLoader(load_config)
         self.ext_yaml = load_config.ext_yaml
+
+    @property
+    def checkpoint_shapes(self) -> dict[str, tuple[int, ...]]:
+        return self.base_lm_loader.checkpoint_shapes
 
     def load_model(
         self,
@@ -974,6 +1029,7 @@ class RunaiModelStreamerLoader(DefaultModelLoader):
 
     def __init__(self, load_config: LoadConfig) -> None:
         BaseModelLoader.__init__(self, load_config)
+        self.checkpoint_shapes: dict[str, tuple[int, ...]] = {}
         extra_config = (
             {}
             if load_config.model_loader_extra_config is None
@@ -1082,7 +1138,7 @@ class RunaiModelStreamerLoader(DefaultModelLoader):
         weight_name_filter: Callable[[str], bool] | None,
         checkpoint_load_group: tuple[int, ...] | None,
         mapping: Mapping,
-    ) -> Generator[tuple[str, torch.Tensor], None, None]:
+    ) -> _PreparedWeights:
         del mapping
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
@@ -1113,6 +1169,8 @@ class RunaiModelStreamerLoader(DefaultModelLoader):
                 prefixed_filter,
             )
 
+        from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
         if self.distributed and checkpoint_load_group is not None:
             raise ValueError(
                 "runai_streamer distributed=True is incompatible with "
@@ -1129,7 +1187,17 @@ class RunaiModelStreamerLoader(DefaultModelLoader):
             concurrency=self.concurrency,
             memory_limit=self.memory_limit,
         )
-        return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+        return _PreparedWeights(
+            weights=(
+                (source.prefix + name, tensor) for name, tensor in weights_iterator
+            ),
+            safetensors_files=(
+                ()
+                if is_object_store_uri(source.model_or_path)
+                else tuple(hf_weights_files)
+            ),
+            prefix=source.prefix,
+        )
 
 
 def get_model_loader(load_config: LoadConfig) -> BaseModelLoader:

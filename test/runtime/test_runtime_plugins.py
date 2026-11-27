@@ -913,6 +913,54 @@ def test_trace_context_provider_rejects_async_and_generators():
         registry.get_trace_provider("test-async-trace")
 
 
+def test_post_model_init_hook_snapshot_order_and_rollback():
+    calls = []
+    before = registry.get_post_model_init_hooks()
+
+    with pytest.raises(RuntimeError, match="undo hooks"):
+        with registry.recording() as record:
+            registry.register_post_model_init_hook(
+                "test.z", lambda context: calls.append("z")
+            )
+            registry.register_post_model_init_hook(
+                "test.a", lambda context: calls.append("a")
+            )
+            snapshot = registry.get_post_model_init_hooks()
+            registry.register_post_model_init_hook(
+                "test.m", lambda context: calls.append("m")
+            )
+            for hook in snapshot:
+                if hook not in before:
+                    hook(None)
+            assert calls == ["a", "z"]
+            calls.clear()
+            for hook in registry.get_post_model_init_hooks():
+                if hook not in before:
+                    hook(None)
+            assert calls == ["a", "m", "z"]
+            assert record.names["post_model_init"] == ["test.z", "test.a", "test.m"]
+            with pytest.raises(ValueError, match="already registered"):
+                registry.register_post_model_init_hook("test.a", lambda context: None)
+            raise RuntimeError("undo hooks")
+    assert registry.get_post_model_init_hooks() == before
+
+
+def test_post_model_init_hook_rejects_async_and_generators():
+    async def async_hook(context):
+        pass
+
+    def generator_hook(context):
+        yield
+
+    class AsyncHook:
+        async def __call__(self, context):
+            pass
+
+    for hook in (async_hook, generator_hook, AsyncHook()):
+        with pytest.raises(TypeError, match="synchronous"):
+            registry.register_post_model_init_hook("test.invalid", hook)
+
+
 def test_non_ascend_backend_discovery_without_ascend_helpers():
     import subprocess
     import sys

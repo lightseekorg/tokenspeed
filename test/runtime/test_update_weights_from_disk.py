@@ -64,6 +64,7 @@ from tokenspeed.runtime.execution.ascend_memory_saver_device import (  # noqa: E
 )
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.model_runner import ModelRunner  # noqa: E402
+from tokenspeed.runtime.execution.weight_loader import WeightLoader  # noqa: E402
 from tokenspeed.runtime.execution.weight_memory import WeightMemoryState  # noqa: E402
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod  # noqa: E402
 from tokenspeed.runtime.layers.dense.unquant import (  # noqa: E402
@@ -161,11 +162,10 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
     runner.device = "cpu"
     runner.gpu_id = 0
     runner.checkpoint_load_group = None
-    runner._disk_reload_shapes = None
     # Resident weights (no peer sharing), so disk reloads are allowed.
     runner.mapping = Mapping(rank=0)
     runner.model_config = SimpleNamespace(
-        model_path=str(booted_from), mapping=runner.mapping
+        model_path=str(booted_from), mapping=runner.mapping, revision=None
     )
     runner.server_args = SimpleNamespace(
         enable_memory_saver=False,
@@ -176,6 +176,9 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
         ext_yaml=None,
         weight_loader_prefetch_checkpoints=False,
         weight_loader_prefetch_num_threads=1,
+    )
+    runner._disk_reload_shapes = WeightLoader.checkpoint_shapes(
+        runner.model_config, model
     )
     return runner
 

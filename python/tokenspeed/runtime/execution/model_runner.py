@@ -155,9 +155,8 @@ class ModelRunner:
         self.is_multimodal = model_config.is_multimodal
         self.is_draft_worker = is_draft_worker
         self.checkpoint_load_group = checkpoint_load_group
-        # Tensor shapes of the checkpoint the last disk reload read; until one
-        # succeeds, update_weights_from_disk reads them from model_path.
-        self._disk_reload_shapes: dict[str, tuple[int, ...]] | None = None
+        # Captured before startup hooks; later disk reloads replace the snapshot.
+        self._disk_reload_shapes: dict[str, tuple[int, ...]] = {}
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
         self.dp_linear_max_tokens: int | None = None
@@ -243,7 +242,7 @@ class ModelRunner:
             initialize_moe_config(server_args)
 
     def load_model(self):
-        self.model = WeightLoader.load_model(
+        loaded = WeightLoader.load_model_with_metadata(
             model_config=self.model_config,
             server_args=self.server_args,
             device=self.device,
@@ -252,6 +251,8 @@ class ModelRunner:
             checkpoint_load_group=self.checkpoint_load_group,
             is_draft_worker=self.is_draft_worker,
         )
+        self.model = loaded.model
+        self._disk_reload_shapes = loaded.checkpoint_shapes
         if not self.is_draft_worker:
             validate_output_vocabulary(self.model, self.model_config.vocab_size)
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
@@ -787,8 +788,7 @@ class ModelRunner:
             )
 
         self.model_config.model_path = model_path
-        if shapes is not None:
-            self._disk_reload_shapes = shapes
+        self._disk_reload_shapes = shapes or {}
         logger.info(f"weights reloaded from {model_path!s} ({consumed:d} tensors)")
         return True, (
             f"Succeeded to update model weights from {model_path} "
@@ -833,22 +833,6 @@ class ModelRunner:
             return None, str(e)
 
         held = self._disk_reload_shapes
-        if held is None:
-            try:
-                _, held_files, held_safetensors = loader._prepare_weights(
-                    self.model_config.model_path,
-                    getattr(self.model_config, "revision", None),
-                    fall_back_to_pt,
-                    weight_files,
-                )
-                held = safetensors_tensor_shapes(held_files) if held_safetensors else {}
-            except Exception as e:  # noqa: BLE001 - only the shape check is lost
-                logger.warning(
-                    "update_weights_from_disk: cannot read the shapes of "
-                    f"{self.model_config.model_path!s} ({e!s}); "
-                    "checking the new checkpoint's shards only"
-                )
-                held = {}
         # The default loader fills a one-element parameter from any
         # one-element tensor, so those match whatever their shapes.
         mismatched = [
