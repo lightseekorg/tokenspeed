@@ -262,6 +262,7 @@ def test_rank_local_state_does_not_define_canonical_checkpoint_shapes(
 def test_incomplete_checkpoint_only_prevents_real_weight_loading(
     tmp_path, monkeypatch, caplog, startup_format, checkpoint_state, error
 ):
+    monkeypatch.setattr(weight_loader.logger, "propagate", True)
     _write_checkpoint(tmp_path, scale=1)
     shard = tmp_path / "model.safetensors"
     if checkpoint_state == "truncated":
