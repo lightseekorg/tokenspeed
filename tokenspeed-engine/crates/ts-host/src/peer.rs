@@ -379,7 +379,31 @@ pub fn start(
                 "peer READ retirement bound unset; orphaned grants require explicit recovery"
             );
         }
-        peer.enable_versioned(layout, name, incarnation, channel, retirement_bound_ms);
+        let progress_mesh = if replica.size() > 1 {
+            let listener =
+                ts_collective::Listener::bind(&settings.bind_host).map_err(|e| e.to_string())?;
+            let port = listener.port().map_err(|e| e.to_string())?;
+            let address = format!("{}:{port}", settings.push_host);
+            let addresses = mesh
+                .all_gather(replica, address.as_bytes())
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(String::from_utf8)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            let rank = replica.index();
+            let group =
+                Group::new(0, (0..addresses.len()).collect(), rank).map_err(|e| e.to_string())?;
+            let transport = Mesh::connect(rank, listener, &addresses, Duration::from_secs(60))
+                .map_err(|e| e.to_string())?;
+            Some((transport, group))
+        } else {
+            None
+        };
+        peer.enable_versioned(layout, name, incarnation, channel, retirement_bound_ms)
+            .map_err(|e| e.to_string())?;
+        peer.start_versioned_progress(progress_mesh)
+            .map_err(|e| e.to_string())?;
     }
     // A second start would be a second peer; there is one per process.
     if outbox.fence.set(peer.fence()).is_err() {

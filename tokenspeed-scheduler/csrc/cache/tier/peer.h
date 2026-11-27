@@ -134,6 +134,8 @@ struct PeerLookupRequest {
     std::vector<std::int32_t> tokens;
     std::int32_t max_tokens{0};
 
+    std::int32_t local_tokens{0};
+
     bool operator==(const PeerLookupRequest&) const = default;
 };
 

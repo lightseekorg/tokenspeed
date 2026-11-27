@@ -1402,6 +1402,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let executed = if copies_clear
                 && (idle_forward || self.peer.as_ref().is_some_and(Peer::autonomous))
             {
+                let _window = self.peer.as_ref().and_then(|p| {
+                    p.cache_window(crate::peer::CacheWait::Execute, self.forwards_dispatched)
+                });
                 let data_plane = &mut self.data_plane;
                 ArcMutexGuard::unlocked(&mut self.scheduler, || {
                     data_plane.execute(plan, &dispatch)
@@ -3304,6 +3307,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let rows = if allow_unlock
             && (self.in_flight.is_empty() || self.peer.as_ref().is_some_and(Peer::autonomous))
         {
+            let _window = self.peer.as_ref().and_then(|p| {
+                p.cache_window(
+                    crate::peer::CacheWait::DataParallel,
+                    self.forwards_dispatched,
+                )
+            });
             let mesh = &mut self.ranks.mesh;
             ArcMutexGuard::unlocked(&mut self.scheduler, || mesh.all_gather_i64(world, &row))?
         } else {
@@ -3526,8 +3535,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let _span = profile::span("EventLoop::commit");
             let (batch, input_logprobs, pending) = self.in_flight.pop_front().expect("non-empty");
             let data_plane = &mut self.data_plane;
-            let result =
-                ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.complete(pending))?;
+            let result = {
+                let _window = self
+                    .peer
+                    .as_ref()
+                    .filter(|_| self.copies_confirmed_at.is_none())
+                    .and_then(|p| {
+                        p.cache_window(crate::peer::CacheWait::Complete, self.forwards_completed)
+                    });
+                ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.complete(pending))?
+            };
             self.forwards_completed += 1;
             if self
                 .copies_confirmed_at

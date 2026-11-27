@@ -36,7 +36,9 @@ mod attempt;
 mod autonomous;
 mod coordinated;
 mod offers;
+mod progress;
 pub use autonomous::Peer;
+pub(crate) use progress::CacheWait;
 pub mod geometry;
 pub mod landing;
 pub mod layout;
@@ -312,7 +314,8 @@ pub struct PeerListener {
     net: Arc<PeerNet>,
     received: mpsc::Receiver<Vec<Bytes>>,
     registered: Option<Arc<registered::Replica>>,
-    inbox: Arc<Mutex<VecDeque<v1::Message>>>,
+    inbox: Arc<Mutex<VecDeque<(Instant, v1::Message)>>>,
+    versioned_wake: Arc<DriverWake>,
 }
 
 /// The public listener dispatches both holder requests and reader replies.
@@ -396,6 +399,7 @@ impl PeerListener {
             received,
             registered: None,
             inbox: Arc::default(),
+            versioned_wake: Arc::default(),
         })
     }
 
@@ -452,6 +456,7 @@ impl PeerListener {
         VersionedChannel {
             net: self.net.clone(),
             inbox: self.inbox.clone(),
+            versioned_wake: self.versioned_wake.clone(),
         }
     }
 }
@@ -459,7 +464,8 @@ impl PeerListener {
 /// Communication endpoints owned by a registered replica leader.
 pub struct VersionedChannel {
     net: Arc<PeerNet>,
-    inbox: Arc<Mutex<VecDeque<v1::Message>>>,
+    inbox: Arc<Mutex<VecDeque<(Instant, v1::Message)>>>,
+    versioned_wake: Arc<DriverWake>,
 }
 
 #[derive(Default)]
@@ -532,7 +538,7 @@ struct Protocol {
     fenced: HashSet<String>,
     /// Landings this member started reading.
     reading: HashSet<String>,
-    reads: Reads,
+    reads: Arc<Mutex<Reads>>,
     metrics: Option<Arc<ts_metrics::PeerMetrics>>,
     read_metrics: Option<Arc<ts_metrics::PeerMetrics>>,
     // Only the endpoint owner measures logical attempts.
@@ -590,7 +596,11 @@ impl Protocol {
             read_metrics: None,
             lookup_times: HashMap::new(),
             decisions: Vec::new(),
-            reads: Reads::start(transfers.reader, transfers.pusher, READ_CONCURRENCY)?,
+            reads: Arc::new(Mutex::new(Reads::start(
+                transfers.reader,
+                transfers.pusher,
+                READ_CONCURRENCY,
+            )?)),
             unplaced: Vec::new(),
             self_lookup_answers: Vec::new(),
         })
@@ -664,7 +674,7 @@ impl Protocol {
     /// This member's report for the round.
     pub fn report(&mut self) -> Vec<u8> {
         let mut outcomes = std::mem::take(&mut self.unplaced);
-        outcomes.extend(self.reads.poll());
+        outcomes.extend(self.reads.lock().poll());
         let mut report = Report {
             now_us: i64::try_from(self.origin.elapsed().as_micros()).unwrap_or(i64::MAX),
             outcomes,
@@ -1194,7 +1204,7 @@ impl Protocol {
                             spans.total_bytes() + push.as_ref().map_or(0, PushJob::bytes),
                         )
                     });
-                    self.reads.submit_observed(
+                    self.reads.lock().submit_observed(
                         ReadJob {
                             request_id: request.clone(),
                             session,
@@ -1227,6 +1237,7 @@ fn start_endpoint(
         received,
         registered,
         inbox,
+        versioned_wake,
     } = listener;
     let sharded = registered
         .as_ref()
@@ -1299,7 +1310,8 @@ fn start_endpoint(
                                 {
                                     let mut queue = inbox.lock();
                                     if queue.len() < 128 {
-                                        queue.push_back(message);
+                                        queue.push_back((Instant::now(), message));
+                                        versioned_wake.notify();
                                     }
                                 }
                             }
