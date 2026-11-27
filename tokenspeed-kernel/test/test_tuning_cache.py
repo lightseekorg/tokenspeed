@@ -375,6 +375,41 @@ def test_tuning_mode_is_owned_by_flashinfer(monkeypatch):
     assert not tuning.is_autotuning()
 
 
+def test_nested_autotune_false_clears_tuning_when_backend_autotune_false_is_noop(
+    monkeypatch,
+):
+    """Real FlashInfer autotune(False) does not clear an enclosing tuning scope;
+    tokenspeed's autotune(tune_mode=False) must still disable is_autotuning()."""
+    tuner, _ = _install_fake_flashinfer(monkeypatch, metadata={})
+
+    @contextlib.contextmanager
+    def flashinfer_like_autotune(tune_mode, **kwargs):
+        del kwargs
+        if not tune_mode:
+            yield
+            return
+        previous, tuner.is_tuning_mode = tuner.is_tuning_mode, True
+        try:
+            yield
+        finally:
+            tuner.is_tuning_mode = previous
+
+    monkeypatch.setattr(tuning._autotuner, "autotune", flashinfer_like_autotune)
+    assert not tuning.is_autotuning()
+    with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
+        assert tuning.is_autotuning()
+        with autotune(tune_mode=False, tuning_buckets=None, round_up=None):
+            assert not tuning.is_autotuning()
+        assert tuning.is_autotuning()
+        with pytest.raises(RuntimeError), autotune(
+            tune_mode=False, tuning_buckets=None, round_up=None
+        ):
+            assert not tuning.is_autotuning()
+            raise RuntimeError("inner failure")
+        assert tuning.is_autotuning()
+    assert not tuning.is_autotuning()
+
+
 def test_missing_flashinfer_is_a_noop(monkeypatch, tmp_path):
     monkeypatch.setattr(tuning, "_autotuner", None)
     assert tuning.autotune_cache_path({}) is None

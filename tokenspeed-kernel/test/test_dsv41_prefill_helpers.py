@@ -212,8 +212,13 @@ class _FakeFlashInferAutoTuner:
     @contextlib.contextmanager
     def autotune(self, tune_mode: bool, *, tuning_buckets=None, round_up=None):
         del tuning_buckets, round_up
+        # Match FlashInfer 0.7's behavior: autotune(False) leaves an enclosing
+        # tuning scope's is_tuning_mode intact.
+        if not tune_mode:
+            yield
+            return
         previous = self.is_tuning_mode
-        self.is_tuning_mode = bool(tune_mode)
+        self.is_tuning_mode = True
         try:
             yield
         finally:
@@ -369,10 +374,26 @@ def test_warm_mxfp8_buckets_releases_transient_buffers(monkeypatch):
         set_autotune_max_num_tokens(prev_max)
 
 
+def _ordinary_pool_usage() -> tuple[int, list[int]]:
+    """Return total bytes and active block sizes in ordinary CUDA pool (0, 0)."""
+    dev = torch.cuda.current_device()
+    total_bytes = 0
+    active_blocks: list[int] = []
+    for segment in torch.cuda.memory_snapshot():
+        if segment["device"] != dev or tuple(segment["segment_pool_id"]) != (0, 0):
+            continue
+        total_bytes += int(segment["total_size"])
+        for block in segment["blocks"]:
+            if block["state"] == "active_allocated":
+                active_blocks.append(int(block["size"]))
+    return total_bytes, sorted(active_blocks)
+
+
 def _check_cuda_warm_mxfp8_zero_ordinary_pool_occupancy() -> None:
-    """Subprocess check: repeated CUDA _warm_mxfp8_buckets leaves pool (0, 0) at 0 B."""
+    """Subprocess check: repeated CUDA _warm_mxfp8_buckets adds 0 B to pool (0, 0)."""
     device = torch.device("cuda")
-    if flashinfer_gemm.mm_mxfp8 is flashinfer_gemm.error_fn:
+    using_stub = flashinfer_gemm.mm_mxfp8 is flashinfer_gemm.error_fn
+    if using_stub:
         flashinfer_gemm.mm_mxfp8 = (
             lambda a, b, a_scales, b_scales, *, out_dtype, backend: (
                 torch.empty((a.shape[0], b.shape[1]), dtype=out_dtype, device=a.device)
@@ -387,6 +408,31 @@ def _check_cuda_warm_mxfp8_zero_ordinary_pool_occupancy() -> None:
     try:
         k, n = 256, 128
         k_tiles = (k + 127) // 128
+
+        # Establish baseline after one plain mm_mxfp8 call with warmup disabled
+        # (isolates any upstream FlashInfer one-time persistent state from this
+        # warmup helper's transient buffers).
+        a = torch.zeros((128, k), dtype=torch.float8_e4m3fn, device=device)
+        s = torch.full((128 * k_tiles * 4,), 127, dtype=torch.uint8, device=device)
+        b = torch.zeros((n, k), dtype=torch.float8_e4m3fn, device=device).t()
+        b_scales = torch.full(
+            ((n + 127) // 128 * 128 * k_tiles * 4,),
+            127,
+            dtype=torch.uint8,
+            device=device,
+        )
+        with kernel_warmup(enabled=False), torch.no_grad():
+            out = flashinfer_gemm.mm_mxfp8(
+                a, b, s, b_scales, out_dtype=torch.bfloat16, backend="cute-dsl"
+            )
+        del out, a, s, b, b_scales
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        baseline_bytes, baseline_blocks = _ordinary_pool_usage()
+        if using_stub:
+            assert baseline_bytes == 0 and baseline_blocks == []
+
         for _ in range(3):
             flashinfer_gemm._WARMED_MXFP8_SHAPES.clear()
             a = torch.zeros((128, k), dtype=torch.float8_e4m3fn, device=device)
@@ -405,13 +451,11 @@ def _check_cuda_warm_mxfp8_zero_ordinary_pool_occupancy() -> None:
             torch.cuda.synchronize()
             gc.collect()
             torch.cuda.empty_cache()
-            ordinary_bytes = sum(
-                segment["total_size"]
-                for segment in torch.cuda.memory_snapshot()
-                if segment["device"] == torch.cuda.current_device()
-                and tuple(segment["segment_pool_id"]) == (0, 0)
-            )
-            assert ordinary_bytes == 0, ordinary_bytes
+            ordinary_bytes, active_blocks = _ordinary_pool_usage()
+            assert (
+                ordinary_bytes == baseline_bytes
+            ), f"warmup added {ordinary_bytes - baseline_bytes} B to pool (0, 0)"
+            assert active_blocks == baseline_blocks, (active_blocks, baseline_blocks)
     finally:
         set_autotune_max_num_tokens(prev_max)
 
