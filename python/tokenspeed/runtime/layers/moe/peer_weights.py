@@ -136,13 +136,16 @@ class MoEPeerWeights:
 
     @property
     def finalized(self) -> bool:
+        """Whether ``finalize()`` has bound full-expert peer views."""
         return self._finalized
 
     @property
     def released(self) -> bool:
+        """Whether the underlying peer-weight physical storage is currently released."""
         return self.store.released
 
     def managed_parameters(self) -> tuple[torch.nn.Parameter, ...]:
+        """Return every registered layer parameter bound to this controller in layer order."""
         return tuple(
             binding.module.get_parameter(name)
             for binding in self._layers.values()
@@ -150,6 +153,11 @@ class MoEPeerWeights:
         )
 
     def vmm_managed_storages(self) -> frozenset[tuple[int, int]]:
+        """Return ``(data_ptr, nbytes)`` pairs for VMM-backed peer tensors after finalization.
+
+        Raises ``RuntimeError`` if called before ``finalize()`` or if VMM tensors exist
+        without any allocated physical memory on the store.
+        """
         if not self._finalized:
             raise RuntimeError("Finalize peer weights before inspecting storage")
         storages = frozenset(
@@ -162,26 +170,31 @@ class MoEPeerWeights:
         return storages
 
     def owned_weights(self, layer: int) -> dict[str, torch.Tensor]:
+        """Return this rank's writable local shard tensors for ``layer`` after finalization."""
         if not self._finalized:
             raise RuntimeError("Finalize peer weights before accessing owned shards")
         return self.store.owned_weights(layer)
 
     def prepare_weight_update(self) -> None:
+        """Quiesce peer readers and copy streams before rewriting owned shards; requires finalization."""
         if not self._finalized:
             raise RuntimeError("Finalize peer weights before updating weights")
         self.store.prepare_weight_update()
 
     def refresh_weights(self) -> None:
+        """Refresh boundary intervals and invalidate staging after owned shards change; requires finalization."""
         if not self._finalized:
             raise RuntimeError("Finalize peer weights before refreshing weights")
         self.store.refresh_weights()
 
     def release_storage(self, *, backup: bool) -> None:
+        """Release VMM physical storage after finalization, backing up owned shards to CPU when ``backup`` is True."""
         if not self._finalized:
             raise RuntimeError("Finalize peer weights before releasing storage")
         self.store.release_storage(backup=backup)
 
     def resume_storage(self, *, backup: bool) -> None:
+        """Reallocate and remap VMM storage after release, restoring owned shards from CPU when ``backup`` is True."""
         if not self._finalized:
             raise RuntimeError("Finalize peer weights before resuming storage")
         self.store.resume_storage(backup=backup)

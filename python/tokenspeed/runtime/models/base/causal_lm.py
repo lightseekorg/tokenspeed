@@ -557,8 +557,7 @@ class BaseCausalLM(nn.Module):
         return frozenset()
 
     def reloadable_post_load_hooks(self) -> frozenset[Any]:
-        """Startup ``process_weights_after_loading`` hooks or MoE preprocessors
-        that this model refreshes safely in place during disk weight updates."""
+        """Return startup hooks and MoE preprocessors safe to refresh in place during disk weight updates."""
         return frozenset()
 
     def allow_redundant_checkpoint_names(self, names: frozenset[str]) -> None:

@@ -54,6 +54,14 @@ def _agree_group_errors(
     local_error: BaseException | None,
     phase: str,
 ) -> None:
+    """Agree on local versus peer errors across ``cpu_group`` at ``phase``.
+
+    Every rank joins ``dist.all_gather_object`` even when ``local_error`` is
+    set so healthy peers do not hang in the collective. If ``local_error`` is
+    set, it is re-raised after the gather; otherwise any peer failure raises a
+    ``RuntimeError`` naming ``phase`` and the failing ranks so the caller can
+    abort any opened weight-update sessions.
+    """
     if cpu_group is not None:
         errors: list[str | None] = [None] * dist.get_world_size(cpu_group)
         dist.all_gather_object(

@@ -134,7 +134,14 @@ class AscendMemorySaverAdapter(NpuMemorySaver, TorchMemorySaverAdapter):
         graphs,
         peer_storages: frozenset[tuple[int, int]] = frozenset(),
     ) -> None:
-        """Check all model and KV storage plus captured graph pool ownership."""
+        """Check all model and KV storage plus captured graph pool ownership.
+
+        Args:
+            peer_storages: ``(data_ptr, nbytes)`` pairs for peer-owned model
+                storage (such as VMM-backed DWDP views) that satisfy weight
+                presence for their role while being exempted from memory-saver
+                allocation tracking.
+        """
         allocations = []
         for role, model in models:
             found = False

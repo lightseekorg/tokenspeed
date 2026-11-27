@@ -632,6 +632,14 @@ class ModelRunner:
             weights = None
 
             def _prepare_disk_load(*, fail_by_raising: bool) -> tuple[bool, str] | None:
+                """Validate disk reloadability and open the checkpoint tensor stream.
+
+                Populates the enclosing ``ignored_disk_names``, ``shapes``, and
+                ``weights`` bindings consumed by ``_counted``. When
+                ``fail_by_raising`` is True (used inside a coordinated group
+                preflight), failures raise ``ValueError``; otherwise, returns
+                ``(False, message)`` on validation failure or ``None`` on success.
+                """
                 nonlocal ignored_disk_names, shapes, weights
                 if require_complete:
                     ignored_disk_names = (
