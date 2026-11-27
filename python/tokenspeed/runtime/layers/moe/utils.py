@@ -237,3 +237,36 @@ def get_deepep_mode() -> DeepEPMode:
         logger.warning("DEEPEP_MODE is not initialized, using auto mode")
         DEEPEP_MODE = DeepEPMode.AUTO
     return DEEPEP_MODE
+
+
+def shared_expert_stream(
+    aux_stream: object | None, *, use_gluon_petit: bool
+) -> object | None:
+    """Return the stream a MoE layer's shared expert forks onto under capture.
+
+    Petit's VMM-backed collective and auxiliary-stream shared experts were
+    kept apart on the assumption that they do not replay safely together, so
+    under Gluon Petit both branches stay on the main stream (None) unless
+    TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM opts in to the overlap every
+    other backend gets. Every other backend uses ``aux_stream``.
+    """
+    # Deferred: utils.env imports server_args, which this module only names
+    # under TYPE_CHECKING.
+    from tokenspeed.runtime.utils.env import envs
+
+    if use_gluon_petit and not envs.TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM.get():
+        return None
+    return aux_stream
+
+
+def shared_expert_stream_label(
+    aux_stream: object | None, *, use_gluon_petit: bool
+) -> str:
+    """Name the stream ``shared_expert_stream`` picks, and why, for the log."""
+    if shared_expert_stream(aux_stream, use_gluon_petit=use_gluon_petit) is None:
+        if aux_stream is None:
+            return "main (no aux stream)"
+        return "main (Gluon Petit default)"
+    if use_gluon_petit:
+        return "aux (TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM)"
+    return "aux (backend default)"

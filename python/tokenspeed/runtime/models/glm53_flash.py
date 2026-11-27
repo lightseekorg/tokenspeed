@@ -74,7 +74,7 @@ from tokenspeed.runtime.layers.moe import (
 )
 from tokenspeed.runtime.layers.moe.block import MoEBlock, MoEBlockFusion
 from tokenspeed.runtime.layers.moe.topk import TopK
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
+from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, shared_expert_stream
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -471,12 +471,8 @@ class Glm53FlashMoE(MoEBlock):
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
         )
-        # Under Gluon Petit the shared expert stays on the main stream unless
-        # TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM opts in, as for DeepSeek
-        # V4.1 (deepseek_v41_moe.shared_expert_stream); other backends keep
-        # forking it onto ``alt_stream`` under graph capture.
-        from tokenspeed.runtime.models.deepseek_v41_moe import shared_expert_stream
-
+        # The shared-expert stream follows layers.moe.utils.shared_expert_stream
+        # (Petit: main unless TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM opts in).
         super().__init__(
             gate,
             topk,

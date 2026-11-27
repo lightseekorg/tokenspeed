@@ -175,6 +175,7 @@ from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
     get_all2all_backend,
     get_moe_backend,
+    shared_expert_stream,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
@@ -2938,8 +2939,7 @@ class KimiLinearMoE(nn.Module):
         # waits for the join.
         petit_shared_expert_aux_stream = (
             self.execution_plan.petit_tp_attention
-            and alt_stream is not None
-            and envs.TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM.get()
+            and shared_expert_stream(alt_stream, use_gluon_petit=True) is not None
         )
         # Native EP owns its collectives; native TP reduces before replicated up-projection.
         self.native_latent_moe = (

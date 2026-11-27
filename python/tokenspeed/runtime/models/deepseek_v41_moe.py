@@ -44,12 +44,17 @@ from tokenspeed.runtime.layers.moe.topk import (
     TopKOutput,
     simulated_router_logits,
 )
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_moe_backend,
+    shared_expert_stream,
+    shared_expert_stream_label,
+)
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import (
     gluon_petit_tp_attention_mapping,
@@ -202,35 +207,6 @@ def _deepseek_v4_routed_expert_quant_config(
         ),
         False,
     )
-
-
-def shared_expert_stream(
-    aux_stream: object | None, *, use_gluon_petit: bool
-) -> object | None:
-    """Return the stream a MoE layer's shared expert forks onto under capture.
-
-    Petit's VMM-backed collective and auxiliary-stream shared experts were
-    kept apart on the assumption that they do not replay safely together, so
-    under Gluon Petit both branches stay on the main stream (None) unless
-    TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM opts in to the overlap every
-    other backend gets. Every other backend uses ``aux_stream``.
-    """
-    if use_gluon_petit and not envs.TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM.get():
-        return None
-    return aux_stream
-
-
-def shared_expert_stream_label(
-    aux_stream: object | None, *, use_gluon_petit: bool
-) -> str:
-    """Name the stream ``shared_expert_stream`` picks, and why, for the log."""
-    if shared_expert_stream(aux_stream, use_gluon_petit=use_gluon_petit) is None:
-        if aux_stream is None:
-            return "main (no aux stream)"
-        return "main (Gluon Petit default)"
-    if use_gluon_petit:
-        return "aux (TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM)"
-    return "aux (backend default)"
 
 
 def log_shared_expert_stream(
