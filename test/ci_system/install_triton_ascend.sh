@@ -30,11 +30,6 @@ TOKENSPEED_TVM_FFI_VERSION="${TOKENSPEED_TVM_FFI_VERSION:-0.1.13.post3}"
 TOKENSPEED_TRITON_ASCEND_VERSION="${TOKENSPEED_TRITON_ASCEND_VERSION:-3.2.1}"
 TOKENSPEED_TRANSFORMERS_VERSION="${TOKENSPEED_TRANSFORMERS_VERSION:-5.12.0}"
 TOKENSPEED_ASCEND_PYPI="${TOKENSPEED_ASCEND_PYPI:-https://mirrors.huaweicloud.com/ascend/repos/pypi}"
-# Internal package index for tokenspeed-smg / tokenspeed-mooncake /
-# tokenspeed-smg-grpc-proto / tokenspeed-smg-grpc-servicer / tokenspeed-spdlog,
-# which are not reachable from the public PyPI. Leave empty when those runtime
-# packages are not needed (for example, pure kernel smoke tests).
-TOKENSPEED_INTERNAL_PYPI="${TOKENSPEED_INTERNAL_PYPI:-}"
 TOKENSPEED_PIP_TIMEOUT="${TOKENSPEED_PIP_TIMEOUT:-600}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 TOKENSPEED_REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -79,26 +74,19 @@ for _pkg in tokenspeed-scheduler tokenspeed-engine tokenspeed-kernel/python pyth
 done
 
 # tokenspeed-smg / tokenspeed-mooncake / tokenspeed-smg-grpc-proto /
-# tokenspeed-smg-grpc-servicer / tokenspeed-spdlog are internal packages not
-# available on the public PyPI (the smg/mooncake pins live in
-# python/pyproject.toml; tokenspeed-spdlog in the scheduler/engine build
-# requirements). They are only installed when an internal index is configured.
-if [[ -n "${TOKENSPEED_INTERNAL_PYPI}" ]]; then
-    python -m pip install \
-        --timeout "${TOKENSPEED_PIP_TIMEOUT}" \
-        "tokenspeed-smg" \
-        "tokenspeed-mooncake" \
-        "tokenspeed-smg-grpc-proto" \
-        "tokenspeed-smg-grpc-servicer" \
-        "tokenspeed-spdlog" \
-        --extra-index-url "${TOKENSPEED_INTERNAL_PYPI}"
-else
-    echo "WARNING: TOKENSPEED_INTERNAL_PYPI is not set; tokenspeed-smg," \
-        "tokenspeed-mooncake, tokenspeed-smg-grpc-proto," \
-        "tokenspeed-smg-grpc-servicer and tokenspeed-spdlog need the internal" \
-        "package index and were not installed. Runtime tests that depend on the" \
-        "smg gateway or mooncake transfer may fail." >&2
-fi
+# tokenspeed-smg-grpc-servicer / tokenspeed-spdlog are pinned in
+# python/pyproject.toml (and the scheduler/engine build requirements) and
+# resolve from the public PyPI. The editable ``--no-deps`` install above skips
+# dependencies, so install them explicitly; the smg/mooncake pins come from
+# python/pyproject.toml, tokenspeed-spdlog from the scheduler/engine build.
+python -m pip install \
+    --timeout "${TOKENSPEED_PIP_TIMEOUT}" \
+    "tokenspeed-smg" \
+    "tokenspeed-mooncake" \
+    "tokenspeed-smg-grpc-proto" \
+    "tokenspeed-smg-grpc-servicer" \
+    "tokenspeed-spdlog" \
+    --extra-index-url "${TOKENSPEED_ASCEND_PYPI}"
 
 PYTHONPATH="${TOKENSPEED_REPO_ROOT}/python:${TOKENSPEED_REPO_ROOT}/tokenspeed-kernel/python:${TOKENSPEED_REPO_ROOT}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}" \
     python "${SCRIPT_DIR}/verify_triton_ascend.py"
