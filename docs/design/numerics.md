@@ -705,6 +705,9 @@ The launch resolves the same registered architecture that the model loader
 uses, before worker environment export and process-group creation. This lets
 the model select its verified arithmetic and parallel mapping before those
 choices become fixed. Standard models retain the existing RL resolver.
+When plugins register model policies during headless CLI preparation, RL
+resolution completes their deferred registration before reading checkpoint
+configuration or selecting a model profile. `auto` retains deferred loading.
 Consumers with a narrower qualification scope can inspect the selected policy
 with `launch_rl_numerics(server_args)` without applying the resolver again.
 Only the target's resolver runs: its choices apply to the shared launch. A
