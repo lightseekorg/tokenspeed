@@ -358,6 +358,78 @@ class TestHistoryEmbeddingSeam:
         # Chunk 2's history came from chunk 1's appended tokens.
         assert history[0, 2:7].tolist() == [10, 11, 12, 13, 14]
 
+    def test_mixed_length_multi_request_packed_batch(self):
+        """Concurrent mixed-length requests in one packed prefill batch.
+
+        The prefill-graph seam (``compute_input_embeddings`` →
+        ``embed_packed_view``) assembles the packed ids into a padded
+        ``[bs, max_seq]`` batch; with requests of different lengths the
+        padded row count ``bs * max_seq`` exceeds the decode staging row
+        count, and the global ``reshape`` the staging branch applied blew up
+        (``shape '[3, 68, -1]' is invalid for input of size 5120`` under the
+        real 32-wide feature columns).  The seam must therefore force the
+        host lookup (``use_staging=False``): it runs outside the graph, and
+        the decode staging rows belong to a different batch indexed by the
+        packed token order, not the padded row order.
+
+        Locks: the mixed-length packed batch embeds to ``[T, hidden]``, each
+        output row is bit-identical (maxdiff=0) to the window-derived
+        reference, and the decode staging path (1-D, staged) still works.
+        """
+        torch.npu.set_device(0)
+        dev = "npu:0"
+        inner = _make_inner(dev)
+        emb = inner.ngram_embeddings
+        # The executor globally enables staging before decode capture; the
+        # prefill seam must not read it (the 107030/reshape regression).
+        emb.use_staging = True
+        emb._ensure_staging()
+
+        history = torch.zeros(POOL + 1, CAPACITY, dtype=torch.int32, device=dev)
+        committed = torch.zeros(POOL + 1, dtype=torch.int32, device=dev)
+        # Three requests of different lengths: 60, 62, 40 packed tokens.
+        # bs * max_seq = 3 * 62 = 186 > the staging row count (160) — the
+        # pre-fix global reshape clamped to 160 rows and crashed.
+        history[0, :2] = torch.tensor([7, 8], device=dev)
+        committed[0] = 2
+        slots = torch.tensor([0, 1, 2], dtype=torch.int64, device=dev)
+        offsets = torch.tensor([0, 60, 122, 162], dtype=torch.int32, device=dev)
+        active = torch.tensor([True, True, True], dtype=torch.bool, device=dev)
+        view = _view(
+            device=dev,
+            history=history,
+            committed=committed,
+            req_pool_indices=slots,
+            input_start_offsets=offsets,
+            active_request_mask=active,
+        )
+        ids = torch.randint(10, 250, (sum((60, 62, 40)),), device=dev)
+        ctx = SimpleNamespace(query_shard=None)
+
+        got = inner.compute_input_embeddings(ids, ctx, request_token_history=view)
+        assert list(got.shape) == [ids.numel(), HIDDEN]
+        assert torch.isfinite(got).all()
+
+        window = _reference_window(ids, offsets, slots, committed, history)
+        ref = emb.forward_from_window(ids, window, use_staging=False)
+        assert list(ref.shape) == [ids.numel(), HIDDEN]
+        md = (got.float() - ref.float()).abs().max().item()
+        assert md == 0.0, f"mixed-length view vs window embedding maxdiff={md}"
+
+        # The decode staging path (1-D packed, one token per request) is
+        # untouched: with the module flag True and a batch that fits the
+        # staging row count, the staged forward matches the host reference
+        # (this mixed-length batch itself exceeds the staging rows by design
+        # — preload_staging rejects it, which is the decode-path guard).
+        staged_ids = ids[:4]
+        staged_window = window[:4]
+        emb.preload_staging(staged_ids, staged_window)
+        staged = emb.forward_from_window(staged_ids, staged_window)
+        ref_staged = emb.forward_from_window(
+            staged_ids, staged_window, use_staging=False
+        )
+        assert (staged.float() - ref_staged.float()).abs().max().item() == 0.0
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

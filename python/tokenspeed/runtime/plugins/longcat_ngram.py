@@ -387,6 +387,15 @@ class NgramEmbedding(nn.Module):
         Assembles the packed ids into a padded ``[bs, max_seq]`` batch with
         the per-request committed history, runs the N-gram embedding and
         flattens the rows back to ``[T, hidden_size]``.
+
+        The inner forward forces ``use_staging=False``: this is the
+        prefill-graph seam, which the executor calls *outside* any captured
+        graph, so it must read the host tables — never the decode staging.
+        The decode staging holds a different (decode) batch's rows indexed by
+        the packed token order, so reading it for a padded mixed-length
+        ``[bs, max_seq]`` batch is both wrong and out of bounds (the global
+        reshape the staging branch applies is only valid for equal-length
+        batches whose ``bs * seq`` fits the staging row count).
         """
         bs = view.req_pool_indices.shape[0]
         starts = view.input_start_offsets  # [bs + 1]
@@ -400,7 +409,7 @@ class NgramEmbedding(nn.Module):
             rows[r, : lengths[r]] = input_ids[s : s + lengths[r]]
 
         hist = self.history_pad(rows, view)  # [bs, n - 1]
-        out = self(rows, ngram_context=hist, query_shard=query_shard)
+        out = self(rows, ngram_context=hist, query_shard=query_shard, use_staging=False)
         if not lengths:
             return torch.empty((0, out.size(-1)), dtype=out.dtype, device=out.device)
         out_rows = [out[r, : lengths[r]] for r in range(bs)]
@@ -588,6 +597,7 @@ class NgramEmbedding(nn.Module):
         predecessor_window: torch.Tensor,
         *,
         query_shard=None,
+        use_staging: bool | None = None,
     ) -> torch.Tensor:
         """Stateless forward from a per-token predecessor window.
 
@@ -600,6 +610,13 @@ class NgramEmbedding(nn.Module):
                 ngram-history machinery, ``prepare_ngram_inputs``).
             query_shard: Forward query-shard plan forwarded to the base word
                 embedding (query context parallelism).
+            use_staging: Explicit lookup-path override. ``None`` follows the
+                module state (``self.use_staging``); ``False`` forces the host
+                table lookup even under a global ``use_staging=True`` (set by
+                the executor before decode capture) — the prefill-graph seam
+                needs this because its embedding is computed outside the
+                graph and must never read the decode staging rows (they hold
+                a different batch, indexed by packed token not padded row).
 
         Returns:
             ``[.., seq_len, hidden_size]`` enriched embeddings.
@@ -626,7 +643,9 @@ class NgramEmbedding(nn.Module):
         # reorders the bf16 additions, which drifts the forward output by up
         # to ~1e-1 away from the reference (V5 numeric criterion regression).
         if self.tp_size > 1:
-            local_partial = self._ngram_local_partial(input_ids, predecessor_window)
+            local_partial = self._ngram_local_partial(
+                input_ids, predecessor_window, use_staging=use_staging
+            )
             # TP feature-column sharding: the local table slice contributes
             # only this rank's feature columns; all-reduce sums the full
             # contribution.
@@ -634,7 +653,9 @@ class NgramEmbedding(nn.Module):
             local_partial = all_reduce(local_partial, self.tp_group)
             x = x + local_partial
         else:
-            x = self._ngram_local_partial(input_ids, predecessor_window, out=x)
+            x = self._ngram_local_partial(
+                input_ids, predecessor_window, out=x, use_staging=use_staging
+            )
         x = x / (1 + self.k * (self.n - 1))
         return x
 
@@ -644,6 +665,7 @@ class NgramEmbedding(nn.Module):
         predecessor_window: torch.Tensor,
         *,
         out: torch.Tensor | None = None,
+        use_staging: bool | None = None,
     ) -> torch.Tensor:
         """Sum of the n-gram table contribution branches (pre all-reduce).
 
@@ -671,13 +693,30 @@ class NgramEmbedding(nn.Module):
           fallback is exactly the host<->device memcpy 910B3 rejects under
           capture (107030).
 
+        The ``use_staging`` argument overrides the module flag: ``None``
+        follows ``self.use_staging`` (the decode in-graph path), ``False``
+        forces the host lookup even when the executor has globally enabled
+        staging before decode capture.  The prefill-graph seam
+        (``embed_packed_view``) passes ``False``: it computes embeddings
+        outside the graph for a padded ``[bs, max_seq]`` batch, and the
+        staging rows are indexed by the *packed* token order of a different
+        (decode) batch — reading them under a ``reshape`` is both wrong and
+        out of bounds whenever ``bs * max_seq`` exceeds the staging row
+        count.
+
         Under TP feature-column sharding this is the local partial; the
         caller all-reduces it.
         """
         local_partial = out
+        # None follows the module state (decode path unchanged); an explicit
+        # False forces the host lookup even under a global use_staging=True
+        # (set by the executor before decode capture), which the prefill-graph
+        # seam needs: its embedding is computed outside the graph, so it must
+        # never read the decode staging rows (they hold a different batch).
+        use_staging = self.use_staging if use_staging is None else use_staging
         for index in range(self.k * (self.n - 1)):
             new_ids = self._compute_new_ids(input_ids, predecessor_window, index)
-            if not self.use_staging:
+            if not use_staging:
                 # Host-resident lookup (W18 scheme 2, eager baseline).
                 host_weight = self._host_embedders[index]
                 new_ids_cpu = new_ids.to("cpu")
@@ -709,6 +748,7 @@ class NgramEmbedding(nn.Module):
         ngram_context: torch.Tensor | None = None,
         *,
         query_shard=None,
+        use_staging: bool | None = None,
     ) -> torch.Tensor:
         """Stateless forward: base embedding + n-gram contributions.
 
@@ -719,6 +759,8 @@ class NgramEmbedding(nn.Module):
                 every predecessor is inside ``input_ids``.
             query_shard: Forward query-shard plan forwarded to the base word
                 embedding (query context parallelism).
+            use_staging: Explicit lookup-path override (see
+                ``forward_from_window``); None follows the module state.
 
         Returns:
             ``[batch, seq_len, hidden_size]`` enriched embeddings.
@@ -730,7 +772,9 @@ class NgramEmbedding(nn.Module):
             committed = 0
             context = input_ids
         window = self._window_from_context(context, committed)
-        return self.forward_from_window(input_ids, window, query_shard=query_shard)
+        return self.forward_from_window(
+            input_ids, window, query_shard=query_shard, use_staging=use_staging
+        )
 
 
 class _RuntimeLongcatNgramModel(_RuntimeLongcatModel):
