@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import os
 import sys
-from test.runtime.test_deepseek_v41_cache import R1, R2, _extend
+from test.runtime.test_deepseek_v41_cache import R1, R2, SWA, _extend
 from test.runtime.test_deepseek_v41_fused_decode import (
     _load_decode_projections,
     _mixed_context,
@@ -482,8 +482,15 @@ def test_ratio2_prefill_replay_preserves_prefix_kv():
     page = tables[R2][0, 0].item()
     prefix_kv = (pool.global_kv(2)[page], pool.index_k(2)[page])
     saved = tuple(field.clone() for field in prefix_kv)
+    tables[SWA][0, 2] = tables[SWA][0, 0]  # Wrap the SWA cache after 128 tokens.
     check(9, 125, 3)  # Reuse the first page and write new pairs in the next.
     torch.testing.assert_close(prefix_kv, saved, rtol=0, atol=0)
+
+    # Query 134 still needs row 7 when row 135 overwrites its SWA slot.
+    slot = tables[SWA][0, :1].long() * 64 + 7
+    old_row = dsv41.cache_gather(pool.swa(2), slot, backend.swa_format, None)
+    check(2, 134, 0)
+    assert torch.equal(backend.prefill_stage.prefix[:1], old_row)
 
 
 @requires_blackwell
@@ -537,9 +544,21 @@ def test_ced_source_replay_matches_eager_across_narrowing():
             decoder_view=backend.decoder_view(),
         )
 
-    _, ctx = extend(hidden.shape[0], hidden.shape[0])
+    # This history fits top-k. The mixed replay below needs the scored path.
+    _, ctx = extend(3, 3)
+
+    def unexpected_projection(module, args):
+        pytest.fail("Short eager prefill projected index Q or head weights")
+
     with active_forward(ctx):
         encode(ctx)
+        land()
+        with (
+            attn.indexer.wq_b.register_forward_pre_hook(unexpected_projection),
+            attn.indexer.weights_proj.register_forward_pre_hook(unexpected_projection),
+        ):
+            decode(ctx)
+        ctx.is_prefill_graph_dummy = True
         encoder = BreakableCapture(run_segments_while_capturing=True)
         with encoder:
             encode(ctx)

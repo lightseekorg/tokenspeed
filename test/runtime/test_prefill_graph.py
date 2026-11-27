@@ -782,6 +782,7 @@ class TestDummyGroupTablesTest:
         assert (ib.input_start_offsets_buf[0].item()) == (0)
         assert (ib.input_start_offsets_buf[bs].item()) == (num_tokens)
         assert ib.active_request_mask_buf[:bs].all().item()
+        assert ctx.is_prefill_graph_dummy
         assert (ctx.attn_backend) is (pg.attn_backend)
         assert (ctx.token_to_kv_pool) is (pg.token_to_kv_pool)
         seen["ctx"] = ctx

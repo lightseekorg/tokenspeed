@@ -221,6 +221,9 @@ class ForwardContext:
     # owns context cache writes; otherwise the drafter owns them.
     dspark_context_producer: DSparkContextProducer | None = None
 
+    # Dummy prefill histories warm up kernels needed by later graph replays.
+    is_prefill_graph_dummy: bool = False
+
     def apply_dp_metadata(
         self, metadata: DpForwardMetadata | None, *, required: bool
     ) -> None:

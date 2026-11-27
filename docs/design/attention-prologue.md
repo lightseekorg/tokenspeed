@@ -585,8 +585,13 @@ slot and workspace addresses. During capture the eager break uploads it
 synchronously from pageable memory to avoid a pinned-allocator event query in
 the next graph segment. Replay uploads it asynchronously from pinned memory.
 
-Each layer snapshots the old SWA prefix before current writes can reuse its
-cache slots. Prefill attends to that snapshot and the current rows. Decode rows,
-including the decode suffix of a mixed batch, read the updated cache. Decoder
-graphs share a BF16 workspace for current rows. On weight resume, the memory
-saver restores the persistent `attention_state` buffers at their captured addresses.
+Encoder layers snapshot the old SWA prefix before current writes can reuse
+its slots. CED decoder prefill starts its SWA window at the first retained
+row and uses only current rows. Decode rows, including the decode suffix of
+a mixed batch, read the updated cache. Decoder graphs share a BF16 workspace
+for current rows. On weight resume, the memory saver restores the persistent
+`attention_state` buffers at their captured addresses.
+
+When a pure eager prefill selects its whole history, index sources skip the
+index Q and head-weight projections. Graph warmup and capture include both
+projections so the same bucket can score a longer history on replay.

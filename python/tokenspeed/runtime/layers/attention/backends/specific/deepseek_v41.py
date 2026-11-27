@@ -1371,12 +1371,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             stage.swa_current = stage.decoder_swa_current(capacity) if decoder else None
             self.prefill_stage = stage
 
-    def publish_prefill_swa(self, layer_id, swa, rope, norm):
+    def publish_prefill_swa(self, layer_id, swa, rope, norm, *, decoder: bool):
         from tokenspeed_kernel.ops.attention import dsv41
 
         stage = self.prefill_stage
         cache = self.cache_pool.swa(layer_id)
-        dsv41.snapshot_swa_prefix(cache, stage.descriptor, self.swa_format)
+        # A CED decoder's SWA window starts at its first retained row.
+        # An encoder graph can replay with a different prefix on every forward.
+        if not decoder:
+            dsv41.snapshot_swa_prefix(cache, stage.descriptor, self.swa_format)
         n = swa.shape[0]
         current = (
             stage.swa_current[:n]

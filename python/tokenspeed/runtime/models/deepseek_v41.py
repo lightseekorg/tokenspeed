@@ -1509,7 +1509,7 @@ class DeepseekV41Attention(nn.Module):
             prepacked_scales=True,
         )
 
-    def _prefill_queries(self, qkv):
+    def _prefill_queries(self, qkv, indexer: DeepseekV41Indexer | None):
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
         qr, codes, scales = rmsnorm_quantize_fp8_group32(
             qr,
@@ -1523,11 +1523,9 @@ class DeepseekV41Attention(nn.Module):
             -1, (self.n_local_heads, self.head_dim)
         )
         index_q = None
-        if self.indexer is not None:
-            quantized = isinstance(
-                self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod
-            )
-            index_q, _ = self.indexer.wq_b(
+        if indexer is not None:
+            quantized = isinstance(indexer.wq_b.quant_method, _ReferenceFp8LinearMethod)
+            index_q, _ = indexer.wq_b(
                 codes if quantized else qr,
                 block_scale=scales if quantized else None,
                 output_dtype=qr.dtype if quantized else None,
@@ -1536,10 +1534,30 @@ class DeepseekV41Attention(nn.Module):
 
     def _forward_with_prefill_stage(self, positions, hidden, ctx, codes, scales):
         """Run the staged attention. The replayed source already has its global KV."""
+        backend = ctx.attn_backend
+        decoder = self.layer_id >= self.ced_decoder_start
+        capturing = is_breakable_capture_active()
+        indexer = self.indexer
+        # A captured bucket must also serve longer histories than its dummy batch.
+        if (
+            indexer is not None
+            and ctx.forward_mode.is_extend()
+            and not (capturing or ctx.is_prefill_graph_dummy)
+        ):
+            meta = (
+                backend.decoder_view().metadata
+                if decoder
+                else backend.query_metadata(ctx.forward_mode)
+            )
+            if not backend.indexer_needs_scores(
+                self.layer_id, meta.positions, meta.request_indices, ctx.forward_mode
+            ):
+                indexer = None
+        write_kv = self.is_kv_source and self.layer_id != self.ced_decoder_start
         self.rotary_emb._prepare_cache(hidden.device)
         aux = self.stream_fork.aux_stream
         overlap = (
-            self.indexer is not None
+            (indexer is not None or write_kv)
             and 0 < hidden.shape[0] <= (384 if self.compressor else 16)
             and aux is not None
             and aux.device == hidden.device
@@ -1549,30 +1567,31 @@ class DeepseekV41Attention(nn.Module):
         with self.stream_fork.scope(enable=overlap, overlap=True) as fork:
             with fork.branch():
                 weights = None
-                if self.indexer is not None:
-                    weights, _ = self.indexer.weights_proj(
+                if indexer is not None:
+                    weights, _ = indexer.weights_proj(
                         hidden, block_scale=None, output_dtype=None
                     )
-                if self.is_kv_source and self.layer_id != self.ced_decoder_start:
+                if write_kv:
                     self.write_prefill_kv(hidden, ctx)
             q, index_q, swa = self._prefill_queries(
-                self._project_qkv(hidden, codes, scales)
+                self._project_qkv(hidden, codes, scales), indexer
             )
-        if overlap:
-            weights.record_stream(torch.cuda.current_stream())
 
-        backend = ctx.attn_backend
         rope = self.rotary_emb.cos_sin_cache
-        if self.indexer is not None:
-            index_q, weights = self.indexer.query_from_projections(
+        if indexer is not None:
+            if overlap:
+                weights.record_stream(torch.cuda.current_stream())
+            index_q, weights = indexer.query_from_projections(
                 index_q, weights, positions, self.rotary_emb
             )
             index_q, weights = backend.prepare_index_query(
                 self.layer_id, index_q, weights
             )
-        current = backend.publish_prefill_swa(self.layer_id, swa, rope, self.kv_norm)
+        current = backend.publish_prefill_swa(
+            self.layer_id, swa, rope, self.kv_norm, decoder=decoder
+        )
         handoff = (None, None)
-        if is_breakable_capture_active():
+        if capturing:
             handoff = allocate_fp8_output(
                 q.device, self.n_local_groups, q.shape[0], zeroed=False
             )
@@ -1586,7 +1605,7 @@ class DeepseekV41Attention(nn.Module):
             self._kernel_attn_sink(),
             *handoff,
             layer_id=self.layer_id,
-            decoder=self.layer_id >= self.ced_decoder_start,
+            decoder=decoder,
             softmax_scale=self.head_dim**-0.5,
             groups=self.n_local_groups,
         )
