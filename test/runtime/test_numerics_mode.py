@@ -812,3 +812,236 @@ def test_explicit_blockwise_order_is_preserved(numerics, order, entrypoint):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+@pytest.fixture
+def model_numerics_policy(tmp_path):
+    from torch import nn
+    from transformers import LlamaConfig
+
+    from tokenspeed.runtime.configs.model_config import configure_mla_attention
+    from tokenspeed.runtime.configs.model_profile import ModelProfile
+    from tokenspeed.runtime.configs.numerics import RLNumericsPolicy
+    from tokenspeed.runtime.plugins import registry
+
+    class PolicyModel(nn.Module):
+        @classmethod
+        def model_profile(cls, hf_config):
+            return ModelProfile(
+                configure_attention=configure_mla_attention,
+                create_attention_config=None,
+                cache_family="ordinary",
+                linear_attention=None,
+                default_attention_backend=None,
+                request_token_history=False,
+                is_multimodal=False,
+                tokenizer_kwargs={},
+                attention_instances_per_layer=1,
+                numerics_envelopes=frozenset({"auto", "rl-bitwise"}),
+            )
+
+    def resolve(args):
+        if args.kv_cache_dtype != "bfloat16":
+            raise ValueError("The model's verified policy requires BF16 KV")
+        args.logprob_order = "blockwise-direct"
+        args._resolve_rl_bitwise()
+
+    def validate(*, quantization, vocab_size, architecture):
+        if quantization not in (None, "fp8") or vocab_size != 65536:
+            raise ValueError(f"Unsupported checkpoint for {architecture}")
+
+    def factory(config):
+        if config.hidden_size != 128:
+            raise ValueError("Unsupported model geometry")
+        return RLNumericsPolicy(resolve=resolve, validate=validate)
+
+    config = LlamaConfig(
+        architectures=["PolicyModel"],
+        hidden_size=128,
+        num_attention_heads=4,
+        num_hidden_layers=2,
+        vocab_size=65536,
+    )
+    config.save_pretrained(tmp_path)
+    with registry.recording() as record:
+        registry.register_model(PolicyModel)
+        registry.register_model_rl_numerics("PolicyModel", factory)
+    try:
+        yield tmp_path, config, PolicyModel.model_profile(config)
+    finally:
+        for undo in reversed(record.undo):
+            undo()
+
+
+class TestModelNumericsPolicy:
+    def test_launch_uses_model_policy_before_common_validation(
+        self, model_numerics_policy
+    ):
+        path, _, _ = model_numerics_policy
+        args = ServerArgs(
+            model=str(path),
+            numerics="rl-bitwise",
+            quantization="fp8",
+            kv_cache_dtype="bfloat16",
+            sampling_backend="greedy",
+        )
+        assert args.logprob_order == "blockwise-direct"
+        assert args.disable_tf32 and args.disable_autotune
+        assert args.batch_invariant_collectives
+        assert args.sampling_stream == "per-request"
+
+    def test_model_policy_rejects_unsupported_launch(self, model_numerics_policy):
+        path, _, _ = model_numerics_policy
+        with pytest.raises(ValueError, match="requires BF16 KV"):
+            ServerArgs(
+                model=str(path),
+                numerics="rl-bitwise",
+                kv_cache_dtype="fp8_e4m3",
+                sampling_backend="greedy",
+            )
+
+    def test_auto_keeps_its_execution_choices(self, model_numerics_policy):
+        path, _, _ = model_numerics_policy
+        args = ServerArgs(model=str(path), numerics="auto", sampling_backend="greedy")
+        assert args.logprob_order == "torch"
+        assert not args.disable_autotune
+
+    def test_checkpoint_overrides_reach_policy_selection(self, model_numerics_policy):
+        path, _, _ = model_numerics_policy
+        with pytest.raises(ValueError, match="Unsupported model geometry"):
+            ServerArgs(
+                model=str(path),
+                numerics="rl-bitwise",
+                sampling_backend="greedy",
+                kv_cache_dtype="bfloat16",
+                hf_overrides='{"hidden_size":256}',
+            )
+
+    @pytest.mark.parametrize("quantization", [None, "fp8"])
+    def test_verified_model_can_validate_its_quantization(
+        self, model_numerics_policy, quantization
+    ):
+        from tokenspeed.runtime.configs.numerics import require_verified_numerics
+
+        _, config, profile = model_numerics_policy
+        require_verified_numerics(
+            "rl-bitwise",
+            model_profile=profile,
+            architecture="PolicyModel",
+            quantization=quantization,
+            vocab_size=config.vocab_size,
+            hf_config=config,
+        )
+
+    def test_model_policy_does_not_bypass_profile_admission(
+        self, model_numerics_policy
+    ):
+        from dataclasses import replace
+
+        from tokenspeed.runtime.configs.numerics import require_verified_numerics
+
+        _, config, profile = model_numerics_policy
+        with pytest.raises(ValueError, match="has not been verified"):
+            require_verified_numerics(
+                "rl-bitwise",
+                model_profile=replace(profile, numerics_envelopes=frozenset({"auto"})),
+                architecture="PolicyModel",
+                quantization="fp8",
+                vocab_size=65536,
+                hf_config=config,
+            )
+
+    @pytest.mark.parametrize(
+        "quantization,vocab_size", [("int8", 65536), ("fp8", 32768)]
+    )
+    def test_target_and_draft_check_actual_checkpoint(
+        self, model_numerics_policy, quantization, vocab_size
+    ):
+        from tokenspeed.runtime.configs.numerics import require_verified_numerics
+
+        _, config, profile = model_numerics_policy
+        with pytest.raises(ValueError, match="Unsupported checkpoint"):
+            require_verified_numerics(
+                "rl-bitwise",
+                model_profile=profile,
+                architecture="PolicyModel",
+                quantization=quantization,
+                vocab_size=vocab_size,
+                hf_config=config,
+            )
+
+    def test_registered_policy_requires_checkpoint_context(self, model_numerics_policy):
+        from tokenspeed.runtime.configs.numerics import require_verified_numerics
+
+        _, _, profile = model_numerics_policy
+        with pytest.raises(ValueError, match="needs its checkpoint config"):
+            require_verified_numerics(
+                "rl-bitwise",
+                model_profile=profile,
+                architecture="PolicyModel",
+                quantization="fp8",
+                vocab_size=65536,
+            )
+
+    def test_policy_follows_the_first_registered_model(self, model_numerics_policy):
+        from torch import nn
+
+        from tokenspeed.runtime.plugins import registry
+
+        path, config, profile = model_numerics_policy
+
+        class FirstModel(nn.Module):
+            @classmethod
+            def model_profile(cls, hf_config):
+                return profile
+
+        with registry.recording() as record:
+            registry.register_model(FirstModel)
+        try:
+            config.architectures = ["FirstModel", "PolicyModel"]
+            config.save_pretrained(path)
+            args = ServerArgs(
+                model=str(path),
+                numerics="rl-bitwise",
+                kv_cache_dtype="bfloat16",
+                sampling_backend="greedy",
+            )
+            assert args.logprob_order == "blockwise"
+        finally:
+            for undo in reversed(record.undo):
+                undo()
+
+    def test_policy_registration_rolls_back_with_failed_plugin(
+        self, model_numerics_policy
+    ):
+        from tokenspeed.runtime.configs.numerics import (
+            STANDARD_RL_NUMERICS,
+            RLNumericsPolicy,
+            require_verified_numerics,
+        )
+        from tokenspeed.runtime.plugins import registry
+
+        _, config, profile = model_numerics_policy
+
+        def allow_checkpoint(*, quantization, vocab_size, architecture):
+            if quantization != "fp8":
+                raise ValueError("This fixture validates FP8")
+
+        def policy(config):
+            return RLNumericsPolicy(
+                resolve=STANDARD_RL_NUMERICS.resolve, validate=allow_checkpoint
+            )
+
+        with pytest.raises(RuntimeError, match="plugin failed"):
+            with registry.recording():
+                registry.register_model_rl_numerics("FailedPolicyModel", policy)
+                raise RuntimeError("plugin failed")
+        with pytest.raises(ValueError, match="fp8-quantized"):
+            require_verified_numerics(
+                "rl-bitwise",
+                model_profile=profile,
+                architecture="FailedPolicyModel",
+                quantization="fp8",
+                vocab_size=65536,
+                hf_config=config,
+            )

@@ -499,8 +499,9 @@ surface. A policy supplies its name, bitwise classification, launch resolver
 and checkpoint validator. Plugin discovery precedes CLI choices and launch
 validation; registrations update shared containers and roll back together if
 plugin loading fails. Every policy still passes the model profile gate.
-Only `rl-bitwise` inherits the RL switches and unquantized/vocab-block limits;
-a plugin owns its own policy without changing individual execution entry points.
+`rl-bitwise` uses the registered model policy when one exists, otherwise the
+standard RL switches and unquantized/vocab-block limits. A plugin owns its
+policy without changing individual execution entry points.
 
 The existing `gemm/mm` plan also accepts already quantized FP8 operands and
 canonical scales. Quantization stays in the caller's existing quantization
@@ -689,6 +690,35 @@ combination is accepted; `--enable-eplb` with the rank-order combine stays an
 `auto` launch. The load counters, the CPU-side algorithm and the P2P copies
 never enter the arithmetic; the dispatch algorithm stays static (required
 under rl-bitwise already) and drafts stay trivially placed.
+
+## Model-owned RL arithmetic
+
+The public contract remains `--numerics rl-bitwise`. A model can implement it
+with a checkpoint-aware `RLNumericsPolicy`, registered through
+`register_model_rl_numerics(architecture, factory)`. The factory receives the
+checkpoint config, including explicit overrides, and returns a launch resolver
+and a checkpoint validator. Different architectures need not use identical
+rounding, precision, or logprob formulas to implement the same contract against
+their respective training references.
+
+The launch resolves the same registered architecture that the model loader
+uses, before worker environment export and process-group creation. This lets
+the model select its verified arithmetic and parallel mapping before those
+choices become fixed. Standard models retain the existing RL resolver.
+Consumers with a narrower qualification scope can inspect the selected policy
+with `launch_rl_numerics(server_args)` without applying the resolver again.
+The target and draft still independently pass `ModelProfile.numerics_envelopes`
+admission. Their actual checkpoint quantization and vocabulary then pass the
+selected model validator; omitting the checkpoint context for a registered
+policy is an error. A quantized policy is opt-in per model, not a blanket
+relaxation of the standard unquantized gate. Plugin-load rollback removes
+model-policy registrations too.
+
+Registration does not establish numerical correctness. Each declared precision,
+layout and execution scope needs the invariance and independent trainer
+comparison below. Unsupported combinations must fail explicitly. Policy
+selection must preserve explicitly supplied launch choices or reject them;
+it must not silently switch a deployment to a different numerical reference.
 
 ## Acceptance
 

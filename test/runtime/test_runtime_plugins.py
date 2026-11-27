@@ -863,3 +863,36 @@ def test_trace_context_provider_rejects_async_and_generators():
             registry.register_trace_provider("test-async-trace", provider)
     with pytest.raises(ValueError, match="Unknown trace provider"):
         registry.get_trace_provider("test-async-trace")
+
+
+def test_non_ascend_backend_discovery_without_ascend_helpers():
+    import subprocess
+    import sys
+
+    from tokenspeed_kernel.platform import current_platform
+
+    if current_platform().is_npu:
+        pytest.skip("This check covers non-Ascend backend discovery")
+    program = """
+import importlib.abc
+import sys
+
+class MissingAscendHelpers(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in (
+            "tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa",
+            "tokenspeed.runtime.layers.attention.backends.paged.ascend_mla",
+            "tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace",
+        ):
+            raise ModuleNotFoundError("Ascend helpers are unavailable", name=fullname)
+
+sys.meta_path.insert(0, MissingAscendHelpers())
+from tokenspeed.runtime.layers.attention import backends
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
