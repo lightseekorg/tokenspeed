@@ -47,15 +47,20 @@ layouts' bytes can be compared without gathering them.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 
 import torch
 from torch import nn
 
+logger = logging.getLogger(__name__)
+
 MXFP4_GROUP = 32
 # Digest granularity: an eighth of the intermediate size, the TP8 slice.
 DIGEST_BLOCKS = 8
 _EXPERT_CHUNK = 8
+# Whether this process (rank) has logged its requantization; one line per rank.
+_requantization_logged = False
 
 
 def dequantize_fp8_block(
@@ -120,6 +125,7 @@ def requantize_moe_layer(layer: nn.Module, block_shape: tuple[int, int]) -> None
     uint8) in the layout ``create_mxfp4_weight_pair`` gives, one layer at a
     time so the FP8 staging is freed before the next layer converts.
     """
+    experts = layer.w13_weight.shape[0]
     for name in ("w13", "w2"):
         weight = getattr(layer, f"{name}_weight")
         scale_inv = getattr(layer, f"{name}_weight_scale_inv")
@@ -133,6 +139,28 @@ def requantize_moe_layer(layer: nn.Module, block_shape: tuple[int, int]) -> None
         layer.register_parameter(f"{name}_weight_scale_inv", None)
         del weight, scale_inv
     _write_digest(layer)
+    _log_requantization(layer, experts, block_shape)
+
+
+def _log_requantization(
+    layer: nn.Module, experts: int, block_shape: tuple[int, int]
+) -> None:
+    """State once per rank, at its first converted layer, that the block-FP8
+    routed experts are requantized to MXFP4 at load."""
+    global _requantization_logged
+    if _requantization_logged:
+        return
+    _requantization_logged = True
+    logger.info(
+        "MoE expert requantization (--moe-requant-experts mxfp4): block-FP8 "
+        "routed experts (%dx%d scale blocks) are requantized to MXFP4 at load, "
+        "%d experts per MoE layer on this rank; first layer %s, logged once "
+        "per rank",
+        block_shape[0],
+        block_shape[1],
+        experts,
+        getattr(layer, "prefix", ""),
+    )
 
 
 def block_digests(

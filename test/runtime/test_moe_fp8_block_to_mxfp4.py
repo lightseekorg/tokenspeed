@@ -8,13 +8,18 @@ Gluon Petit EP8 serve identical expert weights.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 import torch
+from torch import nn
 
+from tokenspeed.runtime.layers.quantization import fp8_block_to_mxfp4
 from tokenspeed.runtime.layers.quantization.fp8_block_to_mxfp4 import (
     block_digests,
     dequantize_fp8_block,
     requantize_fp8_block_to_mxfp4,
+    requantize_moe_layer,
 )
 
 BLOCK = (128, 128)
@@ -142,3 +147,34 @@ def test_block_digests_name_global_blocks() -> None:
         (5, "down", 3),
     ]
     assert rows[0][3] != rows[1][3]
+
+
+@requires_gpu
+def test_requantization_logs_once_per_rank(monkeypatch, caplog) -> None:
+    # Two MoE layers of 2 local experts each convert; the rank logs one line,
+    # at its first layer.
+    monkeypatch.setattr(fp8_block_to_mxfp4, "_requantization_logged", False)
+    monkeypatch.delenv("TOKENSPEED_MOE_REQUANT_DIGEST_DIR", raising=False)
+    caplog.set_level(logging.INFO, logger=fp8_block_to_mxfp4.__name__)
+    layers = []
+    for index in (3, 4):
+        layer = nn.Module()
+        layer.prefix = f"model.layers.{index}.mlp.experts"
+        for name, (n, k), seed in (("w13", (512, 256), index), ("w2", (256, 256), 9)):
+            weight, scale = _fp8_block(2, n, k, seed=seed)
+            layer.register_parameter(
+                f"{name}_weight", nn.Parameter(weight.cuda(), requires_grad=False)
+            )
+            layer.register_parameter(
+                f"{name}_weight_scale_inv",
+                nn.Parameter(scale.cuda(), requires_grad=False),
+            )
+        requantize_moe_layer(layer, BLOCK)
+        layers.append(layer)
+    assert all(layer.w13_weight.dtype == torch.uint8 for layer in layers)
+    assert [r.getMessage() for r in caplog.records] == [
+        "MoE expert requantization (--moe-requant-experts mxfp4): block-FP8 "
+        "routed experts (128x128 scale blocks) are requantized to MXFP4 at load, "
+        "2 experts per MoE layer on this rank; first layer "
+        "model.layers.3.mlp.experts, logged once per rank"
+    ]
