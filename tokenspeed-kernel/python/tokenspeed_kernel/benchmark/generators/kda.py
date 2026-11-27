@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -580,14 +580,24 @@ def _require_state_pages(state_pages: int, required: int) -> None:
         )
 
 
-def _history_capacity(window: int) -> int:
-    # The runtime's default history capacity (16); a wider window needs its
-    # own capacity there (--kda-history-capacity), here it is the window.
-    return max(16, window)
+_DEFAULT_HISTORY_CAPACITY = 16
+
+
+def _history_capacity(parameters: Mapping[str, Any], window: int) -> int:
+    # Match the runtime default (--kda-history-capacity = 16); a window wider
+    # than 16 must pass history_capacity explicitly.
+    raw = parameters.get("history_capacity")
+    capacity = _DEFAULT_HISTORY_CAPACITY if raw is None else raw
+    if type(capacity) is not int or capacity < window:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"KDA history_capacity must be an integer at least draft_token_num ({window})",
+        )
+    return capacity
 
 
 def _retained_benchmark_layer(
-    common, window, generator, reads, live, metadata, stamps, count, verified
+    common, window, capacity, generator, reads, live, metadata, stamps, count, verified
 ):
     """One layer's verify inputs over the request slots' shared counts.
 
@@ -613,7 +623,6 @@ def _retained_benchmark_layer(
         common["conv_kernel_size"],
     )
     _fill_state_pages(conv, state, reads.long(), generator=generator)
-    capacity = _history_capacity(window)
     shape = (reads.numel(), profile.heads, capacity, profile.head_dim)
     history = kda_ops.KdaRetainedHistory(
         torch.zeros(shape, device="cuda"),
@@ -710,7 +719,7 @@ def prepare_kda_fused_paged_verify(
     common = _fused_common(request)
     profile, batch = common["profile"], common["batch"]
     window = _positive_parameter(request.parameters, "draft_token_num")
-    capacity = _history_capacity(window)
+    capacity = _history_capacity(request.parameters, window)
     history_length = request.parameters.get("history_length", 0)
     if type(history_length) is not int or not 0 <= history_length <= capacity - window:
         raise BenchmarkCaseError(
@@ -741,7 +750,16 @@ def prepare_kda_fused_paged_verify(
     # No commit follows, so the verify reads the count itself.
     count = torch.zeros(batch, 1, device="cuda", dtype=torch.int32)
     layer = _retained_benchmark_layer(
-        common, window, generator, reads, reads.clone(), metadata, stamps, count, count
+        common,
+        window,
+        capacity,
+        generator,
+        reads,
+        reads.clone(),
+        metadata,
+        stamps,
+        count,
+        count,
     )
     initial_conv, initial_state = layer["conv"].clone(), layer["state"].clone()
     history = layer["records"].history
@@ -788,6 +806,7 @@ def prepare_kda_retained_commit(
     common = _fused_common(request)
     profile, batch = common["profile"], common["batch"]
     window = _positive_parameter(request.parameters, "draft_token_num")
+    capacity = _history_capacity(request.parameters, window)
     take = _positive_parameter(request.parameters, "accepted_length")
     layers = _positive_parameter(request.parameters, "layers")
     groups = _positive_parameter(request.parameters, "state_groups")
@@ -826,6 +845,7 @@ def prepare_kda_retained_commit(
         layer = _retained_benchmark_layer(
             common,
             window,
+            capacity,
             generator,
             reads,
             live,
@@ -897,7 +917,7 @@ def prepare_kda_retained_commit(
             request_stopped=request_stopped,
             request_ends=request_ends,
             draft_token_num=window,
-            history_capacity=_history_capacity(window),
+            history_capacity=capacity,
             num_heads=profile.heads,
             head_dim=profile.head_dim,
             conv_width=common["conv_kernel_size"],
@@ -915,7 +935,7 @@ def prepare_kda_retained_commit(
             "accepted_length": take,
             "layers": layers,
             "state_groups": groups,
-            "history_capacity": _history_capacity(window),
+            "history_capacity": capacity,
             "write_page_relation": "distinct",
         },
         validation=None,

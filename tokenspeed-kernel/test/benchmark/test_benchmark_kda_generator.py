@@ -24,7 +24,11 @@ import pytest
 import tokenspeed_kernel.benchmark.generators.kda as kda_generator
 import torch
 from tokenspeed_kernel.benchmark.generators.kda import prepare_kda_paged_prefill
-from tokenspeed_kernel.benchmark.harness import BenchmarkCaseError, BenchmarkRequest
+from tokenspeed_kernel.benchmark.harness import (
+    BenchmarkCaseError,
+    BenchmarkRequest,
+    BenchmarkStatus,
+)
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelSpec
 
@@ -376,3 +380,22 @@ def test_retained_verify_benchmark_keeps_the_raw_qkv_rows(monkeypatch, batch):
     prepared.invocation.reset()
     prepared.invocation.invoke()
     torch.testing.assert_close(raw_rows, layer["projection"].mixed_qkv, atol=0, rtol=0)
+
+
+def test_history_capacity_defaults_to_16_and_validates_against_window():
+    assert kda_generator._history_capacity({}, 1) == 16
+    assert kda_generator._history_capacity({}, 16) == 16
+    assert kda_generator._history_capacity({"history_capacity": None}, 4) == 16
+    assert kda_generator._history_capacity({"history_capacity": 20}, 20) == 20
+    assert kda_generator._history_capacity({"history_capacity": 8}, 4) == 8
+
+    for parameters, window in [
+        ({}, 20),
+        ({"history_capacity": None}, 20),
+        ({"history_capacity": 3}, 4),
+        ({"history_capacity": True}, 1),
+        ({"history_capacity": "16"}, 1),
+    ]:
+        with pytest.raises(BenchmarkCaseError) as exc_info:
+            kda_generator._history_capacity(parameters, window)
+        assert exc_info.value.status == BenchmarkStatus.INVALID_CASE
