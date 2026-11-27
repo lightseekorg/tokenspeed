@@ -34,6 +34,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import shutil
 import sys
 import tempfile
 from datetime import timedelta
@@ -64,6 +65,7 @@ from tokenspeed.runtime.execution.ascend_memory_saver_device import (  # noqa: E
 )
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.model_runner import ModelRunner  # noqa: E402
+from tokenspeed.runtime.execution.weight_loader import WeightLoader  # noqa: E402
 from tokenspeed.runtime.execution.weight_memory import WeightMemoryState  # noqa: E402
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod  # noqa: E402
 from tokenspeed.runtime.layers.dense.unquant import (  # noqa: E402
@@ -165,7 +167,7 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
     # Resident weights (no peer sharing), so disk reloads are allowed.
     runner.mapping = Mapping(rank=0)
     runner.model_config = SimpleNamespace(
-        model_path=str(booted_from), mapping=runner.mapping
+        model_path=str(booted_from), mapping=runner.mapping, revision=None
     )
     runner.server_args = SimpleNamespace(
         enable_memory_saver=False,
@@ -178,6 +180,34 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
         weight_loader_prefetch_num_threads=1,
     )
     return runner
+
+
+def test_disk_reload_keeps_shape_validation_after_initial_source_is_removed(tmp_path):
+    initial = tmp_path / "initial"
+    _write_checkpoint(initial, scale=1)
+    runner = _runner(_TinyModel(), initial)
+    runner._disk_reload_shapes = WeightLoader.checkpoint_shapes(
+        runner.model_config, runner.server_args, runner.model
+    )
+    shutil.rmtree(initial)
+
+    invalid = tmp_path / "invalid"
+    invalid.mkdir()
+    save_file({"w": torch.ones(8, 3)}, str(invalid / "model.safetensors"))
+    ok, message = runner.update_weights_from_disk(
+        UpdateWeightFromDiskReqInput(model_path=str(invalid), load_format="auto")
+    )
+    assert not ok and "has shape" in message
+    assert runner.model.seen == []
+
+    replacement = tmp_path / "replacement"
+    expected = _write_checkpoint(replacement, scale=7)
+    ok, message = runner.update_weights_from_disk(
+        UpdateWeightFromDiskReqInput(model_path=str(replacement), load_format="auto")
+    )
+    assert ok, message
+    assert torch.equal(runner.model.w, expected["w"])
+    assert torch.equal(runner.model.b, expected["b"])
 
 
 def _device_handle(runner, drafter=None) -> DeviceHandle:

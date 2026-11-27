@@ -70,6 +70,25 @@ encode requests.
 The launcher snapshots each rank's environment inside its start context so
 allocator preload hooks reach the child along with the native logging defaults.
 
+Runtime plugins may register `register_post_model_init_hook(name, hook)` through
+`tokenspeed.runtime.plugins.registry`. Each engine rank invokes an immutable
+snapshot of these synchronous callbacks in name order, once during startup,
+after target and local draft loading, multimodal preparation and communication
+preparation, and before the first cache profile or allocation. Cache rebuilds
+do not invoke them again. `PostModelInitContext` exposes launch parameters,
+model configurations, mapping, the local device and the world CPU process
+group; it exposes no device model. The group includes pipeline stages without
+a draft. Hooks own their synchronization, must run in the same order on every
+rank, and propagate failures to startup. Registration joins the plugin loader's
+normal recording and rollback.
+
+The host reads its tokenizer and snapshots initial checkpoint shapes before
+this boundary. Later disk updates validate against the saved shapes rather
+than reopening the initial source directory. Plugins must prepare their own
+metadata before retiring a source; external frontends and encode services own
+their source lifetimes independently. Explicit reload requests still require
+the new checkpoint they name.
+
 What an engine registers with tells its frontend what it serves: the
 request types it takes (an encode server takes encode requests only), the
 field order of the positional structs on its wire, its role and, for a

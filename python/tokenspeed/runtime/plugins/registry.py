@@ -46,11 +46,14 @@ from tokenspeed.runtime.configs.numerics import register_numerics_envelope
 from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
-    from torch import nn
+    from torch import device, nn
+    from torch.distributed import ProcessGroup
     from transformers import PretrainedConfig
 
-    from tokenspeed.runtime.configs.model_config import AttentionArch
+    from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
+    from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 logger = get_colorful_logger(__name__)
 
@@ -83,6 +86,10 @@ def register_drafter(
 
 
 __all__ = [
+    "PostModelInitContext",
+    "PostModelInitHook",
+    "register_post_model_init_hook",
+    "get_post_model_init_hooks",
     "PeerHostRegionPlanner",
     "register_peer_host_region_planner",
     "get_peer_host_region_planner",
@@ -192,6 +199,61 @@ def record_external(kind: str, name: str, undo) -> None:
     if _active is not None:
         _active.names.setdefault(kind, []).append(str(name))
         _active.undo.append(undo)
+
+
+@dataclass(frozen=True, kw_only=True)
+class PostModelInitContext:
+    """Startup inputs available after local model initialization.
+
+    Target and local draft weights, multimodal runtimes and communication
+    buffers are ready. The host has read its tokenizer and checkpoint metadata.
+    Cache profiling and allocation have not started. No device model escapes
+    through this context; hooks must not retain it beyond startup.
+
+    ``world_cpu_group`` includes every engine rank, including pipeline stages
+    without a local draft. It is None for a single-rank engine. Hooks own any
+    synchronization they require and must use the same order on every rank.
+    """
+
+    server_args: ServerArgs
+    model_config: ModelConfig
+    draft_model_config: ModelConfig | None
+    mapping: Mapping
+    device: device
+    world_cpu_group: ProcessGroup | None
+
+
+PostModelInitHook = Callable[[PostModelInitContext], None]
+_POST_MODEL_INIT_HOOKS: dict[str, PostModelInitHook] = {}
+
+
+def register_post_model_init_hook(name: str, hook: PostModelInitHook) -> None:
+    """Register a synchronous callback before the first cache build.
+
+    Names are unique. Callbacks run once per engine rank, in name order, after
+    both target and local draft initialization. Exceptions fail startup.
+    """
+    if not name or name != name.strip():
+        raise ValueError(
+            "Post-model-init hook name must be nonempty without whitespace"
+        )
+    if not callable(hook):
+        raise TypeError("Post-model-init hook must be callable")
+    for target in (hook, hook.__call__):
+        if (
+            inspect.iscoroutinefunction(target)
+            or inspect.isasyncgenfunction(target)
+            or inspect.isgeneratorfunction(target)
+        ):
+            raise TypeError("Post-model-init hook must be synchronous")
+    _put(_POST_MODEL_INIT_HOOKS, name, hook, kind="post_model_init", override=False)
+
+
+def get_post_model_init_hooks() -> tuple[PostModelInitHook, ...]:
+    """Return an immutable snapshot of the hooks in deterministic name order."""
+    return tuple(
+        _POST_MODEL_INIT_HOOKS[name] for name in sorted(_POST_MODEL_INIT_HOOKS)
+    )
 
 
 # A planner maps the pool length and compact parent stride to consecutive region

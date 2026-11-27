@@ -155,8 +155,7 @@ class ModelRunner:
         self.is_multimodal = model_config.is_multimodal
         self.is_draft_worker = is_draft_worker
         self.checkpoint_load_group = checkpoint_load_group
-        # Tensor shapes of the checkpoint the last disk reload read; until one
-        # succeeds, update_weights_from_disk reads them from model_path.
+        # Captured before startup hooks; later disk reloads replace the snapshot.
         self._disk_reload_shapes: dict[str, tuple[int, ...]] | None = None
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
@@ -247,6 +246,9 @@ class ModelRunner:
             memory_saver_adapter=self.memory_saver_adapter,
             checkpoint_load_group=self.checkpoint_load_group,
             is_draft_worker=self.is_draft_worker,
+        )
+        self._disk_reload_shapes = WeightLoader.checkpoint_shapes(
+            self.model_config, self.server_args, self.model
         )
         if not self.is_draft_worker:
             validate_output_vocabulary(self.model, self.model_config.vocab_size)

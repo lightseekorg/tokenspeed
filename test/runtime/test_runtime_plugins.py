@@ -863,3 +863,55 @@ def test_trace_context_provider_rejects_async_and_generators():
             registry.register_trace_provider("test-async-trace", provider)
     with pytest.raises(ValueError, match="Unknown trace provider"):
         registry.get_trace_provider("test-async-trace")
+
+
+def test_post_model_init_hooks_execute_in_name_order_and_roll_back():
+    calls = []
+    before = registry.get_post_model_init_hooks()
+
+    with pytest.raises(RuntimeError, match="undo hooks"):
+        with registry.recording() as record:
+            registry.register_post_model_init_hook(
+                "test.z", lambda context: calls.append("z")
+            )
+            registry.register_post_model_init_hook(
+                "test.a", lambda context: calls.append("a")
+            )
+            snapshot = registry.get_post_model_init_hooks()
+            for hook in snapshot:
+                if hook not in before:
+                    hook(None)
+            assert calls == ["a", "z"]
+            assert record.names["post_model_init"] == ["test.z", "test.a"]
+            with pytest.raises(ValueError, match="already registered"):
+                registry.register_post_model_init_hook("test.a", lambda context: None)
+            raise RuntimeError("undo hooks")
+    assert registry.get_post_model_init_hooks() == before
+
+
+def test_post_model_init_hook_failure_propagates():
+    def fail(context):
+        raise RuntimeError("model startup failed")
+
+    with pytest.raises(RuntimeError, match="model startup failed"):
+        with registry.recording():
+            registry.register_post_model_init_hook("test.failure", fail)
+            for hook in registry.get_post_model_init_hooks():
+                if hook is fail:
+                    hook(None)
+
+
+def test_post_model_init_hook_rejects_async_and_generators():
+    async def async_hook(context):
+        pass
+
+    def generator_hook(context):
+        yield
+
+    class AsyncHook:
+        async def __call__(self, context):
+            pass
+
+    for hook in (async_hook, generator_hook, AsyncHook()):
+        with pytest.raises(TypeError, match="synchronous"):
+            registry.register_post_model_init_hook("test.invalid", hook)

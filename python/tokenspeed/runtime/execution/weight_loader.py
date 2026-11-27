@@ -21,11 +21,18 @@
 import torch
 
 from tokenspeed.runtime.configs.device_config import DeviceConfig
-from tokenspeed.runtime.configs.load_config import LoadConfig
+from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.execution.weight_memory import backup_weights
 from tokenspeed.runtime.model_loader import get_model
-from tokenspeed.runtime.model_loader.weight_utils import require_unit_kv_scale_file
+from tokenspeed.runtime.model_loader.loader import (
+    CheckpointFileSelection,
+    DefaultModelLoader,
+)
+from tokenspeed.runtime.model_loader.weight_utils import (
+    require_unit_kv_scale_file,
+    safetensors_tensor_shapes,
+)
 from tokenspeed.runtime.utils import (
     get_available_gpu_memory,
     get_colorful_logger,
@@ -42,8 +49,43 @@ class WeightLoader:
     """Handles model weight loading from disk.
 
     This class is stateless and does not modify external state.
-    It returns LoadedModel with all necessary information.
+    The loaded model and checkpoint metadata have independent lifetimes.
     """
+
+    @staticmethod
+    def checkpoint_shapes(
+        model_config: ModelConfig, server_args: ServerArgs, model: torch.nn.Module
+    ) -> dict[str, tuple[int, ...]]:
+        """Snapshot the source shapes used to validate later disk updates.
+
+        Only safetensors headers are read. Formats without safetensors shape
+        validation, including dummy loading, return an empty snapshot. A later
+        update therefore never needs to reopen the initial checkpoint.
+        """
+        load_format = server_args.load_format
+        if load_format not in (
+            LoadFormat.AUTO,
+            LoadFormat.SAFETENSORS,
+            LoadFormat.INSTANTTENSOR,
+            LoadFormat.MISTRAL,
+            LoadFormat.PT,
+            LoadFormat.NPCACHE,
+        ):
+            return {}
+        loader = DefaultModelLoader(
+            LoadConfig(load_format=load_format, download_dir=server_args.download_dir)
+        )
+        _, files, use_safetensors = loader._prepare_weights(
+            model_config.model_path,
+            model_config.revision,
+            getattr(model, "fall_back_to_pt_during_load", False),
+            (
+                model.checkpoint_weight_files
+                if isinstance(model, CheckpointFileSelection)
+                else None
+            ),
+        )
+        return safetensors_tensor_shapes(files) if use_safetensors else {}
 
     @staticmethod
     def load_model(
@@ -70,7 +112,7 @@ class WeightLoader:
                 keep CPU backup even when target weights use discard.
 
         Returns:
-            LoadedModel with model and dtype
+            The initialized model.
         """
         if (
             server_args.kv_cache_dtype == "fp8_e4m3"
