@@ -262,6 +262,9 @@ def test_load_back_acks_become_payloads():
 
 def _config(**overrides):
     fields = dict(
+        prefix_cache_evict_policy="lru",
+        prefix_cache_gds_prefill_cost=None,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,

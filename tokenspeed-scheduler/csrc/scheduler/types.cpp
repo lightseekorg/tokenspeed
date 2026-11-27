@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include "scheduler/types.h"
+#include "cache/coordinator/eviction_policy.h"
 
 #include <algorithm>
 #include <limits>
@@ -58,7 +59,41 @@ void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroup
 
 }  // namespace
 
+CheckpointConfig SchedulerConfig::ResolveCheckpoints() const {
+    const bool produces = state_checkpoint_in_forward && role != Role::kD && !disable_prefix_cache;
+    return {
+        .production = {.in_forward = produces},
+        .publication = {.filter_covered_endpoints = produces,
+                        .drop_short_prompt_end = drop_short_prompt_end_checkpoints},
+        .retention = {.demote_superseded = demote_superseded_state_checkpoints && role != Role::kD &&
+                                           prefix_cache_evict_policy == "lru"},
+    };
+}
+
+PrefixCacheEvictionConfig SchedulerConfig::ResolveEvictionConfig() const {
+    std::optional<PrefillCost> cost;
+    if (prefix_cache_gds_prefill_cost) {
+        cost = PrefillCost{(*prefix_cache_gds_prefill_cost)[0], (*prefix_cache_gds_prefill_cost)[1]};
+    }
+    auto eviction = PrefixCacheEvictionConfig::Parse(prefix_cache_evict_policy, cost);
+    eviction.disk_block_costs = prefix_cache_gds_disk_block_costs;
+    eviction.Validate();
+    if (eviction.policy == PrefixCacheEvictionConfig::Policy::kGds &&
+        (HasDiskCache() ? eviction.disk_block_costs.size() != cache_groups.size() : !eviction.disk_block_costs.empty()))
+        throw std::invalid_argument("Scheduler: GDS Disk requires explicit per-group read costs, only with Disk");
+    return eviction;
+}
+
 void SchedulerConfig::Validate() const {
+    const auto eviction = ResolveEvictionConfig();
+    if (eviction.policy == PrefixCacheEvictionConfig::Policy::kGds && disable_prefix_cache) {
+        throw std::invalid_argument("Scheduler: gds requires prefix caching");
+    }
+    if (eviction.policy == PrefixCacheEvictionConfig::Policy::kGds &&
+        std::ranges::none_of(
+            cache_groups, [](const auto& group) { return group.attn_kind == AttnKind::kState && !group.replayable; })) {
+        throw std::invalid_argument("Scheduler: gds requires a cacheable State group");
+    }
     ValidateCapacityInputs();
     if (max_kv_page_num < 0) {
         throw std::invalid_argument("Scheduler: max_kv_page_num must be >= 0");

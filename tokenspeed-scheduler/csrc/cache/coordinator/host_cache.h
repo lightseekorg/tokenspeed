@@ -33,6 +33,7 @@
 #include <deque>
 #include <limits>
 #include <optional>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -109,6 +110,12 @@ public:
     // checkpoint takes its unpinned State siblings at the same boundary along.
     // A shortfall leaves an empty reference, without blocking later rows.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
+                                          std::span<const std::int32_t> buckets);
+    // A storage boundary must land whole. A failed trial evicts nothing.
+    HostAllocationBatch AcquireHostLanding(std::span<const std::uint32_t> group_ids,
+                                           std::span<const std::int32_t> buckets);
+    // Optional publication copies may be skipped without dropping a recovery point.
+    HostAllocationBatch AcquireHostCopies(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
     // One segment of an AcquireHostSegments batch, or one boundary of a
     // retraction image's (NumHostBoundariesThatFit): rows [first_row,
@@ -235,23 +242,8 @@ private:
         };
         std::size_t num_placed{0};
         std::vector<Victim> victims;
+        std::shared_ptr<const TieredGdsPlan> tiered;
     };
-    struct HostKvDuplicateCandidate {
-        std::uint32_t group_id{0};
-        CacheBlockLocation location;
-        std::int32_t boundary_tokens{0};
-        // A request holds the Device copy. The visit yields every held copy
-        // before the unheld ones; a Host plan with demoted checkpoint
-        // boundaries next stops at the first unheld one.
-        bool device_in_use{false};
-    };
-    // Unpinned Host KV copies backed by a contiguous Device KV prefix,
-    // excluding pages a sliding group can force into a Host suffix. Visit in
-    // priority order and stop as soon as the callback returns false.
-    // Defined in host_segments.cpp; callers must stay in that translation
-    // unit unless the template definition is moved into a header.
-    template <typename Visitor>
-    void visitHostKvDuplicateCandidates(Visitor&& visit) const;
     // The plan AcquireHostSegments carries out and planHostBoundaries'
     // segment step reuses.
     HostPlacementPlan planHostSegments(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
@@ -267,6 +259,9 @@ private:
     HostPlacementPlan planHostBoundaries(std::span<const std::uint32_t> group_ids,
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries, bool place_by_segments) const;
+
+    HostAllocationBatch acquireGdsBlocks(std::span<const std::uint32_t> group_ids,
+                                         std::span<const std::int32_t> buckets, bool allow_logical_loss, bool whole);
 
     CacheStore& store_;
     CacheEvictor& evictor_;

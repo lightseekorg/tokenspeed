@@ -23,6 +23,9 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
     if prefix_replay_tokens is not None:
         kwargs["prefix_replay_tokens"] = prefix_replay_tokens
     return make_config(
+        prefix_cache_evict_policy="lru",
+        prefix_cache_gds_prefill_cost=None,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
@@ -152,6 +155,9 @@ def test_resolve_dspark_prefix_replay_rejects_unsupported_cache_modes(
 @pytest.mark.parametrize("enable_l3_storage", [False, True])
 def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> None:
     config = make_config(
+        prefix_cache_evict_policy="lru",
+        prefix_cache_gds_prefill_cost=None,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,

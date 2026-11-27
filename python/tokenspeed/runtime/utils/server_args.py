@@ -32,6 +32,7 @@ from typing import Literal
 
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.checkpoints import CheckpointConfig
 from tokenspeed.runtime.configs.numerics import (
     BITWISE_ENVELOPES,
     BLOCKWISE_LOGPROB_ORDERS,
@@ -554,6 +555,9 @@ class ServerArgs:
     # ranks, under cache pressure, as if last used this many new requests ago. None
     # is the scheduler's default, 16 times the per-rank batch size.
     checkpoint_retention_requests: int | None = None
+    prefix_cache_evict_policy: str = "lru"
+    prefix_cache_gds_prefill_cost: list[float] | None = None
+    prefix_cache_gds_disk_read_cost: list[float] | None = None
     # Checkpoints within this many later requests of the newest on their
     # branch rank as it does. None is the scheduler's default, 0.
     checkpoint_retention_leaf_distance: int | None = None
@@ -1038,7 +1042,47 @@ class ServerArgs:
             return 0
         return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
 
+    def validate_prefix_cache_eviction(self) -> None:
+        if self.prefix_cache_evict_policy not in ("lru", "gds"):
+            raise ValueError("prefix-cache-evict-policy must be lru or gds")
+        cost = self.prefix_cache_gds_prefill_cost
+        disk_cost = self.prefix_cache_gds_disk_read_cost
+        if disk_cost is not None:
+            if self.prefix_cache_evict_policy != "gds" or self.disk_tier_paths is None:
+                raise ValueError(
+                    "prefix-cache-gds-disk-read-cost requires gds with a Disk tier"
+                )
+            if (
+                len(disk_cost) != 2
+                or not all(math.isfinite(v) for v in disk_cost)
+                or disk_cost[0] < 0
+                or disk_cost[1] <= 0
+            ):
+                raise ValueError("GDS Disk read cost requires finite A >= 0 and B > 0")
+        elif (
+            self.prefix_cache_evict_policy == "gds" and self.disk_tier_paths is not None
+        ):
+            raise ValueError(
+                "GDS with Disk requires explicit --prefix-cache-gds-disk-read-cost A B"
+            )
+        if self.prefix_cache_evict_policy == "lru":
+            if cost is not None:
+                raise ValueError(
+                    "prefix-cache-gds-prefill-cost requires the gds policy"
+                )
+            return
+        if not self.enable_prefix_caching:
+            raise ValueError("gds requires prefix caching")
+        if cost is None or len(cost) != 2:
+            raise ValueError(
+                "gds requires explicit --prefix-cache-gds-prefill-cost D E"
+            )
+        d, e = cost
+        if not math.isfinite(d) or d <= 0 or not math.isfinite(e) or e < 0:
+            raise ValueError("GDS prefill cost requires finite D > 0 and E >= 0")
+
     def __post_init__(self):
+        self.validate_prefix_cache_eviction()
         self.validate_decode_extra_slots()
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
@@ -1866,6 +1910,15 @@ class ServerArgs:
         return self.enable_kvstore or self.shared_l2_config is not None
 
     @property
+    def checkpoint_config(self) -> CheckpointConfig:
+        """Derive checkpoint rules without depending on startup phase ordering."""
+        return CheckpointConfig.resolve(
+            in_forward=self.enable_state_checkpoint_in_forward,
+            role=self.disaggregation_mode,
+            eviction_policy=self.prefix_cache_evict_policy,
+        )
+
+    @property
     def writes_state_checkpoints_in_forward(self) -> bool:
         """Whether this engine's prefill forwards write in-forward State checkpoints.
 
@@ -1874,10 +1927,7 @@ class ServerArgs:
         checkpoints and demotes superseded in-forward checkpoints; a decode
         server publishes the former as ever.
         """
-        return (
-            self.enable_state_checkpoint_in_forward
-            and self.disaggregation_mode != "decode"
-        )
+        return self.checkpoint_config.production.in_forward
 
     @property
     def drops_short_prompt_end_checkpoints(self) -> bool:
@@ -1886,10 +1936,7 @@ class ServerArgs:
         A prefill server does where it writes in-forward checkpoints; no other
         role does (a fused server keeps its short prompt ends).
         """
-        return (
-            self.writes_state_checkpoints_in_forward
-            and self.disaggregation_mode == "prefill"
-        )
+        return self.checkpoint_config.publication.drop_short_prompt_end
 
     @property
     def scheduler_prefill_chunk_yield_tokens(self) -> int:
@@ -3436,6 +3483,8 @@ class ServerArgs:
             )
 
     def validate(self):
+        # Disaggregation resolution can disable caching (the encode role).
+        self.validate_prefix_cache_eviction()
         self.validate_decode_extra_slots()
         if (
             type(self.ttft_trace_sampling_percentage) is not int
@@ -4010,6 +4059,31 @@ class ServerArgs:
             "docs/design/scheduler.md section 1.2.",
         )
         parser.add_argument(
+            "--prefix-cache-evict-policy",
+            choices=("lru", "gds"),
+            default=ServerArgs.prefix_cache_evict_policy,
+            help="Prefix-cache retention policy. GDS jointly manages Device and "
+            "Host retention and requires State cache groups, prefix caching and "
+            "explicit prefill cost D E. Disk keeps its existing replacement policy.",
+        )
+        parser.add_argument(
+            "--prefix-cache-gds-prefill-cost",
+            type=float,
+            nargs=2,
+            metavar=("D", "E"),
+            default=None,
+            help="GDS cost C(a,b)=D*(b-a)+E*(b*b-a*a)/200000; finite D>0, E>=0.",
+        )
+        parser.add_argument(
+            "--prefix-cache-gds-disk-read-cost",
+            type=float,
+            nargs=2,
+            metavar=("A", "B"),
+            default=None,
+            help="Required with GDS and Disk: read cost A per block plus B per aligned byte, "
+            "in prefill-cost units; finite A>=0, B>0.",
+        )
+        parser.add_argument(
             "--checkpoint-retention-requests",
             type=int,
             dest="checkpoint_retention_requests",
@@ -4090,7 +4164,7 @@ class ServerArgs:
             choices=["write_through", "write_back"],
             default=ServerArgs.kvstore_write_policy,
             help="What feeds Host L2 (the KVStore) from the GPU prefix cache. "
-            "'write_through' (the default) copies every page the fused or "
+            "'write_through' (the default) attempts to copy pages the fused or "
             "prefill role caches. "
             "'write_back' copies only the pages the GPU evicts, in the "
             "scheduling step that evicts them (that step's forward waits for "
