@@ -692,7 +692,7 @@ def _check_gated_residual_workspace_on_cuda():
         register_workspace_region,
     )
 
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     register_workspace_region(saver)
     g, h, r = 4, 2048, 256
     with saver.region(tag="weights", enable_cpu_backup=True), torch.device("cuda"):

@@ -115,7 +115,7 @@ def _run_launcher(workers, server_args, path, logging_signal, writer):
     """Run the headless launcher with its ranks replaced by ``workers``
     (``(target, args)`` each), with ``path`` first on ``sys.path``, and
     report how it ended and what of them it left running."""
-    # Spawned processes inherit this path, so they load what it holds.
+    # Multiprocessing children inherit the launcher's sys.path.
     sys.path[:0] = path
     from tokenspeed.runtime.entrypoints import engine as engine_module
     from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -312,10 +312,12 @@ def _install_relay_probe(directory):
     )
 
 
-def test_the_launcher_lets_the_metrics_relay_flush(tmp_path):
+def test_the_launcher_lets_the_metrics_relay_flush(tmp_path, monkeypatch):
     # The relay closes its sinks on a stop; killed with the process tree, it
     # would drop what they still buffer.
     _install_relay_probe(tmp_path)
+    # The relay starts a fresh interpreter that imports the installed probe.
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path), prepend=os.pathsep)
     marker = tmp_path / "closed"
     config = tmp_path / "reporters.json"
     config.write_text(json.dumps({"relay-probe": {"path": str(marker)}}))
