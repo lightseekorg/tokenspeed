@@ -44,7 +44,7 @@ from tokenspeed_kernel.ops.gemm.cute_dsl import (
 from tokenspeed_kernel.ops.gemm.triton_skinny import skinny_mm, skinny_mm_supported
 from tokenspeed_kernel.ops.moe import ExpertDispatch, dispatch_topk_ids
 from tokenspeed_kernel.ops.tuning import is_warming_up
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry, Priority, register_kernel
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature

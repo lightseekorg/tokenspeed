@@ -104,3 +104,52 @@ def test_warm_ll_bf16_splitk_is_noop_on_cpu_and_narrow_weights(monkeypatch):
     w = torch.zeros((896, 7168), dtype=torch.bfloat16)
     warm_ll_bf16_splitk(x, w, out_dtype=torch.float32, has_bias=False, enable_pdl=False)
     assert not called
+
+
+def test_router_call_sites_warm_splitk_under_kernel_warmup(monkeypatch):
+    """Real call sites execute their is_warming_up() paths cleanly without GPU."""
+    from tokenspeed_kernel.ops import gemm
+    from tokenspeed_kernel.ops.moe import block_scaled
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel.platform import pdl_enabled
+
+    expected_pdl = pdl_enabled()
+    recorded: list[tuple[str, torch.dtype, bool, bool]] = []
+
+    def make_recorder(tag: str):
+        def _record(_x, _w, *, out_dtype, has_bias, enable_pdl):
+            recorded.append((tag, out_dtype, has_bias, enable_pdl))
+
+        return _record
+
+    class _FakeCudaTensor(torch.Tensor):
+        @property
+        def is_cuda(self) -> bool:
+            return True
+
+    # 1. block_scaled_router_mm (uses real block_scaled.pdl_enabled import)
+    monkeypatch.setattr(
+        block_scaled, "warm_ll_bf16_splitk", make_recorder("block_scaled")
+    )
+    monkeypatch.setattr(block_scaled, "ll_bf16_router_supported", lambda *_a: False)
+    monkeypatch.setattr(block_scaled, "skinny_mm_supported", lambda *_a: False)
+    monkeypatch.setattr(
+        block_scaled, "mm", lambda x, w, *, out_dtype: x.float() @ w.float().T
+    )
+    x_bs = torch.zeros((64, 1024), dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
+    w_bs = torch.zeros((32, 1024), dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
+    with kernel_warmup(enabled=True):
+        block_scaled.block_scaled_router_mm(x_bs, w_bs, solution=None)
+
+    # 2. dsv4_linear_fp32 (uses real gemm.pdl_enabled import)
+    monkeypatch.setattr(gemm, "warm_ll_bf16_splitk", make_recorder("dsv4"))
+    with kernel_warmup(enabled=True):
+        gemm.dsv4_linear_fp32(
+            torch.zeros((64, 1024), dtype=torch.bfloat16),
+            torch.zeros((32, 1024), dtype=torch.bfloat16),
+        )
+
+    assert recorded == [
+        ("block_scaled", torch.float32, False, expected_pdl),
+        ("dsv4", torch.float32, False, expected_pdl),
+    ]
