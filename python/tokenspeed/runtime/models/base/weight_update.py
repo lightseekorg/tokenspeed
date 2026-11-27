@@ -162,8 +162,18 @@ def weight_update_session(
             model.abort_weight_update()
         raise
 
-    for controller in peer_controllers:
-        controller.prepare_weight_update()
+    prepare_error: BaseException | None = None
+    try:
+        for controller in peer_controllers:
+            controller.prepare_weight_update()
+    except BaseException as exc:
+        prepare_error = exc
+    try:
+        _agree_group_errors(cpu_group, prepare_error, "during peer preparation")
+    except BaseException:
+        for model in opened:
+            model.abort_weight_update()
+        raise
 
     local_error: BaseException | None = None
     try:

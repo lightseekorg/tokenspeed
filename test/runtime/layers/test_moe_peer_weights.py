@@ -244,6 +244,21 @@ def test_peer_weight_update_and_sleep_wake_preserve_view_addresses():
     assert store.events == []
     assert not model._weight_update_active
 
+    # Failure in prepare_weight_update aborts opened models so later updates still work.
+    real_prepare = store.prepare_weight_update
+
+    def _fail_prepare() -> None:
+        raise RuntimeError("peer quiesce failed")
+
+    store.prepare_weight_update = _fail_prepare
+    try:
+        with pytest.raises(RuntimeError, match="peer quiesce failed"):
+            with weight_update_session([model], require_complete=False, cpu_group=None):
+                raise AssertionError("body must not run after prepare failure")
+    finally:
+        store.prepare_weight_update = real_prepare
+    assert not model._weight_update_active
+
     # Resident live update refreshes owned shards and derived state in order.
     with weight_update_session([model], require_complete=False, cpu_group=None):
         model.load_weights([("0", torch.tensor(21.0)), ("1", torch.tensor(22.0))])
