@@ -813,7 +813,11 @@ publish or release the whole landing.
 Storage reads translate virtual page IDs to the owning rank's local pages and
 check destination registration bounds. Page-sharded history lands only on its
 owner. Same-layout objects continue to use the reader's physical namespace.
-A TP1/KVP1 Decode writer additionally advertises an address-free source layout
+A TP1/KVP1 Decode worker may enable Peer and Mooncake storage together without
+the Prefill-only direct restore flag. In this combination storage publishes
+Host history but does not issue Host QUERY/GET restores; incoming request KV
+still follows PD. Decode without Peer retains its ordinary storage policy.
+This write-back path additionally advertises an address-free source layout
 through its existing Store connection. A TP8/KVP8 Prefill reader can discover
 that layout by semantic model identity and weight generation, query the original
 Decode object keys, and reuse the live Peer partition planner to read its own

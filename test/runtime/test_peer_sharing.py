@@ -277,6 +277,39 @@ def test_peer_sharing_runs_with_the_host_tier_and_prefix_caching():
         _peer_args(peer_prefix_port=None).validate_peer_prefix_options()
 
 
+def test_decode_peer_publishes_l3_without_host_restore():
+    from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+
+    args = _peer_args(disaggregation_mode="decode", kvstore_storage_backend="mooncake")
+    args.validate_peer_prefix_options()
+    config = StorageRuntimeConfig.from_extra_config(
+        None,
+        host_blocks=16,
+        prefix_granularity=128,
+        restore_to_host=args.l3_restore_to_host,
+    )
+    assert not config.scheduler.restore_to_host
+    # Decode without Peer retains the existing storage restore path.
+    args.peer_prefix_port = None
+    assert args.l3_restore_to_host
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"disaggregation_mode": "prefill"},
+        {"kvstore_storage_backend": "file"},
+        {"kv_parallel_size": 8},
+        {"mapping": Mapping(rank=0, world_size=8, attn_tp_size=8, attn_dp_size=1)},
+    ],
+)
+def test_peer_storage_rejects_unsupported_publishers(overrides):
+    values = dict(disaggregation_mode="decode", kvstore_storage_backend="mooncake")
+    values.update(overrides)
+    with pytest.raises(ValueError, match="--kvstore-storage-backend"):
+        _peer_args(**values).validate_peer_prefix_options()
+
+
 @pytest.mark.parametrize("tier", [None, "disk"])
 def test_peer_sharing_needs_an_explicit_landing_tier(tier):
     with pytest.raises(ValueError, match="--peer-prefix-landing-tier"):

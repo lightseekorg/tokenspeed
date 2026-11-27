@@ -407,7 +407,7 @@ def l3_settings(
         server_args.kvstore_storage_backend_extra_config,
         host_blocks=host_block_capacity(host_storage, ownership.shard_counts),
         prefix_granularity=host_cache.memory_plan.prefix_granularity,
-        restore_to_host=not server_args.enable_kvstore_storage_direct,
+        restore_to_host=server_args.l3_restore_to_host,
     )
     deployment_id = cache_deployment_id(
         server_args,

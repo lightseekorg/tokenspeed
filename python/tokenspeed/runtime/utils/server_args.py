@@ -2797,6 +2797,22 @@ class ServerArgs:
                 "--enable-startup-requests is not supported with --shared-l2-config"
             )
 
+    @property
+    def peer_l3_writeback_only(self) -> bool:
+        """Decode publishes its TP1/KVP1 history for cross-layout Prefill reads."""
+        return (
+            self.disaggregation_mode == "decode"
+            and self.peer_prefix_port is not None
+            and self.kvstore_storage_backend == "mooncake"
+            and self.mapping.attn.tp_size == 1
+            and self.kv_parallel_size == 1
+        )
+
+    @property
+    def l3_restore_to_host(self) -> bool:
+        # Peer Decode receives request KV through PD; storage is a publisher.
+        return not (self.enable_kvstore_storage_direct or self.peer_l3_writeback_only)
+
     def validate_peer_prefix_options(self):
         """``--peer-prefix-port`` and its settings: what peer prefix sharing
         runs with (``docs/rfcs/0004-peer-prefix-sharing.md``)."""
@@ -2819,7 +2835,7 @@ class ServerArgs:
                 (
                     "--kvstore-storage-backend",
                     self.kvstore_storage_backend is not None
-                    and not self.enable_kvstore_storage_direct,
+                    and self.l3_restore_to_host,
                 ),
                 (
                     "--pipeline-parallel-size > 1",
