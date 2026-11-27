@@ -38,6 +38,43 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 logger = get_colorful_logger(__name__)
 
 
+def weights_region(
+    memory_saver_adapter: TorchMemorySaverAdapter,
+    server_args: ServerArgs,
+    *,
+    device: str,
+    is_draft_worker: bool,
+):
+    """The memory-saver region a model's weights are allocated in.
+
+    Weights made after loading from other weights (a draft's quantized copy
+    of the target's LM head) allocate here as well, so ``weights``
+    release/resume covers them like the loaded ones.
+
+    Args:
+        memory_saver_adapter: The model runner's memory saver adapter.
+        server_args: Server arguments.
+        device: Device type ("cuda", "npu", "cpu").
+        is_draft_worker: Whether these are draft allocations; frozen drafts
+            keep CPU backup even when target weights use discard.
+    """
+    # Shared target/draft tensors keep their original allocation policy.
+    # Frozen draft allocations are backed up even when the target is discarded.
+    draft_policy = server_args.model_update_draft_weights
+    if device == "npu" and not is_draft_worker and draft_policy is None:
+        # An Ascend disk update can replace the target without an SDK.
+        # A real draft worker still needs an explicit backup policy.
+        draft_policy = "retain"
+    return memory_saver_adapter.region(
+        tag="weights",
+        enable_cpu_backup=backup_weights(
+            policy=server_args.weight_memory_policy,
+            is_draft=is_draft_worker,
+            draft_policy=draft_policy,
+        ),
+    )
+
+
 class WeightLoader:
     """Handles model weight loading from disk.
 
@@ -100,20 +137,11 @@ class WeightLoader:
             checkpoint_load_group=checkpoint_load_group,
         )
 
-        # Shared target/draft tensors keep their original allocation policy.
-        # Frozen draft allocations are backed up even when the target is discarded.
-        draft_policy = server_args.model_update_draft_weights
-        if device == "npu" and not is_draft_worker and draft_policy is None:
-            # An Ascend disk update can replace the target without an SDK.
-            # A real draft worker still needs an explicit backup policy.
-            draft_policy = "retain"
-        with memory_saver_adapter.region(
-            tag="weights",
-            enable_cpu_backup=backup_weights(
-                policy=server_args.weight_memory_policy,
-                is_draft=is_draft_worker,
-                draft_policy=draft_policy,
-            ),
+        with weights_region(
+            memory_saver_adapter,
+            server_args,
+            device=device,
+            is_draft_worker=is_draft_worker,
         ):
             model = get_model(
                 model_config=model_config,

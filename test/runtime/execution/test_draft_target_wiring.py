@@ -1364,7 +1364,10 @@ def test_setup_configures_every_stage_without_creating_a_drafter(
     )
     target_config = object()
     factory.configure_draft_target(
-        SimpleNamespace(speculative_algorithm=algorithm),
+        SimpleNamespace(
+            speculative_algorithm=algorithm,
+            speculative_draft_lm_head_quantization="none",
+        ),
         SimpleNamespace(
             model=target, model_config=SimpleNamespace(hf_text_config=target_config)
         ),

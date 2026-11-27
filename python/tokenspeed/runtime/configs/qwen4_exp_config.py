@@ -66,6 +66,7 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         rope_parameters: dict | None = None,
         num_experts: int | None = None,
         decode_monokernel: bool = False,
+        draft_moe_quantization: str = "none",
         ple_table_layout: str = "global_sharded",
         **kwargs,
     ) -> None:
@@ -113,6 +114,11 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         # monokernel classes. ModelConfig sets it from --decode-monokernel;
         # checkpoints do not hold it.
         self.decode_monokernel = bool(decode_monokernel)
+        # How an MTP draft stores its routed experts: "none" as the
+        # checkpoint holds them, "mxfp4" quantized at load. The draft's
+        # ModelConfig sets it from --speculative-draft-moe-quantization;
+        # checkpoints do not hold it.
+        self.draft_moe_quantization = str(draft_moe_quantization)
 
     @property
     def layers_block_type(self) -> list[str]:
