@@ -2730,6 +2730,7 @@ class DeepseekV41Model(nn.Module):
         ):
             raise ValueError("V4.1 layer count and compression ratios disagree")
         self.config, self.mapping = config, mapping
+        self.expert_placement = get_global_expert_location_metadata()
         self.pp_start_layer, self.pp_end_layer = 0, config.num_hidden_layers
         self.engram_hash = None
         self.dspark_capture_layers = ()
@@ -3567,7 +3568,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 if layer_match is None:
                     raise ValueError(f"Unsupported V4.1 expert parameter: {name}")
                 layer_id = int(layer_match[1])
-                placement = get_global_expert_location_metadata()
+                placement = self.model.expert_placement
                 if placement is not None:
                     local_experts = placement.local_slot_logical_experts(
                         layer_id, self.mapping.moe.ep_rank
@@ -3714,7 +3715,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         params = dict(self.named_parameters())
         targets = self._checkpoint_targets()
         config = self.model.config
-        placement = get_global_expert_location_metadata()
+        placement = self.model.expert_placement
         num_physical_experts = (
             placement.num_physical_experts
             if placement is not None
