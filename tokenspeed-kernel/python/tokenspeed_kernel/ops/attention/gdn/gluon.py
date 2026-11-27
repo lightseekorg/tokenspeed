@@ -38,7 +38,10 @@ if TYPE_CHECKING:
 
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode import (
+        GDN_DECODE_KEY_DIM,
         GDN_DECODE_MAX_TOKENS,
+        GDN_DECODE_STATE_DTYPES,
+        GDN_DECODE_VALUE_DIMS,
         launch_gluon_gdn_decode_gfx950,
     )
 
@@ -59,7 +62,9 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "head_dim": frozenset({128}),
+            "head_dim": frozenset({GDN_DECODE_KEY_DIM}),
+            "value_head_dim": GDN_DECODE_VALUE_DIMS,
+            "state_dtype": GDN_DECODE_STATE_DTYPES,
             "padding_safe": frozenset({False, True}),
             "strided_qkv": frozenset({False, True}),
             "strided_state": frozenset({False, True}),
@@ -117,7 +122,9 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
-            "head_dim": frozenset({128}),
+            "head_dim": frozenset({GDN_DECODE_KEY_DIM}),
+            "value_head_dim": GDN_DECODE_VALUE_DIMS,
+            "state_dtype": GDN_DECODE_STATE_DTYPES,
             "padding_safe": frozenset({False, True}),
             "tree": frozenset({False}),
             # The chunk (WY) form solves all tokens of a request at once.

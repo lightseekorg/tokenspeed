@@ -2059,15 +2059,17 @@ scheduler, which is 3–5% faster there.
 
 `gluon_gdn_decode_gfx950` runs the sigmoid-gated delta-rule recurrence for
 `gdn_decode_step` (one token) and chain `gdn_decode_mtp` (T tokens) over the
-K-last recurrent-state pool. Draft trees, and chains longer than 8 tokens,
-stay on the Triton kernel.
+K-last recurrent-state pool. Draft trees, chains longer than 8 tokens, and
+head dims or pool dtypes outside the contract below stay on the Triton kernel:
+the registrations declare these limits as traits, so selection routes around
+them instead of reaching the launcher's checks.
 
 #### Contract
 
 - q/k are `[B, T, H, 128]` and v is `[B, T, HV, V]` (V a multiple of 16, at
   most 256), with contiguous heads and any batch/token strides, so packed
   conv-output views need no split copy. a/b are `[B, T, HV]` with any strides.
-- The pool is K-last `[rows, HV, V, K]`, BF16 or FP32, with any row stride.
+- The pool is K-last `[rows, HV, V, K]`, BF16, FP16 or FP32, with any row stride.
   A negative read row starts from a zero state; negative destination rows are
   skipped.
 - Per-token states go to `output_state_indices` rows of `output_state` (default

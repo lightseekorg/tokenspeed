@@ -36,6 +36,11 @@ GDN_DECODE_STEPS_DENSE = 2
 
 # Tokens of one launch: the WY form solves all of them at once.
 GDN_DECODE_MAX_TOKENS = 8
+# Head dims the launcher accepts; the registrations declare the same sets so
+# selection routes other shapes to another solution.
+GDN_DECODE_KEY_DIM = 128
+GDN_DECODE_VALUE_DIMS = frozenset(range(16, 257, 16))
+GDN_DECODE_STATE_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float32})
 # Waves per (request, value head), by state element bytes. A BF16 head
 # (128 VGPRs per lane in one wave) stays in one wave, so the T x T algebra
 # runs once per head; an FP32 head would take all 256 VGPRs of one wave, so
@@ -580,7 +585,7 @@ def launch_gluon_gdn_decode_gfx950(
     """
     batch, tokens, heads, key_dim = q.shape
     value_heads, value_dim = v.shape[2], v.shape[3]
-    if key_dim != 128 or value_dim % 16 or value_dim > 256:
+    if key_dim != GDN_DECODE_KEY_DIM or value_dim not in GDN_DECODE_VALUE_DIMS:
         raise ValueError(f"unsupported GDN head dims K={key_dim} V={value_dim}")
     if not 1 <= tokens <= GDN_DECODE_MAX_TOKENS:
         raise ValueError(
@@ -600,6 +605,8 @@ def launch_gluon_gdn_decode_gfx950(
             or not pool[0].is_contiguous()
         ):
             raise ValueError(f"{name} must be a K-last [rows, HV, V, K] pool")
+        if pool.dtype not in GDN_DECODE_STATE_DTYPES:
+            raise ValueError(f"unsupported GDN {name} dtype {pool.dtype}")
     output_norm = norm_gate is not None
     if output_norm != (norm_weight is not None) or output_norm != (
         norm_eps is not None

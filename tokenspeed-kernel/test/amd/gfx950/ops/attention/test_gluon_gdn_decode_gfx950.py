@@ -33,11 +33,13 @@ if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
 from tokenspeed_kernel.ops.attention.gdn import (  # noqa: E402
+    _attention_format_signature,
     gdn_decode_mtp,
     gdn_decode_step,
     gdn_verify_fuses_output_norm,
 )
 from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm  # noqa: E402
+from tokenspeed_kernel.selection import select_kernel  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode import (  # noqa: E402
     gluon_gdn_decode_gfx950,
 )
@@ -87,6 +89,41 @@ def _reference(q, k, v, a, b, A_log, dt_bias, state):
         compute_dtype=torch.float64,
     )
     return out, states.transpose(0, 1)
+
+
+@pytest.mark.parametrize(
+    ("op", "value_head_dim", "expected"),
+    [
+        ("gdn_decode_step", 128, "gluon_gdn_decode_step_gfx950"),
+        ("gdn_decode_step", 256, "gluon_gdn_decode_step_gfx950"),
+        ("gdn_decode_step", 272, "triton_gdn_decode_step"),
+        ("gdn_decode_step", 136, "triton_gdn_decode_step"),
+        ("gdn_decode_mtp", 128, "gluon_gdn_decode_mtp_gfx950"),
+        ("gdn_decode_mtp", 256, "gluon_gdn_decode_mtp_gfx950"),
+        ("gdn_decode_mtp", 272, "triton_gdn_decode_mtp"),
+        ("gdn_decode_mtp", 136, "triton_gdn_decode_mtp"),
+    ],
+)
+def test_value_heads_the_launcher_rejects_select_triton(op, value_head_dim, expected):
+    """Value heads outside the launcher's multiples of 16 up to 256 route to
+    the Triton solution instead of failing in the gfx950 launcher."""
+    probe = torch.empty(0, dtype=torch.bfloat16, device="meta")
+    traits = {
+        "head_dim": D,
+        "value_head_dim": value_head_dim,
+        "state_dtype": torch.bfloat16,
+        "padding_safe": False,
+        "strided_state": False,
+    }
+    if op == "gdn_decode_mtp":
+        traits.update(verify_tokens=4, tree=False, output_only=False)
+    kernel = select_kernel(
+        "attention",
+        op,
+        _attention_format_signature(q=probe, k=probe, v=probe),
+        traits=traits,
+    )
+    assert kernel.name == expected
 
 
 def test_verify_reads_committed_pool_and_stages_scratch():
