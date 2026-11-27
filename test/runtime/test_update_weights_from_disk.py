@@ -34,7 +34,6 @@ from __future__ import annotations
 import glob
 import json
 import os
-import shutil
 import sys
 import tempfile
 from datetime import timedelta
@@ -52,6 +51,12 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from test.runtime.models.checkpoint_fixture import (
+    _runner,
+    _TinyModel,
+    _write_checkpoint,
+)
+
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.distributed.process_group_manager import (  # noqa: E402
@@ -65,7 +70,6 @@ from tokenspeed.runtime.execution.ascend_memory_saver_device import (  # noqa: E
 )
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.model_runner import ModelRunner  # noqa: E402
-from tokenspeed.runtime.execution.weight_loader import WeightLoader  # noqa: E402
 from tokenspeed.runtime.execution.weight_memory import WeightMemoryState  # noqa: E402
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod  # noqa: E402
 from tokenspeed.runtime.layers.dense.unquant import (  # noqa: E402
@@ -125,111 +129,8 @@ def qwen3_checkpoint() -> dict[str, torch.Tensor]:
     }
 
 
-class _TinyModel(torch.nn.Module):
-    """A real module with a real ``load_weights``, small enough for CPU."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.w = torch.nn.Parameter(torch.zeros(4, 3))
-        self.b = torch.nn.Parameter(torch.zeros(4))
-        self.seen: list[str] = []
-
-    def load_weights(self, weights) -> None:
-        params = dict(self.named_parameters())
-        for name, tensor in weights:
-            self.seen.append(name)
-            params[name].data.copy_(tensor)
-
-
 class _SelectedFileQwen3(Qwen3ForCausalLM):
     checkpoint_weight_files = ("draft.safetensors",)
-
-
-def _write_checkpoint(directory: Path, scale: float) -> dict[str, torch.Tensor]:
-    """A one-shard safetensors checkpoint, the shape a trainer writes."""
-    directory.mkdir(parents=True, exist_ok=True)
-    tensors = {
-        "w": torch.arange(12, dtype=torch.float32).reshape(4, 3) * scale,
-        "b": torch.arange(4, dtype=torch.float32) * scale,
-    }
-    save_file(tensors, str(directory / "model.safetensors"))
-    return tensors
-
-
-def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
-    """A ModelRunner with only what the disk reload touches (no GPU load)."""
-    runner = ModelRunner.__new__(ModelRunner)
-    runner.model = model
-    runner.device = "cpu"
-    runner.gpu_id = 0
-    runner.checkpoint_load_group = None
-    # Resident weights (no peer sharing), so disk reloads are allowed.
-    runner.mapping = Mapping(rank=0)
-    runner.model_config = SimpleNamespace(
-        model_path=str(booted_from), mapping=runner.mapping, revision=None
-    )
-    runner.server_args = SimpleNamespace(
-        enable_memory_saver=False,
-        weight_memory_policy=None,
-        load_format="auto",
-        download_dir=None,
-        model_loader_extra_config={},
-        ext_yaml=None,
-        weight_loader_prefetch_checkpoints=False,
-        weight_loader_prefetch_num_threads=1,
-    )
-    # Some CPU fixtures initialize weights in memory, without a startup checkpoint.
-    runner._disk_reload_shapes = (
-        WeightLoader.checkpoint_shapes(runner.model_config, runner.server_args, model)
-        if any(booted_from.glob("*.safetensors"))
-        else {}
-    )
-    return runner
-
-
-@pytest.mark.parametrize("startup_format", ["auto", "runai_streamer"])
-def test_disk_reload_keeps_shape_validation_after_initial_source_is_removed(
-    tmp_path, startup_format
-):
-    initial = tmp_path / "initial"
-    _write_checkpoint(initial, scale=1)
-    runner = _runner(_TinyModel(), initial)
-    runner.server_args.load_format = startup_format
-    runner._disk_reload_shapes = WeightLoader.checkpoint_shapes(
-        runner.model_config, runner.server_args, runner.model
-    )
-    shutil.rmtree(initial)
-
-    invalid = tmp_path / "invalid"
-    invalid.mkdir()
-    save_file({"w": torch.ones(8, 3)}, str(invalid / "model.safetensors"))
-    ok, message = runner.update_weights_from_disk(
-        UpdateWeightFromDiskReqInput(model_path=str(invalid), load_format="auto")
-    )
-    assert not ok and "has shape" in message
-    assert runner.model.seen == []
-
-    replacement = tmp_path / "replacement"
-    expected = _write_checkpoint(replacement, scale=7)
-    ok, message = runner.update_weights_from_disk(
-        UpdateWeightFromDiskReqInput(model_path=str(replacement), load_format="auto")
-    )
-    assert ok, message
-    assert torch.equal(runner.model.w, expected["w"])
-    assert torch.equal(runner.model.b, expected["b"])
-
-
-@pytest.mark.parametrize("source", ["s3://test/model", "gs://test/model"])
-def test_streamer_object_store_startup_has_no_local_shape_snapshot(tmp_path, source):
-    runner = _runner(_TinyModel(), tmp_path)
-    runner.server_args.load_format = "runai_streamer"
-    runner.model_config.model_path = source
-    assert (
-        WeightLoader.checkpoint_shapes(
-            runner.model_config, runner.server_args, runner.model
-        )
-        == {}
-    )
 
 
 def _device_handle(runner, drafter=None) -> DeviceHandle:

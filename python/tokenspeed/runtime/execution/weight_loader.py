@@ -18,18 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from dataclasses import dataclass
+from pathlib import Path
+
 import torch
 
 from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.execution.weight_memory import backup_weights
-from tokenspeed.runtime.model_loader import get_model
+from tokenspeed.runtime.model_loader import get_model_loader
 from tokenspeed.runtime.model_loader.loader import (
     CheckpointFileSelection,
+    CheckpointShapeProvider,
     DefaultModelLoader,
 )
-from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
 from tokenspeed.runtime.model_loader.weight_utils import (
     require_unit_kv_scale_file,
     safetensors_tensor_shapes,
@@ -46,53 +49,42 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 logger = get_colorful_logger(__name__)
 
 
-class WeightLoader:
-    """Handles model weight loading from disk.
+@dataclass(frozen=True, kw_only=True)
+class LoadedModel:
+    """Weights and source metadata from one model initialization."""
 
-    This class is stateless and does not modify external state.
-    The loaded model and checkpoint metadata have independent lifetimes.
-    """
+    model: torch.nn.Module
+    checkpoint_shapes: dict[str, tuple[int, ...]]
+
+
+class WeightLoader:
+    """Load weights and retain source metadata needed for later disk updates."""
 
     @staticmethod
     def checkpoint_shapes(
-        model_config: ModelConfig, server_args: ServerArgs, model: torch.nn.Module
+        model_config: ModelConfig, model: torch.nn.Module
     ) -> dict[str, tuple[int, ...]]:
-        """Snapshot the source shapes used to validate later disk updates.
+        """Read optional local headers when loading produced no shape metadata.
 
-        Only local safetensors headers are read, including Run:ai checkpoints.
-        Object-store sources and formats without local safetensors headers,
-        including dummy loading, return an empty snapshot. A later update
-        therefore never needs to reopen the initial checkpoint.
+        Dummy/config-only startup does not download weights. If its source
+        already contains safetensors, preserve the same reload preflight as a
+        normal load, without a second remote checkpoint resolution.
         """
-        load_format = server_args.load_format
-        if load_format not in (
-            LoadFormat.AUTO,
-            LoadFormat.SAFETENSORS,
-            LoadFormat.INSTANTTENSOR,
-            LoadFormat.RUNAI_STREAMER,
-            LoadFormat.MISTRAL,
-            LoadFormat.PT,
-            LoadFormat.NPCACHE,
-        ):
+        source = Path(model_config.model_path)
+        if not source.is_dir() or not any(source.glob("*.safetensors")):
             return {}
-        if load_format == LoadFormat.RUNAI_STREAMER and is_object_store_uri(
-            model_config.model_path
-        ):
-            return {}
-        loader = DefaultModelLoader(
-            LoadConfig(load_format=load_format, download_dir=server_args.download_dir)
-        )
-        _, files, use_safetensors = loader._prepare_weights(
-            model_config.model_path,
-            model_config.revision,
-            getattr(model, "fall_back_to_pt_during_load", False),
-            (
+        loader = DefaultModelLoader(LoadConfig(load_format=LoadFormat.SAFETENSORS))
+        _, files, _ = loader._prepare_weights(
+            str(source),
+            revision=None,
+            fall_back_to_pt=False,
+            weight_files=(
                 model.checkpoint_weight_files
                 if isinstance(model, CheckpointFileSelection)
                 else None
             ),
         )
-        return safetensors_tensor_shapes(files) if use_safetensors else {}
+        return safetensors_tensor_shapes(files)
 
     @staticmethod
     def load_model(
@@ -103,7 +95,28 @@ class WeightLoader:
         memory_saver_adapter: TorchMemorySaverAdapter,
         checkpoint_load_group: tuple[int, ...] | None,
         is_draft_worker: bool,
-    ):
+    ) -> torch.nn.Module:
+        """Load weights and return the initialized model."""
+        return WeightLoader.load_model_with_metadata(
+            model_config=model_config,
+            server_args=server_args,
+            device=device,
+            gpu_id=gpu_id,
+            memory_saver_adapter=memory_saver_adapter,
+            checkpoint_load_group=checkpoint_load_group,
+            is_draft_worker=is_draft_worker,
+        ).model
+
+    @staticmethod
+    def load_model_with_metadata(
+        model_config: ModelConfig,
+        server_args: ServerArgs,
+        device: str,
+        gpu_id: int,
+        memory_saver_adapter: TorchMemorySaverAdapter,
+        checkpoint_load_group: tuple[int, ...] | None,
+        is_draft_worker: bool,
+    ) -> LoadedModel:
         """Load model from disk.
 
         Args:
@@ -119,7 +132,7 @@ class WeightLoader:
                 keep CPU backup even when target weights use discard.
 
         Returns:
-            The initialized model.
+            The initialized model and its source tensor shapes for disk reloads.
         """
         if (
             server_args.kv_cache_dtype == "fp8_e4m3"
@@ -164,9 +177,9 @@ class WeightLoader:
                 draft_policy=draft_policy,
             ),
         ):
-            model = get_model(
+            loader = get_model_loader(load_config)
+            model = loader.load_model(
                 model_config=model_config,
-                load_config=load_config,
                 device_config=DeviceConfig(device),
             )
             initialize_engram = getattr(model, "initialize_engram", None)
@@ -191,4 +204,9 @@ class WeightLoader:
             f"mem={get_available_gpu_memory(device, gpu_id):.2f} GB",
         )
 
-        return model
+        shapes = (
+            loader.checkpoint_shapes
+            if isinstance(loader, CheckpointShapeProvider)
+            else WeightLoader.checkpoint_shapes(model_config, model)
+        )
+        return LoadedModel(model=model, checkpoint_shapes=dict(shapes))

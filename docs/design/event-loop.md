@@ -82,14 +82,24 @@ a draft. Hooks own their synchronization, must run in the same order on every
 rank, and propagate failures to startup. Registration joins the plugin loader's
 normal recording and rollback.
 
-The host reads its tokenizer and snapshots local safetensors checkpoint shapes
-before this boundary, including local Run:ai sources. Object-store sources and
-formats without local safetensors headers keep an empty shape snapshot. Later
-disk updates validate against the saved shapes rather than reopening the initial
-source directory. Plugins must prepare their own
-metadata before retiring a source; external frontends and encode services own
-their source lifetimes independently. Explicit reload requests still require
-the new checkpoint they name.
+The host reads its tokenizer and preserves safetensors shapes from the selected
+files while loading weights, before this boundary. A loader that does not stream
+tensors (such as `dummy`) snapshots already-local safetensors headers if present;
+config-only startup does not download a checkpoint for this metadata. Later disk updates
+validate against the saved shapes rather than reopening the initial source.
+Without local safetensors headers (including object-store streams and remote
+config-only startup), no held-source shape comparison is available; new shards
+are still validated before loading. Explicit reload requests require the new
+checkpoint they name.
+
+Plugins must prepare their own metadata before retiring a source. The world
+CPU group coordinates one engine only: a source shared by independently
+starting engines (including prefill/decode or external frontends and encode
+services) requires cross-engine coordination owned by the plugin, or a separate
+copy for each engine. A barrier on this group alone cannot protect that source.
+Hooks must not retain GPU allocations after startup except in the memory
+saver's CPU-backed named regions, preserving zero occupancy on weights release
+and restoration on resume.
 
 What an engine registers with tells its frontend what it serves: the
 request types it takes (an encode server takes encode requests only), the

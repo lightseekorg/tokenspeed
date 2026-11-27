@@ -235,16 +235,15 @@ class TestWeightLoaderPrefetch:
     def test_loader_uses_node_local_participants_and_keeps_filtered_reads(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             files = self._make_files(tmpdir, count=2, size=100)
+            for path in files:
+                weight_utils.safetensors.torch.save_file(
+                    {"weight": weight_utils.torch.ones(1)}, path
+                )
             loader = DefaultModelLoader(LoadConfig())
             source = DefaultModelLoader.Source(tmpdir, revision=None, weight_files=None)
             with (
                 mock.patch.object(
                     loader, "_prepare_weights", return_value=(tmpdir, files[::-1], True)
-                ),
-                mock.patch.object(
-                    weight_utils.safetensors.torch,
-                    "load_file",
-                    return_value={"weight": weight_utils.torch.ones(1)},
                 ),
                 mock.patch.object(
                     CheckpointPrefetcher, "_read_range", return_value=100
@@ -277,12 +276,10 @@ class TestWeightLoaderPrefetch:
                         path for path in paths if accept(path)
                     ],
                 ),
-                mock.patch.object(weight_utils, "safe_open") as open_shard,
                 mock.patch.object(
                     CheckpointPrefetcher, "_read_range", return_value=100
                 ) as read,
             ):
-                open_shard.return_value.__enter__.return_value.keys.return_value = []
                 for rank, path in enumerate(files):
                     list(
                         loader._get_weights_iterator(

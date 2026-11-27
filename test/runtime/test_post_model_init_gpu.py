@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 
-"""Cache metadata survives source retirement and is prepared once, before profiling."""
+"""Cache metadata is prepared once and survives retirement of the checkpoint source."""
 
 import json
 import os
@@ -69,7 +69,6 @@ def _checkpoint(directory):
             bos_token_id=0,
             eos_token_id=1,
             pad_token_id=2,
-            source_cache_dtype="bfloat16",
         )
     )
     model.save_pretrained(directory)

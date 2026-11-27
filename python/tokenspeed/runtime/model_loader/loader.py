@@ -68,6 +68,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     pt_weights_iterator,
     runai_streamer_weights_iterator,
     safetensors_filtered_weights_iterator,
+    safetensors_tensor_shapes,
     safetensors_weights_iterator,
     split_kv_cache_scales,
 )
@@ -194,6 +195,16 @@ class CheckpointFileSelection(Protocol):
 
 
 @runtime_checkable
+class CheckpointShapeProvider(Protocol):
+    """A loader retaining canonical shapes from its selected checkpoint files."""
+
+    @property
+    def checkpoint_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Source shapes, including an empty snapshot when no headers exist."""
+        ...
+
+
+@runtime_checkable
 class KVCacheScaleLoader(Protocol):
     """A model that puts its checkpoint's KV-cache scales on its attention layers."""
 
@@ -261,6 +272,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig) -> None:
         super().__init__(load_config)
+        self.checkpoint_shapes: dict[str, tuple[int, ...]] = {}
         if load_config.model_loader_extra_config:
             raise ValueError(
                 f"Model loader extra config is not supported for "
@@ -466,6 +478,11 @@ class DefaultModelLoader(BaseModelLoader):
                 index_file,
                 lambda name: weight_name_filter(source.prefix + name),
             )
+        if use_safetensors:
+            self.checkpoint_shapes.update(
+                (source.prefix + name, shape)
+                for name, shape in safetensors_tensor_shapes(hf_weights_files).items()
+            )
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
             if use_safetensors:
@@ -598,6 +615,7 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
+        self.checkpoint_shapes.clear()
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             with startup_phase("weights.allocate"):
@@ -719,6 +737,10 @@ class ExtensibleModelLoader:
         load_config.load_format = LoadFormat.AUTO
         self.base_lm_loader = DefaultModelLoader(load_config)
         self.ext_yaml = load_config.ext_yaml
+
+    @property
+    def checkpoint_shapes(self) -> dict[str, tuple[int, ...]]:
+        return self.base_lm_loader.checkpoint_shapes
 
     def load_model(
         self,
@@ -959,6 +981,7 @@ class RunaiModelStreamerLoader(DefaultModelLoader):
 
     def __init__(self, load_config: LoadConfig) -> None:
         BaseModelLoader.__init__(self, load_config)
+        self.checkpoint_shapes: dict[str, tuple[int, ...]] = {}
         extra_config = (
             {}
             if load_config.model_loader_extra_config is None
@@ -1096,6 +1119,14 @@ class RunaiModelStreamerLoader(DefaultModelLoader):
                 hf_folder,
                 SAFE_WEIGHTS_INDEX_NAME,
                 prefixed_filter,
+            )
+
+        from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+        if not is_object_store_uri(source.model_or_path):
+            self.checkpoint_shapes.update(
+                (source.prefix + name, shape)
+                for name, shape in safetensors_tensor_shapes(hf_weights_files).items()
             )
 
         if self.distributed and checkpoint_load_group is not None:

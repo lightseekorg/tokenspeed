@@ -238,7 +238,7 @@ class ModelRunner:
             initialize_moe_config(server_args)
 
     def load_model(self):
-        self.model = WeightLoader.load_model(
+        loaded = WeightLoader.load_model_with_metadata(
             model_config=self.model_config,
             server_args=self.server_args,
             device=self.device,
@@ -247,9 +247,8 @@ class ModelRunner:
             checkpoint_load_group=self.checkpoint_load_group,
             is_draft_worker=self.is_draft_worker,
         )
-        self._disk_reload_shapes = WeightLoader.checkpoint_shapes(
-            self.model_config, self.server_args, self.model
-        )
+        self.model = loaded.model
+        self._disk_reload_shapes = loaded.checkpoint_shapes
         if not self.is_draft_worker:
             validate_output_vocabulary(self.model, self.model_config.vocab_size)
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(

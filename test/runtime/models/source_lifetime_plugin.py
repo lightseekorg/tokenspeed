@@ -18,21 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""A plugin whose cache metadata must outlive its checkpoint source."""
+"""A hook prepares metadata once; the ordinary cache recipe consumes it."""
 
 import json
 import os
 import shutil
-from dataclasses import replace
 from pathlib import Path
 
-from tokenspeed.runtime.configs.model_config import configure_mha_attention
-from tokenspeed.runtime.configs.model_profile import ModelProfile
-from tokenspeed.runtime.layers.attention.configs.base import resolve_dtype
-from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
-from tokenspeed.runtime.models.llama import LlamaForCausalLM
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import OrdinaryRecipe
 from tokenspeed.runtime.plugins.registry import (
-    register_model,
+    register_cache_recipe,
     register_post_model_init_hook,
 )
 
@@ -42,46 +37,26 @@ def _metadata():
 
 
 def initialized(context):
-    source = Path(context.model_config.model_path)
-    metadata = json.loads((source / "config.json").read_text())
-    metadata["has_draft"] = context.draft_model_config is not None
-    # Exclusive creation also rejects repeated hooks during cache rebuilds.
+    # Exclusive creation rejects a repeated hook during cache rebuilds.
     with _metadata().open("x") as output:
-        json.dump(metadata, output)
+        json.dump(
+            {
+                "family": context.model_config.attention_arch.name.lower(),
+                "has_draft": context.draft_model_config is not None,
+            },
+            output,
+        )
     if os.environ["SOURCE_TEST_MODE"] == "fail":
         raise RuntimeError("source lifetime hook refused startup")
     if os.environ["SOURCE_TEST_MODE"] == "retire":
-        shutil.rmtree(source)
+        shutil.rmtree(context.model_config.model_path)
 
 
-def create_attention_config(server_args, model_config, is_draft):
-    # This dependency must be ready before the first cache memory profile.
+def cache_recipe(**kwargs):
     metadata = json.loads(_metadata().read_text())
-    return replace(
-        MHAConfig.generate(server_args, model_config, is_draft),
-        kv_cache_dtype=resolve_dtype(metadata["source_cache_dtype"]),
-    )
-
-
-class SourceLifetimeLlama(LlamaForCausalLM):
-    @classmethod
-    def model_profile(cls, hf_config):
-        return ModelProfile(
-            configure_attention=configure_mha_attention,
-            create_attention_config=create_attention_config,
-            cache_family="mha",
-            linear_attention=None,
-            default_attention_backend=None,
-            request_token_history=False,
-            is_multimodal=False,
-            tokenizer_kwargs={},
-            attention_instances_per_layer=1,
-            numerics_envelopes=frozenset({"auto"}),
-        )
+    return OrdinaryRecipe(family=metadata["family"], **kwargs)
 
 
 def register():
-    register_model(
-        SourceLifetimeLlama, architectures=("LlamaForCausalLM",), override=True
-    )
     register_post_model_init_hook("source_lifetime_fixture", initialized)
+    register_cache_recipe("mha", cache_recipe, override=True)

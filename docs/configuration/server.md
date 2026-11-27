@@ -404,7 +404,12 @@ kernel, or the Gluon kernel on gfx950), reload in place.
 For a safetensors checkpoint the shard headers are read before the first
 write. A shard shorter than its header declares (for example, one still being
 written) or a tensor whose shape differs from the same name in the checkpoint
-the model holds fails the request with the weights unchanged. A failure after
+the model holds fails the request with the weights unchanged. The held shapes
+are captured from the files selected at startup, so this check survives removal
+of the original source. A dummy/config-only startup snapshots already-local
+safetensors headers if present; it does not download weights for this check.
+Without those headers, or for object-store streams, only the new shards' header
+validity is checked, without a held-source shape comparison. A failure after
 the load has started says that the worker's weights may now mix the two
 checkpoints: reload a complete checkpoint or restart the engine before relying
 on its output. The weight version does not advance on any failure.

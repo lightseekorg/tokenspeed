@@ -206,13 +206,17 @@ class PostModelInitContext:
     """Startup inputs available after local model initialization.
 
     Target and local draft weights, multimodal runtimes and communication
-    buffers are ready. The host has read its tokenizer and checkpoint metadata.
+    buffers are ready. The host has read its tokenizer and captured available
+    checkpoint metadata.
     Cache profiling and allocation have not started. No device model escapes
     through this context; hooks must not retain it beyond startup.
 
     ``world_cpu_group`` includes every engine rank, including pipeline stages
     without a local draft. It is None for a single-rank engine. Hooks own any
     synchronization they require and must use the same order on every rank.
+    This group does not coordinate other engines sharing a checkpoint source.
+    Hooks must not retain GPU allocations after startup, except in the memory
+    saver's CPU-backed named regions that participate in weights release/resume.
     """
 
     server_args: ServerArgs
