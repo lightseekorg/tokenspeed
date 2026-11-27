@@ -1398,7 +1398,7 @@ def test_input_logprobs_match_the_output_logprob_arithmetic(chunk_tokens):
     metadata = LogitsMetadata(
         forward_mode=ForwardMode.EXTEND,
         query_shard=None,
-        gather_ids=torch.tensor([2, 4], device=device),
+        gather_ids=torch.tensor([2, 4], dtype=torch.int32, device=device),
         input_logprob_rows=_input_logprob_rows(
             rows, targets, num_input_rows=5, chunk_tokens=chunk_tokens, device=device
         ),
@@ -1444,7 +1444,7 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
     metadata = LogitsMetadata(
         forward_mode=ForwardMode.MIXED,
         query_shard=None,
-        gather_ids=torch.tensor([3, 4, 5], device=device),
+        gather_ids=torch.tensor([3, 4, 5], dtype=torch.int32, device=device),
         input_logprob_rows=_input_logprob_rows(
             [0, 1, 2], [1, 2, 3], num_input_rows=6, chunk_tokens=2, device=device
         ),
@@ -1464,7 +1464,7 @@ def test_input_logprobs_are_gathered_from_prefill_rows_of_a_mixed_batch():
         torch.arange(3, device=device), torch.tensor([1, 2, 3], device=device)
     ]
     torch.testing.assert_close(out.input_token_logprobs, expected, rtol=0, atol=0)
-    assert out.next_token_logits.shape == (3, vocab)
+    torch.testing.assert_close(out.next_token_logits, logits[[3, 4, 5]])
 
 
 def test_input_logprobs_refuse_a_model_that_narrowed_its_logits_rows():

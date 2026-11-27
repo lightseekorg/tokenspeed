@@ -81,6 +81,20 @@ def load_symbol(path, name, *, owner=None, **bindings):
     return scope[name]
 
 
+@pytest.mark.parametrize(
+    "lengths, expected",
+    [([5], [4]), ([5, 3, 1], [4, 7, 8]), ([2**31 - 3, 2], [2**31 - 4, 2**31 - 2])],
+)
+def test_last_packed_token_rows_fit_int32(lengths, expected):
+    last_rows = load_symbol(
+        RUNTIME + "execution/model_executor.py", "_last_packed_token_rows"
+    )
+    torch.testing.assert_close(
+        last_rows(torch.tensor(lengths, dtype=torch.int32)),
+        torch.tensor(expected, dtype=torch.int32),
+    )
+
+
 class SharedBufferSampler:
     def __init__(self):
         self.tokens = torch.empty(32, dtype=torch.int32)

@@ -927,3 +927,38 @@ def test_persistent_topk_pdl_register_budget(enabled, large_grid, columns, resto
     # Blackwell configuration used to select this policy.
     if torch.cuda.get_device_capability() == (10, 3):
         assert occupancy == expected_budget
+
+
+@pytest.mark.skipif(
+    not current_platform().is_blackwell, reason="CuTe QSA requires Blackwell"
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_qsa_fp8_private_tail_waits_for_delayed_inputs(enabled, restore_pdl):
+    torch.manual_seed(1847)
+    query = torch.randn(96, 24, 256, device="cuda", dtype=torch.bfloat16)
+    keys, values = (
+        torch.randn(4096, 2, 256, device="cuda").to(torch.float8_e4m3fn)
+        for _ in range(2)
+    )
+    slots = torch.randint(1, 4096, (96, 2051), device="cuda", dtype=torch.int32)
+    slots[0] = -1
+    sources = (query, keys, values, slots)
+    targets = tuple(torch.empty_like(t) for t in sources)
+
+    def forward(enable_pdl):
+        pdl_enabled(enable_pdl)
+        _publish(sources, targets)
+        output = qsa_sparse_attention(
+            *targets,
+            scale=1 / 16,
+            max_seqlen_q=4,
+            metadata_capacity_rows=None,
+            k_scale=1.0,
+            v_scale=1.0,
+            override=None,
+            solution="cute_dsl",
+            sparse_metadata=None,
+        )
+        return (output,)
+
+    _check_replays(forward, sources, targets, enabled, unordered_outputs=False)

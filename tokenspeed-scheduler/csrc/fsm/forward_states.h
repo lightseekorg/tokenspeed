@@ -30,6 +30,7 @@
 #include <variant>
 #include <vector>
 
+#include "cache/core/cache_block_ref.h"
 #include "cache/core/cache_types.h"
 #include "cache/tier/storage_lease.h"
 #include "core/token_container.h"
@@ -47,6 +48,13 @@ enum class PrefillSource { kLocal, kRemote, kPeer };
 // A scheduling attempt advances this in place and StagedCacheProgress
 // (scheduler/operations/progress.h) undoes the advance when the attempt
 // fails: a field an attempt changes must be restored there.
+struct MaterializedCheckpoint {
+    std::int32_t tokens;
+    std::int32_t computed_tokens;
+    std::vector<CacheBlockRef> blocks;
+    std::shared_ptr<CheckpointLifecycle> lifecycle;
+};
+
 struct CacheProgress {
     // One source of truth for both the next hash-chain seed and the cumulative
     // history needed to publish a resumable boundary across chunk edges.
@@ -68,6 +76,14 @@ struct CacheProgress {
     // (AdvanceRequestProgress); zero tokens means none is pending.
     std::int32_t state_checkpoint_tokens{0};
     std::vector<CacheBlockRef> state_checkpoint_blocks;
+    std::shared_ptr<CheckpointLifecycle> checkpoint_lifecycle;
+    std::optional<MaterializedCheckpoint> TakeMaterializedCheckpoint(std::int32_t computed_tokens) {
+        if (state_checkpoint_tokens == 0 || computed_tokens < state_checkpoint_tokens) return std::nullopt;
+        if (checkpoint_lifecycle) checkpoint_lifecycle->Materialize();
+        return MaterializedCheckpoint{std::exchange(state_checkpoint_tokens, 0), computed_tokens,
+                                      std::exchange(state_checkpoint_blocks, {}),
+                                      std::exchange(checkpoint_lifecycle, {})};
+    }
     // The blocks of the checkpoint the latest publication point published,
     // held until the next one so the publication's spans stay valid; the
     // index keeps them cached, unless another request published the
@@ -75,6 +91,7 @@ struct CacheProgress {
     // retraction drops them once its publication is applied (a Retracted
     // request holds no Device block).
     std::vector<CacheBlockRef> published_state_checkpoint_blocks;
+    std::shared_ptr<CheckpointLifecycle> published_checkpoint_lifecycle;
     // The boundary of the in-forward State checkpoint the request published
     // -- from its block, or from the live slot of a chunk that ended there --
     // zero without one. Kept after the blocks are let go: the finish reads it
@@ -127,7 +144,14 @@ struct StorageReadyHold {
 struct PeerHit {
     PeerLeaseId lease;
     std::int32_t num_tokens{0};
+    unsigned source_mask{0};               // Device=1, Host=2, Disk=4; mixed sources combine bits.
+    std::vector<std::uint8_t> checkpoint;  // Original holder answer, for an exact re-PIN.
 };
+
+// How far a waiting prompt's lookup at a shared L2 pool has come: not handed
+// out yet; handed out, its answer not applied yet; settled, that is answered
+// or never needed.
+enum class SharedL2LookupState { kNotAsked, kAsked, kSettled };
 
 struct AdmissionResources {
     TokenContainer* token_container;
@@ -136,13 +160,34 @@ struct AdmissionResources {
     std::int32_t cached_prefix_tokens{0};
     bool storage_prepared{false};
     std::optional<StorageReadyHold> storage_hold;
+    // The Ready hold a peer Host landing extended: the landing's hold took
+    // `storage_hold`, and the prefix below it stays held for as long.
+    std::optional<StorageReadyHold> storage_base_hold;
     // The request has asked its peer holder once (or has none to ask), and
     // what the holder answered.
     bool peer_prepared{false};
+    std::int32_t disk_wait_plans{0};
+    // Backoff gate when a partial Host-credit reservation retries in prepareDisk:
+    // skip re-probing until held Host blocks drop below this watermark, with
+    // `disk_read_retries` capping total retry attempts.
+    std::optional<std::size_t> disk_retry_below_held_blocks;
+    std::uint8_t disk_read_retries{0};
     std::optional<PeerHit> peer_hit;
+    // Successful later first admissions while this is the oldest waiting prompt.
+    std::int32_t prefill_bypasses{0};
     // Fixed prompt identities for admission retries, never residency. Leaving
     // the pre-admission states releases them together with the storage hold.
     PreparedPrefixKeys prefix_keys;
+    // With a shared L2 pool: the prompt's lookup. It is handed out once, and
+    // the prompt is admitted only once the lookup is settled, so a prefix
+    // the pool holds is not recomputed. shared_l2_hit_blocks pins the proxy
+    // Host entries the answer mirrored until this state goes: admission
+    // consumes it (the load-back it starts holds its sources itself), or the
+    // request leaves. shared_l2_kv_tokens is how far the answer said the
+    // pool's KV reaches: past the hit, a junction the first chunk is cut at.
+    SharedL2LookupState shared_l2_lookup_state{SharedL2LookupState::kNotAsked};
+    std::vector<CacheBlockRef> shared_l2_hit_blocks;
+    std::int32_t shared_l2_kv_tokens{0};
 };
 
 // Eligible for ordinary admission. A pending L3 dependency is Prefetching.
@@ -153,8 +198,6 @@ struct Submitted {
     TokenContainer* TokenContainerPtr() const { return admission.token_container; }
     std::int32_t PrefixGranularity() const { return admission.prefix_granularity; }
 
-    // Successful later first admissions while this is the oldest waiting prompt.
-    std::int32_t prefill_bypasses{0};
     AdmissionResources admission;
 };
 

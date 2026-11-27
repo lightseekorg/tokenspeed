@@ -289,6 +289,7 @@ def test_bf16_verify_auto_keeps_null_state(pdl):
         initial_state_indices=read,
         disable_state_update=False,
         tree_ancestors=None,
+        pending_replay=None,
     )
     assert torch.isfinite(out[[0, 2]]).all()
     untouched = [i for i in range(pool.shape[0]) if i not in (1, 3)]

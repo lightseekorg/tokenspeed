@@ -22,7 +22,8 @@
 
 Workers record rank/PID/phase logs and Python stack snapshots every five minutes.
 Failures retain these under .ci-artifacts for the existing upload. The suite
-timeout is unchanged.
+timeout is unchanged. Like serving, workers bind the NCCL group to their CUDA
+device during initialization, before preparing symmetric-memory buffers.
 
 Usage:
     python -m pytest test/runtime/distributed/test_muse_owned_projections.py -v
@@ -87,19 +88,20 @@ def _run_worker(
     )
 
     phase("default_nccl_group")
-    torch.cuda.set_device(rank)
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
         init_method=f"tcp://127.0.0.1:{port}",
         rank=rank,
         world_size=world_size,
+        device_id=device,
     )
     try:
         phase("tokenspeed_groups_and_backend")
         group = tuple(range(world_size))
         process_group_manager.init_process_group(group)
         set_global_backend(AutoBackend())
-        device = torch.device("cuda", rank)
         experts = 32 * world_size
         shapes = {
             "qkv": (96, _HIDDEN),

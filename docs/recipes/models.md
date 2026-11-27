@@ -752,6 +752,9 @@ Notes:
 - Leave `--attention-backend` unset (or pass `dsa`): the MLA layers then run
   the `dsa` sparse-MLA backend inside the KDA hybrid wrapper. The dense MLA
   backends do not run the indexer.
+- Under attention DP with MoE EP, `--moe-backend mega_moe
+  --all2all-backend none` runs the MXFP4 routed experts through FlashInfer's
+  Kimi K3 MegaMoE instead of the all-to-all transport and the TRT-LLM kernel.
 - The indexer keys live in an index-K plane beside each MLA layer's latent
   plane in the full-attention cache group, so prefix caching, PD transfer, and
   frees treat them with the latent rows. The plane stores the keys as FP8 with
@@ -1321,6 +1324,11 @@ the start of FC1:
 | 128 | 21.0 -> 20.7 us | -0.1% |
 
 A 16k-token prefill chunk is unchanged.
+
+The GSM8K CI task serves the NVFP4 checkpoint on two B200 GPUs with MTP3
+and BF16 recurrent state. It enables `--enable-deferred-gdn-state` and
+requires at least 96% accuracy on the GSM8K test split.
+[Task configuration](../../test/ci/eval/qwen3.8-flash-next-nvfp4-deferred-gdn-evalscope-gsm8k.yaml)
 
 ### AMD
 

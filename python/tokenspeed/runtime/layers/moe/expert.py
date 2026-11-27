@@ -28,6 +28,9 @@ import torch
 from tokenspeed_kernel.ops.communication.peer_weights import PreparedExpertWeights
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import (
+    moe_prepare_input_buffers as kernel_moe_prepare_input_buffers,
+)
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.ops.moe.flashinfer import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
@@ -66,7 +69,10 @@ from tokenspeed.runtime.layers.quantization.utils import (
     should_ignore_quant_layer,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
-from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_communication
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+    TorchMemorySaverAdapter,
+    initialize_communication,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -259,7 +265,7 @@ class MoELayer(torch.nn.Module):
 
         fp8_scale_block_shape = None
         internal_activation_dtype = "input"
-        if self._quant_kind == "fp8":
+        if self._quant_kind in ("fp8", "w8a16_fp8_block"):
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
             # The loader slices each rank's block scales at ceil(ispp / block)
             # rows, which follow its weight rows only for a block-aligned
@@ -649,6 +655,13 @@ class MoELayer(torch.nn.Module):
         )
         self._weights_processed = False
         self._moe_backend_state: object | None = None
+        self._input_buffer_factory: (
+            Callable[
+                [int, int],
+                tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            ]
+            | None
+        ) = None
 
     def _swiglu_form(self) -> str | None:
         """``"standard"`` for silu(gate)*up with an optional clamp, ``"generalized"``
@@ -696,6 +709,13 @@ class MoELayer(torch.nn.Module):
 
         if self._quant_kind == "fp8_channel":
             check_fp8_channel_scales(module, self.prefix)
+        if self._quant_kind == "w8a16_fp8_block":
+            from tokenspeed.runtime.layers.quantization.w8a16_fp8_block import (
+                validate_w8a16_weights,
+            )
+
+            validate_w8a16_weights(module.w13_weight, module.w13_weight_scale_inv)
+            validate_w8a16_weights(module.w2_weight, module.w2_weight_scale_inv)
         prepared = kernel_moe_process_weights(
             self.plan, module, communication_initializer=initialize_communication
         )
@@ -706,6 +726,21 @@ class MoELayer(torch.nn.Module):
                 )
             self.peer_weights.publish(self.layer_index, module, prepared)
         self._weights_processed = True
+
+    def input_buffers(
+        self, num_tokens: int, max_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The selected kernel's activation, scale, ID and routing-weight views."""
+        if self._input_buffer_factory is None:
+            saver = TorchMemorySaverAdapter.create(
+                enable=global_server_args_dict["enable_memory_saver"],
+                device=global_server_args_dict["device"],
+            )
+            with saver.named_region("workspace"):
+                self._input_buffer_factory = kernel_moe_prepare_input_buffers(
+                    self.plan, self
+                )
+        return self._input_buffer_factory(num_tokens, max_tokens)
 
     @property
     def support_routing(self) -> bool:

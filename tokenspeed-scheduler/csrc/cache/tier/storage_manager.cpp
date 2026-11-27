@@ -252,6 +252,7 @@ StorageLease StorageTransferManager::StartRead(const PromptPrefix& prompt, std::
                                    {},
                                    std::move(reservation.tail_prior),
                                    std::move(reservation.tail)});
+    operations_.at(id).recovery_metadata = coordinator_.TrackRecoveryMetadata(prompt, reservation.num_tokens);
     commands_.push_back(std::move(op));
     return StorageLease{*this, id};
 }

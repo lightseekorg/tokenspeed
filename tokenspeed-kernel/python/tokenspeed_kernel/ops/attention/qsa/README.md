@@ -28,21 +28,43 @@ successful and failed availability checks are cached.
 
 ## Streaming block selection
 
-The Blackwell CuTe implementation lives under
-`thirdparty/cute_dsl/_qsa_stream_topk/`. It computes BF16 dot products with
-FP32 accumulation, clamps each head score at zero, and selects up to 512
-logical compressed-block IDs. Full candidate scores and logical IDs retain
-FP32 and 32-bit precision. `score.py` shares the positive clamps and paired
-head sums between warp-MMA decode and TMEM prefill; each independent score
-keeps its original left-to-right FP32 addition order.
+The Blackwell CuTe implementation under `thirdparty/cute_dsl/_qsa_stream_topk/`
+computes BF16 dot products with FP32 accumulation, clamps each head at zero,
+and selects up to 512 compressed-block IDs. Scores retain FP32 precision;
+logical IDs remain int32. A bounded 528-candidate carry includes the coarse
+boundary bucket, with exact FP32 refinement on overflow and final output.
+The retained minimum is a conservative producer cutoff: stale values may
+retain extra candidates, but cannot exclude a required higher score.
 
-Long prefill shares K tiles across eight request-owned queries per CTA.
-TMA key copies, MMA accumulators, and compacted score queues each have two
-stages. Every row keeps two 1120-entry FP32 score buffers. Integer coarse
-and fine histograms can retain a bounded 528-candidate set, including the
-complete boundary bucket; exact FP32 refinement runs on overflow and final
-output. The retained minimum is a conservative producer cutoff. A stale
-cutoff may retain extra scores but cannot remove a required winner.
+Uniform requests use four-query tiles when their CTAs fit in the SM waves
+already required by an eight-query grid; other grids keep eight-query tiles.
+Shared memory limits either geometry to one CTA per SM. MMA accumulators and
+score queues each have two stages. K lookahead uses the following presets:
+
+| Query tile | Compressed-block capacity | K stages | Score entries per row |
+| --- | --- | --- | --- |
+| 4 | Any supported capacity | 4 | 1120 |
+| 8 | Below 32768 | 2 | 1120 |
+| 8 | At least 32768 | 3 | 784 |
+
+The smaller eight-query score queue frees space for the third K stage.
+Producer capacity checks derive from the selected score size. The TMA warp
+caches 32 page IDs in lane registers; shuffles supply each tile's two pages.
+Rounded per-warp counts bound row occupancy and determine how many subtiles
+can append before another collective check. Queue publication and the 64K
+logical-ID boundary retain their synchronization contracts.
+
+`auto` uses shape metadata, independently of live device frontiers:
+
+* Three-query requests prefer streaming from 192 rows and 8192 compressed
+  blocks of capacity.
+* Wider odd request widths prefer streaming from 384 rows at that capacity;
+  the power-of-two logits tile otherwise cannot share K across these queries.
+* Four-query requests prefer streaming from 384 rows at capacity 32768.
+
+Other shapes retain the existing row/logits-budget policy. Smaller grids
+keep logits where producer/selector overhead outweighs reuse. Explicit path
+and backend arguments retain their normal selection semantics.
 
 Shared storage is allocated once outside request-group branches. Full
 single-owner groups bypass the ownership loop; mixed-owner groups and tails
@@ -70,6 +92,42 @@ and scratch buffers. Logical slots and TMA coordinates require fewer than
 Only static geometry, explicit algorithm parameters, and bucketed capacity
 specialize compilation. Graph replay refreshes the same input buffers as
 eager execution; no backend-private request state is introduced.
+
+## Numerical contract and validation
+
+FP8 decode converts E4M3 K/V to BF16 exactly for finite values. QK/PV use
+BF16 operands and FP32 accumulators; online softmax stays FP32 and its P
+operand rounds to BF16. The copy/conversion pipeline does not add query or
+probability quantization. The independent FP8 direct-slot prefill solution
+below has a different, explicitly documented Q/P quantization contract.
+
+Tests exhaust all 65536 adjacent FP8 byte pairs, comparing finite conversion
+results as raw BF16 bits, including signed zero and subnormals. Fixed ordered
+slots isolate core-attention arithmetic from top-k ordering. On SM107, a
+24-case comparison against `main` commit `947b25bc9` matched core-attention
+output bits exactly for identical slots, across 32K/128K/256K contexts, query
+widths 1/3/4/5/8, and PDL on/off.
+
+The complete selection/attention chain does not promise bitwise equality:
+
+* Top-k order and boundary tie IDs are unspecified, including in native CUDA
+  top-k. The same implementation can return a different ordering on replay.
+* Reordering slots changes the tiles processed by online softmax, its running
+  maxima, FP32 accumulation order and BF16 P roundings. In those 24 random
+  cases, block sets agreed and the maximum final-output difference was
+  `1.220703125e-4`, within `atol=1e-3, rtol=1e-2`.
+* Logits and streaming backends can associate the four FP32 head sums
+  differently. Near a tied cutoff, either backend may choose different IDs.
+  Such cases are checked against reference top-k scores and attention over
+  each selected set; the random-case output bound is not a bound for ties.
+  An all-equal index-score fixture produced different admissible sets and a
+  maximum output difference of `0.03271484375`; each output still matched
+  the attention reference for its own selected set.
+
+The corresponding default-auto QSA-chain timing comparison measured about
+30.6% lower cold-L2 latency and 30.8% lower warm-L2 latency (geometric mean of
+24 configurations). It includes index/top-k, slot expansion and FP8 attention,
+and excludes projections, cache writes and other model/serving work.
 
 ## FP8 direct-slot prefill
 
@@ -324,6 +382,33 @@ while refreshing the launch grid. Grouping and occupancy policies are the same
 during prefill, decode, and CUDA graphs.
 
 ## FP8 decode head tile and grid
+
+FP8 prefix operands advance as `K0,V0,K1,V1,...`, with QK and PV using their
+buffer pipelines independently. Each conversion stage publishes two
+64-element fragments together and remains owned until its MMA completes.
+Initial O is published before P enables PV. Non-bulk `cp.async` completion and
+the producer warpgroup barrier protect shared-ring reads and reuse without an
+additional async-proxy shared-memory fence after each register load.
+
+Unsplit 24 Q / 2 KV-head calls with one row per CTA use five gather slots with
+four copies in flight; the unused MMA warp stages the three private tail K/V
+slots. Other tactics retain four slots and three copies in flight. Copy width
+follows the cache dtype. CUDA 13.2/PTX 9.2+ converts E4M3 pairs directly to BF16
+with a 16-bit source operand; older compilers retain the FP32 conversion.
+This adds no global workspace or persistent tensors. FP8 prefix gathers copy
+32 bytes per lane using two 16-byte operations sharing a slot and address
+calculation. Four lanes cover each 64-byte half-row together and share slot
+ids through warp shuffles; cache base alignment remains 16 bytes.
+Softmax skips padded head columns, retaining an even bound for paired
+arithmetic and zero probabilities for padding. Eight-head output fragments
+skip TMEM correction when every scaling coefficient is exactly one. All
+softmax warps capture the shared maxima before any warp advances to the next
+tile and updates them.
+
+For FP8, the existing CTA joins publish local partials and retire their readers.
+Only split-KV calls additionally synchronize the cluster, because their peer
+CTAs read those partials through distributed shared memory. Unsplit calls avoid
+both redundant cluster barriers, including between serial query rows.
 
 The direct-slot CuTe path uses a 16-column tile for twelve query heads per KV
 head with FP8 caches on SM100, SM103 and SM107, for every grid. Each query

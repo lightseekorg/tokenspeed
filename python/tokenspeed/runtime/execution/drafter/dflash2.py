@@ -58,6 +58,7 @@ class DFlash2(DFlash):
     candidate_topk: VocabParallelTopK | None = None
     # The walk samples each step from the selector's q and records it.
     supports_speculative_sampling = True
+    records_sparse_draft_q = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

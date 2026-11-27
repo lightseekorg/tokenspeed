@@ -67,6 +67,10 @@ class LinearAttnConfig(AttnComponentSpec):
     replay_ssm: bool = False
     # Draft-tree verify windows (topk > 1); a ReplaySSM tree keeps node states in one shared workspace.
     draft_tree: bool = False
+    # KDA: records each request slot keeps per layer between dense-state
+    # folds, counting the verify window (--kda-history-capacity). None keeps
+    # KDA_DEFAULT_HISTORY_CAPACITY of kv_cache/recipes/kda.py.
+    kda_history_capacity: int | None = None
     # Whether that workspace exists: Mamba2 rebuilds a branch's state by replaying its ancestors instead.
     tree_node_state_workspace: ClassVar[bool] = True
 
@@ -138,6 +142,7 @@ class LinearAttnConfig(AttnComponentSpec):
                 conv_kernel_size=int(kda["short_conv_kernel_size"]),
                 layer_ids=tuple(linear_layer_ids),
                 tp_size=tp_size,
+                kda_history_capacity=server_args.kda_history_capacity,
             )
         # Qwen3.5 GDN: flat fields, asymmetric k/v heads.
         return cls(

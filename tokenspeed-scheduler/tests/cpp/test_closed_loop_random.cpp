@@ -100,6 +100,7 @@ constexpr std::int32_t kRounds = 300;
 struct LoopKnobs {
     // SchedulerConfig::demote_superseded_state_checkpoints.
     bool demote{false};
+    std::string eviction_policy{"lru"};
     // Replace the drawn write policy (true: write-back) and in-forward
     // checkpoints when set.
     std::optional<bool> write_back;
@@ -313,6 +314,8 @@ struct ClosedLoop {
         const std::int32_t packing = std::max(4, kv_shards);
         SchedulerConfig cfg{};
         cfg.role = role;
+        cfg.prefix_cache_evict_policy = knobs.eviction_policy;
+        if (knobs.eviction_policy == "gds") cfg.prefix_cache_gds_prefill_cost = std::array{1.0, 0.5};
         if (role == Role::kP) {
             cfg.decode_allocation_policy = deferred ? SchedulerConfig::DecodeAllocationPolicy::kDeferred
                                                     : SchedulerConfig::DecodeAllocationPolicy::kEarly;
@@ -693,7 +696,15 @@ struct ClosedLoop {
             const std::uint64_t evicted =
                 stats.device_evictions.admission.blocks + stats.device_evictions.stranded_suffix.blocks +
                 stats.device_evictions.restore.blocks + stats.device_evictions.request_reclaim_for_write_back;
-            if (outcomes != evicted) {
+            // Joint GDS can copy dependencies whose Device copies remain.
+            // Every pre-reserved destination must produce exactly one copy;
+            // physical removals therefore have a separate counter.
+            if (knobs.eviction_policy == "gds") {
+                const auto copies = std::accumulate(eviction.blocks.begin(), eviction.blocks.end(), std::uint64_t{0});
+                if (copies != stats.gds_evictions.host_copies_reserved)
+                    throw std::logic_error("reserved GDS copies differ from the drained transfers");
+            }
+            if (knobs.eviction_policy != "gds" && outcomes != evicted) {
                 throw std::logic_error("round " + std::to_string(round) + ": the drain's outcomes add up to " +
                                        std::to_string(outcomes) + " blocks, the evictions for the cache to " +
                                        std::to_string(evicted));
@@ -976,6 +987,28 @@ TEST(ClosedLoopRandomTest, PrefillRoleDroppingShortPromptEndsNeverRaisesAndDrain
 
 // 64 seeds of the fused role, each of its own configuration, acknowledged op
 // by op.
+TEST(ClosedLoopRandomTest, GdsHybridPressureKeepsMirroredRanksAndWriteBackConsistent) {
+    std::uint64_t evicted = 0;
+    std::uint64_t rejected = 0;
+    for (Role role : {Role::kP, Role::kFused}) {
+        for (unsigned seed = 0; seed < 32; ++seed) {
+            ClosedLoop loop(seed, role, /*mirrored_ranks=*/true,
+                            LoopKnobs{.eviction_policy = "gds", .kv_events = true});
+            SCOPED_TRACE(::testing::Message() << "GDS seed " << seed << " role " << static_cast<int>(role));
+            ASSERT_NO_THROW(loop.Run());
+            for (const auto& scheduler : loop.schedulers) {
+                EXPECT_EQ(scheduler->HostPoolPinnedBlocks(), 0);
+                EXPECT_TRUE(scheduler->CanClearCache());
+                const auto stats = scheduler->GetHostCacheStats().gds_evictions;
+                evicted += stats.evicted_units;
+                rejected += stats.retention_rejections;
+            }
+        }
+    }
+    EXPECT_GT(evicted, 0u);
+    EXPECT_GT(rejected, 0u);
+}
+
 TEST(ClosedLoopRandomTest, FusedRoleNeverRaisesAndDrains) {
     // Per write policy and shard count: the eviction write-backs and the
     // prefix loads the runs made.

@@ -443,12 +443,17 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
                     self.model.embed_tokens(input_ids), captured_hidden_states
                 )
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
-            hidden_states, aux_hidden_states = self.model(
-                input_ids,
-                positions,
-                ctx,
-                input_embeds=fused,
-            )
+            try:
+                hidden_states, aux_hidden_states = self.model(
+                    input_ids,
+                    positions,
+                    ctx,
+                    input_embeds=fused,
+                )
+            finally:
+                if ctx.draft_narrowing is not None:
+                    # Later draft steps carry physical slots through decode.
+                    ctx.attn_backend.sparse_topk.clear_qsa()
             # The first draft step narrows verify rows to one per request.
             # Keep that row table active through the cross-DP head exchange.
             return self.logits_processor(

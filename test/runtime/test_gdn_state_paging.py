@@ -1314,6 +1314,398 @@ class TestGDNStatePagingGPUTest:
         assert (ssm_slab[3].abs().max().item()) > (0.0)
 
 
+def _poison(torch, tensor):
+    """Fill ``tensor`` with a NaN of distinctive payload: a stray read leaks NaN
+    into the outputs and a stray write changes the bytes."""
+    view_dtype, bits = {
+        torch.bfloat16: (torch.int16, 0x7FA5),
+        torch.float32: (torch.int32, 0x7FA5A5A5),
+    }[tensor.dtype]
+    tensor.view(view_dtype).fill_(bits)
+
+
+def _same_bytes(torch, actual, expected):
+    """Bitwise equality, which also tells NaN payloads and signed zeros apart."""
+    return actual.dtype == expected.dtype and torch.equal(
+        actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+    )
+
+
+@pytest.mark.parametrize("family", ["gdn", "kda-fla", "kda-cutedsl"])
+class TestPrefillStateGuardPagesGPUTest:
+    """GDN and KDA prefill over state slabs fenced by NaN guard blocks.
+
+    Each conv and recurrent slab is a view into a larger backing. The blocks
+    around the slab and the slab's null block 0 hold NaNs with a distinctive
+    payload, and every out-of-range block id under test (``-7`` to ``-1`` and
+    ``PAGES`` to ``PAGES + 3``) lands in that guard memory. A row whose source
+    lies outside ``(0, PAGES)`` starts from the zero state, and a destination
+    outside it is never written. Every row with a live block must match, bit
+    for bit, the same batch on a plain slab whose rows carry what the runtime
+    delivers instead: source 0 for a row without history, and -1 for a block
+    a row lacks.
+
+    The convolution writes the live block itself and skips only -1, so an
+    out-of-range block other than -1 is exercised as an in-forward checkpoint
+    block, which only the state-row store writes.
+    """
+
+    PAGES = 10
+    LEAD = 7  # guard blocks before the slab: ids -7 to -1
+    TRAIL = 4  # guard blocks after the slab: ids PAGES to PAGES + 3
+    SNAPSHOTS = (2, 3)  # published input states; every other block is stale
+    GROUP = "linear_attention"
+    RESUMED_PREFIX = 64
+
+    def setup_method(self):
+        from importlib.util import find_spec
+
+        # Only the optional packages may skip; a broken runtime import fails.
+        missing = [
+            name for name in ("torch", "tokenspeed_kernel") if not find_spec(name)
+        ]
+        if missing:
+            pytest.skip(f"needs {' + '.join(missing)}")
+        import torch
+
+        if not torch.cuda.is_available():
+            pytest.skip("needs a CUDA device")
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        self.torch = torch
+        self.ForwardMode = ForwardMode
+        torch.manual_seed(0)
+
+    def _gdn(self):
+        """GDN: (heads, make_backend(conv, ssm), per-token inputs, kwargs)."""
+        from tokenspeed_kernel.ops.attention.gdn import flashinfer as flashinfer_gdn
+        from tokenspeed_kernel.platform import ArchVersion, current_platform
+
+        from tokenspeed.runtime.layers.attention.backends.state.gdn import (
+            GdnAttnBackend,
+        )
+
+        torch = self.torch
+        heads = 16
+        # Of the GDN chunk-prefill kernels only FlashInfer's (NVIDIA SM90 to
+        # SM10.7 with CUDA 13) stores in-forward checkpoints; the Triton scan
+        # that runs elsewhere, e.g. on ROCm, does not.
+        platform = current_platform()
+        self.checkpoint_kernel_available = (
+            platform.is_nvidia
+            and ArchVersion(9, 0) <= platform.arch_version <= ArchVersion(10, 7)
+            and flashinfer_gdn.is_supported(128, torch.bfloat16, heads, heads)
+        )
+
+        def make(conv, ssm):
+            backend = GdnAttnBackend(
+                *_mamba_config_pair(torch, heads=heads, head_dim=128, device="cuda"),
+                writes_state_checkpoints_in_forward=True,
+                defer_recurrent_state=False,
+            )
+            backend.set_kv_pool(_ContractPool({0: (self.GROUP, conv, ssm)}))
+            backend.init_cuda_graph_state(max_bs=8)
+            return backend
+
+        def tokens(total):
+            a = torch.randn(total, heads, device="cuda")
+            return dict(
+                mixed_qkv=torch.randn(
+                    total, 3 * heads * 128, device="cuda", dtype=torch.bfloat16
+                ),
+                a=a,
+                b=torch.randn_like(a),
+            )
+
+        return (
+            heads,
+            make,
+            tokens,
+            dict(dt_bias=torch.randn(heads, device="cuda") * 0.1),
+        )
+
+    def _kda(self, solution):
+        """KDA: (heads, make_backend(conv, ssm), per-token inputs, kwargs)."""
+        if solution == "fla":
+            from importlib.util import find_spec
+
+            if find_spec("fla") is None:
+                pytest.skip("flash-linear-attention (fla) required")
+        else:
+            from tokenspeed_kernel.ops.attention.kda.cute_dsl import (
+                cutedsl_kda_supported,
+            )
+
+            if not cutedsl_kda_supported():
+                pytest.skip("requires the native CuteDSL KDA prefill package")
+        from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
+        from tokenspeed.runtime.layers.attention.backends.state.kda import (
+            KdaAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+        from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+        torch = self.torch
+        heads = 4
+        # Both KDA solutions store in-forward checkpoints once their
+        # prerequisites above pass.
+        self.checkpoint_kernel_available = True
+        spec = MHAConfig(
+            num_attention_heads=heads, num_kv_heads=heads, head_dim=128, attn_tp_size=1
+        )
+        config = AttnConfig(
+            device="cuda",
+            dtype=torch.bfloat16,
+            kv_cache_dtype=torch.bfloat16,
+            kv_cache_quant_method="none",
+            context_len=4096,
+            max_bs=8,
+            max_resident_requests=8,
+            is_draft=False,
+            speculative_num_draft_tokens=1,
+            components=(spec,),
+        )
+
+        def make(conv, ssm):
+            backend = KdaAttnBackend(
+                config, spec, enable_prefill_graph=False, kda_backend=solution
+            )
+            backend.set_kv_pool(_ContractPool({0: (self.GROUP, conv, ssm)}))
+            backend.bind_request_stop_flags(
+                torch.zeros(
+                    RequestSlotLayout(8).capacity, dtype=torch.bool, device="cuda"
+                ),
+                torch.zeros(8, dtype=torch.int32, device="cuda"),
+            )
+            backend.init_cuda_graph_state(max_bs=8)
+            # Serving allocates the request-slot records up front, so the
+            # prefill also folds them into the staged inputs.
+            backend.preallocate_verify_workspace(8, 1)
+            return backend
+
+        def tokens(total):
+            return dict(
+                mixed_qkv=torch.randn(
+                    total, 3 * heads * 128, device="cuda", dtype=torch.bfloat16
+                ),
+                g_raw=torch.randn(
+                    total, heads * 128, device="cuda", dtype=torch.bfloat16
+                )
+                * 0.5,
+                beta_raw=torch.randn(total, heads, device="cuda", dtype=torch.bfloat16),
+            )
+
+        kwargs = dict(
+            dt_bias=torch.randn(heads * 128, device="cuda") * 0.1,
+            a=None,
+            b=None,
+            lower_bound=-5.0,
+        )
+        return heads, make, tokens, kwargs
+
+    def _family(self, family):
+        """(heads, make_backend(conv, ssm), per-token inputs, fixed kwargs)."""
+        torch = self.torch
+        heads, make, tokens, fixed = (
+            self._gdn()
+            if family == "gdn"
+            else self._kda({"kda-fla": "fla", "kda-cutedsl": "cutedsl_kda"}[family])
+        )
+        channels = 3 * heads * 128
+        fixed.update(
+            conv_weights=torch.randn(channels, 4, device="cuda", dtype=torch.bfloat16)
+            * 0.1,
+            bias=torch.randn(channels, device="cuda", dtype=torch.bfloat16) * 0.1,
+            activation="silu",
+            key_dim=heads * 128,
+            value_dim=heads * 128,
+            attention_tp_size=1,
+            head_k_dim=128,
+            head_v_dim=128,
+            A_log=torch.randn(heads, device="cuda") * 0.1,
+            layer_id=0,
+        )
+        return heads, make, tokens, fixed
+
+    def _prefill(self, make, slabs, rows, prefix, lens, checkpoint, inputs, fixed):
+        """One EXTEND forward of ``rows`` (source, destination[, checkpoint]).
+
+        Returns the ``[tokens, -1]`` output and the recurrent inputs and
+        history flags the backend staged for the scan.
+        """
+        torch = self.torch
+        backend = make(*slabs)
+        # A platform without a kernel that stores in-forward checkpoints for
+        # this family has nothing to check. Where one runs, a backend that
+        # stops advertising them fails.
+        if (
+            checkpoint
+            and not self.checkpoint_kernel_available
+            and not backend.stores_in_forward_state_checkpoints
+        ):
+            pytest.skip("no chunk-prefill kernel stores in-forward checkpoints here")
+        assert not checkpoint or backend.stores_in_forward_state_checkpoints
+        bs = len(rows)
+        lens_cpu = torch.tensor(lens, dtype=torch.int32)
+        prefix_cpu = torch.tensor(prefix, dtype=torch.int32)
+        backend.init_forward_metadata(
+            bs=bs,
+            num_extends=bs,
+            req_pool_indices=torch.arange(1, bs + 1, dtype=torch.int32, device="cuda"),
+            seq_lens=(prefix_cpu + lens_cpu).cuda(),
+            forward_mode=self.ForwardMode.EXTEND,
+            block_tables={
+                self.GROUP: torch.tensor(rows, dtype=torch.int32, device="cuda")
+            },
+            extend_state_checkpoint_lens_cpu=(
+                torch.full((bs,), checkpoint, dtype=torch.int32) if checkpoint else None
+            ),
+            **_extend_kwargs(torch, lens_cpu, prefix_cpu, "cuda"),
+        )
+        # Pin the resolved blocks to the ids under test: the two-slot resolve
+        # falls back to the live block when the input slot is not positive.
+        metadata = backend.forward_metadata
+        for resolved, column in (
+            (metadata.state_in_blocks_by_group, 0),
+            (metadata.state_out_blocks_by_group, 1),
+        ):
+            resolved[self.GROUP].copy_(
+                torch.tensor([row[column] for row in rows], dtype=torch.int32)
+            )
+        staged = []
+        prepare = backend._prepare_prefill_state_inputs
+
+        def record_staging(*args, **kwargs):
+            result = prepare(*args, **kwargs)
+            staged.append(tuple(tensor.clone() for tensor in result))
+            return result
+
+        with patch.object(backend, "_prepare_prefill_state_inputs", record_staging):
+            out = backend.forward_extend(
+                None,
+                None,
+                None,
+                layer=None,
+                out_cache_loc=None,
+                token_to_kv_pool=backend.kv_pool,
+                bs=bs,
+                forward_mode=self.ForwardMode.EXTEND,
+                seq_len=sum(lens),
+                **{name: tensor.clone() for name, tensor in inputs.items()},
+                **fixed,
+            )
+        torch.cuda.synchronize()
+        ((recurrent, has_initial_state),) = staged
+        return out.reshape(sum(lens), -1), recurrent, has_initial_state
+
+    def _check(self, family, rows, lens, checkpoint=None):
+        torch = self.torch
+        pages, lead = self.PAGES, self.LEAD
+        heads, make, tokens, fixed = self._family(family)
+
+        def valid(block):
+            return 0 < block < pages
+
+        backings, plain = [], []
+        for shape, dtype in (
+            ((3 * heads * 128, 3), torch.bfloat16),
+            ((heads, 128, 128), torch.float32),
+        ):
+            backing = torch.empty(
+                lead + pages + self.TRAIL, *shape, device="cuda", dtype=dtype
+            )
+            _poison(torch, backing)
+            slab = torch.zeros(pages, *shape, device="cuda", dtype=dtype)
+            for block in self.SNAPSHOTS:
+                slab[block].normal_(0, 0.1)
+                backing[lead + block].copy_(slab[block])
+            backings.append(backing)
+            plain.append(slab)
+        before = [backing.clone() for backing in backings]
+        # What the runtime delivers instead: a row without history reads
+        # source 0 and a row without a live block is a padding row.
+        delivered = [
+            ((src if valid(src) else 0, dst) if valid(dst) else (-1, -1))
+            + tuple(block if valid(block) else -1 for block in ckpt)
+            for src, dst, *ckpt in rows
+        ]
+        prefix = [self.RESUMED_PREFIX if row[0] else 0 for row in rows]
+        inputs = tokens(sum(lens))
+        out, recurrent, has_initial_state = self._prefill(
+            make,
+            [backing[lead : lead + pages] for backing in backings],
+            rows,
+            prefix,
+            lens,
+            checkpoint,
+            inputs,
+            fixed,
+        )
+        expected_out, _, _ = self._prefill(
+            make, plain, delivered, prefix, lens, checkpoint, inputs, fixed
+        )
+
+        # Only an in-range source is read; any other starts from exact zeros.
+        assert has_initial_state.tolist() == [valid(row[0]) for row in rows]
+        for i, (src, *_) in enumerate(rows):
+            staged = (
+                before[1][lead + src].to(recurrent.dtype)
+                if valid(src)
+                else torch.zeros_like(recurrent[i])
+            )
+            assert _same_bytes(torch, recurrent[i], staged), f"row {i} input state"
+
+        bounds = [0, *torch.tensor(lens).cumsum(0).tolist()]
+        for i, (_, dst, *_) in enumerate(rows):
+            if valid(dst):
+                rows_out = slice(bounds[i], bounds[i + 1])
+                assert torch.isfinite(expected_out[rows_out].float()).all()
+                assert _same_bytes(
+                    torch, out[rows_out], expected_out[rows_out]
+                ), f"row {i} output"
+
+        # Only in-range destinations change, to exactly what the plain slab
+        # holds; the guards, the null block and every other block keep
+        # their bytes.
+        written = {block for _, *blocks in rows for block in blocks if valid(block)}
+        for backing, start, slab in zip(backings, before, plain, strict=True):
+            expected = start.clone()
+            for block in written:
+                expected[lead + block] = slab[block]
+            changed = (
+                (backing.view(torch.uint8) != expected.view(torch.uint8))
+                .flatten(1)
+                .any(1)
+            )
+            assert (
+                not changed.any()
+            ), f"blocks {(changed.nonzero().flatten() - lead).tolist()} differ"
+
+    def test_resumed_row_without_a_live_block_reads_its_source_only(self, family):
+        # A resumed request whose group has no live block this forward
+        # (source 3, destination -1), beside a cold and a resumed row.
+        self._check(family, rows=[(0, 4), (2, 5), (3, -1)], lens=[37, 29, 21])
+
+    def test_out_of_range_sources_start_from_the_zero_state(self, family):
+        pages = self.PAGES
+        self._check(
+            family,
+            rows=[(0, 4), (2, 5), (pages, 6), (pages + 3, 7), (-7, 8)],
+            lens=[37, 29, 21, 18, 26],
+        )
+
+    def test_out_of_range_checkpoint_blocks_store_nothing(self, family):
+        # Each row stores an in-forward checkpoint 64 tokens into its chunk;
+        # only the first row's checkpoint block is a page of the slab.
+        pages = self.PAGES
+        self._check(
+            family,
+            rows=[(0, 4, 9), (2, 5, 0), (0, 6, pages), (3, 7, pages + 3), (0, 8, -7)],
+            lens=[96, 80, 72, 100, 70],
+            checkpoint=64,
+        )
+
+
 class TestReplayStateTapeGPUTest:
     """Decode replay refresh over many state groups and more rows than one tape block."""
 

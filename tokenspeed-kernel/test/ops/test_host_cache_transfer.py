@@ -58,7 +58,9 @@ def host_transfer_contract():
     module = _load_host_transfer_contract_module()
     return SimpleNamespace(
         HostTransferGeometry=module.HostTransferGeometry,
+        HostTransferMode=module.HostTransferMode,
         HostTransferWorkspace=module.HostTransferWorkspace,
+        StagingBuffer=module.StagingBuffer,
         build_host_transfer_geometry=module.build_host_transfer_geometry,
         _triton_is_unavailable=module._triton_is_unavailable,
         _transfer_cache_ranges=module._transfer_cache_ranges,
@@ -1483,3 +1485,238 @@ def test_layered_h2d_reuses_workspaces_after_delayed_flag_reset():
         offset = generation * 16
         assert torch.equal(first.cpu(), host[offset : offset + 8])
         assert torch.equal(second.cpu(), host[offset + 8 : offset + 16])
+
+
+def test_staged_group_slices_merge_contiguous_fields_and_preserve_gaps(
+    host_transfer_contract,
+):
+    geometry = host_transfer_contract.build_host_transfer_geometry(
+        rows=(
+            # Group 0 layer 0: two contiguous fields [0, 40) and [40, 52)
+            (0, 0, 0, 128, 128, 0, 2, 40),
+            (0, 1, 0, 32, 128, 40, 2, 12),
+            # Group 0 layer 1: gap at [52, 80), then [80, 112)
+            (0, 0, 64, 128, 128, 80, 2, 32),
+            # Group 1 layer 1: [0, 64)
+            (1, 1, 0, 64, 64, 0, 1, 64),
+        ),
+        layer_slices=((0, 2), (2, 2)),
+        group_packing=(2, 1),
+        host_group_packing=(2, 1),
+        host_lcm_block_bytes=256,
+        num_host_lcm_blocks=2,
+        num_device_lcm_blocks=4,
+        num_device_buffers=2,
+    )
+
+    full = geometry.staged_group_slices(0, 4)
+    assert len(full) == 2
+    assert full[0].group_index == 0
+    assert full[0].span_base == 0
+    assert full[0].staged_block_bytes == 112
+    assert full[0].spans == ((0, 52), (80, 32))
+    assert full[0].word_aligned_geometry is True
+    assert full[0].buffer_indices == (0, 1)
+    assert full[1].group_index == 1
+    assert full[1].span_base == 0
+    assert full[1].staged_block_bytes == 64
+    assert full[1].spans == ((0, 64),)
+    assert full[1].word_aligned_geometry is True
+    assert full[1].buffer_indices == (1,)
+
+    layer0 = geometry.staged_group_slices(0, 2)
+    assert len(layer0) == 1
+    assert layer0[0].spans == ((0, 52),)
+    assert layer0[0].staged_block_bytes == 52
+
+    layer1 = geometry.staged_group_slices(2, 2)
+    assert len(layer1) == 2
+    assert layer1[0].span_base == 80
+    assert layer1[0].staged_block_bytes == 32
+    assert layer1[0].spans == ((80, 32),)
+
+
+def test_staging_buffer_reuses_and_grows_through_custom_allocator(
+    host_transfer_contract,
+):
+    alloc_calls = []
+
+    def allocator(nbytes: int, device: torch.device) -> torch.Tensor:
+        alloc_calls.append((nbytes, device))
+        return torch.empty(nbytes, dtype=torch.uint8, device=device)
+
+    staging = host_transfer_contract.StagingBuffer(
+        allocator=allocator, default_bytes=64
+    )
+    first = staging.acquire(16, torch.device("cpu"))
+    second = staging.acquire(64, torch.device("cpu"))
+    assert first.data_ptr() == second.data_ptr()
+    assert first.numel() == 64
+    assert alloc_calls == [(64, torch.device("cpu"))]
+
+    grown = staging.acquire(100, torch.device("cpu"))
+    assert grown.numel() == 100
+    assert alloc_calls == [(64, torch.device("cpu")), (100, torch.device("cpu"))]
+
+
+def test_staged_dma_round_trip_chunks_multi_group_and_preserves_gaps(monkeypatch):
+    module = _load_host_transfer_contract_module()
+    geometry = module.build_host_transfer_geometry(
+        rows=(
+            # Group 0: contiguous [0, 20) + [20, 29), then gap [29, 40), then [40, 53)
+            (0, 0, 7, 64, 64, 0, 2, 20),
+            (0, 1, 3, 32, 64, 20, 2, 9),
+            (0, 0, 32, 64, 64, 40, 2, 13),
+            # Group 1: [0, 37)
+            (1, 1, 5, 48, 48, 0, 1, 37),
+        ),
+        layer_slices=((0, 2), (2, 2)),
+        group_packing=(2, 1),
+        host_group_packing=(2, 1),
+        host_lcm_block_bytes=128,
+        num_host_lcm_blocks=3,
+        num_device_lcm_blocks=4,
+        num_device_buffers=2,
+    ).bind(torch.device("cpu"), non_blocking=False)
+
+    device_buffers = (
+        torch.arange(64 * 9, dtype=torch.int64).remainder(251).to(torch.uint8),
+        torch.arange(48 * 6, dtype=torch.int64).add(73).remainder(251).to(torch.uint8),
+    )
+    expected_device = tuple(buf.clone() for buf in device_buffers)
+    host = torch.full((128 * 3,), 0xCC, dtype=torch.uint8)
+
+    recorded_use_words: list[bool] = []
+
+    def fake_stage_kernel(
+        address_table,
+        geometry_table,
+        block_pairs,
+        staging_buffer,
+        direction,
+        *,
+        geometry_offset,
+        num_geometry_rows,
+        target_group,
+        chunk_start,
+        chunk_blocks,
+        span_base,
+        staged_block_bytes,
+        work_items,
+        use_words,
+        grid_cap,
+    ):
+        del address_table, work_items, grid_cap
+        recorded_use_words.append(use_words)
+        rows = geometry_table[
+            geometry_offset : geometry_offset + num_geometry_rows
+        ].tolist()
+        pairs = block_pairs[chunk_start : chunk_start + chunk_blocks].tolist()
+        for row in rows:
+            if int(row[0]) != target_group:
+                continue
+            buf_idx, dev_zero, dev_stride = int(row[1]), int(row[2]), int(row[3])
+            field_off, payload = int(row[5]), int(row[7])
+            dev_buf = device_buffers[buf_idx]
+            for local_idx, (dev_id, _host_id) in enumerate(pairs):
+                dev_off = dev_zero + int(dev_id) * dev_stride
+                stg_off = local_idx * staged_block_bytes + (field_off - span_base)
+                if direction == 0:
+                    staging_buffer[stg_off : stg_off + payload].copy_(
+                        dev_buf[dev_off : dev_off + payload]
+                    )
+                else:
+                    dev_buf[dev_off : dev_off + payload].copy_(
+                        staging_buffer[stg_off : stg_off + payload]
+                    )
+
+    monkeypatch.setattr(module, "_stage_cache_blocks_triton", fake_stage_kernel)
+
+    # Small staging floor (64B) forces multi-chunk iteration for 3 blocks of group 0.
+    workspace = module.HostTransferWorkspace()
+    workspace.bind_staging_buffer(module.StagingBuffer(default_bytes=64))
+    transfers = ((0, 1, 1), (0, 3, 2), (0, 6, 4), (1, 2, 3), (1, 4, 1))
+    num_blocks, _ = workspace.load_block_transfers(transfers, geometry=geometry)
+    block_rows, _ = workspace.commit_block_transfers(
+        num_blocks, torch.device("cpu"), non_blocking=False
+    )
+    workspace._address_table = torch.tensor(
+        [buf.data_ptr() for buf in device_buffers], dtype=torch.uint64
+    )
+
+    # Full-geometry D2H
+    module._transfer_staged_dma(
+        "d2h",
+        device_buffers,
+        host,
+        geometry,
+        workspace,
+        block_rows,
+        None,
+        num_blocks=num_blocks,
+        geometry_offset=0,
+        num_geometry_rows=4,
+        grid_cap=4,
+    )
+
+    expected_host = torch.full_like(host, 0xCC)
+    for buf_idx, dev_off, host_off, payload in module._make_block_ranges(
+        geometry,
+        workspace,
+        num_blocks=num_blocks,
+        geometry_offset=0,
+        num_geometry_rows=4,
+    ):
+        expected_host[host_off : host_off + payload] = expected_device[buf_idx][
+            dev_off : dev_off + payload
+        ]
+    assert torch.equal(host, expected_host)
+
+    # Layer-by-layer H2D restore into zeroed device buffers
+    for buf in device_buffers:
+        buf.fill_(0x5A)
+    for slice_offset, slice_rows in geometry.layer_slices:
+        module._transfer_staged_dma(
+            "h2d",
+            device_buffers,
+            host,
+            geometry,
+            workspace,
+            block_rows,
+            None,
+            num_blocks=num_blocks,
+            geometry_offset=slice_offset,
+            num_geometry_rows=slice_rows,
+            grid_cap=4,
+        )
+
+    expected_restored = tuple(torch.full_like(buf, 0x5A) for buf in expected_device)
+    for buf_idx, dev_off, host_off, payload in module._make_block_ranges(
+        geometry,
+        workspace,
+        num_blocks=num_blocks,
+        geometry_offset=0,
+        num_geometry_rows=4,
+    ):
+        expected_restored[buf_idx][dev_off : dev_off + payload] = expected_host[
+            host_off : host_off + payload
+        ]
+    for actual, wanted in zip(device_buffers, expected_restored, strict=True):
+        assert torch.equal(actual, wanted)
+    assert recorded_use_words
+    assert all(flag is False for flag in recorded_use_words)
+
+
+def test_host_transfer_mode_accepts_staged_dma_and_rejects_layer_ready(
+    host_transfer_contract,
+):
+    mode = host_transfer_contract.HostTransferMode("staged_dma", layer_ready=False)
+    assert mode.uses_device_tables is True
+    with pytest.raises(ValueError, match="layer_ready=True"):
+        host_transfer_contract.HostTransferMode("staged_dma", layer_ready=True)
+
+
+def test_workspace_staging_buffer_requires_explicit_binding(host_transfer_contract):
+    workspace = host_transfer_contract.HostTransferWorkspace()
+    with pytest.raises(RuntimeError, match="bind_staging_buffer"):
+        workspace.staging_buffer()

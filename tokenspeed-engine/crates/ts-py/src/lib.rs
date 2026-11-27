@@ -39,6 +39,10 @@
 
 mod bootstrap;
 mod l3;
+mod transfer_engine;
+
+#[cfg(test)]
+mod tests;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -62,6 +66,13 @@ create_exception!(
     EngineError,
     PyException,
     "The engines are unreachable or refused a submission."
+);
+
+create_exception!(
+    tokenspeed_engine._native,
+    RequestCancelled,
+    EngineError,
+    "The client cancelled this stream; engine resource retirement may still be in progress."
 );
 
 fn engine_error(error: impl std::fmt::Display) -> PyErr {
@@ -291,7 +302,8 @@ impl Frontend {
             .collect()
     }
 
-    /// This frontend's unfinished requests per engine, in index order.
+    /// This frontend's attached request streams per engine, in index order.
+    /// `abort` and `cancel` decrease this count when they detach a stream.
     fn in_flight(&self) -> Vec<usize> {
         self.client.in_flight()
     }
@@ -329,8 +341,8 @@ impl Frontend {
 
     /// Wait for outputs and return every one that arrived, oldest first: a
     /// `(rid, chunk)` per output, where the chunk is a dict, or an
-    /// `EngineError` for a stream the engines ended without a finished
-    /// output.
+    /// `EngineError` for a stream ended without a finished output.
+    /// The `cancel` method yields its subclass `RequestCancelled`.
     fn next_outputs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let receiver = self.receiver.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -346,12 +358,30 @@ impl Frontend {
         })
     }
 
-    /// Ask the engine to abort a request; its outputs then end with an
-    /// abort. Resolves to False if the request is not in flight.
+    /// Send an abort and close its local stream. `next_outputs` yields a
+    /// terminal chunk with `finish_reason` set to `"abort"` after any queued
+    /// outputs, or the terminal result if the stream already ended.
+    /// Resolves to True if the abort was sent or False if the request was
+    /// absent. Use a fresh request id for a subsequent submission.
     fn abort<'py>(&self, py: Python<'py>, rid: String) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             client.abort(&rid).await.map_err(engine_error)
+        })
+    }
+
+    /// Send an abort and close this client's stream. `next_outputs` yields
+    /// `(rid, RequestCancelled)` after any already queued outputs.
+    /// Resolves to True only if this call closed the stream; False if it
+    /// was absent or finished/closed concurrently. A failed or interrupted
+    /// send leaves the stream attached for retry unless it ended independently.
+    /// If cancellation completed before the awaitable was interrupted, its
+    /// result remains queued. This is not an engine/cache/transfer retirement fence.
+    /// Use a fresh request id for a subsequent submission.
+    fn cancel<'py>(&self, py: Python<'py>, rid: String) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.client.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            client.cancel(&rid).await.map_err(engine_error)
         })
     }
 
@@ -404,9 +434,12 @@ impl<'py> IntoPyObject<'py> for Deliveries {
         for (rid, item) in self.0 {
             let output = match item {
                 Ok(chunk) => chunk_dict(py, chunk)?.into_any(),
-                Err(error) => EngineError::new_err(error.to_string())
-                    .into_value(py)
-                    .into_bound_py_any(py)?,
+                Err(error) => match error {
+                    StreamError::Cancelled => RequestCancelled::new_err(error.to_string()),
+                    _ => EngineError::new_err(error.to_string()),
+                }
+                .into_value(py)
+                .into_bound_py_any(py)?,
             };
             list.append((rid, output))?;
         }
@@ -432,6 +465,13 @@ fn chunk_dict<'py>(py: Python<'py>, chunk: OutputChunk) -> PyResult<Bound<'py, P
             })
             .transpose()?,
     )?;
+    dict.set_item(
+        "request_timing",
+        chunk
+            .request_timing
+            .map(|timing| request_timing_dict(py, timing))
+            .transpose()?,
+    )?;
     dict.set_item("prompt_tokens", chunk.prompt_tokens)?;
     dict.set_item("completion_tokens", chunk.completion_tokens)?;
     dict.set_item("cached_tokens", chunk.cached_tokens)?;
@@ -446,6 +486,51 @@ fn chunk_dict<'py>(py: Python<'py>, chunk: OutputChunk) -> PyResult<Bound<'py, P
     dict.set_item("input_token_logprobs", chunk.input_token_logprobs)?;
     dict.set_item("input_top_logprobs", chunk.input_top_logprobs)?;
     dict.set_item("output_top_logprobs", chunk.output_top_logprobs)?;
+    Ok(dict)
+}
+
+fn request_timing_dict(
+    py: Python<'_>,
+    timing: ts_wire::RequestTiming,
+) -> PyResult<Bound<'_, PyDict>> {
+    fn timestamp(py: Python<'_>, stamp: ts_wire::RequestTimestamp) -> PyResult<Bound<'_, PyDict>> {
+        let dict = PyDict::new(py);
+        dict.set_item("ts_unix_ns", stamp.ts_unix_ns)?;
+        dict.set_item("ts_mono_ns", stamp.ts_mono_ns)?;
+        Ok(dict)
+    }
+
+    let clock = PyDict::new(py);
+    clock.set_item("host_id", timing.clock.host_id)?;
+    clock.set_item("process_instance_id", timing.clock.process_instance_id)?;
+    clock.set_item("clock_sync", timing.clock.clock_sync)?;
+    clock.set_item("clock_uncertainty_ns", timing.clock.clock_uncertainty_ns)?;
+    let events = PyDict::new(py);
+    events.set_item(
+        "accepted",
+        timing
+            .events
+            .accepted
+            .map(|stamp| timestamp(py, stamp))
+            .transpose()?,
+    )?;
+    events.set_item(
+        "kv_ready",
+        timing
+            .events
+            .kv_ready
+            .map(|stamp| timestamp(py, stamp))
+            .transpose()?,
+    )?;
+    events.set_item("finished", timestamp(py, timing.events.finished)?)?;
+    let dict = PyDict::new(py);
+    dict.set_item("role", timing.role)?;
+    dict.set_item("dp_rank", timing.dp_rank)?;
+    dict.set_item("tp_rank", timing.tp_rank)?;
+    dict.set_item("clock", clock)?;
+    dict.set_item("events", events)?;
+    dict.set_item("kv_output_tokens", timing.kv_output_tokens)?;
+    dict.set_item("e2e_latency_s", timing.e2e_latency_s)?;
     Ok(dict)
 }
 
@@ -481,9 +566,14 @@ fn value_to_py(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<bootstrap::BootstrapServer>()?;
     module.add_class::<l3::L3Executor>()?;
+    module.add_class::<transfer_engine::TransferEngine>()?;
     module.add_class::<FrontendListener>()?;
     module.add_class::<PendingFrontend>()?;
     module.add_class::<Frontend>()?;
     module.add("EngineError", module.py().get_type::<EngineError>())?;
+    module.add(
+        "RequestCancelled",
+        module.py().get_type::<RequestCancelled>(),
+    )?;
     Ok(())
 }

@@ -176,6 +176,7 @@ def _host_storage(monkeypatch) -> HostCacheStorage:
         return allocate(*args, **kwargs)
 
     monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
     field = lambda name, size: CacheField(name, 0, 0, size, size)
     layout = CacheTransferLayout(
         num_lcm_blocks=2,
@@ -201,6 +202,7 @@ def _host_storage(monkeypatch) -> HostCacheStorage:
         group_specs=specs,
         num_host_lcm_blocks=8,
         block_alignment=DIRECT_IO_ALIGNMENT,
+        align_host_buffer=True,
     )
 
 
@@ -273,6 +275,9 @@ def _disk_scheduler():
     Host tier and a Disk tier."""
     scheduler = ts.Scheduler(
         make_config(
+            prefix_cache_evict_policy="lru",
+            prefix_cache_gds_prefill_cost=None,
+            prefix_cache_gds_disk_block_costs=(),
             num_device_pages=9,
             max_scheduled_tokens=64,
             max_batch_size=8,
@@ -294,6 +299,7 @@ def _disk_scheduler():
             prefill_decode_interval=0,
             prefill_decode_min_interval=0,
             max_consecutive_prefill_rounds=0,
+            prefill_interval_min_decoding=0,
             cache_groups=[
                 ts.CacheGroupConfig(
                     group_id="full",
