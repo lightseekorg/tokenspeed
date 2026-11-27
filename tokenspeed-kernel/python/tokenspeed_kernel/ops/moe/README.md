@@ -985,6 +985,30 @@ python -m torch.distributed.run --standalone --nproc-per-node=2 -m pytest -q \
 ```
 
 
+## Fused BF16 sqrt-softplus router (`deep_gemm_bf16_mega_gate`)
+
+`moe_topk(..., score_function="sqrt_softplus", selection_method="topk", hidden_states=..., gate_weight=...)`
+prefers `deep_gemm_bf16_mega_gate` (`Priority.SPECIALIZED`) on SM100 GPUs when
+`hidden_states` and `gate_weight` are contiguous BF16 (`hidden % 256 == 0`,
+`experts` divisible by 4 up to 512, `top_k <= 32`, `renormalize=True`).
+It fuses the router GEMM, correction bias / multimodal `image_bias` +
+`image_token_mask` selection, normalized `sqrt(softplus(logit))` scoring, and
+optional static replica selection (`to_physical_map`, `logical_count`,
+`ep_rank`) into one launch.
+
+On the first uncaptured non-empty launch per CUDA stream, `bf16_mega_gate.py`
+wraps the call in the runtime workspace region registered via
+`set_mega_gate_workspace_region` so DeepGEMM's persistent per-stream barrier
+buffer lands in the CPU-backed `workspace` pool instead of pinning an ordinary
+torch CUDA segment. Callers with a fused MegaMoE shared expert can supply
+`out=(topk_weights, topk_idx)` (FP32 / INT64 views into `symm_buffer`) and pair
+them with direct `try_mhc_shifted_post_pre_norm_quantize_fp8` targets from
+`moe_prepare_mega_moe_staging_buffers`: `deep_gemm_mxfp4_mega_moe_apply` skips
+`stage_mxfp4_mega_moe_inputs` completely when both pre-staged activations and
+routing buffers are supplied, or runs `stage_mega_moe_routing_inputs` alone when
+only activations were pre-staged.
+
+
 ## Router projection with NVFP4 input
 
 `try_router_gemm_nvfp4` produces BF16 router logits and the packed E2M1 / linear

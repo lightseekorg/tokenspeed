@@ -158,6 +158,10 @@ def deep_gemm_mhc_shifted_post_pre_norm_quantize_fp8(
     sinkhorn_iters,
     norm_weight,
     norm_eps,
+    y_fp8_out=None,
+    y_routed_sf_out=None,
+    y_shared_sf_out=None,
+    shared_sf_block_m=0,
 ):
     from tokenspeed_kernel.thirdparty.cuda.mega_mhc import (
         shifted_post_pre_norm_quantize_fp8,
@@ -177,6 +181,10 @@ def deep_gemm_mhc_shifted_post_pre_norm_quantize_fp8(
         sinkhorn_iters,
         norm_weight,
         norm_eps,
+        y_fp8_out=y_fp8_out,
+        y_routed_sf_out=y_routed_sf_out,
+        y_shared_sf_out=y_shared_sf_out,
+        shared_sf_block_m=shared_sf_block_m,
     )
 
 

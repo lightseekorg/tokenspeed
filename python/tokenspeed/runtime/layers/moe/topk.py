@@ -141,7 +141,11 @@ class ExpertLocationDispatchInfo:
             load=(
                 LayerExpertLoad(
                     expert_location_metadata.physical_load[layer_id],
-                    expert_location_metadata.load_rows,
+                    (
+                        expert_location_metadata.load_rows.local_view()
+                        if all_to_all_ep
+                        else expert_location_metadata.load_rows
+                    ),
                 )
                 if expert_location_metadata.physical_load is not None
                 else None

@@ -31,6 +31,9 @@ from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import (
     moe_prepare_input_buffers as kernel_moe_prepare_input_buffers,
 )
+from tokenspeed_kernel.ops.moe import (
+    moe_prepare_mega_moe_staging_buffers as kernel_moe_prepare_mega_moe_staging_buffers,
+)
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from tokenspeed_kernel.ops.moe.flashinfer import (
     TRTLLM_NVFP4_ISPP_ALIGNMENT,
@@ -741,6 +744,12 @@ class MoELayer(torch.nn.Module):
                     self.plan, self
                 )
         return self._input_buffer_factory(num_tokens, max_tokens)
+
+    def mega_moe_staging_buffers(self, num_tokens: int) -> object | None:
+        """Direct symmetric-buffer targets for upstream producers, or None."""
+        if not self._weights_processed:
+            return None
+        return kernel_moe_prepare_mega_moe_staging_buffers(self.plan, self, num_tokens)
 
     @property
     def support_routing(self) -> bool:

@@ -865,6 +865,11 @@ def try_mhc_shifted_post_pre_norm_quantize_fp8(
     sinkhorn_iters: int,
     norm_weight: _torch.Tensor,
     norm_eps: float,
+    *,
+    y_fp8_out: _torch.Tensor | None = None,
+    y_routed_sf_out: _torch.Tensor | None = None,
+    y_shared_sf_out: _torch.Tensor | None = None,
+    shared_sf_block_m: int = 0,
 ) -> (
     tuple[
         _torch.Tensor,
@@ -882,9 +887,11 @@ def try_mhc_shifted_post_pre_norm_quantize_fp8(
     Takes the same arguments and has the same contract. Returns the five
     outputs of ``try_mhc_shifted_post_pre_norm`` followed by the input's E4M3
     codes ``[T,H]`` and int32 packed group-32 UE8M0 scales ``[T,H/128]``,
-    strided ``(1, T padded to 4)`` as ``fp8_projection`` reads them; or None
-    for unsupported inputs. H must also be a multiple of 128 (always true
-    given the multiple of 1024).
+    strided ``(1, T padded to 4)`` as ``fp8_projection`` reads them (or written
+    into caller-supplied MegaMoE symmetric-buffer ``y_fp8_out``,
+    ``y_routed_sf_out``, and ``y_shared_sf_out`` for ``shared_sf_block_m``);
+    or None for unsupported inputs. H must also be a multiple of 128 (always
+    true given the multiple of 1024).
     """
     from tokenspeed_kernel.ops.residual.deep_gemm import mega_mhc_eligible
 
@@ -892,6 +899,43 @@ def try_mhc_shifted_post_pre_norm_quantize_fp8(
         x, residual, pre, post, comb, weight, scale, base, sinkhorn_iters, norm_weight
     ):
         return None
+    has_direct_targets = any(
+        t is not None for t in (y_fp8_out, y_routed_sf_out, y_shared_sf_out)
+    )
+    if has_direct_targets:
+        tokens, hidden = x.shape
+        min_shared_rows = (
+            ((tokens + shared_sf_block_m - 1) // shared_sf_block_m)
+            * ((shared_sf_block_m + 127) // 128 * 128)
+            if shared_sf_block_m > 0
+            else 0
+        )
+        if (
+            y_fp8_out is None
+            or y_routed_sf_out is None
+            or y_shared_sf_out is None
+            or shared_sf_block_m <= 0
+            or y_fp8_out.shape != (tokens, hidden)
+            or y_fp8_out.dtype != _torch.float8_e4m3fn
+            or not y_fp8_out.is_contiguous()
+            or y_fp8_out.device != x.device
+            or y_routed_sf_out.shape != (tokens, hidden // 128)
+            or y_routed_sf_out.dtype != _torch.int32
+            or not y_routed_sf_out.is_contiguous()
+            or y_routed_sf_out.device != x.device
+            or y_shared_sf_out.shape != (tokens, hidden // 128)
+            or y_shared_sf_out.dtype != _torch.int32
+            or y_shared_sf_out.stride(0) != 1
+            or y_shared_sf_out.stride(1) < min_shared_rows
+            or y_shared_sf_out.device != x.device
+        ):
+            raise ValueError(
+                "Invalid MegaMoE FP8 destination targets for shifted mHC quantization"
+            )
+    elif shared_sf_block_m != 0:
+        raise ValueError(
+            "shared_sf_block_m must be zero unless direct MegaMoE targets are given"
+        )
     try:
         kernel = select_kernel(
             "residual",
@@ -903,6 +947,16 @@ def try_mhc_shifted_post_pre_norm_quantize_fp8(
         )
     except NoKernelFoundError:
         return None
+    kwargs = (
+        {
+            "y_fp8_out": y_fp8_out,
+            "y_routed_sf_out": y_routed_sf_out,
+            "y_shared_sf_out": y_shared_sf_out,
+            "shared_sf_block_m": shared_sf_block_m,
+        }
+        if has_direct_targets
+        else {}
+    )
     return kernel(
         x,
         residual,
@@ -917,6 +971,7 @@ def try_mhc_shifted_post_pre_norm_quantize_fp8(
         sinkhorn_iters,
         norm_weight,
         norm_eps,
+        **kwargs,
     )
 
 

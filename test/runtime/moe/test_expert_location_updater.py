@@ -312,3 +312,19 @@ def _worker(rank, rendezvous):
 
 def test_four_gloo_ranks_apply_the_plan_with_batch_isend_irecv(tmp_path):
     mp.spawn(_worker, args=((tmp_path / "rendezvous").as_uri(),), nprocs=4, join=True)
+
+
+def test_all_to_all_ep_detects_mega_moe_layers():
+    from tokenspeed.runtime.layers.moe.expert import MoELayer
+    from tokenspeed.runtime.moe.expert_location_updater import _all_to_all_ep
+
+    layer = MoELayer.__new__(MoELayer)
+    torch.nn.Module.__init__(layer)
+    layer.plan = {"solution": "mega_moe", "supports_all_to_all_ep": False}
+    model = torch.nn.ModuleList([layer])
+    assert _all_to_all_ep(model) is True
+
+    other = MoELayer.__new__(MoELayer)
+    torch.nn.Module.__init__(other)
+    other.plan = {"solution": "flashinfer_trtllm", "supports_all_to_all_ep": False}
+    assert _all_to_all_ep(torch.nn.ModuleList([other])) is False

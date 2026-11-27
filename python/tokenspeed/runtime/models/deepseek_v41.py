@@ -73,6 +73,7 @@ from collections import Counter
 from collections.abc import Iterable
 from copy import copy
 from dataclasses import dataclass, replace
+from typing import ClassVar
 from weakref import WeakValueDictionary
 
 import torch
@@ -163,7 +164,11 @@ from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
-from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
+from tokenspeed.runtime.layers.moe.topk import (
+    StandardTopKOutput,
+    record_expert_load,
+    topk_ids_logical_to_physical,
+)
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
 from tokenspeed.runtime.layers.paged_attention import QueryShardGather
 from tokenspeed.runtime.layers.parameter import ModelWeightParameter
@@ -193,7 +198,10 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
-from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
+from tokenspeed.runtime.moe.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
@@ -202,7 +210,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalForwardContext,
 )
-from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils import LazyValue, add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -1901,15 +1909,63 @@ class DeepseekV41MoE(DeepseekV4MoE):
         logits = F.linear(hidden_states.float(), self.gate.weight.float())
         return logits, bias, None, None
 
-    def _compute_topk_output(self, hidden_states, image_mask):
+    def _fused_router_call_kwargs(self, image_mask):
         gate, config = self.gate, self.topk.topk_config
+        info = self.expert_dispatch_info
         if (
-            hidden_states.is_cuda
-            and (gate.bias_vl is None or image_mask is None)
-            and gate.tid2eid is None
-            and not self.topk.simulate_routing
-            and self.experts.supports_precomputed_topk
+            not gate.weight.is_cuda
+            or config.router_topk != "fused"
+            or gate.tid2eid is not None
+            or self.topk.simulate_routing
+            or not self.experts.supports_precomputed_topk
+            or (info is not None and info.ep_dispatch_algorithm == "fake")
         ):
+            return None
+        image_bias = gate.bias_vl if image_mask is not None else None
+        image_token_mask = image_mask if image_bias is not None else None
+        mapped_in_kernel = (
+            info is not None
+            and info.ep_dispatch_algorithm == "static"
+            and info.partial_logical_to_rank_dispatch_physical_map is not None
+        )
+        kwargs = {
+            "correction_bias": gate.e_score_correction_bias,
+            "topk_weights_dtype": self.topk.weights_dtype,
+            "hidden_states": None,
+            "gate_weight": gate.weight,
+        }
+        if image_bias is not None:
+            kwargs["image_bias"] = image_bias
+            kwargs["image_token_mask"] = image_token_mask
+        if mapped_in_kernel:
+            kwargs["logical_to_physical_map"] = info.partial_logical_to_all_physical_map
+            kwargs["logical_replica_counts"] = (
+                info.partial_logical_to_all_physical_map_num_valid
+            )
+            kwargs["ep_rank"] = self.topk.ep_rank
+        return kwargs, mapped_in_kernel
+
+    def _compute_topk_output(self, hidden_states, image_mask, routing_out=None):
+        config = self.topk.topk_config
+        info = self.expert_dispatch_info
+        plan = (
+            self._fused_router_call_kwargs(image_mask)
+            if hidden_states.is_cuda
+            else None
+        )
+        if plan is not None:
+            kwargs, mapped_in_kernel = plan
+            kwargs["hidden_states"] = hidden_states
+            # Only write directly into pre-staged buffers when bf16_mega_gate
+            # already emits final physical IDs (avoiding remapping copies).
+            direct_out = (
+                routing_out
+                if routing_out is not None and (info is None or mapped_in_kernel)
+                else None
+            )
+            if direct_out is not None:
+                kwargs["out"] = direct_out
+                kwargs["topk_indices_dtype"] = direct_out[1].dtype
             # moe_topk fuses the router GEMM when a kernel supports it.
             try:
                 topk_weights, topk_ids = moe_topk(
@@ -1919,16 +1975,63 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     "topk",
                     config.renormalize,
                     config.routed_scaling_factor,
-                    correction_bias=gate.e_score_correction_bias,
-                    topk_weights_dtype=self.topk.weights_dtype,
-                    hidden_states=hidden_states,
-                    gate_weight=gate.weight,
+                    **kwargs,
                 )
             except NoKernelFoundError:
                 pass
             else:
+                if not mapped_in_kernel:
+                    topk_ids = topk_ids_logical_to_physical(
+                        topk_ids,
+                        info,
+                        num_experts=self.gate.weight.shape[0],
+                    )
+                record_expert_load(None if info is None else info.load, topk_ids)
                 return StandardTopKOutput(topk_weights, topk_ids, None)
         return super()._compute_topk_output(hidden_states, image_mask)
+
+    def warmup_router(self, max_tokens: int) -> None:
+        """Warm up SM100 fused router variants before CUDA graph capture."""
+        if max_tokens <= 0 or self._fused_router_call_kwargs(None) is None:
+            return
+        gate_weight = self.gate.weight
+        device = gate_weight.device
+        token_counts = sorted(
+            {
+                min(count, max_tokens)
+                for count in (1, 16, 32, 64, 128, 256, 512, max_tokens)
+            }
+        )
+        image_modes = (False,) if self.gate.bias_vl is None else (False, True)
+        for include_image_bias in image_modes:
+            for tokens in token_counts:
+                hidden = torch.zeros(
+                    (tokens, gate_weight.shape[1]),
+                    dtype=gate_weight.dtype,
+                    device=device,
+                )
+                image_mask = (
+                    torch.zeros(tokens, dtype=torch.bool, device=device)
+                    if include_image_bias
+                    else None
+                )
+                plan = self._fused_router_call_kwargs(image_mask)
+                if plan is None:
+                    return
+                kwargs, _ = plan
+                kwargs["hidden_states"] = hidden
+                try:
+                    moe_topk(
+                        None,
+                        self.topk.topk_config.top_k,
+                        "sqrt_softplus",
+                        "topk",
+                        self.topk.topk_config.renormalize,
+                        self.topk.topk_config.routed_scaling_factor,
+                        **kwargs,
+                    )
+                except NoKernelFoundError:
+                    return
 
 
 @dataclass(frozen=True)
@@ -1966,6 +2069,7 @@ def _v41_hc_post_pre(
     sinkhorn_iters: int,
     prefer_overlap: bool,
     quantize_fp8: bool,
+    fp8_staging=None,
 ):
     """Prepare a consumer with its own weights at either sublayer boundary.
 
@@ -1991,28 +2095,55 @@ def _v41_hc_post_pre(
         return residual, x, None, None
     # DeepGEMM mega_mhc split barriers race under CUDA graph replay: a replay can
     # read the previous replay's partials, so keep it out of captured segments.
-    if not prefer_overlap and not is_breakable_capture_active():
-        join = (
-            try_mhc_shifted_post_pre_norm_quantize_fp8
-            if quantize_fp8
-            else try_mhc_shifted_post_pre_norm
-        )
-        shifted = join(
-            pending.x,
-            residual,
-            pre_mix,
-            pending.post,
-            pending.comb,
-            *hc_weights,
-            hc_norm_eps,
-            hc_eps,
-            sinkhorn_iters,
-            norm.weight,
-            norm.variance_epsilon,
-        )
-        if shifted is not None:
-            residual, x, pre, post, comb, *quantized = shifted
-            return residual, x, (pre, post, comb), tuple(quantized) or None
+    if (
+        not prefer_overlap
+        and not is_breakable_capture_active()
+        and not (residual.is_cuda and torch.cuda.is_current_stream_capturing())
+    ):
+        if quantize_fp8 and fp8_staging is not None:
+            x_fp8, x_sf, shared_x_sf = fp8_staging.x_quantized
+            shifted = try_mhc_shifted_post_pre_norm_quantize_fp8(
+                pending.x,
+                residual,
+                pre_mix,
+                pending.post,
+                pending.comb,
+                *hc_weights,
+                hc_norm_eps,
+                hc_eps,
+                sinkhorn_iters,
+                norm.weight,
+                norm.variance_epsilon,
+                y_fp8_out=x_fp8,
+                y_routed_sf_out=x_sf,
+                y_shared_sf_out=shared_x_sf,
+                shared_sf_block_m=fp8_staging.shared_block_m,
+            )
+            if shifted is not None:
+                residual, x, pre, post, comb, *_ = shifted
+                return residual, x, (pre, post, comb), fp8_staging.x_quantized
+        else:
+            join = (
+                try_mhc_shifted_post_pre_norm_quantize_fp8
+                if quantize_fp8
+                else try_mhc_shifted_post_pre_norm
+            )
+            shifted = join(
+                pending.x,
+                residual,
+                pre_mix,
+                pending.post,
+                pending.comb,
+                *hc_weights,
+                hc_norm_eps,
+                hc_eps,
+                sinkhorn_iters,
+                norm.weight,
+                norm.variance_epsilon,
+            )
+            if shifted is not None:
+                residual, x, pre, post, comb, *quantized = shifted
+                return residual, x, (pre, post, comb), tuple(quantized) or None
     return pending.finish(residual), None, None, None
 
 
@@ -2247,7 +2378,17 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-        residual, x, ffn_mixes, _ = _v41_hc_post_pre(
+        can_mega_mhc_ffn = (
+            not (decode_hc and can_overlap)
+            and not is_breakable_capture_active()
+            and not (residual.is_cuda and torch.cuda.is_current_stream_capturing())
+        )
+        ffn_staging = (
+            self.ffn.mega_moe_staging_buffers(residual.shape[0])
+            if can_mega_mhc_ffn and isinstance(self.ffn, DeepseekV4MoE)
+            else None
+        )
+        residual, x, ffn_mixes, ffn_quantized = _v41_hc_post_pre(
             residual,
             attn_pre,
             V41HCPost(
@@ -2262,7 +2403,8 @@ class DeepseekV41DecoderLayer(nn.Module):
             hc_eps=self.hc_eps,
             sinkhorn_iters=self.hc_sinkhorn_iters,
             prefer_overlap=decode_hc and can_overlap,
-            quantize_fp8=False,
+            quantize_fp8=ffn_staging is not None,
+            fp8_staging=ffn_staging,
         )
         if x is None:
             x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
@@ -2300,7 +2442,13 @@ class DeepseekV41DecoderLayer(nn.Module):
                         self.hc_eps,
                         self.hc_sinkhorn_iters,
                     )
-            x = self._forward_ffn(x, image_mask, ctx, defer_reduce=defer_moe)
+            x = self._forward_ffn(
+                x,
+                image_mask,
+                ctx,
+                defer_reduce=defer_moe,
+                staging=ffn_staging if ffn_quantized is not None else None,
+            )
             ffn_pre, post, comb = ffn_mixes
             if ffn_overlap:
                 for tensor in (ffn_pre, post, comb):
@@ -2330,7 +2478,9 @@ class DeepseekV41DecoderLayer(nn.Module):
             collective_global_num_tokens=None,
         )
 
-    def _forward_ffn(self, x, image_mask, ctx, *, defer_reduce: bool):
+    def _forward_ffn(
+        self, x, image_mask, ctx, *, defer_reduce: bool, staging: object | None = None
+    ):
         """MoE output after its communication.
 
         With defer_reduce, the pending plain all-reduce over the MoE TPxEP
@@ -2345,6 +2495,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                     "Expert-owned communication cannot defer its reduction"
                 )
             counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
+            extra = {"staging": staging} if staging is not None else {}
             return self.ffn(
                 x,
                 image_mask,
@@ -2352,7 +2503,10 @@ class DeepseekV41DecoderLayer(nn.Module):
                 max(counts),
                 ctx=ctx if self.ffn.use_mega_moe else None,
                 comm_manager=self.comm_manager if self.ffn.use_mega_moe else None,
+                **extra,
             )
+        if staging is not None:
+            raise ValueError("Pre-staged MoE inputs require owns_ep_communication")
         # DP ranks may mix image and text rows. Carry the routing mask in
         # the same gather as the activations; keep the wire width 16B aligned.
         gather_mask = (
@@ -2564,6 +2718,7 @@ class DeepseekV41Model(nn.Module):
         ):
             raise ValueError("V4.1 layer count and compression ratios disagree")
         self.config, self.mapping = config, mapping
+        self.expert_placement = get_global_expert_location_metadata()
         self.pp_start_layer, self.pp_end_layer = 0, config.num_hidden_layers
         self.engram_hash = None
         self.dspark_capture_layers = ()
@@ -3186,6 +3341,24 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     model_cls = DeepseekV41Model
     logits_processor_cls = _DeepseekV41LogitsProcessor
+    supports_expert_placement: ClassVar[bool] = True
+
+    def post_init(self) -> None:
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: (
+                {}
+                if self.model is None
+                else {
+                    layer_id: layer.ffn.get_moe_routed_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if isinstance(layer.ffn, DeepseekV4MoE)
+                }
+            )
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     def __init__(
         self,
@@ -3379,11 +3552,22 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     "weight_scale",
                 ):
                     raise ValueError(f"Unsupported V4.1 expert parameter: {name}")
-                count = self.model.config.n_routed_experts // self.mapping.moe.ep_size
-                for expert in range(
-                    self.mapping.moe.ep_rank * count,
-                    (self.mapping.moe.ep_rank + 1) * count,
-                ):
+                layer_match = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix)
+                if layer_match is None:
+                    raise ValueError(f"Unsupported V4.1 expert parameter: {name}")
+                layer_id = int(layer_match[1])
+                placement = self.model.expert_placement
+                if placement is not None:
+                    local_experts = placement.local_slot_logical_experts(
+                        layer_id, self.mapping.moe.ep_rank
+                    )
+                else:
+                    count = (
+                        self.model.config.n_routed_experts // self.mapping.moe.ep_size
+                    )
+                    start = self.mapping.moe.ep_rank * count
+                    local_experts = range(start, start + count)
+                for expert in local_experts:
                     for shard in ("w1", "w3") if projection == "w13" else ("w2",):
                         field = "scale" if suffix == "weight_scale" else "weight"
                         targets[f"{prefix}.experts.{expert}.{shard}.{field}"] = (
@@ -3519,6 +3703,24 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         params = dict(self.named_parameters())
         targets = self._checkpoint_targets()
         config = self.model.config
+        placement = self.model.expert_placement
+        num_physical_experts = (
+            placement.num_physical_experts
+            if placement is not None
+            else config.n_routed_experts
+        )
+        local_logical_by_layer = (
+            [
+                set(
+                    placement.local_slot_logical_experts(
+                        layer_id, self.mapping.moe.ep_rank
+                    )
+                )
+                for layer_id in range(config.num_hidden_layers)
+            ]
+            if placement is not None
+            else None
+        )
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params,
             expert_schema=ExpertCheckpointSchema(
@@ -3529,13 +3731,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 extra_names={},
             ),
             fused_schema=None,
-            num_experts=config.n_routed_experts,
+            num_experts=num_physical_experts,
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             fused_gate_up_as_w13=False,
             include_bias=False,
             fused_load_style="per_expert",
             transpose_local_tensor_non_bias=False,
+            expert_placement=placement,
         )
         seen, loaded = set(), set()
         skipped = Counter()
@@ -3578,8 +3781,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     raise TypeError(
                         f"{raw_name}: expected packed FP4/E8M0, got {tensor.dtype}"
                     )
-                local_count = config.n_routed_experts // self.mapping.moe.ep_size
-                if expert_id // local_count != self.mapping.moe.ep_rank:
+                if local_logical_by_layer is not None:
+                    is_local = expert_id in local_logical_by_layer[layer_id]
+                else:
+                    local_count = config.n_routed_experts // self.mapping.moe.ep_size
+                    is_local = expert_id // local_count == self.mapping.moe.ep_rank
+                if not is_local:
                     skipped["remote_expert"] += 1
                     continue
                 if name not in targets:
@@ -3759,11 +3966,31 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             for module in self.modules()
             if isinstance(module, DeepseekV41Attention)
         ]
+        max_tokens = _max_forward_tokens()
         if attentions:
-            _warmup_query_projections(attentions, _max_forward_tokens())
+            _warmup_query_projections(attentions, max_tokens)
+        warmed_routers = set()
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()
+                if isinstance(module, DeepseekV41MoE) and module.gate.weight.is_cuda:
+                    info = module.expert_dispatch_info
+                    has_placement = (
+                        info is not None
+                        and info.ep_dispatch_algorithm == "static"
+                        and info.partial_logical_to_rank_dispatch_physical_map
+                        is not None
+                    )
+                    router_key = (
+                        module.gate.weight.device,
+                        tuple(module.gate.weight.shape),
+                        module.gate.e_score_correction_bias is not None,
+                        module.gate.bias_vl is not None,
+                        has_placement,
+                    )
+                    if router_key not in warmed_routers:
+                        module.warmup_router(max_tokens)
+                        warmed_routers.add(router_key)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
