@@ -211,13 +211,13 @@ def relay_environment(tmp_path):
     return launcher, env
 
 
-def run_launcher(relay_environment, mode):
-    launcher, env = relay_environment
+def _run_relay_subprocess(command, *, env, cwd=None):
     record = Path(env["RELAY_RECORD"])
     record.touch()
     try:
         result = subprocess.run(
-            [sys.executable, str(launcher), mode],
+            command,
+            cwd=cwd,
             env=env,
             capture_output=True,
             text=True,
@@ -236,6 +236,11 @@ def run_launcher(relay_environment, mode):
             os.kill(pid, signal.SIGKILL)
     assert not survivors, f"relay processes survived launcher shutdown: {survivors}"
     return result, events
+
+
+def run_launcher(relay_environment, mode):
+    launcher, env = relay_environment
+    return _run_relay_subprocess([sys.executable, str(launcher), mode], env=env)
 
 
 @pytest.mark.parametrize("override", [False, True])
@@ -288,18 +293,8 @@ def test_metrics_relay_kills_child_when_sink_exceeds_shutdown_budget(
     assert len([event for event in events if event["kind"] == "event"]) == 1
 
 
-@pytest.mark.parametrize("with_pythonpath", [False, True])
-def test_metrics_relay_inherits_runtime_sys_path(tmp_path, with_pythonpath):
-    """Plugins added to ``sys.path`` after startup remain importable in the relay."""
-    plugin_dir = tmp_path / "runtime_plugins"
+def _write_runtime_path_plugin(plugin_dir: Path) -> None:
     plugin_dir.mkdir()
-    cwd_dir = tmp_path / "cwd"
-    cwd_dir.mkdir()
-    # Pin python -P: without -P, python -c prepends cwd before restoring
-    # sys.path and picks up this decoy during the bootstrap stdlib import.
-    (cwd_dir / "multiprocessing.py").write_text(
-        'raise RuntimeError("working directory shadowed stdlib multiprocessing")\n'
-    )
     (plugin_dir / "runtime_path_probe.py").write_text(textwrap.dedent(r"""
         import json
         import os
@@ -346,11 +341,8 @@ def test_metrics_relay_inherits_runtime_sys_path(tmp_path, with_pythonpath):
         "[tokenspeed.plugins]\nruntime-path-probe = runtime_path_probe:register\n"
     )
 
-    python_source = Path(__file__).resolve().parents[2] / "python"
-    runtime_paths = (
-        [str(plugin_dir)] if with_pythonpath else [str(plugin_dir), str(python_source)]
-    )
-    launcher = tmp_path / "runtime_path_launcher.py"
+
+def _write_runtime_path_launcher(launcher: Path, runtime_paths: list[str]) -> None:
     launcher.write_text(textwrap.dedent(f"""
         import os
         import sys
@@ -401,38 +393,39 @@ def test_metrics_relay_inherits_runtime_sys_path(tmp_path, with_pythonpath):
             relay.close(timeout=2.0)
     """))
 
+
+@pytest.mark.parametrize("with_pythonpath", [False, True])
+def test_metrics_relay_inherits_runtime_sys_path(tmp_path, with_pythonpath):
+    """Plugins added to ``sys.path`` after startup remain importable in the relay."""
+    plugin_dir = tmp_path / "runtime_plugins"
+    _write_runtime_path_plugin(plugin_dir)
+    cwd_dir = tmp_path / "cwd"
+    cwd_dir.mkdir()
+    # Pin python -P: without -P, python -c prepends cwd before restoring
+    # sys.path and picks up this decoy during the bootstrap stdlib import.
+    (cwd_dir / "multiprocessing.py").write_text(
+        'raise RuntimeError("working directory shadowed stdlib multiprocessing")\n'
+    )
+
+    python_source = Path(__file__).resolve().parents[2] / "python"
+    runtime_paths = (
+        [str(plugin_dir)] if with_pythonpath else [str(plugin_dir), str(python_source)]
+    )
+    launcher = tmp_path / "runtime_path_launcher.py"
+    _write_runtime_path_launcher(launcher, runtime_paths)
+
     env = os.environ.copy()
     if with_pythonpath:
         env["PYTHONPATH"] = str(python_source)
     else:
         env.pop("PYTHONPATH", None)
     env.pop("TOKENSPEED_DISABLE_PLUGINS", None)
-    record_file = tmp_path / "record.jsonl"
-    record_file.touch()
-    env["RELAY_RECORD"] = str(record_file)
+    env["RELAY_RECORD"] = str(tmp_path / "record.jsonl")
     env["RELAY_RECEIVED"] = str(tmp_path / "received")
 
-    try:
-        result = subprocess.run(
-            [sys.executable, str(launcher)],
-            cwd=cwd_dir,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=45,
-        )
-    finally:
-        events = [json.loads(line) for line in record_file.read_text().splitlines()]
-        child_pids = {event["pid"] for event in events if event["kind"] == "sink"}
-        survivors = []
-        for pid in child_pids:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                continue
-            survivors.append(pid)
-            os.kill(pid, signal.SIGKILL)
-    assert not survivors, f"relay processes survived launcher shutdown: {survivors}"
+    result, events = _run_relay_subprocess(
+        [sys.executable, str(launcher)], env=env, cwd=cwd_dir
+    )
     assert result.returncode == 0, result.stderr
     (sink,) = [event for event in events if event["kind"] == "sink"]
     assert sink["heavy"] == []
