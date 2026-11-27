@@ -213,7 +213,7 @@ protected:
     }
 
     void Prompt(const std::string& id, std::int32_t tokens, std::int32_t first, const std::string& holder) {
-        Submit(RequestSpec{.request_id = id, .tokens = MakeTokens(tokens, first), .peer_holder = holder});
+        Submit(RequestSpec{.request_id = id, .peer_holder = holder, .tokens = MakeTokens(tokens, first)});
         ExecutionEvent event;
         event.With(pd::BootstrappedEvent{id});
         scheduler_->Advance(std::move(event));
