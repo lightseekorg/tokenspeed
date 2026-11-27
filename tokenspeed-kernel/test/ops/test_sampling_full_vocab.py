@@ -20,8 +20,6 @@
 
 """Bit-pattern regression for the configured full-vocabulary logprob form."""
 
-import math
-
 import pytest
 import torch
 from tokenspeed_kernel.ops.sampling import FullVocabTopK
@@ -50,27 +48,17 @@ def test_full_vocab_preserves_zero_sign(form, zero_bits):
 
 
 @pytest.mark.parametrize("form", ["direct", "negative-cross-entropy"])
-def test_tail_is_invariant_to_a_large_common_logit_offset(form):
+def test_tail_matches_raw_logit_reference_with_common_offset(form):
     vocab, k = 32768, 128
     scorer = FullVocabTopK(k=k, vocab_block=32768, form=form, solution="torch")
-    baseline = scorer.prepare(torch.zeros((1, vocab), dtype=torch.float32))
     logits = torch.full((1, vocab), 1e8, dtype=torch.float32)
-    shifted = scorer.prepare(logits)
-    torch.testing.assert_close(
-        shifted.log_tail,
-        torch.tensor([math.log1p(-k / vocab)], dtype=torch.float32),
-        atol=1e-6,
-        rtol=0,
-    )
-    assert torch.equal(
-        shifted.log_tail.view(torch.int32), baseline.log_tail.view(torch.int32)
-    )
-    packed, sampled = shifted.pack(torch.tensor([0]), prediction_rows=None)
-    baseline_packed, baseline_sampled = baseline.pack(
-        torch.tensor([0]), prediction_rows=None
-    )
-    assert torch.equal(packed, baseline_packed)
-    assert torch.equal(sampled.view(torch.int32), baseline_sampled.view(torch.int32))
+    scores = scorer.prepare(logits)
+    maximum = logits.max(dim=-1).values
+    expected = torch.logsumexp(logits.scatter(1, scores.ids, -torch.inf), dim=-1)
+    expected = expected - (maximum + scores.log_z)
+    assert torch.equal(scores.log_tail.view(torch.int32), expected.view(torch.int32))
+    packed, _ = scores.pack(torch.tensor([0]), prediction_rows=None)
+    assert torch.equal(packed[:, 1], expected.view(torch.int32))
     assert torch.all(logits == 1e8)
 
 
@@ -114,3 +102,28 @@ def test_shared_scores_and_tree_gathers_preserve_selected_bits(form):
     packed, actual = scores.pack(tokens, prediction_rows=path)
     assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
     assert torch.equal(packed[:, 0], tokens.int())
+
+
+@pytest.mark.parametrize("form", ["direct", "negative-cross-entropy"])
+def test_packing_without_materialized_head_preserves_explicit_scores(form):
+    from tokenspeed_kernel.ops.sampling.torch import torch_full_vocab_pack
+
+    logits = torch.arange(96, dtype=torch.float32).reshape(6, 16) % 13
+    logits[0].zero_()
+    scorer = FullVocabTopK(k=4, vocab_block=8, form=form, solution="torch")
+    scores = scorer.prepare(logits)
+    tokens = torch.tensor([0, 2, -1, 3, 4, -1])
+    path = torch.tensor([0, 2, 2, 3, 5, 5])
+    expected = torch_full_vocab_pack(
+        scores.shifted,
+        scores.log_z,
+        scores.ids,
+        scores.logprobs,
+        scores.log_tail,
+        tokens,
+        prediction_rows=path,
+        form=form,
+    )
+    actual, sampled = scores.rows(slice(None)).pack(tokens, prediction_rows=path)
+    assert torch.equal(actual, expected[:, :-1])
+    assert torch.equal(sampled.view(torch.int32), expected[:, -1])

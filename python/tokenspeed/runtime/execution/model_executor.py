@@ -1861,7 +1861,13 @@ class ModelExecutor:
                 raise ValueError(
                     "full-vocabulary logits must match the forward output layout"
                 )
-            full_scores = self.full_vocab_topk.prepare(logits_output.next_token_logits)
+            full_scores = self.full_vocab_topk.begin(
+                logits_output.next_token_logits,
+                defer_head=(
+                    ctx.output_layout.num_decodes > 0
+                    and ctx.output_layout.decode_width > 1
+                ),
+            )
             if sampling_info.vocab_mask is None:
                 logits_output.logprob_scores = full_scores
         output_tokens, accept_lengths = sample_with_diagnostics(
@@ -1883,19 +1889,6 @@ class ModelExecutor:
                 )
             ),
         )
-        if full_scores is not None:
-            prediction_rows = None
-            if self.tree_spec is not None and ctx.num_extends == 0:
-                prediction_rows = accepted_path_rows(
-                    self.sampling_backend.accepted_path(
-                        ctx.bs, self.tree_spec.num_nodes
-                    )
-                )
-            packed, sampled = full_scores.pack(
-                output_tokens, prediction_rows=prediction_rows
-            )
-            logits_output.full_vocab_topk = packed
-            logits_output.full_vocab_logprobs = sampled
         ib = self.input_buffers
         self.runtime_states.apply_stop_conditions(
             ib.state_write_req_pool_indices_buf[: ctx.bs],
@@ -1909,6 +1902,28 @@ class ModelExecutor:
             decode_width=ctx.output_layout.decode_width,
             padding_index=ib.state_write_padding_pool_index,
         )
+        if full_scores is not None:
+            prediction_rows = None
+            if self.tree_spec is not None and ctx.num_extends == 0:
+                prediction_rows = accepted_path_rows(
+                    self.sampling_backend.accepted_path(
+                        ctx.bs, self.tree_spec.num_nodes
+                    )
+                )
+            full_scores = full_scores.complete_accepted(
+                accept_lengths,
+                ib.state_write_req_pool_indices_buf[: ctx.bs],
+                num_prefill_outputs=ctx.output_layout.num_prefill_outputs,
+                num_extends=ctx.num_extends,
+                decode_width=ctx.output_layout.decode_width,
+                padding_index=ib.state_write_padding_pool_index,
+                prediction_rows=prediction_rows,
+            )
+            packed, sampled = full_scores.pack(
+                output_tokens, prediction_rows=prediction_rows
+            )
+            logits_output.full_vocab_topk = packed
+            logits_output.full_vocab_logprobs = sampled
         return output_tokens, accept_lengths
 
     def _sample_and_verify(

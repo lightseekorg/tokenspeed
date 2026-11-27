@@ -719,11 +719,14 @@ def vocab_shard_logprobs(
     kernel(partials, rows, tokens, row_max, shard_columns, vocab_size, out)
 
 
-# Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.sampling.cuda  # noqa: E402,F401
+
+# Backend registration (side-effect imports).
+import tokenspeed_kernel.ops.sampling.cuda_full_vocab  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.full_vocab  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.verify_coins  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_logprobs  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_shard_draft  # noqa: E402,F401
