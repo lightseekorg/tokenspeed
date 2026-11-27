@@ -55,8 +55,7 @@ def model_checkpoint_id(server_args: ServerArgs, model_config: ModelConfig) -> s
         hf_config=model_config.hf_config,
         revision=str(model_config.revision or ""),
         load_format=str(server_args.load_format),
-        # LoadConfig uses this same empty extra-config.
-        model_loader_extra_config={},
+        model_loader_extra_config=server_args.model_loader_extra_config,
         ext_yaml=str(server_args.ext_yaml or ""),
     )
 

@@ -695,6 +695,10 @@ def _prewarm_hf_tokenizer(model_id: str) -> None:
     """
     if not model_id or os.path.isdir(model_id):
         return
+    from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+    if is_object_store_uri(model_id):
+        return
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
