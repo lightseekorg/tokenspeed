@@ -122,6 +122,31 @@ enum Delivery {
     Late,
 }
 
+fn replica_meshes() -> Vec<Mesh> {
+    let sockets = (0..8)
+        .map(|_| Listener::bind("127.0.0.1").unwrap())
+        .collect::<Vec<_>>();
+    let addresses = sockets
+        .iter()
+        .map(|s| format!("127.0.0.1:{}", s.port().unwrap()))
+        .collect::<Vec<_>>();
+    thread::scope(|scope| {
+        sockets
+            .into_iter()
+            .enumerate()
+            .map(|(rank, s)| {
+                let addresses = &addresses;
+                scope.spawn(move || {
+                    Mesh::connect(rank, s, addresses, Duration::from_secs(5)).unwrap()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect::<Vec<_>>()
+    })
+}
+
 fn exercise(delivery: Delivery, budget: Duration, start: impl FnOnce(), finish: impl FnOnce()) {
     let layout = layout();
     let mut listener = PeerListener::bind("127.0.0.1", 0).unwrap();
@@ -156,28 +181,7 @@ fn exercise(delivery: Delivery, budget: Duration, start: impl FnOnce(), finish: 
         caches[0].clone(),
     )
     .unwrap();
-    let sockets = (0..8)
-        .map(|_| Listener::bind("127.0.0.1").unwrap())
-        .collect::<Vec<_>>();
-    let addresses = sockets
-        .iter()
-        .map(|s| format!("127.0.0.1:{}", s.port().unwrap()))
-        .collect::<Vec<_>>();
-    let meshes = thread::scope(|scope| {
-        sockets
-            .into_iter()
-            .enumerate()
-            .map(|(rank, s)| {
-                let addresses = &addresses;
-                scope.spawn(move || {
-                    Mesh::connect(rank, s, addresses, Duration::from_secs(5)).unwrap()
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|t| t.join().unwrap())
-            .collect::<Vec<_>>()
-    });
+    let meshes = replica_meshes();
     let mut channel = Some(ch);
     let mut controls = Vec::new();
     let mut workers = Vec::new();
@@ -369,74 +373,6 @@ fn eight_schedulers_keep_timely_sharded_answers_across_a_long_forward() {
 }
 
 #[test]
-#[ignore = "requires eight visible Ascend NPUs, torch_npu and the MLP runtime environment"]
-fn eight_npu_forwards_outlast_the_sharded_lookup_deadline() {
-    use pyo3::types::PyModule;
-    let _ = tracing_subscriber::fmt()
-        .with_test_writer()
-        .with_max_level(tracing::Level::DEBUG)
-        .try_init();
-    crate::init_test_scheduler();
-    let module = Python::attach(|py| {
-        PyModule::from_code(
-            py,
-            &CString::new(include_str!("../../tests/peer_forward_npu.py")).unwrap(),
-            c"peer_forward_npu.py",
-            c"peer_forward_npu",
-        )
-        .unwrap()
-        .unbind()
-    });
-    for delivery in [
-        Delivery::Recompute,
-        Delivery::DuringForward,
-        Delivery::DelayedAgreement,
-        Delivery::Late,
-    ] {
-        Python::attach(|py| {
-            module.call_method0(py, "arm").unwrap();
-        });
-        exercise(
-            delivery,
-            Duration::from_millis(50),
-            || {
-                Python::attach(|py| {
-                    module.call_method0(py, "begin").unwrap();
-                })
-            },
-            || {
-                Python::attach(|py| {
-                    let timings: Vec<f64> = module
-                        .call_method0(py, "finish")
-                        .unwrap()
-                        .extract(py)
-                        .unwrap();
-                    eprintln!("case={delivery:?} device_forward_ms={timings:?}");
-                    assert_eq!(timings.len(), 8);
-                    assert!(timings.iter().all(|ms| *ms > 50.0));
-                })
-            },
-        );
-    }
-    delayed_checkpoint_reads(|| {
-        let start = Instant::now();
-        Python::attach(|py| {
-            module.call_method1(py, "arm", (24_576,)).unwrap();
-            module.call_method0(py, "begin").unwrap();
-            let times: Vec<f64> = module
-                .call_method0(py, "finish")
-                .unwrap()
-                .extract(py)
-                .unwrap();
-            eprintln!("queued_checkpoint device_ms={times:?}");
-            assert_eq!(times.len(), 8);
-            assert!(times.iter().all(|t| *t > 4_000.0));
-        });
-        start.elapsed().as_micros() as i64
-    });
-}
-
-#[test]
 fn all_readers_follow_the_leader_group_cost_even_when_followers_would_read() {
     exercise(
         Delivery::Recompute,
@@ -451,18 +387,8 @@ fn four_seconds_after_lookup_repin_requires_every_original_shard() {
     delayed_checkpoint_reads(|| 4_000_001);
 }
 
-fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
-    use super::super::{offers::Offers, v1::Disposition, wire::Prompt};
-    use ts_scheduler::{ForwardEvent, ForwardEventKind};
-    let layout = layout();
-    let generation = |name: &str| Generation {
-        name: name.into(),
-        incarnation: 1,
-        epoch: 1,
-    };
-    let reader = generation("reader:1");
-    let holder = generation("holder:1");
-    let spec = |id: &str, peer: &str| RequestSpec {
+fn shard_request(id: &str, peer: &str) -> RequestSpec {
+    RequestSpec {
         admission_id: 0,
         request_id: id.into(),
         session_id: String::new(),
@@ -472,44 +398,76 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
         tokens: (1..=133).collect(),
         max_new_tokens: 4,
         max_cached_prefix_tokens: i32::MAX,
-    };
-    let event = |kind, id: &str, tokens| ForwardEvent {
+    }
+}
+fn shard_event(
+    kind: ts_scheduler::ForwardEventKind,
+    id: &str,
+    tokens: Vec<i32>,
+) -> ts_scheduler::ForwardEvent {
+    ts_scheduler::ForwardEvent {
         kind,
         request_id: id.into(),
         tokens,
         spec_candidate_ids: vec![],
         reserve_num_tokens: 0,
         bootstrap_token: -1,
+    }
+}
+
+fn seeded_holder(name: &str) -> Vec<Arc<Mutex<Scheduler>>> {
+    use ts_scheduler::ForwardEventKind;
+    (0..8)
+        .map(|_| {
+            let s = scheduler(name, Duration::from_secs(1));
+            let mut c = s.lock();
+            c.submit_requests(&[shard_request("seed", "")]).unwrap();
+            c.advance(&[shard_event(
+                ForwardEventKind::PdBootstrapped,
+                "seed",
+                vec![],
+            )])
+            .unwrap();
+            assert!(!c
+                .next_execution_plan(true, false)
+                .forward_batches()
+                .is_empty());
+            c.advance(&[shard_event(ForwardEventKind::ExtendResult, "seed", vec![1])])
+                .unwrap();
+            c.next_execution_plan(true, false);
+            c.advance(&[shard_event(ForwardEventKind::PdSucceeded, "seed", vec![])])
+                .unwrap();
+            drop(c);
+            s
+        })
+        .collect()
+}
+
+fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
+    use super::super::{offers::Offers, v1::Disposition, wire::Prompt};
+    use ts_scheduler::ForwardEventKind;
+    let layout = layout();
+    let generation = |name: &str| Generation {
+        name: name.into(),
+        incarnation: 1,
+        epoch: 1,
     };
+    let reader = generation("reader:1");
+    let holder = generation("holder:1");
     for evict in [None, Some(7)] {
-        let caches: Vec<_> = (0..8)
-            .map(|_| {
-                let s = scheduler(&holder.name, Duration::from_secs(1));
-                let mut c = s.lock();
-                c.submit_requests(&[spec("seed", "")]).unwrap();
-                c.advance(&[event(ForwardEventKind::PdBootstrapped, "seed", vec![])])
-                    .unwrap();
-                assert!(!c
-                    .next_execution_plan(true, false)
-                    .forward_batches()
-                    .is_empty());
-                c.advance(&[event(ForwardEventKind::ExtendResult, "seed", vec![1])])
-                    .unwrap();
-                c.next_execution_plan(true, false);
-                c.advance(&[event(ForwardEventKind::PdSucceeded, "seed", vec![])])
-                    .unwrap();
-                drop(c);
-                s
-            })
-            .collect();
+        let caches = seeded_holder(&holder.name);
         let sched = scheduler(&reader.name, Duration::from_millis(50));
         let mut sched = sched.lock();
         assert!(sched.enable_async_device_peer(false));
         sched
-            .submit_requests(&[spec("follow", &holder.name)])
+            .submit_requests(&[shard_request("follow", &holder.name)])
             .unwrap();
         sched
-            .advance(&[event(ForwardEventKind::PdBootstrapped, "follow", vec![])])
+            .advance(&[shard_event(
+                ForwardEventKind::PdBootstrapped,
+                "follow",
+                vec![],
+            )])
             .unwrap();
         sched.next_execution_plan(true, false);
         let q = sched.take_peer_lookups().pop().unwrap();
@@ -519,7 +477,14 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
             unreachable!()
         };
         let mut offers: Vec<_> = (0..8).map(|_| Offers::new(Arc::default())).collect();
-        let answer = offers[0].lookup(key, &holder, &layout, &query, &mut caches[0].lock(), 1);
+        let answer = offers[0].lookup(
+            key,
+            &holder,
+            &layout,
+            &query,
+            |q| caches[0].lock().answer_peer_lookup_bounded(q, 0),
+            1,
+        );
         for h in &mut offers[1..] {
             h.install(&query, &answer, 4, 8, 1);
         }
@@ -578,7 +543,14 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
             unreachable!()
         };
         assert_eq!(*max_tokens, f.end_tokens);
-        let fresh = offers[0].lookup(key, &holder, &layout, &renew, &mut caches[0].lock(), now);
+        let fresh = offers[0].lookup(
+            key,
+            &holder,
+            &layout,
+            &renew,
+            |q| caches[0].lock().answer_peer_lookup_bounded(q, 0),
+            now,
+        );
         for h in &mut offers[1..] {
             h.install(&renew, &fresh, 4, 8, now);
         }
@@ -703,4 +675,153 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
             );
         }
     }
+}
+
+#[test]
+fn a_failed_progress_mesh_reports_the_error_before_worker_exit() {
+    let mut meshes = replica_meshes().into_iter();
+    let leader = meshes.next().unwrap();
+    let follower = meshes.next().unwrap();
+    let name = "mesh-failure";
+    let origin = Instant::now();
+    let (control, _) = Control::new(
+        origin,
+        layout(),
+        1,
+        Generation {
+            name: name.into(),
+            incarnation: 1,
+            epoch: 1,
+        },
+        None,
+        Arc::default(),
+        0,
+    );
+    let progress = Progress::start(
+        Some((follower, Group::new(0, (0..8).collect(), 1).unwrap())),
+        Arc::new(Mutex::new(control)),
+        scheduler(name, Duration::from_millis(50)),
+        None,
+        origin,
+    )
+    .unwrap();
+    drop(leader);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let next_error = || loop {
+        if let Err(e) = progress.drain(&mut PeerRound::default()) {
+            break e;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not report the mesh disconnect"
+        );
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert!(matches!(next_error(), super::super::PeerError::Mesh(_)));
+    assert!(matches!(
+        next_error(),
+        super::super::PeerError::WorkerExited
+    ));
+}
+
+#[test]
+fn a_worker_forwards_attribution_even_without_scheduler_events() {
+    let mut round = PeerRound {
+        now_us: 1,
+        ..Default::default()
+    };
+    assert!(!round.has_feedback());
+    round
+        .decisions
+        .push(("follow".into(), "adaptive_recompute"));
+    assert!(round.has_feedback());
+}
+
+#[test]
+fn sharded_holder_answers_while_all_eight_schedulers_stay_locked() {
+    use ts_scheduler::ForwardEventKind;
+    let layout = layout();
+    let mut listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+    listener.set_registered_layout(layout.clone());
+    let holder = Generation {
+        name: format!("127.0.0.1:{}", listener.port()),
+        epoch: 1,
+        incarnation: 1,
+    };
+    let caches = seeded_holder(&holder.name);
+    let ch = listener.versioned_channel();
+    let (tx, replies) = mpsc::channel();
+    let net = super::super::net::PeerNet::start("127.0.0.1", 0, tx).unwrap();
+    let reader = Generation {
+        name: format!("127.0.0.1:{}", net.port()),
+        epoch: 1,
+        incarnation: 1,
+    };
+    let sched = scheduler(&reader.name, Duration::from_millis(50));
+    let mut cache = sched.lock();
+    cache
+        .submit_requests(&[shard_request("follow", &holder.name)])
+        .unwrap();
+    cache
+        .advance(&[shard_event(
+            ForwardEventKind::PdBootstrapped,
+            "follow",
+            vec![],
+        )])
+        .unwrap();
+    cache.next_execution_plan(true, false);
+    let query = Attempt::new(cache.take_peer_lookups().pop().unwrap())
+        .query(&reader, &layout, &holder, layout.clone())
+        .unwrap();
+    let (mut control, _) = Control::new(
+        Instant::now(),
+        layout.clone(),
+        0,
+        holder.clone(),
+        Some(ch),
+        Arc::default(),
+        0,
+    );
+    control
+        .start_lookups(caches[0].lock().peer_lookup_index())
+        .unwrap();
+    let _endpoint = start_endpoint(
+        &PeerSettings {
+            name: holder.name.clone(),
+            incarnation: 1,
+            deployment_id: "deployment".into(),
+            weight_version: "1".into(),
+            timeouts: Timeouts {
+                answer_us: 50000,
+                quarantine_us: 10000,
+                push_us: 2000000,
+            },
+            record_lifetime: Duration::from_secs(5),
+        },
+        PeerProgress::Coordinated,
+        layout.members.iter().map(|m| m.geometry.clone()).collect(),
+        listener,
+        caches[0].clone(),
+    )
+    .unwrap();
+    let locks = caches.iter().map(|s| s.lock()).collect::<Vec<_>>();
+    let start = Instant::now();
+    net.versioned(&holder.name, &query).unwrap();
+    let frames = replies.recv_timeout(Duration::from_millis(50)).unwrap();
+    let elapsed = start.elapsed();
+    let Some(Message::Offered(_, Some((offer, _, pages)))) = Message::decode(&frames[1], true)
+    else {
+        panic!("missing sharded hit")
+    };
+    assert_eq!(offer.end, 132);
+    assert_eq!(pages.len(), 33);
+    assert!(elapsed < Duration::from_millis(50), "{elapsed:?}");
+    thread::sleep(Duration::from_millis(100).saturating_sub(start.elapsed()));
+    eprintln!(
+        "sharded holder: reply {elapsed:?}, eight scheduler locks held {:?}",
+        start.elapsed()
+    );
+    drop(locks);
+    let (_, reports) = Control::unpack(&[control.report(Vec::new())]).unwrap();
+    assert_eq!(reports[0].proposals.len(), 1);
 }

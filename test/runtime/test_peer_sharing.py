@@ -226,15 +226,33 @@ def test_the_geometry_addresses_the_bytes_the_cache_holds():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned Host memory")
-def test_a_host_layout_out_of_the_schedulers_order_is_refused():
+@pytest.mark.parametrize("tier", ["Host", "Device"])
+def test_a_layout_out_of_the_schedulers_order_is_refused(tier):
     groups, device, storage, field_addresses = _setup()
-    with pytest.raises(ValueError, match="scheduler's order"):
+    with pytest.raises(ValueError, match=f"peer {tier} groups") as error:
         build_peer_geometry(
             scheduler_group_ids=("swa", "full"),
-            groups=groups,
+            groups=groups[::-1] if tier == "Host" else groups,
             field_addresses=field_addresses,
             device_regions=((device.data_ptr(), device.numel()),),
             host_storage=storage,
+        )
+    assert "('full', 'swa') != ('swa', 'full')" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{"host_virtual_bounds": (2,)}, {"host_region_planner": lambda n, _: (n,)}],
+)
+def test_device_only_geometry_refuses_host_registration_options(options):
+    with pytest.raises(ValueError, match="require a Host pool"):
+        build_peer_geometry(
+            scheduler_group_ids=("target",),
+            groups=(CacheGroupLayout("target", 1, (CacheField("k", 0, 0, 32, 24),)),),
+            field_addresses={"k": 4096},
+            device_regions=((4096, 32),),
+            host_storage=None,
+            **options,
         )
 
 

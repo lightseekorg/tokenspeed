@@ -372,18 +372,19 @@ gain falls below a minimum fetch size.
 
 ### Engine roles and scope
 
-The first version covers every role, with
-attention TP and KV parallelism; replicated cache groups only, no KV-page
-sharding; no pipeline stages and no query context parallelism. A prefill replica keeps Host L2 and transfers to its decode peer
-through the ordinary PD path. A decode replica only serves history. With
+The original protocol covers replicated cache groups with attention TP and KV
+parallelism. Peer sharing requires a single pipeline stage and a single query
+context rank. A prefill replica keeps Host L2 and transfers its prompt to the
+decode replica through the [ordinary PD path](0005-runtime-pd-roles.md).
+A decode replica serves its prompt and generated history to peers. With
 TP1/KVP1 it may use `--disable-kvstore` together with `--peer-prefix-port`
 and `--peer-prefix-landing-tier device`. Keep prefix caching enabled and
 omit the Host write-back policy. This holder registers only its Device
 arena, including draft cache fields when present. Once a prefix leaves
 Device memory, the holder cannot serve it from L2. Retraction snapshots, if
 configured, remain private. A TP8/KVP8 prefill reader can reuse the
-resident history through the sharded peer protocol. Hybrid models (sliding window, State checkpoints) are in scope
-through the holder's matchers.
+resident history through the sharded peer protocol. The holder's matchers
+also support hybrid models with sliding windows and state checkpoints.
 
 Out of scope: a storage tier, a central owner, sharing across namespaces, and
 moving PD itself onto the new read entry point.

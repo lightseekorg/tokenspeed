@@ -2896,8 +2896,10 @@ class ServerArgs:
             setting
             for setting, refused in (
                 (
-                    "--disable-kvstore (no Host L2)",
+                    "--disable-kvstore (device-only peer sharing requires decode "
+                    "TP1/KVP1 with --peer-prefix-landing-tier device)",
                     not self.enable_kvstore
+                    # Match the Decode transfer-contract topology in build_device_side.
                     and not (
                         self.disaggregation_mode == "decode"
                         and self.peer_prefix_landing_tier == "device"

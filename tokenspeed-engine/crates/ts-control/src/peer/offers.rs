@@ -154,7 +154,7 @@ impl Offers {
         local: &Generation,
         layout: &Replica,
         msg: &Message,
-        scheduler: &mut Scheduler,
+        query: impl FnOnce(&PeerEventView) -> ts_scheduler::PeerAnswerView,
         now: i64,
     ) -> Message {
         let Message::Lookup(_, s, _, l, p) = msg else {
@@ -192,7 +192,7 @@ impl Offers {
         };
         let mut event = p.lookup_event(&lease);
         // Soft offers reserve no source pages. PIN rechecks capacity and the exact manifest.
-        let answer = scheduler.answer_peer_lookup_bounded(&event, 0);
+        let answer = query(&event);
         let end = answer.num_tokens;
         if end <= 0
             || end > p.max_tokens
@@ -314,6 +314,8 @@ impl Offers {
         };
         let expired = || (Some(Message::Expired(k.clone(), o.clone())), None);
         let Some(r) = self.records.get_mut(k) else {
+            // A forgotten offer cannot grant a PIN. Let the reader look it up
+            // once more and validate the exact pages under a fresh offer.
             return expired();
         };
         if *o != r.offer {

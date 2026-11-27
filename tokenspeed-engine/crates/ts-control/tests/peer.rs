@@ -692,6 +692,58 @@ fn independent_device_recomputes_a_short_extension() {
     independent_device_choice(true);
 }
 
+#[test]
+fn independent_device_holder_answers_while_its_scheduler_stays_locked() {
+    let arena = Arena::new(200_000);
+    let replica = |base| {
+        let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+        let mut cfg = settings(&format!("127.0.0.1:{}", listener.port()), "v1");
+        cfg.driver = TestDriver::Automatic;
+        cfg.peer.timeouts.answer_us = 50_000;
+        Replica::with_listener(cfg, listener, base, &arena, "Fused")
+    };
+    let mut holder = replica(HOLDER_BASE);
+    let mut reader = replica(READER_BASE);
+    let mut tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+    let expected = tokens.len() as i32;
+    tokens.extend(1000..1000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("follow", tokens, &holder.name)])
+        .unwrap();
+    let lock = holder.scheduler.lock();
+    let start = Instant::now();
+    reader.round();
+    loop {
+        let report = reader.peer.report();
+        let round = reader.peer.agree(&[report]).unwrap();
+        if let Some(hit) = round
+            .events
+            .iter()
+            .find(|e| e.kind == ts_scheduler::PeerEventKind::LookupAnswered)
+        {
+            assert_eq!(hit.num_tokens, expected);
+            assert!(!hit.pages.is_empty());
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "holder failed to answer under lock"
+        );
+        std::thread::yield_now();
+    }
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(100).saturating_sub(elapsed));
+    eprintln!(
+        "DP holder: {expected} tokens, reply {elapsed:?}, scheduler held {:?}",
+        start.elapsed()
+    );
+    drop(lock);
+}
+
 fn independent_device_choice(adaptive: bool) {
     let arena = Arena::new(200_000);
     let replica = |base| {

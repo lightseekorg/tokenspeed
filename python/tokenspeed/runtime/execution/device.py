@@ -2037,12 +2037,12 @@ def build_device_side(
     host_cache_executor = None
     host_cache = None
     host_tail_packing = {}
+    contract = views.token_to_kv_pool.arena.runtime_contract
     if server_args.enable_kvstore or peer_outbox is not None:
         from tokenspeed.runtime.cache.transfer.layout import (
             combine_cache_transfer_layouts,
         )
 
-        contract = views.token_to_kv_pool.arena.runtime_contract
         layout = combine_cache_transfer_layouts(
             views.token_to_kv_pool.cache_transfer_layout(),
             (
@@ -2070,7 +2070,7 @@ def build_device_side(
         }
     snapshot_pool = _retraction_pool_request(
         server_args,
-        views.token_to_kv_pool.arena.runtime_contract,
+        contract,
         host_group_packing=host_tail_packing,
         max_batch_size=max_batch_size,
         max_resident_requests=max_resident_requests,
@@ -2093,17 +2093,11 @@ def build_device_side(
             if server_args.mapping.world_size > 1
             else None
         )
-    if (
-        server_args.has_host_tier
-        or not snapshot_pool.disabled
-        or peer_outbox is not None
-    ):
-        checkpoint_granularities = tuple(
-            (spec.group_id, spec.checkpoint_granularity)
-            for spec in views.token_to_kv_pool.arena.runtime_contract.group_specs
-            if spec.checkpoint_granularity is not None
-            and spec.checkpoint_granularity > 1
-        )
+    checkpoint_granularities = tuple(
+        (spec.group_id, spec.checkpoint_granularity)
+        for spec in contract.group_specs
+        if spec.checkpoint_granularity is not None and spec.checkpoint_granularity > 1
+    )
     if server_args.shared_l2_config is not None:
         from tokenspeed.runtime.cache.shared_l2.rank import join_shared_l2_pool
 
@@ -2283,7 +2277,11 @@ def build_device_side(
                 if host_cache is not None
                 else ()
             ),
-            host_region_planner=get_peer_host_region_planner(server_args.device),
+            host_region_planner=(
+                get_peer_host_region_planner(server_args.device)
+                if host_cache is not None
+                else None
+            ),
         )
 
     kv_transfer = kv_transfer_builder(

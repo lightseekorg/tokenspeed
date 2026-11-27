@@ -244,14 +244,20 @@ def build_peer_geometry(
         device_regions: The Device ranges the cache lives in
             (``CacheArena.registration_regions``).
         host_storage: The Host L2 pool, or None for a Device-only holder.
-        host_region_planner: Optional device plugin supplying consecutive region sizes.
+        host_region_planner: Optional planner for registering a local Host pool.
+        host_virtual_bounds: Exclusive Host page bounds in scheduler group order.
+            A Device-only holder takes empty bounds and publishes 1 for each
+            group because page 0 is reserved.
 
     Returns:
         The Device geometry and registered ranges, including Host L2 when present.
     """
     group_ids = tuple(group.group_id for group in groups)
     if group_ids != tuple(scheduler_group_ids):
-        raise ValueError("peer Device groups must follow the scheduler's order")
+        raise ValueError(
+            f"peer Device groups must follow the scheduler's order: "
+            f"{group_ids} != {tuple(scheduler_group_ids)}"
+        )
     device = tuple(
         PeerDeviceField(
             group=index,
@@ -265,6 +271,8 @@ def build_peer_geometry(
     )
     regions = tuple((int(address), int(length)) for address, length in device_regions)
     if host_storage is None:
+        if host_virtual_bounds or host_region_planner is not None:
+            raise ValueError("Host page bounds and region planning require a Host pool")
         # Page 0 is reserved. An exclusive bound of 1 admits no Host page.
         return PeerGeometry(
             device=device,
@@ -275,7 +283,10 @@ def build_peer_geometry(
             host_virtual_bounds=(1,) * len(groups),
         )
     if tuple(host_storage.group_ids) != group_ids:
-        raise ValueError("peer Host groups must follow the scheduler's order")
+        raise ValueError(
+            f"peer Host groups must follow the scheduler's order: "
+            f"{tuple(host_storage.group_ids)} != {group_ids}"
+        )
     host_groups = []
     for index, group in enumerate(groups):
         offsets = host_storage.host_field_offsets[index]

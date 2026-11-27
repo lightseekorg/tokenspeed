@@ -1880,8 +1880,20 @@ it can lend the scheduler to the peer worker when device copies are clear. Each
 member reports its scheduler round, wait site and forward sequence on that mesh.
 Only a matching window on every member permits a protocol step. The ordinary
 replica round also advances the same state machine and delivers its events to
-all eight schedulers. Device submission still requires the local plan fence.
+all eight schedulers. During protocol advancement, both paths take the local
+scheduler, protocol control and read-state locks in that order. A worker round
+forwards request attribution even when it has no scheduler events or landings.
+Device submission still requires the local plan fence.
 The reader publishes a landing only after member retirement and holder closure.
+
+Single-member and registered holders answer the initial lookup from the same
+scheduler-owned prefix indexes. The lookup handle keeps the native owner alive.
+It guards index membership, page locations and published tails through the copy
+of the page list. No scheduler window is needed to answer. A single-member
+holder applies queued soft exports before pinning. A registered holder queues
+the offer for installation on the other members before replying. Their next
+round installs proposals before processing PIN. Both paths revalidate the pages
+before granting a read.
 
 Rank zero timestamps lookup dispatch and receipt on its monotonic clock. The
 receipt must precede the deadline, even if admission happens several rounds
