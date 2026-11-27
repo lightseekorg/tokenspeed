@@ -1675,8 +1675,14 @@ def test_owner_topology_and_reject_invalid_recipes():
 def test_pool_strides_owner_fences_and_no_redundant_fields():
     backend = _backend("cpu", 2)
     pool = backend.cache_pool
-    tracker = Mock()
-    pool.layerwise_load_tracker = tracker
+    assert pool.layer_accesses_wait_for_load is True
+    waited: list[int] = []
+
+    class _Tracker:
+        def wait_for_layer(self, layer_index: int) -> None:
+            waited.append(layer_index)
+
+    pool.layerwise_load_tracker = _Tracker()
     for view, shape, stride, owner in (
         (pool.swa(7), (64, 528), 1_382_400, 7),
         (pool.global_kv(8), (64, 288), 69_120, 8),
@@ -1689,7 +1695,12 @@ def test_pool_strides_owner_fences_and_no_redundant_fields():
             view.untyped_storage().data_ptr()
             == pool.arena.buffer.untyped_storage().data_ptr()
         )
-        tracker.wait_for_layer.assert_any_call(owner)
+        assert waited[-1] == owner
+    waited.clear()
+    pool.get_key_buffer(3)
+    pool.get_value_buffer(5)
+    pool.get_kv_buffer(9)
+    assert waited == [3, 5, 9]
     with pytest.raises(ValueError, match="not planned"):
         pool.global_kv(24)
     assert pool.history_group_by_layer() == {layer: SWA for layer in range(40)}
