@@ -694,9 +694,11 @@ def test_cuda_host_table_feeds_wkv_its_mxfp8_rows(alloc):
     # Canonicalizing the shared host table in place preserves bit-for-bit output
     # eagerly and under CUDA graph replay, with zero extra host allocation.
     packed_ptr = host.embed.packed.data_ptr()
-    host.prepare_mxfp8_rows()
+    assert host.prepare_mxfp8_rows(sync=True)
     assert host.embed._mxfp8_canonical
     assert host.embed.packed.data_ptr() == packed_ptr
+    with pytest.raises(RuntimeError, match="canonicalized"):
+        host.embed(ids, query_shard=None)
     torch.testing.assert_close(
         host(hidden, ids, mask, query_shard=None),
         gpu(hidden, ids, mask, query_shard=None),
@@ -714,7 +716,7 @@ def test_cuda_host_table_feeds_wkv_its_mxfp8_rows(alloc):
     )
 
 
-def test_host_table_prepare_mxfp8_rows_canonicalizes_in_place():
+def test_host_table_prepare_mxfp8_rows_canonicalizes_in_place(monkeypatch):
     quant = Mxfp8Config.from_config(
         {
             "quant_method": "fp8",
@@ -742,19 +744,38 @@ def test_host_table_prepare_mxfp8_rows_canonicalizes_in_place():
     assert not model.embed._mxfp8_canonical
     packed_ptr = model.embed.packed.data_ptr()
 
+    # Without CUDA, DeepseekV41Engram.prepare_mxfp8_rows skips canonicalization
+    # rather than running a slow host-CPU pass at boot, keeping BF16 forward valid.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert not model.prepare_mxfp8_rows(sync=False)
+    assert not model.embed._mxfp8_canonical
+    ids = torch.tensor([[0, 1, 2, 3, 4, 5]])
+    bf16_before = model.embed(ids, query_shard=None)
+    assert bf16_before.dtype == torch.bfloat16
+
     expected = model.embed.packed.clone()
     from tokenspeed_kernel.ops.embedding import host_gather
 
     host_gather.canonicalize_mxfp8_table(expected, device="cpu")
-    model.prepare_mxfp8_rows()
+    assert model.embed.prepare_mxfp8_rows(device=torch.device("cpu"), sync=False)
     assert model.embed._mxfp8_canonical
     assert model.embed.packed.data_ptr() == packed_ptr
     assert torch.equal(model.embed.packed, expected)
+    # Second call is a no-op.
+    assert not model.embed.prepare_mxfp8_rows(device=torch.device("cpu"), sync=False)
+    # Non-MXFP8 BF16 reader fails explicitly on a canonicalized table.
+    with pytest.raises(RuntimeError, match="canonicalized"):
+        model.embed(ids, query_shard=None)
 
-    # Reloading weights resets canonical state on both writer and follower paths.
+    # Reloading weights resets canonical state on both writer and follower paths
+    # and restores BF16 forward access.
     model.embed.weight_loader(model.embed.weight, codes)
+    model.embed.weight_loader(model.embed.scale, scales)
     assert not model.embed._mxfp8_canonical
-    model.prepare_mxfp8_rows()
+    torch.testing.assert_close(
+        model.embed(ids, query_shard=None), bf16_before, rtol=0, atol=0
+    )
+    assert model.embed.prepare_mxfp8_rows(device=torch.device("cpu"), sync=False)
     assert model.embed._mxfp8_canonical
 
     class _DummySlice:
@@ -764,6 +785,81 @@ def test_host_table_prepare_mxfp8_rows_canonicalizes_in_place():
     model.embed._shared_writer = False
     model.embed.load_sharded("weight", _DummySlice(), 16)
     assert not model.embed._mxfp8_canonical
+
+
+def test_post_load_weights_barriers_once_across_engram_layers(monkeypatch):
+    from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41ForCausalLM
+
+    quant = Mxfp8Config.from_config(
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [32, 32],
+            "scale_fmt": "ue8m0",
+        }
+    )
+    v41_quant = v41_mxfp8_config(quant)
+    called_sync = []
+
+    class _StubModel(torch.nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.config = _config()
+            self.engram_host_layout = "shared"
+            self.engrams = torch.nn.ModuleList(layers)
+
+    # Two Engram layers on this rank: post_load_weights passes sync=False to
+    # each layer and runs exactly ONE barrier at the end.
+    eng1 = DeepseekV41Engram(
+        _config(),
+        1,
+        _mapping(0, 1, 1),
+        v41_quant,
+        "model.layers.1.engram",
+        "cpu",
+        True,
+        "shared",
+        EngramHostAlloc("mmap", "writer"),
+    )
+    eng2 = DeepseekV41Engram(
+        _config(),
+        1,
+        _mapping(0, 1, 1),
+        v41_quant,
+        "model.layers.2.engram",
+        "cpu",
+        True,
+        "shared",
+        EngramHostAlloc("mmap", "writer"),
+    )
+    for eng in (eng1, eng2):
+        monkeypatch.setattr(
+            eng,
+            "prepare_mxfp8_rows",
+            lambda *, sync, _e=eng: called_sync.append(sync) or True,
+        )
+
+    barriers = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(1))
+
+    holder_two = torch.nn.Module()
+    holder_two._weight_update_active = False
+    holder_two.model = _StubModel([eng1, eng2])
+    DeepseekV41ForCausalLM.post_load_weights(holder_two)
+    assert called_sync == [False, False]
+    assert len(barriers) == 1
+
+    # Zero Engram layers on this rank (e.g. a stage without Engram): still
+    # enters the same single barrier so ranks stay in lockstep.
+    barriers.clear()
+    holder_zero = torch.nn.Module()
+    holder_zero._weight_update_active = False
+    holder_zero.model = _StubModel([])
+    DeepseekV41ForCausalLM.post_load_weights(holder_zero)
+    assert len(barriers) == 1
 
 
 def test_distributed_four_way_lookup(monkeypatch):

@@ -2564,6 +2564,7 @@ class DeepseekV41Model(nn.Module):
         ):
             raise ValueError("V4.1 layer count and compression ratios disagree")
         self.config, self.mapping = config, mapping
+        self.engram_host_layout = host_layout
         self.pp_start_layer, self.pp_end_layer = 0, config.num_hidden_layers
         self.engram_hash = None
         self.dspark_capture_layers = ()
@@ -3738,7 +3739,18 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 module.prepare_output_projections()
                 module.prepare_fused_decode()
             elif isinstance(module, DeepseekV41Engram):
-                module.prepare_mxfp8_rows()
+                module.prepare_mxfp8_rows(sync=False)
+        if (
+            self.model is not None
+            and self.model.config.engram_layer_ids
+            and self.model.engram_host_layout == "shared"
+            and torch.cuda.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            # One barrier after all Engram layers instead of per-layer barriers
+            # so ranks owning different Engram subsets cannot deadlock.
+            torch.distributed.barrier()
 
     def post_quant_warmup(self) -> None:
         # Every loader calls this once the loaded state is final. The sharded
