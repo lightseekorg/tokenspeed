@@ -100,7 +100,6 @@ def torch_prepare_decode_tables(
         return
     steps = torch.arange(tokens_per_req, device=tables.device)
     positions = (lengths.to(torch.int64)[:, None] - tokens_per_req + steps).clamp_min(0)
-    requests = torch.arange(bs, device=tables.device)[:, None]
     for g, source in enumerate(sources):
         dst = tables[g, :bs]
         if actual_bs:
@@ -115,7 +114,7 @@ def torch_prepare_decode_tables(
             dst[:actual_bs, num_pages:].zero_()
         dst[actual_bs:].zero_()
         page_index = positions // page_sizes[g]
-        page = dst[requests, page_index.clamp_max(dst.shape[1] - 1)].to(torch.int64)
+        page = dst.gather(1, page_index.clamp_max(dst.shape[1] - 1)).to(torch.int64)
         slots = page * page_sizes[g] + positions % page_sizes[g]
         slots = torch.where((page_index >= dst.shape[1]) | (page <= 0), 0, slots)
         locations[g, : bs * tokens_per_req].copy_(slots.flatten())

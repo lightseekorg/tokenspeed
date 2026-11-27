@@ -50,3 +50,12 @@ block-end length to `[low, high]` and writes it to the per-request row and to
 each of the request's entries; a block-causal draft's entry `e` of `n` gets
 `n - 1 - e` fewer tokens. CUDA runs one Triton launch for both; other devices
 run a clamp and a copy or subtraction.
+
+# Decode tables and write locations
+
+`prepare_decode_tables` refreshes page tables and write locations once per batch.
+The Torch implementation gathers each request's pages along its own table row,
+keeping page holes and padded requests zero. Positions and physical-slot
+arithmetic use int64; destinations retain their existing integer dtypes and
+storage addresses. Query width changes the columns gathered for each row and
+does not introduce per-request Python work.
