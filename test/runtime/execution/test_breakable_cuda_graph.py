@@ -1215,5 +1215,78 @@ class TestPoolReuseAcrossCaptures:
             torch.testing.assert_close(outbuf[:n], eager(xbuf[:n]))
 
 
+def test_begin_segment_uses_thread_local_capture_error_mode(monkeypatch):
+    """BreakableCapture must use thread_local capture error mode on every segment."""
+    calls: list[dict[str, object]] = []
+    fake_pool = (7, 11)
+
+    class _FakeCUDAGraph:
+        def capture_begin(self, **kwargs):
+            calls.append(kwargs)
+
+        def capture_end(self):
+            pass
+
+        def pool(self):
+            return fake_pool
+
+        def replay(self):
+            pass
+
+    class _FakeStream:
+        def wait_stream(self, _other):
+            pass
+
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", _FakeCUDAGraph)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _FakeStream())
+    monkeypatch.setattr(torch.cuda, "stream", lambda _s: contextlib.nullcontext())
+
+    cap = BreakableCapture(stream=_FakeStream())
+    with cap:
+        cap.add_eager(lambda: None)
+
+    assert calls == [
+        {"capture_error_mode": "thread_local"},
+        {"pool": fake_pool, "capture_error_mode": "thread_local"},
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_background_thread_event_query_allowed_during_capture():
+    """A background thread polling CUDAEvent.query must not break capture."""
+    import threading
+
+    x = torch.randn(4, 16, device="cuda")
+    w = torch.randn(16, 16, device="cuda")
+    out = torch.empty_like(x)
+
+    ev = torch.cuda.Event()
+    ev.record()
+    errors: list[Exception] = []
+
+    def poll_event() -> None:
+        try:
+            ev.query()
+        except Exception as exc:  # pragma: no cover - regression check
+            errors.append(exc)
+
+    for _ in range(2):
+        out.copy_(x @ w)
+    torch.cuda.synchronize()
+
+    cap = BreakableCapture()
+    with cap:
+        t = threading.Thread(target=poll_event)
+        t.start()
+        out.copy_(x @ w)
+        t.join()
+
+    assert errors == []
+    x.normal_()
+    cap.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, x @ w)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -308,10 +308,14 @@ class BreakableCapture:
     def _begin_segment(self) -> None:
         assert not self._capturing
         graph = torch.cuda.CUDAGraph()
+        # Use thread_local capture error mode so background C++ threads (e.g.
+        # c10::ThreadPool / ProcessGroupNCCL polling CUDAEvent::query) cannot
+        # invalidate capture with cudaErrorStreamCaptureUnsupported, while
+        # unsafe operations on the capturing thread still fail loudly.
         if self.pool is not None:
-            graph.capture_begin(pool=self.pool)
+            graph.capture_begin(pool=self.pool, capture_error_mode="thread_local")
         else:
-            graph.capture_begin()
+            graph.capture_begin(capture_error_mode="thread_local")
         self._current_graph = graph
         self._current_waits = {}
         self._capturing = True
