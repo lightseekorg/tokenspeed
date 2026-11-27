@@ -1125,9 +1125,9 @@ The Ascend path supports the LongCat-Flash-Lite checkpoint on one or more
 NPUs. It uses the normal TokenSpeed scheduler and paged KV cache: the runtime
 captures both the fixed-shape prefill buckets and the fixed-shape decode
 batches as ACL Graphs (prefill graphs are enabled through the N-gram
-`HistoryEmbeddingModel` seam; see below). All seven decode capture sizes were
+`HistoryEmbeddingModel` seam; see below). All eight decode capture sizes were
 validated
-(`--cudagraph-capture-sizes 64 32 16 8 4 2 1`, 7/7 captures succeeded).
+(`--cudagraph-capture-sizes 128 64 32 16 8 4 2 1`, 8/8 captures succeeded).
 
 The validated environment is the same as the Qwen3-0.6B NPU recipe: CANN
 9.0.0, PyTorch 2.9.0, `torch_npu` 2.9.0.post2, Transformers 5.12.0, Triton
@@ -1166,7 +1166,7 @@ python -m tokenspeed.cli serve <longcat-checkpoint> \
   --chunked-prefill-size 128 \
   --enable-metrics \
   --gpu-memory-utilization 0.88 \
-  --cudagraph-capture-sizes 64 32 16 8 4 2 1
+  --cudagraph-capture-sizes 128 64 32 16 8 4 2 1
 ```
 
 `<longcat-checkpoint>` is the local path to the LongCat-Flash-Lite checkpoint.
@@ -1190,8 +1190,8 @@ LongCat's MLA attention and zero-expert MoE additionally require
 `--mla-lora-scale folded`, `--router-topk torch`, and
 `--ep-dispatch-algorithm static_with_zero_expert` with
 `--expert-distribution-recorder-mode stat` and `--all2all-backend none`. The
-command above captures decode batches 64, 32, 16, 8, 4, 2, and 1 as ACL
-Graphs (all seven validated) and the prefill buckets
+command above captures decode batches 128, 64, 32, 16, 8, 4, 2, and 1 as ACL
+Graphs (all eight validated) and the prefill buckets
 (`--prefill-graph-capture-sizes`) as breakable graphs. Scale `--max-model-len`,
 the KV pool
 (`--gpu-memory-utilization`), and the capture sizes together when growing the

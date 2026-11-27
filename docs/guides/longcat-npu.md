@@ -87,7 +87,7 @@ python -m tokenspeed.cli serve <longcat-checkpoint> \
   --chunked-prefill-size 128 \
   --enable-metrics \
   --gpu-memory-utilization 0.88 \
-  --cudagraph-capture-sizes 64 32 16 8 4 2 1
+  --cudagraph-capture-sizes 128 64 32 16 8 4 2 1
 ```
 
 `<longcat-checkpoint>` is the local path to the LongCat-Flash-Lite checkpoint;
@@ -98,7 +98,7 @@ graph embeds the request token history eagerly through
 `--disable-prefill-graph`. Keep `--disable-pdl` (a hard NPU requirement), and
 do not pass `--enforce-eager` (it would disable both the decode ACL Graphs and
 the prefill graphs). The command captures decode
-batches 64 through 1 as ACL Graphs; all seven captures are validated. See the
+batches 128 through 1 as ACL Graphs; all eight captures are validated. See the
 [recipe](../recipes/models.md#longcat-flash-lite-on-ascend-npu) for the
 scaling rules.
 
