@@ -109,6 +109,9 @@ def handle_type(request, peer_env):
 
 def test_peer_device_memory_gather_and_release_resume(peer_env, handle_type):
     _, world_size, device = peer_env
+    if handle_type == "fabric":
+        domain = peer_memory.query_peer_fabric_domain(device.index)
+        assert domain is not None and len(domain[0]) == 32
     exchange = peer_memory.DistributedPeerExchange(
         dist.group.WORLD,
         namespace=f"test-peermem-{handle_type}",

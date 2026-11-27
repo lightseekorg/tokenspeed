@@ -45,6 +45,7 @@ peers with a fresh ``rendezvous_id``.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import functools
 import logging
 import os
@@ -355,6 +356,7 @@ class LocalPeerExchange:
 
     def __init__(self, *, namespace: str = "") -> None:
         self._namespace = namespace
+        self._used_scopes: set[str] = set()
 
     @property
     def rank(self) -> int:
@@ -369,6 +371,12 @@ class LocalPeerExchange:
         return False
 
     def scoped(self, namespace: str) -> LocalPeerExchange:
+        if namespace in self._used_scopes:
+            raise ValueError(
+                f"Peer memory scope {namespace!r} has already been created on "
+                f"{self._namespace!r}"
+            )
+        self._used_scopes.add(namespace)
         prefix = f"{self._namespace}/{namespace}" if self._namespace else namespace
         return LocalPeerExchange(namespace=prefix)
 
@@ -395,6 +403,7 @@ class DistributedPeerExchange:
             )
         self._group = group
         self._namespace = namespace
+        self._used_scopes: set[str] = set()
         self._rank = dist.get_rank(group=group)
         self._world_size = dist.get_world_size(group=group)
 
@@ -411,6 +420,12 @@ class DistributedPeerExchange:
         return False
 
     def scoped(self, namespace: str) -> DistributedPeerExchange:
+        if namespace in self._used_scopes:
+            raise ValueError(
+                f"Peer memory scope {namespace!r} has already been created on "
+                f"{self._namespace!r}"
+            )
+        self._used_scopes.add(namespace)
         prefix = f"{self._namespace}/{namespace}" if self._namespace else namespace
         return DistributedPeerExchange(self._group, namespace=prefix)
 
@@ -432,7 +447,8 @@ class TCPStorePeerExchange:
     created via :func:`serve_peer_rendezvous`, isolating the rendezvous server
     from individual worker restarts. Every key carries the per-launch
     ``rendezvous_id`` and a per-scope monotonic call sequence so repeated
-    exchanges or barriers never collide with earlier keys.
+    exchanges or barriers never collide with earlier keys. Each scope name
+    may be opened only once per parent exchange so sequence numbers stay unique.
     """
 
     def __init__(
@@ -459,6 +475,7 @@ class TCPStorePeerExchange:
         self._rendezvous_id = rendezvous_id
         self._namespace = namespace
         self._seq = 0
+        self._used_scopes: set[str] = set()
 
     @classmethod
     def connect(
@@ -511,6 +528,12 @@ class TCPStorePeerExchange:
         return self._rendezvous_id
 
     def scoped(self, namespace: str) -> TCPStorePeerExchange:
+        if namespace in self._used_scopes:
+            raise ValueError(
+                f"Peer memory scope {namespace!r} has already been created on "
+                f"{self._namespace!r}"
+            )
+        self._used_scopes.add(namespace)
         prefix = f"{self._namespace}/{namespace}" if self._namespace else namespace
         return TCPStorePeerExchange(
             self._store,
@@ -547,16 +570,18 @@ class TCPStorePeerExchange:
 
 
 @functools.cache
-def query_peer_fabric_domain(device_index: int) -> tuple[str, int] | None:
-    """Return ``(cluster_uuid_hex, clique_id)`` from NVML GPU fabric info, or None.
+def query_peer_fabric_domain(device_index: int) -> tuple[str, int]:
+    """Return ``(cluster_uuid_hex, clique_id)`` from NVML GPU fabric info.
 
-    Returns ``None`` when NVML or the GPU fabric query is unavailable on this
-    host (for example on single-node GPUs without an NVLink fabric manager).
-    Raises ``RuntimeError`` when NVML reports an unhealthy or incomplete fabric
-    registration so cross-slice mismatches fail before VMM handle import.
+    Queries ``nvmlDeviceGetGpuFabricInfoV`` using ``c_nvmlGpuFabricInfo_v2_t``
+    so cross-slice fabric mismatches fail before VMM handle import. Fails
+    closed with ``RuntimeError`` whenever the NVML query is unavailable,
+    incomplete, or reports an empty cluster UUID.
     """
     if not platform_supported():
-        return None
+        raise RuntimeError(
+            "NVLink fabric domain query requires an NVIDIA CUDA platform"
+        )
     nvml_initialized = False
     try:
         import pynvml
@@ -569,15 +594,14 @@ def query_peer_fabric_domain(device_index: int) -> tuple[str, int] | None:
             f"{props.pci_device_id:02X}.0"
         )
         handle = pynvml.nvmlDeviceGetHandleByPciBusId(pci_bus_id)
-        query_fn = getattr(pynvml, "nvmlDeviceGetGpuFabricInfoV", None) or getattr(
-            pynvml, "nvmlDeviceGetGpuFabricInfo", None
-        )
-        if query_fn is None:
-            return None
-        info = query_fn(handle)
+        info = pynvml.c_nvmlGpuFabricInfo_v2_t()
+        info.version = pynvml.nvmlGpuFabricInfo_v2
+        pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(info))
         cluster_uuid = bytes(info.clusterUuid)
         if not any(cluster_uuid):
-            return None
+            raise RuntimeError(
+                f"GPU {device_index} reported an empty NVLink fabric clusterUuid"
+            )
         state = int(info.state)
         status = int(info.status)
         if status != 0 or state != _NVML_GPU_FABRIC_STATE_COMPLETED:
@@ -589,16 +613,13 @@ def query_peer_fabric_domain(device_index: int) -> tuple[str, int] | None:
     except RuntimeError:
         raise
     except Exception as exc:
-        logger.debug(
-            f"NVML GPU fabric domain query unavailable on device {device_index}: {exc!s}"
-        )
-        return None
+        raise RuntimeError(
+            f"NVML GPU fabric domain query failed on device {device_index}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
     finally:
         if nvml_initialized:
-            try:
-                pynvml.nvmlShutdown()
-            except Exception:
-                pass
+            pynvml.nvmlShutdown()
 
 
 @functools.cache
@@ -687,19 +708,20 @@ def validate_peer_handle_type(
         raise RuntimeError(
             "Peer GPU VMM fabric handles unavailable: " + "; ".join(errors)
         )
-    if peer_fabric_domains is not None and any(
-        domain is not None for domain in peer_fabric_domains
-    ):
-        domains = set(peer_fabric_domains)
-        if None in domains or len(domains) > 1:
-            summary = ", ".join(
-                f"peer {rank}={domain}"
-                for rank, domain in enumerate(peer_fabric_domains)
-            )
-            raise RuntimeError(
-                "Peer GPU VMM fabric handles require all peers in the same NVLink "
-                f"fabric cluster and clique: {summary}"
-            )
+    if peer_fabric_domains is None:
+        raise RuntimeError(
+            "Peer GPU VMM fabric handles require reported NVLink fabric domains "
+            "from every peer"
+        )
+    domains = set(peer_fabric_domains)
+    if None in domains or len(domains) != 1:
+        summary = ", ".join(
+            f"peer {rank}={domain}" for rank, domain in enumerate(peer_fabric_domains)
+        )
+        raise RuntimeError(
+            "Peer GPU VMM fabric handles require all peers in the same NVLink "
+            f"fabric cluster and clique: {summary}"
+        )
     return "fabric"
 
 
@@ -1023,15 +1045,20 @@ class PeerDeviceMemory:
         """
         if self._closed:
             return
+        sync_error: Exception | None = None
         if not self._released:
             try:
                 torch.cuda.synchronize(self.device_index)
-            except Exception:
-                pass
-        self._backup = None
-        self._finalizer.detach()
-        _cleanup_vmm(self._resources)
-        self._closed = True
+            except Exception as exc:
+                sync_error = exc
+        try:
+            self._backup = None
+            self._finalizer.detach()
+            _cleanup_vmm(self._resources)
+        finally:
+            self._closed = True
+        if sync_error is not None:
+            raise sync_error
 
 
 def create_peer_device_memory(

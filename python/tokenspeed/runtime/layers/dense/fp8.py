@@ -432,27 +432,24 @@ class Fp8LinearMethod(LinearMethodBase):
                 output = output + bias
             return output.view(*output_shape)
 
+    def activation_scale_layouts(self) -> frozenset[str]:
+        """Return the group-32 activation scale layouts this method reads."""
+        layouts = {"canonical"}
+        if self.prepared_weight_scales is not None:
+            layouts.add("swizzled")
+        return frozenset(layouts)
+
     def static_fp8_input_scale(self, layer: torch.nn.Module) -> torch.Tensor | None:
         # Block and dynamic activation scales are found per call, so no producer can apply them.
         return None if self.block_quant else layer.input_scale
 
 
 def fp8_activation_scale_layouts(layer: torch.nn.Module) -> frozenset[str]:
-    """Return the group-32 activation scale layouts ``layer``'s GEMMs read as given.
-
-    ``"canonical"`` is always supported. A prepared ``Fp8LinearMethod`` adds
-    ``"swizzled"`` when ``prepared_weight_scales`` is ready and ``"packed"``
-    when ``projection_weight_scales`` is ready.
-    """
+    """Return the group-32 activation scale layouts ``layer``'s GEMMs read as given."""
     method = layer.quant_method
     if not isinstance(method, Fp8LinearMethod):
         return frozenset({"canonical"})
-    layouts = {"canonical"}
-    if method.prepared_weight_scales is not None:
-        layouts.add("swizzled")
-    if method.projection_weight_scales is not None:
-        layouts.add("packed")
-    return frozenset(layouts)
+    return method.activation_scale_layouts()
 
 
 def prepare_fp8_linear_weight_scales(model: torch.nn.Module) -> None:

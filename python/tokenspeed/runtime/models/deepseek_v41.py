@@ -398,6 +398,12 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
             raise ValueError("DeepGEMM projection weight scales changed layout")
         cached.copy_(prepared)
 
+    def activation_scale_layouts(self) -> frozenset[str]:
+        layouts = set(super().activation_scale_layouts())
+        if self.projection_weight_scales is not None:
+            layouts.add("packed")
+        return frozenset(layouts)
+
     def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
         # Only row-parallel layers preallocate their output, and none of them
         # takes the packed scales, which DeepGEMM's projection writes itself.

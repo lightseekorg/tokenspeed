@@ -138,19 +138,20 @@ def test_validate_peer_handle_type_rules():
         == "posix_fd"
     )
     with pytest.raises(RuntimeError, match="fabric handles unavailable"):
-        peer_memory.validate_peer_handle_type("fabric", [1, 1], [None, "no IMEX"])
-    with pytest.raises(RuntimeError, match="same NVLink fabric cluster and clique"):
         peer_memory.validate_peer_handle_type(
-            "fabric", [1, 2], [None, None], [domain_a, domain_b]
+            "fabric", [1, 1], [None, "no IMEX"], [domain_a, domain_a]
         )
-    with pytest.raises(RuntimeError, match="same NVLink fabric cluster and clique"):
-        peer_memory.validate_peer_handle_type(
-            "fabric", [1, 2], [None, None], [domain_a, domain_a2]
-        )
-    with pytest.raises(RuntimeError, match="same NVLink fabric cluster and clique"):
-        peer_memory.validate_peer_handle_type(
-            "fabric", [1, 2], [None, None], [domain_a, None]
-        )
+    for bad_domains in (
+        None,
+        [domain_a, domain_b],
+        [domain_a, domain_a2],
+        [domain_a, None],
+        [None, None],
+    ):
+        with pytest.raises(RuntimeError, match="fabric"):
+            peer_memory.validate_peer_handle_type(
+                "fabric", [1, 2], [None, None], bad_domains
+            )
     with pytest.raises(RuntimeError, match="one host"):
         peer_memory.validate_peer_handle_type("posix_fd", [1, 2], [None, None])
     with pytest.raises(RuntimeError, match="posix_fd handles unavailable"):
@@ -180,6 +181,8 @@ def _tcp_exchange_worker(rank: int, port: int, rendezvous_id: str) -> None:
     gathered_again = exchange.all_gather_object("hello", {"rank": rank, "round": 2})
     assert gathered_again == [{"rank": 0, "round": 2}, {"rank": 1, "round": 2}]
     scoped = exchange.scoped("L1")
+    with pytest.raises(ValueError, match="already been created"):
+        exchange.scoped("L1")
     assert scoped.all_gather_object("round", rank * 10) == [0, 10]
     assert scoped.all_gather_object("round", rank * 100) == [0, 100]
     scoped.barrier("load-complete")
