@@ -1002,8 +1002,13 @@ On the first uncaptured non-empty launch per CUDA stream, `bf16_mega_gate.py`
 wraps the call in the runtime workspace region registered via
 `set_mega_gate_workspace_region` so DeepGEMM's persistent per-stream barrier
 buffer lands in the CPU-backed `workspace` pool instead of pinning an ordinary
-torch CUDA segment. Graph capture on an uninitialized stream raises
-immediately instead of allocating the barrier inside the graph pool. Callers
+torch CUDA segment. Token counts are padded to canonical warmed buckets
+(`bucket_mega_gate_tokens`: `1`, powers of 2 in `16..65536`, and `65536`
+multiples above) matching `mega_gate_warmup_token_counts(max_tokens)` so
+arbitrary serving batch sizes hit warmed cubins with zero runtime compiles,
+preserving caller `mask=None` vs explicit `mask` presence so padding never
+triggers a hidden mask specialization. Graph capture on an uninitialized stream
+raises immediately instead of allocating the barrier inside the graph pool. Callers
 with a fused MegaMoE shared expert can supply `out=(topk_weights, topk_idx)`
 (FP32 / INT64 views into `symm_buffer`) across eager and captured paths, and on
 uncaptured forwards where `mega_mhc` runs can pair them with direct

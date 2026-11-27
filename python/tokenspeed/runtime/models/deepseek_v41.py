@@ -103,7 +103,7 @@ from tokenspeed_kernel.ops.gemm import (
     warmup_fp8_projection,
     warmup_fp8_projections,
 )
-from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.moe import mega_gate_warmup_token_counts, moe_topk
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
@@ -1952,7 +1952,7 @@ class DeepseekV41MoE(DeepseekV4MoE):
         info = self.expert_dispatch_info
         plan = (
             self._fused_router_call_kwargs(image_mask)
-            if hidden_states.is_cuda
+            if hidden_states.is_cuda and hidden_states.shape[0] <= 65536
             else None
         )
         if plan is not None:
@@ -1998,12 +1998,7 @@ class DeepseekV41MoE(DeepseekV4MoE):
             return
         gate_weight = self.gate.weight
         device = gate_weight.device
-        token_counts = sorted(
-            {
-                min(count, max_tokens)
-                for count in (1, 16, 32, 64, 128, 256, 512, max_tokens)
-            }
-        )
+        token_counts = mega_gate_warmup_token_counts(min(max_tokens, 65536))
         image_modes = (False,) if self.gate.bias_vl is None else (False, True)
         for include_image_bias in image_modes:
             for tokens in token_counts:

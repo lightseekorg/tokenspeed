@@ -29,13 +29,48 @@ from contextlib import AbstractContextManager, nullcontext
 from functools import lru_cache
 
 import torch
+import torch.nn.functional as F
 from tokenspeed_kernel.platform import pdl_enabled, prepare_cuda_toolkit_env
 
 _MAX_TOKENS = 1 << 20
+_WARMUP_BUCKET_CAP = 65536
 _MAX_EXPERTS = 512
 _MAX_TOPK = 32
 _HIDDEN_ALIGNMENT = 256
 _EXPERT_ALIGNMENT = 4
+
+
+def bucket_mega_gate_tokens(num_tokens: int) -> int:
+    """Return the canonical warmed batch size for ``num_tokens`` tokens.
+
+    Keeps exact ``M=1`` latency and buckets larger batches to powers of two
+    starting at 16 (and 64K multiples above 65,536, within ``_MAX_TOKENS``)
+    so arbitrary uncaptured serving batch sizes hit warmed DeepGEMM kernels
+    without runtime JIT compilations.
+    """
+    if num_tokens <= 1:
+        return num_tokens
+    if num_tokens <= _WARMUP_BUCKET_CAP:
+        return max(16, 1 << (num_tokens - 1).bit_length())
+    stride = _WARMUP_BUCKET_CAP
+    rounded = ((num_tokens + stride - 1) // stride) * stride
+    return min(rounded, _MAX_TOKENS)
+
+
+def mega_gate_warmup_token_counts(max_tokens: int) -> list[int]:
+    """Return every canonical ``bf16_mega_gate`` bucket up to ``max_tokens``."""
+    if max_tokens <= 0:
+        return []
+    target_max = bucket_mega_gate_tokens(min(max_tokens, _MAX_TOKENS))
+    counts = [1]
+    bucket = 16
+    while bucket <= min(target_max, _WARMUP_BUCKET_CAP):
+        counts.append(bucket)
+        bucket *= 2
+    if target_max > _WARMUP_BUCKET_CAP:
+        counts.extend(range(2 * _WARMUP_BUCKET_CAP, target_max + 1, _WARMUP_BUCKET_CAP))
+    return counts
+
 
 _INIT_LOCK = threading.Lock()
 _INITIALIZED_STREAMS: set[tuple[int, int]] = set()
@@ -172,6 +207,26 @@ def bf16_mega_gate(
                 "hidden_states and gate_weight must be contiguous BF16 tensors on one CUDA device"
             )
 
+    if image_token_mask is not None and (
+        image_token_mask.ndim != 1
+        or image_token_mask.shape[0] != num_tokens
+        or image_token_mask.device != device
+    ):
+        raise ValueError(
+            f"image_token_mask must be 1D with length {num_tokens} on {device}"
+        )
+    if mask is not None and (
+        mask.ndim != 1 or mask.shape[0] != num_tokens or mask.device != device
+    ):
+        raise ValueError(f"mask must be 1D with length {num_tokens} on {device}")
+    if unmapped_topk_idx is not None and (
+        unmapped_topk_idx.shape != (num_tokens, top_k)
+        or unmapped_topk_idx.device != device
+    ):
+        raise ValueError(
+            f"unmapped_topk_idx must have shape [{num_tokens}, {top_k}] on {device}"
+        )
+
     out_arg: tuple[torch.Tensor, torch.Tensor] | None = None
     if out is not None:
         out_weights, out_idx = out
@@ -203,13 +258,54 @@ def bf16_mega_gate(
             torch.empty((0, top_k), dtype=torch.int64, device=device),
         )
 
+    padded_tokens = bucket_mega_gate_tokens(num_tokens)
     api = _api()
     if api.get_pdl() != pdl_enabled():
         api.set_pdl(pdl_enabled())
 
     def _launch():
-        return api.bf16_mega_gate(
-            x=hidden_states,
+        if padded_tokens == num_tokens:
+            return api.bf16_mega_gate(
+                x=hidden_states,
+                weight=gate_weight,
+                num_topk=int(top_k),
+                use_shared_as_routed=False,
+                num_shared_experts=0,
+                routed_scaling_factor=float(routed_scaling_factor),
+                ep_rank=0 if ep_rank is None else int(ep_rank),
+                scoring_func="sqrtsoftplus",
+                mask=mask,
+                bias=correction_bias,
+                image_bias=image_bias,
+                image_token_mask=image_token_mask,
+                fix_routing_mask=None,
+                to_physical_map=to_physical_map,
+                logical_count=logical_count,
+                unmapped_topk_idx=unmapped_topk_idx,
+                force_random=None,
+                out=out_arg,
+            )
+        # Pad only to canonical warmed buckets; keep mask=None when the caller
+        # passed mask=None because DeepGEMM specializes on mask presence.
+        extra = padded_tokens - num_tokens
+        hidden_in = F.pad(hidden_states, (0, 0, 0, extra))
+        image_mask_in = (
+            F.pad(image_token_mask, (0, extra), value=False)
+            if image_token_mask is not None
+            else None
+        )
+        mask_in = F.pad(mask, (0, extra), value=False) if mask is not None else None
+        unmapped_in = (
+            torch.empty(
+                (padded_tokens, top_k),
+                dtype=unmapped_topk_idx.dtype,
+                device=device,
+            )
+            if unmapped_topk_idx is not None
+            else None
+        )
+        padded_idx, padded_weights = api.bf16_mega_gate(
+            x=hidden_in,
             weight=gate_weight,
             num_topk=int(top_k),
             use_shared_as_routed=False,
@@ -217,17 +313,27 @@ def bf16_mega_gate(
             routed_scaling_factor=float(routed_scaling_factor),
             ep_rank=0 if ep_rank is None else int(ep_rank),
             scoring_func="sqrtsoftplus",
-            mask=mask,
+            mask=mask_in,
             bias=correction_bias,
             image_bias=image_bias,
-            image_token_mask=image_token_mask,
+            image_token_mask=image_mask_in,
             fix_routing_mask=None,
             to_physical_map=to_physical_map,
             logical_count=logical_count,
-            unmapped_topk_idx=unmapped_topk_idx,
+            unmapped_topk_idx=unmapped_in,
             force_random=None,
-            out=out_arg,
+            out=None,
         )
+        sliced_idx = padded_idx[:num_tokens]
+        sliced_weights = padded_weights[:num_tokens]
+        if unmapped_topk_idx is not None and unmapped_in is not None:
+            unmapped_topk_idx.copy_(unmapped_in[:num_tokens])
+        if out is not None:
+            out_weights, out_idx = out
+            out_weights.copy_(sliced_weights)
+            out_idx.copy_(sliced_idx)
+            return out_idx, out_weights
+        return sliced_idx, sliced_weights
 
     topk_idx, topk_weights = _call_with_workspace_region(device, _launch)
     return topk_weights, topk_idx

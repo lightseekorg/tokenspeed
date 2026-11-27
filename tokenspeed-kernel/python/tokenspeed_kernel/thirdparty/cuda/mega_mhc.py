@@ -21,6 +21,7 @@
 """Optional DeepGEMM shifted mHC adapter, with caller-owned BF16 outputs."""
 
 import inspect
+import re
 from functools import lru_cache
 
 import torch
@@ -51,13 +52,16 @@ def is_mega_mhc_direct_staging_available() -> bool:
     """Return whether installed DeepGEMM accepts direct MegaMoE staging targets."""
     if not is_mega_mhc_available():
         return False
+    fn = _api().mega_mhc
+    required = ("y_routed_sf", "y_shared_sf", "shared_sf_block_m")
     try:
-        params = inspect.signature(_api().mega_mhc).parameters
+        params = inspect.signature(fn).parameters
+        return all(name in params for name in required)
     except (TypeError, ValueError):
-        return False
-    return all(
-        name in params for name in ("y_routed_sf", "y_shared_sf", "shared_sf_block_m")
-    )
+        # Builtin nanobind/pybind11 C++ extensions lack Python inspect
+        # signatures and expose their keyword parameters in __doc__.
+        doc = getattr(fn, "__doc__", None) or ""
+        return all(re.search(rf"\b{name}\b", doc) is not None for name in required)
 
 
 def _launch(

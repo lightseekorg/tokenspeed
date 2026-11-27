@@ -281,6 +281,9 @@ def test_direct_mega_mhc_and_router_staging_skips_stage_kernel(monkeypatch):
         try_mhc_shifted_post_pre_norm_quantize_fp8,
     )
     from tokenspeed_kernel.thirdparty.cuda.mega_gate import is_bf16_mega_gate_available
+    from tokenspeed_kernel.thirdparty.cuda.mega_mhc import (
+        is_mega_mhc_direct_staging_available,
+    )
     from utils import assert_no_triton_compile
 
     plan = {
@@ -298,6 +301,7 @@ def test_direct_mega_mhc_and_router_staging_skips_stage_kernel(monkeypatch):
         mega_moe.deep_gemm_mxfp4_mega_moe_apply._tokenspeed_prepare_mega_moe_buffers
     )
     assert is_bf16_mega_gate_available()
+    assert is_mega_mhc_direct_staging_available()
 
     g = torch.Generator(device="cuda").manual_seed(9)
     tokens = 48

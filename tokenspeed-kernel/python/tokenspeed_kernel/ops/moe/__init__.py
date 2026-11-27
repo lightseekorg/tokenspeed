@@ -2505,6 +2505,15 @@ def set_mega_gate_workspace_region(region) -> None:
     _set_region(region)
 
 
+def mega_gate_warmup_token_counts(max_tokens: int) -> list[int]:
+    """Return canonical warmed token counts for SM100 MegaGate up to ``max_tokens``."""
+    from tokenspeed_kernel.thirdparty.cuda.mega_gate import (
+        mega_gate_warmup_token_counts as _warmup_counts,
+    )
+
+    return _warmup_counts(max_tokens)
+
+
 def moe_warmup(plan: dict, w: torch.nn.Module, *, max_num_tokens: int) -> None:
     """Warm ``plan``'s selected backend using ``w``'s processed expert weights.
 

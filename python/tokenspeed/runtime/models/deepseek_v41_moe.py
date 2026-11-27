@@ -38,6 +38,7 @@ from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo,
     StandardTopKOutput,
     TopK,
     TopKOutput,
@@ -49,10 +50,7 @@ from tokenspeed.runtime.layers.moe.topk import (
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.moe.expert_location import (
-    ExpertLocationDispatchInfo,
-    get_global_expert_location_metadata,
-)
+from tokenspeed.runtime.moe.expert_location import get_global_expert_location_metadata
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict

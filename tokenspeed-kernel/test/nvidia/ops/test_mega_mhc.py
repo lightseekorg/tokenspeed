@@ -319,6 +319,29 @@ def test_shifted_mhc_omits_direct_staging_kwargs_and_feature_detects(monkeypatch
             is None
         )
         assert len(seen_kwargs) == 2
+
+        # Builtin nanobind/pybind11 callables raise ValueError from
+        # inspect.signature and fall back to __doc__ parameter matching.
+        class _BuiltinDocCallable:
+            def __init__(self, doc: str) -> None:
+                self.__doc__ = doc
+
+            def __call__(self, *call_args, **call_kwargs):
+                return real_fn(*call_args, **call_kwargs)
+
+        monkeypatch.setattr(
+            real_api,
+            "mega_mhc",
+            _BuiltinDocCallable(
+                "mega_mhc(..., y_routed_sf: Tensor, y_shared_sf: Tensor, shared_sf_block_m: int)"
+            ),
+        )
+        native.is_mega_mhc_direct_staging_available.cache_clear()
+        assert native.is_mega_mhc_direct_staging_available()
+
+        monkeypatch.setattr(real_api, "mega_mhc", _BuiltinDocCallable("mega_mhc(...)"))
+        native.is_mega_mhc_direct_staging_available.cache_clear()
+        assert not native.is_mega_mhc_direct_staging_available()
     finally:
         native.is_mega_mhc_available.cache_clear()
         native.is_mega_mhc_direct_staging_available.cache_clear()
