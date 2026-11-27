@@ -408,8 +408,9 @@ the model holds fails the request with the weights unchanged. The held shapes
 are captured from the files selected at startup, so this check survives removal
 of the original source. A dummy/config-only startup snapshots already-local
 safetensors headers if present; it does not download weights for this check.
-Without those headers, or for object-store streams, only the new shards' header
-validity is checked, without a held-source shape comparison. A failure after
+Without a snapshot (including object-store streams and loaders that do not
+provide canonical checkpoint shapes), only the new shards' header validity is
+checked, without a held-source shape comparison. A failure after
 the load has started says that the worker's weights may now mix the two
 checkpoints: reload a complete checkpoint or restart the engine before relying
 on its output. The weight version does not advance on any failure.

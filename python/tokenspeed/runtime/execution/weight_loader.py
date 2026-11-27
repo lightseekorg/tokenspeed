@@ -32,6 +32,7 @@ from tokenspeed.runtime.model_loader.loader import (
     CheckpointFileSelection,
     CheckpointShapeProvider,
     DefaultModelLoader,
+    DummyModelLoader,
 )
 from tokenspeed.runtime.model_loader.weight_utils import (
     require_unit_kv_scale_file,
@@ -64,7 +65,7 @@ class WeightLoader:
     def checkpoint_shapes(
         model_config: ModelConfig, model: torch.nn.Module
     ) -> dict[str, tuple[int, ...]]:
-        """Read optional local headers when loading produced no shape metadata.
+        """Read optional local headers for dummy/config-only startup.
 
         Dummy/config-only startup does not download weights. If its source
         already contains safetensors, preserve the same reload preflight as a
@@ -204,9 +205,11 @@ class WeightLoader:
             f"mem={get_available_gpu_memory(device, gpu_id):.2f} GB",
         )
 
-        shapes = (
-            loader.checkpoint_shapes
-            if isinstance(loader, CheckpointShapeProvider)
-            else WeightLoader.checkpoint_shapes(model_config, model)
-        )
+        if isinstance(loader, CheckpointShapeProvider):
+            shapes = loader.checkpoint_shapes
+        elif isinstance(loader, DummyModelLoader):
+            shapes = WeightLoader.checkpoint_shapes(model_config, model)
+        else:
+            # Rank-local state and custom formats need not use checkpoint shapes.
+            shapes = {}
         return LoadedModel(model=model, checkpoint_shapes=dict(shapes))

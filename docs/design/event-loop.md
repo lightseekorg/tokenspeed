@@ -83,14 +83,14 @@ rank, and propagate failures to startup. Registration joins the plugin loader's
 normal recording and rollback.
 
 The host reads its tokenizer and preserves safetensors shapes from the selected
-files while loading weights, before this boundary. A loader that does not stream
-tensors (such as `dummy`) snapshots already-local safetensors headers if present;
-config-only startup does not download a checkpoint for this metadata. Later disk updates
-validate against the saved shapes rather than reopening the initial source.
-Without local safetensors headers (including object-store streams and remote
-config-only startup), no held-source shape comparison is available; new shards
-are still validated before loading. Explicit reload requests require the new
-checkpoint they name.
+files while loading weights, before this boundary. Dummy/config-only startup
+snapshots already-local safetensors headers if present, without downloading a
+checkpoint for this metadata. Later disk updates validate against the saved
+shapes rather than reopening the initial source. Rank-local state and custom
+loaders must supply canonical checkpoint shapes to support this comparison;
+their storage layouts need not match a regular checkpoint. Without a snapshot,
+new shards are still validated before loading. Explicit reload requests require
+the new checkpoint they name.
 
 Plugins must prepare their own metadata before retiring a source. The world
 CPU group coordinates one engine only: a source shared by independently
