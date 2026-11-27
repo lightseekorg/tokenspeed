@@ -1286,7 +1286,6 @@ class PrefillGraph:
         if self.dp_size > 1:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
             ctx.global_bs = [bs] * self.config.world_size
-            ctx.global_decoder_rows = [num_tokens] * self.config.world_size
             ctx.all_extend = True
             ctx.all_extend_or_idle = True
         # Every backend gets the same kwargs; V4 reads num_tokens/positions
@@ -1368,6 +1367,13 @@ class PrefillGraph:
                     forward_mode=ForwardMode.EXTEND,
                     **extend_kwargs,
                 )
+        if self.dp_size > 1:
+            decoder_rows = (
+                self._narrowing.decoder_rows(ctx)
+                if self._narrowing is not None
+                else num_tokens
+            )
+            ctx.global_decoder_rows = [decoder_rows] * self.config.world_size
         return ctx
 
     # ------------------------------------------------------------------
@@ -1732,9 +1738,10 @@ class PrefillGraph:
             # Narrowing models never capture inline (tokens, bs) variants, so
             # active and idle DP ranks always pick the identical bucket without
             # consulting rank-local ctx.bs.
-            assert (
-                not self._captures
-            ), "narrowing prefill graphs never capture inline (tokens, bs) variants"
+            if self._captures:
+                raise RuntimeError(
+                    "narrowing prefill graphs never capture inline (tokens, bs) variants"
+                )
             return bucket
         # A full token bucket may have no room for padded native scan slots.
         # Reuse the next existing token bucket; never capture while serving.

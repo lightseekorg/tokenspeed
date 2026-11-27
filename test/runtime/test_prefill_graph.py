@@ -1810,6 +1810,48 @@ class TestNarrowingPrefillGraphTest:
                 request_token_history=None,
             )
 
+    def test_dp_make_dummy_batch_uses_narrowed_decoder_rows(self):
+        """Under DP, _make_dummy_batch populates global_decoder_rows from
+        model.decoder_rows(ctx) after init_forward_metadata so warmup/autotune
+        batches that narrow below num_tokens match decoder_collective_counts."""
+        torch = self.torch
+        model, _ = self._model(128, [])
+        pg = self.mod.PrefillGraph.__new__(self.mod.PrefillGraph)
+        pg.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=False, device="cpu"
+        )
+        pg._narrowing = model
+        pg.dp_size = 4
+        pg.drafter = None
+        pg.config = SimpleNamespace(
+            world_size=4,
+            context_len=1024,
+            physical_context_len=1024,
+            device="cpu",
+            query_shard_size=1,
+            query_shard_rank=0,
+        )
+        pg.token_to_kv_pool = _fake_pool(runtime_contract=object())
+        pg.attn_backend = SimpleNamespace(init_forward_metadata=lambda **kwargs: None)
+        pg.input_buffers = SimpleNamespace(
+            input_ids_buf=torch.zeros(512, dtype=torch.int64),
+            positions_buf=torch.zeros(512, dtype=torch.int64),
+            req_pool_indices_buf=torch.zeros(8, dtype=torch.int64),
+            seq_lens_buf=torch.zeros(8, dtype=torch.int32),
+            extend_seq_lens_buf=torch.zeros(8, dtype=torch.int32),
+            extend_seq_lens_cpu=torch.zeros(8, dtype=torch.int32),
+            extend_prefix_lens_buf=torch.zeros(8, dtype=torch.int32),
+            extend_prefix_lens_cpu=torch.zeros(8, dtype=torch.int32),
+            extend_replay_lens_cpu=torch.zeros(8, dtype=torch.int32),
+            extend_prompt_lens_cpu=torch.zeros(8, dtype=torch.int32),
+            input_lengths_buf=torch.zeros(8, dtype=torch.int32),
+            prepare_request_token_history_inputs=lambda **kwargs: None,
+        )
+        ctx = pg.make_dummy_batch(512, 1)
+        assert ctx.global_num_tokens == [512] * 4
+        assert ctx.global_decoder_rows == [128] * 4
+        assert ctx.all_extend and ctx.all_extend_or_idle
+
 
 class TestTrtllmPrefillGraphSeamsTest:
     """trtllm leaves reach the prefill graph through the cache-group router."""
