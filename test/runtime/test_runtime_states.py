@@ -212,6 +212,9 @@ def _scheduled_batch():
     """Two prompts' first forward, as the scheduler plans it."""
     kinds = {"state": ts.AttnKind.State, "full_history": ts.AttnKind.Full}
     config = make_config(
+        prefix_cache_evict_policy="lru",
+        prefix_cache_gds_prefill_cost=None,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=_PAGES,
         max_scheduled_tokens=64,
         max_batch_size=2,

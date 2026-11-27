@@ -329,7 +329,7 @@ TEST(SwaSink, DemotedChainStillEvictsItsSinkLast) {
         Put(coordinator, pool, slot, 10);
         keys.push_back(CacheKey{.content_hash = ContentHash{kHashes[slot]}});
     }
-    EXPECT_EQ(coordinator.DemoteEntries(keys), 6);
+    EXPECT_EQ(coordinator.DemoteEntries(keys, CacheCoordinator::DemotionCause::kPeerHandoff), 6);
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{20}}};
     ASSERT_TRUE(lone.Admit(coordinator.Prober().ProbePrefix({}), demands, {}, {}, std::nullopt, std::nullopt, {},

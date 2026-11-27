@@ -824,7 +824,8 @@ class TestPagedRouterNameResolution:
 
 
 class TestDecodeHostL2:
-    def test_decode_enables_host_l2_without_prefix_matching(self):
+    @pytest.mark.parametrize("in_forward", [False, True])
+    def test_decode_enables_host_l2_without_prefix_matching(self, in_forward):
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "decode"
         args.kv_parallel_size = 1
@@ -832,11 +833,24 @@ class TestDecodeHostL2:
         args.enable_kvstore = False
         args.enable_prefix_caching = False
         args.kvstore_io_backend = "kernel"
+        args.enable_state_checkpoint_in_forward = in_forward
 
         args._handle_kvstore()
         args.validate_cache_options()
 
         assert args.enable_kvstore
+
+
+@pytest.mark.parametrize("role", ["null", "prefill", "encode"])
+def test_cache_validation_rejects_in_forward_checkpoints_without_prefix_caching(role):
+    args = object.__new__(ServerArgs)
+    args.disaggregation_mode = role
+    args.enable_kvstore = False
+    args.enable_prefix_caching = False
+    args.enable_state_checkpoint_in_forward = True
+
+    with pytest.raises(ValueError, match="requires prefix caching"):
+        args.validate_cache_options()
 
 
 class TestDisaggregationGraphFlags:

@@ -725,6 +725,56 @@ DiskStatsView disk_stats(const tokenspeed::Scheduler& scheduler) {
     };
 }
 
+rust::Vec<CacheReleaseView> cache_release_stats(const tokenspeed::Scheduler& scheduler) {
+    rust::Vec<CacheReleaseView> result;
+    for (const auto& stats : scheduler.GetCacheReleaseStats()) {
+        result.push_back({stats.group_id, stats.tier == tokenspeed::CacheTier::kHost, stats.child_slots, stats.parents});
+    }
+    return result;
+}
+
+GdsStatsView gds_stats(const tokenspeed::Scheduler& scheduler) {
+    const auto stats = scheduler.GetHostCacheStats().gds_evictions;
+    return GdsStatsView{
+        .evicted_units = stats.evicted_units,
+        .retention_rejections = stats.retention_rejections,
+        .demoted_units = stats.demoted_units,
+        .mixed_tier_units = stats.mixed_tier_units,
+        .orphan_blocks = stats.orphan_blocks,
+        .fallback_blocks = stats.fallback_blocks,
+        .fallback_units = stats.fallback_units,
+        .watermark = stats.watermark,
+        .logical_evictions = stats.logical_evictions,
+        .logical_rejections = stats.logical_rejections,
+        .device_copies_released = stats.device_copies_released,
+        .host_copies_reserved = stats.host_copies_reserved,
+        .host_copy_rejections = stats.host_copy_rejections,
+        .host_clean_copies_released = stats.host_clean_copies_released,
+        .disk_recoverable_units = stats.disk_recoverable_units,
+        .disk_route_losses = stats.disk_route_losses,
+        .checkpoint_planned = stats.checkpoint_planned,
+        .checkpoint_allocated = stats.checkpoint_allocated,
+        .checkpoint_materialized = stats.checkpoint_materialized,
+        .checkpoint_published = stats.checkpoint_published,
+        .checkpoint_cancelled = stats.checkpoint_cancelled,
+        .checkpoint_extra_blocks = stats.checkpoint_extra_blocks,
+        .checkpoint_chunk_end_fallbacks = stats.checkpoint_chunk_end_fallbacks,
+        .checkpoint_fresh_rejected = stats.checkpoint_fresh_rejected,
+        .checkpoint_rejected_extra_blocks = stats.checkpoint_rejected_extra_blocks,
+        .checkpoint_rejected_unmeasured = stats.checkpoint_rejected_unmeasured,
+        .committed_plans = stats.committed_plans,
+        .planning_nanoseconds = stats.planning_nanoseconds,
+        .ready_units = stats.ready_units,
+        .device_ready_units = stats.device_ready_units,
+        .pending_units = stats.pending_units,
+        .broken_units = stats.broken_units,
+        .dependency_points = stats.dependency_points,
+        .dependency_ranges = stats.dependency_ranges,
+        .dependency_leaves = stats.dependency_leaves,
+        .host_watermark = stats.host_watermark,
+    };
+}
+
 PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler) {
     const tokenspeed::HostCacheStats stats = scheduler.GetHostCacheStats();
     return PrefixHitView{
@@ -732,6 +782,8 @@ PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler) {
         .device_hit_tokens = stats.prefix_hits.device_hit_tokens,
         .host_hit_tokens = stats.prefix_hits.host_hit_tokens,
         .peer_hit_tokens = stats.prefix_hits.peer_hit_tokens,
+        .host_gain_tokens = stats.prefix_hits.host_gain_tokens,
+        .unresumable_kv_tokens = stats.prefix_hits.unresumable_kv_tokens,
         .l3_hit_tokens = stats.storage_query_hit_tokens,
     };
 }
