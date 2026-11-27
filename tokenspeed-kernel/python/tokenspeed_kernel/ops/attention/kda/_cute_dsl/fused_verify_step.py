@@ -463,7 +463,8 @@ class FusedVerifyStep:
             if warp >= WARPS:
                 # The gate warps wait on the history copy barrier.
                 _sync_history_warps()
-            accepted = retained_length(retained, slot)
+            # A one-token verify window.
+            accepted = retained_length(retained, slot, self.capacity - 1)
             projected_history = (accepted > 0) & (accepted <= _MAX_PROJECTED_HISTORY)
             if (accepted == 0) | projected_history:
                 tile_src = state + (

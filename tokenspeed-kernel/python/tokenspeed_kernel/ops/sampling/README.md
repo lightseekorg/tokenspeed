@@ -170,6 +170,9 @@ representation as well as signed zero.
 `full_vocab_pack` gathers the prediction row and writes the sampled ID, tail
 bits, head IDs, head bits and private sampled-score bits in one launch. Both
 helpers have Torch reference leaves; GPU dispatch uses the kernel registry.
+The fused head and pack leaves are selected on NVIDIA. AMD keeps the Torch
+leaves because its fused subtraction does not preserve Torch's exceptional
+NaN payload/sign bits. The full-vocabulary output contract is unchanged.
 
 Row counts and strides are runtime inputs; only vocabulary geometry, K and
 subtraction form specialize the helpers. No helper keeps persistent buffers.

@@ -31,7 +31,9 @@ Head gathering and its explicit subtraction form are computed directly during
 packing. Inspecting the scores materializes head values on demand, without
 retaining another buffer on the serving path. Negative cross-entropy still
 flips the rounded difference's sign bit, except for NaN, whose arithmetic
-representation is preserved to match Torch.
+representation is preserved to match Torch. NVIDIA uses fused head/pack
+helpers; AMD retains the original Torch leaves because the fused subtraction
+does not preserve its exceptional NaN payload/sign bits.
 
 This work runs on the same eager/graph path and uses a fixed K for the deployment.
 The graph's padded outputs are sliced to the live batch. Verification maps the

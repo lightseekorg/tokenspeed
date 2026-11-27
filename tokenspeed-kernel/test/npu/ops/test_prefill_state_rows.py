@@ -53,11 +53,6 @@ def exact(actual, expected):
 
 
 def test_index_alignment_without_recompile():
-    from tokenspeed_kernel.ops.attention.gdn._triton.prefill_state_inputs import (
-        _prepare_prefill_state_inputs_kernel,
-    )
-    from tokenspeed_kernel.ops.kvcache.triton import _store_state_rows_kernel
-
     for dtype in (torch.int32, torch.int64):
         conv = torch.randn(8, 3, 32, dtype=torch.bfloat16, device="npu")
         slab = torch.randn(8, 2, 16, 16, device="npu")
@@ -95,11 +90,13 @@ def test_store_cases():
         actual_backing = backing.npu()
         slab = actual_backing[1::2, ::2, 1::2, ::2].transpose(-1, -2)
         ref = expected_backing[1::2, ::2, 1::2, ::2].transpose(-1, -2)
-        for ids in [[1, -1, 3], [5], [2, 4, -1, -1, 1, 0], [-1, -1]]:
+        # Block 0 is the null block; it, padding, and ids past the slab's six
+        # blocks are skipped.
+        for ids in [[1, -1, 3], [5], [2, 4, -1, -1, 1, 0], [-1, -1], [0, 6, 3, -7]]:
             values = torch.randn(len(ids), 4, 9, 5).transpose(-1, -2)
             states = values.transpose(-1, -2).contiguous().npu().transpose(-1, -2)
             for i, dest in enumerate(ids):
-                if dest >= 0:
+                if 0 < dest < ref.shape[0]:
                     ref[dest].copy_(values[i].to(target_dtype))
             store_state_rows(
                 states, slab, torch.tensor(ids, dtype=torch.int32, device="npu")

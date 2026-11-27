@@ -25,7 +25,10 @@ from test.utils import assert_no_triton_compile
 import pytest
 import torch
 from tokenspeed_kernel.ops.sampling import FullVocabTopK
-from tokenspeed_kernel.ops.sampling.full_vocab import full_vocab_active_rows
+from tokenspeed_kernel.ops.sampling.full_vocab import (
+    FullVocabScores,
+    full_vocab_active_rows,
+)
 from tokenspeed_kernel.ops.sampling.torch import (
     torch_block_sumexp,
     torch_full_vocab_active_rows,
@@ -283,18 +286,23 @@ def test_head_and_pack_preserve_exceptional_bits_on_graph_replay(
     tail = torch.zeros(4, device="cuda")
 
     def run():
-        head = triton_full_vocab_head(values, ids, log_z, form=form)
-        packed = triton_full_vocab_pack(
-            values,
-            log_z,
-            ids,
-            head if materialized_head else None,
-            tail,
-            tokens,
-            prediction_rows=None,
+        scores = FullVocabScores(
+            shifted=values,
+            log_z=log_z,
+            ids=ids,
+            _head=None,
+            log_tail=tail,
             form=form,
+            vocab_block=8,
+            kernel_name="torch",
         )
-        return head, packed
+        head = scores.logprobs
+        if materialized_head:
+            from dataclasses import replace
+
+            scores = replace(scores, _head=head)
+        packed, sampled = scores.pack(tokens, prediction_rows=None)
+        return head, packed, sampled
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -303,7 +311,7 @@ def test_head_and_pack_preserve_exceptional_bits_on_graph_replay(
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        head, packed = run()
+        head, packed, sampled = run()
     for _ in range(2):
         graph.replay()
         expected_head = torch_full_vocab_head(values, ids, log_z, form=form)
@@ -318,7 +326,8 @@ def test_head_and_pack_preserve_exceptional_bits_on_graph_replay(
             form=form,
         )
         _bits_equal(head, expected_head)
-        assert torch.equal(packed, expected_pack)
+        assert torch.equal(packed, expected_pack[:, :-1])
+        _bits_equal(sampled, expected_pack[:, -1].view(torch.float32))
         log_z.copy_(log_z.roll(1))
 
 
@@ -409,3 +418,16 @@ def test_source_shift_large_row_offset_and_runtime_strides():
     source, shifted = triton_full_vocab_source_shift(logits, maximum)
     _bits_equal(source, logits)
     _bits_equal(shifted, logits - maximum[:, None])
+
+
+def test_fold_large_block_stride_does_not_wrap_int32():
+    stride = 2**30 + 1
+    required = (2 * stride + 2) * 4
+    if torch.cuda.mem_get_info()[0] < required + 2**30:
+        pytest.skip("large block-stride test needs 9 GiB free")
+    values = torch.empty_strided((2, 3), (1, stride), device="cuda")
+    compact = torch.tensor([[1.0, 2**-24, 2**-24], [0.25, 0.5, 1.0]], device="cuda")
+    values.copy_(compact)
+    expected = compact[:, 0] + compact[:, 1]
+    expected = expected + compact[:, 2]
+    _bits_equal(triton_full_vocab_sum(values), expected)

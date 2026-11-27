@@ -27,6 +27,7 @@ and closes its local sinks before those sessions within a shared time budget.
 from __future__ import annotations
 
 import atexit
+import importlib.metadata
 import logging
 import threading
 import time
@@ -157,8 +158,20 @@ class MetricsService:
                 self.close(timeout=_STARTUP_CLEANUP_TIMEOUT)
                 raise
 
-    def connect(self, configs: dict[str, MetricConfig]) -> None:
-        """Configure lazy process-local outputs from serializable producer data."""
+    def connect(
+        self,
+        configs: dict[str, MetricConfig],
+        *,
+        reporter_entry_points: list[str] | None = None,
+    ) -> None:
+        """Configure lazy process-local outputs from serializable producer data.
+
+        Args:
+            configs: Validated producer configurations from the launcher.
+            reporter_entry_points: Successful launcher registrations to replay in
+                an isolated relay. Omit in other producers to retain full plugin
+                discovery, its loading lock and registration rollback semantics.
+        """
         with self._lock:
             if self._sinks_closed or self._nodes_closed or self._closed:
                 raise RuntimeError("Cannot connect a closed metrics service")
@@ -173,7 +186,15 @@ class MetricsService:
                     raise RuntimeError("Cannot replace an active metrics configuration")
                 return
             if copied:
-                ensure_metric_reporters_loaded()
+                if reporter_entry_points is None:
+                    ensure_metric_reporters_loaded()
+                else:
+                    for value in reporter_entry_points:
+                        importlib.metadata.EntryPoint(
+                            name="metrics-relay",
+                            value=value,
+                            group="tokenspeed.plugins",
+                        ).load()()
                 for name in copied:
                     get_metric_reporter(name)
             self._producer_configs = copied

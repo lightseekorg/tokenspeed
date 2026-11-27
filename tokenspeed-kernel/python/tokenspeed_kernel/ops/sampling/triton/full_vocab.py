@@ -75,12 +75,13 @@ def _full_vocab_head(
     tl.store(out + row * K + col, head, col < K)
 
 
+# AMD retains the Torch leaf: fused subtraction changes NaN payload/sign bits.
 @register_kernel(
     "sampling",
     "full_vocab_head",
     name="triton_full_vocab_head",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=format_signatures("values", "dense", {torch.float32}),
     priority=Priority.PERFORMANT,
 )
@@ -138,7 +139,9 @@ def _full_vocab_sum(
     # No parallel reduction, reassociation or logarithm: this is the original
     # FP32 left fold. Torch still supplies the original log implementation.
     for block in range(1, BLOCKS):
-        total = total + tl.load(base + block * stride_block, row < rows, other=0.0)
+        total = total + tl.load(
+            base + block * stride_block.to(tl.int64), row < rows, other=0.0
+        )
     tl.store(out + row, total, row < rows)
 
 
@@ -252,7 +255,7 @@ def _full_vocab_pack(
     "full_vocab_pack",
     name="triton_full_vocab_pack",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=format_signatures("values", "dense", {torch.float32}),
     priority=Priority.PERFORMANT,
 )

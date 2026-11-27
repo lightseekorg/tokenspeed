@@ -236,37 +236,37 @@ at::Tensor maximum_from_topk(at::Tensor logits, at::Tensor values) {
       FirstMaximum::Pair(-INFINITY, INT64_MAX));
 }
 
-at::Tensor selected_tail(at::Tensor shifted, at::Tensor ids, at::Tensor log_z,
+at::Tensor selected_tail(at::Tensor logits, at::Tensor ids, at::Tensor log_z,
                          at::Tensor row_maximum, at::Tensor active) {
-  c10::cuda::CUDAGuard guard(shifted.device());
-  TORCH_CHECK(shifted.is_cuda() && shifted.scalar_type() == at::kFloat &&
-              shifted.dim() == 2 && shifted.is_contiguous());
+  c10::cuda::CUDAGuard guard(logits.device());
+  TORCH_CHECK(logits.is_cuda() && logits.scalar_type() == at::kFloat &&
+              logits.dim() == 2 && logits.is_contiguous());
   TORCH_CHECK(ids.scalar_type() == at::kLong && ids.is_contiguous() &&
-              ids.size(0) == shifted.size(0));
+              ids.size(0) == logits.size(0));
   TORCH_CHECK(log_z.scalar_type() == at::kFloat &&
-              log_z.numel() == shifted.size(0));
+              log_z.numel() == logits.size(0));
   TORCH_CHECK(row_maximum.scalar_type() == at::kFloat && row_maximum.is_contiguous() &&
-              row_maximum.numel() == shifted.size(0));
+              row_maximum.numel() == logits.size(0));
   TORCH_CHECK(active.scalar_type() == at::kBool && active.is_contiguous() &&
-              active.numel() == shifted.size(0));
-  TORCH_CHECK(ids.device() == shifted.device() &&
-              log_z.device() == shifted.device() &&
-              row_maximum.device() == shifted.device() &&
-              active.device() == shifted.device());
-  int64_t words = (shifted.size(1) + 31) / 32;
+              active.numel() == logits.size(0));
+  TORCH_CHECK(ids.device() == logits.device() &&
+              log_z.device() == logits.device() &&
+              row_maximum.device() == logits.device() &&
+              active.device() == logits.device());
+  int64_t words = (logits.size(1) + 31) / 32;
   auto mask =
-      at::empty({shifted.size(0), words}, ids.options().dtype(at::kInt));
-  build_head_mask<<<shifted.size(0), 128, 0,
+      at::empty({logits.size(0), words}, ids.options().dtype(at::kInt));
+  build_head_mask<<<logits.size(0), 128, 0,
                     at::cuda::getCurrentCUDAStream()>>>(
       ids.data_ptr<int64_t>(), active.data_ptr<bool>(),
       reinterpret_cast<uint32_t *>(mask.data_ptr<int>()), words, ids.size(1));
   auto maximum = reduce_rows(
-      shifted, active,
+      logits, active,
       MaskMax{reinterpret_cast<const uint32_t *>(mask.data_ptr<int>()), words,
               0},
       -INFINITY);
   return reduce_rows(
-      shifted, active,
+      logits, active,
       MaskExpSum{reinterpret_cast<const uint32_t *>(mask.data_ptr<int>()),
                  maximum.data_ptr<float>(), log_z.data_ptr<float>(),
                  row_maximum.data_ptr<float>(), words, 0},
@@ -278,6 +278,6 @@ TORCH_LIBRARY(tokenspeed_full_vocab, m) {
         &selected_topk);
   m.def("maximum(Tensor logits, Tensor values) -> Tensor", &maximum_from_topk);
   m.def(
-      "tail(Tensor shifted, Tensor ids, Tensor log_z, Tensor row_maximum, Tensor active) -> Tensor",
+      "tail(Tensor logits, Tensor ids, Tensor log_z, Tensor row_maximum, Tensor active) -> Tensor",
       &selected_tail);
 }

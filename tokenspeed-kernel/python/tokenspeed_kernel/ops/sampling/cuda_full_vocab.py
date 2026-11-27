@@ -57,22 +57,22 @@ def cuda_full_vocab_maximum(logits, topk_values):
     return full_vocab_scoring.maximum(logits, topk_values)
 
 
-def cuda_full_vocab_tail(shifted, ids, log_z, *, row_maximum, active_rows):
+def cuda_full_vocab_tail(logits, ids, log_z, *, row_maximum, active_rows):
     """Mask raw logits during ATen loads; fold row_maximum + log_z at writeback."""
-    if not _supported(shifted) or not shifted.is_contiguous():
+    if not _supported(logits) or not logits.is_contiguous():
         from tokenspeed_kernel.ops.sampling.torch import torch_full_vocab_tail
 
         return torch_full_vocab_tail(
-            shifted, ids, log_z, row_maximum=row_maximum, active_rows=active_rows
+            logits, ids, log_z, row_maximum=row_maximum, active_rows=active_rows
         )
     active = (
-        torch.ones(shifted.shape[0], dtype=torch.bool, device=shifted.device)
+        torch.ones(logits.shape[0], dtype=torch.bool, device=logits.device)
         if active_rows is None
         else active_rows
     )
-    if not shifted.shape[0]:
+    if not logits.shape[0]:
         return log_z.clone()
-    return full_vocab_scoring.tail(shifted, ids, log_z, row_maximum, active)
+    return full_vocab_scoring.tail(logits, ids, log_z, row_maximum, active)
 
 
 if full_vocab_scoring.available():
