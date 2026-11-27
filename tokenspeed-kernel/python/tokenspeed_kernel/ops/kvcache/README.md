@@ -140,12 +140,16 @@ strides. CUDA keeps one launch. The start row is a runtime argument.
 The common `prepare_prefill_state_inputs` and `store_state_rows` entry points
 use Triton on Ascend as well as CUDA. They honor strided convolution and
 recurrent arena views, preserve shared input snapshots, and mask fresh
-recurrent rows to zero without reading the null page. Stores accept padded
-negative destinations and require contiguous integer destination indices.
+recurrent rows to zero without reading the null page. Stores require
+contiguous integer destination indices and write only destinations in
+`(0, num_blocks)`, where `num_blocks` is the slab's block count: the null
+page `0`, negative padding such as `-1`, and ids at or past `num_blocks` skip
+the row without touching any slab memory.
 Model plugins use these common operations through the state backend.
 
 State scatter tiles each request independently and specializes the fixed state
-shape and inner strides; changing the request count does not recompile it.
+shape and inner strides; changing the request count or the slab's block count
+does not recompile it.
 
 Prefill source/destination index slices are runtime metadata. Both gather and
 scatter kernels ignore their pointer alignment when choosing a specialization,
