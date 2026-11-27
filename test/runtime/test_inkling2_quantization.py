@@ -289,6 +289,7 @@ def _loader_model(path: str, inline: dict | None) -> ModelConfig:
     model = ModelConfig.__new__(ModelConfig)
     model.model_path = path
     model.revision = None
+    model.download_dir = None
     model.quantization = "inkling2"
     model.hf_config = PretrainedConfig()
     if inline is not None:

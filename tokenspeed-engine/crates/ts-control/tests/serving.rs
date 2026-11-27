@@ -35,7 +35,7 @@ use std::{
         Arc, Mutex, Once, PoisonError,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pyo3::{prelude::*, types::PyDict};
@@ -54,6 +54,7 @@ use ts_control::{
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
     output::{FinishLog, ForwardResult, LogprobPlan, OutputProcessor, Role, StreamedOutput},
+    shared_l2::{PoolClient, PoolError},
     startup,
     transport::EngineTransport,
 };
@@ -68,9 +69,11 @@ use ts_pd::{
 };
 use ts_scheduler::{
     profile, CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
+    SharedL2AnswerView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2ProxyBlockView,
+    StorageKeyView,
 };
 use ts_wire::{
-    codec::Dict,
+    codec::{Dict, StrOrList},
     control::{
         FlushCacheReqInput, GetAdmissionReqInput, GetAdmissionReqOutput,
         GetSharedPrefixPublicationReqInput, GetSharedPrefixPublicationReqOutput,
@@ -131,6 +134,8 @@ enum Tiers {
     /// A Host L2 tier backed by an L3 store, which holds every prefix page
     /// a query asks for.
     L3,
+    /// A Host tier that is the proxy of a shared L2 pool.
+    SharedL2,
 }
 
 /// The scheduler over `tiers` for `role`, its KV cache split over
@@ -188,6 +193,12 @@ fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize, setup: &Setup)
              cfg.storage_config = ts.StorageConfig(\n\
                  8, 8, storage_host_credits, 64, 1024, 1, 10**9, 10**9,\n\
                  storage_pressure_high, storage_pressure_low)"
+        }
+        Tiers::SharedL2 => {
+            "cfg.disable_l2_cache = False\n\
+             cfg.num_host_pages = 1025\n\
+             cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough\n\
+             cfg.shared_l2_config = ts.SharedL2Config(max_writes_in_flight=2, max_keys_per_write=64)"
         }
     };
     let l3_default_pressure = if setup.l3_default_pressure {
@@ -304,6 +315,10 @@ const FORWARD_TIME: Duration = Duration::from_millis(1);
 /// forward's request ids and its cache ops.
 type ExecutedPlan = (usize, Vec<String>, Vec<CacheOpView>);
 
+/// One prefill row as a rank ran it: its plan's index, its request and the
+/// prefix it started behind.
+type PrefillRow = (usize, String, i32);
+
 /// Stands in for the device: results are ready when the forward returns,
 /// and a cache op is acknowledged once, on the first poll after it ran or
 /// `ack_polls` polls later, and never while `ack_gate` is closed.
@@ -321,12 +336,18 @@ struct FakeDevice {
     released: Arc<Mutex<Vec<(String, i32)>>>,
     /// Every plan run, in order.
     plans: Arc<Mutex<Vec<ExecutedPlan>>>,
+    /// Every prefill row's request ID and matching prefix length.
+    prefill_prefixes: Arc<Mutex<Vec<(String, i32)>>>,
     /// Cache ops run and not acknowledged yet, in the order they ran, each
     /// with the polls it still waits.
     unacknowledged: Vec<(usize, CacheOpView)>,
     /// The polls a cache op waits after the first one before it is
     /// acknowledged.
     ack_polls: usize,
+    /// The replay polls a retirement waits after the first, or disabled.
+    replay_ack_polls: Option<usize>,
+    replay_pending: VecDeque<(u64, usize)>,
+    replay_completed: u64,
     /// Cache-event polls so far.
     polls: usize,
     /// While closed, a poll acknowledges nothing.
@@ -361,12 +382,23 @@ struct FakeDevice {
     /// The rank's load prerequisites refuse (weights released, KV still
     /// resident); a test clears it before retrying.
     weight_load_refused: Arc<AtomicBool>,
+    /// Model a discard-policy prerequisite on one rank.
+    discard_memory: bool,
+    /// Inject a device error after release was admitted.
+    fail_memory_release: bool,
+    /// Inject a device error after wake was admitted.
+    fail_memory_resume: bool,
     /// Count prerequisite checks while a queued load yields to cache I/O.
     weight_load_checks: Arc<AtomicUsize>,
     /// EPLB: this rank's EP rank, which skews the load it counts.
     ep_rank: usize,
     /// EPLB: the placement the experts sit in, as the routing tables say.
     placement: Arc<Mutex<Vec<Vec<i32>>>>,
+    /// The forwards committed so far.
+    commits: Arc<Mutex<usize>>,
+    /// Each prefill row run: its plan's index, its request and the prefix
+    /// it started behind.
+    prefixes: Arc<Mutex<Vec<PrefillRow>>>,
     /// EPLB: every chunk applied, with its layers' rows.
     applied: Applied,
     /// EPD: requests whose landed embeddings were published, in order.
@@ -438,6 +470,8 @@ struct Wire {
 
 #[derive(Default)]
 struct WireRoom {
+    /// One-shot observation made while the transport is polling this room.
+    on_poll: Option<Box<dyn FnOnce() + Send>>,
     /// The decode engine connected to the room.
     decode_registered: bool,
     /// The decode engine admitted the pages, in this slot.
@@ -466,12 +500,10 @@ struct FakePeer {
     role: Role,
     rank: usize,
     wire: Arc<Mutex<Wire>>,
-    /// Prefill: decode allocation is deferred, so a request is admitted
-    /// at once and its destination's allocation has its own event.
+    /// Deferred prefill waits only for its destination, not for bootstrap.
     deferred: bool,
-    /// Tracked requests: rid, room, bootstrapped, failure reported, and
-    /// (deferred) admitted.
-    tracked: Vec<(String, u64, bool, bool, bool)>,
+    /// Tracked requests: rid, room, bootstrapped, failure reported.
+    tracked: Vec<(String, u64, bool, bool)>,
 }
 
 impl TransferPeer for FakePeer {
@@ -501,7 +533,7 @@ impl TransferPeer for FakePeer {
                 .decode_registered = true;
         }
         self.tracked
-            .push((rid.to_owned(), bootstrap.room, false, false, false));
+            .push((rid.to_owned(), bootstrap.room, false, false));
         Ok(())
     }
 
@@ -519,8 +551,11 @@ impl TransferPeer for FakePeer {
             let prefill_ranks = wire.prefill_ranks;
             self.tracked
                 .iter()
-                .flat_map(|(_, room, bootstrapped, _, _)| {
+                .flat_map(|(_, room, bootstrapped, _)| {
                     let room = wire.rooms.entry(*room).or_default();
+                    if let Some(observe) = room.on_poll.take() {
+                        observe();
+                    }
                     let poll = if room.fails
                         || room.cancel_pending
                         || (role == Role::Prefill && room.fails_on_prefill_rank == Some(rank))
@@ -567,14 +602,10 @@ impl TransferPeer for FakePeer {
         let mut agreed = agreed.chunks_exact(2);
         let deferred = self.deferred && role == Role::Prefill;
         self.tracked
-            .retain_mut(|(rid, room, bootstrapped, failed, admitted)| {
+            .retain_mut(|(rid, room, bootstrapped, failed)| {
                 let state = agreed.next().expect("one state per tracked request");
                 let (poll, retired) = (state[0], state[1]);
                 let room = wire.rooms.entry(*room).or_default();
-                if deferred && !*admitted {
-                    *admitted = true;
-                    events.push(PdEvent::Bootstrapped(rid.clone()));
-                }
                 match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
                     TransferPoll::Failed => {
                         // Failure ends the output before held writes retire.
@@ -605,6 +636,10 @@ impl TransferPeer for FakePeer {
                             _ => PdEvent::RemotePrefillDone(RemotePrefill {
                                 rid: rid.clone(),
                                 bootstrap_token: room.sent.expect("sent with the KV"),
+                                kv_ready_at: (
+                                    std::time::SystemTime::now(),
+                                    std::time::Instant::now(),
+                                ),
                                 cached_tokens: 0,
                                 bootstrap_logprob: None,
                                 spec_candidate_ids: None,
@@ -747,6 +782,10 @@ impl DataPlane for FakeDevice {
         plan: ExecutionPlan,
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
+        if let Some(id) = dispatch.retirement_id {
+            self.replay_pending
+                .push_back((id, self.replay_ack_polls.unwrap()));
+        }
         let forward = dispatch.forward;
         if let Some(directory) = &self.metrics_dir {
             let gauges = exported_gauges(directory);
@@ -824,7 +863,20 @@ impl DataPlane for FakeDevice {
         let Some(batch) = forward else {
             return Ok(None);
         };
+        self.prefill_prefixes.lock().unwrap().extend(
+            batch.request_ids[..batch.num_extends]
+                .iter()
+                .cloned()
+                .zip(batch.extend_prefix_lens.iter().copied()),
+        );
         thread::sleep(FORWARD_TIME);
+        let plan_index = self.plans.lock().unwrap().len() - 1;
+        self.prefixes.lock().unwrap().extend(
+            batch.request_ids[..batch.num_extends]
+                .iter()
+                .zip(&batch.extend_prefix_lens)
+                .map(|(rid, &prefix)| (plan_index, rid.clone(), prefix)),
+        );
         let mut result = ForwardResult::default();
         for (i, rid) in batch.request_ids.iter().enumerate() {
             let mid_chunk = i < batch.num_extends
@@ -862,6 +914,7 @@ impl DataPlane for FakeDevice {
     }
 
     fn complete(&mut self, pending: ForwardResult) -> Result<ForwardResult, DataPlaneError> {
+        *self.commits.lock().unwrap() += 1;
         Ok(pending)
     }
 
@@ -881,6 +934,7 @@ impl DataPlane for FakeDevice {
                 CacheOpKind::LoadBack => CacheEventKind::LoadBackDone,
                 CacheOpKind::SnapshotStore => CacheEventKind::SnapshotDone,
                 CacheOpKind::SnapshotRestore => CacheEventKind::RestoreDone,
+                CacheOpKind::StateCommit => CacheEventKind::StateCommitDone,
                 kind => return Err(DataPlaneError(format!("no fake for {kind:?}"))),
             };
             self.acknowledged
@@ -895,7 +949,33 @@ impl DataPlane for FakeDevice {
         Ok(events)
     }
 
-    fn release(&mut self, rids: &[String]) -> Result<(), DataPlaneError> {
+    fn replay_retirement_enabled(&self) -> bool {
+        self.replay_ack_polls.is_some()
+    }
+
+    fn poll_replay_retirement(&mut self) -> Result<u64, DataPlaneError> {
+        for (_, polls_left) in &mut self.replay_pending {
+            *polls_left = polls_left.saturating_sub(1);
+        }
+        while self
+            .replay_pending
+            .front()
+            .is_some_and(|(_, polls)| *polls == 0)
+        {
+            self.replay_completed = self.replay_pending.pop_front().unwrap().0;
+        }
+        Ok(self.replay_completed)
+    }
+
+    fn release(
+        &mut self,
+        rids: &[String],
+        retirement_id: Option<u64>,
+    ) -> Result<(), DataPlaneError> {
+        if let Some(id) = retirement_id {
+            self.replay_pending
+                .push_back((id, self.replay_ack_polls.unwrap()));
+        }
         let mut released = self.released.lock().unwrap();
         for rid in rids {
             let generated = self
@@ -960,12 +1040,35 @@ impl DataPlane for FakeDevice {
         Ok((true, "Succeeded".to_owned()))
     }
 
+    fn check_memory_transition(
+        &mut self,
+        tags: &[String],
+        release: bool,
+    ) -> Result<(bool, String), DataPlaneError> {
+        if self.discard_memory {
+            if release && tags == ["weights"] {
+                return Ok((false, "release KV before discarding weights".to_owned()));
+            }
+            if !release
+                && tags.iter().any(|tag| tag == "kv_cache")
+                && self.weight_commits.lock().unwrap().last() != Some(&true)
+            {
+                return Ok((false, "weights have not been committed".to_owned()));
+            }
+        }
+        Ok((true, String::new()))
+    }
+
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
         self.device_ops
             .lock()
             .unwrap()
             .push(format!("release {}", tags.join(",")));
-        Ok(())
+        if self.fail_memory_release {
+            Err(DataPlaneError("injected memory release failure".to_owned()))
+        } else {
+            Ok(())
+        }
     }
 
     fn reload_forward(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
@@ -978,7 +1081,11 @@ impl DataPlane for FakeDevice {
             .lock()
             .unwrap()
             .push(format!("resume {}", tags.join(",")));
-        Ok(())
+        if self.fail_memory_resume {
+            Err(DataPlaneError("injected memory resume failure".to_owned()))
+        } else {
+            Ok(())
+        }
     }
 
     fn finish_memory_resume(&mut self) -> Result<(), DataPlaneError> {
@@ -1442,6 +1549,9 @@ enum Layout {
     TpKvp(usize, usize),
     /// This many attention-DP ranks, one scheduler and frontend each.
     Dp(usize),
+    /// One scheduler and frontend per attention-DP replica, with its plan
+    /// mirrored on each of the replica's attention-TP ranks.
+    TpDp { tp: usize, dp: usize },
     /// One scheduler mirrored on this many pipeline stages; the last samples.
     Pp(usize),
 }
@@ -1664,15 +1774,34 @@ struct Setup {
     cache_ack_polls: Option<fn(usize) -> usize>,
     /// The devices acknowledge no cache op until the test opens their gates.
     held_cache_acks: bool,
+    /// Give only this rank a write-through Host cache to exercise a
+    /// rank-local finish store with a real scheduler.
+    host_l2_rank: Option<usize>,
+    /// Polls each rank waits to complete recurrent State retirement.
+    replay_ack_polls: Option<fn(usize) -> usize>,
     /// A rank whose device refuses a weight load.
     weight_update_failure_rank: Option<usize>,
     /// A test-only callback for real host failures after the device load.
     weight_update_hook: Option<fn(&ControlRequest)>,
     /// The ranks whose load prerequisites refuse until the test clears them.
     weight_load_refused: Option<fn(usize) -> bool>,
+    /// A rank with discard-policy preflight requirements.
+    discard_memory_rank: Option<usize>,
+    /// Agree memory transitions across ranks that share device work.
+    replica_memory_transitions: bool,
+    /// Advertise the Ascend graph region beside the shared KV arena.
+    ascend_graph: bool,
+    backup_device_kv: bool,
+    /// A rank that fails after memory release begins.
+    memory_release_failure_rank: Option<usize>,
+    /// A rank that fails after memory resume begins.
+    memory_resume_failure_rank: Option<usize>,
     /// The requests each engine serves itself before its frontend attaches,
     /// [`STARTUP_OUTPUT_TOKENS`] each.
     startup: Vec<startup::Phase>,
+    /// A shared L2 pool (`Tiers::SharedL2`): what the rank's client talks
+    /// to.
+    pool: Option<Arc<Mutex<FakePool>>>,
     /// Receives the scheduler the loop runs over, as a peer servicer holds
     /// it.
     scheduler: Option<Arc<Mutex<Option<SharedScheduler>>>>,
@@ -1689,6 +1818,7 @@ impl Layout {
             Layout::Single => (1, 1, 1),
             Layout::Tp(size) | Layout::TpKvp(size, _) | Layout::Pp(size) => (size, size, 1),
             Layout::Dp(size) => (size, 1, size),
+            Layout::TpDp { tp, dp } => (tp * dp, tp, dp),
         }
     }
 }
@@ -1697,6 +1827,13 @@ impl Layout {
 fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopConfig {
     let pd = setup.pd.as_ref();
     let kv_total_pages = setup.device_pages.map_or(512, |pages| pages as i64 - 1);
+    let mut memory_regions = vec!["kv_cache".to_owned(), "weights".to_owned()];
+    if setup.nccl_suspendable {
+        memory_regions.push("nccl".to_owned());
+    }
+    if setup.ascend_graph {
+        memory_regions.push("acl_graph".to_owned());
+    }
     LoopConfig {
         in_flight_depth,
         limits: IngressLimits {
@@ -1726,16 +1863,10 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         request_token_history: setup.request_token_history,
         request_token_history_lookback: setup.request_token_history_lookback,
         controls: ControlConfig {
+            backup_device_kv: setup.backup_device_kv,
             memory_saver: true,
-            memory_regions: if setup.nccl_suspendable {
-                vec![
-                    "kv_cache".to_owned(),
-                    "weights".to_owned(),
-                    "nccl".to_owned(),
-                ]
-            } else {
-                vec!["kv_cache".to_owned(), "weights".to_owned()]
-            },
+            replica_memory_transitions: setup.replica_memory_transitions,
+            memory_regions,
             shared_weight_version: (setup.l3_store.is_some() || !setup.l3_stores.is_empty())
                 .then(|| "v1".to_owned()),
             allow_reload_forward: true,
@@ -1802,6 +1933,11 @@ fn run_rank<F: Frontend>(
         Layout::TpKvp(_, shards) => shards,
         _ => 1,
     };
+    let tiers = if setup.host_l2_rank == Some(rank) {
+        Tiers::HostL2
+    } else {
+        tiers
+    };
     let scheduler = Arc::new(parking_lot::Mutex::new(new_scheduler(
         tiers,
         role,
@@ -1816,15 +1952,24 @@ fn run_rank<F: Frontend>(
         grammar_timeouts,
         epd_receive_enabled,
         startup,
+        pool,
         scheduler: scheduler_handle,
         deferred_allocation,
         ..
     } = setup;
+    let pool = pool.map(|pool| {
+        Box::new(FakePoolClient {
+            pool,
+            plans: device.plans.clone(),
+            commits: device.commits.clone(),
+        }) as Box<dyn PoolClient + Send>
+    });
     let outputs = OutputProcessor::new(
         None,
         1,
         None,
         role,
+        false,
         FinishLog {
             enabled: true,
             request_stats: true,
@@ -1926,6 +2071,7 @@ fn run_rank<F: Frontend>(
             }),
             disk: None,
             disk_metrics: None,
+            shared_l2: pool,
             peer: None,
         },
     );
@@ -1947,6 +2093,7 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
         last_admission: 0,
         rank,
         ack_polls: setup.cache_ack_polls.map_or(0, |polls| polls(rank)),
+        replay_ack_polls: setup.replay_ack_polls.map(|polls| polls(rank)),
         ack_gate: if setup.held_cache_acks {
             Gate::closed()
         } else {
@@ -1962,6 +2109,9 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
                 .weight_load_refused
                 .is_some_and(|refused| refused(rank)),
         )),
+        discard_memory: setup.discard_memory_rank == Some(rank),
+        fail_memory_release: setup.memory_release_failure_rank == Some(rank),
+        fail_memory_resume: setup.memory_resume_failure_rank == Some(rank),
         // The trivial initial placement: slot p holds expert p % 4.
         placement: Arc::new(Mutex::new(vec![vec![0, 1, 2, 3, 0, 1]; 2])),
         ..Default::default()
@@ -2112,11 +2262,15 @@ async fn start_ranks_with(
 /// round.
 type Script = Vec<Vec<EngineRequest>>;
 
+type LiveInput = std::sync::mpsc::Receiver<(Vec<EngineRequest>, std::sync::mpsc::Sender<()>)>;
+
 /// One engine's frontend in a scripted run: each round it hands the engine
 /// the next batch of its script, after the messages `react` made of the
 /// previous round's outputs. Once its script ran out it is gone, so the
 /// engine stops.
 struct ScriptedFrontend {
+    /// Live ingress keeps the same rank harness open while a test drives it.
+    input: Option<LiveInput>,
     script: VecDeque<Vec<EngineRequest>>,
     react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
     reacted: Vec<EngineRequest>,
@@ -2127,14 +2281,23 @@ struct ScriptedFrontend {
 }
 
 impl Frontend for ScriptedFrontend {
-    fn receive(&mut self, _wait: Option<Duration>) -> Vec<EngineRequest> {
+    fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest> {
+        if let Some(input) = &self.input {
+            return match input.recv_timeout(wait.unwrap_or(Duration::ZERO)) {
+                Ok((messages, delivered)) => {
+                    delivered.send(()).unwrap();
+                    messages
+                }
+                Err(_) => Vec::new(),
+            };
+        }
         let mut messages = std::mem::take(&mut self.reacted);
         messages.extend(self.script.pop_front().unwrap_or_default());
         messages
     }
 
     fn closed(&self) -> bool {
-        self.script.is_empty() && self.reacted.is_empty()
+        self.input.is_none() && self.script.is_empty() && self.reacted.is_empty()
     }
 
     fn send(&mut self, outputs: Vec<StreamedOutput>, _load: Load) {
@@ -2164,8 +2327,11 @@ struct ScriptedRank {
     outputs: Vec<StreamedOutput>,
     released: Vec<(String, i32)>,
     cache_ops: Vec<CacheOpKind>,
+    prefill_prefixes: Vec<(String, i32)>,
     idle_forwards: usize,
     forwards: usize,
+    /// Each prefill row the rank ran.
+    prefixes: Vec<PrefillRow>,
     /// The device operations the rank ran (weight updates, reloads, ...).
     device_ops: Vec<String>,
     weight_load_versions: Vec<Option<String>>,
@@ -2183,10 +2349,54 @@ fn run_scripted(
     scripts: Vec<Script>,
     react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
 ) -> Vec<ScriptedRank> {
+    run_scripted_live(
+        layout,
+        in_flight_depth,
+        tiers,
+        setup,
+        scripts,
+        react,
+        LiveRun {
+            inputs: Vec::new(),
+            drive: |_: &[LiveObservation], _: &AtomicBool| {},
+        },
+    )
+}
+
+struct LiveObservation {
+    replies: Arc<Mutex<Vec<ControlOutput>>>,
+    outputs: Arc<Mutex<Vec<StreamedOutput>>>,
+    device_ops: Arc<Mutex<Vec<String>>>,
+}
+
+struct LiveRun<F> {
+    inputs: Vec<LiveInput>,
+    drive: F,
+}
+
+fn run_scripted_live(
+    layout: Layout,
+    in_flight_depth: usize,
+    tiers: Tiers,
+    setup: Setup,
+    scripts: Vec<Script>,
+    react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
+    live: LiveRun<impl FnOnce(&[LiveObservation], &AtomicBool)>,
+) -> Vec<ScriptedRank> {
+    let LiveRun { inputs, drive } = live;
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     let (world, tp_size, num_engines) = layout.sizes();
     assert_eq!(scripts.len(), num_engines);
     let config = loop_config(in_flight_depth, matches!(layout, Layout::Pp(_)), &setup);
     let stop = Arc::new(AtomicBool::new(false));
+    let _stop_on_drop = StopOnDrop(stop.clone());
+    let mut inputs = inputs.into_iter();
+    let mut observed = Vec::new();
     let (mesh_listeners, addresses) = mesh_listeners(world);
     let mut scripts = scripts.into_iter();
     let (done, outcomes) = std::sync::mpsc::channel();
@@ -2196,13 +2406,19 @@ fn run_scripted(
         .map(|(rank, mesh_listener)| {
             let device = fake_device(layout, rank, &setup);
             let (plans, idle_forwards) = (device.plans.clone(), device.idle_forwards.clone());
-            let device_ops = device.device_ops.clone();
+            let prefill_prefixes = device.prefill_prefixes.clone();
+            let (device_ops, prefixes) = (device.device_ops.clone(), device.prefixes.clone());
             let weight_load_versions = device.weight_load_versions.clone();
             let weight_commits = device.weight_commits.clone();
             let replies = Arc::new(Mutex::new(Vec::new()));
             let finished = Arc::new(Mutex::new(Vec::new()));
             let outputs = Arc::new(Mutex::new(Vec::new()));
             let released = device.released.clone();
+            observed.push(LiveObservation {
+                replies: replies.clone(),
+                outputs: outputs.clone(),
+                device_ops: device_ops.clone(),
+            });
             let store = matches!(tiers, Tiers::L3).then(|| ScriptedStore {
                 landed: setup.l3_landed_keys.map(|landed| landed(rank)),
                 gate: Gate::opened(),
@@ -2215,6 +2431,7 @@ fn run_scripted(
                     .or_else(|| setup.l3_store.clone()),
             });
             let frontend = (rank % tp_size == 0).then(|| ScriptedFrontend {
+                input: inputs.next(),
                 script: scripts.next().unwrap().into(),
                 react,
                 reacted: Vec::new(),
@@ -2246,13 +2463,16 @@ fn run_scripted(
                 outputs,
                 released,
                 plans,
+                prefill_prefixes,
                 idle_forwards,
                 device_ops,
+                prefixes,
                 weight_load_versions,
                 weight_commits,
             )
         })
         .collect();
+    drive(&observed, &stop);
     for _ in 0..world {
         if outcomes.recv_timeout(Duration::from_secs(60)).is_err() {
             stop.store(true, Ordering::Relaxed);
@@ -2269,8 +2489,10 @@ fn run_scripted(
                 outputs,
                 released,
                 plans,
+                prefill_prefixes,
                 idle_forwards,
                 device_ops,
+                prefixes,
                 weight_load_versions,
                 weight_commits,
             )| {
@@ -2286,8 +2508,10 @@ fn run_scripted(
                         .iter()
                         .flat_map(|(_, _, ops)| ops.iter().map(|op| op.kind))
                         .collect(),
+                    prefill_prefixes: prefill_prefixes.lock().unwrap().clone(),
                     idle_forwards: *idle_forwards.lock().unwrap(),
                     forwards: plans.iter().filter(|(_, rids, _)| !rids.is_empty()).count(),
+                    prefixes: prefixes.lock().unwrap().clone(),
                     device_ops: device_ops.lock().unwrap().clone(),
                     weight_load_versions: weight_load_versions.lock().unwrap().clone(),
                     weight_commits: weight_commits.lock().unwrap().clone(),
@@ -4347,6 +4571,23 @@ fn a_grant_during_the_final_forward_sends_once_its_result_lands() {
     }
 }
 
+#[test]
+fn a_deferred_prefill_computes_in_its_submission_round_without_a_decode_peer() {
+    for depth in [0, 1] {
+        let script = vec![vec![EngineRequest::Add(Box::new(disaggregated(
+            "r", 9, 40, 4,
+        )))]];
+        let (rank, wire) = run_prefill_under_deferred_allocation(depth, script);
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.forwards, 1, "depth {depth}");
+        assert!(rank.released.is_empty());
+        let wire = wire.lock().unwrap();
+        assert!(!wire.rooms[&9].decode_registered);
+        assert!(wire.rooms[&9].preallocated.is_none());
+        assert!(wire.rooms[&9].sent.is_none());
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_keep_pause_freezes_a_prefill_under_deferred_allocation_on_either_side_of_its_grant() {
     // Frozen, the engine computes nothing and polls no transfer. A prompt
@@ -4564,13 +4805,10 @@ fn a_pd_abort_in_the_submission_round_retires_the_transfer() {
     }
 }
 
-/// A peer servicer answers from the scheduler between rounds. A loop waiting
-/// on a transfer -- here a decode engine waiting for its prefill peer's KV --
-/// runs neither a forward nor an idle frontend wait, the two points that
-/// release the scheduler, so it hands the scheduler to a waiting servicer
-/// once per round instead.
+/// While Decode waits for Prefill's KV, the transfer poll must leave the
+/// scheduler available to a holder serving Prefill's prefix lookup.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_loop_waiting_on_a_transfer_hands_the_scheduler_to_a_waiting_servicer() {
+async fn a_decode_waiting_for_kv_leaves_the_scheduler_available_during_poll() {
     let wire = Arc::new(Mutex::new(Wire {
         prefill_ranks: 1,
         ..Wire::default()
@@ -4610,14 +4848,16 @@ async fn a_loop_waiting_on_a_transfer_hands_the_scheduler_to_a_waiting_servicer(
     .expect("decode allocated its KV landing pages and waits for them");
 
     let scheduler = handle.lock().unwrap().clone().unwrap();
-    let held = tokio::task::spawn_blocking(move || {
-        scheduler.try_lock_for(Duration::from_secs(5)).is_some()
-    })
-    .await
-    .unwrap();
+    let (observed, available) = tokio::sync::oneshot::channel();
+    wire.lock().unwrap().rooms.get_mut(&70).unwrap().on_poll = Some(Box::new(move || {
+        let _ = observed.send(scheduler.try_lock().is_some());
+    }));
     assert!(
-        held,
-        "the servicer waited past five seconds of empty rounds"
+        tokio::time::timeout(Duration::from_secs(5), available)
+            .await
+            .expect("decode continued polling for KV")
+            .unwrap(),
+        "PD polling held the scheduler needed by the holder"
     );
 }
 
@@ -4739,6 +4979,7 @@ async fn assert_pause_waits_for_pd_retirement(mode: &str) {
         control(
             &decode,
             ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+                transition_id: None,
                 rid: None,
                 http_worker_ipc: None,
                 tags: Some(vec!["kv_cache".to_owned()]),
@@ -4751,6 +4992,7 @@ async fn assert_pause_waits_for_pd_retirement(mode: &str) {
         control(
             &decode,
             ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+                transition_id: None,
                 rid: None,
                 http_worker_ipc: None,
                 tags: Some(vec!["kv_cache".to_owned()]),
@@ -5480,6 +5722,7 @@ fn a_further_nccl_release_waits_for_every_already_sleeping_dp_engine() {
     let release = |tags: &[&str]| {
         EngineRequest::Control(Box::new(ControlRequest::ReleaseMemoryOccupation(
             ReleaseMemoryOccupationReqInput {
+                transition_id: None,
                 rid: None,
                 http_worker_ipc: None,
                 tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
@@ -5489,6 +5732,7 @@ fn a_further_nccl_release_waits_for_every_already_sleeping_dp_engine() {
     let wake = || {
         EngineRequest::Control(Box::new(ControlRequest::ResumeMemoryOccupation(
             ResumeMemoryOccupationReqInput {
+                transition_id: None,
                 rid: None,
                 http_worker_ipc: None,
                 tags: None,
@@ -5529,6 +5773,7 @@ fn nccl_resume_waits_for_every_dp_engine() {
         let release = || {
             EngineRequest::Control(Box::new(ControlRequest::ReleaseMemoryOccupation(
                 ReleaseMemoryOccupationReqInput {
+                    transition_id: None,
                     rid: None,
                     http_worker_ipc: None,
                     tags: None,
@@ -5538,6 +5783,7 @@ fn nccl_resume_waits_for_every_dp_engine() {
         let wake = || {
             EngineRequest::Control(Box::new(ControlRequest::ResumeMemoryOccupation(
                 ResumeMemoryOccupationReqInput {
+                    transition_id: None,
                     rid: None,
                     http_worker_ipc: None,
                     tags: None,
@@ -5596,21 +5842,10 @@ fn slow_schema() -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_cancels_the_requests_still_compiling_their_grammars() {
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     for (drain, undo) in [
         (pause("wait"), resume()),
-        (
-            release,
-            ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-                rid: None,
-                http_worker_ipc: None,
-                tags: None,
-            }),
-        ),
+        (release, memory_request(false, None, None)),
     ] {
         let engine = start_ranks_with(
             Layout::Single,
@@ -8113,11 +8348,7 @@ async fn a_failed_weight_load_is_committed_as_invalid_on_every_rank() {
 async fn a_released_pd_engine_refuses_requests_until_it_wakes() {
     let (prefill, decode, _wire) =
         start_pd_pair(1, Layout::Single, Tiers::DeviceOnly, Setup::default()).await;
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     assert_eq!(
         control(&decode, release).await,
         [("ReleaseMemoryOccupationReqOutput", true)]
@@ -8133,11 +8364,7 @@ async fn a_released_pd_engine_refuses_requests_until_it_wakes() {
          resume_memory_occupation"
             .into()
     );
-    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let wake = memory_request(false, None, None);
     assert_eq!(
         control(&decode, wake).await,
         [("ResumeMemoryOccupationReqOutput", true)]
@@ -8157,11 +8384,7 @@ async fn a_released_pd_engine_refuses_requests_until_it_wakes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
     let engine = start_engine(1).await;
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     let running = engine
         .client
         .generate(request("r1", 3, budget(20)))
@@ -8183,11 +8406,7 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
         control(&engine, resume()).await,
         [("ResumeSchedulerReqOutput", false)]
     );
-    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let wake = memory_request(false, None, None);
     assert_eq!(
         control(&engine, wake).await,
         [("ResumeMemoryOccupationReqOutput", true)]
@@ -8221,13 +8440,88 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
     assert_eq!(tokens(&chunks), [1000, 1001]);
 }
 
+fn memory_request(release: bool, tags: Option<&[&str]>, id: Option<&str>) -> ControlRequest {
+    let tags = tags.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect());
+    let transition_id = id.map(str::to_owned);
+    if release {
+        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            rid: None,
+            transition_id,
+            http_worker_ipc: None,
+            tags,
+        })
+    } else {
+        ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+            rid: None,
+            transition_id,
+            http_worker_ipc: None,
+            tags,
+        })
+    }
+}
+
+fn memory_transition(release: bool, tags: Option<&[&str]>) -> EngineRequest {
+    EngineRequest::Control(Box::new(memory_request(release, tags, None)))
+}
+
+#[path = "serving/test_memory_saver.rs"]
+mod test_memory_saver;
+
+#[test]
+fn memory_release_waits_for_the_retirement_batch_queued_by_the_last_forward() {
+    let sleeping = || {
+        EngineRequest::Control(Box::new(ControlRequest::IsSleeping(IsSleepingReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        })))
+    };
+    let mut script = vec![Vec::new(); 8];
+    script[0].push(EngineRequest::Add(Box::new(request("r", 3, budget(2)))));
+    script[0].push(EngineRequest::Add(Box::new(request("s", 3, budget(2)))));
+    // A weights-only release exercises drain itself without a cache clear.
+    script[0].push(EngineRequest::Control(Box::new(
+        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            transition_id: None,
+            rid: None,
+            http_worker_ipc: None,
+            tags: Some(vec!["weights".to_owned()]),
+        }),
+    )));
+    // The last forward queues both exits at the tail of round 1. The
+    // slower rank completes retirement in round 5.
+    script[2].push(sleeping());
+    script[4].push(sleeping());
+    script[6].push(sleeping());
+    let ranks = run_scripted(
+        Layout::Tp(2),
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            replay_ack_polls: Some(|rank| 1 + 3 * rank),
+            ..Setup::default()
+        },
+        vec![script],
+        no_reaction,
+    );
+    let rank = &ranks[0];
+    assert_scripted_tokens(rank, "r", 2);
+    assert_scripted_tokens(rank, "s", 2);
+    assert!(rank.cache_ops.is_empty());
+    assert_eq!(rank.device_ops, ["release weights"]);
+    assert_eq!(
+        outcome(rank.replies.clone()),
+        [
+            ("IsSleepingReqOutput", false),
+            ("IsSleepingReqOutput", false),
+            ("ReleaseMemoryOccupationReqOutput", true),
+            ("IsSleepingReqOutput", true),
+        ]
+    );
+}
+
 #[test]
 fn dp_memory_release_waits_for_every_rank_to_pause_and_drain() {
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     for peer_pause in [pause("wait"), release.clone()] {
         let peer_releases = matches!(&peer_pause, ControlRequest::ReleaseMemoryOccupation(_));
         let mut busy = vec![Vec::new(); 340];
@@ -8287,13 +8581,9 @@ fn dp_memory_release_waits_for_an_idle_peer_to_pause() {
         budget(20),
     ))));
     let mut releasing = vec![Vec::new(); 60];
-    releasing[2].push(EngineRequest::Control(Box::new(
-        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-            rid: None,
-            http_worker_ipc: None,
-            tags: None,
-        }),
-    )));
+    releasing[2].push(EngineRequest::Control(Box::new(memory_request(
+        true, None, None,
+    ))));
     let ranks = run_scripted(
         Layout::Dp(2),
         0,
@@ -8322,13 +8612,7 @@ fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
     for (nccl, wake_peer) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut scripts = vec![vec![Vec::new(); 90]; 2];
         for (rank, script) in scripts.iter_mut().enumerate() {
-            script[0].push(EngineRequest::Control(Box::new(
-                ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-                    rid: None,
-                    http_worker_ipc: None,
-                    tags: None,
-                }),
-            )));
+            script[0].push(memory_transition(true, None));
             let mut wake = vec![(4 + rank * 16, "weights"), (8 + rank * 22, "kv_cache")];
             if nccl {
                 wake.insert(0, (2, "nccl"));
@@ -8337,13 +8621,7 @@ fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
                 if rank == 1 && tag == "kv_cache" && !wake_peer {
                     continue;
                 }
-                script[round].push(EngineRequest::Control(Box::new(
-                    ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-                        rid: None,
-                        http_worker_ipc: None,
-                        tags: Some(vec![tag.to_owned()]),
-                    }),
-                )));
+                script[round].push(memory_transition(false, Some(&[tag])));
             }
         }
         scripts[0][5].push(EngineRequest::Add(Box::new(request(
@@ -8489,6 +8767,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
             }
             let release =
                 ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+                    transition_id: None,
                     rid: None,
                     http_worker_ipc: None,
                     tags: Some(vec!["kv_cache".to_owned()]),
@@ -8530,6 +8809,7 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
                 "{case}"
             );
             let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+                transition_id: None,
                 rid: None,
                 http_worker_ipc: None,
                 tags: Some(vec!["kv_cache".to_owned()]),
@@ -8576,16 +8856,8 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
 
 #[test]
 fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
-    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
+    let wake = memory_request(false, None, None);
     for (drain, undo) in [(pause("wait"), resume()), (release, wake)] {
         let tag = drain.reply_tag();
         let undo_tag = undo.reply_tag();
@@ -8771,6 +9043,7 @@ fn a_profile_keeps_the_spans_of_rounds_that_did_something() {
     script[0] = vec![EngineRequest::Add(Box::new(request("r", 16, budget(3))))];
     let finished = Arc::new(Mutex::new(Vec::new()));
     let frontend = ScriptedFrontend {
+        input: None,
         script: script.into(),
         react: no_reaction,
         reacted: Vec::new(),
@@ -9536,4 +9809,639 @@ fn duplicate_bootstrap_room_is_refused_while_epd_staged_and_released_on_epd_fail
     assert_room_conflict_409(&ranks[0].outputs, "dup-same-round");
     assert_room_conflict_409(&ranks[0].outputs, "dup-while-staged");
     assert_scripted_tokens(&ranks[0], "after-epd-fail", 1);
+}
+
+/// What a test's pool did, in order.
+#[derive(Debug, Clone, PartialEq)]
+enum PoolEvent {
+    /// One lookup request: the requests it asked about, and the plans the
+    /// device had run by then.
+    Lookup {
+        rids: Vec<String>,
+        plans: usize,
+    },
+    /// The write `op_id`, of this many blocks, was started, after the
+    /// device's `commits`-th forward was committed.
+    Wrote {
+        op_id: u32,
+        blocks: usize,
+        commits: usize,
+    },
+    /// A write was reported finished.
+    WriteDone,
+    Released(u64),
+    /// The proxy blocks of a round's answers were mapped to pool pages, this
+    /// many.
+    Mapped(usize),
+}
+
+/// A shared L2 pool as one rank sees it: the owner and the rank's client in
+/// one, scripted by the test.
+#[derive(Default)]
+struct FakePool {
+    /// How many of its prompt's full pages the pool holds, per request; a
+    /// request not named misses.
+    held: HashMap<String, usize>,
+    /// The owner answers no lookup request.
+    fail_lookups: bool,
+    /// Every write fails; the next poll reports it.
+    fail_writes: bool,
+    /// The client's ping to the owner fails once the device ran this many
+    /// plans; every poll from then on reports it.
+    ping_fails_after: Option<usize>,
+    /// Every load from the pool fails: the client holds the failure from
+    /// the plan that carries the load on.
+    fail_loads: bool,
+    /// The polls a write stays in flight before it is reported finished.
+    write_polls: usize,
+    /// Writes started and not reported, each with the polls it still waits.
+    writes: Vec<(usize, u32)>,
+    tickets: u64,
+    pages: i32,
+    log: Vec<PoolEvent>,
+}
+
+/// One rank's client of a [`FakePool`].
+struct FakePoolClient {
+    pool: Arc<Mutex<FakePool>>,
+    /// The rank's device: the plans it ran and the forwards committed.
+    plans: Arc<Mutex<Vec<ExecutedPlan>>>,
+    commits: Arc<Mutex<usize>>,
+}
+
+impl PoolClient for FakePoolClient {
+    fn lookup(
+        &mut self,
+        lookups: &[SharedL2LookupView],
+    ) -> Result<Vec<SharedL2AnswerView>, PoolError> {
+        let plans = self.plans.lock().unwrap().len();
+        let mut pool = self.pool.lock().unwrap();
+        if pool.fail_lookups {
+            return Err(PoolError("the owner did not answer the lookups".to_owned()));
+        }
+        pool.log.push(PoolEvent::Lookup {
+            rids: lookups
+                .iter()
+                .map(|lookup| lookup.request_id.clone())
+                .collect(),
+            plans,
+        });
+        let mut answers = Vec::new();
+        for lookup in lookups {
+            let hit = pool
+                .held
+                .get(&lookup.request_id)
+                .map_or(0, |held| *held.min(&lookup.prefix_hashes.len()));
+            if hit > 0 {
+                pool.tickets += 1;
+            }
+            let first_page = pool.pages;
+            pool.pages += hit as i32;
+            answers.push(SharedL2AnswerView {
+                request_id: lookup.request_id.clone(),
+                ticket: if hit > 0 { pool.tickets } else { 0 },
+                num_tokens: 16 * hit as i32,
+                kv_tokens: 16 * hit as i32,
+                tail_tokens: 0,
+                tail_hash: String::new(),
+                keys: lookup.prefix_hashes[..hit]
+                    .iter()
+                    .map(|hash| StorageKeyView {
+                        group_id: 0,
+                        content_hash: hash.clone(),
+                        page_offset: 0,
+                    })
+                    .collect(),
+                buckets: vec![0; hit],
+                pool_pages: (1..=hit as i32).map(|page| first_page + page).collect(),
+            });
+        }
+        Ok(answers)
+    }
+
+    fn poll_writes(&mut self) -> Result<Vec<u32>, PoolError> {
+        let plans = self.plans.lock().unwrap().len();
+        let mut pool = self.pool.lock().unwrap();
+        if pool.ping_fails_after.is_some_and(|after| plans >= after) {
+            return Err(PoolError("the owner did not answer a ping".to_owned()));
+        }
+        if let (true, Some((_, write))) = (pool.fail_writes, pool.writes.first()) {
+            return Err(PoolError(format!("pool write {write} failed")));
+        }
+        for (polls, _) in &mut pool.writes {
+            *polls = polls.saturating_sub(1);
+        }
+        let (finished, open) = std::mem::take(&mut pool.writes)
+            .into_iter()
+            .partition(|(polls, _)| *polls == 0);
+        pool.writes = open;
+        let finished: Vec<u32> = finished.into_iter().map(|(_, write)| write).collect();
+        for _ in &finished {
+            pool.log.push(PoolEvent::WriteDone);
+        }
+        Ok(finished)
+    }
+
+    fn map_proxy_blocks(&mut self, proxy_blocks: &[SharedL2ProxyBlockView]) {
+        let mut pool = self.pool.lock().unwrap();
+        pool.log.push(PoolEvent::Mapped(proxy_blocks.len()));
+    }
+
+    fn submit(&mut self, ops: &[SharedL2OpView]) -> Result<(), PoolError> {
+        let commits = *self.commits.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap();
+        for op in ops {
+            match op.kind {
+                SharedL2OpKind::Write => {
+                    let polls = pool.write_polls;
+                    pool.writes.push((polls, op.op_id));
+                    pool.log.push(PoolEvent::Wrote {
+                        op_id: op.op_id,
+                        blocks: op.keys.len(),
+                        commits,
+                    });
+                }
+                SharedL2OpKind::Release => pool.log.push(PoolEvent::Released(op.ticket)),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn check_failure(&self) -> Result<(), PoolError> {
+        let loaded = self
+            .plans
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, ops)| ops.iter().any(|op| op.kind == CacheOpKind::LoadBack));
+        if loaded && self.pool.lock().unwrap().fail_loads {
+            return Err(PoolError("a load from the pool failed".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+/// A request whose prompt is `len` tokens from `first` on, so that prompts
+/// with different `first` share no prefix.
+fn add(rid: &str, first: i32, len: i32, max_new_tokens: i64) -> EngineRequest {
+    EngineRequest::Add(Box::new(TokenizedGenerateReqInput {
+        input_ids: Some((first..first + len).collect()),
+        stream: true,
+        ..TokenizedGenerateReqInput::new(rid, budget(max_new_tokens))
+    }))
+}
+
+/// Run one rank whose Host tier is the proxy of `pool` through `script`,
+/// its frontend reacting to outputs with `react`; returns what the rank
+/// left behind and what the pool did.
+fn run_with_pool(
+    pool: FakePool,
+    in_flight_depth: usize,
+    script: Script,
+    react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
+) -> (ScriptedRank, Vec<PoolEvent>) {
+    let pool = Arc::new(Mutex::new(pool));
+    let setup = Setup {
+        pool: Some(pool.clone()),
+        ..Setup::default()
+    };
+    let rank = run_scripted(
+        Layout::Single,
+        in_flight_depth,
+        Tiers::SharedL2,
+        setup,
+        vec![script],
+        react,
+    )
+    .remove(0);
+    let log = pool.lock().unwrap().log.clone();
+    (rank, log)
+}
+
+#[test]
+fn a_round_looks_up_its_new_prompts_in_one_request_before_its_plan() {
+    // A prompt the pool holds three pages of arrives once "first" has its
+    // fifth token: at the head of the round whose plan, the sixth the device
+    // runs, gives "first" its next one.
+    fn late_arrival(outputs: &[StreamedOutput]) -> Vec<EngineRequest> {
+        if outputs
+            .iter()
+            .any(|output| output.rid == "first" && output.output_ids.contains(&1004))
+        {
+            vec![add("late", 5000, 64, 2)]
+        } else {
+            Vec::new()
+        }
+    }
+    let mut script: Script = vec![Vec::new(); 40];
+    script[0] = vec![add("first", 1, 64, 30), add("second", 1000, 64, 30)];
+    let (rank, log) = run_with_pool(
+        FakePool {
+            held: HashMap::from([("late".to_owned(), 3)]),
+            ..FakePool::default()
+        },
+        0,
+        script,
+        late_arrival,
+    );
+    // The prompts a round took in are asked about together, in one request,
+    // before the round's plan: no plan ran between a prompt's arrival and
+    // its lookup.
+    let lookups: Vec<_> = log
+        .iter()
+        .filter_map(|event| match event {
+            PoolEvent::Lookup { rids, plans } => Some((rids.clone(), *plans)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        lookups,
+        [
+            (vec!["first".to_owned(), "second".to_owned()], 0),
+            (vec!["late".to_owned()], 5)
+        ],
+        "{log:?}"
+    );
+    // The plan built after each lookup returned ran its prompts, with the
+    // answers: the late one in the plan of the round it arrived in, behind
+    // the pages the pool holds.
+    assert_eq!(
+        rank.prefixes,
+        [
+            (0, "first".to_owned(), 0),
+            (0, "second".to_owned(), 0),
+            (5, "late".to_owned(), 48),
+        ]
+    );
+    for (rid, count) in [("first", 30), ("second", 30), ("late", 2)] {
+        assert_scripted_tokens(&rank, rid, count);
+    }
+}
+
+#[test]
+fn a_failed_lookup_stops_the_engine_and_plans_nothing_for_its_prompt() {
+    let mut script: Script = vec![Vec::new(); 20];
+    script[0] = vec![add("asked", 1, 64, 2)];
+    let (rank, log) = run_with_pool(
+        FakePool {
+            fail_lookups: true,
+            ..FakePool::default()
+        },
+        0,
+        script,
+        no_reaction,
+    );
+    // The pool's failure is the engine's: no miss stands in for the answer.
+    let error = rank.outcome.unwrap_err();
+    assert!(
+        error.contains("the owner did not answer the lookups"),
+        "{error}"
+    );
+    assert_eq!((rank.forwards, &rank.prefixes[..]), (0, &[][..]));
+    assert!(rank.outputs.is_empty() && log.is_empty());
+}
+
+#[test]
+fn a_failed_pool_write_stops_the_engine() {
+    let mut script: Script = vec![Vec::new(); 20];
+    script[0] = vec![add("writer", 1, 64, 2)];
+    let (rank, log) = run_with_pool(
+        FakePool {
+            fail_writes: true,
+            ..FakePool::default()
+        },
+        0,
+        script,
+        no_reaction,
+    );
+    // The write of the pages the prompt published failed: the poll that
+    // reports it ends serving, and the write is not dropped.
+    let error = rank.outcome.unwrap_err();
+    let [.., PoolEvent::Wrote {
+        op_id, blocks: 4, ..
+    }] = &log[..]
+    else {
+        panic!("{log:?}");
+    };
+    assert!(
+        error.contains(&format!("pool write {op_id} failed")),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_failed_pool_load_fails_the_commit_of_the_forward_it_let_go() {
+    // The prompt's first plan loads its hit from the pool and computes the
+    // rest. The load fails and lets the forward go over pages it never
+    // filled: the client holds the failure, and the commit of that forward
+    // ends serving before its token is streamed.
+    let mut script: Script = vec![Vec::new(); 20];
+    script[0] = vec![add("hit", 1, 64, 4)];
+    let failing = || FakePool {
+        held: HashMap::from([("hit".to_owned(), 3)]),
+        fail_loads: true,
+        ..FakePool::default()
+    };
+    let (rank, log) = run_with_pool(failing(), 0, script, no_reaction);
+    let error = rank.outcome.unwrap_err();
+    assert!(error.contains("a load from the pool failed"), "{error}");
+    assert_eq!(
+        (rank.forwards, &rank.cache_ops[..]),
+        (1, &[CacheOpKind::LoadBack][..])
+    );
+    assert!(rank.outputs.is_empty(), "{:?}", rank.outputs);
+    assert!(log.contains(&PoolEvent::Mapped(3)), "{log:?}");
+
+    // One forward ahead of its commit, and a prompt of three chunks: the
+    // second plan carries the write of the pages the first forward computed,
+    // which waits for that forward's commit. The commit ends serving, and
+    // the write never starts.
+    let mut script: Script = vec![Vec::new(); 20];
+    script[0] = vec![add("hit", 1, 2 * MAX_SCHEDULED_TOKENS as i32 + 64, 4)];
+    let (rank, log) = run_with_pool(failing(), 1, script, no_reaction);
+    let error = rank.outcome.unwrap_err();
+    assert!(error.contains("a load from the pool failed"), "{error}");
+    assert_eq!(rank.forwards, 2, "{log:?}");
+    assert!(
+        !log.iter()
+            .any(|event| matches!(event, PoolEvent::Wrote { .. })),
+        "{log:?}"
+    );
+}
+
+#[test]
+fn a_failure_the_client_stored_stops_the_engine_with_no_write_in_flight() {
+    // An idle rank, which never sent the pool anything: the poll at the head
+    // of its round reads the failed ping.
+    let (idle, log) = run_with_pool(
+        FakePool {
+            ping_fails_after: Some(0),
+            ..FakePool::default()
+        },
+        0,
+        vec![Vec::new(); 20],
+        no_reaction,
+    );
+    let error = idle.outcome.unwrap_err();
+    assert!(error.contains("the owner did not answer a ping"), "{error}");
+    assert!(log.is_empty(), "{log:?}");
+
+    // A rank that only decodes: the write of the prompt's pages finished
+    // long before the ping fails, and the next page is not full yet. The
+    // round after the eighth plan stops the engine, with eight tokens out.
+    let mut script: Script = vec![Vec::new(); 40];
+    script[0] = vec![add("decoding", 1, 64, 30)];
+    let (decoding, log) = run_with_pool(
+        FakePool {
+            ping_fails_after: Some(8),
+            ..FakePool::default()
+        },
+        0,
+        script,
+        no_reaction,
+    );
+    let error = decoding.outcome.unwrap_err();
+    assert!(error.contains("the owner did not answer a ping"), "{error}");
+    assert_eq!(decoding.forwards, 8, "{log:?}");
+    assert!(
+        matches!(log[..], [.., PoolEvent::Wrote { .. }, PoolEvent::WriteDone]),
+        "{log:?}"
+    );
+}
+
+#[test]
+fn a_pool_miss_computes_its_prompt_as_without_a_pool() {
+    let mut script: Script = vec![Vec::new(); 12];
+    script[0] = vec![add("miss", 1, 64, 4)];
+    let (with_pool, log) = run_with_pool(FakePool::default(), 0, script.clone(), no_reaction);
+    let without = run_scripted(
+        Layout::Single,
+        0,
+        Tiers::DeviceOnly,
+        Setup::default(),
+        vec![script],
+        no_reaction,
+    )
+    .remove(0);
+    // The pool was asked and holds nothing of the prompt: no page is mapped
+    // or loaded, and the prompt runs through the same plans as on a rank
+    // without a pool.
+    assert_eq!(
+        log[0],
+        PoolEvent::Lookup {
+            rids: vec!["miss".to_owned()],
+            plans: 0
+        }
+    );
+    assert!(
+        !log.iter()
+            .any(|event| matches!(event, PoolEvent::Mapped(1..) | PoolEvent::Released(_))),
+        "{log:?}"
+    );
+    assert_eq!(with_pool.prefixes, [(0, "miss".to_owned(), 0)]);
+    assert_eq!(with_pool.prefixes, without.prefixes);
+    assert_eq!(with_pool.forwards, without.forwards);
+    assert_eq!(
+        (&with_pool.cache_ops[..], &without.cache_ops[..]),
+        (&[][..], &[][..])
+    );
+    for rank in [&with_pool, &without] {
+        assert_scripted_tokens(rank, "miss", 4);
+    }
+}
+
+#[test]
+fn a_pool_hit_loads_its_prefix_and_releases_its_ticket() {
+    let mut script: Script = vec![Vec::new(); 12];
+    script[0] = vec![add("hit", 1, 64, 2)];
+    let (rank, log) = run_with_pool(
+        FakePool {
+            held: HashMap::from([("hit".to_owned(), 3)]),
+            ..FakePool::default()
+        },
+        0,
+        script,
+        no_reaction,
+    );
+    // The prompt resumes behind the three pages the pool holds, which a
+    // load-back reads through the proxy blocks the client was told of; the
+    // load-back's acknowledgment lets go of them, and of the ticket.
+    assert_eq!(rank.prefixes, [(0, "hit".to_owned(), 48)]);
+    assert_eq!(rank.cache_ops, [CacheOpKind::LoadBack]);
+    assert!(log.contains(&PoolEvent::Mapped(3)), "{log:?}");
+    assert!(log.contains(&PoolEvent::Released(1)), "{log:?}");
+    assert_scripted_tokens(&rank, "hit", 2);
+}
+
+#[test]
+fn a_pool_write_pins_its_blocks_until_the_client_reports_it_even_while_frozen() {
+    let flush = || {
+        EngineRequest::Control(Box::new(ControlRequest::FlushCache(FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        })))
+    };
+    let mut script: Script = vec![Vec::new(); 34];
+    script[0] = vec![add("writer", 1, 64, 2)];
+    // The request is gone, but what it published is on its way to the pool:
+    // a flush cannot drop the blocks the write reads.
+    script[8] = vec![EngineRequest::Control(Box::new(pause("keep"))), flush()];
+    // The frozen rounds took the write's completion to the scheduler.
+    script[28] = vec![flush()];
+    script[30] = vec![EngineRequest::Control(Box::new(resume()))];
+    let (rank, log) = run_with_pool(
+        FakePool {
+            write_polls: 16,
+            ..FakePool::default()
+        },
+        0,
+        script,
+        no_reaction,
+    );
+    assert_eq!(
+        outcome(rank.replies.clone()),
+        [
+            ("PauseSchedulerReqOutput", true),
+            ("FlushCacheReqOutput", false),
+            ("FlushCacheReqOutput", true),
+            ("ResumeSchedulerReqOutput", true),
+        ]
+    );
+    // The writes carried the pages the prompt published and the partial
+    // page its finish published, and both were reported.
+    let wrote: Vec<usize> = log
+        .iter()
+        .filter_map(|event| match event {
+            PoolEvent::Wrote { blocks, .. } => Some(*blocks),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(wrote, [4, 1], "{log:?}");
+    assert_eq!(
+        log.iter()
+            .filter(|event| **event == PoolEvent::WriteDone)
+            .count(),
+        2
+    );
+    assert_scripted_tokens(&rank, "writer", 2);
+}
+
+#[test]
+fn a_pool_command_planned_while_paused_reaches_the_client() {
+    // The prompt's hit is loaded by its first plan. The device acknowledges
+    // the load-back eight polls later, long after the pause of the third
+    // round: the plan that drops the hit's proxy blocks, and so releases the
+    // owner's ticket, is a frozen round's.
+    let mut script: Script = vec![Vec::new(); 30];
+    script[0] = vec![add("hit", 1, 64, 2)];
+    script[2] = vec![EngineRequest::Control(Box::new(pause("keep")))];
+    let pool = Arc::new(Mutex::new(FakePool {
+        held: HashMap::from([("hit".to_owned(), 3)]),
+        ..FakePool::default()
+    }));
+    let setup = Setup {
+        pool: Some(pool.clone()),
+        cache_ack_polls: Some(|_| 8),
+        ..Setup::default()
+    };
+    let rank = run_scripted(
+        Layout::Single,
+        0,
+        Tiers::SharedL2,
+        setup,
+        vec![script],
+        no_reaction,
+    )
+    .remove(0);
+    let log = pool.lock().unwrap().log.clone();
+    assert_eq!(
+        outcome(rank.replies.clone()),
+        [("PauseSchedulerReqOutput", true)]
+    );
+    // The request ran its two forwards before the pause, and no forward ran
+    // after it.
+    assert_scripted_tokens(&rank, "hit", 2);
+    assert_eq!(rank.forwards, 2);
+    assert_eq!(rank.cache_ops, [CacheOpKind::LoadBack]);
+    // The frozen round's release reached the client: the engine never
+    // resumed.
+    assert!(log.contains(&PoolEvent::Released(1)), "{log:?}");
+}
+
+#[test]
+fn a_pool_write_starts_only_once_the_forward_that_fills_its_blocks_landed() {
+    // One forward ahead of its commit, and a prompt of three chunks: the
+    // plan that carries the write of a chunk's pages is made while the
+    // forward that computes them is still on the device.
+    let mut script: Script = vec![Vec::new(); 20];
+    script[0] = vec![add("writer", 1, 2 * MAX_SCHEDULED_TOKENS as i32 + 64, 4)];
+    let (rank, log) = run_with_pool(FakePool::default(), 1, script, no_reaction);
+    let started: Vec<(usize, usize)> = log
+        .iter()
+        .filter_map(|event| match event {
+            PoolEvent::Wrote {
+                blocks, commits, ..
+            } => Some((*blocks, *commits)),
+            _ => None,
+        })
+        .collect();
+    // The client reads the Device blocks at once, beside the device's
+    // streams. Each chunk's pages go in a write of their own, in the plan
+    // after the chunk's: the client got the k-th write only once the k-th
+    // forward was committed, not merely the first.
+    assert_eq!(
+        started
+            .iter()
+            .map(|(blocks, _)| *blocks)
+            .collect::<Vec<_>>()[..3],
+        [16, 16, 4],
+        "{log:?}"
+    );
+    for (write, (_, commits)) in started.iter().enumerate() {
+        assert!(*commits > write, "write {write}: {log:?}");
+    }
+    assert_scripted_tokens(&rank, "writer", 4);
+}
+
+#[test]
+fn with_a_pool_weight_loads_and_forward_reloads_are_refused_as_they_arrive() {
+    let reload = ControlRequest::ReloadForward(ReloadForwardReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        mode: "abort".to_owned(),
+        modules: None,
+        id: Some("pool".to_owned()),
+        timeout_s: None,
+    });
+    let mut script: Script = vec![Vec::new(); 50];
+    script[0] = vec![add("running", 1, 64, 30)];
+    script[3] = vec![EngineRequest::Control(Box::new(reload))];
+    script[40] = vec![EngineRequest::Control(Box::new(disk_load()))];
+    script[42] = vec![add("again", 1, 64, 2)];
+    let (rank, _) = run_with_pool(FakePool::default(), 0, script, no_reaction);
+    assert_eq!(
+        outcome(rank.replies.clone()),
+        [
+            ("ReloadForwardReqOutput", false),
+            ("UpdateWeightFromDiskReqOutput", false),
+        ]
+    );
+    for reply in &rank.replies {
+        let message = match reply {
+            ControlOutput::ReloadForward(reply) => &reply.message,
+            ControlOutput::UpdateWeightFromDisk(reply) => &reply.message,
+            other => panic!("unexpected {}", other.tag()),
+        };
+        assert!(message.contains("shared L2 pool"), "{message}");
+    }
+    // Neither drained nor flushed anything: the abort-mode reload left the
+    // running request alone, and the same prompt still resumes behind its
+    // pages on the Device.
+    assert_scripted_tokens(&rank, "running", 30);
+    assert!(rank
+        .prefixes
+        .iter()
+        .any(|(_, rid, prefix)| rid == "again" && *prefix == 48));
+    assert_scripted_tokens(&rank, "again", 2);
 }

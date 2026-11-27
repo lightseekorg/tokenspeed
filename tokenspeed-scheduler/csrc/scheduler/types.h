@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #pragma once
+#include "cache/coordinator/eviction_policy.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -27,6 +28,7 @@
 
 #include "cache/tier/disk.h"
 #include "cache/tier/peer.h"
+#include "cache/tier/shared_l2.h"
 #include "cache/tier/storage.h"
 #include <vector>
 
@@ -35,7 +37,26 @@
 
 namespace tokenspeed {
 
+// Resolved once after startup validation. Legacy binding fields below remain
+// input adapters; production, publication and retention consume these contracts.
+struct CheckpointProductionConfig {
+    bool in_forward;
+};
+struct CheckpointPublicationRules {
+    bool filter_covered_endpoints;
+    bool drop_short_prompt_end;
+};
+struct CheckpointRetentionHints {
+    bool demote_superseded;
+};
+struct CheckpointConfig {
+    CheckpointProductionConfig production;
+    CheckpointPublicationRules publication;
+    CheckpointRetentionHints retention;
+};
+
 struct SchedulerConfig {
+    CheckpointConfig ResolveCheckpoints() const;
     std::int32_t prefix_granularity{};
     struct AllocatorConfig {
         // Page 0 is the null placeholder, so usable = total - 1. Validate
@@ -134,6 +155,11 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // A shared L2 pool as the rank's Host L2: the Host allocator then sizes
+    // the proxy tier (no bytes; at least the pool's blocks), and published
+    // entries are written to the pool as a write-through Host store would be.
+    // P and fused roles, replicated groups, never with L3 or a snapshot pool.
+    std::optional<SharedL2Config> shared_l2_config;
     // Sharing cached prefixes with other replicas
     // (docs/rfcs/0004-peer-prefix-sharing.md); absent turns it off.
     std::optional<PeerConfig> peer_config;
@@ -153,6 +179,14 @@ struct SchedulerConfig {
     // chunks runs (docs/design/scheduler.md §3.3). 0 keeps the unbounded
     // suspension.
     std::int32_t max_consecutive_prefill_rounds{0};
+    // With max_consecutive_prefill_rounds: a round owes the decode rounds of
+    // prefill_decode_interval and prefill_decode_min_interval only while at
+    // least this many requests are ready to decode (PrefillDone or Decoding)
+    // before it. With fewer, the intervals are waived, but a run of
+    // back-to-back prefill rounds that hold a decode back still ends at the
+    // cap and the next round decodes (docs/design/scheduler.md §3.3). 0
+    // always owes them.
+    std::int32_t prefill_interval_min_decoding{0};
     // P and fused roles: rank new local prefills by work after Device/Host
     // prefix reuse, keeping stable ties and resident chunks first. Only the
     // oldest waiting prompt counts successful later first admissions; after
@@ -166,12 +200,12 @@ struct SchedulerConfig {
     // on the role directly.
     Role role{Role::kFused};
     // What the Decode destination gates on the P role; refused elsewhere
-    // (Validate), and absent there it is kEarly. Under either policy a prompt
-    // is admitted once pd::BootstrappedEvent arrived.
-    //   kEarly     that event also says every Decode rank allocated the
+    // (Validate), and absent there it is kEarly.
+    //   kEarly     pd::BootstrappedEvent says every Decode rank allocated the
     //              destination, so a prompt computes with its destination
     //              allocated.
-    //   kDeferred  the destination has its own event,
+    //   kDeferred  a prompt is submitted without waiting for Decode. The
+    //              destination has its own event,
     //              pd::DestinationReadyEvent. A prompt computed before it
     //              waits in PrefillAwaitingDestination, and its KV is sent
     //              once it arrived.
@@ -229,6 +263,10 @@ struct SchedulerConfig {
     // unused for longer leave first. 0 ranks every entry by its own use. Unset
     // means 16 * max_batch_size; at most kMaxCheckpointRetentionRequests.
     std::optional<std::int64_t> checkpoint_retention_requests;
+    std::string prefix_cache_evict_policy{"lru"};
+    std::optional<std::array<double, 2>> prefix_cache_gds_prefill_cost;
+    std::vector<double> prefix_cache_gds_disk_block_costs;
+    PrefixCacheEvictionConfig ResolveEvictionConfig() const;
     // Checkpoints within this many later requests of the newest on their
     // branch rank as it does: 0 only the newest request's, 1 the previous
     // turn's too. Below CheckpointTree::kMaxDistance.

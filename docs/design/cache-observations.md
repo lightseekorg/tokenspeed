@@ -74,6 +74,11 @@ observation. The subsequent ordinary Host-to-Device prefix load carries the
 admission and slot identity and completes through the same physical-copy fence.
 Disk operation IDs are not prefix-load IDs and do not enter these joins.
 
+A rank that joined a shared L2 pool logs `prefix_load_scheduled` as usual and no
+`prefix_load_completed`: the engine host runs its loads and records no
+completion yet. On such a rank a scheduled load without a completion is not
+evidence of a pending copy.
+
 Slot ownership additionally carries `slot_previous_admission_id`. Restore
 records preserve `previous_slot`, `previous_slot_generation`,
 `slot_previous_admission_id`, `restore_sequence`, `committed_tokens`,

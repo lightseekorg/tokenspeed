@@ -40,6 +40,7 @@ import msgspec
 import numpy as np
 import torch
 
+from tokenspeed.runtime.engine.request_timing import RequestTiming
 from tokenspeed.runtime.multimodal.inputs import MultimodalInputs
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
@@ -228,6 +229,8 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # Rank-wide token counts; None means an older producer did not report them.
     num_resident_tokens: int | None = None
     num_waiting_uncached_tokens: int | None = None
+    # Request timing metadata: only terminal rows carry a map. Older producers omit it.
+    request_timing: list[RequestTiming | None] = []
 
 
 class GetAdmissionReqInput(BaseReq, kw_only=True):
@@ -445,6 +448,7 @@ class RebalanceExpertsReqOutput(BaseReq, kw_only=True):
 class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Memory regions to release. None ⇒ all ("weights" and "kv_cache").
     tags: list[str] | None = None
+    transition_id: str | None = None
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
@@ -455,6 +459,7 @@ class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Memory regions to resume. None ⇒ all previously released tags.
     tags: list[str] | None = None
+    transition_id: str | None = None
 
 
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):

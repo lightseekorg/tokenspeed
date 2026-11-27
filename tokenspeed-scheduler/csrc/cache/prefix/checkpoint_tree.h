@@ -34,6 +34,9 @@
 #include <vector>
 
 #include "cache/core/cache_types.h"
+#include "cache/coordinator/recovery_index.h"
+#include "cache/core/checkpoint_lifecycle.h"
+#include "cache/prefix/prefix_hasher.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -96,6 +99,9 @@ public:
         }
         node.num_tokens = static_cast<std::int32_t>(tokens.size());
         node.access_epoch = access_epoch;
+        node.stamp = watermark_;
+        node.host_stamp = host_watermark_;
+        node.sequence = ++publication_sequence_;
         node.tail.assign(tokens.begin() + static_cast<std::ptrdiff_t>(full_tokens), tokens.end());
         // A shorter checkpoint published after longer ones on its path takes
         // them as children. Only an already interned prefix can have them.
@@ -116,6 +122,7 @@ public:
             tails_by_prior_[prior(node)].insert(&node);
         }
         refresh(&node);
+        if (recovery_index_) node.recovery = recovery_index_->Register(hash, node.num_tokens);
         return true;
     }
 
@@ -128,7 +135,7 @@ public:
         Node& node = it->second;
         const bool was_present = present(node);
         node.residency = residency;
-        if (residency.held) {
+        if (residency.held || node.metadata_holds > 0) {
             if (present(node) != was_present) {
                 for (Node* child : node.children) {
                     reanchor(*child);
@@ -174,7 +181,167 @@ public:
         return it != nodes_.end() && !leafWithin(it->second, leaf_distance_, static_cast<std::size_t>(tier), removed);
     }
 
+    // What another coordinator needs to observe a checkpoint this tree knows
+    // (a shared L2 pool's owner, which is sent it with the checkpoint's State
+    // block): its tokens, the chain hashes of its full pages, its tail and
+    // its publishing request's access epoch.
+    struct Checkpoint {
+        std::vector<std::int32_t> tokens;
+        std::vector<std::string> prefix_hashes;
+        std::optional<TailPublication> tail;
+        std::uint64_t access_epoch{0};
+
+        bool operator==(const Checkpoint&) const = default;
+    };
+    std::optional<Checkpoint> CheckpointOf(const ContentHash& hash) const {
+        const auto it = nodes_.find(hash);
+        if (it == nodes_.end()) {
+            return std::nullopt;
+        }
+        const Node& node = it->second;
+        const auto page = static_cast<std::size_t>(prefix_granularity_);
+        const std::size_t pages = node.full_prefix == nullptr ? 0 : static_cast<std::size_t>(node.full_prefix->depth);
+        Checkpoint checkpoint{.access_epoch = node.access_epoch};
+        checkpoint.tokens.resize(static_cast<std::size_t>(node.num_tokens));
+        checkpoint.prefix_hashes.resize(pages);
+        for (const PrefixSegment* segment = node.full_prefix; segment != nullptr; segment = segment->parent) {
+            const auto index = static_cast<std::size_t>(segment->depth - 1);
+            checkpoint.prefix_hashes[index] = segment->hash.ToString();
+            std::ranges::copy(segment->tokens, checkpoint.tokens.begin() + static_cast<std::ptrdiff_t>(index * page));
+        }
+        std::ranges::copy(node.tail, checkpoint.tokens.begin() + static_cast<std::ptrdiff_t>(pages * page));
+        if (!node.tail.empty()) {
+            checkpoint.tail = TailPublication{.tail_tokens = static_cast<std::int32_t>(node.tail.size()), .hash = hash};
+        }
+        return checkpoint;
+    }
+    // A pending import keeps identity and token ancestry, never Device/Host
+    // capacity. After ACK the index entries own residency; cancellation drops
+    // the last metadata hold and removes an otherwise absent point.
+    class MetadataHold {
+    public:
+        MetadataHold() = default;
+        MetadataHold(CheckpointTree& tree, const ContentHash& hash)
+            : tree_{&tree}, hash_{hash}, generation_{tree.generation_} {
+            ++tree.nodes_.at(hash).metadata_holds;
+        }
+        MetadataHold(const MetadataHold&) = delete;
+        MetadataHold& operator=(const MetadataHold&) = delete;
+        MetadataHold(MetadataHold&& other) noexcept
+            : tree_{std::exchange(other.tree_, nullptr)}, hash_{other.hash_}, generation_{other.generation_} {}
+        MetadataHold& operator=(MetadataHold&& other) noexcept {
+            if (this != &other) {
+                Reset();
+                tree_ = std::exchange(other.tree_, nullptr);
+                hash_ = other.hash_;
+                generation_ = other.generation_;
+            }
+            return *this;
+        }
+        ~MetadataHold() { Reset(); }
+        void Reset() noexcept {
+            if (!tree_) return;
+            const auto it = tree_->nodes_.find(hash_);
+            if (it != tree_->nodes_.end() && generation_ == tree_->generation_) {
+                FatalCheck(it->second.metadata_holds > 0, "checkpoint metadata hold underflow");
+                if (--it->second.metadata_holds == 0 && !it->second.residency.held) tree_->remove(it);
+            }
+            tree_ = nullptr;
+        }
+
+    private:
+        CheckpointTree* tree_{nullptr};
+        ContentHash hash_{};
+        std::uint64_t generation_{0};
+    };
+
+    // Compact policy metadata; range dependencies retain the shared history.
+    struct RecoveryPoint {
+        ContentHash hash;
+        std::optional<ContentHash> parent;
+        std::int32_t tokens;
+        double stamp;
+        double host_stamp;
+        bool fresh;
+        std::uint64_t sequence;
+    };
+
+    std::vector<RecoveryPoint> RecoveryPoints() const {
+        std::vector<RecoveryPoint> result;
+        result.reserve(nodes_.size());
+        for (const auto& [hash, node] : nodes_) {
+            RecoveryPoint point{hash,
+                                node.parent ? std::optional{*node.parent->hash} : std::nullopt,
+                                node.num_tokens,
+                                node.stamp,
+                                node.host_stamp,
+                                node.fresh,
+                                node.sequence};
+            result.push_back(std::move(point));
+        }
+        std::ranges::sort(result, {}, &RecoveryPoint::sequence);
+        return result;
+    }
+
+    // One non-owning production receipt per published identity. Natural
+    // checkpoints have no extra-output receipt and incur no forward charge.
+    void AttachProduction(const ContentHash& hash, std::shared_ptr<CheckpointLifecycle> receipt) {
+        auto& node = nodes_.at(hash);
+        if (!node.production) node.production = std::move(receipt);
+    }
+    void RejectFreshProduction(const ContentHash& hash) {
+        const auto it = nodes_.find(hash);
+        if (it != nodes_.end() && it->second.fresh && it->second.production) it->second.production->RejectFresh();
+    }
+
+    void SetGdsEnabled(bool enabled) { gds_enabled_ = enabled; }
+    void SetRecoveryIndex(RecoveryIndex* index) { recovery_index_ = index; }
+    RecoveryIndex* RecoveryDependencies() const { return recovery_index_; }
+    ContentHash PrefixHashAt(const ContentHash& hash, std::int32_t page) const {
+        return segmentAt(nodes_.at(hash), page + 1)->hash;
+    }
+    bool GdsEnabled() const { return gds_enabled_; }
+    ContentHash PrefixIdentityAt(const ContentHash& hash, std::int32_t tokens) const {
+        const auto& node = nodes_.at(hash);
+        _assert(tokens > 0 && tokens <= node.num_tokens, "preview prefix lies inside its checkpoint");
+        const auto full = tokens / prefix_granularity_;
+        const auto tail = tokens % prefix_granularity_;
+        const auto* prior = segmentAt(node, full);
+        const ContentHash seed = prior ? prior->hash : ContentHash{};
+        if (tail == 0) return seed;
+        const auto data = full < node.num_tokens / prefix_granularity_
+                              ? std::span<const std::int32_t>{segmentAt(node, full + 1)->tokens}
+                              : std::span<const std::int32_t>{node.tail};
+        return HashPrefixPage(data.first(tail), seed);
+    }
+    double Watermark() const { return watermark_; }
+    double HostWatermark() const { return host_watermark_; }
+    void CommitHostWatermark(double value) { host_watermark_ = std::max(host_watermark_, value); }
+    void CommitWatermark(double watermark) { watermark_ = std::max(watermark_, watermark); }
+    void Apply(const CheckpointUseEvent& event) noexcept {
+        if (auto it = nodes_.find(event.hash); it != nodes_.end()) {
+            if (gds_enabled_ && spdlog::should_log(spdlog::level::debug)) {
+                const auto cause = event.cause == CheckpointUseEvent::Cause::kLastRelease ? "last_release"
+                                   : event.cause == CheckpointUseEvent::Cause::kPeerUse   ? "peer_use"
+                                                                                          : "acquire";
+                spdlog::debug(
+                    "[GDS] stamp hash={} cause={} device_before={} device_after={} host_before={} host_after={}",
+                    event.hash.ToString(), cause, it->second.stamp, watermark_, it->second.host_stamp, host_watermark_);
+            }
+            it->second.stamp = watermark_;
+            it->second.host_stamp = host_watermark_;
+            if (event.cause != CheckpointUseEvent::Cause::kLastRelease) it->second.fresh = false;
+        }
+    }
+    void RecordUse(const ContentHash& hash) { Apply({hash, CheckpointUseEvent::Cause::kAcquire}); }
+    // A newly produced checkpoint remains fresh when its producer releases it.
+    void RecordRelease(const ContentHash& hash) noexcept { Apply({hash, CheckpointUseEvent::Cause::kLastRelease}); }
+
     void Clear() {
+        ++generation_;
+        watermark_ = 0;
+        host_watermark_ = 0;
+        publication_sequence_ = 0;
         nodes_.clear();
         roots_.clear();
         tails_by_prior_.clear();
@@ -215,6 +382,13 @@ private:
         // Position in the parent's children (or the roots).
         std::size_t slot{0};
         Residency residency{};
+        std::size_t metadata_holds{0};
+        double stamp{0};
+        double host_stamp{0};
+        bool fresh{true};
+        std::uint64_t sequence{0};
+        RecoveryIndex::Registration recovery;
+        std::shared_ptr<CheckpointLifecycle> production;
         // How many children report each value (index 0 unused).
         std::array<std::uint32_t, kMaxDistance + 2> child_values{};
         // What the parent sees, 0 for no checkpoint: a present checkpoint
@@ -530,6 +704,12 @@ private:
         return std::ranges::equal(page.first(prefix.tail.size()), prefix.tail);
     }
 
+    std::uint64_t generation_{0};
+    bool gds_enabled_{false};
+    RecoveryIndex* recovery_index_{nullptr};
+    double watermark_{0};
+    double host_watermark_{0};
+    std::uint64_t publication_sequence_{0};
     std::int32_t prefix_granularity_;
     std::int32_t leaf_distance_;
     std::unordered_map<ContentHash, Node> nodes_;

@@ -420,6 +420,16 @@ mod tests {
         }
     }
 
+    fn admit_chunks(
+        queues: &mut Queues,
+        direction: Direction,
+        chunks: impl IntoIterator<Item = Chunk>,
+        done: Done,
+        now: Instant,
+    ) -> u64 {
+        queues.admit(direction, chunks, done, now)
+    }
+
     type Outcomes = std::sync::Arc<Mutex<Vec<Result<(), IoError>>>>;
 
     fn recorder() -> (Done, Outcomes) {
@@ -441,7 +451,8 @@ mod tests {
         let mut queues = Queues::default();
         let now = Instant::now();
         let (done, _) = recorder();
-        queues.admit(
+        admit_chunks(
+            &mut queues,
             Direction::Write,
             [chunk(Direction::Write, 1), chunk(Direction::Write, 1)],
             done,
@@ -450,7 +461,13 @@ mod tests {
         queues.release_write();
         queues.release_write();
         let (done, _) = recorder();
-        queues.admit(Direction::Read, [chunk(Direction::Read, 1)], done, now);
+        admit_chunks(
+            &mut queues,
+            Direction::Read,
+            [chunk(Direction::Read, 1)],
+            done,
+            now,
+        );
         assert_eq!(queues.next(LIMITS).unwrap().direction, Direction::Read);
         assert_eq!(queues.next(LIMITS).unwrap().direction, Direction::Write);
         // One write in flight is the share, though a slot is free.
@@ -461,7 +478,8 @@ mod tests {
     fn a_job_reports_once_after_its_last_chunk_and_keeps_the_first_error() {
         let mut queues = Queues::default();
         let (done, seen) = recorder();
-        queues.admit(
+        admit_chunks(
+            &mut queues,
             Direction::Read,
             [
                 chunk(Direction::Read, 1),
@@ -488,7 +506,8 @@ mod tests {
     fn a_cancelled_job_waits_for_its_chunks_in_flight() {
         let mut queues = Queues::default();
         let (done, _) = recorder();
-        let job = queues.admit(
+        let job = admit_chunks(
+            &mut queues,
             Direction::Read,
             [chunk(Direction::Read, 1), chunk(Direction::Read, 1)],
             done,
@@ -506,7 +525,8 @@ mod tests {
     fn closing_cancels_what_is_queued() {
         let mut queues = Queues::default();
         let (done, _) = recorder();
-        queues.admit(
+        admit_chunks(
+            &mut queues,
             Direction::Write,
             [chunk(Direction::Write, 1)],
             done,

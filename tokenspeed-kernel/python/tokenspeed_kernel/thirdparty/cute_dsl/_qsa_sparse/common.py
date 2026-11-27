@@ -330,16 +330,19 @@ def _prefetch_private_kv_payload(
             tail = private_index % 3
             raw_slot = selected_slots[row_idx * query_group + query, 2048 + tail]
             slot = cutlass.Int64(raw_slot if raw_slot > 0 else _PADDING_READ_SLOT)
-            dim = lane_idx * 8
-            offset = slot * num_kv_heads * _HEAD_DIM + dim
-            key_destination = cute.domain_offset(
-                (dim, tail, query), staged_key
-            ).iterator
-            value_destination = cute.domain_offset(
-                (dim, tail, query), staged_value
-            ).iterator
-            copy_gmem_to_smem_u128(key_destination, k_iter + offset)
-            copy_gmem_to_smem_u128(value_destination, v_iter + offset)
+            # A lane copies sixteen bytes for either cache format. FP8 uses
+            # sixteen lanes; BF16 uses the entire warp, without overlapping stores.
+            dim = lane_idx * (128 // k_iter.dtype.width)
+            if dim < _HEAD_DIM:
+                offset = slot * num_kv_heads * _HEAD_DIM + dim
+                key_destination = cute.domain_offset(
+                    (dim, tail, query), staged_key
+                ).iterator
+                value_destination = cute.domain_offset(
+                    (dim, tail, query), staged_value
+                ).iterator
+                copy_gmem_to_smem_u128(key_destination, k_iter + offset)
+                copy_gmem_to_smem_u128(value_destination, v_iter + offset)
             cute.arch.cp_async_commit_group()
             # Bound pending groups while keeping the newest four in flight.
             if (private_index & 3) == 3:

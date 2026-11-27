@@ -216,6 +216,11 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         store_hashes.push_back(completed.completed_pages->tail->hash.ToString());
     }
     coordinator_.Host().QueueCachedBlocksForStore(store_hashes);
+    if (shared_l2_proxy_) {
+        // A shared L2 pool takes them with the next plan's writes; queued,
+        // they pin nothing.
+        return std::nullopt;
+    }
     // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
     return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
@@ -241,7 +246,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
 // the forward spanning C writes it, and a forward that starts or ends at C
 // finds or leaves the state there cached (a hit at C, a chunk end at C).
 std::int32_t Scheduler::promptEndCheckpoint(const Request& request, std::int32_t resume_tokens) const {
-    if (!config_.state_checkpoint_in_forward || config_.role == Role::kD) {
+    if (!checkpoints_.publication.filter_covered_endpoints) {
         return 0;
     }
     const std::int32_t page = coordinator_.PrefixGranularity();
@@ -289,7 +294,7 @@ bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm
 // end, and it never retracts.
 bool Scheduler::shortPromptEndIsDropped(const Request& request) const {
     const std::int32_t prompt = request.PrefillSize();
-    if (!config_.drop_short_prompt_end_checkpoints || request.NumComputedTokens() != prompt ||
+    if (!checkpoints_.publication.drop_short_prompt_end || request.NumComputedTokens() != prompt ||
         prompt % coordinator_.PrefixGranularity() == 0 ||
         PrefillStateCheckpointTokens(coordinator_, prompt, config_.max_scheduled_tokens,
                                      config_.prefix_replay_tokens) != 0) {
@@ -322,7 +327,7 @@ bool Scheduler::shortPromptEndIsDropped(const Request& request) const {
 // their own. The D role publishes its frontier as ever. (Validate requires
 // prefix caching with the in-forward checkpoint on the other roles.)
 bool Scheduler::finishCheckpointIsDead(const Request& request, const fsm::CacheProgress& progress) const {
-    if (!config_.state_checkpoint_in_forward || config_.role == Role::kD) {
+    if (!checkpoints_.publication.filter_covered_endpoints) {
         return false;
     }
     const std::int32_t frontier = request.NumComputedTokens();
@@ -341,6 +346,8 @@ bool Scheduler::finishCheckpointIsDead(const Request& request, const fsm::CacheP
 }
 
 void Scheduler::demoteSupersededCheckpoint(const fsm::CacheProgress& progress) {
+    // GDS owns logical retention on both tiers, including pending stores.
+    if (!checkpoints_.retention.demote_superseded) return;
     const std::int32_t page = coordinator_.PrefixGranularity();
     const std::int32_t checkpoint = progress.published_state_checkpoint_tokens;
     const std::int32_t resumed = progress.resume_tokens;
@@ -378,7 +385,7 @@ void Scheduler::demoteSupersededCheckpoint(const fsm::CacheProgress& progress) {
     const std::array<std::int32_t, 2> kept_boundaries{resumed, checkpoint};
     const std::vector<CacheKey> keys =
         coordinator_.BoundaryCheckpointKeys(chain.first(static_cast<std::size_t>(superseded / page)), kept_boundaries);
-    std::int32_t demoted = coordinator_.DemoteEntries(keys);
+    std::int32_t demoted = coordinator_.DemoteEntries(keys, CacheCoordinator::DemotionCause::kSupersededCheckpoint);
     // Under the write-back policy an eviction may still be carrying one of
     // them to the Host: it lands demoted as well.
     demoted += tier_transfers_.DemoteInFlightEvictions(keys);
@@ -502,6 +509,11 @@ void Scheduler::handleEvent(const cache::RestoreDone& event) {
     }
     // Otherwise the row and the blob slot return with the ticket: the request
     // that would have used them is gone.
+}
+
+void Scheduler::handleEvent(const cache::StateCommitDone& event) {
+    // Every replica member committed the endpoints; a duplicate ACK finds none.
+    state_commit_fences_.erase(event.op_id);
 }
 
 }  // namespace tokenspeed

@@ -20,7 +20,7 @@
 
 """Resolving a forward's in-forward State checkpoints and the scan's plan.
 
-CPU-only: the rows that write a checkpoint, the packed position after each,
+The rows that write a checkpoint, the packed position after each,
 the receiving block of every State group, and where a chunked scan stores
 them -- plus the refusals that keep the scheduler from publishing a block the
 runtime never wrote.
@@ -136,3 +136,21 @@ def test_a_single_checkpoint_is_the_scans_only_state():
     )
     interval, cu_starts, rows = scan_checkpoint_plan(checkpoints, seq)
     assert (interval, cu_starts.tolist(), rows.tolist()) == (5120, [0, 1], [0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_checkpoint_metadata_upload_does_not_synchronize():
+    lengths = torch.tensor([200, 192], dtype=torch.int32)
+    offsets = torch.tensor([0, 128], dtype=torch.int32)
+    tables = {
+        group: table.cuda() for group, table in _tables([[1, 2, -1], [3, 4, 8]]).items()
+    }
+    in_forward_state_checkpoints(offsets, lengths, 2, tables, _GROUPS)
+    torch.cuda.synchronize()
+    previous_sync_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        checkpoints = in_forward_state_checkpoints(offsets, lengths, 2, tables, _GROUPS)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_sync_mode)
+    assert checkpoints is not None

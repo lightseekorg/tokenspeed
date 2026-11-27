@@ -84,15 +84,28 @@ def register():
 Pass `start_node=None` explicitly when no shared resource is needed. In this case,
 the normalized configuration becomes the producer configuration directly, and
 `create_sink` can construct the plugin's SDK adapter in each producer process.
-Only plain configuration crosses spawn; never return a live socket, thread, or
-SDK client in `producer_config`. TokenSpeed validates and copies both configuration
-results before passing them to another process.
+Use plain values for `producer_config`. TokenSpeed validates and copies both
+configuration results before passing them to another process.
 
 Registering an existing name requires `override=True`. Failed plugin registration
 rolls back its metric registrations along with its other runtime registrations.
 The name `prometheus` is reserved. A selected plugin that fails registration or is
 disabled through `TOKENSPEED_DISABLE_PLUGINS` causes an unknown-reporter startup
 error rather than silently dropping the requested output.
+
+The headless launcher's metrics relay uses a standalone Python entry point so it
+does not re-import the engine's main module. The launcher passes the entry-point
+targets of successfully loaded plugins that registered the selected reporters.
+The relay registers those plugins in the same order, creates its sinks, and
+binds the event socket before acknowledging readiness. Unrelated model and kernel
+plugins are not discovered again. A lightweight reporter plugin can keep model
+dependencies out of its registration callback.
+
+Configuration preparation and other producers still perform normal discovery,
+including its loading lock and rollback behavior. Only the isolated relay replays
+the launcher's selections. Missing reporters remain startup errors. Relay startup
+failure still fails the launcher before GPU workers start. Shutdown drains sinks
+within its budget and terminates an unresponsive relay, including on normal launcher exit.
 
 ## Event semantics
 

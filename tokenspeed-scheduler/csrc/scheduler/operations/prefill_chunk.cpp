@@ -27,6 +27,51 @@
 
 namespace tokenspeed {
 
+CheckpointMaterializationPlan PlanCheckpointMaterialization(std::int32_t checkpoint, std::int32_t first_pos,
+                                                            std::int32_t tokens, std::int32_t junction,
+                                                            std::int32_t max_chunk_tokens,
+                                                            std::int32_t prefix_granularity,
+                                                            CheckpointProductionConfig production,
+                                                            std::span<const CacheGroupConfig> groups) {
+    _assert(checkpoint >= 0 && first_pos >= 0 && tokens >= 0 && prefix_granularity > 0,
+            "checkpoint planning requires nonnegative positions and a positive grain");
+    _assert(checkpoint == 0 || production.in_forward, "an interior target requires a validated producer");
+    const std::int64_t end = std::int64_t{first_pos} + tokens;
+    if (checkpoint > first_pos && end != checkpoint && checkpoint - end < max_chunk_tokens) {
+        if (end < checkpoint) {
+            if (!(junction >= end && junction < checkpoint)) {
+                const std::int64_t page_end = end / prefix_granularity * prefix_granularity;
+                if (page_end > first_pos) tokens = static_cast<std::int32_t>(page_end - first_pos);
+            }
+        } else if ((checkpoint - first_pos) % prefix_granularity != 0) {
+            tokens = checkpoint - first_pos;
+        }
+    }
+    const bool interior = checkpoint > first_pos && checkpoint < std::int64_t{first_pos} + tokens &&
+                          (checkpoint - first_pos) % prefix_granularity == 0;
+    CheckpointMaterializationPlan result{checkpoint,
+                                         first_pos,
+                                         tokens,
+                                         interior ? checkpoint - first_pos : 0,
+                                         interior ? CheckpointMaterializationPlan::Producer::kInterior
+                                                  : CheckpointMaterializationPlan::Producer::kNatural,
+                                         std::vector<CheckpointMaterializationPlan::GroupOutput>(groups.size())};
+    if (checkpoint > first_pos && checkpoint <= std::int64_t{first_pos} + tokens) {
+        for (std::size_t i = 0; i < groups.size(); ++i) {
+            const auto& group = groups[i];
+            if (group.attn_kind == AttnKind::kState) {
+                result.groups[i].extra_blocks = interior ? 1 : 0;
+            } else if (!group.replayable) {
+                result.groups[i].history_begin =
+                    group.sliding_window_tokens ? std::max(0, checkpoint - *group.sliding_window_tokens + 1) : 0;
+                result.groups[i].history_end = checkpoint;
+                result.groups[i].sink_end = std::min(checkpoint, group.sink_tokens);
+            }
+        }
+    }
+    return result;
+}
+
 std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, std::int32_t prompt_tokens,
                                           std::int32_t chunk_budget, std::int32_t prefix_replay_tokens) {
     _assert(prompt_tokens >= 0 && chunk_budget > 0 && prefix_replay_tokens >= 0,

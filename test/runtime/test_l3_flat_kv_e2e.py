@@ -144,7 +144,9 @@ class TestL3FlatKvRoundTripTest:
                 self.layout = layout
                 self.arena = SimpleNamespace(
                     runtime_contract=contract,
-                    memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+                    memory_saver_adapter=TorchMemorySaverAdapter.create(
+                        enable=False, device="cpu"
+                    ),
                 )
                 self.load_tracker = None
 

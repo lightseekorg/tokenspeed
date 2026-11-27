@@ -111,9 +111,11 @@ struct PrefixProbe {
     // The Host suffix of the hit. Admission loads these; nothing an
     // admission touches can miss.
     Tier host;
-    // Accounting only, never read by a decision: the Device-only
-    // boundary before a Host suffix replaced it. Zero without a Host pool
-    // and on the D role.
+    // The Device-only boundary before a Host suffix replaced it. Zero
+    // without a Host pool and on the D role. Accounting, and read by one
+    // decision: a shared L2 rank's lookup step
+    // (Scheduler::StartSharedL2Lookups) asks the pool nothing for a prompt
+    // the Device alone already covers.
     std::int32_t device_only_hit_tokens{0};
 };
 // The publication point an admission reserves copy-in blocks for: the

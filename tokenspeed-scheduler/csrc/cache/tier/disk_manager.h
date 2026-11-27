@@ -55,21 +55,32 @@ public:
 
     const DiskConfig& Config() const { return config_; }
 
+    struct ReadStartResult {
+        StorageLease lease;
+        // True when Disk had hits (or credits were exhausted before probing)
+        // and the read could not start only because operation or Host-block
+        // credits were temporarily insufficient.
+        bool retryable{false};
+    };
+
+    // Whether a read can start now within the operation and Host-block bounds.
+    bool HasReadCredits() const;
     // Reads the keys of the prompt's prefix that only the Disk holds -- for
     // the longest boundary Disk extends the local hit to under the
     // Host-suffix rule -- into Host blocks it allocates, holding the Disk
-    // sources. Returns an empty lease when Disk adds nothing, the credits are
-    // spent, or no boundary's blocks fit the Host.
+    // sources. Distinguishes a permanent miss from transient credit exhaustion.
+    ReadStartResult TryStartRead(const PromptPrefix& prompt, std::int32_t local_tokens);
+    // Convenience wrapper returning only the lease.
     StorageLease StartRead(const PromptPrefix& prompt);
     // Whether the operation finished; an unknown operation counts as finished.
     bool Completed(std::uint64_t id) const;
 
-    // Queues Host entries to be cleaned, oldest first. They are checked
-    // again when a cleaning write takes them.
+    // Queues Host entries for legacy cleaning, oldest first. GDS uses the
+    // resident dirty index instead and does not enqueue these notifications.
     void QueueCleaning(std::span<const CacheKey> keys);
-    // Writes the oldest queued keys that are still dirty Host entries, each
-    // with the dirty Host entries of the pages above it, into Disk blocks it
-    // allocates, within the write credits. At most one write per plan.
+    // Selects dirty Host entries in the current policy's order, with their
+    // dirty ancestors, and writes them within the credits. At most one write
+    // per plan; GDS derives candidates from residency, legacy from the queue.
     void StartCleaning();
     // Forgets the queued keys (a flush, a frozen round).
     void DropCleaning();
@@ -89,6 +100,7 @@ public:
     // (CacheCoordinator::CacheIsClearableAfterStorageDrain).
     std::vector<const CacheBlockRef*> HeldHostBlockRefs() const;
     std::size_t NumQueuedCleanings() const { return cleaning_.size(); }
+    std::size_t NumAwaitingReuse() const { return awaiting_reuse_.size(); }
     std::uint64_t WrittenBlocks() const { return written_blocks_; }
     std::uint64_t ReadBlocks() const { return read_blocks_; }
     std::uint64_t FailedReads() const { return failed_reads_; }
@@ -100,7 +112,9 @@ private:
         DiskOpKind kind{DiskOpKind::kRead};
         std::vector<CacheKey> keys;
         std::vector<CacheBlockRef> host_blocks;
+        std::vector<PrefixCacheIndex::CleaningSource> cleaning_sources;
         std::vector<CacheBlockRef> disk_blocks;
+        std::vector<CacheBlockRef> disk_dependencies;
         // A cleaning write: each key's Host entry metadata, which its Disk
         // entry is published with.
         std::vector<PrefixCacheIndex::CachedBlockMetadata> metadata;
@@ -109,17 +123,27 @@ private:
         std::optional<TailPublication> tail;
         bool detached{false};
         bool completed{false};
+        CacheCoordinator::RecoveryMetadata recovery_metadata;
     };
 
     std::uint64_t nextId();
     void detach(std::uint64_t id) noexcept override;
+    std::size_t numOperations(DiskOpKind kind) const;
     std::size_t heldHostBlocks(DiskOpKind kind) const;
     DiskOperation command(std::uint64_t id, const Ticket& ticket) const;
+    // Moves the entries acquired since the reuse gate turned them away back
+    // into the cleaning queue, a bounded number per call.
+    void requeueReused();
+    bool mayClean(const CacheKey& key) const;
+    void filterCleaning(Ticket& ticket);
 
     CacheCoordinator& coordinator_;
     const DiskConfig config_;
     std::map<std::uint64_t, Ticket> operations_;
     std::deque<CacheKey> cleaning_;
+    // Dirty Host entries the reuse gate turned away: cleaned once a later
+    // admission acquires them, forgotten when the Host drops them.
+    std::deque<CacheKey> awaiting_reuse_;
     std::vector<DiskOperation> commands_;
     std::uint64_t next_id_{1};
     std::uint64_t written_blocks_{0};

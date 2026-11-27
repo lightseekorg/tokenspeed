@@ -116,14 +116,15 @@ def stage_up(
     if wave_pending((tid > 0) & (tid < 28)):
         poll_pairs(lnrdy, (tid,), tag, (tid > 0) & (tid < 28), "gpu", guard)
     gl.barrier()
-    rows_to_lds(ln, xl, 3584, S, 3584, 0, "gpu")
-    acc = gemv_dot(xl, weights, 3584, S, False)
-    gemv_reduce(acc, red, S)
     token, pair = gl.minimum(tid // 8, S - 1), tid % 8
     at = (token * 896 + group * 16 + pair * 2) // 2
+    # Issued ahead of the rows' loads, so its latency overlaps theirs.
     word = gl.amd.cdna3.buffer.load(
         descriptor(shp.to(gl.pointer_type(gl.uint32))), at, scope="gpu"
     )
+    rows_to_lds(ln, xl, 3584, S, 3584, 0, "gpu")
+    acc = gemv_dot(xl, weights, 3584, S, False)
+    gemv_reduce(acc, red, S)
     lo = bf16_round(
         (word << 16).to(gl.float32, bitcast=True) + sum_waves(red, pair * 2, token)
     )
@@ -165,6 +166,12 @@ def stage_final(
     live = tid < S * 64
     token, pair = sent_item(gl.minimum(tid, S * 64 - 1), S)
     col = group * 128 + pair * 2
+    # The prefix this launch's slices wrote is in flight across the wait.
+    pw = gl.amd.cdna3.buffer.load(
+        descriptor(prefix.to(gl.pointer_type(gl.uint32))),
+        (token * 7168 + col) // 2,
+        scope="gpu",
+    )
     lo, hi = sent_sum(
         final_own,
         col,
@@ -179,11 +186,6 @@ def stage_final(
         FLAGS_OFFSET,
         14,
         False,
-    )
-    pw = gl.amd.cdna3.buffer.load(
-        descriptor(prefix.to(gl.pointer_type(gl.uint32))),
-        (token * 7168 + col) // 2,
-        scope="gpu",
     )
     lo = bf16_round(bf16_round(lo) + (pw << 16).to(gl.float32, bitcast=True))
     hi = bf16_round(bf16_round(hi) + (pw & 0xFFFF0000).to(gl.float32, bitcast=True))

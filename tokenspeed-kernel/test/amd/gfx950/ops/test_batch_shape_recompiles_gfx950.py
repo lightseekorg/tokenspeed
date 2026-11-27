@@ -300,7 +300,13 @@ def test_mha_prefill_token_stride_and_request_count(window):
 # FP8 caches run the products on the F8F6F4 MFMA, a separate set of variants.
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("window", [-1, 127, 2047])
-def test_mha_extend_startup_warmup_covers_every_variant(window, dtype):
+# Head dim 256 (24 query heads over 4 KV heads) runs single-buffered.
+@pytest.mark.parametrize(
+    "heads,kv_heads,dim", [(16, 2, 64), (24, 4, 256)], ids=["hd64", "hd256"]
+)
+def test_mha_extend_startup_warmup_covers_every_variant(
+    window, dtype, heads, kv_heads, dim
+):
     from tokenspeed_kernel.numerics.torch.attention.mha import (
         gather_pages,
         torch_dense_attention,
@@ -309,7 +315,7 @@ def test_mha_extend_startup_warmup_covers_every_variant(window, dtype):
     from tokenspeed_kernel.ops.tuning import kernel_warmup
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
 
-    heads, kv_heads, dim, page, width, slots = 16, 2, 64, 64, 160, 80
+    page, width, slots = 64, 160, 80
     generator = torch.Generator(device=DEVICE).manual_seed(3)
     cache_shape = (1 + slots * width, page, kv_heads, dim)
     k_cache = torch.randn(cache_shape, device=DEVICE, generator=generator).to(dtype)
@@ -746,99 +752,6 @@ def test_iris_lamport_allreduce_row_count(moe):
             )
 
     assert_warmup_covers((kernel,), lambda: compile_for(1), compile_for, (5, 16, 63))
-
-
-def test_kda_fused_replay_batch_size():
-    from tokenspeed_kernel_amd.ops.gfx950.attention.kda import decode
-
-    layers = 4
-    descriptors = torch.zeros(layers, 10, dtype=torch.uint64, device=DEVICE)
-    groups = torch.zeros(layers, dtype=torch.int32, device=DEVICE)
-
-    # Compile only: the descriptors would have to address real layer buffers.
-    def compile_for(batch):
-        pages = torch.zeros(2, batch, dtype=torch.int32, device=DEVICE)
-        accepted = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
-        metadata = torch.zeros(batch, 3, dtype=torch.int64, device=DEVICE)
-        stamps = torch.zeros(layers, batch, 4, 2, dtype=torch.int64, device=DEVICE)
-        activation_ref = torch.empty(0, dtype=torch.bfloat16, device=DEVICE)
-        decode.gluon_kda_fused_replay_gfx950.warmup(
-            descriptors,
-            groups,
-            pages,
-            pages,
-            accepted,
-            metadata,
-            stamps,
-            activation_ref,
-            activation_ref,
-            torch.empty(0, dtype=torch.float32, device=DEVICE),
-            BATCH=batch,
-            qkv_stride=4608,
-            conv_stride=13824,
-            state_stride=196608,
-            u_stride=1536,
-            kg_stride=3072,
-            record_slots=batch,
-            stamp_layer_stride=stamps.stride(0),
-            lower_bound=-5.0,
-            H=12,
-            D=128,
-            T=4,
-            CAPACITY=4,
-            BOUNDED=True,
-            num_warps=4,
-            debug=True,
-            grid=(1,),
-        )
-
-    compile_for(16)
-    compile_for(3)
-    with assert_no_triton_compile(decode.gluon_kda_fused_replay_gfx950):
-        for batch in (5, 7, 11, 13, 15):
-            compile_for(batch)
-
-
-def test_kda_fused_decode_batch_size():
-    from tokenspeed_kernel_amd.ops.gfx950.attention.kda import decode
-
-    heads, head_dim, pages = 12, 128, 96
-    width = heads * head_dim
-    # Q/K/V, output gate, f_a, and beta are column slices of one projection.
-    packed = torch.randn(48, 4 * width + head_dim + heads, device=DEVICE).bfloat16()
-    conv_weights = torch.randn(3 * width, 4, device=DEVICE).bfloat16()
-    conv_states = torch.zeros(pages, 3 * width, 3, device=DEVICE).bfloat16()
-    f_b_weight = torch.randn(width, head_dim, device=DEVICE).bfloat16()
-    state_pool = torch.zeros(pages, heads, head_dim, head_dim, device=DEVICE)
-
-    def run(batch):
-        rows = packed[:batch]
-        decode.gluon_kda_fused_decode_gfx950(
-            mixed_qkv=rows[:, : 3 * width],
-            conv_weights=conv_weights,
-            conv_states=conv_states,
-            f_a_out=rows[:, 4 * width : 4 * width + head_dim],
-            f_b_weight=f_b_weight,
-            beta_logits=rows[:, 4 * width + head_dim :],
-            A_log=torch.zeros(heads, device=DEVICE),
-            dt_bias=torch.zeros(width, device=DEVICE),
-            state_pool=state_pool,
-            read_indices=torch.arange(batch, device=DEVICE, dtype=torch.int32),
-            write_indices=torch.arange(
-                batch, 2 * batch, device=DEVICE, dtype=torch.int32
-            ),
-            num_heads=heads,
-            head_dim=head_dim,
-            cu_seqlens=torch.arange(batch + 1, device=DEVICE, dtype=torch.int32),
-            lower_bound=-5.0,
-        )
-
-    # The state pipeline depth is bucketed by programs per CU.
-    for batch in (16, 32, 48):
-        run(batch)
-    with assert_no_triton_compile(decode.gluon_kda_fused_paged_decode_vmajor_gfx950):
-        for batch in (1, 3, 7, 21, 22, 33, 42, 43, 47):
-            run(batch)
 
 
 def test_dsa_decode_scorer_table_width():

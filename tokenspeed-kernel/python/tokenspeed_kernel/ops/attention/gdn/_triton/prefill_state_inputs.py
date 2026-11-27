@@ -22,15 +22,13 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.platform import current_platform
 
 
+# Pool block counts change with the pool size and the index vectors are often
+# offset slices of larger buffers, so neither may key a new specialization.
 @triton.jit(
-    **(
-        {"do_not_specialize_on_alignment": ["state_in", "state_out"]}
-        if current_platform().is_npu
-        else {}
-    )
+    do_not_specialize=["conv_num_blocks", "ssm_num_blocks"],
+    do_not_specialize_on_alignment=["state_in", "state_out"],
 )
 def _prepare_prefill_state_inputs_kernel(
     conv_states,
@@ -39,6 +37,8 @@ def _prepare_prefill_state_inputs_kernel(
     state_out,
     recurrent,
     has_initial_state,
+    conv_num_blocks,
+    ssm_num_blocks,
     conv_width: tl.constexpr,
     conv_state_len: tl.constexpr,
     recurrent_width: tl.constexpr,
@@ -55,50 +55,70 @@ def _prepare_prefill_state_inputs_kernel(
     out_stride: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    # The request count scales row * recurrent_width past int32.
+    row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
     source = tl.load(state_in + row * in_stride).to(tl.int64)
     destination = tl.load(state_out + row * out_stride).to(tl.int64)
-    has_history = source > 0
+    # Block 0 is the null block and ids <= 0 or past either pool are not
+    # pages of that pool, so each pool bounds source and destination itself.
+    valid_conv_src = (source > 0) & (source < conv_num_blocks)
+    valid_conv_dst = (destination > 0) & (destination < conv_num_blocks)
+    valid_ssm_src = (source > 0) & (source < ssm_num_blocks)
     if tile == 0:
-        tl.store(has_initial_state + row, has_history)
-    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+        tl.store(has_initial_state + row, valid_ssm_src)
+    tile_start = tile * BLOCK
+    offsets = tile_start + tl.arange(0, BLOCK)
 
     # Fresh conv windows stay on the allocator-zeroed working block; in-place
-    # evolution needs no copy. Shared input snapshots are never written.
-    conv_offset = (
-        offsets // conv_state_len * conv_channel_stride
-        + offsets % conv_state_len * conv_position_stride
-    )
-    copy_conv = has_history & (source != destination) & (offsets < conv_width)
-    window = tl.load(
-        conv_states + source * conv_block_stride + conv_offset,
-        mask=copy_conv,
-        other=0,
-    )
-    tl.store(
-        conv_states + destination * conv_block_stride + conv_offset,
-        window,
-        mask=copy_conv,
-    )
+    # evolution needs no copy. Shared input snapshots are never written. The
+    # branch is uniform per program, so tiles past the conv window, which are
+    # most of the grid, skip the index math and the masked copy entirely.
+    if (
+        valid_conv_src
+        & valid_conv_dst
+        & (source != destination)
+        & (tile_start < conv_width)
+    ):
+        conv_offset = (
+            offsets // conv_state_len * conv_channel_stride
+            + offsets % conv_state_len * conv_position_stride
+        )
+        copy_conv = offsets < conv_width
+        window = tl.load(
+            conv_states + source * conv_block_stride + conv_offset,
+            mask=copy_conv,
+            other=0,
+        )
+        tl.store(
+            conv_states + destination * conv_block_stride + conv_offset,
+            window,
+            mask=copy_conv,
+        )
 
-    state_offset = (
-        offsets // (key_dim * value_dim) * ssm_head_stride
-        + offsets // value_dim % key_dim * ssm_key_stride
-        + offsets % value_dim * ssm_value_stride
-    )
-    # Never read the null block or stale working-block bytes for a fresh row,
-    # even if they contain NaNs. Materialize its logical zero directly.
-    state = tl.load(
-        ssm_states + source * ssm_block_stride + state_offset,
-        mask=has_history & (offsets < recurrent_width),
-        other=0,
-    )
-    tl.store(
-        recurrent + row * recurrent_width + offsets,
-        state,
-        mask=offsets < recurrent_width,
-    )
+    if tile_start < recurrent_width:
+        in_state = offsets < recurrent_width
+        if valid_ssm_src:
+            state_offset = (
+                offsets // (key_dim * value_dim) * ssm_head_stride
+                + offsets // value_dim % key_dim * ssm_key_stride
+                + offsets % value_dim * ssm_value_stride
+            )
+            state = tl.load(
+                ssm_states + source * ssm_block_stride + state_offset,
+                mask=in_state,
+                other=0,
+            )
+            tl.store(recurrent + row * recurrent_width + offsets, state, mask=in_state)
+        else:
+            # Never read the null block, stale working-block bytes, or memory
+            # past the pool for a row without history, even if they contain
+            # NaNs. Materialize its logical zero directly.
+            tl.store(
+                recurrent + row * recurrent_width + offsets,
+                tl.zeros((BLOCK,), dtype=recurrent.dtype.element_ty),
+                mask=in_state,
+            )
 
 
 def prepare_prefill_state_inputs(
@@ -111,21 +131,32 @@ def prepare_prefill_state_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Copy resumed conv windows and gather/zero recurrent inputs in one launch.
 
+    Block ids are pages of each cache pool. Only ids in the open interval
+    ``(0, num_blocks)`` of a pool are read or written there: block 0 is the
+    reserved null block, and ids ``<= 0`` (including ``-1`` padding) or
+    ``>= num_blocks`` are skipped. Each id is checked against each pool on its
+    own, so the conv and recurrent pools may differ in size.
+
     Args:
-        conv_states: Strided [blocks, channels, window] convolution cache.
-        ssm_states: Strided [blocks, heads, key, value] recurrent cache.
-        state_in_blocks: int32/int64 [requests] source ids; <=0 means fresh.
-        state_out_blocks: int32/int64 [requests] unique, positive working ids.
-            As required by cache ownership, a destination cannot overwrite
-            another request's input snapshot; source==destination is allowed
-            for that request's private in-place evolution.
+        conv_states: Strided [conv_num_blocks, channels, window] convolution
+            cache.
+        ssm_states: Strided [ssm_num_blocks, heads, key, value] recurrent cache.
+        state_in_blocks: int32/int64 [requests] source ids. A row has history
+            only when its source lies in ``(0, ssm_num_blocks)``.
+        state_out_blocks: int32/int64 [requests] working ids. A row's conv
+            window is copied only when its source and destination both lie in
+            ``(0, conv_num_blocks)`` and differ. As required by cache
+            ownership, a copied destination cannot overwrite another request's
+            input snapshot; source==destination is allowed for that request's
+            private in-place evolution.
         dtype: Recurrent input dtype; conversion is fused into the gather.
 
     Returns:
         Contiguous [requests, heads, key, value] recurrent inputs and bool
-        [requests] history flags. Fresh recurrent rows are exactly zero;
-        fresh conv windows are unchanged. The recurrent cache and null block
-        are untouched. CUDA and Ascend support arbitrary cache strides without index
+        [requests] history flags. Rows without history are exactly zero; conv
+        windows of rows without a copy are unchanged. The recurrent cache, the
+        null block of each cache, and memory outside both caches are untouched.
+        CUDA, ROCm, and Ascend support arbitrary cache strides without index
         casts or scratch gathers; CPU retains the PyTorch reference.
     """
     if conv_states.ndim != 3 or ssm_states.ndim != 4:
@@ -143,13 +174,23 @@ def prepare_prefill_state_inputs(
     ):
         raise ValueError("prefill caches and indices must be on the same device")
     if conv_states.device.type not in ("cuda", "npu"):
-        has_initial_state = state_in_blocks > 0
-        safe_inputs = torch.where(
-            has_initial_state, state_in_blocks, state_out_blocks
-        ).to(torch.int64)
-        conv_states[state_out_blocks.long()] = conv_states[safe_inputs]
-        recurrent = ssm_states[safe_inputs].to(dtype)
-        recurrent.masked_fill_(~has_initial_state[:, None, None, None], 0)
+        source = state_in_blocks.long()
+        destination = state_out_blocks.long()
+        has_initial_state = (source > 0) & (source < ssm_states.shape[0])
+        copy_conv = (
+            (source > 0)
+            & (source < conv_states.shape[0])
+            & (destination > 0)
+            & (destination < conv_states.shape[0])
+            & (source != destination)
+        )
+        conv_states[destination[copy_conv]] = conv_states[source[copy_conv]]
+        recurrent = torch.zeros(
+            (source.numel(), *ssm_states.shape[1:]),
+            device=ssm_states.device,
+            dtype=dtype,
+        )
+        recurrent[has_initial_state] = ssm_states[source[has_initial_state]].to(dtype)
         return recurrent, has_initial_state
 
     rows = state_in_blocks.numel()
@@ -175,6 +216,8 @@ def prepare_prefill_state_inputs(
             state_out_blocks,
             recurrent,
             has_initial_state,
+            conv_states.shape[0],
+            ssm_states.shape[0],
             conv_width,
             conv_states.shape[2],
             recurrent_width,

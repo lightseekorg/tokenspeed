@@ -156,6 +156,7 @@ class SparseTopKShare:
     verify window); each family stores its own record type. ``qsa_metadata``
     holds QSA's layer-invariant row geometry so it is built once per forward;
     ``qsa_selection`` retains its logical candidates alongside physical slots.
+    ``qsa_draft_rows`` memoizes the logical inputs for narrowed draft attention.
     ``write_slots`` holds the KVP-local write slots the layers resolved from
     the round's virtual write slots (``placement.resolve_write_slots``).
     """
@@ -164,14 +165,20 @@ class SparseTopKShare:
     decode: Any | None = None
     qsa_metadata: Any | None = None
     qsa_selection: Any | None = None
+    qsa_draft_rows: Any | None = None
     write_slots: list = field(default_factory=list)
 
     def clear(self) -> None:
         self.prefill = None
         self.decode = None
+        self.clear_qsa()
+        self.write_slots = []
+
+    def clear_qsa(self) -> None:
+        """Drop QSA inputs while keeping the physical slots carried to another step."""
         self.qsa_metadata = None
         self.qsa_selection = None
-        self.write_slots = []
+        self.qsa_draft_rows = None
 
 
 class CachePoolBinding:
@@ -201,6 +208,34 @@ class CachePoolBinding:
     def child_backends(self) -> tuple[CachePoolBinding, ...]:
         """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
         return ()
+
+    def prepare_pending_recurrent_state(
+        self, slots: torch.Tensor, frontier: torch.Tensor, *, allow_defer: bool
+    ) -> None:
+        """Order pending recurrent reads before this forward's state consumers."""
+        for backend in self.child_backends():
+            backend.prepare_pending_recurrent_state(
+                slots, frontier, allow_defer=allow_defer
+            )
+
+    def prepare_recurrent_state_acceptance(
+        self, stopped: torch.Tensor, frontier: torch.Tensor, *, allow_defer: bool
+    ) -> None:
+        """Bind stop-truncated completion facts before accepted-state commit."""
+        for backend in self.child_backends():
+            backend.prepare_recurrent_state_acceptance(
+                stopped, frontier, allow_defer=allow_defer
+            )
+
+    def materialize_recurrent_state(self, slots: torch.Tensor | None) -> None:
+        """Replay unique device slots, or all rows when slots is None."""
+        for backend in self.child_backends():
+            backend.materialize_recurrent_state(slots)
+
+    def discard_recurrent_state(self, slots: torch.Tensor) -> None:
+        """Retire pending replay for unique device slots without writing state."""
+        for backend in self.child_backends():
+            backend.discard_recurrent_state(slots)
 
     def fixed_workspace_bytes(self) -> int:
         """Return recipe-reserved workspace bytes, excluding the shared arena.
@@ -247,6 +282,21 @@ class CachePoolBinding:
         selection as scheduler slots."""
         return False
 
+    def projects_decode_values(
+        self,
+        layer: PagedAttention,
+        *,
+        tokens: int,
+        topk: int,
+        q_len_per_req: int,
+        value_head_dim: int,
+        gated: bool,
+    ) -> bool:
+        """Whether ``layer``'s sparse decode of ``tokens`` rows over the whole
+        ``topk`` selection applies a ``value_projection`` it is given (its
+        latent's per-head value projection and gate) as it merges."""
+        return False
+
     def dcp_decode_query_rider(
         self, layer: PagedAttention, q: torch.Tensor
     ) -> torch.Tensor | None:
@@ -291,6 +341,74 @@ class CachePoolBinding:
         """
         del slot
         return []
+
+    def bind_request_stop_flags(
+        self, stopped: torch.Tensor, request_ends: torch.Tensor
+    ) -> None:
+        """Share the request-end flags with the nodes that read them.
+
+        ``stopped`` is ``RuntimeStates.stopped``, one bool per request slot.
+        The sampling epilogue sets it in the forward that ends a request,
+        before the decode commit runs. ``request_ends`` is the executor's
+        INT32 per-row report of a forward's requests (``apply_stop_conditions``
+        writes it in the sampling epilogue): a commit that cannot complete
+        the deferred decode state of a request that ended raises its row to
+        ``REQUEST_ENDED_INCOMPLETE``, and the control plane then stops rather
+        than publish it. The executor binds both once; their storage lives as
+        long as the executor. Broadcast to child backends; a node whose
+        commit leaves no deferred state ignores them.
+        """
+        for child in self.child_backends():
+            child.bind_request_stop_flags(stopped, request_ends)
+
+    def fold_deferred_state(
+        self, state_folds: Mapping[str, torch.Tensor], *, stream: torch.Stream
+    ) -> None:
+        """Fold retraction victims' deferred decode state into their live blocks.
+
+        ``state_folds`` is the plan's ``state_folds``: per State group id in
+        ``deferred_decode_state_groups``, an ``(n, 2)`` int32 CPU tensor of
+        (request slot, page id), each a victim's live block, which its image
+        and every reader of the endpoint its retraction published read. The
+        data plane calls this on ``stream`` ahead of the plan's stores, device
+        copies, zeroing and forward. Broadcast to child backends; a node whose
+        pages always hold complete state does nothing. KDA folds each slot's
+        accepted decode records into the block.
+        """
+        for child in self.child_backends():
+            child.fold_deferred_state(state_folds, stream=stream)
+
+    def reset_request_workspace(
+        self, request_slots: torch.Tensor, *, stream: torch.Stream
+    ) -> None:
+        """Clear the slot-keyed working state a slot's previous owner left.
+
+        ``request_slots`` holds the device indices of the slots that start
+        serving a new admission: at its first forward
+        (``RuntimeStates.bind_stop_criteria``) and, for a prompt computed on
+        another node, already at its landing, which a retraction may follow
+        before any forward. The executor calls this on ``stream`` ahead of
+        both. Broadcast to child backends; a node without such state does
+        nothing. KDA clears the accepted-record counts of an owner whose end
+        the device did not see (an abort, a finish decided on the host).
+        """
+        for child in self.child_backends():
+            child.reset_request_workspace(request_slots, stream=stream)
+
+    def deferred_decode_state_groups(self) -> frozenset[str]:
+        """State groups whose decode state reaches the live block only when
+        this node commits it at a request's end or a retraction.
+
+        A retraction's plan lists its victims' live blocks in such a group for
+        ``fold_deferred_state``, and the scheduler withholds the decoded
+        endpoint it publishes there from peers until the data plane
+        acknowledges the fold (``ExecutionPlan.state_commit_fence``); local
+        readers order behind it on the device. The union over child backends;
+        a node whose pages always hold complete state declares none.
+        """
+        return frozenset().union(
+            *(child.deferred_decode_state_groups() for child in self.child_backends())
+        )
 
     def slot_state_exporters(self) -> tuple[CachePoolBinding, ...]:
         """This node and every node below it, each imaging its own rows.

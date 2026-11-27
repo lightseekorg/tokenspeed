@@ -434,7 +434,19 @@ public:
             entry_it->boundary =
                 cache_index.boundary_tree->HoldEntry(key.content_hash, cache_index.boundary_entry_kind);
         }
+        if (cache_index.boundary_tree && cache_index.boundary_entry_kind.state) {
+            entry.checkpoints = cache_index.boundary_tree->GdsCheckpoints();
+            if (entry.checkpoints && cache_index.boundary_entry_kind.tier == CacheTier::kDevice) {
+                entry.use_observer.Observe(entry.block_ref, recordCheckpointRelease, &entry);
+            }
+        }
         linkCommonEntry(cache_index, entry_it);
+        if (cache_index.boundary_tree) {
+            if (auto* checkpoints = cache_index.boundary_tree->GdsCheckpoints()) {
+                entry.recovery_residency = RecoveryIndex::Residency{*checkpoints->RecoveryDependencies(), key,
+                                                                    cache_index.boundary_entry_kind.tier};
+            }
+        }
         if (newly_cached != nullptr) {
             newly_cached->emplace_back(key, block_ref);
         }
@@ -484,6 +496,36 @@ public:
             const auto entry = item.second->by_location.Find(block_ref->Location());
             return entry != item.second->entries.end() && entry->block_ref == block_ref;
         });
+    }
+
+    struct CleaningRegistration {};
+    class CleaningSource {
+    public:
+        CleaningSource() = default;
+        CleaningSource(const CleaningSource&) = delete;
+        CleaningSource& operator=(const CleaningSource&) = delete;
+        CleaningSource(CleaningSource&&) noexcept = default;
+        CleaningSource& operator=(CleaningSource&&) noexcept = default;
+        const CacheBlockRef& Block() const { return block_; }
+        explicit operator bool() const { return static_cast<bool>(block_); }
+
+    private:
+        friend class PrefixCacheIndex;
+        CleaningSource(std::shared_ptr<const CleaningRegistration> registration, CacheBlockRef block)
+            : registration_{std::move(registration)}, block_{std::move(block)} {}
+        // One registration travels with exactly one source owner. Its count
+        // distinguishes maintenance pins from newer request/peer use.
+        std::shared_ptr<const CleaningRegistration> registration_;
+        CacheBlockRef block_;
+    };
+
+    CleaningSource AcquireCleaningSource(const BlockPool& pool, const CacheKey& key) {
+        auto* entries = findCacheEntries(pool);
+        if (!entries) return {};
+        auto entry = findEntry(*entries, key);
+        if (entry == entries->entries.end()) return {};
+        if (!entry->cleaning_registration) entry->cleaning_registration = std::make_shared<CleaningRegistration>();
+        return CleaningSource{entry->cleaning_registration, entry->block_ref};
     }
 
     CacheBlockRef Find(const BlockPool& pool, const CacheKey& key) const {
@@ -753,8 +795,11 @@ public:
             return false;
         }
         const CacheEntryIterator entry_it = findEntry(*cache_index, key);
-        if (entry_it == cache_index->entries.end() || entry_it->demoted || entry_it->last_access_epoch < epoch ||
-            entry_it->block_ref.use_count() > 1 + write_back_holds) {
+        if (entry_it == cache_index->entries.end()) return false;
+        const auto cleaning_holds =
+            entry_it->cleaning_registration ? entry_it->cleaning_registration.use_count() - 1 : 0;
+        if (entry_it->demoted || entry_it->last_access_epoch < epoch ||
+            entry_it->block_ref.use_count() > std::uint64_t{1} + write_back_holds + cleaning_holds) {
             return false;
         }
         markDemoted(*cache_index, entry_it, epoch);
@@ -809,6 +854,17 @@ public:
             return std::nullopt;
         }
         return Evict(std::move(evictable));
+    }
+
+    // I/O invalidation removes discoverability immediately. Existing owners
+    // retain the physical block until their operation retires.
+    bool Invalidate(const BlockPool& pool, const CacheKey& key) {
+        auto* entries = findCacheEntries(pool);
+        if (!entries) return false;
+        auto entry = findEntry(*entries, key);
+        if (entry == entries->entries.end()) return false;
+        eraseEntry(*entries, entry);
+        return true;
     }
 
     // The entry at `location` when Evict may take it, located and checked
@@ -900,8 +956,12 @@ public:
         // The pin watch, if any, follows the block (restored below).
         cache_index->by_location.Set(to->Location(), entry_it);
         entry_it->unique_observer.Reset();
+        entry_it->use_observer.Reset();
         cache_index->by_location.Erase(from);
         entry_it->block_ref = to;
+        if (entry_it->checkpoints) {
+            entry_it->use_observer.Observe(entry_it->block_ref, recordCheckpointRelease, &*entry_it);
+        }
         reorderEntry(entry_it);
         if (to->Location().lcm_block_id != from.lcm_block_id) {
             uncountInParent(*cache_index, from, entry_it->last_access_epoch);
@@ -958,10 +1018,20 @@ public:
             // suspends its order node only if it actually reaches this entry.
             match.blocks[i] = entry_it->block_ref;
             entry_it->was_acquired = true;
+            recordCheckpointUse(*entry_it, CheckpointUseEvent::Cause::kAcquire);
             mergeSession(*entry_it, session);
             touchEntry(*cache_index, entry_it, access_epoch);
         }
         return match;
+    }
+
+    // A committed peer export owns the exact source block when calling this.
+    // Publication's TouchExisting is deliberately separate from real reuse.
+    void RecordUseExisting(const BlockPool& pool, const CacheKey& key) {
+        CacheEntries* entries = findCacheEntries(pool);
+        if (!entries) return;
+        auto entry = findEntry(*entries, key);
+        if (entry != entries->entries.end()) recordCheckpointUse(*entry, CheckpointUseEvent::Cause::kPeerUse);
     }
 
     // Present source blocks refresh matching entries without pinning or inserting them.
@@ -1027,11 +1097,15 @@ private:
         OrderRegistration common_order;
         // Cancel callbacks before either registration or the block is destroyed.
         CacheBlockUniqueObserver unique_observer;
+        CheckpointTree* checkpoints{nullptr};
+        CacheBlockUniqueObserver use_observer;
         CacheEntry* common_peer{nullptr};
         SessionCacheOwner session;
         // The entry's claim on the boundary-tree node of its hash, in a bound
         // index (TrackBoundaries): dropped with the entry.
         BoundaryTree::Hold boundary;
+        RecoveryIndex::Residency recovery_residency;
+        std::shared_ptr<const CleaningRegistration> cleaning_registration;
     };
 
     static void mergeSession(CacheEntry& entry, const SessionCacheOwner& session) {
@@ -1097,6 +1171,16 @@ private:
         source_entry->common_order.Insert(source.common_order, evictionOrder(*source_entry), source_entry);
         // The source side counts the pair in the node.
         source_entry->boundary.SetPaired(true);
+    }
+
+    static void recordCheckpointRelease(void* context) noexcept {
+        auto& entry = *static_cast<CacheEntry*>(context);
+        entry.checkpoints->Apply({entry.key.content_hash, CheckpointUseEvent::Cause::kLastRelease});
+    }
+    static void recordCheckpointUse(CacheEntry& entry, CheckpointUseEvent::Cause cause) {
+        if (!entry.checkpoints) return;
+        entry.checkpoints->Apply({entry.key.content_hash, cause});
+        entry.use_observer.Observe(entry.block_ref, recordCheckpointRelease, &entry);
     }
 
     static void restoreAvailable(void* context) noexcept {

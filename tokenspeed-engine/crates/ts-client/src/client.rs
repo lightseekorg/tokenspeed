@@ -87,6 +87,8 @@ pub struct OutputChunk {
     pub input_top_logprobs: Option<PromptTopLogprobs>,
     /// This step's tokens' top-k alternatives, when requested.
     pub output_top_logprobs: Option<TopLogprobs>,
+    /// Request boundaries returned once on the terminal chunk.
+    pub request_timing: Option<ts_wire::RequestTiming>,
 }
 
 impl OutputChunk {
@@ -120,6 +122,7 @@ impl OutputChunk {
         Ok(rids.into_iter().enumerate().map(move |(i, rid)| {
             let reason = take(&mut batch.finished_reasons, i);
             let chunk = Self {
+                request_timing: take(&mut batch.request_timing, i),
                 output_ids: take(&mut batch.output_ids, i),
                 finish_reason: (!reason.is_empty()).then_some(reason),
                 prompt_tokens: batch.prompt_tokens[i],
@@ -161,6 +164,7 @@ impl From<&RequestOutput<'_>> for OutputChunk {
             pair.map(|(a, b)| (a.to_vec(), b.to_vec()))
         }
         Self {
+            request_timing: row.request_timing.cloned(),
             output_ids: row.output_ids.to_vec(),
             finish_reason: row.finish_reason.map(str::to_owned),
             prompt_tokens: row.prompt_tokens,
@@ -204,7 +208,7 @@ type StreamItem = std::result::Result<OutputChunk, StreamError>;
 struct Engine {
     info: EngineInfo,
     identity: Bytes,
-    /// This client's requests on the engine that have not finished.
+    /// This client's attached request streams on the engine.
     in_flight: AtomicUsize,
     load: Mutex<EngineLoad>,
 }
@@ -212,6 +216,34 @@ struct Engine {
 struct Pending {
     engine: usize,
     tx: mpsc::UnboundedSender<StreamItem>,
+    // Counts from the latest output, used when the client ends the stream.
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cached_tokens: i64,
+    reasoning_tokens: i64,
+    spec_verify_ct: Option<i64>,
+}
+
+impl Pending {
+    fn abort_chunk(&self) -> OutputChunk {
+        OutputChunk {
+            output_ids: Vec::new(),
+            finish_reason: Some("abort".to_owned()),
+            prompt_tokens: self.prompt_tokens,
+            completion_tokens: self.completion_tokens,
+            cached_tokens: self.cached_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            output_token_logprobs: Vec::new(),
+            output_token_cumulative_probs: Vec::new(),
+            finish_details: None,
+            spec_verify_ct: self.spec_verify_ct,
+            accept_draft_tokens: None,
+            input_token_logprobs: None,
+            input_top_logprobs: None,
+            output_top_logprobs: None,
+            request_timing: None,
+        }
+    }
 }
 
 /// A control operation awaiting every engine's reply.
@@ -333,13 +365,29 @@ impl Shared {
         }
     }
 
-    /// Stop tracking a request; returns its engine if it was in flight.
-    fn forget(&self, rid: &str) -> Option<usize> {
-        let pending = lock(&self.requests).remove(rid)?;
+    /// Remove only this admission. A finished stream can outlive its map
+    /// entry, and must never remove a later request using the same id.
+    fn forget(&self, rid: &str, tx: &mpsc::UnboundedSender<StreamItem>) -> Option<Pending> {
+        let mut requests = lock(&self.requests);
+        if !requests.get(rid)?.tx.same_channel(tx) {
+            return None;
+        }
+        let pending = requests.remove(rid).expect("matched above");
         self.engines[pending.engine]
             .in_flight
             .fetch_sub(1, Ordering::Relaxed);
-        Some(pending.engine)
+        Some(pending)
+    }
+
+    /// Send the abort and return the original sender for matching the request.
+    async fn send_abort(&self, rid: &str) -> Result<Option<mpsc::UnboundedSender<StreamItem>>> {
+        let (engine, tx) = match lock(&self.requests).get(rid) {
+            Some(pending) => (pending.engine, pending.tx.clone()),
+            None => return Ok(None),
+        };
+        let frames = EngineRequest::Abort(vec![rid.to_owned()]).to_frames();
+        self.send(engine, frames).await?;
+        Ok(Some(tx))
     }
 
     fn dispatch(&self, batch: BatchTokenIDOutSlim) {
@@ -379,7 +427,7 @@ impl Shared {
         let mut discarded = Vec::new();
         let mut requests = lock(&self.requests);
         for (rid, chunk) in rows.by_ref() {
-            let Some(pending) = requests.get(&rid) else {
+            let Some(pending) = requests.get_mut(&rid) else {
                 // Cancelled while its output was in flight.
                 debug!(rid, "output for a request that is not in flight");
                 discarded.push(Ok(chunk));
@@ -388,6 +436,11 @@ impl Shared {
             // A closed receiver means the stream is being dropped; its drop
             // forgets the request.
             let finished = chunk.finish_reason.is_some();
+            pending.prompt_tokens = chunk.prompt_tokens;
+            pending.completion_tokens = chunk.completion_tokens;
+            pending.cached_tokens = chunk.cached_tokens;
+            pending.reasoning_tokens = chunk.reasoning_tokens;
+            pending.spec_verify_ct = chunk.spec_verify_ct;
             if let Err(error) = pending.tx.send(Ok(chunk)) {
                 discarded.push(error.0);
             }
@@ -534,7 +587,9 @@ impl EngineClient {
             .unwrap_or_default()
     }
 
-    /// This client's unfinished requests per engine, in index order.
+    /// This client's attached request streams per engine, in index order.
+    /// `abort` and `cancel` decrease this count when they detach a stream.
+    /// Engine load reports track the engine's own requests and resources.
     pub fn in_flight(&self) -> Vec<usize> {
         self.shared
             .engines
@@ -545,9 +600,10 @@ impl EngineClient {
 
     /// Submit a request and return its output stream.
     ///
-    /// The request's `rid` must be a single string, unique among requests
-    /// in flight. Dropping the stream before its last chunk aborts the
-    /// request on the engine.
+    /// The request's `rid` must be a single string. Use a fresh id for every
+    /// submission: the wire cannot distinguish late outputs or aborts for
+    /// a reused id. Dropping the stream before its last chunk sends a
+    /// best-effort abort to the engine.
     pub async fn generate(&self, request: TokenizedGenerateReqInput) -> Result<RequestStream> {
         let rid = match &request.rid {
             Some(StrOrList::One(rid)) => rid.clone(),
@@ -564,29 +620,42 @@ impl EngineClient {
         let engine = self.shared.route(&request)?;
         debug!(rid, engine, routing = ?self.shared.routing, bootstrap_room = request.bootstrap_room, "generate request routed");
         let (tx, rx) = mpsc::unbounded_channel();
+        let stream = RequestStream {
+            shared: self.shared.clone(),
+            rid: rid.clone(),
+            tx: tx.downgrade(),
+            rx,
+            done: false,
+        };
+        let pending = Pending {
+            engine,
+            tx,
+            prompt_tokens: request.input_ids.as_ref().map_or(0, Vec::len) as i64,
+            completion_tokens: 0,
+            cached_tokens: 0,
+            reasoning_tokens: 0,
+            spec_verify_ct: None,
+        };
         {
             // Register before sending: outputs can arrive before `send`
             // returns.
             let mut requests = lock(&self.shared.requests);
+            if let Some(reason) = self.shared.closed() {
+                return Err(Error::Unavailable(reason));
+            }
             if requests.contains_key(&rid) {
                 return Err(Error::DuplicateRequestId(rid));
             }
-            requests.insert(rid.clone(), Pending { engine, tx });
+            requests.insert(rid.clone(), pending);
+            self.shared.engines[engine]
+                .in_flight
+                .fetch_add(1, Ordering::Relaxed);
         }
-        self.shared.engines[engine]
-            .in_flight
-            .fetch_add(1, Ordering::Relaxed);
         let frames = EngineRequest::Add(Box::new(request)).to_frames();
-        if let Err(error) = self.shared.send(engine, frames).await {
-            self.shared.forget(&rid);
-            return Err(error);
-        }
-        Ok(RequestStream {
-            shared: self.shared.clone(),
-            rid,
-            rx,
-            done: false,
-        })
+        // The stream owns the registration across this await, including a
+        // failed send or a caller dropping the submission future.
+        self.shared.send(engine, frames).await?;
+        Ok(stream)
     }
 
     /// Run a control operation on every engine and return their replies,
@@ -640,15 +709,49 @@ impl EngineClient {
         self.shared.send(engine, frames).await
     }
 
-    /// Ask the engine to abort a request. Its stream then ends with an
-    /// `"abort"` chunk. Returns `false` if the request is not in flight.
+    /// Send the wire abort and end the local stream with an `"abort"` chunk
+    /// after any queued outputs. The chunk carries the latest reported token
+    /// counts and verify rounds. Before the first output, it uses the submitted
+    /// prompt length.
+    ///
+    /// Returns `true` if the abort was sent and `false` if no request was in
+    /// flight. A concurrent terminal result takes precedence if it arrives
+    /// before local detachment. A failed or interrupted send leaves any still
+    /// active stream attached for retry. Use a fresh id for each submission.
     pub async fn abort(&self, rid: &str) -> Result<bool> {
-        let engine = match lock(&self.shared.requests).get(rid) {
-            Some(pending) => pending.engine,
-            None => return Ok(false),
+        let Some(tx) = self.shared.send_abort(rid).await? else {
+            return Ok(false);
         };
-        let frames = EngineRequest::Abort(vec![rid.to_owned()]).to_frames();
-        self.shared.send(engine, frames).await?;
+        if let Some(pending) = self.shared.forget(rid, &tx) {
+            let _ = pending.tx.send(Ok(pending.abort_chunk()));
+        }
+        Ok(true)
+    }
+
+    /// Send an ordinary abort and end this client's stream with
+    /// [`StreamError::Cancelled`], after any outputs already queued.
+    /// Returns `true` only if this call closed the stream; `false` if no
+    /// request was in flight or a finish, error or another cancel won.
+    ///
+    /// A failed send or a dropped cancel future leaves the stream attached
+    /// (unless it ended independently), so cancellation can be retried.
+    /// The engine may already have received the abort in either case.
+    /// Success is local closure, not an engine/cache/transfer retirement
+    /// fence. Use a fresh request id for any subsequent submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Zmq`] for an abort-send socket failure or
+    /// [`Error::SendTimeout`] when sending exceeds the configured deadline.
+    /// The stream remains attached for retry unless it ended independently.
+    pub async fn cancel(&self, rid: &str) -> Result<bool> {
+        let Some(tx) = self.shared.send_abort(rid).await? else {
+            return Ok(false);
+        };
+        let Some(pending) = self.shared.forget(rid, &tx) else {
+            return Ok(false);
+        };
+        let _ = pending.tx.send(Err(StreamError::Cancelled));
         Ok(true)
     }
 }
@@ -666,6 +769,8 @@ impl Drop for EngineClient {
 pub struct RequestStream {
     shared: Arc<Shared>,
     rid: String,
+    /// Admission identity without keeping the output channel open.
+    tx: mpsc::WeakUnboundedSender<StreamItem>,
     rx: mpsc::UnboundedReceiver<StreamItem>,
     done: bool,
 }
@@ -696,14 +801,17 @@ impl Drop for RequestStream {
         if self.done {
             return;
         }
-        let Some(engine) = self.shared.forget(&self.rid) else {
+        let Some(tx) = self.tx.upgrade() else {
+            return;
+        };
+        let Some(pending) = self.shared.forget(&self.rid, &tx) else {
             return;
         };
         let shared = self.shared.clone();
         let frames = EngineRequest::Abort(vec![self.rid.clone()]).to_frames();
         let rid = self.rid.clone();
         self.shared.runtime.spawn(async move {
-            if let Err(error) = shared.send(engine, frames).await {
+            if let Err(error) = shared.send(pending.engine, frames).await {
                 warn!(rid, %error, "failed to abort a dropped request");
             }
         });

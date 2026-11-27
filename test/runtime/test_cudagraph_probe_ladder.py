@@ -533,10 +533,20 @@ def test_a_rebind_hands_back_views_of_the_rebuilt_pool(monkeypatch) -> None:
     monkeypatch.setattr(
         scheduler_utils, "scheduler_cache_geometry_from_pool", lambda p: ("geometry", p)
     )
-    monkeypatch.setattr(
-        scheduler_utils, "pool_to_cache_groups", lambda p: ("groups", p)
+    groups = {
+        pool: [SimpleNamespace(group_id=f"{pool} state", deferred_decode_state=False)]
+        for pool in ("probe", "real")
+    }
+    monkeypatch.setattr(scheduler_utils, "pool_to_cache_groups", groups.__getitem__)
+    # The views mark the State groups whose decode state the rebuilt backend
+    # defers, as the scheduler's retraction folds need.
+    rebuilt = SimpleNamespace(
+        token_to_kv_pool="real",
+        draft_token_to_kv_pool="draft",
+        attn_backend=SimpleNamespace(
+            deferred_decode_state_groups=lambda: frozenset({"real state"})
+        ),
     )
-    rebuilt = SimpleNamespace(token_to_kv_pool="real", draft_token_to_kv_pool="draft")
     seen = []
     args = SimpleNamespace(
         attention_backend="hybrid_linear_attn", drafter_attention_backend=None
@@ -578,8 +588,10 @@ def test_a_rebind_hands_back_views_of_the_rebuilt_pool(monkeypatch) -> None:
         token_to_kv_pool="real",
         draft_token_to_kv_pool="draft",
         cache_geometry=("geometry", "real"),
-        cache_groups=("groups", "real"),
+        cache_groups=groups["real"],
     )
+    assert [group.deferred_decode_state for group in views.cache_groups] == [True]
+    assert not groups["probe"][0].deferred_decode_state
 
 
 @pytest.mark.parametrize("side", ["target", "draft"])
