@@ -349,9 +349,9 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
                                       node->StateEntries(BoundaryTree::kDisk);
         const bool no_hotter_descendant =
             store_.NumStateGroups() > 0 ? !node->HasRamCheckpointInProperSubtree() : (node->first_child == nullptr);
-        const bool swa_disk_only =
-            store_.DiskPool() != nullptr && swa_disk > 0 && node->PendingHostStores() == 0 && no_hotter_descendant &&
-            ((swa_dev == 0 && swa_host == 0) || HasDiskOnlySwaEntry(boundary, tail_tokens));
+        const bool swa_disk_only = store_.DiskPool() != nullptr && swa_disk > 0 && node->PendingHostStores() == 0 &&
+                                   no_hotter_descendant &&
+                                   ((swa_dev == 0 && swa_host == 0) || HasDiskOnlySwaEntry(boundary, tail_tokens));
         const bool lower_tier_only = state_disk_only || swa_disk_only;
         const bool any_history = on_device == expected || on_host == expected || on_disk == expected;
         return {.device_publishable = on_device == expected && !lower_tier_only,
