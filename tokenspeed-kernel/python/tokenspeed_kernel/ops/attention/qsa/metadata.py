@@ -20,6 +20,8 @@
 
 """Logical selection metadata for grouped QSA attention implementations."""
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,11 +31,21 @@ import torch
 class QSAWorkspace:
     """Caller-owned attention plans and scratch, shared across query layouts.
 
-    Keep one workspace per KV pool. ``clear`` releases eager plans when the
-    pool is rebound; graph-owned plans live until their capture is released.
+    Keep one workspace per KV pool. Rebinding replaces the workspace and
+    drops its eager plans. Graph-owned plans live until their capture is released.
+
+    Args:
+        allocation_region: Context factory used when plans or scratch retain
+            new device allocations. The default uses the ordinary allocator
+            for standalone calls and temporary warmup.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        allocation_region: Callable[[], AbstractContextManager[None]] = nullcontext,
+    ) -> None:
+        self.allocation_region = allocation_region
         self.runners: dict[torch.device, Any] = {}
 
     def clear(self) -> None:
