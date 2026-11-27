@@ -863,6 +863,10 @@ class RecoverSsmVerify:
         # Records exist only where the capacity leaves room beside the window.
         has_history = self.history_rows > 0
         late_loads = has_history and not self.early_history_loads
+        # With several value tiles per head only tile 0 stores the window's
+        # records; the branch is uniform per CTA and skips the others' exps
+        # and addresses. A single tile per head always stores them.
+        split_value = self.value_tile_rows < self.value_dim
         history_keys = early_keys
         history_decays = early_decays
         history_us = early_us
@@ -890,6 +894,18 @@ class RecoverSsmVerify:
             if const_expr(self.defer_window_records):
                 for t in cutlass.range_constexpr(W):
                     decay_steps[t] = steps[t]
+            elif const_expr(split_value):
+                if records_keys != 0:
+                    self._store_decay_records(
+                        retained,
+                        record_slot,
+                        record_head,
+                        record_start,
+                        records_keys,
+                        valid_tokens,
+                        tidx,
+                        steps,
+                    )
             else:
                 self._store_decay_records(
                     retained,
@@ -1009,16 +1025,29 @@ class RecoverSsmVerify:
         if const_expr(not self.defer_window_records):
             # The window's normalized keys need the final key scales.
             cute.arch.barrier()
-            self._store_key_records(
-                shared,
-                retained,
-                record_slot,
-                record_head,
-                record_start,
-                records_keys,
-                valid_tokens,
-                tidx,
-            )
+            if const_expr(split_value):
+                if records_keys != 0:
+                    self._store_key_records(
+                        shared,
+                        retained,
+                        record_slot,
+                        record_head,
+                        record_start,
+                        records_keys,
+                        valid_tokens,
+                        tidx,
+                    )
+            else:
+                self._store_key_records(
+                    shared,
+                    retained,
+                    record_slot,
+                    record_head,
+                    record_start,
+                    records_keys,
+                    valid_tokens,
+                    tidx,
+                )
         return decay_steps
 
     @cute.jit
