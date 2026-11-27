@@ -368,11 +368,16 @@ void DiskTransferManager::StartCleaning() {
             // The pages above it first, nearest the root first, so a cleaned page
             // never waits on the Disk for a parent only the Host holds: a Host
             // placement dropping that parent would leave it unresumable. The
-            // climb stops at a page on the Disk, whose own parents cleaning
-            // wrote before it, or one the Host does not hold.
+            // climb stops at a page on the Disk that has no remaining dirty Host
+            // keys (e.g., partial-OnDisk boundaries where History was cleaned
+            // earlier while SWA/State keys are still dirty on Host), or a page
+            // the Host does not hold.
             std::vector<const BoundaryTree::Node*> chain{node};
-            for (const BoundaryTree::Node* above = node->parent;
-                 above != nullptr && above->OnHost() && !above->OnDisk(); above = above->parent) {
+            for (const BoundaryTree::Node* above = node->parent; above != nullptr && above->OnHost();
+                 above = above->parent) {
+                if (above->OnDisk() && dirty_keys_of(*above).empty()) {
+                    break;
+                }
                 chain.push_back(above);
             }
             std::vector<CacheKey> batch;

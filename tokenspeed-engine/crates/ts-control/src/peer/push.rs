@@ -1322,6 +1322,151 @@ impl Holder {
 }
 
 impl HolderState {
+    /// Gather-packs consecutive spans whose remote destination addresses are
+    /// contiguous (`dst[i+1] == dst[i] + len[i]`, e.g. `D(TP1, Disk) -> P(TP8)`
+    /// head-sharded 256B DFLASH SWA slices) into already-registered staging
+    /// memory, collapsing `1,536 x 256B` RDMA WRITE WQEs into `12 x 32KB`
+    /// without changing the wire protocol.
+    fn build_write_spans<'a>(
+        &'a self,
+        ring: usize,
+        base: u64,
+        range_size: usize,
+        allow_in_place: bool,
+        batch_spans: &[PushSpan],
+    ) -> (Spans, Option<SlotGuard<'a>>) {
+        static COALESCE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *COALESCE_ENABLED.get_or_init(|| {
+            std::env::var("TOKENSPEED_PEER_PUSH_COALESCE")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true)
+        });
+        let raw = || {
+            (
+                Spans {
+                    sources: batch_spans.iter().map(|span| base + span.offset).collect(),
+                    destinations: batch_spans.iter().map(|span| span.address).collect(),
+                    lengths: batch_spans.iter().map(|span| span.length).collect(),
+                    host_bytes: 0,
+                },
+                None,
+            )
+        };
+        if !enabled || batch_spans.len() < 2 {
+            return raw();
+        }
+        // Identify maximal runs of consecutive spans targeting contiguous remote
+        // addresses.
+        let mut runs: Vec<(usize, usize, u64)> = Vec::new();
+        let mut pack_bytes: usize = 0;
+        let mut has_merged = false;
+        let mut i = 0;
+        while i < batch_spans.len() {
+            let start = i;
+            let mut total = batch_spans[i].length;
+            let mut end_addr = match batch_spans[i].address.checked_add(batch_spans[i].length) {
+                Some(a) => a,
+                None => return raw(),
+            };
+            i += 1;
+            while i < batch_spans.len() && batch_spans[i].address == end_addr {
+                total = match total.checked_add(batch_spans[i].length) {
+                    Some(t) => t,
+                    None => return raw(),
+                };
+                end_addr = match end_addr.checked_add(batch_spans[i].length) {
+                    Some(a) => a,
+                    None => return raw(),
+                };
+                i += 1;
+            }
+            if i - start > 1 {
+                has_merged = true;
+                pack_bytes = match usize::try_from(total)
+                    .ok()
+                    .and_then(|n| pack_bytes.checked_add(n))
+                {
+                    Some(n) => n,
+                    None => return raw(),
+                };
+            }
+            runs.push((start, i, total));
+        }
+        if !has_merged || pack_bytes == 0 {
+            return raw();
+        }
+        let slot_bytes = self.source.slot_bytes;
+        let src_slot_off = match usize::try_from(base).ok().and_then(|b| b.checked_sub(ring)) {
+            Some(off) => off,
+            None => return raw(),
+        };
+        // Fast path 1 (zero extra slot contention, zero locks): pack into unused
+        // tail of the same registered staging slot when `range_size + pack_bytes <= slot_bytes`.
+        // Fast path 2 (zero extra slot contention, works even when `range_size == slot_bytes`):
+        // in-place monotonic compaction to offset 0 of the same slot when this is the sole batch
+        // for the block and all spans are strictly ascending and non-overlapping in source offset.
+        // Fast path 3: borrow a free staging slot if available.
+        let can_in_place = allow_in_place
+            && batch_spans.windows(2).all(|w| {
+                w[0].offset
+                    .checked_add(w[0].length)
+                    .is_some_and(|e| e <= w[1].offset)
+            });
+        let (pack_ring_off, in_place_all, pack_guard) = if range_size
+            .checked_add(pack_bytes)
+            .is_some_and(|end| end <= slot_bytes)
+        {
+            (src_slot_off + range_size, false, None)
+        } else if can_in_place {
+            (src_slot_off, true, None)
+        } else if pack_bytes <= slot_bytes {
+            match self.slots.try_take() {
+                Some(guard) => (guard.index() * slot_bytes, false, Some(guard)),
+                None => return raw(),
+            }
+        } else {
+            return raw();
+        };
+
+        let mut sources = Vec::with_capacity(runs.len());
+        let mut destinations = Vec::with_capacity(runs.len());
+        let mut lengths = Vec::with_capacity(runs.len());
+        let mut cursor: usize = 0;
+        for (start, end, total) in runs {
+            if !in_place_all && end - start == 1 {
+                let span = batch_spans[start];
+                sources.push(base + span.offset);
+                destinations.push(span.address);
+                lengths.push(span.length);
+            } else {
+                let run_src = (ring + pack_ring_off + cursor) as u64;
+                for span in &batch_spans[start..end] {
+                    let src_off = src_slot_off + span.offset as usize;
+                    let dst_off = pack_ring_off + cursor;
+                    let len = span.length as usize;
+                    if in_place_all {
+                        self.source.ring.move_within(src_off, dst_off, len);
+                    } else {
+                        self.source.ring.copy_within(src_off, dst_off, len);
+                    }
+                    cursor += len;
+                }
+                sources.push(run_src);
+                destinations.push(batch_spans[start].address);
+                lengths.push(total);
+            }
+        }
+        (
+            Spans {
+                sources,
+                destinations,
+                lengths,
+                host_bytes: 0,
+            },
+            pack_guard,
+        )
+    }
+
     /// Runs one push to its end: every block read into a slot and written to
     /// the reader, unless `deadline` passes (arrival-anchored `arrived + budget`
     /// for legacy pushes, and clamped to `activated_at + offer_push_deadline`
@@ -1491,19 +1636,17 @@ impl HolderState {
             ok &= read;
             if !stopped(ok) {
                 let base = (ring + slot_idx * self.source.slot_bytes) as u64;
+                let range_size = blocks[index].range.size;
                 let mut block_ok = true;
+                let allow_in_place = blocks[index].batches.len() == 1;
                 for batch_spans in &blocks[index].batches {
                     if stopped(ok) {
                         block_ok = false;
                         ok = false;
                         break;
                     }
-                    let spans = Spans {
-                        sources: batch_spans.iter().map(|span| base + span.offset).collect(),
-                        destinations: batch_spans.iter().map(|span| span.address).collect(),
-                        lengths: batch_spans.iter().map(|span| span.length).collect(),
-                        host_bytes: 0,
-                    };
+                    let (spans, _pack_slot) =
+                        self.build_write_spans(ring, base, range_size, allow_in_place, batch_spans);
                     let write_ns = profile::now_ns();
                     if let Err(error) = self.source.writer.write(session, &spans) {
                         tracing::warn!(%error, slot = slot_idx, "peer push write failed");
@@ -4071,5 +4214,162 @@ mod tests {
             (1..20).contains(&calls),
             "capped push must start writing (>= 1) then stop before all 20 blocks once offer_push_deadline elapses (got {calls})"
         );
+    }
+
+    #[test]
+    fn build_write_spans_coalesces_tail_inplace_and_borrowed_slot() {
+        use std::path::PathBuf;
+        use ts_disk::{Backend, DiskFile, ExecutorConfig};
+
+        struct TempDisk(PathBuf);
+        impl Drop for TempDisk {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        struct NoopWriter;
+        impl PageWriter for NoopWriter {
+            fn write(&self, _: &str, _: &Spans) -> Result<(), String> {
+                Ok(())
+            }
+        }
+
+        let make_state = |slot_bytes: usize, num_slots: usize| {
+            let dir = std::env::var_os("TS_DISK_TEST_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let temp = TempDisk(dir.join(format!(
+                "ts-push-coalesce-{}-{}-{}.bin",
+                std::process::id(),
+                slot_bytes,
+                profile::now_ns()
+            )));
+            let disk_file = DiskFile::create(&temp.0, 8192).unwrap();
+            let mut ring = Memory::map(slot_bytes * num_slots).unwrap();
+            // Fill slot 0 with 16 distinct 256-byte chunks.
+            for chunk in 0..(slot_bytes / 256) {
+                let byte = ((chunk * 17 + 3) & 0xff) as u8;
+                ring.write_at(chunk * 256, &vec![byte; 256]);
+            }
+            let ring = Arc::new(ring);
+            let executor = Arc::new(
+                ts_disk::Executor::start(
+                    disk_file,
+                    &[(ring.address(), ring.size())],
+                    ExecutorConfig {
+                        backend: Backend::Psync,
+                        queue_depth: 2,
+                        write_queue_depth: 1,
+                        max_io_bytes: 1 << 20,
+                        write_bytes_per_second: 1 << 30,
+                    },
+                )
+                .unwrap(),
+            );
+            let source = PushSource {
+                executor,
+                disk_layout: HostLayout {
+                    groups: vec![ts_l3::GroupLayout {
+                        packing: 1,
+                        block_bytes: 4096,
+                        shard_count: 1,
+                    }],
+                    lcm_block_bytes: 4096,
+                    num_lcm_blocks: 2,
+                    owner_rank: 0,
+                    tp_rank: 0,
+                },
+                writer: Arc::new(NoopWriter),
+                ring: ring.clone(),
+                slot_bytes,
+            };
+            let state = HolderState {
+                source,
+                slots: Slots {
+                    total: num_slots,
+                    max_per_job: num_slots,
+                    free: Mutex::new((0..num_slots).rev().collect()),
+                    returned: Condvar::new(),
+                },
+                running: Mutex::new(HashMap::new()),
+                fenced: Mutex::new(FencedJobs::default()),
+                active_offers: Mutex::new(HashMap::new()),
+                offer_accept_window: OFFER_PUSH_ACCEPT_WINDOW,
+                offer_push_deadline: OFFER_PUSH_DEADLINE,
+            };
+            (state, ring, temp)
+        };
+
+        // Four strided 256B slices (chunks 1, 3, 5, 7) targeting one contiguous 1024B remote range.
+        let strided: Vec<PushSpan> = (0u64..4)
+            .map(|i| PushSpan {
+                offset: (2 * i + 1) * 256,
+                address: 0x20_000 + i * 256,
+                length: 256,
+            })
+            .collect();
+        let mut expected = Vec::with_capacity(1024);
+        for chunk in [1usize, 3, 5, 7] {
+            expected.extend(std::iter::repeat_n(((chunk * 17 + 3) & 0xff) as u8, 256));
+        }
+
+        // Fast path 1: unused tail of the same slot (`range_size + pack_bytes <= slot_bytes`).
+        let (state1, ring1, _t1) = make_state(8192, 1);
+        let ring_addr1 = ring1.address();
+        let (spans1, guard1) =
+            state1.build_write_spans(ring_addr1, ring_addr1 as u64, 4096, false, &strided);
+        assert!(guard1.is_none());
+        assert_eq!(spans1.lengths, vec![1024]);
+        assert_eq!(spans1.destinations, vec![0x20_000]);
+        assert_eq!(spans1.sources, vec![(ring_addr1 + 4096) as u64]);
+        let mut got1 = vec![0u8; 1024];
+        ring1.read_at(4096, &mut got1);
+        assert_eq!(got1, expected);
+
+        // Fast path 2: in-place monotonic compaction (`range_size == slot_bytes`, `allow_in_place = true`).
+        let (state2, ring2, _t2) = make_state(4096, 1);
+        let ring_addr2 = ring2.address();
+        let (spans2, guard2) =
+            state2.build_write_spans(ring_addr2, ring_addr2 as u64, 4096, true, &strided);
+        assert!(guard2.is_none());
+        assert_eq!(spans2.lengths, vec![1024]);
+        assert_eq!(spans2.destinations, vec![0x20_000]);
+        assert_eq!(spans2.sources, vec![ring_addr2 as u64]);
+        let mut got2 = vec![0u8; 1024];
+        ring2.read_at(0, &mut got2);
+        assert_eq!(got2, expected);
+
+        // Fast path 3: borrow a spare staging slot (`range_size == slot_bytes`, `allow_in_place = false`).
+        let (state3, ring3, _t3) = make_state(4096, 2);
+        let ring_addr3 = ring3.address();
+        let _busy0 = state3.slots.try_take().unwrap(); // hold slot 0 like the active read
+        let (spans3, guard3) =
+            state3.build_write_spans(ring_addr3, ring_addr3 as u64, 4096, false, &strided);
+        assert!(guard3.is_some());
+        assert_eq!(spans3.lengths, vec![1024]);
+        assert_eq!(spans3.destinations, vec![0x20_000]);
+        assert_eq!(spans3.sources, vec![(ring_addr3 + 4096) as u64]);
+        let mut got3 = vec![0u8; 1024];
+        ring3.read_at(4096, &mut got3);
+        assert_eq!(got3, expected);
+
+        // Non-contiguous remote destinations bypass coalescing untouched.
+        let disjoint = vec![
+            PushSpan {
+                offset: 0,
+                address: 0x20_000,
+                length: 256,
+            },
+            PushSpan {
+                offset: 512,
+                address: 0x21_000,
+                length: 256,
+            },
+        ];
+        let (spans4, guard4) =
+            state1.build_write_spans(ring_addr1, ring_addr1 as u64, 4096, true, &disjoint);
+        assert!(guard4.is_none());
+        assert_eq!(spans4.lengths, vec![256, 256]);
+        assert_eq!(spans4.destinations, vec![0x20_000, 0x21_000]);
     }
 }

@@ -86,9 +86,23 @@ fn interpreter() {
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../../tokenspeed-scheduler/python"
             );
-            py.import("sys")
+            let sys = py.import("sys").unwrap();
+            let meta_path = sys.getattr("meta_path").unwrap();
+            let filtered: Vec<Py<PyAny>> = meta_path
+                .try_iter()
                 .unwrap()
-                .getattr("path")
+                .filter_map(|item| {
+                    let obj = item.ok()?;
+                    let repr = obj.repr().ok()?.to_str().ok()?.to_owned();
+                    if repr.contains("tokenspeed_scheduler") || repr.contains("_editable_skbc") {
+                        None
+                    } else {
+                        Some(obj.unbind())
+                    }
+                })
+                .collect();
+            sys.setattr("meta_path", filtered).unwrap();
+            sys.getattr("path")
                 .unwrap()
                 .call_method1("insert", (0, package))
                 .unwrap();

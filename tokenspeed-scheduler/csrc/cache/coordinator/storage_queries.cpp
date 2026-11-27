@@ -91,9 +91,20 @@ StorageQuery StorageQueries::SharedPrefixKeys(const PromptPrefix& prompt, std::s
         const auto grain = store_.Geometry()[i].BlockGranularity();
         const auto per_prefix = store_.PrefixGranularity() / grain;
         const auto full_blocks = full_tokens / grain;
-        const auto first = group.Matcher().IsPrefixClosed()
-                               ? 0
-                               : store_.SlidingWindowBlocks(static_cast<std::int32_t>(i), prompt.max_tokens).first;
+        std::int32_t first = 0;
+        if (!group.Matcher().IsPrefixClosed()) {
+            const auto window = store_.SlidingWindowBlocks(static_cast<std::int32_t>(i), prompt.max_tokens);
+            first = window.first;
+            const auto sink = store_.SinkBlocksBelow(static_cast<std::int32_t>(i), window);
+            for (auto block = sink.first; block < std::min(sink.past_end, full_blocks); ++block) {
+                if (!add(CacheKey{.group_id = group.Id(),
+                                  .content_hash = ContentHash{prompt.prefix_hashes[block / per_prefix]},
+                                  .page_offset = block % per_prefix})) {
+                    result.max_tokens = -1;
+                    return result;
+                }
+            }
+        }
         for (auto block = first; block < full_blocks; ++block) {
             if (!add(CacheKey{.group_id = group.Id(),
                               .content_hash = ContentHash{prompt.prefix_hashes[block / per_prefix]},

@@ -1022,7 +1022,7 @@ mod tests {
             let dg = geometry(8);
             let sources: Vec<_> = (0..holders).map(|_| endpoint(&sg)).collect();
             for reader in 0..8 {
-                let mut plan = PeerReadPlan::new(&src, &dst, holders, 8, reader).unwrap();
+                let plan = PeerReadPlan::new(&src, &dst, holders, 8, reader).unwrap();
                 let planned = plan
                     .plan(&sources, &endpoint(&dg), &[(page(2, 4, 3), page(2, 4, 6))])
                     .unwrap();
@@ -1045,6 +1045,114 @@ mod tests {
                         expected.push((
                             base + (3 * 4 + row) * heads + reader as u64 % heads,
                             base + 6 * 4 + row,
+                        ));
+                    }
+                }
+                actual.sort_unstable();
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn sliding_draft_disk_push_slices_heads_for_both_topologies() {
+        use crate::peer::geometry::{HostGroup, HostPool};
+
+        let dst = with_draft(8);
+        let mk_geom = |width: usize, with_disk: bool| {
+            let mut result = geometry(width as u64);
+            let field_bytes = 4 * (8 / width as u64);
+            for (id, base) in [("layer.2.k", 1024), ("layer.2.v", 2048)] {
+                result.device.push(DeviceField {
+                    group_id: 2,
+                    field_id: id.into(),
+                    address: base,
+                    bytes: field_bytes,
+                    page_stride: field_bytes,
+                });
+            }
+            if with_disk {
+                result.push = Some("127.0.0.1:9000".into());
+                result.host = Some(HostPool {
+                    address: 0x10000,
+                    groups: vec![
+                        HostGroup {
+                            parent_bytes: 256,
+                            packing: 1,
+                            block_bytes: 4,
+                            field_offsets: vec![("layer.0.kv".into(), 0)],
+                        },
+                        HostGroup {
+                            parent_bytes: 256,
+                            packing: 1,
+                            block_bytes: 8 / width as u64,
+                            field_offsets: vec![("layer.1.recurrent_state".into(), 0)],
+                        },
+                        HostGroup {
+                            parent_bytes: 256,
+                            packing: 1,
+                            block_bytes: 16 + 2 * field_bytes,
+                            field_offsets: vec![
+                                ("layer.2.k".into(), 16),
+                                ("layer.2.v".into(), 16 + field_bytes),
+                            ],
+                        },
+                    ],
+                });
+            }
+            result
+        };
+        let disk_bounds = [17i64, 17, 17];
+        for holders in [1, 8] {
+            let src = with_draft(holders);
+            let sg = mk_geom(holders, true);
+            let dg = mk_geom(8, false);
+            let sources: Vec<_> = (0..holders)
+                .map(|_| ReadEndpoint {
+                    geometry: &sg,
+                    host_virtual_bounds: &[],
+                    disk_virtual_bounds: &disk_bounds,
+                    regions: &[(100, 4096)],
+                })
+                .collect();
+            let dst_ep = ReadEndpoint {
+                geometry: &dg,
+                host_virtual_bounds: &[],
+                disk_virtual_bounds: &[],
+                regions: &[(100, 4096)],
+            };
+            let src_page = PeerPageView {
+                group_id: 2,
+                slot: 4,
+                block_id: 3,
+                tier: PeerTier::Disk,
+            };
+            let dst_page = page(2, 4, 6);
+            for reader in 0..8 {
+                let plan = PeerReadPlan::new(&src, &dst, holders, 8, reader).unwrap();
+                let planned = plan
+                    .plan(&sources, &dst_ep, &[(src_page, dst_page)])
+                    .unwrap();
+                assert!(planned.reads.is_empty());
+                assert_eq!(planned.pushes.len(), 1);
+                let items = &planned.pushes[&(reader % holders)];
+                assert_eq!(items.len(), 1);
+                assert_eq!((items[0].group, items[0].block), (2, 3));
+                let mut actual = Vec::new();
+                for s in &items[0].spans {
+                    for i in 0..s.length {
+                        actual.push((s.offset + i, s.address + i));
+                    }
+                }
+                let heads = 8 / holders as u64;
+                let field_bytes = 4 * heads;
+                let mut expected = Vec::new();
+                for (fidx, dst_base) in [1024u64, 2048u64].into_iter().enumerate() {
+                    let foff = 16 + (fidx as u64) * field_bytes;
+                    for row in 0..4 {
+                        expected.push((
+                            foff + row * heads + (reader as u64 % heads),
+                            dst_base + 6 * 4 + row,
                         ));
                     }
                 }

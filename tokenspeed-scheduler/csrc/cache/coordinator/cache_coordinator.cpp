@@ -329,21 +329,33 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
         const std::int32_t on_disk = node->ClosedEntries(BoundaryTree::kDisk);
         _assert(on_device <= expected && on_host <= expected && on_disk <= expected,
                 "a boundary's history entries lie among its keys");
-        // On hybrid State+History models with a Disk tier, large State (e.g.
-        // KDA) checkpoints can evict from Host L2 to Disk while History (MLA)
-        // blocks stay in Host/Device RAM. Any prefix hitting such a boundary
-        // MUST read State from Disk (ListWithDisk), so report Disk residency
-        // rather than RAM-only residency to prevent routers from bypassing
-        // Disk cost pricing, outbound Disk-push caps, and Disk kill-switches.
+        // On hybrid State/SWA+History models with a Disk tier, State (KDA) or
+        // non-replayable SWA (DFLASH draft) blocks at an active boundary can
+        // evict from Host L2 to Disk while History (MLA) blocks stay in RAM.
+        // Any prefix hitting such a boundary MUST read State/SWA from Disk
+        // (ListWithDisk), so report Disk residency rather than RAM-only
+        // residency to prevent routers from bypassing Disk cost pricing,
+        // outbound Disk-push caps, and Disk kill-switches.
         const bool state_disk_only =
             store_.NumStateGroups() > 0 && store_.DiskPool() != nullptr &&
             (node->IsStateDiskOnly() ||
              (!node->HasRamCheckpointInProperSubtree() && node->PendingCheckpointStores() == 0 &&
               node->StateEntries(BoundaryTree::kDisk) > 0 && !HoldsStateCheckpoint(boundary.content_hash)));
+        const std::int32_t swa_dev = node->Entries(BoundaryTree::kDevice) - node->ClosedEntries(BoundaryTree::kDevice) -
+                                     node->StateEntries(BoundaryTree::kDevice);
+        const std::int32_t swa_host = node->Entries(BoundaryTree::kHost) - node->ClosedEntries(BoundaryTree::kHost) -
+                                      node->StateEntries(BoundaryTree::kHost);
+        const std::int32_t swa_disk = node->Entries(BoundaryTree::kDisk) - node->ClosedEntries(BoundaryTree::kDisk) -
+                                      node->StateEntries(BoundaryTree::kDisk);
+        const bool no_hotter_descendant =
+            store_.NumStateGroups() > 0 ? !node->HasRamCheckpointInProperSubtree() : (node->first_child == nullptr);
+        const bool swa_disk_only = store_.DiskPool() != nullptr && swa_disk > 0 && swa_dev == 0 && swa_host == 0 &&
+                                   node->PendingHostStores() == 0 && no_hotter_descendant;
+        const bool lower_tier_only = state_disk_only || swa_disk_only;
         const bool any_history = on_device == expected || on_host == expected || on_disk == expected;
-        return {.device_publishable = on_device == expected && !state_disk_only,
-                .host_publishable = on_host == expected && !state_disk_only,
-                .disk_publishable = on_disk == expected || (state_disk_only && any_history),
+        return {.device_publishable = on_device == expected && !lower_tier_only,
+                .host_publishable = on_host == expected && !lower_tier_only,
+                .disk_publishable = on_disk == expected || (lower_tier_only && any_history),
                 .retains_descriptor = retains_descriptor};
     }
     // No continuous history means no ordinary prefix-residency events.

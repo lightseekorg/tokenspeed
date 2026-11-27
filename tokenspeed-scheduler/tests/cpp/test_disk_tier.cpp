@@ -1306,6 +1306,120 @@ TEST(DiskTierTest, ShardedDiskPrefetchMixedTiersPreservesOwners) {
     }
 }
 
+TEST(DiskTierTest, DiskNodeEntriesIncludesDiskOnlyStateCheckpoint) {
+    // Regression test for Fix #3: CacheStore::NodeEntries(disk_pool, node) must
+    // check `BoundaryTree::kDisk` (not `kDevice`) so Disk-only State checkpoints
+    // are enumerated even when neither Device nor Host holds a checkpoint.
+    DiskTierCache cache(FullAndState(), 16);
+    const Prompt prompt(2, 101);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(keys).op_id, .success = true});
+    cache.EvictFromHost(keys);
+
+    const BoundaryTree::Node* tip = cache.coordinator.Store().Boundaries().Find(ContentHash{prompt.hashes.back()});
+    ASSERT_NE(tip, nullptr);
+    ASSERT_FALSE(tip->HasCheckpoint(BoundaryTree::kDevice));
+    ASSERT_FALSE(tip->HasCheckpoint(BoundaryTree::kHost));
+    ASSERT_TRUE(tip->HasCheckpoint(BoundaryTree::kDisk));
+
+    const auto entries = cache.coordinator.Store().NodeEntries(*cache.coordinator.Store().DiskPool(), *tip);
+    const bool found_state =
+        std::ranges::any_of(entries, [](const CacheStore::NodeEntry& e) { return e.group_id == 1; });
+    const bool found_full =
+        std::ranges::any_of(entries, [](const CacheStore::NodeEntry& e) { return e.group_id == 0; });
+    EXPECT_TRUE(found_state);
+    EXPECT_TRUE(found_full);
+}
+
+TEST(DiskTierTest, SwaDiskOnlyBoundaryReportsDiskPublishable) {
+    // Regression test for Fix #4a: when a non-replayable SWA group (e.g. DFLASH
+    // draft) has been evicted from Host/Device to Disk while Full History stays
+    // in Host RAM, GetBoundaryEventStatus must downgrade the boundary from
+    // Host/Device to Disk publishable.
+    std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kGrain},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .sink_tokens = 2,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kGrain},
+    };
+    DiskTierCache cache(specs, 16);
+    const Prompt prompt(4, 103);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(keys).op_id, .success = true});
+
+    // Evict only SWA (group 1) from Host while keeping Full History (group 0) on Host.
+    std::vector<CacheKey> swa_keys;
+    for (const CacheKey& key : keys) {
+        if (key.group_id == 1) swa_keys.push_back(key);
+    }
+    ASSERT_FALSE(swa_keys.empty());
+    cache.EvictFromHost(swa_keys);
+
+    const auto status =
+        cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{prompt.hashes.back()}}, 0);
+    EXPECT_FALSE(status.device_publishable);
+    EXPECT_FALSE(status.host_publishable);
+    EXPECT_TRUE(status.disk_publishable);
+}
+
+TEST(DiskTierTest, EndpointSwaMatchesClosedPrefixEvictionTier) {
+    // Regression test for Fix #4b: on a hybrid Full + SWA(sink>0) cache,
+    // newer endpoint SWA blocks must rank in `kClosedPrefix` (same tier as
+    // Full History) rather than `kEstablished`, so eviction prefers dropping
+    // older Full History blocks before newer endpoint SWA blocks.
+    std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kGrain},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .sink_tokens = 2,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kGrain},
+    };
+    BlockPool device(32, {1, 1});
+    auto coordinator =
+        MakeCoordinator(specs, kGrain, device, false, nullptr, /*disk_pool=*/nullptr, nullptr, false, false, 0);
+
+    const Prompt old_prompt(4, 107);
+    const Prompt new_prompt(4, 109);
+    auto publish = [&](const Prompt& p, std::uint64_t epoch) {
+        std::vector<BlockTable> tables(2);
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, static_cast<std::int32_t>(p.tokens.size())));
+        CacheCompletedBlocksForTest(coordinator, tables, p.hashes, epoch, /*first_new_prefix_page=*/0,
+                                    static_cast<std::int32_t>(p.tokens.size()), CacheBoundaryKind::kEndpoint,
+                                    /*stream_completed_to_host=*/false, /*publish_state=*/false);
+        coordinator.Free(tables);
+    };
+    publish(old_prompt, 10);
+    publish(new_prompt, 20);
+
+    // Inspect eviction candidate ordering directly on the device pool:
+    // older prompt's Full blocks (epoch 10, kClosedPrefix) must precede newer
+    // prompt's endpoint SWA blocks (epoch 20, also kClosedPrefix).
+    std::pmr::monotonic_buffer_resource scratch;
+    const CacheEvictionCandidates::LocationSet empty{&scratch};
+    CacheEvictionCandidates candidates{coordinator.Store().Groups(), device, CheckpointAging{}};
+    const CacheKey old_full_tip{.group_id = 0, .content_hash = ContentHash{old_prompt.hashes.back()}};
+    const CacheKey new_swa_tip{.group_id = 1, .content_hash = ContentHash{new_prompt.hashes.back()}};
+    const auto old_full_loc = coordinator.Store().LocationOf(device, 0, old_full_tip);
+    const auto new_swa_loc = coordinator.Store().LocationOf(device, 1, new_swa_tip);
+    ASSERT_TRUE(old_full_loc);
+    ASSERT_TRUE(new_swa_loc);
+    std::int32_t old_full_rank = -1;
+    std::int32_t new_swa_rank = -1;
+    std::int32_t step = 0;
+    while (auto c = candidates.Next({}, empty, empty, [](CacheBlockLocation) { return false; })) {
+        if (c->group_id == 0 && c->location == *old_full_loc) old_full_rank = step;
+        if (c->group_id == 1 && c->location == *new_swa_loc) new_swa_rank = step;
+        ++step;
+    }
+    ASSERT_GE(old_full_rank, 0);
+    ASSERT_GE(new_swa_rank, 0);
+    EXPECT_LT(old_full_rank, new_swa_rank)
+        << "older Full History block should be evicted before newer endpoint SWA block";
+}
+
 DiskConfig GdsDiskLimits() {
     auto limits = Limits();
     limits.max_host_blocks = 64;

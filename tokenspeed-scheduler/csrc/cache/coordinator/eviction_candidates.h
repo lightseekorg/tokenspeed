@@ -481,11 +481,12 @@ private:
         const bool sink = position >= 0 && position < ranking.sink_blocks;
         const bool probationary = !sink && !closed && kind == CacheBoundaryKind::kChunk &&
                                   !(metadata && metadata->was_acquired) && position >= 0;
+        const bool endpoint_swa = !sink && !closed && ranking.has_sink && !probationary;
         if (candidate.last_access_epoch != 0 || sink) {
-            candidate.boundary_tier = sink ? BoundaryTier::kSink
-                                      : probationary
-                                          ? BoundaryTier::kProbationary
-                                          : (closed ? BoundaryTier::kClosedPrefix : BoundaryTier::kEstablished);
+            candidate.boundary_tier =
+                sink           ? BoundaryTier::kSink
+                : probationary ? BoundaryTier::kProbationary
+                               : ((closed || endpoint_swa) ? BoundaryTier::kClosedPrefix : BoundaryTier::kEstablished);
         }
         if (probationary || (!closed && ranking.has_sink)) {
             candidate.position_rank = position;
