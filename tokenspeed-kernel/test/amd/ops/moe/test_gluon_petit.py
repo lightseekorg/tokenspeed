@@ -862,16 +862,6 @@ def test_largest_capacity_needs_no_extension_or_gpu() -> None:
     capacities, gpu_files = result.stdout.splitlines()[-2:]
     assert capacities == "2368 2624 2464 1344"
     assert gpu_files == "[]"
-    # The same search through the profiles.
-    assert [
-        _profile_largest_max_tokens_per_rank(profile, 8)
-        for profile in (
-            _MUSE_SPARK_PROFILE,
-            _DSV41_FLASH_PROFILE,
-            _GLM53_FLASH_PROFILE,
-            _KIMI_K3_PROFILE,
-        )
-    ] == [2368, 2624, 2464, 1344]
 
 
 def test_muse_spark_capacity_at_ep8() -> None:
@@ -919,7 +909,6 @@ def test_kimi_k3_capacity_at_ep8() -> None:
     # Under attention TP8 a rank hands Petit ceil(chunk / 8) rows: the TP8
     # recipe's 8192-token chunk needs 1024 rows, a 10752-token chunk 1344,
     # Kimi K3's limit; the next 32-row block is refused.
-    assert _profile_largest_max_tokens_per_rank(_KIMI_K3_PROFILE, 8) == 1344
     assert gluon_petit_max_tokens_per_rank(8, 1024, _KIMI_K3_PROFILE) == 1024
     assert gluon_petit_max_tokens_per_rank(8, 1344, _KIMI_K3_PROFILE) == 1344
     for rows in (1345, 1376, 2048):

@@ -405,13 +405,6 @@ def test_triton_mxfp4_moe_applies_glm53_flash_swiglu_clamp(
 
     scale = expected.abs().max().item()
     error = (actual - expected).abs()
-    print(
-        f"glm53 clamped mxfp4 activation={activation} tokens={num_tokens}: "
-        f"max|out|={scale:.4g} max_abs_err={error.max().item():.4g} "
-        f"max_err/max|out|={error.max().item() / scale:.3g} "
-        f"mean_abs_err={error.mean().item():.4g} "
-        f"max|unclamped-clamped|={(unclamped - expected).abs().max().item():.4g}"
-    )
     # The clamp decides this case: without it the outputs move by more than
     # their own range. The MXFP4 requantization of the intermediate turns a
     # one-ulp BF16 difference of gate/up (the kernel's FP32 sums against the
@@ -433,12 +426,6 @@ def test_triton_mxfp4_moe_without_limit_stays_unclamped() -> None:
     clamped = _swiglu_mxfp4_reference(*case, limit=GLM53_FLASH_SWIGLU_LIMIT)
     scale = expected.abs().max().item()
     error = (actual - expected).abs()
-    print(
-        f"glm53 unclamped mxfp4: max|out|={scale:.4g} "
-        f"max_abs_err={error.max().item():.4g} "
-        f"mean_abs_err={error.mean().item():.4g} "
-        f"max_err/max|out|={error.max().item() / scale:.3g}"
-    )
     assert (clamped - expected).abs().max().item() > 0.5 * scale
     # Unclamped gate/up reach about 100, so the E2M1 steps of the
     # intermediate (and the same requantization noise) are coarser.
