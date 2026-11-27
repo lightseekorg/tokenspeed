@@ -1463,7 +1463,8 @@ def _check_dflash2_mla_fused_context_write_cuda_and_zero_occupancy() -> None:
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
     device = torch.device("cuda")
-    config = _mla_dflash2_config()
+    # Real MLA geometry: set_mla_kv_buffer_triton requires kv_lora_rank % 256 == 0.
+    config = _mla_dflash2_config(kv_lora_rank=512, qk_rope_head_dim=64)
     prev_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
@@ -1576,7 +1577,8 @@ def _check_dflash2_mla_fused_context_write_memory_saver() -> None:
     )
 
     device = torch.device("cuda")
-    config = _mla_dflash2_config()
+    # Real MLA geometry: set_mla_kv_buffer_triton requires kv_lora_rank % 256 == 0.
+    config = _mla_dflash2_config(kv_lora_rank=512, qk_rope_head_dim=64)
     prev_dtype = torch.get_default_dtype()
     prev_saver = global_server_args_dict["enable_memory_saver"]
     global_server_args_dict["enable_memory_saver"] = True
