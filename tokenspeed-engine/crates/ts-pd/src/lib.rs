@@ -120,6 +120,103 @@ impl Copy {
 /// The most descriptors one WRITE batch carries.
 const DESCRIPTOR_BATCH: usize = 4096;
 
+/// Default maximum descriptors per sub-page `Copy::Spans` WRITE batch (override
+/// via `TOKENSPEED_PD_SPAN_BATCH`). Splitting large bursts of tiny RDMA WRITE
+/// WQEs (e.g. DFLASH SWA 256B head-sharded slices) avoids overflowing shallow
+/// RoCE switch egress buffers without changing `Copy::Pages` or large-span
+/// transfers.
+const DEFAULT_SPAN_DESCRIPTOR_BATCH: usize = 512;
+
+/// Span byte length at or below which a descriptor counts as a small sub-page
+/// span when deciding whether to apply `DEFAULT_SPAN_DESCRIPTOR_BATCH`.
+const SMALL_SPAN_MAX_BYTES: u64 = 4096;
+
+fn span_descriptor_batch_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("TOKENSPEED_PD_SPAN_BATCH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| n.clamp(1, DESCRIPTOR_BATCH))
+    })
+}
+
+fn span_descriptor_batch_for(lengths: &[u64], override_batch: Option<usize>) -> usize {
+    if let Some(batch) = override_batch {
+        return batch.clamp(1, DESCRIPTOR_BATCH);
+    }
+    if lengths.len() <= DEFAULT_SPAN_DESCRIPTOR_BATCH {
+        return DESCRIPTOR_BATCH;
+    }
+    // Count small spans rather than averaging across the whole Copy::Spans
+    // list: a mixed transfer can combine large state spans (e.g. linear
+    // attention) with thousands of 256B DFLASH SWA spans in one list.
+    let small_spans = lengths
+        .iter()
+        .filter(|&&len| len <= SMALL_SPAN_MAX_BYTES)
+        .count();
+    if small_spans > DEFAULT_SPAN_DESCRIPTOR_BATCH {
+        DEFAULT_SPAN_DESCRIPTOR_BATCH
+    } else {
+        DESCRIPTOR_BATCH
+    }
+}
+
+/// Detect whether the configured PD transport runs over RoCE (Ethernet RDMA)
+/// rather than lossless InfiniBand or a non-RDMA transport.
+///
+/// Fails closed (`false`) when sysfs is unavailable or when any configured
+/// device reports `InfiniBand`, ensuring lossless IB clusters incur zero
+/// default incast pacing.
+fn detect_roce_transport_in(sysfs_root: &std::path::Path, protocol: &str, ib_device: &str) -> bool {
+    if protocol == "ascend_direct" {
+        return true;
+    }
+    if protocol != "rdma" {
+        return false;
+    }
+    let configured: Vec<String> = ib_device
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let devices: Vec<String> = if configured.is_empty() {
+        let Ok(entries) = std::fs::read_dir(sysfs_root) else {
+            return false;
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect()
+    } else {
+        configured
+    };
+    if devices.is_empty() {
+        return false;
+    }
+    let mut saw_ethernet = false;
+    let mut saw_infiniband = false;
+    for dev in devices {
+        let ports_dir = sysfs_root.join(&dev).join("ports");
+        let Ok(ports) = std::fs::read_dir(&ports_dir) else {
+            continue;
+        };
+        for port in ports.filter_map(|e| e.ok()) {
+            let Ok(layer) = std::fs::read_to_string(port.path().join("link_layer")) else {
+                continue;
+            };
+            match layer.trim() {
+                "Ethernet" => saw_ethernet = true,
+                "InfiniBand" => saw_infiniband = true,
+                _ => {}
+            }
+        }
+    }
+    saw_ethernet && !saw_infiniband
+}
+
 /// A peer that failed to start.
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
@@ -165,6 +262,7 @@ struct Transport {
     local_ip: String,
     protocol: String,
     ib_device: String,
+    roce_transport: bool,
     /// The device ranges registered with the engine.
     regions: Vec<(usize, usize)>,
     /// Replaced when a sleeping Decode rank wakes under a fresh session.
@@ -204,11 +302,17 @@ impl Transport {
         );
         let sockets = net::Sockets::start(&config.local_ip, incoming)?;
         let engine = Arc::new(engine);
+        let roce_transport = detect_roce_transport_in(
+            std::path::Path::new("/sys/class/infiniband"),
+            &config.protocol,
+            &config.ib_device,
+        );
         Ok(Arc::new(Self {
             library,
             local_ip: config.local_ip.clone(),
             protocol: config.protocol.clone(),
             ib_device: config.ib_device.clone(),
+            roce_transport,
             regions: config.regions.clone(),
             engine: RwLock::new(engine.clone()),
             cache_sender: Mutex::new(CacheSender {
@@ -316,6 +420,11 @@ impl Transport {
     /// device.
     fn deregistration_fences_writes(&self) -> bool {
         self.protocol == "rdma"
+    }
+
+    /// Whether this transport was detected as Ethernet RDMA (RoCE) / Ascend direct.
+    fn is_roce(&self) -> bool {
+        self.roce_transport
     }
 
     /// A new engine with the cache registered, not yet addressed by peers.
@@ -435,8 +544,10 @@ impl Transport {
                     destinations,
                     lengths,
                 } => {
-                    for start in (0..sources.len()).step_by(DESCRIPTOR_BATCH) {
-                        let end = (start + DESCRIPTOR_BATCH).min(sources.len());
+                    let batch =
+                        span_descriptor_batch_for(lengths, span_descriptor_batch_override());
+                    for start in (0..sources.len()).step_by(batch) {
+                        let end = (start + batch).min(sources.len());
                         engine.write(
                             session,
                             &sources[start..end],
@@ -489,6 +600,71 @@ mod tests {
             lengths: vec![10, 20],
         };
         assert_eq!(spans.bytes(), 30);
+    }
+
+    #[test]
+    fn span_descriptor_batch_only_splits_large_subpage_bursts() {
+        let small_short = vec![256u64; 512];
+        assert_eq!(
+            span_descriptor_batch_for(&small_short, None),
+            DESCRIPTOR_BATCH
+        );
+
+        let small_burst = vec![256u64; 1536];
+        assert_eq!(
+            span_descriptor_batch_for(&small_burst, None),
+            DEFAULT_SPAN_DESCRIPTOR_BATCH
+        );
+
+        let large_burst = vec![65_536u64; 1536];
+        assert_eq!(
+            span_descriptor_batch_for(&large_burst, None),
+            DESCRIPTOR_BATCH
+        );
+
+        // Large spans mixed with a large burst of small spans must still split.
+        let mut mixed_burst = vec![1_048_576u64; 64];
+        mixed_burst.extend(std::iter::repeat_n(256u64, 1536));
+        assert_eq!(
+            span_descriptor_batch_for(&mixed_burst, None),
+            DEFAULT_SPAN_DESCRIPTOR_BATCH
+        );
+
+        assert_eq!(span_descriptor_batch_for(&large_burst, Some(256)), 256);
+        assert_eq!(
+            span_descriptor_batch_for(&small_burst, Some(99_999)),
+            DESCRIPTOR_BATCH
+        );
+    }
+
+    #[test]
+    fn detect_roce_transport_distinguishes_ethernet_from_infiniband() {
+        let root = std::env::temp_dir().join(format!(
+            "ts_pd_roce_test_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let write_layer = |dev: &str, port: &str, layer: &str| {
+            let dir = root.join(dev).join("ports").join(port);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("link_layer"), format!("{layer}\n")).unwrap();
+        };
+        write_layer("mlx5_0", "1", "Ethernet");
+        write_layer("mlx5_1", "1", "InfiniBand");
+
+        assert!(detect_roce_transport_in(&root, "rdma", "mlx5_0"));
+        assert!(!detect_roce_transport_in(&root, "rdma", "mlx5_1"));
+        assert!(!detect_roce_transport_in(&root, "rdma", "mlx5_0,mlx5_1"));
+        assert!(!detect_roce_transport_in(&root, "rdma", ""));
+        assert!(!detect_roce_transport_in(&root, "tcp", "mlx5_0"));
+        assert!(detect_roce_transport_in(&root, "ascend_direct", ""));
+
+        let _ = std::fs::remove_dir_all(root.join("mlx5_1"));
+        assert!(detect_roce_transport_in(&root, "rdma", ""));
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!detect_roce_transport_in(&root, "rdma", ""));
     }
 }
 

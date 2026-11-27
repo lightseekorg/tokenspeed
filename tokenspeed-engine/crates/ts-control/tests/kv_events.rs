@@ -25,7 +25,10 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use ts_control::kv_events::{encode_batch, KvEventPublisher, KvEventsConfig};
+use ts_control::kv_events::{
+    encode_batch, encode_coalesced_batch, KvEventPublisher, KvEventsConfig,
+    DEFAULT_KV_EVENT_COALESCE_MAX_BLOCKS,
+};
 use ts_scheduler::{KvEventBatch, KvEventView};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
@@ -201,4 +204,41 @@ fn batching_rejects_tokens_that_a_removal_would_discard() {
     events[0].has_parent = false;
     events[0].parent_block_hash = 0;
     KvEventBatch::from_events(&events);
+}
+
+#[test]
+fn coalesced_batch_decodes_cleanly_as_vllm_msgpack_and_reduces_event_count() {
+    let mut input = Vec::new();
+    for i in 1..=260u64 {
+        input.push(KvEventView {
+            stored: true,
+            block_hashes: vec![i],
+            has_parent: i > 1,
+            parent_block_hash: i.saturating_sub(1),
+            token_ids: vec![
+                (i * 4) as i32,
+                (i * 4 + 1) as i32,
+                (i * 4 + 2) as i32,
+                (i * 4 + 3) as i32,
+            ],
+            block_size: 4,
+            medium: 0,
+        });
+    }
+    let batch = KvEventBatch::from_events(&input);
+    let raw = encode_batch(42.5, &batch, 2);
+    let coalesced = encode_coalesced_batch(42.5, &batch, 2, DEFAULT_KV_EVENT_COALESCE_MAX_BLOCKS);
+    assert!(
+        coalesced.len() < raw.len(),
+        "coalesced payload ({}) should be smaller than raw ({})",
+        coalesced.len(),
+        raw.len()
+    );
+    // Top-level msgpack array: [timestamp (f64), [3 BlockStored events], dp_rank=2]
+    assert_eq!(coalesced[0], 0x93);
+    assert_eq!(coalesced[1], 0xcb);
+    assert_eq!(
+        coalesced[10], 0x93,
+        "260 blocks should coalesce into 3 events (128+128+4)"
+    );
 }

@@ -494,6 +494,90 @@ struct Shared {
     metadata_ready: Condvar,
 }
 
+const DEFAULT_INCAST_PACE_GBPS: f64 = 6.0;
+const DEFAULT_INCAST_MIN_STAGGER_US: u64 = 2_000;
+const MAX_INCAST_PER_RANK_US: u64 = 50_000;
+const INCAST_SLEEP_SLICE: Duration = Duration::from_millis(5);
+
+#[derive(Debug, Clone, Copy)]
+struct IncastConfig {
+    pace_gbps_override: Option<f64>,
+    min_stagger_us: u64,
+}
+
+fn incast_config() -> IncastConfig {
+    static CFG: std::sync::OnceLock<IncastConfig> = std::sync::OnceLock::new();
+    *CFG.get_or_init(|| {
+        let pace_gbps_override = std::env::var("TOKENSPEED_PD_INCAST_PACE_GBPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok());
+        let min_stagger_us = std::env::var("TOKENSPEED_PD_INCAST_MIN_STAGGER_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_INCAST_MIN_STAGGER_US)
+            .min(MAX_INCAST_PER_RANK_US);
+        IncastConfig {
+            pace_gbps_override,
+            min_stagger_us,
+        }
+    })
+}
+
+/// Bandwidth-aware per-rank stagger for many-to-one (`src_tp > dst_tp`, e.g.
+/// `P(TP8) -> D(TP1)`) RoCE RDMA WRITEs to eliminate switch incast drops and
+/// multi-second QP retry timeouts.
+///
+/// Strictly disabled by default on lossless InfiniBand and non-RoCE transports
+/// unless explicitly enabled via `TOKENSPEED_PD_INCAST_PACE_GBPS`.
+fn compute_pd_incast_stagger(
+    room: u64,
+    tp_rank: i64,
+    src_tp: i64,
+    dst_tp: i64,
+    copies: &[Copy],
+    is_roce: bool,
+    cfg: IncastConfig,
+) -> Duration {
+    let pace_gbps = match cfg.pace_gbps_override {
+        Some(v) => v,
+        None => {
+            if is_roce {
+                DEFAULT_INCAST_PACE_GBPS
+            } else {
+                0.0
+            }
+        }
+    };
+    if !pace_gbps.is_finite() || pace_gbps <= 0.0 || dst_tp <= 0 || src_tp <= dst_tp {
+        return Duration::ZERO;
+    }
+    let fanin = src_tp / dst_tp;
+    if fanin <= 1 {
+        return Duration::ZERO;
+    }
+    let slot = (tp_rank.rem_euclid(fanin) as u64).wrapping_add(room) % (fanin as u64);
+    if slot == 0 {
+        return Duration::ZERO;
+    }
+    let total_bytes: u64 = copies.iter().map(Copy::bytes).sum();
+    let total_spans: usize = copies
+        .iter()
+        .map(|c| match c {
+            Copy::Spans { lengths, .. } => lengths.len(),
+            Copy::Pages(_) => 0,
+        })
+        .sum();
+    if total_bytes < 262_144 && total_spans < 256 {
+        return Duration::ZERO;
+    }
+    // bytes / (GB/s * 1e3) == microseconds at `pace_gbps` GB/s.
+    let bw_us = ((total_bytes as f64) / (pace_gbps * 1_000.0)) as u64;
+    let per_rank_us = bw_us
+        .max(cfg.min_stagger_us.min(MAX_INCAST_PER_RANK_US))
+        .min(MAX_INCAST_PER_RANK_US);
+    Duration::from_micros(slot.saturating_mul(per_rank_us))
+}
+
 impl Shared {
     fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("the PD state lock is poisoned")
@@ -1178,6 +1262,29 @@ impl Shared {
         registration: &Registration,
         copies: &[Copy],
     ) -> Result<(), String> {
+        let started = Instant::now();
+        let stagger = compute_pd_incast_stagger(
+            room,
+            self.layout.tp_rank,
+            self.layout.tp_size,
+            registration.decode_tp_size,
+            copies,
+            self.transport.is_roce(),
+            incast_config(),
+        );
+        if !stagger.is_zero() {
+            let deadline = started + stagger;
+            loop {
+                if self.state().ended(room) {
+                    return Err("CachePD transfer room was cancelled or ended".to_owned());
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                thread::sleep(remaining.min(INCAST_SLEEP_SLICE));
+            }
+        }
         let gate = self
             .state()
             .registration_gates
@@ -1198,7 +1305,6 @@ impl Shared {
         if self.state().ended(room) {
             return Err("CachePD transfer room was cancelled or ended".to_owned());
         }
-        let started = Instant::now();
         if let Err(error) =
             self.transport
                 .write_cache(&registration.session_id, &registration.cache_id, copies)
@@ -2647,6 +2753,118 @@ mod tests {
         state.clear(5);
         assert!(state.take_cancellation_replies().is_empty());
         assert!(state.cancellation_replies.contains_key(&key));
+    }
+
+    #[test]
+    fn pd_incast_stagger_only_applies_to_roce_many_to_one_transfers() {
+        let default_cfg = IncastConfig {
+            pace_gbps_override: None,
+            min_stagger_us: DEFAULT_INCAST_MIN_STAGGER_US,
+        };
+        let big_span = Copy::Spans {
+            sources: vec![0; 512],
+            destinations: vec![0; 512],
+            lengths: vec![256; 512],
+        };
+        let tiny_span = Copy::Spans {
+            sources: vec![0; 16],
+            destinations: vec![0; 16],
+            lengths: vec![256; 16],
+        };
+
+        // Disabled by default on non-RoCE (e.g. lossless InfiniBand).
+        assert_eq!(
+            compute_pd_incast_stagger(
+                0,
+                3,
+                8,
+                1,
+                std::slice::from_ref(&big_span),
+                false,
+                default_cfg
+            ),
+            Duration::ZERO
+        );
+        // Disabled for equal or one-to-many TP layouts even on RoCE.
+        assert_eq!(
+            compute_pd_incast_stagger(
+                0,
+                3,
+                8,
+                8,
+                std::slice::from_ref(&big_span),
+                true,
+                default_cfg
+            ),
+            Duration::ZERO
+        );
+        // Disabled for tiny transfers below threshold.
+        assert_eq!(
+            compute_pd_incast_stagger(
+                0,
+                3,
+                8,
+                1,
+                std::slice::from_ref(&tiny_span),
+                true,
+                default_cfg
+            ),
+            Duration::ZERO
+        );
+        // Enabled on RoCE 8->1 fan-in; slot rotates by room and slot 0 has zero wait.
+        assert_eq!(
+            compute_pd_incast_stagger(
+                0,
+                0,
+                8,
+                1,
+                std::slice::from_ref(&big_span),
+                true,
+                default_cfg
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            compute_pd_incast_stagger(
+                0,
+                3,
+                8,
+                1,
+                std::slice::from_ref(&big_span),
+                true,
+                default_cfg
+            ),
+            Duration::from_micros(3 * DEFAULT_INCAST_MIN_STAGGER_US)
+        );
+        assert_eq!(
+            compute_pd_incast_stagger(
+                5,
+                3,
+                8,
+                1,
+                std::slice::from_ref(&big_span),
+                true,
+                default_cfg
+            ),
+            Duration::ZERO
+        );
+        // Explicit override 0 disables even on RoCE; explicit >0 enables even on non-RoCE.
+        let disabled = IncastConfig {
+            pace_gbps_override: Some(0.0),
+            min_stagger_us: DEFAULT_INCAST_MIN_STAGGER_US,
+        };
+        assert_eq!(
+            compute_pd_incast_stagger(0, 3, 8, 1, std::slice::from_ref(&big_span), true, disabled),
+            Duration::ZERO
+        );
+        let forced = IncastConfig {
+            pace_gbps_override: Some(20.0),
+            min_stagger_us: 1_000,
+        };
+        assert_eq!(
+            compute_pd_incast_stagger(0, 2, 8, 1, std::slice::from_ref(&big_span), false, forced),
+            Duration::from_micros(2_000)
+        );
     }
 }
 
