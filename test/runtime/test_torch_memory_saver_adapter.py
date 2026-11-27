@@ -33,7 +33,7 @@ import torch
 
 from tokenspeed.runtime.utils import torch_memory_saver_adapter as adapter
 
-register_cuda_ci(est_time=5, suite="runtime-1gpu")
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 
 class CpuMemorySaver:
@@ -458,22 +458,109 @@ def _check_managed_metadata_on_cuda():
                 lengths,
             )
         )
-        for _ in range(3):
-            torch.cuda.synchronize()
-            saver.pause(tag="weights")
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
-            ordinary_bytes = sum(
-                segment["total_size"]
-                for segment in torch.cuda.memory_snapshot()
-                if segment["device"] == torch.cuda.current_device()
-                and tuple(segment["segment_pool_id"]) == (0, 0)
+        _check_weights_release_and_resume(saver, retained)
+
+
+def _check_weights_release_and_resume(saver, snapshots):
+    for _ in range(3):
+        torch.cuda.synchronize()
+        saver.pause(tag="weights")
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        ordinary_bytes = sum(
+            segment["total_size"]
+            for segment in torch.cuda.memory_snapshot()
+            if segment["device"] == torch.cuda.current_device()
+            and tuple(segment["segment_pool_id"]) == (0, 0)
+        )
+        assert ordinary_bytes == 0, ordinary_bytes
+        saver.resume(tag="weights")
+        for tensor, pointer, reference in snapshots:
+            assert tensor.data_ptr() == pointer
+            torch.testing.assert_close(tensor.cpu(), reference, rtol=0, atol=0)
+
+
+def _check_v41_prefill_graph_inputs_on_cuda():
+    from test.runtime import test_deepseek_v41_cache as cache
+    from test.runtime.test_deepseek_v41_model import _ctx
+
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    from tokenspeed.runtime.execution.breakable_cuda_graph import (
+        BreakableCapture,
+        active_forward,
+    )
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+        DeepseekV41AttentionBackend,
+    )
+    from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
+        DeepseekV41Config,
+    )
+
+    recipe = cache._recipe("cuda")
+    pool = cache._pool(recipe, "cuda", enable_memory_saver=True)
+    saver = pool.arena.memory_saver_adapter
+    config = recipe.attn_config
+    with saver.named_region("attention_state"):
+        backend = DeepseekV41AttentionBackend(
+            config, config.component(DeepseekV41Config)
+        )
+        backend.set_cache_pool(pool)
+        tables = cache._tables("cuda")
+    pool.swa(0).zero_()
+    for rows, prefix in ((4, 2), (64, 32)):
+        with saver.named_region("attention_state"):
+            meta = cache._extend(
+                backend, tables, [rows], [prefix], [0], [rows + prefix]
             )
-            assert ordinary_bytes == 0, ordinary_bytes
-            saver.resume(tag="weights")
-            for tensor, pointer, reference in retained:
-                assert tensor.data_ptr() == pointer
-                torch.testing.assert_close(tensor.cpu(), reference, rtol=0, atol=0)
+        ctx = _ctx(backend, rows, ForwardMode.EXTEND)
+        capture = BreakableCapture()
+        with active_forward(ctx), capture:
+            backend.prepare_prefill_stage(ctx, rows, decoder=True)
+            current = backend.prefill_stage.swa_current
+            current.fill_(rows)
+        current.fill_(-1)
+        backend.prepare_prefill_stage(ctx, 64, decoder=False)
+        stage = backend.prefill_stage
+        assert stage.prefix.shape[0] == prefix
+        stage.prefix.fill_(rows)
+        plan = backend._swa_query_plan(
+            meta.positions, meta.request_indices, ctx.forward_mode, query_shard=None
+        )
+        layout = backend._prefill_layout(plan, -1, ctx.forward_mode)
+        tensors = (
+            stage.rows,
+            stage.pairs.active,
+            stage.prefix,
+            stage.descriptor,
+            plan.prefix_slots,
+            layout.batches[0].swa_indices,
+            current,
+        )
+        _check_weights_release_and_resume(
+            saver, [(t, t.data_ptr(), t.cpu()) for t in tensors]
+        )
+        torch.testing.assert_close(stage.positions[:rows], meta.positions)
+        dsv41.snapshot_swa_prefix(pool.swa(0), stage.descriptor, backend.swa_format)
+        assert torch.count_nonzero(stage.prefix) == 0
+        with active_forward(ctx):
+            capture.replay()
+        assert torch.all(current == rows)
+
+    # The 64-row graph still owns its workspace when the smaller graph captures.
+    with saver.named_region("attention_state"):
+        cache._extend(backend, tables, [4], [0], [0], [4])
+    ctx = _ctx(backend, 4, ForwardMode.EXTEND)
+    smaller = BreakableCapture(pool=capture.pool)
+    with active_forward(ctx):
+        with smaller:
+            backend.prepare_prefill_stage(ctx, 4, decoder=True)
+            small = backend.prefill_stage.swa_current
+            small.fill_(4)
+        smaller.replay()
+    assert small.data_ptr() == current.data_ptr()
+    assert torch.all(current[:4] == 4) and torch.all(current[4:] == 64)
 
     from tokenspeed_kernel.ops.attention.kda import kda_paged_prefill
     from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
@@ -559,12 +646,13 @@ def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
             [
                 sys.executable,
                 "-c",
-                "from test.runtime.test_torch_memory_saver_adapter import "
-                "_check_managed_metadata_on_cuda; _check_managed_metadata_on_cuda()",
+                "from test.runtime import test_torch_memory_saver_adapter as checks\n"
+                "checks._check_managed_metadata_on_cuda()\n"
+                "checks._check_v41_prefill_graph_inputs_on_cuda()",
             ],
             cwd=Path(__file__).resolve().parents[2],
             check=True,
-            timeout=90,
+            timeout=180,
         )
 
 

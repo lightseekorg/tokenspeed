@@ -480,45 +480,6 @@ decode graph capture. A forward never creates a process group; an idle DP
 rank still participates in startup. The backend retains its shared workspace
 across layers, while the process-group manager retains the communicator.
 
-### V4.1 fused attention
-
-On supported Blackwell configurations, V4.1 decode keeps a separate prepared
-copy of the query and grouped output projection weights. The query projection
-returns the fused attention layout without applying RoPE. Selected attention
-then applies Q RoPE, the existing softmax and sink, inverse output RoPE, and
-per-32 FP8 quantization; the matching output projection consumes those codes
-and packed scales directly. The latent query norm remains before its projection.
-DSpark decode uses the same contract over its BF16 window workspace.
-
-The native epilogue requires eight query heads per output group. Unsupported
-head or projection geometry and distributed partial attention retain the regular
-path. Prefill uses one fused call per workspace batch. Mixed prefill and
-decode copy FlashMLA's results into disjoint rows of one buffer. Its allocator
-sets the FP8 layout and each caller supplies one destination row per query.
-The output projection reads the entire batch or graph bucket.
-Skipped prefill rows stay zero. Slices retain the parent stride of the packed
-scales. Operator QCP exchanges BF16 heads, and model query shards rotate Q
-at their source positions. Both use the regular path. Prepared copies are
-nonpersistent buffers, refreshed in place from the canonical checkpoint after
-weight updates so captured graphs retain their addresses. Cache ownership,
-selection and write ordering are unchanged.
-
-In a breakable prefill graph, eager attention fills a bucket-sized FP8 buffer
-and clears its padding, or the entire buffer on an idle rank. The next segment
-replays `wo_a` and `wo_b`. The CED narrowing layer runs eagerly between stages.
-
-Attention-front FP8 projection warmup visits every layer and deduplicates by
-device and weight shape. The initial window-only layers have no indexer, and
-canonical Q weights remain active when fused attention is unavailable, so
-neither the first layer nor the fused Q copy alone covers every projection.
-
-A head cache may retain explicit ``[pages, rows, heads, dim]`` axes when its
-K and V fields share a plane. Prologue and context scatters resolve a token
-slot as ``page * page_stride + row * row_stride``; flattening these pages
-would discard the gap occupied by the other field. Dense row caches keep
-their existing three-dimensional views.
-
-
 ### Ascend DSA execution ownership
 
 DSA Prefill prepares its batch metadata and reusable transport in
@@ -572,3 +533,65 @@ directly; `_gather_send` (`gather_send_rows`) is reused for history and current
 sends; `_current_receive` (`current_receive_rows`) holds gathered current rows
 before they are unpacked. `current_rank_stride` is the aligned distance between
 producers' current regions in the attention planes, distinct from send capacity.
+
+## DeepSeek V4.1 attention
+
+### V4.1 fused attention
+
+On supported Blackwell configurations, V4.1 decode keeps a separate prepared
+copy of the query and grouped output projection weights. The query projection
+returns the fused attention layout without applying RoPE. Selected attention
+then applies Q RoPE, the existing softmax and sink, inverse output RoPE, and
+per-32 FP8 quantization; the matching output projection consumes those codes
+and packed scales directly. The latent query norm remains before its projection.
+DSpark decode uses the same contract over its BF16 window workspace.
+
+The native epilogue requires eight query heads per output group. Unsupported
+head or projection geometry and distributed partial attention retain the regular
+path. Prefill uses one fused call per workspace batch. Mixed prefill and
+decode copy FlashMLA's results into disjoint rows of one buffer. Its allocator
+sets the FP8 layout and each caller supplies one destination row per query.
+The output projection reads the entire batch or graph bucket.
+Skipped prefill rows stay zero. Slices retain the parent stride of the packed
+scales. Operator QCP exchanges BF16 heads, and model query shards rotate Q
+at their source positions. Both use the regular path. Prepared copies are
+nonpersistent buffers, refreshed in place from the canonical checkpoint after
+weight updates so captured graphs retain their addresses.
+
+In a breakable prefill graph, eager attention fills a bucket-sized FP8 buffer
+and clears its padding, or the entire buffer on an idle rank. The next segment
+replays `wo_a` and `wo_b`. For the candidate source's row layout, see
+[Prefill graphs around a row narrowing](unified_path.md#prefill-graphs-around-a-row-narrowing).
+
+Attention-front FP8 projection warmup visits every layer and deduplicates by
+device and weight shape. The initial window-only layers have no indexer, and
+canonical Q weights remain active when fused attention is unavailable, so
+neither the first layer nor the fused Q copy alone covers every projection.
+
+A head cache may retain explicit ``[pages, rows, heads, dim]`` axes when its
+K and V fields share a plane. Prologue and context scatters resolve a token
+slot as ``page * page_stride + row * row_stride``; flattening these pages
+would discard the gap occupied by the other field. Dense row caches keep
+their existing three-dimensional views.
+
+### Staged prefill
+
+On the replicated-head FP8 path, both stages refresh live positions and SWA
+write slots at fixed addresses. The encoder also refreshes global write slots
+and compressor coordinates. Padding has no cache slots, but projecting a padded
+bucket can change the rounding of the compressor's FP32 reduction. The old SWA
+prefix can outgrow the token bucket, so a device descriptor supplies the current
+slot and workspace addresses. During capture the eager break uploads it
+synchronously from pageable memory to avoid a pinned-allocator event query in
+the next graph segment. Replay uploads it asynchronously from pinned memory.
+
+Encoder layers snapshot the old SWA prefix before current writes can reuse
+its slots. CED decoder prefill starts its SWA window at the first retained
+row and uses only current rows. Decode rows, including the decode suffix of
+a mixed batch, read the updated cache. Decoder graphs share a BF16 workspace
+for current rows. On weight resume, the memory saver restores the persistent
+`attention_state` buffers at their captured addresses.
+
+When a pure eager prefill selects its whole history, index sources skip the
+index Q and head-weight projections. Graph warmup and capture include both
+projections so the same bucket can score a longer history on replay.

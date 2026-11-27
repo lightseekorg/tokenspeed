@@ -24,6 +24,17 @@ from __future__ import annotations
 
 import os
 import sys
+from test.runtime.test_deepseek_v41_cache import R1, R2, SWA, _extend
+from test.runtime.test_deepseek_v41_fused_decode import (
+    _load_decode_projections,
+    _mixed_context,
+    _real_backend,
+    _require_fused_cuda,
+    _supported_config,
+)
+from test.runtime.test_deepseek_v41_fused_decode import (
+    pdl_for_fp8_gemm as pdl_for_fp8_gemm,
+)
 from test.runtime.test_deepseek_v41_model import (
     _Backend,
     _config,
@@ -42,7 +53,12 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import pack_index_inputs
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    BreakableCapture,
+    active_forward,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
 )
@@ -57,7 +73,7 @@ from tokenspeed.runtime.models.deepseek_v41 import (
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
+register_cuda_ci(est_time=45, suite="runtime-1gpu")
 
 requires_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or not current_platform().is_blackwell,
@@ -386,6 +402,196 @@ def test_shared_q_decode_graph_replay_with_auxiliary_indexer(monkeypatch):
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
         for actual_index, expected_index in zip(captured_index, selected[-1]):
             torch.testing.assert_close(actual_index, expected_index, rtol=0, atol=0)
+
+
+def _staged_kv_owner(layer_id, *, aux_stream=None):
+    _require_fused_cuda()
+    torch.manual_seed(220)
+    config = _supported_config()
+    config.index_n_heads, config.index_head_dim = 32, 128
+    config.max_position_embeddings = 512
+    with torch.device("cuda"):
+        attn = DeepseekV41Attention(
+            config,
+            _mapping(0, 1, 1),
+            layer_id,
+            config.candidate_source_layer_id,
+            v41_mxfp8_config(_quant()),
+            f"layers.{layer_id}.attn",
+            aux_stream=aux_stream,
+        )
+    _initialize(attn)
+    _load_decode_projections(attn, seed=220)
+    attn.prepare_fused_decode()
+    assert attn.fused_q_weight is not None
+    return attn, config.hidden_size
+
+
+@requires_blackwell
+@pytest.mark.usefixtures("pdl_for_fp8_gemm")
+@torch.inference_mode()
+def test_ratio2_prefill_replay_preserves_prefix_kv():
+    attn, hidden_size = _staged_kv_owner(2, aux_stream=torch.cuda.Stream())
+    backend, tables = _real_backend()
+    reference, _ = _real_backend()
+    capacity = 128  # One page of ratio-2 KV represents 128 input tokens.
+    mode = ForwardMode.EXTEND
+    # One nonzero per dot product makes the cache bytes comparable even when
+    # eager projects the shorter input and the graph projects the full bucket.
+    hidden = torch.eye(capacity, hidden_size, dtype=torch.bfloat16, device="cuda")
+    nn.init.eye_(attn.indexer.wk.weight)
+    positions = torch.arange(capacity, device="cuda")
+
+    def staged(ctx):
+        backend.prepare_prefill_stage(ctx, capacity, decoder=False)
+        return attn(positions, hidden, ctx, reduce_output=True)
+
+    _extend(backend, tables, [capacity], [0], [0], [capacity])
+    ctx = _ctx(backend, capacity, mode)
+    with active_forward(ctx), backend.prefill_graph_scope():
+        staged(ctx)
+        graph = BreakableCapture(run_segments_while_capturing=True)
+        with graph:
+            actual = staged(ctx)
+
+    pool = backend.cache_pool
+    pool.arena.buffer.zero_()
+    reference.cache_pool.arena.buffer.zero_()
+
+    def check(rows, prefix, replay):
+        batch = ([rows], [prefix], [replay], [prefix + rows])
+        meta = _extend(backend, tables, *batch)
+        ref_meta = _extend(reference, tables, *batch)
+        hidden.neg_()
+        positions[:rows].copy_(meta.positions)
+        with reference.prefill_graph_scope():
+            expected = attn(
+                ref_meta.positions,
+                hidden[:rows],
+                _ctx(reference, rows, mode),
+                reduce_output=True,
+            )
+        with active_forward(_ctx(backend, rows, mode)), backend.prefill_graph_scope():
+            graph.replay(valid_rows=rows)
+        torch.testing.assert_close(actual[:rows], expected, rtol=0.02, atol=0.002)
+        assert not actual[rows:].any()
+        # Includes global KV, index K and the FP32 compressor tail.
+        assert torch.equal(pool.arena.buffer, reference.cache_pool.arena.buffer)
+
+    check(capacity, 0, 0)
+    page = tables[R2][0, 0].item()
+    prefix_kv = (pool.global_kv(2)[page], pool.index_k(2)[page])
+    saved = tuple(field.clone() for field in prefix_kv)
+    tables[SWA][0, 2] = tables[SWA][0, 0]  # Wrap the SWA cache after 128 tokens.
+    check(9, 125, 3)  # Reuse the first page and write new pairs in the next.
+    torch.testing.assert_close(prefix_kv, saved, rtol=0, atol=0)
+
+    # Query 134 still needs row 7 when row 135 overwrites its SWA slot.
+    slot = tables[SWA][0, :1].long() * 64 + 7
+    old_row = dsv41.cache_gather(pool.swa(2), slot, backend.swa_format, None)
+    check(2, 134, 0)
+    assert torch.equal(backend.prefill_stage.prefix[:1], old_row)
+
+
+@requires_blackwell
+@pytest.mark.usefixtures("pdl_for_fp8_gemm")
+@torch.inference_mode()
+def test_ced_source_replay_matches_eager_across_narrowing():
+    source_layer = 20
+    attn, hidden_size = _staged_kv_owner(source_layer)
+
+    backend, tables = _real_backend(max_bs=2)
+    pool = backend.cache_pool
+    hidden = torch.randn(160, hidden_size, dtype=torch.bfloat16, device="cuda")
+    decoder_hidden = hidden.new_zeros((144, hidden_size))
+    decoder_positions = torch.zeros(
+        decoder_hidden.shape[0], dtype=torch.int64, device="cuda"
+    )
+    pages = tables[R1].long()
+    pages = pages[pages > 0].unique()
+
+    def source_kv():
+        # SWA can write other parts of the shared arena during decoder replay.
+        return pool.global_kv(source_layer)[pages], pool.index_k(source_layer)[pages]
+
+    def extend(rows, prompt_len):
+        meta = _extend(backend, tables, [rows], [0], [0], [prompt_len])
+        ctx = _ctx(backend, rows, ForwardMode.EXTEND)
+        ctx.output_layout = ForwardOutputLayout(1, int(rows == prompt_len), 0, 1)
+        return meta, ctx
+
+    def encode(ctx):
+        backend.prepare_prefill_stage(ctx, hidden.shape[0], decoder=False)
+        attn.write_prefill_kv(hidden, ctx)
+
+    def land():
+        view = backend.decoder_view()
+        rows = view.metadata.positions.numel()
+        retained = hidden[:rows] if view.keep_rows is None else hidden[view.keep_rows]
+        decoder_hidden[:rows].copy_(retained)
+        decoder_hidden[rows:].zero_()
+        decoder_positions[:rows].copy_(view.metadata.positions)
+        decoder_positions[rows:].zero_()
+        return rows
+
+    def decode(ctx):
+        backend.prepare_prefill_stage(ctx, decoder_hidden.shape[0], decoder=True)
+        return attn(
+            decoder_positions,
+            decoder_hidden,
+            ctx,
+            reduce_output=True,
+            decoder_view=backend.decoder_view(),
+        )
+
+    # This history fits top-k. The mixed replay below needs the scored path.
+    _, ctx = extend(3, 3)
+
+    def unexpected_projection(module, args):
+        pytest.fail("Short eager prefill projected index Q or head weights")
+
+    with active_forward(ctx):
+        encode(ctx)
+        land()
+        with (
+            attn.indexer.wq_b.register_forward_pre_hook(unexpected_projection),
+            attn.indexer.weights_proj.register_forward_pre_hook(unexpected_projection),
+        ):
+            decode(ctx)
+        ctx.is_prefill_graph_dummy = True
+        encoder = BreakableCapture(run_segments_while_capturing=True)
+        with encoder:
+            encode(ctx)
+        land()
+        decode(ctx)
+        decoder = BreakableCapture(pool=encoder.pool, run_segments_while_capturing=True)
+        with decoder:
+            output = decode(ctx)
+
+    def check_replay(meta, ctx, expected_rows):
+        live = meta.positions.numel()
+        hidden.normal_()
+        pool.arena.buffer.zero_()
+        with backend.prefill_graph_scope():
+            expected = attn(meta.positions, hidden[:live], ctx, reduce_output=True)
+        expected_kv = source_kv()
+        pool.arena.buffer.zero_()
+        with active_forward(ctx), backend.prefill_graph_scope():
+            encoder.replay(valid_rows=live)
+            torch.testing.assert_close(source_kv(), expected_kv, rtol=0, atol=0)
+            rows = land()
+            assert rows == expected_rows
+            decoder.replay(valid_rows=rows)
+        torch.testing.assert_close(
+            output[:expected_rows], expected, rtol=0.02, atol=0.002
+        )
+        assert not torch.count_nonzero(output[expected_rows:])
+        torch.testing.assert_close(source_kv(), expected_kv, rtol=0, atol=0)
+
+    # Both batches write 160 source rows. Only the completed prompt and decode
+    # request have a decoder tail. Equal encoder widths make the KV comparison exact.
+    check_replay(*_mixed_context(backend, tables, 159), expected_rows=129)
+    check_replay(*extend(160, 192), expected_rows=0)
 
 
 @pytest.mark.parametrize("qcp_size", [1, 4])

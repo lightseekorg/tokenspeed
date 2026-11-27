@@ -1,10 +1,16 @@
 # DeepSeek V4.1 indexer scores
 
+Staged prefill prepares index Q and head weights before `index_topk`, while
+decode can pass `IndexQueryInput` to defer preparation to the scorer. The
+native Blackwell kernel applies RoPE to Q, packs it as MXFP4 and rounds the
+scaled head weights once to BF16. A Reindex window can use the same rounded
+values for Full scoring (FP32 weights) or native sparse scoring (BF16 weights).
+
 The native Blackwell DeepGEMM indexer writes BF16 logits and passes BF16 rows
-through masking, alignment, candidate gathering, and DeepSelect. Head weights
-retain their existing precision. Paged scoring uses the caller's query tile;
-replicated-cache decode supplies the complete local query batch, including
-speculative verify rows. Owner-local history retains its per-request windows.
+through masking, alignment, candidate gathering, and DeepSelect. Paged scoring
+uses the caller's query tile. Replicated-cache decode supplies the complete
+local query batch, including speculative verify rows. Owner-local history
+retains its per-request windows.
 This design avoids splitting a decode batch solely because its configured
 history capacity is large. Each score tensor uses 2 bytes per query-by-history
 entry; paged native logits and their cleaned copy can coexist, so peak storage

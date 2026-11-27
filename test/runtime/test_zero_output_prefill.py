@@ -378,26 +378,39 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
         source_shard=None,
         query_shard=None,
     )
-    forward = load_symbol(
-        RUNTIME + "models/deepseek_v41.py",
-        "forward",
-        owner="DeepseekV41Attention",
-        _row_plan=lambda *args: plan,
-        current_forward_ctx=lambda: None,
-    )
+    path = RUNTIME + "models/deepseek_v41.py"
+    owner = "DeepseekV41Attention"
+    backend = SimpleNamespace(can_stage_attention=lambda ctx: False)
     writes = []
-    attention = SimpleNamespace(
-        layer_id=20,
-        ced_decoder_start=20,
-        fused_q_weight=None,
-        _write_global_kv=lambda hidden, *args, **kwargs: writes.append(hidden.clone()),
-    )
+
+    class CPUAttention:
+        n_local_heads, head_dim = 1, 8
+        layer_id = ced_decoder_start = 20
+        fused_q_weight = None
+        forward = load_symbol(
+            path,
+            "forward",
+            owner=owner,
+            DeepseekV41AttentionBackend=type(backend),
+            is_breakable_capture_active=lambda: False,
+        )
+        _uses_fused_attention = load_symbol(path, "_uses_fused_attention", owner=owner)
+        _attention = load_symbol(
+            path,
+            "_attention",
+            owner=owner,
+            _row_plan=lambda *args: plan,
+            current_forward_ctx=lambda: None,
+        )
+
+        def _write_global_kv(self, hidden, *args, **kwargs):
+            writes.append(hidden.clone())
+
     hidden = torch.randn(4, 8)
-    output = forward(
-        attention,
+    output = CPUAttention().forward(
         positions,
         hidden,
-        SimpleNamespace(attn_backend=None, forward_mode=object()),
+        SimpleNamespace(attn_backend=backend, forward_mode=object()),
         reduce_output=True,
     )
     assert output.shape == (0, 8)
@@ -413,6 +426,7 @@ def test_zero_decoder_skips_layers_and_normalization():
         ced_decoder_start=20,
         dspark_capture_layers=(19, 20, 39),
         mapping=SimpleNamespace(attn=SimpleNamespace(has_dp=False)),
+        _prepare_prefill_stage=lambda ctx, rows, *, decoder: None,
     )
     state = SimpleNamespace(
         rows=0,

@@ -104,3 +104,14 @@ class SelectionSlots:
             self.ratio,
             self.pages,
         )
+
+
+@dataclass(frozen=True)
+class PreparedIndexQuery:
+    """Post-RoPE MXFP4 queries with uint8 [T,H,64] codes and int32 [T,H] scales."""
+
+    data: torch.Tensor
+    scales: torch.Tensor
+
+    def __getitem__(self, rows) -> PreparedIndexQuery:
+        return PreparedIndexQuery(self.data[rows], self.scales[rows])

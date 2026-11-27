@@ -1333,6 +1333,7 @@ class PrefillGraph:
             output_layout=ForwardOutputLayout(bs, bs, 0, 1),
             input_num_tokens=num_tokens,
             forward_mode=ForwardMode.EXTEND,
+            is_prefill_graph_dummy=True,
             capture_hidden_mode=(
                 CaptureHiddenMode.FULL
                 if self.drafter is not None

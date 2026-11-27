@@ -43,6 +43,7 @@ holds (``V41Metadata.global_write_floor``).
 """
 
 import logging
+import weakref
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -50,9 +51,15 @@ from typing import NamedTuple
 
 import torch
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_partials
+from tokenspeed_kernel.workspace import retain_for_capture
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.distributed.comm_ops import all_gather, token_all_gather
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    BreakableCapture,
+    break_point,
+    scrub_padding_tail,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -149,6 +156,105 @@ class V41Metadata:
     # [bs] first position whose global/index rows this forward may write; rows
     # below it (a prefix hit's replay window) are read-only. None on decode.
     global_write_floor: torch.Tensor | None
+
+
+class V41PrefillStage:
+    """Shared bucket-sized coordinate buffers for all V4.1 prefill layers.
+
+    Only the old SWA prefix can grow independently of the token bucket. Its
+    gather reads the live slots and workspace addresses from the descriptor.
+    """
+
+    def __init__(self, device, capacity, ratios):
+        # All integer fields share one backing so the bucket tail takes one fill.
+        first_pair = 2 + int(1 in ratios)
+        fields = first_pair + (6 if 2 in ratios else 0)
+        self.rows = torch.empty((fields, capacity), device=device, dtype=torch.int64)
+        self.positions, self.swa_slots = self.rows[:2].unbind()
+        self.source_slots = self.rows[2] if 1 in ratios else None
+        self.pair_rows = self.rows[first_pair:] if 2 in ratios else None
+        self.pairs: V41CompressorPlan | None = None
+        self.pair_slots: torch.Tensor | None = None
+        if self.pair_rows is not None:
+            self.pair_slots, *coordinates = self.pair_rows.unbind()
+            self.pairs = V41CompressorPlan(
+                self.rows.new_empty(capacity, dtype=torch.bool), *coordinates
+            )
+        self.descriptor = self.rows.new_empty(6)
+        self.counts = self.descriptor[4:]
+        self.live_rows = self.counts[1:]
+        self._prefix_workspace = self.rows.new_empty(
+            (1, V41_HEAD_DIM), dtype=torch.bfloat16
+        )
+        self.prefix = self._prefix_workspace[:0]
+        self._prefix_slots = self.positions[:0]
+        self._decoder_swa_workspace: weakref.ReferenceType[torch.Tensor] | None = None
+        self.swa_current: torch.Tensor | None = None
+
+    def decoder_swa_current(self, rows: int) -> torch.Tensor | None:
+        """Borrow the captured decoder workspace for this many rows, if it fits."""
+        ref = self._decoder_swa_workspace
+        workspace = ref() if ref is not None else None
+        if rows and BreakableCapture.current() is not None:
+            # The decoder captures its widest bucket first. Each graph owns the
+            # address it recorded, even if a later capture needs a larger one.
+            if workspace is None or rows > workspace.shape[0]:
+                workspace = self.rows.new_empty(
+                    (rows, V41_HEAD_DIM), dtype=torch.bfloat16
+                )
+                self._decoder_swa_workspace = weakref.ref(workspace)
+            retain_for_capture(workspace)
+        if workspace is not None and rows <= workspace.shape[0]:
+            return workspace[:rows]
+        return None
+
+    def refresh(
+        self, meta, capacity, source_slots, pair_slots, prefix_slots, prefill_rows
+    ):
+        live = meta.positions.numel()
+        if not live <= capacity <= self.rows.shape[1]:
+            raise ValueError("V4.1 stage rows exceed the token bucket")
+        sources = [meta.positions, meta.swa_write_slots]
+        if source_slots is not None:
+            sources.append(source_slots)
+        if pair_slots is not None:
+            plan = meta.compressor
+            sources.extend((pair_slots, *plan[1:]))
+            self.pairs.active[:live].copy_(plan.active)
+            self.pairs.active[live:capacity].zero_()
+        dst = self.rows[: len(sources)]
+        if live:
+            torch._foreach_copy_(list(dst[:, :live].unbind()), sources)
+        dst[:, live:capacity].fill_(-1)
+        count = prefix_slots.numel()
+        if count > self._prefix_workspace.shape[0]:
+            self._prefix_workspace = self._prefix_workspace.new_empty(
+                (count, V41_HEAD_DIM)
+            )
+        self.prefix = self._prefix_workspace[:count]
+        # The gather dereferences these after refresh returns. Retain them until
+        # the next refresh and cover an allocator reuse on another CUDA stream.
+        self._prefix_slots = prefix_slots.contiguous()
+        stream = torch.cuda.current_stream(self.descriptor.device)
+        self._prefix_slots.record_stream(stream)
+        self._prefix_workspace.record_stream(stream)
+        # A freed pinned source can trigger a background CUDA event query in
+        # the next capture segment. Upload synchronously during capture setup.
+        async_copy = BreakableCapture.current() is None
+        host = torch.tensor(
+            [
+                self._prefix_slots.data_ptr(),
+                self._prefix_workspace.data_ptr(),
+                count,
+                self._prefix_workspace.shape[0],
+                prefill_rows,
+                live,
+            ],
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=async_copy,
+        )
+        self.descriptor.copy_(host, non_blocking=async_copy)
 
 
 class V41PrefillSpan(NamedTuple):
@@ -253,6 +359,8 @@ class V41SWAQueryPlan:
     positions: torch.Tensor
     request_indices: torch.Tensor
     requests: tuple[V41PrefillRequestPlan, ...]
+    # Old SWA prefix slots in request order, shared by all KV owners.
+    prefix_slots: torch.Tensor
 
 
 @dataclass
@@ -285,8 +393,6 @@ class V41PrefillLayout:
     """Batched prefill attention addressing for one SWA plan and KV owner."""
 
     plan: V41SWAQueryPlan
-    # Every request's old SWA prefix slots, gathered once per layer.
-    prefix_slots: torch.Tensor
     batches: tuple[V41PrefillBatch, ...]
     # Per batch: owner history slots in workspace order (replicated cache).
     history_slots: tuple[torch.Tensor | None, ...]
@@ -319,6 +425,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     def __init__(self, config: AttnConfig, spec: DeepseekV41Config) -> None:
         super().__init__(config, spec)
         self._attention_exchange_layers: set[int] = set()
+        self.prefill_stage: V41PrefillStage | None = None
+        self._prefill_storage: V41PrefillStage | None = None
         self.kvp_size = config.kvp_size
         self.kvp_rank = config.kvp_rank
         self.kvp_group = config.kvp_group
@@ -423,6 +531,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 raise ValueError(f"V4.1 {gid} must be a replayable group")
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        self.prefill_stage = self._prefill_storage = None
         super()._publish_cache_pool(cache_pool)
         self._kvp_tables_cpu = {}
         # Allocated once with the pool (the recipe reserves it); every layer
@@ -550,6 +659,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         for_graph_replay: bool,
         **kwargs,
     ) -> None:
+        self.prefill_stage = None
         if self.kvp_size > 1 and kwargs.get("num_extends", 0):
             raise NotImplementedError("V4.1 KVP does not support mixed decode batches")
         # The target runner omits num_extends on pure decode; mixed/draft
@@ -730,6 +840,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         query_shard: QueryShardPlan | None,
         **kwargs,
     ) -> None:
+        self.prefill_stage = None
         if query_shard is not None:
             if (
                 not forward_mode.is_extend()
@@ -1193,6 +1304,164 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             ),
         )
 
+    @break_point
+    def prepare_prefill_stage(self, ctx, capacity: int, *, decoder: bool) -> None:
+        self.prefill_stage = None
+        mode = ctx.forward_mode
+        # With DP counts, a peer's extend also admits local decode and idle rows.
+        has_prefill = (
+            mode in (ForwardMode.EXTEND, ForwardMode.MIXED)
+            if ctx.global_num_tokens is None
+            else not ctx.all_decode_or_idle
+        )
+        if (
+            not has_prefill
+            or torch.device(self.device).type != "cuda"
+            or not self.supports_fused_prefill
+            or self.spec.attn_tp_size != 1
+            or len(self.spec.indexer_query_group) != 1
+            or ctx.query_shard is not None
+        ):
+            return
+        meta = self.decoder_view().metadata if decoder else self.query_metadata(mode)
+        if mode.is_mixed():
+            prefill = (
+                self.decoder_view().prefill
+                if decoder
+                else self.forward_prefill_metadata
+            )
+        else:
+            prefill = meta if mode.is_extend() else None
+        prefill_rows = 0 if prefill is None else prefill.positions.numel()
+        with self.cache_pool.arena.memory_saver_adapter.named_region("attention_state"):
+            if self._prefill_storage is None:
+                self._prefill_storage = V41PrefillStage(
+                    self.device, self.spec.max_query_tokens, self.spec.compress_ratios
+                )
+            stage = self._prefill_storage
+            source_slots = pair_slots = None
+            if not decoder and stage.source_slots is not None:
+                source_slots = self._global_write_slots(
+                    V41_GLOBAL_R1_GROUP_ID,
+                    1,
+                    meta.positions,
+                    meta.request_indices,
+                    mode,
+                )
+            if not decoder and stage.pairs is not None:
+                pairs = meta.compressor
+                pair_slots = self._global_write_slots(
+                    V41_GLOBAL_R2_GROUP_ID,
+                    2,
+                    pairs.pair_positions,
+                    pairs.pair_requests,
+                    mode,
+                )
+            prefix = meta.positions[:0]
+            if prefill_rows:
+                prefix = self._swa_query_plan(
+                    prefill.positions,
+                    prefill.request_indices,
+                    ForwardMode.EXTEND,
+                    query_shard=None,
+                ).prefix_slots
+            stage.refresh(
+                meta, capacity, source_slots, pair_slots, prefix, prefill_rows
+            )
+            stage.swa_current = stage.decoder_swa_current(capacity) if decoder else None
+            self.prefill_stage = stage
+
+    def publish_prefill_swa(self, layer_id, swa, rope, norm, *, decoder: bool):
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        stage = self.prefill_stage
+        cache = self.cache_pool.swa(layer_id)
+        # A CED decoder's SWA window starts at its first retained row.
+        # An encoder graph can replay with a different prefix on every forward.
+        if not decoder:
+            dsv41.snapshot_swa_prefix(cache, stage.descriptor, self.swa_format)
+        n = swa.shape[0]
+        current = (
+            stage.swa_current[:n]
+            if stage.swa_current is not None
+            else swa.new_empty(swa.shape)
+        )
+        dsv41.swa_rope_scatter(
+            swa,
+            stage.positions[:n],
+            rope,
+            cache,
+            stage.swa_slots[:n],
+            self.swa_format,
+            current,
+            norm.weight,
+            norm.variance_epsilon,
+            prefill_counts=stage.counts,
+        )
+        return current
+
+    @break_point
+    def forward_live_queries(
+        self,
+        ctx,
+        q,
+        index_q,
+        weights,
+        current,
+        rope,
+        sink,
+        codes,
+        scales,
+        *,
+        layer_id,
+        decoder,
+        softmax_scale,
+        groups,
+    ):
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        mode = ctx.forward_mode
+        if mode.is_idle() and codes is not None:
+            scrub_padding_tail(0, codes, scales)
+            return None
+        meta = self.decoder_view().metadata if decoder else self.query_metadata(mode)
+        live = meta.positions.numel()
+        if live > q.shape[0]:
+            raise ValueError("V4.1 queries exceed the stage bucket")
+        if self.spec.kv_owners[layer_id] == layer_id:
+            self._prefill_kv_batch = None
+        dst = None
+        if codes is not None:
+            scrub_padding_tail(live, codes, scales)
+            dst = codes[:live], scales[:live]
+        if not live:
+            return (
+                None
+                if dst is not None
+                else dsv41.allocate_fp8_output(q.device, groups, 0, zeroed=False)
+            )
+        out = self.forward_v41(
+            q[:live],
+            current[:live],
+            layer_id=layer_id,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=mode,
+            index_q=None if index_q is None else index_q[:live],
+            index_weights=None if weights is None else weights[:live],
+            attn_sink=sink,
+            softmax_scale=softmax_scale,
+            index_process_group=None,
+            swa_rope_cache=rope,
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            fused_decode_groups=groups,
+            key_rows=None,
+            fp8_out=dst,
+            swa_prefix_snapshot=self.prefill_stage.prefix,
+        )
+        return out if dst is None else None
+
     def _lookup_rows(
         self, source_positions, source_requests, positions, requests
     ) -> torch.Tensor:
@@ -1254,6 +1523,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         forward_mode,
         norm_weight,
         norm_eps,
+        pair_plan: V41CompressorPlan | None = None,
     ):
         """Pool projected inputs in query_metadata(forward_mode) row order.
 
@@ -1262,17 +1532,20 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         must not be passed to this entry point. Pairing and tail addresses come
         from the current forward's shared compressor plan; all request history
         stays in LCM. Metadata preparation validates dependencies before layers.
+        A supplied pair_plan is sliced to T rows for the current prefill bucket.
 
         Returns pooled rows and pair-start positions/requests, all with capacity
         T on eager and graph paths. Inactive outputs are zero with coordinates
         -1. With norm_weight, output is BF16 and pooling is rounded to BF16 BEFORE
         RMSNorm; otherwise output is FP32. RoPE remains model-owned.
         """
-        meta = self.query_metadata(forward_mode)
-        positions = meta.positions
-        active, pair_positions, pair_requests, previous, slots, write_slots = (
-            meta.compressor
+        plan = (
+            self.query_metadata(forward_mode).compressor
+            if pair_plan is None
+            else pair_plan.window(0, content.shape[0])
         )
+        active, pair_positions, pair_requests, previous, slots, write_slots = plan
+        positions = pair_positions
         if content.dtype != torch.float32 or scores.dtype != torch.float32:
             raise ValueError("V4.1 ratio-2 projection/pooling requires FP32 inputs")
         if self.spec.compress_ratios[owner] != 2:
@@ -1368,6 +1641,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise ValueError(
                 "global main/index rows must have matching positions and dimensions"
             )
+        slots = self._global_write_slots(
+            gid, ratio, positions, request_indices, forward_mode
+        )
+        self.write_global_slots(
+            owner, main_kv, index_k, positions, slots, main_rope_cache
+        )
+
+    def _global_write_slots(self, gid, ratio, positions, request_indices, forward_mode):
         slots = self.cache_slots(gid, positions, request_indices, forward_mode)
         floor = self.query_metadata(forward_mode).global_write_floor
         if floor is not None:
@@ -1379,6 +1660,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 positions + (ratio - 1) < floor[request_indices.clamp_min(0)]
             )
             slots = slots.masked_fill(below, -1)
+        return slots
+
+    def write_global_slots(
+        self, owner, main_kv, index_k, positions, slots, main_rope_cache
+    ):
+        from tokenspeed_kernel.ops.attention import dsv41
+
         if main_rope_cache is None:
             dsv41.cache_scatter(
                 main_kv, self.cache_pool.global_kv(owner), slots, self.global_format
@@ -1479,7 +1767,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     ):
         """Select/reuse request-local global rows; return (physical slots, lengths).
 
-        Index Q is post-RoPE BF16 [T,Hindex,128] with already-scaled weights,
+        Index Q is post-RoPE BF16 [T,Hindex,128] or packed MXFP4 with scaled weights,
         or IndexQueryInput containing pre-RoPE BF16 values, paired with
         unscaled BF16 weights. Preprocessing applies its weight_scale once.
         Sources may omit both when indexer_needs_scores is false; Reuse layers
@@ -1640,9 +1928,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         expected_rows = (
             projected_partition.local_rows if projected_partition is not None else n
         )
-        index_values = (
-            index_q.values if isinstance(index_q, dsv41.IndexQueryInput) else index_q
-        )
+        if isinstance(index_q, dsv41.PreparedIndexQuery):
+            index_values = index_q.data
+        else:
+            index_values = (
+                index_q.values
+                if isinstance(index_q, dsv41.IndexQueryInput)
+                else index_q
+            )
         if index_values is not None and (
             index_values.shape[0] != expected_rows
             or index_weights.shape[0] != expected_rows
@@ -2174,6 +2467,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 positions[query_shard.local_row_ids],
                 requests[query_shard.local_row_ids],
                 tuple(plans),
+                source.prefix_slots,
             )
         key = (forward_mode, id(positions))
         plan = self._swa_plans.get(key)
@@ -2252,7 +2546,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     request, rows, last_position, prefix_slots, indices, {}
                 )
             )
-        plan = V41SWAQueryPlan(positions, requests, tuple(plans))
+        prefix_slots = (
+            torch.cat([request.prefix_slots for request in plans])
+            if plans
+            else torch.empty(0, dtype=torch.int64, device=self.device)
+        )
+        plan = V41SWAQueryPlan(positions, requests, tuple(plans), prefix_slots)
         self._swa_plans[key] = plan
         return plan
 
@@ -2290,26 +2589,22 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             prefix_offset += prefix_count
         if pending:
             groups.append(pending)
-        batches = tuple(self._prefill_batch(group) for group in groups)
-        history_slots = tuple(
-            (
-                torch.cat(
-                    [
-                        self._prefill_global_history(request, owner, forward_mode)
-                        for request, _, _ in batch.histories
-                    ]
+        with self.cache_pool.arena.memory_saver_adapter.named_region("attention_state"):
+            batches = tuple(self._prefill_batch(group) for group in groups)
+            history_slots = tuple(
+                (
+                    torch.cat(
+                        [
+                            self._prefill_global_history(request, owner, forward_mode)
+                            for request, _, _ in batch.histories
+                        ]
+                    )
+                    if owner >= 0 and self.kvp_size == 1 and batch.histories
+                    else None
                 )
-                if owner >= 0 and self.kvp_size == 1 and batch.histories
-                else None
+                for batch in batches
             )
-            for batch in batches
-        )
-        prefix_slots = (
-            torch.cat([request.prefix_slots for request in plan.requests])
-            if plan.requests
-            else torch.empty(0, dtype=torch.int64, device=self.device)
-        )
-        layout = V41PrefillLayout(plan, prefix_slots, batches, history_slots)
+        layout = V41PrefillLayout(plan, batches, history_slots)
         self._prefill_layouts[key] = layout
         return layout
 
@@ -2494,6 +2789,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         out_rope_cache=None,
         key_rows: QueryShardGather | None,
         fp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        swa_prefix_snapshot: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Joint SWA/global attention; returns BF16 [T,Hlocal,512].
 
@@ -2517,7 +2813,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         Prefill SWA writes follow all old-prefix reads, using only LCM-retained
         pages. Decode publishes the current row before its paged read; it cannot
         alias the preceding 127 logical rows. CED callers supply the required SWA
-        activation range, not only the final output position.
+        activation range, not only the final output position. Supplying
+        swa_prefix_snapshot means the cache write is complete. It holds the
+        old prefix and swa_kv contains the restored current rows.
 
         With key_rows, q and swa_kv hold local query rows while positions and
         request_indices describe the complete canonical source window. The
@@ -2671,6 +2969,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     out_rope_cache=out_rope_cache,
                     key_rows=None,
                     fp8_out=child_out,
+                    swa_prefix_snapshot=swa_prefix_snapshot,
                 )
                 if fused_decode_groups is not None:
                     if child_out is None:
@@ -2735,7 +3034,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             written = self._prepared_swa_writes.pop(
                 (layer_id, forward_mode, id(positions), id(request_indices)), None
             )
-            if written is None:
+            if written is None and swa_prefix_snapshot is None:
                 self._scatter_decode_swa(
                     swa_kv,
                     positions,
@@ -2745,7 +3044,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     swa_norm_weight,
                     swa_norm_eps,
                 )
-            elif written[2] is not swa_kv:
+            elif written is not None and written[2] is not swa_kv:
                 raise RuntimeError(
                     f"V4.1 layer {layer_id} wrote other SWA rows than it attends"
                 )
@@ -2861,24 +3160,33 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # Quantize current rows exactly as cache storage, without publishing them
         # until every request has read its old sliding prefix.
         layout = self._prefill_layout(plan, owner, forward_mode)
-        prefixes = dsv41.cache_gather(cache, layout.prefix_slots, self.swa_format, None)
-        if swa_rope_cache is None:
-            current = dsv41.cache_unpack(
-                dsv41.cache_pack(swa_kv, self.swa_format, None), self.swa_format, None
-            )
+        if swa_prefix_snapshot is not None:
+            if swa_prefix_snapshot.shape != (plan.prefix_slots.numel(), V41_HEAD_DIM):
+                raise ValueError("SWA snapshot disagrees with the live prefill prefix")
+            prefixes, current = swa_prefix_snapshot, swa_kv
         else:
-            current = torch.empty_like(swa_kv)
-            dsv41.swa_rope_scatter(
-                swa_kv,
-                source_positions,
-                swa_rope_cache,
-                cache,
-                locations,
-                self.swa_format,
-                current,
-                swa_norm_weight,
-                swa_norm_eps,
+            prefixes = dsv41.cache_gather(
+                cache, plan.prefix_slots, self.swa_format, None
             )
+            if swa_rope_cache is None:
+                current = dsv41.cache_unpack(
+                    dsv41.cache_pack(swa_kv, self.swa_format, None),
+                    self.swa_format,
+                    None,
+                )
+            else:
+                current = torch.empty_like(swa_kv)
+                dsv41.swa_rope_scatter(
+                    swa_kv,
+                    source_positions,
+                    swa_rope_cache,
+                    cache,
+                    locations,
+                    self.swa_format,
+                    current,
+                    swa_norm_weight,
+                    swa_norm_eps,
+                )
         logical_rows = None
         if owner >= 0:
             record = self.sparse_topk.prefill
@@ -3142,6 +3450,24 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 layer_id, self._index_history_bound(positions, requests, mode)
             )
             != "all"
+        )
+
+    def prepare_index_query(self, layer_id, query, weights):
+        """Prepare a deferred index query for the scorer bound to the current cache."""
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        if not isinstance(query, dsv41.IndexQueryInput):
+            return query, weights
+        owner = self.spec.kv_owners[layer_id]
+        stage = self.prefill_stage
+        return dsv41.prepare_index_query(
+            query,
+            weights,
+            self.cache_pool.index_k(owner),
+            candidate_consumer=self.kvp_size == 1
+            and layer_id != owner
+            and self.spec.candidate_topk > 0,
+            num_live_rows=None if stage is None else stage.live_rows,
         )
 
     @contextmanager

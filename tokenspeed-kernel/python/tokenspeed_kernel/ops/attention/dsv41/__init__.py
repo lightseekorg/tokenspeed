@@ -53,6 +53,7 @@ import torch
 from tokenspeed_kernel.ops.attention.dsv41._inputs import (
     IndexKeyInput,
     IndexQueryInput,
+    PreparedIndexQuery,
     SelectionSlots,
 )
 from tokenspeed_kernel.ops.attention.dsv41._metadata import index_logit_rows
@@ -67,6 +68,8 @@ __all__ = [
     "VERIFY_LAYOUT_MAX_TOKENS",
     "IndexKeyInput",
     "IndexQueryInput",
+    "PreparedIndexQuery",
+    "prepare_index_query",
     "SelectionSlots",
     "decode_rows",
     "decode_window",
@@ -174,7 +177,13 @@ def index_key_norm_rope_scatter(
 
 
 def index_query_rope_quant(
-    query, head_weights, positions, cos_sin_cache, weight_scale, output_dtype
+    query,
+    head_weights,
+    positions,
+    cos_sin_cache,
+    weight_scale,
+    output_dtype,
+    num_live_rows=None,
 ):
     """Rotate and pack BF16 [T,H,128] queries and scale BF16 [T,H] weights.
 
@@ -183,10 +192,17 @@ def index_query_rope_quant(
     BF16 or FP32 head weights for the scorer. Returns ((uint8 [T,H,64] FP4
     values, int32 [T,H] E8M0 scale words), weights [T,H]). Inputs are preserved;
     RoPE retains its BF16 rounding before quantization. Negative positions use
-    table row zero.
+    table row zero. If supplied, num_live_rows is a device int64 count of the
+    leading rows to pack. Remaining rows receive neutral codes, scales and weights.
     """
     return _kernel("index_query_rope_quant", query)(
-        query, head_weights, positions, cos_sin_cache, weight_scale, output_dtype
+        query,
+        head_weights,
+        positions,
+        cos_sin_cache,
+        weight_scale,
+        output_dtype,
+        num_live_rows,
     )
 
 
@@ -273,6 +289,7 @@ def swa_rope_scatter(
     out: torch.Tensor | None,
     norm_weight: torch.Tensor | None,
     norm_eps: float,
+    prefill_counts: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Rotate normalized BF16 SWA rows and quantize directly into planar pages.
 
@@ -283,6 +300,8 @@ def swa_rope_scatter(
     quantized/dequantized BF16 [T,512] rows there, including rows outside
     persistent retention. Read old prefixes before this operation.
     If norm_weight is supplied, normalize and round to BF16 before RoPE.
+    For a padded prefill graph, prefill_counts holds [prefill_rows, live_rows]
+    on device. The decode suffix writes only to cache and padding writes nothing.
     """
     _kernel("swa_rope_scatter", values)(
         values,
@@ -294,8 +313,18 @@ def swa_rope_scatter(
         out,
         norm_weight,
         norm_eps,
+        prefill_counts=prefill_counts,
     )
     return out
+
+
+def snapshot_swa_prefix(cache, descriptor, cache_format):
+    """Gather the live SWA prefix before the in-graph cache insert.
+
+    The int64 descriptor holds slot and destination pointers, row count and
+    capacity, followed by the stage's prefill and live row counts.
+    """
+    _kernel("snapshot_swa_prefix", cache)(cache, descriptor, cache_format)
 
 
 def compressor_pool(
@@ -720,7 +749,7 @@ def prefill_indexer_batching_supported(index_row_bytes: int) -> bool:
 
 
 def index_topk(
-    index_q: torch.Tensor | IndexQueryInput,
+    index_q: torch.Tensor | IndexQueryInput | PreparedIndexQuery,
     weights: torch.Tensor,
     index_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -740,10 +769,9 @@ def index_topk(
     """Bounded Full/Reindex scoring, Top-K rows, and optional source candidates.
 
     Args:
-        index_q: Post-RoPE BF16 [T,H,128], or IndexQueryInput to fuse RoPE and
-            quantization into native scoring's input preparation.
-        weights: BF16/FP32 [T,H], already scaled for a tensor index_q, or
-            unscaled BF16 weights when index_q is IndexQueryInput.
+        index_q: Post-RoPE BF16 [T,H,128], IndexQueryInput for deferred RoPE
+            and packing, or PreparedIndexQuery for previously packed MXFP4 rows.
+        weights: BF16/FP32 [T,H], already scaled except for IndexQueryInput.
         index_cache: Owner's strided uint8 [pages, 64, 68] index field.
         page_table: Int32/int64 [T, logical_pages], a request table per query.
             Entries address this index field, not the main-KV field. Invalid
@@ -839,13 +867,20 @@ def index_topk(
             raise TypeError("index_metadata must come from new_index_metadata")
         index_metadata.validate(page_table, visible_lens)
 
-    query_values = index_q.values if isinstance(index_q, IndexQueryInput) else index_q
+    packed = isinstance(index_q, PreparedIndexQuery)
+    if packed:
+        query_values = index_q.data
+    else:
+        query_values = (
+            index_q.values if isinstance(index_q, IndexQueryInput) else index_q
+        )
+    query_dtype = torch.bfloat16 if packed else query_values.dtype
     if slots is not None:
         _validate_selection_slots(slots, query_values.shape[0], topk, page_table)
     kernel = select_kernel(
         "attention",
         "dsv41_index_topk",
-        format_signature(x=dense_tensor_format(query_values.dtype)),
+        format_signature(x=dense_tensor_format(query_dtype)),
         features=None,
         platform=None,
         traits=_index_topk_traits(
@@ -855,6 +890,10 @@ def index_topk(
         override=None,
     )
     spec = KernelRegistry.get().get_by_name(kernel.name)
+    if packed and (
+        spec is None or True not in spec.traits.get("supports_prepared_index_query", ())
+    ):
+        raise ValueError("Selected scorer cannot consume prepared index queries")
     if isinstance(index_q, IndexQueryInput) and (
         spec is None or True not in spec.traits.get("supports_index_query_input", ())
     ):
@@ -2101,3 +2140,47 @@ def verify_layout(
         request_slots=request_slots,
         active_count=active_count,
     )
+
+
+def prepare_index_query(
+    query: IndexQueryInput, weights, index_cache, *, candidate_consumer, num_live_rows
+):
+    """Rotate Q and scale head weights for this cache's scorer.
+    MXFP4 packing masks padded rows. The BF16 path rotates Q in place."""
+    args = (
+        query.values,
+        weights,
+        query.positions,
+        query.cos_sin_cache,
+        query.weight_scale,
+    )
+    traits = _index_topk_traits(
+        query.values.shape[1], index_cache.is_cuda, index_cache, None
+    )
+    if traits["native_indexer"] and traits["index_k_format"] == "mxfp4":
+        kernel = select_kernel(
+            "attention",
+            "dsv41_index_topk",
+            format_signature(x=dense_tensor_format(torch.bfloat16)),
+            features=None,
+            platform=None,
+            traits=traits,
+            solution=None,
+            override=None,
+        )
+        spec = KernelRegistry.get().get_by_name(kernel.name)
+        if spec is not None and True in spec.traits.get(
+            "supports_prepared_index_query", ()
+        ):
+            from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
+                sparse_candidate_pages_supported,
+            )
+
+            dtype = (
+                torch.bfloat16
+                if candidate_consumer and sparse_candidate_pages_supported(index_cache)
+                else torch.float32
+            )
+            (data, scales), scaled = index_query_rope_quant(*args, dtype, num_live_rows)
+            return PreparedIndexQuery(data, scales), scaled
+    return index_query_rope_weights(*args)

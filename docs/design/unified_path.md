@@ -971,29 +971,35 @@ completing prompt's last window. An open chunk keeps one row if another
 request in the local batch produces output, zero otherwise. The encoder's
 token count alone therefore cannot determine the decoder bucket.
 
-The model declares the split instead of opting out: it implements
-`PrefillGraph`'s `NarrowingPrefillModel` contract — `encoder_forward` (the
-token-shaped layers), `narrowing_forward` (the candidate source layer, all
-rows in, the view's rows out), `decoder_forward` (the remaining layers and
-the final norm on whatever rows it is given) and `finish_forward` (the
-sampled-row gather, the DSpark row report); `forward` is their composition,
-so eager and graphed prefill are one path. `PrefillGraph` captures the
-encoder per token bucket and the decoder per decoder-row bucket, from a
-fixed-row static state the narrowing lands into (leading rows copied, tail
-zeroed). `--prefill-graph-decoder-capture-token-sizes` sets decoder buckets
-in retained rows. An explicit size may exceed the encoder ceiling if it fits
-both the forward token budget and `max_local_requests × min(window, context_len)`.
+V4.1 implements the four `NarrowingPrefillModel` stages. `encoder_forward`
+runs the layers below the candidate source. The source projects global KV and
+index K from all encoder input rows, even when the decoder retains zero rows.
+Writes honor each request's replay write floor.
+
+- When staged FP8 attention splits the source, `encoder_forward` writes its KV.
+  `narrowing_forward` selects the retained rows of the residual, its input mix
+  and the DSpark taps. `decoder_forward` runs the source's query projections,
+  attention and FFN on that state.
+- With an unsplit source, `narrowing_forward` writes the KV and completes the
+  source. For a nonempty decoder view it selects rows after the full-row mHC
+  and QKV projections.
+
+`decoder_forward` finishes the later layers and final norm. `finish_forward`
+gathers sampled rows and reports the DSpark row layout. `PrefillGraph` captures
+the encoder per token bucket and the decoder per retained-row bucket. For
+replay it copies the retained rows into the decoder's static state and zeros
+the tail.
+`--prefill-graph-decoder-capture-token-sizes` sets these decoder buckets. An
+explicit size may exceed the encoder ceiling if it fits both the forward token
+budget and `max_local_requests × min(window, context_len)`.
 
 Each stage replays the smallest captured bucket covering its rows, or runs
 eagerly if none fits. DP1 uses local input and retained row counts and runs
 an empty decoder eagerly. Both encoder paths read positions from `InputBuffers`,
-including M-RoPE positions prepared in place. The narrowing and decoder
-stages size their own collectives from their row counts
-(`report_collective_sizing`). The decoder graph replays with the narrowed
-row count as its valid rows, so its breaks scrub the static tail. Layers
-read their row plan from the live context on every replay. Capture runs
-narrowing before each decoder run so V4.1's reuse layers read the current
-source's index selection before a later source overwrites it.
+including M-RoPE positions prepared in place. CED collectives use the row
+count of the stage that runs them (`report_collective_sizing`). Decoder
+breaks read the live row plan on each replay and clear padding in their
+outputs. Decoder warmup and capture each start from a freshly narrowed state.
 
 Under attention DP, all ranks use the scheduler's maximum input count for the
 encoder. Before the target forward, one `MAX` on a dedicated Gloo group
@@ -1008,8 +1014,9 @@ dense and MoE layers, replicated KV and full-world expert-owned communication.
 Pure decode/idle rounds use the full decode path. Ordinary EP exchanges
 counts eagerly.
 
-Attention stays at eager breaks. The backend's `prefill_graph_scope` retains
-indexer scratch across encoder, narrowing and decoder, then releases it.
+Core attention runs at eager breaks. For staged FP8 layers, the graph captures
+the surrounding projections and cache writes. The backend's `prefill_graph_scope`
+retains indexer scratch across encoder, narrowing and decoder, then releases it.
 
 Eager TP1 attention/dense with fused EP may narrow: the
 fused dispatch exchanges the actual local row counts, while the original
@@ -1028,9 +1035,10 @@ on the capture stream initializes its split barriers, and DeepGEMM advances
 their epoch on every replay. Allocation observers wrap capture alone, leaving eager
 warmup allocations in utilization headroom. Fused HC all-reduce admission
 respects both deterministic and batch-invariant collective settings. Empty
-consumer rows carry no deferred post. Cache-only narrowing completes the incoming
-post before the global KV producer and skips new HC mixes; idle ranks still
-participate in expert-owned dispatch/combine, which never defers another reduction.
+consumer rows carry no deferred post. An unprepared source with no decoder rows
+finishes the incoming post before writing global KV and skips new HC mixes.
+Idle ranks still participate in expert-owned dispatch/combine, which never
+defers another reduction.
 
 ### Drafter prefill graphs
 
@@ -1164,27 +1172,19 @@ adding state or parameters to the shared metadata initialization interface.
 Cache advancement still consumes all input lengths for prefill, independently
 of output lengths. Future input writes, NaN/OOV attribution, grammar advances
 and V4.1 DSpark anchors operate only on output-bearing requests. Grammar keeps
-one completion per forward, including zero-output rounds; both deferred
-hostfunc and host fallback consume the frozen layout. A zero-row decoder
-bypasses its graph, normalization, LM head, sampler, and draft-context writes;
-the encoder and global KV producer have already executed.
+one completion per forward, including zero-output rounds. Both the deferred
+hostfunc and the host fallback consume the frozen layout. When a forward reaches
+a zero-row decoder, the candidate source has written the required KV. Without
+attention DP, this forward skips decoder replay, normalization, the LM head,
+sampling and draft-context writes. Under attention DP, a rank with zero local
+decoder rows still joins its peers' expert collectives.
 
-When the decoder view is nonempty, the candidate-source layer retains the
-original full-row mHC and QKV projection shapes, then gathers the selected
-rows. Moving that gather before the projections changes split-K or quantized
-GEMM arithmetic and can change the retained logits. Only an empty decoder
-view bypasses those projections; its global KV producer still runs on all
-encoder rows.
-
-Compute rows and output rows are distinct. When a batch contains a completing
-prefill or a decode, each incomplete prefill retains its original single
-decoder compute row. Removing that row changes quantized attention and MoE
-batch shapes and can alter other requests' logits even with identical input
-tokens and chunk boundaries. The retained row is omitted from `logits_rows`,
-so it still has no sampled token. Batches containing only incomplete prefills
-keep zero decoder rows and skip the entire decoder consumer stack. This
-preserves the optimization on cache-only rounds without changing the numerical
-shape of rounds that produce outputs.
+In a batch with any output, an incomplete prefill keeps one decoder compute
+row and omits it from `logits_rows`. Dropping it can change attention and MoE
+batch shapes and alter other requests' logits. A split source runs its query
+projections on the retained rows in eager mode and on the padded decoder bucket
+during replay. Both narrowing and padding can change split-K or quantized
+GEMM rounding and thus the retained logits.
 
 Final prefill windows, bootstrap tokens, and PD candidate/cache handoff remain
 unchanged. V4.1 PD still requires layerwise transfer interval zero. This does
@@ -2879,15 +2879,12 @@ ownership, graph lifetime and supported configurations.
 
 ### V4.1 context encoder/decoder with attention DP
 
-Ordinary EP supports attention, dense, and MoE TP1 with attention DP; other
-ordinary-EP attention-DP layouts are rejected during model construction. Its
-prefills require `--disable-prefill-graph`: CED narrowing changes each rank's
-decoder row count, which eager execution exchanges on a dedicated host
-process group before the CED source layer and again before the remaining
-decoder layers. Idle ranks enter the same exchanges and expert collectives
-with zero rows. The stage-local counts are restored after each stage; decode
-keeps the scheduler's graph-compatible counts. Fused EP retains its own
-dispatch and row-count exchange.
+With attention DP, ordinary EP requires TP1 for attention, dense and MoE
+layers and `--disable-prefill-graph` for prefill. Each rank exchanges its
+narrowed row count on a dedicated host process group before the source FFN
+and again before the remaining decoder layers. Idle ranks join both exchanges
+and the expert collectives with zero rows. Pure decode uses the scheduler's
+counts. Fused EP manages its own dispatch and row-count exchange.
 
 For mixed text/image prefills, ordinary EP gathers the routing mask with
 the activations in eight additional aligned lanes. The mask therefore
