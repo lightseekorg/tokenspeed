@@ -30,10 +30,17 @@ from pathlib import Path
 
 import pytest
 from tokenspeed_kernel.ops.attention.gdn.flashinfer import is_rubin_decode_available
+from tokenspeed_kernel.thirdparty.flashinfer.gdn_compat import compatibility_error
 
-pytestmark = pytest.mark.skipif(
+requires_rubin = pytest.mark.skipif(
     not is_rubin_decode_available(), reason="Audited FlashInfer on SM107 is required"
 )
+
+
+@pytest.mark.parametrize("operation", ["prefill", "decode"])
+def test_pinned_release_passes_rubin_source_check(operation):
+    pytest.importorskip("flashinfer")
+    assert compatibility_error(operation) is None
 
 
 def _run(program, env):
@@ -47,6 +54,7 @@ def _run(program, env):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@requires_rubin
 @pytest.mark.parametrize(
     "operation,change",
     [
@@ -83,7 +91,9 @@ def test_incompatible_package_falls_back_and_explicit_adapter_rejects(
     if change == "changed":
         path.write_text(original + "\n# unreviewed upstream modification\n")
     elif change == "version":
-        path.write_text(original.replace('"0.7.5"', '"0.7.2.post1"'))
+        path.write_text(
+            original.replace(f'"{flashinfer.__version__}"', '"0.7.2.post1"')
+        )
     env = dict(
         os.environ,
         PYTHONPATH=f"{tmp_path}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
@@ -146,6 +156,7 @@ def test_incompatible_package_falls_back_and_explicit_adapter_rejects(
     )
 
 
+@requires_rubin
 @pytest.mark.parametrize("variant", ["sm100", "sm107"])
 def test_prefill_preserves_logging_dumps_trace_and_validation(tmp_path, variant):
     env = dict(

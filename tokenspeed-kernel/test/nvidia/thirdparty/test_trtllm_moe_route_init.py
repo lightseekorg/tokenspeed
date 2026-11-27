@@ -83,7 +83,9 @@ _QWEN38_TP1 = {**_QWEN38, "num_local_experts": 512}
 _KIMI_K3 = dict(top_k=16, num_local_experts=896, intermediate_size=384, num_experts=896)
 
 
-def _moe_runner_and_inputs(num_tokens, hidden_size, weight_dtype, geometry=_QWEN38):
+def _moe_runner_and_inputs(
+    num_tokens, hidden_size, weight_dtype, geometry=_QWEN38, *, device="cpu"
+):
     core = pytest.importorskip("flashinfer.fused_moe.core")
     inputs_module = pytest.importorskip("flashinfer.fused_moe.shared.inputs")
     enums = pytest.importorskip("flashinfer.tllm_enums")
@@ -111,7 +113,7 @@ def _moe_runner_and_inputs(num_tokens, hidden_size, weight_dtype, geometry=_QWEN
     )
     inputs = [None] * len(inputs_module.MoeRunnerInputs._FIELDS)
     hidden_index = inputs_module.MoeRunnerInputs._FIELDS.index("hidden_states")
-    inputs[hidden_index] = torch.empty((num_tokens, hidden_size))
+    inputs[hidden_index] = torch.empty((num_tokens, hidden_size), device=device)
     return core, runner, inputs, tactics, hidden_index
 
 
@@ -234,7 +236,7 @@ def _is_blackwell():
 )
 def test_valid_tactics_apply_the_target_policy(num_tokens, hidden_size, targeted):
     _, runner, inputs, tactics, _ = _moe_runner_and_inputs(
-        num_tokens, hidden_size, "E2m1"
+        num_tokens, hidden_size, "E2m1", device="cuda"
     )
     expected = [tactics[1]] if targeted else tactics
     assert runner.get_valid_tactics(inputs, None) == expected
@@ -249,7 +251,7 @@ def test_valid_tactics_apply_the_target_policy(num_tokens, hidden_size, targeted
 )
 def test_qwen38_tp1_decode_valid_tactics_keep_tile_32(num_tokens, targeted):
     _, runner, inputs, tactics, _ = _moe_runner_and_inputs(
-        num_tokens, 2560, "E2m1", _QWEN38_TP1
+        num_tokens, 2560, "E2m1", _QWEN38_TP1, device="cuda"
     )
     expected = [tactics[1]] if targeted else tactics
     assert runner.get_valid_tactics(inputs, None) == expected
@@ -262,7 +264,7 @@ def test_qwen38_tp1_decode_valid_tactics_keep_tile_32(num_tokens, targeted):
 @pytest.mark.parametrize(("num_tokens", "targeted"), [(256, True), (128, False)])
 def test_kimi_k3_decode_valid_tactics_keep_tile_32(num_tokens, targeted):
     _, runner, inputs, tactics, _ = _moe_runner_and_inputs(
-        num_tokens, 3584, "MxE2m1", _KIMI_K3
+        num_tokens, 3584, "MxE2m1", _KIMI_K3, device="cuda"
     )
     expected = [tactics[1]] if targeted else tactics
     assert runner.get_valid_tactics(inputs, None) == expected
