@@ -170,9 +170,29 @@ def _ldg_bf16_if(present: Int32, byte_addr: Int64, *, loc=None, ip=None) -> Floa
 
 
 @dsl_user_op
-def _store_bf16_if(live: Int32, byte_addr: Int64, value: Float32, *, loc=None, ip=None):
-    """Store an FP32 value that is already a BF16 number as BF16, when live."""
-    _store_if(live, byte_addr, value, True, loc=loc, ip=ip)
+def _store_ring_bf16_if(
+    live: Int32, byte_addr: Int64, value: Float32, *, loc=None, ip=None
+):
+    """Store an FP32 value that is already a BF16 number as a BF16 ring element, when live.
+
+    The store asks L2 to keep the line (``evict_last``): the layer's next
+    verify reads it as convolution history after a round of state traffic
+    (GB300, Kimi-K3 TP8 rank, one-token rounds: 2 to 4 us faster at batches
+    1 and 16, 9 us slower at batch 64, which still saves far more than its
+    old convolution commit cost).
+    """
+    _asm(
+        None,
+        [Int32(live), Int64(byte_addr), Float32(value)],
+        "{ .reg .pred p; .reg .b16 x; .reg .b64 q; setp.ne.b32 p, $0, 0; "
+        "cvt.rn.bf16.f32 x, $2; "
+        "createpolicy.fractional.L2::evict_last.b64 q, 1.0; "
+        "@p st.global.L2::cache_hint.b16 [$1], x, q; }",
+        "r,l,f",
+        True,
+        loc,
+        ip,
+    )
 
 
 @cute.jit
@@ -227,6 +247,7 @@ class FusedVerifyStep:
         gated_norm: bool,
         fp32_checkpoint: bool,
         packed_history: bool,
+        contiguous_rows: bool = False,
     ) -> None:
         self.key_dim = self.value_dim = self.gate_rank = THREADS
         self.heads = heads
@@ -237,6 +258,11 @@ class FusedVerifyStep:
         self.fp32_checkpoint = fp32_checkpoint
         self.packed_history = packed_history
         self.width = heads * THREADS
+        # A ring whose rows of a slot are contiguous (the runtime's layout)
+        # compiles their pitch, 3 P channels: a row offset then stays below
+        # RING_ROWS * 3 P, so INT32 math cannot wrap, and no runtime stride
+        # feeds the tap addresses. Other row pitches are INT64 runtime values.
+        self.row_pitch = 3 * self.width if contiguous_rows else None
         # Checkpoint, convolution and gate vectors, reduction partials and copy barriers.
         self.smem_bytes = 4 * (THREADS * THREADS + 4 * THREADS + 4 * WARPS) + 128
         # U, K and decay prefixes, cumulative decay, and the two dot products
@@ -252,6 +278,12 @@ class FusedVerifyStep:
             )
             + 384
         )
+
+    def _ring_row_offset(self, row: Int32, ring_row_stride: Int64):
+        """Elements from a slot's first ring row to its row ``row``."""
+        if self.row_pitch is not None:
+            return row * Int32(self.row_pitch)
+        return Int64(row) * ring_row_stride
 
     @cute.jit
     def __call__(
@@ -612,8 +644,9 @@ class FusedVerifyStep:
                 v_taps = _ldg_bf16x4((conv_weights + v_channel * CONV_TAPS).toint())
                 # The slot's ring: the 3 previous inputs are rows
                 # (head - 3 + i) mod RING_ROWS. The row index stays below
-                # RING_ROWS, so its INT32 math cannot wrap; the offset is INT64
-                # before the stride multiplies it. Only a live request touches
+                # RING_ROWS, so its INT32 math cannot wrap; the row pitch is
+                # compiled for contiguous rows, else an INT64 runtime stride
+                # (``_ring_row_offset``). Only a live request touches
                 # its slot: padding rows read a zero history and write no row,
                 # so they never reach a live request's rows (slot 0 included)
                 # or an empty ring. The loads are predicated rather than under
@@ -629,7 +662,9 @@ class FusedVerifyStep:
                 for i in cutlass.range_constexpr(CONV_TAPS - 1):
                     past_row = first_row + Int32(i - (CONV_TAPS - 1))
                     past_row = past_row + Int32(RING_ROWS) * Int32(past_row < 0)
-                    past_offsets.append(Int64(past_row) * ring_row_stride)
+                    past_offsets.append(
+                        self._ring_row_offset(past_row, ring_row_stride)
+                    )
                 channels = [q_channel, k_channel, v_channel]
                 pasts = []
                 for c in cutlass.range_constexpr(3):
@@ -653,9 +688,9 @@ class FusedVerifyStep:
                     convolved.append(_bf16(_silu(acc)))
                 query, key_value, value = convolved
                 # The candidate's ring row: head itself, the window being one row.
-                kept = history + Int64(first_row) * ring_row_stride
+                kept = history + self._ring_row_offset(first_row, ring_row_stride)
                 for c in cutlass.range_constexpr(3):
-                    _store_bf16_if(
+                    _store_ring_bf16_if(
                         Int32(live), (kept + channels[c]).toint(), raw[c].to(Float32)
                     )
                 if live:
@@ -1093,6 +1128,7 @@ def _compile(
     bias_dtype: torch.dtype,
     start_dtype: torch.dtype,
     index_dtype: torch.dtype,
+    contiguous_rows: bool,
 ):
     key_dim = value_dim = gate_rank = THREADS
     tokens = cute.sym_int()
@@ -1144,6 +1180,7 @@ def _compile(
         norm_dtype is not None,
         state_dtype == torch.float32,
         packed_history,
+        contiguous_rows,
     )
     return cute.compile(
         kernel,
@@ -1445,6 +1482,7 @@ def fused_verify_step(
         dt_bias.dtype,
         query_start_loc.dtype,
         state_indices.dtype,
+        preconv.rows.stride(1) == preconv.rows.shape[2],
     )
     kernel(
         mixed_qkv,

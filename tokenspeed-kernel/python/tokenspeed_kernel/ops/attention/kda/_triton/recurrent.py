@@ -65,24 +65,37 @@ def fused_kda_verify_conv_update_kernel(
     stride_ring_row: tl.constexpr,
     RING_SLOT_ALIGN: tl.constexpr,
     T: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     C: tl.constexpr,
     BLOCK_C: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
     # The ring keeps the 3 inputs before each request's window: R = T + 3.
     R: tl.constexpr = T + 3
-    i_row = tl.program_id(0).to(tl.int64)
+    T_TILES: tl.constexpr = (T + BLOCK_T - 1) // BLOCK_T
+    # One program covers up to BLOCK_T tokens of a request for one channel
+    # block (the whole window for typical decode T <= 16), so metadata loads
+    # once and every tap load issues before the first store (GB300, Kimi-K3
+    # TP8 rank, T 4, batch 64: 165 us a round faster than a program per
+    # token). Larger windows fold token tiles into grid dim 0 so BLOCK_T *
+    # BLOCK_C stays within Triton's element limit without hitting CUDA's
+    # grid.z limit; history and candidate ring rows are disjoint, so
+    # concurrent token tiles do not alias.
+    if T_TILES == 1:
+        i_n = tl.program_id(0).to(tl.int64)
+        o_t = tl.arange(0, BLOCK_T)
+    else:
+        i_nt = tl.program_id(0).to(tl.int64)
+        i_n = i_nt // T_TILES
+        o_t = ((i_nt % T_TILES) * BLOCK_T).to(tl.int32) + tl.arange(0, BLOCK_T)
     i_c = tl.program_id(1).to(tl.int64)
-    i_n = i_row // T
-    i_t = i_row % T
     begin = tl.load(query_start_loc + i_n * query_stride).to(tl.int64)
     end = tl.load(query_start_loc + (i_n + 1) * query_stride).to(tl.int64)
     token_valid = (
-        (begin >= 0) & (end <= total_tokens) & (end - begin <= T) & (i_t < end - begin)
+        (begin >= 0) & (end <= total_tokens) & (end - begin <= T) & (o_t < end - begin)
     )
-    i_row = begin + i_t
     o_c = i_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    mask_c = (o_c < C) & token_valid
+    mask_c = token_valid[:, None] & (o_c < C)[None, :]
     b_read = tl.load(read_indices + i_n * read_stride).to(tl.int64)
     b_live = tl.load(live_indices + i_n * live_stride).to(tl.int64)
     slot = tl.load(record_slots + i_n * slot_stride).to(tl.int64)
@@ -101,45 +114,47 @@ def fused_kda_verify_conv_update_kernel(
     # The slot's rows: one scalar base, so each row adds a scalar offset to
     # the channel vector and its loads and stores vectorize.
     slot_rows = ring + slot * (ring_slot_stride // RING_SLOT_ALIGN) * RING_SLOT_ALIGN
-    acc = tl.zeros([BLOCK_C], dtype=tl.float32)
-    for i_w in range(4):
-        i_window = i_t + i_w
-        from_raw = i_window >= 3
+    rows = qkv_raw + begin * stride_raw_tok + o_c[None, :]
+    acc = tl.zeros([BLOCK_T, BLOCK_C], dtype=tl.float32)
+    for i_w in tl.static_range(4):
+        i_window = o_t + i_w
+        from_raw = (i_window >= 3)[:, None]
         i_raw = i_window - 3
         # Tap i_window < 3 is ring row (head - 3 + i_window) mod R. The row
         # index stays below R, so its INT32 math cannot wrap; it is widened
         # before the row stride multiplies it, since the product grows with
         # the ring's row pitch. (INT64 row math measured 40 us a round slower
         # at a batch of 64 with T = 4.)
-        i_past = head + i_raw.to(tl.int32)
+        i_past = head + i_raw
         i_past = tl.where(i_past < 0, i_past + R, i_past)
         b_state = tl.load(
-            slot_rows + i_past.to(tl.int64) * stride_ring_row + o_c,
+            slot_rows + i_past.to(tl.int64)[:, None] * stride_ring_row + o_c[None, :],
             mask=mask_c & ~from_raw & has_ring,
             other=0.0,
         ).to(tl.float32)
         b_raw = tl.load(
-            qkv_raw + (begin + i_raw) * stride_raw_tok + o_c,
+            rows + i_raw.to(tl.int64)[:, None] * stride_raw_tok,
             mask=mask_c & from_raw,
             other=0.0,
         )
         if i_w == 3:
-            # The last tap reads this row before convolution and SiLU; it is
-            # candidate i_t, ring row (head + i_t) mod R.
-            i_kept = head + i_t.to(tl.int32)
-            i_kept = tl.where(i_kept >= R, i_kept - R, i_kept)
-            tl.store(
-                slot_rows + i_kept.to(tl.int64) * stride_ring_row + o_c,
-                b_raw.to(ring.dtype.element_ty),
-                mask=mask_c & has_ring,
-            )
-        b_w = tl.load(conv_w + o_c * 4 + i_w, mask=mask_c, other=0.0).to(tl.float32)
-        acc += tl.where(from_raw, b_raw.to(tl.float32), b_state) * b_w
+            # The last tap reads each row before convolution and SiLU.
+            kept = b_raw
+        b_w = tl.load(conv_w + o_c * 4 + i_w, mask=o_c < C, other=0.0).to(tl.float32)
+        acc += tl.where(from_raw, b_raw.to(tl.float32), b_state) * b_w[None, :]
+    # Candidate t is ring row (head + t) mod R. Stores follow every load.
+    i_kept = head + o_t
+    i_kept = tl.where(i_kept >= R, i_kept - R, i_kept)
+    tl.store(
+        slot_rows + i_kept.to(tl.int64)[:, None] * stride_ring_row + o_c[None, :],
+        kept.to(ring.dtype.element_ty),
+        mask=mask_c & has_ring,
+    )
     if HAS_BIAS:
-        acc += tl.load(conv_bias + o_c, mask=mask_c, other=0.0).to(tl.float32)
+        acc += tl.load(conv_bias + o_c, mask=o_c < C, other=0.0).to(tl.float32)[None, :]
     acc = acc * tl.sigmoid(acc)
     tl.store(
-        out + i_row * stride_out_tok + o_c,
+        out + (begin + o_t.to(tl.int64))[:, None] * stride_out_tok + o_c[None, :],
         acc.to(out.dtype.element_ty),
         mask=mask_c,
     )
@@ -160,7 +175,7 @@ def fused_kda_verify_conv_update(
     query_start_loc: torch.Tensor,
     bias: torch.Tensor | None = None,
     out: torch.Tensor | None = None,
-    block_c: int = 256,
+    block_c: int = 512,
     num_warps: int = 4,
 ) -> torch.Tensor:
     """Compute verify conv1d(+silu) rows from the pre-convolution ring.
@@ -255,7 +270,11 @@ def fused_kda_verify_conv_update(
     preconv.check_separate_storage(qkv_raw, conv_w, bias, out)
     # 16-byte row vectors need the slot base 16-byte aligned.
     vector = 16 // ring.element_size()
-    grid = (N * T, triton.cdiv(C, block_c))
+    # Cap BLOCK_T so BLOCK_T * block_c stays well below Triton's per-program
+    # element limit even for large T; decode windows (T <= 16) stay in one tile.
+    max_block_t = min(16, max(1, (1 << 16) // block_c))
+    block_t = triton.next_power_of_2(min(T, max_block_t))
+    grid = (N * triton.cdiv(T, block_t), triton.cdiv(C, block_c))
     fused_kda_verify_conv_update_kernel[grid](
         qkv_raw=qkv_raw,
         conv_w=conv_w,
@@ -281,6 +300,7 @@ def fused_kda_verify_conv_update(
         stride_ring_row=ring.stride(1),
         RING_SLOT_ALIGN=vector if ring.stride(0) % vector == 0 else 1,
         T=T,
+        BLOCK_T=block_t,
         C=C,
         BLOCK_C=block_c,
         HAS_BIAS=bias is not None,

@@ -67,8 +67,10 @@ raw row to `(head + t) mod R`; `head` is the prepare's per-row snapshot
 (`KdaPreconvRing.heads`), loaded beside the record slot, so the tap loads wait
 on one round trip as the page-tap loads did. R is a compile-time value, so a
 compare and an add or subtract replace the modulo. The row index stays below
-R, so its INT32 math cannot wrap; every row offset is INT64 before the row
-stride multiplies it. A request takes part as in the retained prepare: its
+R, so its INT32 math cannot wrap. A runtime row stride multiplies an INT64
+row offset; the CuTe kernels compile the pitch of a ring whose rows are
+contiguous (3 P channels) where that measured faster, and keep that offset,
+below R * 3 P, in INT32. A request takes part as in the retained prepare: its
 source and live pages lie in the pool and its record slot is resident.
 Padding rows read a zero history and write no row, and touch no slot's rows
 (slot 0 and empty rings included): the Triton producer and the one-token
@@ -77,7 +79,11 @@ where predicated loads cost 10 to 35 us a round, points a padding row's tap
 loads at the layer's convolution weights, which no launch writes during a
 verify, and discards the values. A split verify runs
 the producer (which takes the live pages for that predicate) on the ring and
-then takes records without it (`preconv=None`). The ring must not share
+then takes records without it (`preconv=None`). The producer runs one
+program per request, channel block and token tile (one tile for windows up to
+16 tokens at the default channel block), which loads its taps and inputs before it stores any ring or output
+row. The one-token kernel stores its ring rows with an L2 `evict_last` hint to
+ask L2 to retain them longer across surrounding state traffic. The ring must not share
 storage with the verify's projection inputs or outputs; the Triton producer,
 the fused CuTe entry points and the AMD launchers all reject such a ring
 before any launch.

@@ -246,6 +246,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
         gated_norm: bool,
         smem_floor: int,
         copy_records: bool,
+        compile_row_pitch: bool = False,
     ) -> None:
         super().__init__(
             DIM,
@@ -259,6 +260,15 @@ class FusedVerifyWindow(RecoverSsmVerify):
         )
         self.heads = heads
         self.width = heads * DIM
+        # A ring whose rows of a slot are contiguous (the runtime's layout)
+        # compiles their pitch, 3 P channels, in 32-row tiles and in 64-row
+        # tiles that copy their records: a row offset then stays below
+        # R * 3 P, so INT32 math cannot wrap, and no runtime stride feeds the
+        # tap addresses (GB300, Kimi-K3 TP8 rank, T 4: batch-1 and batch-4
+        # rounds 5 to 6 us faster). Other tiles and row pitches take an
+        # INT64 runtime stride: compiled, a 64-row tile that loads its
+        # records itself made a batch-16 round 28 us slower.
+        self.row_pitch = 3 * self.width if compile_row_pitch else None
         # 64- and 128-row tiles stage their ring rows in shared memory and
         # write them in 16-byte copies after the gate projection's barrier:
         # whole lines per copy, instead of 2-byte stores per thread and token
@@ -313,6 +323,12 @@ class FusedVerifyWindow(RecoverSsmVerify):
         if gated_norm:
             self.norm_words = _round_up(NORM_GROUPS * window, 4)
             self.smem_bytes += 4 * self.norm_words + 16
+
+    def _ring_row_offset(self, row: Int32, ring_row_stride: Int64):
+        """Elements from a slot's first ring row to its row ``row``."""
+        if self.row_pitch is not None:
+            return row * Int32(self.row_pitch)
+        return Int64(row) * ring_row_stride
 
     @cute.jit
     def _publish_pairs(self, row_addr: Int32, values, lane: Int32, barrier_addr: Int32):
@@ -557,20 +573,25 @@ class FusedVerifyWindow(RecoverSsmVerify):
         # The slot's ring keeps the 3 inputs before the window at rows
         # (head - 3 + i) mod R, R = W + 3, and takes candidate t at row
         # (head + t) mod R. The row index stays below R, so its INT32 math
-        # cannot wrap; the offset is INT64 before the stride multiplies it.
+        # cannot wrap (``_ring_row_offset`` scales it).
         # Padding rows see a zero history, as the split producer's do, and
-        # touch no ring: their tap offsets point the loads at channel c of
-        # this layer's convolution weights (4 * channels BF16 values, which
-        # no launch writes while it verifies), and the values are discarded.
-        # So a padding row never reads a live request's rows (slot 0
-        # included) or an empty ring. The loads themselves stay plain: in
-        # this kernel predicated loads measured 10 to 35 us a round slower.
+        # touch no ring: their tap loads read channel c of this layer's
+        # convolution weights (4 * channels BF16 values, which no launch
+        # writes while it verifies) at row pitch 0, and the values are
+        # discarded. So a padding row never reads a live request's rows
+        # (slot 0 included) or an empty ring. The loads themselves stay
+        # plain: in this kernel predicated loads measured 10 to 35 us a
+        # round slower.
         R = W + CONV_TAPS - 1
         has_history = live
         history = ring + slot * ring_slot_stride
-        # Elements from the slot's rows to the weights: a padding row's tap
-        # offset, so its loads read channel c of the weights.
-        to_weights = (conv_weights.toint() - history.toint()) // 2
+        taps_base = cute.make_ptr(
+            BFloat16,
+            history.toint() if live else conv_weights.toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=2,
+        )
+        live_pitch = self._ring_row_offset(Int32(live), ring_row_stride)
         # A live head already lies in the ring; the clamp only bounds padding.
         # Scaling the head by ``live`` instead would make the live branch copy
         # it, and that copy waits for its load ahead of the bulk copies.
@@ -579,9 +600,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
         for i in cutlass.range_constexpr(CONV_TAPS - 1):
             past_row = first_row + Int32(i - (CONV_TAPS - 1))
             past_row = past_row + Int32(R) * Int32(past_row < 0)
-            past_offsets.append(
-                Int64(past_row) * ring_row_stride if live else to_weights
-            )
+            if const_expr(self.row_pitch is None):
+                past_row = Int64(past_row)
+            past_offsets.append(past_row * live_pitch)
         for item in cutlass.range_constexpr(self.conv_items):
             c = cutlass.min(item * THREADS + tidx, 3 * VT - 1)
             kind = c // VT
@@ -589,7 +610,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
             channels.append(channel)
             tap_words.append(_ldg_b32x2((conv_weights + channel * CONV_TAPS).toint()))
             for i in cutlass.range_constexpr(CONV_TAPS - 1):
-                past_values.append(_load(history, past_offsets[i] + channel))
+                past_values.append(_load(taps_base, past_offsets[i] + channel))
         a_log_value = _load(a_log, head)
         gate_bias_value = _load(dt_bias, head * K + tidx)
         channel = cutlass.min(tidx, VT - 1)
@@ -977,7 +998,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
                 else:
                     _store_if(
                         Int32(live) & in_range & Int32(t < valid_tokens),
-                        (kept + Int64(kept_row) * ring_row_stride).toint(),
+                        (
+                            kept + self._ring_row_offset(kept_row, ring_row_stride)
+                        ).toint(),
                         raws[t],
                         True,
                     )
@@ -1049,7 +1072,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
             _copy_shared_to_global_b128(
                 Int32(j * THREADS + tidx < chunks) & Int32(t < valid_tokens),
                 shared.tokens_addr + staged * 2,
-                (history + (Int64(row) * ring_row_stride + channel)).toint(),
+                (
+                    history + (self._ring_row_offset(row, ring_row_stride) + channel)
+                ).toint(),
             )
 
     @cute.jit
@@ -1197,6 +1222,7 @@ def _compile(
     start_dtype: torch.dtype,
     index_dtype: torch.dtype,
     smem_floor: int,
+    compile_row_pitch: bool,
     copy_records: bool,
 ):
     tokens = cute.sym_int()
@@ -1251,6 +1277,7 @@ def _compile(
         norm_dtype is not None,
         smem_floor,
         copy_records,
+        compile_row_pitch,
     )
     return cute.compile(
         kernel,
@@ -1572,6 +1599,8 @@ def fused_verify_window(
         query_start_loc.dtype,
         state_indices.dtype,
         _smem_floor(ctas, mixed_qkv.device),
+        preconv.rows.stride(1) == preconv.rows.shape[2]
+        and (value_tile_rows == 32 or copy_records),
         copy_records,
     )
     kernel(
