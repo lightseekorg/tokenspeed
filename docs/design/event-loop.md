@@ -110,25 +110,24 @@ The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
 
-The native frontend's `abort(rid)` only sends the ordinary wire abort. A
-client abort suppresses terminal output in the engine, so callers must not
-wait for a final chunk as its acknowledgment. `EngineClient::cancel` (Python
-`Frontend.cancel`) sends that same abort and then detaches the local stream.
-The stream yields `StreamError::Cancelled`, exposed by `next_outputs` as a
-`(rid, RequestCancelled)` exception value, after any already queued outputs.
-It creates no finish chunk or token/finish metrics. Only that stream and the
-client's in-flight count change; engine-reported load and slot, cache and
-transfer retirement keep their existing owners and fences.
+The native frontend's `abort(rid)` and `cancel(rid)` send the ordinary wire
+abort. After a successful send, the frontend detaches the original local
+stream if it is still attached and releases its in-flight count. After any
+queued outputs, `abort` delivers an empty token chunk with `finish_reason`
+set to `"abort"` and the latest reported token counts and verify rounds.
+Before the first output, it uses the submitted input ID count for prompt
+usage. `cancel` delivers `StreamError::Cancelled`, exposed by Python's
+`next_outputs` as a `(rid, RequestCancelled)` exception value. The engine owns
+its own load reports and releases slots, cache, and transfer resources at
+retirement.
 
-Cancellation returns `true` only when it closes the local stream. If a finish,
-stream error or another cancellation wins, its result is preserved and
-cancellation returns `false`. A failed send or a dropped cancellation future
-does not detach the stream: the caller can retry, even if the engine already
-received the abort. Stream drop and send cleanup compare the original local
-admission's channel before removing an entry. This protects a later local
-owner, but adds no wire identity: new submissions must use fresh request ids
-to avoid delayed output or abort messages reaching a reused id. Local closure
-is never evidence that engine resources are free.
+`abort` returns `true` when it sends the wire abort. `cancel` returns `true`
+when it detaches the local stream. A finish, stream error or another
+cancellation that wins the race keeps its result. A failed send or a dropped
+cancellation future leaves any still-active stream attached for retry, even
+if the engine already received the abort. Stream drop and send cleanup compare
+the original local admission's channel before removing an entry. Fresh request
+ids keep delayed wire output or abort messages from reaching a later request.
 
 On disaggregated engines, `bootstrap_room` carries the same one-active-request
 rule across distinct request IDs. Peer state is keyed by room, so every new
