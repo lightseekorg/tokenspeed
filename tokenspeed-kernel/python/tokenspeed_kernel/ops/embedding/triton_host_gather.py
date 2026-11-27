@@ -92,6 +92,7 @@ def _host_mxfp8_row_gather_kernel(
     ROWS: tl.constexpr,
     SORTED: tl.constexpr,
     CANONICAL: tl.constexpr,
+    FLOOR_EXPONENT: tl.constexpr,
 ):
     # Each program handles ROWS lookup entries. When CANONICAL is False, an
     # entry loads a packed [codes | scales] row, rebuilds its FP32 values and
@@ -129,7 +130,7 @@ def _host_mxfp8_row_gather_kernel(
         exponents = tl.load(
             host_rows[:, None] + DIM + groups[None, :],
             mask=valid[:, None],
-            other=_FLOOR_EXPONENT,
+            other=FLOOR_EXPONENT,
         )
         tl.store(
             codes_ptr + dst[:, None] * DIM + cols[None, :],
@@ -280,6 +281,7 @@ def _launch_mxfp8_row_gather(
             ROWS=1,
             SORTED=False,
             CANONICAL=canonical,
+            FLOOR_EXPONENT=_FLOOR_EXPONENT,
         )
         return
     # Everything below stays on the device: no host sync on the number of
@@ -307,6 +309,7 @@ def _launch_mxfp8_row_gather(
         ROWS=_ROWS_PER_PROGRAM,
         SORTED=True,
         CANONICAL=canonical,
+        FLOOR_EXPONENT=_FLOOR_EXPONENT,
     )
     _copy_duplicate_rows_kernel[grid](
         dst,
