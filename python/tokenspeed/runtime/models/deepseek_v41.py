@@ -1381,6 +1381,8 @@ class DeepseekV41Attention(nn.Module):
         backend, mode = ctx.attn_backend, ctx.forward_mode
         if mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
+        if mode.is_idle():
+            return hidden_states.new_empty((0, self.wo_b.output_size))
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         meta = rows.source
         source_gather = (
@@ -1437,6 +1439,8 @@ class DeepseekV41Attention(nn.Module):
             or positions.numel() != hidden_states.shape[0]
         ):
             raise ValueError("V4.1 hidden rows and backend query metadata disagree")
+        if source_count == 0 and rows.source_shard is None and rows.query_shard is None:
+            return hidden_states.new_empty((0, self.wo_b.output_size))
         # Backend positions carry -1 for padding; request indices are batch rows.
         positions, requests = source_positions, source_requests
         if rows.source_shard is not None:
@@ -2118,6 +2122,11 @@ class DeepseekV41DecoderLayer(nn.Module):
     ):
         if ctx.forward_mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
+        all_zero_decoder = (
+            self.layer_id >= self.ced_decoder_start
+            and ctx.global_decoder_rows is not None
+            and not any(ctx.global_decoder_rows)
+        )
         if hidden_states.shape[0] == 0:
             if ctx.query_shard is not None:
                 rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
@@ -2126,9 +2135,10 @@ class DeepseekV41DecoderLayer(nn.Module):
                 if rows.query_shard.total_rows == 0:
                     captured = hidden_states[:, 0, :] if capture_input else None
                     return hidden_states, pre_mix, None, captured
-            self._forward_ffn(
-                hidden_states[:, 0, :], image_mask, ctx, defer_reduce=False
-            )
+            if not all_zero_decoder:
+                self._forward_ffn(
+                    hidden_states[:, 0, :], image_mask, ctx, defer_reduce=False
+                )
             captured = hidden_states[:, 0, :] if capture_input else None
             return hidden_states, pre_mix, None, captured
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
@@ -2143,12 +2153,17 @@ class DeepseekV41DecoderLayer(nn.Module):
             captured = residual.mean(dim=1) if capture_input else None
             x = _v41_hc_input(residual, pre_mix, self.attn_norm)
             self.attn(positions, x, ctx, reduce_output=True)
-            # A rank with no CED tail still joins the other DP ranks' MoE.
-            # Ordinary EP gathers/scatters here, just as fused EP dispatches.
-            if (
-                rows.query_shard is None
-                and (self.ffn.owns_ep_communication or self.attn.mapping.attn.has_dp)
-            ) or (rows.query_shard is not None and rows.query_shard.total_rows):
+            # A rank with no CED tail still joins the other DP ranks' MoE,
+            # unless every DP rank has 0 decoder rows (lockstep skip).
+            if not all_zero_decoder and (
+                (
+                    rows.query_shard is None
+                    and (
+                        self.ffn.owns_ep_communication or self.attn.mapping.attn.has_dp
+                    )
+                )
+                or (rows.query_shard is not None and rows.query_shard.total_rows)
+            ):
                 self._forward_ffn(
                     x[:0],
                     None if image_mask is None else image_mask[:0],
@@ -2529,10 +2544,9 @@ class DeepseekV41Model(nn.Module):
                 raise NotImplementedError(
                     "V4.1 ordinary attention DP/EP requires attention/dense/MoE TP1"
                 )
-            if not global_server_args_dict["disable_prefill_graph"]:
-                raise ValueError("V4.1 ordinary DP/EP requires --disable-prefill-graph")
             # Forward and scheduler threads must not interleave collectives
-            # on the scheduler's shared CPU communicator.
+            # on the scheduler's shared CPU communicator when falling back
+            # without control-plane global_decoder_rows.
             pg_manager.init_process_group(
                 tuple(range(mapping.world_size)),
                 backend="gloo",
@@ -2663,7 +2677,12 @@ class DeepseekV41Model(nn.Module):
                     (0, self.config.hc_mult), dtype=torch.float32, device=hidden.device
                 )
                 counts = None
+                skip_decoder = ctx.global_decoder_rows is not None and not any(
+                    ctx.global_decoder_rows
+                )
                 for index, layer in enumerate(self.layers):
+                    if skip_decoder and index > self.ced_decoder_start:
+                        break
                     # Match both eager CED stages on active peers. Idle ranks
                     # still participate in their expert collectives with zero rows.
                     if index in (self.ced_decoder_start, self.ced_decoder_start + 1):
@@ -2873,21 +2892,26 @@ class DeepseekV41Model(nn.Module):
     def decoder_collective_counts(
         self, ctx: ForwardContext, num_rows: int
     ) -> list[int] | None:
-        """Exchange the CED stage row counts, including idle DP ranks.
+        """Per-rank CED stage row counts across DP ranks, including idle ranks.
 
-        Decode does not narrow and uses the scheduler's graph-compatible
-        counts. Eager prefill exchanges host shape metadata, not CUDA data.
+        When the control plane gathered ``ctx.global_decoder_rows`` (or the
+        prefill graph pinned it to the uniform decoder bucket), return it
+        directly for both fused and ordinary EP with no forward-thread
+        collective. Otherwise decode reuses ``ctx.global_num_tokens`` and
+        ordinary eager prefill falls back to the gloo host exchange.
         """
-        if (
-            not self.mapping.attn.has_dp
-            or self.ced_decoder_start >= len(self.layers)
-            or self.layers[self.ced_decoder_start].ffn.owns_ep_communication
-        ):
+        if not self.mapping.attn.has_dp or self.ced_decoder_start >= len(self.layers):
+            return None
+        if ctx.global_decoder_rows is not None:
+            return ctx.global_decoder_rows
+        if self.layers[self.ced_decoder_start].ffn.owns_ep_communication:
             return None
         if ctx.global_num_tokens is None or ctx.all_decode_or_idle:
             return ctx.global_num_tokens
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("V4.1 DP prefill requires --disable-prefill-graph")
+            raise RuntimeError(
+                "V4.1 DP prefill graph capture requires ctx.global_decoder_rows"
+            )
         return _exchange_decoder_counts(num_rows, self.mapping.world_size)
 
     def narrowing_forward(self, state: V41RowState, ctx: ForwardContext) -> V41RowState:
@@ -2903,6 +2927,37 @@ class DeepseekV41Model(nn.Module):
         start = self.ced_decoder_start
         if start >= len(self.layers):
             return state
+        if ctx.forward_mode is not None and ctx.forward_mode.is_idle():
+            state = state.leading(0)
+            counts = self.decoder_collective_counts(ctx, 0)
+            captured = list(state.captured)
+            with report_collective_sizing(ctx, 0, counts):
+                hidden, pre_mix, pending_post = self._run_layer(
+                    self.layers[start],
+                    state.hidden,
+                    state.pre_mix,
+                    state,
+                    ctx,
+                    captured,
+                    None,
+                    stage_end=start + 1,
+                )
+                if pending_post is not None:
+                    hidden = pending_post.finish(hidden)
+            hashes, mask = (
+                (state.hashes, state.engram_token_mask)
+                if self.decoder_uses_engram
+                else (None, None)
+            )
+            return V41RowState(
+                hidden,
+                pre_mix,
+                state.positions,
+                None,
+                hashes,
+                mask,
+                captured,
+            )
         backend = ctx.attn_backend
         row_plan = _row_plan(start, start, ctx)
         rows = (
@@ -2971,7 +3026,15 @@ class DeepseekV41Model(nn.Module):
             else None
         )
         if (query_plan is not None and query_plan.total_rows == 0) or (
-            state.rows == 0 and not self.mapping.attn.has_dp and query_plan is None
+            state.rows == 0
+            and query_plan is None
+            and (
+                not self.mapping.attn.has_dp
+                or (
+                    ctx.global_decoder_rows is not None
+                    and not any(ctx.global_decoder_rows)
+                )
+            )
         ):
             hidden = h[:, 0, :]
             captured.extend(

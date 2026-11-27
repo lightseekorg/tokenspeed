@@ -421,6 +421,7 @@ fn round_loop_config(shape: &RoundShape, pages: usize) -> LoopConfig {
     LoopConfig {
         in_flight_depth: 1,
         prefill_delay: None,
+        narrowing_decoder_window: None,
         limits: IngressLimits {
             vocab_size: 1 << 17,
             eos_token_ids: vec![2],

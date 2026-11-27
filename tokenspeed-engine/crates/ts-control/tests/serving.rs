@@ -357,6 +357,8 @@ struct FakeDevice {
     acknowledged: Arc<Mutex<Vec<(usize, CacheEventKind, u32)>>>,
     /// Idle forwards run for attention-DP peers.
     idle_forwards: Arc<Mutex<usize>>,
+    /// Every attention-DP round that ran a forward or idle forward on this rank.
+    dp_rounds: Arc<Mutex<Vec<DpRound>>>,
     /// A pipeline stage before the last: it samples nothing meaningful.
     placeholder_stage: bool,
     /// Every forward's n-gram windows: (position, window) per row.
@@ -818,9 +820,14 @@ impl DataPlane for FakeDevice {
                     .zip(seeds.tokens.iter().cloned()),
             );
         }
-        if dispatch.dp.is_some_and(|dp| dp.idle_forward) {
-            assert!(forward.is_none(), "an idle forward replaces the batch");
-            *self.idle_forwards.lock().unwrap() += 1;
+        if let Some(dp) = dispatch.dp {
+            if forward.is_some() || dp.idle_forward {
+                self.dp_rounds.lock().unwrap().push(dp.clone());
+            }
+            if dp.idle_forward {
+                assert!(forward.is_none(), "an idle forward replaces the batch");
+                *self.idle_forwards.lock().unwrap() += 1;
+            }
         }
         let ops = plan.cache_ops();
         self.plans.lock().unwrap().push((
@@ -999,7 +1006,8 @@ impl DataPlane for FakeDevice {
         Ok(())
     }
 
-    fn idle_forward(&mut self, _dp: &DpRound) -> Result<(), DataPlaneError> {
+    fn idle_forward(&mut self, dp: &DpRound) -> Result<(), DataPlaneError> {
+        self.dp_rounds.lock().unwrap().push(dp.clone());
         *self.idle_forwards.lock().unwrap() += 1;
         Ok(())
     }
@@ -1515,6 +1523,7 @@ struct Rank {
     /// The rank's cache acknowledgments: poll, kind, op id.
     acknowledged: Arc<Mutex<Vec<(usize, CacheEventKind, u32)>>>,
     idle_forwards: Arc<Mutex<usize>>,
+    dp_rounds: Arc<Mutex<Vec<DpRound>>>,
     ngram: Arc<Mutex<Vec<NgramRow>>>,
     history: Arc<Mutex<Vec<HistorySeed>>>,
     /// L3: the queries and gets the rank's store ran.
@@ -1633,6 +1642,10 @@ impl Engine {
         *self.ranks[rank].idle_forwards.lock().unwrap()
     }
 
+    fn dp_rounds(&self, rank: usize) -> Vec<DpRound> {
+        self.ranks[rank].dp_rounds.lock().unwrap().clone()
+    }
+
     /// Wait until every rank of a mirrored replica (TP, PP) released the
     /// requests the frontend's rank did: they end each request in the same
     /// round, but their threads may get there after the client saw it end.
@@ -1730,6 +1743,8 @@ struct Setup {
     device_pages: Option<usize>,
     /// Batch prefill in windows, with pressure checks for fresh admissions.
     prefill_delay: Option<PrefillDelay>,
+    /// Per-request decoder row cap for a narrowing prefill model.
+    narrowing_decoder_window: Option<usize>,
     /// PD, prefill: admit without waiting for the decode allocation.
     deferred_allocation: bool,
     /// Override periodic debug retraction when a test requires a snapshot.
@@ -1887,6 +1902,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         // as the eager path does.
         eager_grammar: setup.grammar,
         prefill_delay: setup.prefill_delay,
+        narrowing_decoder_window: setup.narrowing_decoder_window,
     }
 }
 
@@ -2183,6 +2199,7 @@ async fn start_ranks_with(
                 ack_gate: device.ack_gate.clone(),
                 acknowledged: device.acknowledged.clone(),
                 idle_forwards: device.idle_forwards.clone(),
+                dp_rounds: device.dp_rounds.clone(),
                 ngram: device.ngram.clone(),
                 history: device.history.clone(),
                 storage_queries: store
@@ -4191,6 +4208,55 @@ async fn an_idle_data_parallel_rank_forwards_with_the_busy_one() {
         [1000, 1001, 1002]
     );
     assert_eq!(engine.released_on(1), [("s0".to_owned(), 3 + 1)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn narrowing_data_parallel_ranks_gather_identical_decoder_rows() {
+    let window = 64;
+    let engine = start_ranks_with(
+        Layout::Dp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            narrowing_decoder_window: Some(window),
+            ..Default::default()
+        },
+    )
+    .await;
+    // 384 tokens splits into two chunks against MAX_SCHEDULED_TOKENS (256):
+    // chunk 1 (256, incomplete -> 0 decoder rows), chunk 2 (128, completing
+    // -> window=64 decoder rows), then 2 decode steps (1 decoder row each).
+    let req = TokenizedGenerateReqInput {
+        data_parallel_rank: Some(0),
+        ..request("chunked", 384, budget(3))
+    };
+    assert_eq!(tokens(&run(&engine.client, req).await), [1000, 1001, 1002]);
+    let r0 = engine.dp_rounds(0);
+    let r1 = engine.dp_rounds(1);
+    assert_eq!(r0.len(), r1.len());
+    for (a, b) in r0.iter().zip(&r1) {
+        assert_eq!(a.num_tokens, b.num_tokens);
+        assert_eq!(a.batch_sizes, b.batch_sizes);
+        assert_eq!(a.num_extends, b.num_extends);
+        assert_eq!(a.decoder_rows, b.decoder_rows);
+        assert!(!a.idle_forward);
+        assert!(b.idle_forward);
+    }
+    let observed: Vec<(Vec<i64>, Vec<i64>)> = r0
+        .iter()
+        .map(|round| (round.num_tokens.clone(), round.decoder_rows.clone()))
+        .collect();
+    assert_eq!(
+        &observed[..2],
+        &[
+            (vec![256, 0], vec![0, 0]),
+            (vec![128, 0], vec![window as i64, 0]),
+        ]
+    );
+    assert!(observed.len() >= 4);
+    assert!(observed[2..]
+        .iter()
+        .all(|round| *round == (vec![1, 0], vec![1, 0])));
 }
 
 #[tokio::test(flavor = "multi_thread")]

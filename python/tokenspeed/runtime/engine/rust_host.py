@@ -656,6 +656,9 @@ class HostConfig:
     # rounds and single_round; None plans prefill every round. See
     # ``ServerArgs.prefill_delay``.
     prefill_delay: tuple[int, int, bool] | None
+    # Per-request decoder row cap for a narrowing prefill model; None when
+    # the model does not narrow.
+    narrowing_decoder_window: int | None
 
 
 def host_in_flight_depth(server_args: ServerArgs) -> int:
@@ -843,7 +846,7 @@ class HostDataPlane:
     def execute(
         self,
         plan,
-        dp: tuple[list[int], list[int], list[int], bool] | None,
+        dp: tuple[list[int], list[int], list[int], list[int], bool] | None,
         ngram: tuple[list[list[int]], list[int]] | None,
         grammar_advance: list[bool] | None,
         logprobs: tuple[tuple[list[int], list[int], list[int], int] | None, int] | None,
@@ -854,9 +857,10 @@ class HostDataPlane:
 
         Args:
             plan: The round's plan.
-            dp: With attention DP, every rank's batch: tokens, requests and
-                prefill rows each, and whether this rank runs an idle forward
-                in place of its batch. None without attention DP.
+            dp: With attention DP, every rank's batch: tokens, requests,
+                prefill rows, and narrowed decoder rows each, and whether this
+                rank runs an idle forward in place of its batch. None without
+                attention DP.
             ngram: Engram's input windows and positions for the batch, None
                 for a model without Engram.
             grammar_advance: With a grammar row in the batch, whether each
@@ -874,11 +878,12 @@ class HostDataPlane:
         dp_metadata = None
         idle_forward = False
         if dp is not None:
-            num_tokens, batch_sizes, num_extends, idle_forward = dp
+            num_tokens, batch_sizes, num_extends, decoder_rows, idle_forward = dp
             dp_metadata = DpForwardMetadata.from_ranks(
                 global_num_tokens=num_tokens,
                 global_batch_size=batch_sizes,
                 global_num_extends=num_extends,
+                global_decoder_rows=decoder_rows,
                 need_idle_forward=idle_forward,
             )
         forward_ops = plan.forward
@@ -1099,15 +1104,18 @@ class HostDataPlane:
         (``run_remote_prefill_landing``)."""
         self._device.run_remote_prefill_landing(spec_candidates, cache_slot)
 
-    def idle_forward(self, dp: tuple[list[int], list[int], list[int]]) -> None:
-        """A frozen round's idle forward: every rank's tokens, requests and
-        prefill rows."""
-        num_tokens, batch_sizes, num_extends = dp
+    def idle_forward(
+        self, dp: tuple[list[int], list[int], list[int], list[int]]
+    ) -> None:
+        """A frozen round's idle forward: every rank's tokens, requests,
+        prefill rows and narrowed decoder rows."""
+        num_tokens, batch_sizes, num_extends, decoder_rows = dp
         self._device.run_idle_forward(
             DpForwardMetadata.from_ranks(
                 global_num_tokens=num_tokens,
                 global_batch_size=batch_sizes,
                 global_num_extends=num_extends,
+                global_decoder_rows=decoder_rows,
                 need_idle_forward=True,
             )
         )
@@ -1856,6 +1864,7 @@ class HostBootstrap:
                 ),
                 eager_grammar=specs.uses_eager_grammar,
                 prefill_delay=server_args.prefill_delay,
+                narrowing_decoder_window=specs.narrowing_decoder_window,
                 eplb=(
                     EplbSettings(
                         specs=specs.expert_rebalance,

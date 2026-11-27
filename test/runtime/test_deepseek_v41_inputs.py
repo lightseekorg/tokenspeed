@@ -1127,6 +1127,8 @@ def test_execute_idle_forward_passes_empty_engram_views(buffers):
     executor.token_to_kv_pool = SimpleNamespace()
     executor.model_runner = SimpleNamespace(forward=forward)
     executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
+    executor.prefill_graph = SimpleNamespace(can_run_idle=lambda ctx: False)
+    executor.dspark_context_producer = None
     executor.drafter = None
     executor.execute_idle_forward(
         DpForwardMetadata(

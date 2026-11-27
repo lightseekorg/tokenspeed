@@ -294,6 +294,8 @@ def test_idle_rank_hands_history_drafts_an_empty_view() -> None:
     executor.token_to_kv_pool = SimpleNamespace()
     executor.model_runner = SimpleNamespace(forward=lambda ctx, **kwargs: None)
     executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
+    executor.prefill_graph = SimpleNamespace(can_run_idle=lambda ctx: False)
+    executor.dspark_context_producer = None
     executor.drafter = SimpleNamespace(
         idle_forward_global_num_tokens=lambda tokens, bs, *, global_num_decodes: [
             tokens,

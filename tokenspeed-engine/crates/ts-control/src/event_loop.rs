@@ -395,6 +395,9 @@ pub struct DpRound {
     pub batch_sizes: Vec<i64>,
     /// Prefill rows in each rank's batch.
     pub num_extends: Vec<i64>,
+    /// Narrowed decoder rows each rank forwards (equals `num_tokens` when
+    /// `narrowing_decoder_window` is `None`).
+    pub decoder_rows: Vec<i64>,
     /// This rank has no batch while another has: it runs an idle forward so
     /// the model's collectives see every rank.
     pub idle_forward: bool,
@@ -568,6 +571,9 @@ pub struct LoopConfig {
     /// The fused role's prefill-delay gate (`--prefill-attempt-interval` and
     /// `--prefill-any-attempt-interval`); `None` plans prefill every round.
     pub prefill_delay: Option<PrefillDelay>,
+    /// Per-request decoder row cap for a narrowing prefill model (e.g.
+    /// DeepSeek V4.1's sliding window); `None` when the model does not narrow.
+    pub narrowing_decoder_window: Option<usize>,
 }
 
 /// The prefill-delay gate's two vote intervals, in rounds since the last
@@ -769,6 +775,36 @@ struct Relayed {
     peer_reports: Vec<Vec<u8>>,
     /// Most recent replay fence every replica member has completed.
     replay_completed: Option<u64>,
+}
+
+/// Narrowed decoder rows a `NarrowingPrefillModel` produces for `batch`.
+///
+/// Mirrors `DeepseekV41AttentionBackend._build_decoder_view`: a completing
+/// extend keeps its trailing `window` rows (capped by its chunk length), a
+/// non-completing extend keeps 1 row when the batch has any output (a
+/// completing extend or a decode row) and 0 otherwise, and decode rows are all
+/// kept. Pure control-plane arithmetic, carried in the existing DP `all_gather`.
+pub(crate) fn narrowed_decoder_rows(batch: &ForwardBatchView, window: usize) -> i64 {
+    let n_ext = batch.num_extends;
+    let decode_rows: i64 = batch.input_lengths[n_ext..]
+        .iter()
+        .map(|&n| i64::from(n))
+        .sum();
+    let any_complete = (0..n_ext).any(|i| {
+        i64::from(batch.extend_prefix_lens[i]) + i64::from(batch.input_lengths[i])
+            >= i64::from(batch.prefill_lengths[i])
+    });
+    let incomplete_rows = i64::from(any_complete || decode_rows > 0);
+    let window = window as i64;
+    let extend_kept: i64 = (0..n_ext)
+        .map(|i| {
+            let count = i64::from(batch.input_lengths[i]);
+            let done = i64::from(batch.extend_prefix_lens[i]) + count
+                >= i64::from(batch.prefill_lengths[i]);
+            count.min(if done { window } else { incomplete_rows })
+        })
+        .sum();
+    extend_kept + decode_rows
 }
 
 impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
@@ -3553,20 +3589,25 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         stop: &mut bool,
         allow_unlock: bool,
     ) -> Result<Option<DpRound>, LoopError> {
-        let (num_tokens, batch_size, num_extends) = match forward {
+        let (num_tokens, batch_size, num_extends, decoder_rows) = match forward {
             Some(batch) => {
                 let tokens: i64 = batch.input_lengths.iter().map(|&n| i64::from(n)).sum();
                 if tokens > 0 {
+                    let dec_rows = match self.config.narrowing_decoder_window {
+                        Some(window) => narrowed_decoder_rows(batch, window),
+                        None => tokens,
+                    };
                     (
                         tokens,
                         batch.request_ids.len() as i64,
                         batch.num_extends as i64,
+                        dec_rows,
                     )
                 } else {
-                    (0, 0, 0)
+                    (0, 0, 0, 0)
                 }
             }
-            None => (0, 0, 0),
+            None => (0, 0, 0, 0),
         };
         // What this rank publishes about the delay gate: whether it has
         // prefill work the next round could take, and whether it would decode
@@ -3593,6 +3634,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             i64::from(*stop),
             i64::from(wants_prefill),
             i64::from(has_decode_work),
+            decoder_rows,
         ];
         let rows = if allow_unlock
             && (self.in_flight.is_empty() || self.peer.as_ref().is_some_and(Peer::autonomous))
@@ -3618,6 +3660,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             num_tokens: rows.iter().map(|row| row[0]).collect(),
             batch_sizes: rows.iter().map(|row| row[1]).collect(),
             num_extends: rows.iter().map(|row| row[2]).collect(),
+            decoder_rows: rows.iter().map(|row| row[6]).collect(),
             idle_forward: num_tokens == 0 && any_work,
         }))
     }
@@ -4228,5 +4271,58 @@ mod tests {
             .filter(|&r| delay(true).attempt_points(r, true).0)
             .collect();
         assert_eq!(any_points, [6, 12]);
+    }
+
+    #[test]
+    fn narrowed_decoder_rows_matches_v41_decoder_view_rules() {
+        let make = |rows: &[(i32, i32, i32)], num_extends: usize| -> ForwardBatchView {
+            ForwardBatchView {
+                request_ids: (0..rows.len()).map(|i| format!("r{i}")).collect(),
+                request_pool_indices: (0..rows.len() as i32).collect(),
+                input_lengths: rows.iter().map(|r| r.0).collect(),
+                prefill_lengths: rows.iter().map(|r| r.2).collect(),
+                extend_prefix_lens: rows[..num_extends].iter().map(|r| r.1).collect(),
+                extend_replay_lens: vec![0; num_extends],
+                num_extends,
+            }
+        };
+        let window = 128;
+
+        // Incomplete prefill chunk alone keeps 0 decoder rows.
+        assert_eq!(
+            narrowed_decoder_rows(&make(&[(512, 0, 1024)], 1), window),
+            0
+        );
+        // Completing chunk longer than window keeps exactly window rows.
+        assert_eq!(
+            narrowed_decoder_rows(&make(&[(512, 512, 1024)], 1), window),
+            128
+        );
+        // Short completing prompt keeps its full length (< window).
+        assert_eq!(narrowed_decoder_rows(&make(&[(37, 0, 37)], 1), window), 37);
+        // Mixed incomplete + completing chunks: incomplete keeps 1 row, completing keeps window.
+        assert_eq!(
+            narrowed_decoder_rows(&make(&[(512, 0, 1024), (256, 768, 1024)], 2), window),
+            1 + 128
+        );
+        // Mixed incomplete chunk + decode rows: incomplete keeps 1 row, decode keeps all rows.
+        assert_eq!(
+            narrowed_decoder_rows(
+                &make(&[(512, 0, 1024), (4, 0, 200), (4, 0, 200)], 1),
+                window
+            ),
+            1 + 8
+        );
+        // Pure decode keeps all input rows.
+        assert_eq!(
+            narrowed_decoder_rows(&make(&[(4, 0, 200), (4, 0, 200)], 0), window),
+            8
+        );
+        // Large prefix + chunk near i32::MAX must not overflow i32.
+        let half = (i32::MAX / 2) + 1;
+        assert_eq!(
+            narrowed_decoder_rows(&make(&[(half, half, i32::MAX)], 1), window),
+            128
+        );
     }
 }

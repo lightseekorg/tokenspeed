@@ -2429,14 +2429,29 @@ class ModelExecutor:
 
             # Run model forward with IDLE mode — skips attention but still
             # participates in MLP NCCL collectives (dense all-gather, MoE).
+            # When active peers replay the narrowing prefill graph, join the
+            # same encoder/decoder graph buckets with 0 valid rows instead of
+            # running eager so collectives stay aligned.
             ctx.forward_mode = ForwardMode.IDLE
-            empty = torch.zeros(0, dtype=torch.int32, device=self.device)
-            self.model_runner.forward(
-                ctx,
-                input_ids=empty,
-                positions=empty,
-                **self._model_input_kwargs(0, 0, slice(0, 0)),
+            ctx.all_extend = dp_metadata.all_extend
+            ctx.all_extend_or_idle = dp_metadata.all_extend_or_idle
+            ctx.global_decoder_rows = dp_metadata.global_decoder_rows
+            ctx.capture_hidden_mode = (
+                CaptureHiddenMode.FULL
+                if self.drafter is not None and self.dspark_context_producer is None
+                else CaptureHiddenMode.NULL
             )
+            if self.prefill_graph.can_run_idle(ctx):
+                with nvtx_range("prefill_graph idle", color="blue"):
+                    self.prefill_graph.replay_idle(ctx)
+            else:
+                empty = torch.zeros(0, dtype=torch.int32, device=self.device)
+                self.model_runner.forward(
+                    ctx,
+                    input_ids=empty,
+                    positions=empty,
+                    **self._model_input_kwargs(0, 0, slice(0, 0)),
+                )
 
             # If a drafter is active, its model also has MoE layers that issue
             # NCCL collectives. Idle ranks must match those collectives: the

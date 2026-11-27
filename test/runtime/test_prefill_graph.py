@@ -1256,16 +1256,16 @@ class TestNarrowingPrefillGraphTest:
             assert (graph._narrowing) is (inner if expected_buckets else None)
             assert (graph.decoder_buckets) == (expected_buckets)
 
-    def test_narrowing_model_stays_eager_under_attention_dp(self):
-        """The narrowed row count is rank-local, so decoder buckets (and the
-        collective shapes their graphs bake) could differ across DP ranks:
-        the split graph is off under DP; an ordinary model keeps its graph."""
+    def test_narrowing_model_enables_split_graph_under_attention_dp(self):
+        """Under attention DP the control plane carries global_decoder_rows, so
+        narrowing models keep their split encoder/decoder graph ladders with
+        per-rank request capacity."""
         from unittest import mock
 
         model, _ = self._model(128, [])
-        for inner, expected_disable in (
-            (model, True),
-            (SimpleNamespace(embed_tokens=object()), False),
+        for inner, expected_buckets in (
+            (model, [64, 256]),
+            (SimpleNamespace(embed_tokens=object()), []),
         ):
             inner.embed_tokens = object()
             model_runner = SimpleNamespace(
@@ -1298,8 +1298,8 @@ class TestNarrowingPrefillGraphTest:
                         enable=False, device="cpu"
                     ),
                 )
-            assert (graph.disable) == (expected_disable)
-            assert (graph.decoder_buckets) == ([])
+            assert not (graph.disable)
+            assert (graph.decoder_buckets) == (expected_buckets)
 
     def _bare(self, model, State, decoder_buckets, calls):
         pg = self.mod.PrefillGraph.__new__(self.mod.PrefillGraph)
@@ -1310,7 +1310,8 @@ class TestNarrowingPrefillGraphTest:
         pg.decoder_buckets = decoder_buckets
         pg.dp_size = 1
         pg._engaged_logged = set()
-        pg.config = SimpleNamespace(world_size=1)
+        pg._expert_load_rows = None
+        pg.config = SimpleNamespace(world_size=1, global_rank=0)
         pg.attn_backend = SimpleNamespace(
             step_counter=None,
             prepare_prefill_metadata=lambda *args, **kwargs: False,
@@ -1359,7 +1360,9 @@ class TestNarrowingPrefillGraphTest:
         model, State = self._model(100, calls)
         pg = self._bare(model, State, [64, 192], calls)
         ctx = self._ctx(200)
-        hidden, aux = pg._replay_narrowed(256, ctx, 200, noted_waits_done=False)
+        hidden, aux = pg._replay_narrowed(
+            256, ctx, 200, noted_waits_done=False, is_idle=False
+        )
         assert (calls) == (
             [
                 # The encoder replays over the padded bucket with the real
@@ -1388,7 +1391,7 @@ class TestNarrowingPrefillGraphTest:
         assert (pg._decoder_bucket(64)) == (64)
         assert (pg._decoder_bucket(65)) == (192)
         hidden, _ = pg._replay_narrowed(
-            256, self._ctx(256), 256, noted_waits_done=False
+            256, self._ctx(256), 256, noted_waits_done=False, is_idle=False
         )
         assert (calls) == (
             [
@@ -1406,7 +1409,388 @@ class TestNarrowingPrefillGraphTest:
         model.decoder_rows = lambda ctx: 99
         pg = self._bare(model, State, [192], calls)
         with pytest.raises((RuntimeError), match=("narrowing yielded 100 rows")):
-            pg._replay_narrowed(256, self._ctx(200), 200, noted_waits_done=False)
+            pg._replay_narrowed(
+                256, self._ctx(200), 200, noted_waits_done=False, is_idle=False
+            )
+
+    def _make_dp_rank(self, rank, world_size, local_decoder_rows, events):
+        """Construct one simulated DP rank sharing the narrowing graph contract."""
+        from tokenspeed.runtime.execution.breakable_cuda_graph import (
+            current_forward_ctx,
+        )
+        from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
+
+        torch = self.torch
+
+        class State:
+            def __init__(self, rows):
+                self.rows = rows
+                self.buf = torch.full((rows, 2), float("nan"))
+
+            def land_into(self, dst):
+                dst.buf[: self.rows].fill_(1.0)
+                if self.rows < dst.rows:
+                    dst.buf[self.rows :].zero_()
+                events.append(("land", rank, self.rows, dst.rows))
+
+        class Model:
+            max_decoder_rows_per_request = 128
+
+            def encoder_forward(self, input_ids, positions, ctx, **model_kwargs):
+                return State(input_ids.shape[0])
+
+            def narrowing_forward(self, state, ctx):
+                events.append(
+                    (
+                        "narrow",
+                        rank,
+                        state.rows,
+                        list(ctx.global_num_tokens),
+                        list(ctx.global_decoder_rows),
+                    )
+                )
+                return State(local_decoder_rows)
+
+            def decoder_forward(self, state, ctx):
+                events.append(
+                    (
+                        "decoder eager",
+                        rank,
+                        state.rows,
+                        list(ctx.global_num_tokens),
+                        list(ctx.global_decoder_rows),
+                    )
+                )
+                return torch.zeros(state.rows, 2), []
+
+            def finish_forward(self, hidden, captured, ctx):
+                events.append(
+                    (
+                        "finish",
+                        rank,
+                        hidden.shape[0],
+                        list(ctx.global_num_tokens),
+                        list(ctx.global_decoder_rows),
+                    )
+                )
+                return hidden, None
+
+            def decoder_rows(self, ctx):
+                return local_decoder_rows
+
+            def allocate_decoder_state(self, rows):
+                return State(rows)
+
+        pg = self.mod.PrefillGraph.__new__(self.mod.PrefillGraph)
+        pg.disable = False
+        pg.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=False, device="cpu"
+        )
+        pg._narrowing = Model()
+        pg.capture_buckets = [64, 128, 256]
+        pg.decoder_buckets = [64, 192]
+        pg.dp_size = world_size
+        pg._engaged_logged = set()
+        pg._expert_load_rows = None
+        pg._captured_hidden_mode = CaptureHiddenMode.NULL
+        pg._captured_load_tracker = None
+        pg._multimodal_input_embeds = None
+        pg._compute_input_embeddings = lambda ids, ctx, *, request_token_history: (
+            torch.ones(ids.shape[0], 2)
+        )
+        pg._input_embeds_buf = torch.full((256, 2), float("nan"))
+        dummy_fills = []
+
+        def fill_dummy(batch_size, total_tokens):
+            dummy_fills.append((batch_size, total_tokens))
+            pg.input_buffers.input_ids_buf[:total_tokens].fill_(1)
+            pg.input_buffers.positions_buf[:total_tokens].zero_()
+
+        pg.input_buffers = SimpleNamespace(
+            input_ids_buf=torch.zeros(256, dtype=torch.int64),
+            positions_buf=torch.zeros(256, dtype=torch.int64),
+            req_pool_indices_buf=torch.zeros(8, dtype=torch.int64),
+            fill_dummy_decode_buffers=fill_dummy,
+            _dummy_fills=dummy_fills,
+        )
+        pg.token_to_kv_pool = SimpleNamespace(
+            layerwise_load_tracker=None, layer_accesses_wait_for_load=False
+        )
+        pg.config = SimpleNamespace(
+            world_size=world_size,
+            global_rank=rank,
+            model_is_mrope=False,
+        )
+        pg.attn_backend = SimpleNamespace(step_counter=None)
+        pg.text_model = SimpleNamespace(
+            lm_head=None,
+            logits_processor=lambda ids, h, head, meta, aux: h,
+        )
+
+        def make_enc_replay(bucket):
+            def replay(valid_rows, noted_waits_done):
+                ctx = current_forward_ctx()
+                events.append(
+                    (
+                        "encoder",
+                        rank,
+                        bucket,
+                        valid_rows,
+                        list(ctx.global_num_tokens),
+                        list(ctx.global_decoder_rows),
+                    )
+                )
+
+            return replay
+
+        def make_dec_replay(dec_bucket, statics):
+            def replay(valid_rows, noted_waits_done):
+                ctx = current_forward_ctx()
+                assert not torch.isnan(statics.buf).any()
+                if valid_rows < dec_bucket:
+                    assert torch.count_nonzero(statics.buf[valid_rows:]) == 0
+                events.append(
+                    (
+                        "decoder graph",
+                        rank,
+                        dec_bucket,
+                        valid_rows,
+                        list(ctx.global_num_tokens),
+                        list(ctx.global_decoder_rows),
+                    )
+                )
+
+            return replay
+
+        pg._encoders = {
+            b: self.mod.CapturedEncoder(
+                SimpleNamespace(replay=make_enc_replay(b)), State(b)
+            )
+            for b in pg.capture_buckets
+        }
+        pg._decoders = {}
+        for d in pg.decoder_buckets:
+            statics = State(d)
+            pg._decoders[d] = self.mod.CapturedDecoder(
+                SimpleNamespace(replay=make_dec_replay(d, statics)),
+                statics,
+                self.mod.CapturedForward(torch.zeros(d, 2), []),
+            )
+        pg._captures = {}
+        return pg
+
+    def test_dp_multi_rank_heterogeneous_decoder_rows_agree_on_graph_route_and_bucket(
+        self,
+    ):
+        """4 DP ranks with heterogeneous decoder_rows (including 0 incomplete
+        and an IDLE rank via execute_idle_forward) agree on the exact encoder
+        and decoder buckets, bake [decoder_bucket]*4 in decoder collectives,
+        and scrub padded tails."""
+        from tokenspeed.runtime.execution.context import ForwardContext
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.execution.model_executor import ModelExecutor
+        from tokenspeed.runtime.execution.types import DpForwardMetadata
+
+        tokens = [120, 80, 200, 0]
+        batch_sizes = [1, 1, 1, 0]
+        num_extends = [1, 1, 1, 0]
+        dec_rows = [100, 0, 64, 0]
+        events_by_rank = [[] for _ in range(4)]
+        ranks = [
+            self._make_dp_rank(r, 4, dec_rows[r], events_by_rank[r]) for r in range(4)
+        ]
+
+        for r in range(4):
+            meta = DpForwardMetadata.from_ranks(
+                global_num_tokens=tokens,
+                global_batch_size=batch_sizes,
+                global_num_extends=num_extends,
+                global_decoder_rows=dec_rows,
+                need_idle_forward=(r == 3),
+            )
+            assert meta.all_extend_or_idle and not meta.all_extend
+            if r < 3:
+                ctx = ForwardContext(
+                    attn_backend=ranks[r].attn_backend,
+                    token_to_kv_pool=ranks[r].token_to_kv_pool,
+                    bs=1,
+                    num_extends=1,
+                    output_layout=ForwardOutputLayout(1, 1, 0, 1),
+                    input_num_tokens=tokens[r],
+                    forward_mode=ForwardMode.EXTEND,
+                )
+                ctx.apply_dp_metadata(meta, required=True)
+                assert ranks[r].can_run(ctx)
+                ranks[r].replay(
+                    ctx,
+                    self.torch.ones(tokens[r], dtype=self.torch.int64),
+                    request_token_history=None,
+                )
+                assert ctx.global_num_tokens == tokens
+                assert ctx.global_decoder_rows == dec_rows
+            else:
+                executor = ModelExecutor.__new__(ModelExecutor)
+                executor.device = "cpu"
+                executor.device_module = self.torch.get_device_module("cpu")
+                executor.default_stream = executor.device_module.current_stream()
+                executor.execution_stream = executor.device_module.Stream()
+                executor.input_buffers = ranks[r].input_buffers
+                executor.runtime_states = SimpleNamespace(
+                    valid_cache_lengths=self.torch.zeros(8, dtype=self.torch.int32),
+                    vocab_size=32,
+                )
+                executor.attn_backend = ranks[r].attn_backend
+                executor.token_to_kv_pool = ranks[r].token_to_kv_pool
+                executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
+                executor.prefill_graph = ranks[r]
+                executor.dspark_context_producer = None
+                executor.drafter = None
+                executor.model_runner = SimpleNamespace(
+                    forward=lambda *a, **k: (_ for _ in ()).throw(
+                        AssertionError("idle rank must replay prefill graph, not eager")
+                    )
+                )
+                executor.execute_idle_forward(meta)
+                assert not self.torch.isnan(ranks[r]._input_embeds_buf[:256]).any()
+                assert self.torch.count_nonzero(ranks[r]._input_embeds_buf[:256]) == 0
+                assert ranks[r].input_buffers._dummy_fills == [(0, 256)]
+
+        # Every rank agreed on encoder bucket 256 and decoder bucket 192.
+        for r in range(4):
+            enc, narrow, land, dec = events_by_rank[r][:4]
+            assert enc == ("encoder", r, 256, tokens[r], [256] * 4, dec_rows)
+            assert narrow == ("narrow", r, 256, [256] * 4, dec_rows)
+            assert land == ("land", r, dec_rows[r], 192)
+            assert dec == ("decoder graph", r, 192, dec_rows[r], [192] * 4, [192] * 4)
+            if r < 3:
+                assert events_by_rank[r][4] == (
+                    "finish",
+                    r,
+                    dec_rows[r],
+                    tokens,
+                    dec_rows,
+                )
+            else:
+                assert len(events_by_rank[r]) == 4
+
+    def test_dp_multi_rank_decoder_rows_above_max_bucket_or_all_zero_agree(self):
+        """Heterogeneous decoder_rows with any rank > max_bucket, or all ranks == 0,
+        both keep all ranks in lockstep on encoder bucket + eager/skip decoder."""
+        from tokenspeed.runtime.execution.context import ForwardContext
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.execution.types import DpForwardMetadata
+
+        for dec_rows in ([0, 64, 300, 0], [0, 0, 0, 0]):
+            tokens = [120, 80, 250, 0]
+            events_by_rank = [[] for _ in range(4)]
+            ranks = [
+                self._make_dp_rank(r, 4, dec_rows[r], events_by_rank[r])
+                for r in range(4)
+            ]
+            for r in range(4):
+                meta = DpForwardMetadata.from_ranks(
+                    global_num_tokens=tokens,
+                    global_batch_size=[1, 1, 1, 0],
+                    global_num_extends=[1, 1, 1, 0],
+                    global_decoder_rows=dec_rows,
+                    need_idle_forward=(r == 3),
+                )
+                ctx = ForwardContext(
+                    attn_backend=ranks[r].attn_backend,
+                    token_to_kv_pool=ranks[r].token_to_kv_pool,
+                    bs=0 if r == 3 else 1,
+                    num_extends=0 if r == 3 else 1,
+                    output_layout=ForwardOutputLayout(
+                        0 if r == 3 else 1, 0 if r == 3 else 1, 0, 1
+                    ),
+                    input_num_tokens=tokens[r],
+                    forward_mode=ForwardMode.IDLE if r == 3 else ForwardMode.EXTEND,
+                )
+                ctx.apply_dp_metadata(meta, required=True)
+                if r == 3:
+                    assert ranks[r].can_run_idle(ctx)
+                    ranks[r].replay_idle(ctx)
+                else:
+                    assert ranks[r].can_run(ctx)
+                    ranks[r].replay(
+                        ctx,
+                        self.torch.ones(tokens[r], dtype=self.torch.int64),
+                        request_token_history=None,
+                    )
+                assert events_by_rank[r][:3] == [
+                    ("encoder", r, 256, tokens[r], [256] * 4, dec_rows),
+                    ("narrow", r, 256, [256] * 4, dec_rows),
+                    ("decoder eager", r, dec_rows[r], tokens, dec_rows),
+                ]
+
+    def test_dp_multi_rank_eager_fallback_and_mismatch_guard(self):
+        """Mixed/decode peers, oversized encoder tokens, or missing global_decoder_rows
+        keep every rank (active and idle) eager; local vs gathered mismatch fails fast.
+        """
+        from tokenspeed.runtime.execution.context import ForwardContext
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.execution.types import DpForwardMetadata
+
+        # 1. Mixed or decode peer, oversized encoder tokens, or missing decoder rows -> all eager.
+        cases = [
+            # One rank decoding
+            ([120, 4, 0, 0], [1, 4, 0, 0], [1, 0, 0, 0], [64, 4, 0, 0]),
+            # One rank mixed extend+decode
+            ([120, 84, 0, 0], [1, 2, 0, 0], [1, 1, 0, 0], [64, 68, 0, 0]),
+            # One rank exceeds largest encoder bucket (256)
+            ([120, 300, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0], [64, 128, 0, 0]),
+            # Missing global_decoder_rows
+            ([120, 80, 0, 0], [1, 1, 0, 0], [1, 1, 0, 0], None),
+        ]
+        for tokens, bs_list, ext_list, dec_rows in cases:
+            meta = DpForwardMetadata.from_ranks(
+                global_num_tokens=tokens,
+                global_batch_size=bs_list,
+                global_num_extends=ext_list,
+                global_decoder_rows=dec_rows,
+                need_idle_forward=False,
+            )
+            for r in range(4):
+                pg = self._make_dp_rank(r, 4, 0, [])
+                mode = ForwardMode.from_num_extends(ext_list[r], bs_list[r])
+                ctx = ForwardContext(
+                    attn_backend=pg.attn_backend,
+                    token_to_kv_pool=pg.token_to_kv_pool,
+                    bs=bs_list[r],
+                    num_extends=ext_list[r],
+                    output_layout=ForwardOutputLayout(bs_list[r], ext_list[r], 0, 1),
+                    input_num_tokens=tokens[r],
+                    forward_mode=mode,
+                )
+                ctx.apply_dp_metadata(meta, required=True)
+                assert not pg.can_run(ctx)
+                assert not pg.can_run_idle(ctx)
+
+        # 2. Local decoder_rows disagreeing with control-plane global_decoder_rows raises.
+        pg = self._make_dp_rank(1, 4, 77, [])
+        meta = DpForwardMetadata.from_ranks(
+            global_num_tokens=[120, 80, 0, 0],
+            global_batch_size=[1, 1, 0, 0],
+            global_num_extends=[1, 1, 0, 0],
+            global_decoder_rows=[64, 50, 0, 0],
+            need_idle_forward=False,
+        )
+        ctx = ForwardContext(
+            attn_backend=pg.attn_backend,
+            token_to_kv_pool=pg.token_to_kv_pool,
+            bs=1,
+            num_extends=1,
+            output_layout=ForwardOutputLayout(1, 1, 0, 1),
+            input_num_tokens=80,
+            forward_mode=ForwardMode.EXTEND,
+        )
+        ctx.apply_dp_metadata(meta, required=True)
+        with pytest.raises(RuntimeError, match="prefill decoder rows disagree"):
+            pg.replay(
+                ctx,
+                self.torch.ones(80, dtype=self.torch.int64),
+                request_token_history=None,
+            )
 
 
 class TestTrtllmPrefillGraphSeamsTest:

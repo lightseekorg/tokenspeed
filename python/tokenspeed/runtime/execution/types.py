@@ -50,6 +50,8 @@ class DpForwardMetadata:
     all_decode_or_idle: bool
     all_extend: bool
     need_idle_forward: bool
+    all_extend_or_idle: bool = False
+    global_decoder_rows: list[int] | None = None
 
     @classmethod
     def from_ranks(
@@ -58,6 +60,7 @@ class DpForwardMetadata:
         global_num_tokens: list[int],
         global_batch_size: list[int],
         global_num_extends: list[int],
+        global_decoder_rows: list[int] | None,
         need_idle_forward: bool,
     ) -> DpForwardMetadata:
         """The metadata from every rank's batch, in rank order.
@@ -67,6 +70,8 @@ class DpForwardMetadata:
             global_batch_size: Requests in each rank's batch; 0 for a rank
                 without model work.
             global_num_extends: Prefill rows in each rank's batch.
+            global_decoder_rows: Narrowed decoder rows each rank forwards, or
+                ``None`` when not reported.
             need_idle_forward: This rank has no batch while another has one.
         """
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -89,11 +94,21 @@ class DpForwardMetadata:
                 mode in (int(ForwardMode.DECODE), int(ForwardMode.IDLE))
                 for mode in global_forward_mode
             ),
-            # Replicated prefill-graph gate (see PrefillGraph._select_bucket).
+            # Replicated prefill-graph gates (see PrefillGraph._select_bucket).
             all_extend=all(
                 mode == int(ForwardMode.EXTEND) for mode in global_forward_mode
             ),
             need_idle_forward=need_idle_forward,
+            all_extend_or_idle=(
+                any(mode == int(ForwardMode.EXTEND) for mode in global_forward_mode)
+                and all(
+                    mode in (int(ForwardMode.EXTEND), int(ForwardMode.IDLE))
+                    for mode in global_forward_mode
+                )
+            ),
+            global_decoder_rows=(
+                list(global_decoder_rows) if global_decoder_rows is not None else None
+            ),
         )
 
 

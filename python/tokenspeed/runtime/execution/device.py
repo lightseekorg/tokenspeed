@@ -185,6 +185,7 @@ from tokenspeed.runtime.distributed.nccl_suspend import (
 from tokenspeed.runtime.engine.scheduler_utils import is_device_cache_op
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     ModelExecutionResult,
@@ -317,6 +318,9 @@ class DeviceSpecs:
             None unless the server started with ``--enable-eplb``.
         cache_observation_capacity: Startup capacity of optional completed
             CPU copy observations; zero when diagnostics are disabled.
+        narrowing_decoder_window: Per-request decoder row cap for a narrowing
+            prefill model (e.g. DeepSeek V4.1's sliding window); ``None`` when
+            the model does not narrow.
     """
 
     cache_geometry: Any
@@ -338,6 +342,7 @@ class DeviceSpecs:
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
     cache_observation_capacity: int = 0
+    narrowing_decoder_window: int | None = None
 
 
 def speculative_widths(
@@ -2332,6 +2337,11 @@ def build_device_side(
         expert_rebalance=(
             target.expert_location_updater.specs
             if target.expert_location_updater is not None
+            else None
+        ),
+        narrowing_decoder_window=(
+            int(narrowing.max_decoder_rows_per_request)
+            if (narrowing := narrowing_prefill_model(target.model)) is not None
             else None
         ),
     )

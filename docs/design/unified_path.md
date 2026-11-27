@@ -991,26 +991,30 @@ fixed-row static state the narrowing lands into (leading rows copied, tail
 zeroed). The decoder graphs depend only on their row count, so one ladder
 serves every token bucket; it is the token ladder clipped to
 `max_decoder_rows_per_request × max_num_seqs` (a request contributes at most
-its window). A replay is encoder graph → eager narrowing → decoder graph,
-all under the bucket-pinned ambient context. The narrowing and decoder
-stages size their own collectives from their row counts
-(`report_collective_sizing`). The decoder graph replays with the narrowed
-row count as its valid rows, so its breaks scrub the static tail. A forward
-whose narrowed rows exceed the largest decoder bucket runs its decoder
-stage eager. Layers read their row plan from the live context, never from a
-loose argument a captured break would freeze. Capture runs the
-narrowing before every decoder run, as serving does: the decoder consumes
-per-forward backend state its predecessor produces (V4.1's reuse layers read
-the index source's selection, which later sources overwrite). Under
-attention DP the split graph stays off: the narrowed row count is rank-local
-(which prompts complete on this rank), so the decoder bucket and the
-collective shapes its graph bakes would differ across ranks, and the stages
-size their collectives from their own rows, which the DP metadata gather
-does not carry. Eager TP1 attention/dense with fused EP may narrow: the
-fused dispatch exchanges the actual local row counts, while the original
-DP counts remain capacity bounds. The CPU metadata gather also carries
-per-rank decode request counts. V4.1 DSpark sizes its one draft forward at
-block width times these counts, including in aggregated mixed batches.
+its window). A replay is encoder graph → eager narrowing → decoder graph (or eager/skip
+decoder). The encoder replay and eager narrowing run under the encoder-bucket
+pin (`_padded_to`, leaving `global_decoder_rows` unpinned), and the decoder
+graph replays under `_padded_decoder_to` (pinning `global_num_tokens` and
+`global_decoder_rows` to `[decoder_bucket] * world_size`), with the narrowed
+row count as its valid rows so its breaks scrub the static tail. A forward
+whose global max narrowed rows exceed the largest decoder bucket runs its
+decoder stage eager on the unpinned live context; when every DP rank has 0
+decoder rows, all ranks skip the narrowing FFN and decoder layers in lockstep.
+Layers read their row plan from the live context, never from a loose argument a
+captured break would freeze. Capture runs segments while capturing
+(`run_segments_while_capturing=True`) so breaks never read stale pool storage,
+and runs the narrowing before every decoder run, as serving does: the decoder
+consumes per-forward backend state its predecessor produces (V4.1's reuse
+layers read the index source's selection, which later sources overwrite). Under
+attention DP, the Rust control plane computes each rank's narrowed decoder row
+count from `narrowing_decoder_window` and carries `global_decoder_rows` in the
+existing DP `all_gather` (no extra forward-thread collective). Every rank —
+including idle ranks via `execute_idle_forward` -> `PrefillGraph.replay_idle` —
+decides graph vs eager, the encoder bucket, and the decoder bucket (from
+`max(global_decoder_rows)`) identically from replicated DP metadata. The CPU
+metadata gather also carries per-rank decode request counts. V4.1 DSpark sizes
+its one draft forward at block width times these counts, including in
+aggregated mixed batches.
 Prefill writes context KV; if another rank has decodes, prefill-only and
 idle ranks join its draft collectives with empty rows. A round with no
 decodes performs no draft forward. Decode graph warmup and capture use the
@@ -2886,14 +2890,19 @@ ownership, graph lifetime and supported configurations.
 ### V4.1 context encoder/decoder with attention DP
 
 Ordinary EP supports attention, dense, and MoE TP1 with attention DP; other
-ordinary-EP attention-DP layouts are rejected during model construction. Its
-prefills require `--disable-prefill-graph`: CED narrowing changes each rank's
-decoder row count, which eager execution exchanges on a dedicated host
-process group before the CED source layer and again before the remaining
-decoder layers. Idle ranks enter the same exchanges and expert collectives
-with zero rows. The stage-local counts are restored after each stage; decode
-keeps the scheduler's graph-compatible counts. Fused EP retains its own
-dispatch and row-count exchange.
+ordinary-EP attention-DP layouts are rejected during model construction. The
+control plane carries each rank's narrowed decoder row count in
+`global_decoder_rows` inside the existing DP `all_gather`, so both ordinary EP
+and fused EP size CED narrowing and decoder collectives (including captured
+prefill decoder graphs and idle ranks) without a forward-thread host exchange.
+When `global_decoder_rows` is not populated (e.g. standalone unit fixtures),
+ordinary eager prefill falls back to its dedicated host process group before
+the CED source layer and remaining decoder layers. Idle ranks enter the same
+collectives (and prefill-graph replays when active peers replay) with zero
+real rows, and when every rank has 0 decoder rows all ranks skip the narrowing
+FFN and remaining decoder layers in lockstep. The stage-local counts are
+restored after each stage; decode keeps the scheduler's graph-compatible
+counts.
 
 For mixed text/image prefills, ordinary EP gathers the routing mask with
 the activations in eight additional aligned lanes. The mask therefore

@@ -845,8 +845,12 @@ def test_model_constructor_preserves_fused_ep_layout_requirement(monkeypatch):
         DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
 
 
-def test_ordinary_dp_ep_requires_disabled_prefill_graph(monkeypatch):
+def test_ordinary_dp_ep_allows_prefill_graph(monkeypatch):
     monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.TRITON)
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(
+        v41.pg_manager, "init_process_group", lambda *args, **kwargs: None
+    )
     monkeypatch.setitem(global_server_args_dict, "disable_prefill_graph", False)
     mapping = v41.Mapping(
         rank=0,
@@ -856,8 +860,8 @@ def test_ordinary_dp_ep_requires_disabled_prefill_graph(monkeypatch):
         moe_tp_size=1,
         moe_ep_size=2,
     )
-    with pytest.raises(ValueError, match="requires --disable-prefill-graph"):
-        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+    model = DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+    assert model.mapping.attn.has_dp
 
 
 def test_decoder_counts_preserve_decode_and_fused_ep_boundaries(
@@ -870,23 +874,155 @@ def test_decoder_counts_preserve_decode_and_fused_ep_boundaries(
     assert ctx.global_num_tokens == [9, 7]
 
     def forbidden(*args, **kwargs):
-        raise AssertionError("decode and fused EP must not exchange host counts")
+        raise AssertionError(
+            "decode, fused EP, and control-plane global_decoder_rows must not exchange host counts"
+        )
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", forbidden)
     ctx.all_decode_or_idle = True
     assert model.decoder_collective_counts(ctx, 3) is ctx.global_num_tokens
     ctx.all_decode_or_idle = False
+    # Control-plane global_decoder_rows serves both ordinary and fused EP directly.
+    ctx.global_decoder_rows = [5, 0]
+    assert model.decoder_collective_counts(ctx, 3) == [5, 0]
     model.layers[model.ced_decoder_start].ffn.owns_ep_communication = True
+    assert model.decoder_collective_counts(ctx, 3) == [5, 0]
+    ctx.global_decoder_rows = None
     assert model.decoder_collective_counts(ctx, 3) is None
 
 
-def test_ordinary_dp_prefill_rejects_capture(monkeypatch, ordinary_dp_model):
+def test_ordinary_dp_prefill_capture_requires_global_decoder_rows(
+    monkeypatch, ordinary_dp_model
+):
     ctx = _ctx(None, 3, ForwardMode.EXTEND)
     ctx.global_num_tokens = [9, 7]
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    with pytest.raises(RuntimeError, match="requires --disable-prefill-graph"):
+    with pytest.raises(RuntimeError, match="requires ctx.global_decoder_rows"):
         ordinary_dp_model.decoder_collective_counts(ctx, 3)
+    ctx.global_decoder_rows = [128, 128]
+    assert ordinary_dp_model.decoder_collective_counts(ctx, 128) == [128, 128]
+
+
+def test_dp_narrowing_attention_and_lockstep_zero_decoder_skip(
+    monkeypatch, ordinary_dp_model
+):
+    """IDLE and 0-row decoder breaks avoid stale reads, and [0, 0] skips decoder layers."""
+    model = ordinary_dp_model
+    start = model.ced_decoder_start
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("global_decoder_rows must avoid host gloo exchange")
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", forbidden)
+
+    # 1. DeepseekV41Attention.forward early-returns (0, hidden) on IDLE without touching backend.
+    attn = model.layers[0].attn
+    idle_ctx = _ctx(None, 0, ForwardMode.IDLE)
+    padded_h = torch.ones((8, model.config.hidden_size), dtype=torch.bfloat16)
+    padded_pos = torch.zeros(8, dtype=torch.int64)
+    out_idle = attn(padded_pos, padded_h, idle_ctx, reduce_output=True)
+    assert out_idle.shape == (0, model.config.hidden_size)
+
+    # 2. DeepseekV41Attention.forward on a decoder layer with 0 decoder rows slices and returns empty.
+    from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
+    from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+        V41DecoderView,
+    )
+
+    empty_view = V41DecoderView(
+        SimpleNamespace(
+            positions=torch.empty(0, dtype=torch.int64),
+            request_indices=torch.empty(0, dtype=torch.int64),
+        ),
+        None,
+        (),
+        torch.empty(0, dtype=torch.int64),
+        None,
+        (),
+    )
+    empty_backend = SimpleNamespace(
+        begin_indexer_stage=lambda: None,
+        query_metadata=lambda mode: empty_view.metadata,
+        decoder_view=lambda: empty_view,
+    )
+    zero_dec_ctx = _ctx(empty_backend, 8, ForwardMode.EXTEND)
+    with active_forward(zero_dec_ctx):
+        out_zero = model.layers[start + 1].attn(
+            padded_pos, padded_h, zero_dec_ctx, reduce_output=True
+        )
+    assert out_zero.shape == (0, model.config.hidden_size)
+
+    # 3. IDLE narrowing_forward accepts padded encoder state, joins layer `start` FFN with
+    #    global_decoder_rows, and lands cleanly into allocate_decoder_state(decoder_bucket).
+    seen_ffn: list[tuple[int, int]] = []
+    handles = [
+        layer.ffn.register_forward_pre_hook(
+            lambda _m, args, lid=lid: seen_ffn.append((lid, len(args[0])))
+        )
+        for lid, layer in enumerate(model.layers)
+    ]
+    try:
+        idle_state = v41.V41RowState(
+            torch.ones(
+                (8, model.config.hc_mult, model.config.hidden_size),
+                dtype=torch.bfloat16,
+            ),
+            torch.ones((8, model.config.hc_mult), dtype=torch.float32),
+            torch.zeros(8, dtype=torch.int64),
+            None,
+            None,
+            None,
+            [],
+        )
+        idle_graph_ctx = _ctx(empty_backend, 8, ForwardMode.IDLE)
+        idle_graph_ctx.global_num_tokens = [0, 8]
+        idle_graph_ctx.global_decoder_rows = [0, 4]
+        narrowed_idle = model.narrowing_forward(idle_state, idle_graph_ctx)
+        assert narrowed_idle.rows == 0
+        assert seen_ffn == [(start, 4)]
+        statics = model.allocate_decoder_state(16)
+        statics.hidden.fill_(float("nan"))
+        narrowed_idle.land_into(statics)
+        assert torch.count_nonzero(statics.hidden) == 0
+
+        # 4. Lockstep all-zero skip: when global_decoder_rows == [0, 0], BOTH idle
+        #    narrowing+decoder AND eager idle forward skip layer `start` FFN and all
+        #    decoder layers `start + 1 ..`.
+        seen_ffn.clear()
+        idle_zero_ctx = _ctx(empty_backend, 8, ForwardMode.IDLE)
+        idle_zero_ctx.global_num_tokens = [0, 8]
+        idle_zero_ctx.global_decoder_rows = [0, 0]
+        narrowed_zero = model.narrowing_forward(idle_state, idle_zero_ctx)
+        hidden_zero, _ = model.decoder_forward(narrowed_zero, idle_zero_ctx)
+        assert narrowed_zero.rows == 0 and hidden_zero.shape == (
+            0,
+            model.config.hidden_size,
+        )
+        assert seen_ffn == []
+
+        seen_ffn.clear()
+        ids = torch.empty(0, dtype=torch.int64)
+        eager_zero_ctx = _ctx(None, 0, ForwardMode.IDLE)
+        eager_zero_ctx.global_num_tokens = [0, 8]
+        eager_zero_ctx.global_decoder_rows = [0, 0]
+        eager_h, eager_cap = model(
+            ids,
+            ids,
+            eager_zero_ctx,
+            None,
+            None,
+            engram_hash_ids=None,
+            engram_token_mask=None,
+            image_mask=None,
+        )
+        assert eager_h.shape == (0, model.config.hidden_size) and eager_cap is None
+        # Only encoder layers 0..start-1 ran FFN (to join peers' encoder rows); layer
+        # `start` FFN and all decoder layers `start+1..` were skipped in lockstep.
+        assert [lid for lid, _ in seen_ffn] == list(range(start))
+    finally:
+        for handle in handles:
+            handle.remove()
 
 
 def test_ordinary_dp_idle_rank_joins_narrowed_expert_collectives(ordinary_dp_model):
