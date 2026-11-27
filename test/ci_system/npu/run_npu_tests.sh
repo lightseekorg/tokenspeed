@@ -94,7 +94,7 @@ else
   "$NPU_VENV_PYTHON" -m pytest -p no:cacheprovider -q \
     test/runtime/layers/test_npu_attention_backend.py \
     test/runtime/execution/test_breakable_cuda_graph_npu.py \
-    test/runtime/execution/test_ngram_prefill_seam_npu.py \
+    test/runtime/test_longcat_ngram_history_embedding.py \
     test/runtime/test_ascend_dsa_cache_npu.py \
     test/runtime/test_npu_version_evidence.py
 fi
