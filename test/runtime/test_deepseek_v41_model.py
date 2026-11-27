@@ -617,8 +617,6 @@ def test_empty_decoder_rows_complete_hc_and_preserve_ep_participation(
         "layers.0",
         None,
         None,
-        False,
-        "gpu",
         None,
     )
     _initialize(layer)
@@ -751,7 +749,7 @@ def ordinary_dp_model(monkeypatch):
     monkeypatch.setattr(torch.distributed, "all_gather_object", exchange)
     monkeypatch.setattr(comm_manager, "token_all_gather", gather)
     monkeypatch.setattr(comm_manager, "token_reduce_scatter", scatter)
-    return DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+    return DeepseekV41Model(_config(), mapping, None, "model", host_table=False)
 
 
 @pytest.mark.parametrize("dense_tp_size", [1, 2])
@@ -773,7 +771,7 @@ def test_ordinary_dp_ep_rejects_tensor_parallel_layouts(
         NotImplementedError,
         match="ordinary attention DP/EP requires attention/dense/MoE TP1",
     ):
-        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+        DeepseekV41Model(_config(), mapping, None, "model", host_table=False)
 
 
 @pytest.mark.parametrize(
@@ -828,7 +826,7 @@ def test_model_constructor_accepts_supported_parallel_layouts(
     config.hidden_size = 256
     config.engram_layer_ids = []
     with torch.device("meta"):
-        DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu", None)
+        DeepseekV41Model(config, mapping, _quant(), "model", host_table=False)
 
 
 def test_model_constructor_preserves_fused_ep_layout_requirement(monkeypatch):
@@ -842,7 +840,7 @@ def test_model_constructor_preserves_fused_ep_layout_requirement(monkeypatch):
         moe_ep_size=2,
     )
     with pytest.raises(NotImplementedError, match="requires attention TP == MoE TPxEP"):
-        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+        DeepseekV41Model(_config(), mapping, None, "model", host_table=False)
 
 
 def test_ordinary_dp_ep_requires_disabled_prefill_graph(monkeypatch):
@@ -857,7 +855,7 @@ def test_ordinary_dp_ep_requires_disabled_prefill_graph(monkeypatch):
         moe_ep_size=2,
     )
     with pytest.raises(ValueError, match="requires --disable-prefill-graph"):
-        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+        DeepseekV41Model(_config(), mapping, None, "model", host_table=False)
 
 
 def test_decoder_counts_preserve_decode_and_fused_ep_boundaries(
@@ -954,9 +952,7 @@ def test_idle_model_calls_every_ep_layer_with_completed_empty_state(monkeypatch)
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     config = _config()
     config.engram_layer_ids = []
-    model = DeepseekV41Model(
-        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
-    )
+    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", host_table=False)
     model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=True))
     calls = []
     for layer in model.layers:
@@ -1004,9 +1000,7 @@ def test_cache_only_narrowing_handoff_has_no_pending_hc(monkeypatch, attention_d
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     config = _config()
     config.engram_layer_ids = []
-    model = DeepseekV41Model(
-        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
-    )
+    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", host_table=False)
     _initialize(model)
     model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=attention_dp))
     model.dspark_capture_layers = (20, 21, 39)
@@ -1302,8 +1296,6 @@ def test_attention_reduction_precedes_hc_join_unless_fusible(
         "layers.0",
         None,
         None,
-        False,
-        "gpu",
         None,
     )
     _initialize(layer)
@@ -1417,8 +1409,6 @@ def test_shifted_mhc_consumes_reduced_rows_and_reuses_ffn_mixes(
         "layers.0",
         None,
         None,
-        False,
-        "gpu",
         None,
     )
     _initialize(layer)
@@ -1705,8 +1695,6 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
             f"layers.{i}",
             None,
             None,
-            False,
-            "gpu",
             None,
         )
         for i in (0, 1)
@@ -1796,8 +1784,6 @@ def test_cross_layer_reduction_uses_consumer_norm(monkeypatch, fusion, mode):
             f"layers.{i}",
             None,
             None,
-            False,
-            "gpu",
             None,
         )
         for i in range(2)
@@ -1907,7 +1893,7 @@ def test_cross_layer_chain_preserves_engram_taps_and_stage_handoffs(
     torch.manual_seed(91)
     config = _config()
     model = v41.DeepseekV41Model(
-        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+        config, _mapping(0, 1, 1), None, "model", host_table=False
     )
     _initialize(model)
     model.initialize_engram(_Tokenizer())
@@ -2187,9 +2173,7 @@ def test_decode_forward_builds_index_geometry_ahead_of_its_layers(monkeypatch, m
     torch.manual_seed(92)
     config = _config()
     config.engram_layer_ids = []
-    model = DeepseekV41Model(
-        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
-    )
+    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", host_table=False)
     _initialize(model)
     positions = torch.arange(6)
 
@@ -2246,9 +2230,7 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     torch.manual_seed(7)
     config = _config()
-    model = DeepseekV41Model(
-        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
-    )
+    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", host_table=False)
     _initialize(model)
     model.initialize_engram(_Tokenizer())
     ids = torch.tensor([0, 3, 4, 6])
@@ -2328,7 +2310,7 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
         ordinary_dp_model
         if attention_dp
         else DeepseekV41Model(
-            config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+            config, _mapping(0, 1, 1), None, "model", host_table=False
         )
     )
     _initialize(model)
@@ -2445,9 +2427,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     torch.manual_seed(7)
     config = _config()
-    model = DeepseekV41Model(
-        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
-    )
+    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", host_table=False)
     _initialize(model)
     model.initialize_engram(_Tokenizer())
     model.dspark_capture_layers = (19, 20, 39)
@@ -2588,9 +2568,7 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     draft.num_hidden_layers, draft.engram_layer_ids = 2, []
     draft.kv_source_layer_ids = draft.index_source_layer_ids = []
     draft.compress_ratios = [0, 0]
-    stack = DeepseekV41Model(
-        draft, _mapping(0, 1, 1), None, "draft", False, "gpu", None
-    )
+    stack = DeepseekV41Model(draft, _mapping(0, 1, 1), None, "draft", host_table=False)
     _initialize(stack)
     plain = _Backend(positions, requests)
     ctx = _ctx(plain, 6, ForwardMode.EXTEND)
@@ -4014,6 +3992,33 @@ def _loader_model(monkeypatch, config, rank, device):
         )
 
 
+def test_engram_publication_follows_final_dummy_fill(monkeypatch):
+    mapping = _mapping(0, 1, 1)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 32)
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    model = DeepseekV41ForCausalLM(
+        SimpleNamespace(text_config=_loader_config()), mapping, None, False, None
+    )
+    # Snapshot the rows a peer may read at publication.
+    weight = model.model.layers[1].engram.embed.weight
+    published = []
+    model.model.engram_group = Mock(
+        spec=v41.EngramGroup,
+        publish_loaded=lambda: published.append(weight.view(torch.uint8).clone()),
+    )
+    monkeypatch.setattr(loader_module, "_initialize_model", lambda *_: model)
+    loader = loader_module.DummyModelLoader(LoadConfig(load_format="dummy"))
+    loaded = loader.load_model(
+        model_config=SimpleNamespace(dtype=torch.bfloat16),
+        device_config=SimpleNamespace(device="cpu"),
+    )
+    assert not published
+    loaded.initialize_engram(_Tokenizer())
+    assert len(published) == 1
+    assert torch.equal(published[0], weight.view(torch.uint8))
+
+
 def _checkpoint(config):
     """Independent raw checkpoint schema, with deliberately distinct shard values."""
     weights = {}
@@ -4723,7 +4728,7 @@ def test_model_qcp_ced_communication_and_outputs(
         # stage layouts and output gathering, so allocate them on meta.
         with torch.device("meta"):
             model = DeepseekV41Model(
-                config, mapping, _quant(), "model", False, "gpu", None
+                config, mapping, _quant(), "model", host_table=False
             )
         backend = _backend("cpu", 2)
         plan = QueryShardPlan.from_forward(

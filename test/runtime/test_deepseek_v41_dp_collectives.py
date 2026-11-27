@@ -140,7 +140,7 @@ def _cpu_model(rank, world_size, moe_ep_size, monkeypatch, transport):
     monkeypatch.setattr(comm_ops, "get_global_backend", lambda: transport)
     monkeypatch.setitem(global_server_args_dict, "disable_prefill_graph", True)
     torch.manual_seed(17)
-    model = DeepseekV41Model(config, mapping, None, "model", False, "cpu", None)
+    model = DeepseekV41Model(config, mapping, None, "model", host_table=False)
     _initialize(model)
     for index, layer in enumerate(model.layers):
         layer.attn = _CpuAttention(mapping, index, model.ced_decoder_start)

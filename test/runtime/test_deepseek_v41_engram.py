@@ -181,7 +181,8 @@ def _mapping(rank, tp_size, world_size):
 
 
 # Host tables in a registered mmap, as before host-NUMA cuMem memory existed.
-_MMAP = EngramHostAlloc("mmap", "writer")
+_SHARED_MMAP = EngramHostAlloc("shared", "mmap", "writer")
+_SHARDED_MMAP = EngramHostAlloc("sharded", "mmap", "writer")
 
 
 def _weights(rows, width):
@@ -334,7 +335,7 @@ def test_bounded_shard_loading_and_four_way_lookup(tmp_path, monkeypatch):
     outputs = []
     for rank in range(4, 8):
         embed = RowShardedEngramEmbedding(
-            rows, width, _mapping(rank, 4, 8), "cpu", False, "gpu", None, 1
+            rows, width, _mapping(rank, 4, 8), "cpu", None, 1
         )
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             for name in ("weight", "scale"):
@@ -373,9 +374,7 @@ def test_bounded_shard_loading_and_four_way_lookup(tmp_path, monkeypatch):
 
 
 def test_scale_bytes_and_loader_validation():
-    embed = RowShardedEngramEmbedding(
-        8, 256, _mapping(0, 1, 1), "cpu", False, "gpu", None, 1
-    )
+    embed = RowShardedEngramEmbedding(8, 256, _mapping(0, 1, 1), "cpu", None, 1)
     codes = torch.ones(8, 256).to(torch.float8_e4m3fn)
     # Includes E8M0 subnormal, extreme finite and NaN encodings.
     scales = torch.arange(256, dtype=torch.uint8).reshape(8, 32)[:, :8].contiguous()
@@ -411,9 +410,7 @@ def test_scale_bytes_and_loader_validation():
 )
 @pytest.mark.parametrize("ndim", [1, 2, 3])
 def test_embedding_noncontiguous_ids(device, ndim):
-    embed = RowShardedEngramEmbedding(
-        64, 256, _mapping(0, 1, 1), device, False, "gpu", None, 1
-    )
+    embed = RowShardedEngramEmbedding(64, 256, _mapping(0, 1, 1), device, None, 1)
     codes = torch.randn(64, 256, device=device).to(torch.float8_e4m3fn)
     scales = torch.randint(120, 132, (64, 8), dtype=torch.uint8, device=device)
     embed.weight_loader(embed.weight, codes)
@@ -439,8 +436,6 @@ def _model(device, quant_config):
         v41_mxfp8_config(quant_config),
         "model.layers.1.engram",
         device,
-        False,
-        "gpu",
         None,
     )
 
@@ -538,7 +533,7 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(
     } == set(dict(model.named_parameters()))
     for rank in range(4):
         large = RowShardedEngramEmbedding(
-            384016682, 256, _mapping(rank, 4, 4), "meta", False, "gpu", None, 1
+            384016682, 256, _mapping(rank, 4, 4), "meta", None, 1
         )
         assert large.weight.shape == (96004171, 256)
         assert large.scale.shape == (96004171, 8)
@@ -549,9 +544,7 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_lookup_hash_and_graph_replay():
     state = EngramHashState(_config(), _Tokenizer(), "cuda:0")
-    embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
-    )
+    embed = RowShardedEngramEmbedding(72, 32, _mapping(0, 1, 1), "cuda:0", None, 1)
     codes, scales = _weights(72, 32)
     embed.weight_loader(embed.weight, codes)
     embed.weight_loader(embed.scale, scales)
@@ -653,9 +646,7 @@ def test_cuda_host_table_feeds_wkv_its_mxfp8_rows(alloc):
             v41_mxfp8_config(quant),
             "model.layers.1.engram",
             "cuda:0",
-            host_table,
-            "shared" if host_table else "gpu",
-            EngramHostAlloc(alloc, "writer") if host_table else None,
+            EngramHostAlloc("shared", alloc, "writer") if host_table else None,
         )
         model.embed.weight_loader(model.embed.weight, codes)
         model.embed.weight_loader(model.embed.scale, scales)
@@ -668,7 +659,7 @@ def test_cuda_host_table_feeds_wkv_its_mxfp8_rows(alloc):
         model.wkv.quant_method.process_weights_after_loading(model.wkv)
         models.append(model)
     gpu, host = models
-    assert host.embed.serves_mxfp8_rows and not gpu.embed.serves_mxfp8_rows
+    assert host.embed.has_full_packed_table and not gpu.embed.has_full_packed_table
     assert (host.embed.cumem is not None) == (alloc == "cumem")
     hashes = torch.randint(0, 72, (5, 2, 6), device="cuda:0")
     hashes[1, 0, 2], hashes[3, 0, 5] = -1, 72
@@ -724,9 +715,7 @@ def test_distributed_four_way_lookup(monkeypatch):
     process_group_manager.init_process_group(mapping.attn.tp_group, backend="nccl")
     try:
         codes, scales = _weights(19, 64)
-        table = RowShardedEngramEmbedding(
-            19, 64, mapping, device, False, "gpu", None, 1
-        )
+        table = RowShardedEngramEmbedding(19, 64, mapping, device, None, 1)
         table.weight_loader(table.weight, codes)
         table.weight_loader(table.scale, scales)
         ids = torch.tensor([[0, 4, 5, 9, 10, 14, 15, 18]], device=device)
@@ -778,8 +767,6 @@ def test_local_snapshot_reference_parity():
         v41_mxfp8_config(quant),
         "model.layers.1.engram",
         "meta",
-        False,
-        "gpu",
         None,
     )
     assert full.wkv.weight.shape == (25600, 6144)
@@ -870,6 +857,8 @@ def test_local_snapshot_reference_parity():
 
 
 def test_host_table_matches_gpu_shard_and_skips_allreduce(tmp_path, monkeypatch):
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
     rows, width = 19, 64
     codes, scales = _weights(rows, width)
     path = tmp_path / "table.safetensors"
@@ -889,7 +878,7 @@ def test_host_table_matches_gpu_shard_and_skips_allreduce(tmp_path, monkeypatch)
     sharded = []
     for rank in range(4):
         embed = RowShardedEngramEmbedding(
-            rows, width, _mapping(rank, 4, 4), "cpu", False, "gpu", None, 1
+            rows, width, _mapping(rank, 4, 4), "cpu", None, 1
         )
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             embed.load_sharded("weight", handle.get_slice("weight"), 4)
@@ -898,21 +887,25 @@ def test_host_table_matches_gpu_shard_and_skips_allreduce(tmp_path, monkeypatch)
     gpu_path = torch.stack(sharded).sum(0)
     assert reduces
     host = RowShardedEngramEmbedding(
-        rows, width, _mapping(0, 4, 4), "cpu", True, "shared", _MMAP, 1
+        rows, width, _mapping(0, 4, 4), "cpu", _SHARED_MMAP, 1
     )
     with safe_open(str(path), framework="pt", device="cpu") as handle:
         host.load_sharded("weight", handle.get_slice("weight"), 4)
         host.load_sharded("scale", handle.get_slice("scale"), 4)
     reduces.clear()
-    host_out = host(indices, query_shard=None)
+    plan = QueryShardPlan.from_forward(
+        total_tokens=4, input_lengths=[4], size=4, rank=0, device="cpu"
+    )
+    for query_shard in (None, plan):
+        host_out = host(indices, query_shard=query_shard)
+        torch.testing.assert_close(host_out, gpu_path, rtol=0, atol=0)
     assert reduces == []
     assert host.weight.shape == (rows, width)
-    torch.testing.assert_close(host_out, gpu_path, rtol=0, atol=0)
 
 
 def test_host_table_meta_keeps_full_rows():
     table = RowShardedEngramEmbedding(
-        384016682, 256, _mapping(0, 4, 4), "meta", True, "shared", _MMAP, 14
+        384016682, 256, _mapping(0, 4, 4), "meta", _SHARED_MMAP, 14
     )
     assert table.weight.shape == (384016682, 256)
     assert table.scale.shape == (384016682, 8)
@@ -960,31 +953,20 @@ def test_engram_host_table_server_arg():
 def test_resolve_engram_host_alloc_follows_the_cli(monkeypatch):
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    monkeypatch.setitem(global_server_args_dict, "engram_host_table_alloc", "cumem")
+    monkeypatch.setitem(global_server_args_dict, "engram_host_table_alloc", "mmap")
     monkeypatch.setitem(global_server_args_dict, "engram_host_table_numa", "writer")
-    assert engram.resolve_engram_host_alloc("gpu") is None
-    for layout in ("shared", "sharded"):
-        assert engram.resolve_engram_host_alloc(layout) == EngramHostAlloc(
-            "cumem", "writer"
+    for requested, tp, layout in (
+        ("auto", 1, "shared"),
+        ("auto", 4, "sharded"),
+        ("shared", 4, "shared"),
+        ("sharded", 1, "sharded"),
+    ):
+        monkeypatch.setitem(
+            global_server_args_dict, "engram_host_table_layout", requested
         )
-
-
-def test_resolve_engram_host_layout_auto_and_explicit():
-    from tokenspeed.runtime.models.deepseek_v41_engram import resolve_engram_host_layout
-    from tokenspeed.runtime.utils.env import global_server_args_dict
-
-    previous = global_server_args_dict["engram_host_table_layout"]
-    try:
-        global_server_args_dict["engram_host_table_layout"] = "auto"
-        assert resolve_engram_host_layout(False, 4) == "gpu"
-        assert resolve_engram_host_layout(True, 1) == "shared"
-        assert resolve_engram_host_layout(True, 4) == "sharded"
-        global_server_args_dict["engram_host_table_layout"] = "shared"
-        assert resolve_engram_host_layout(True, 4) == "shared"
-        global_server_args_dict["engram_host_table_layout"] = "sharded"
-        assert resolve_engram_host_layout(True, 1) == "sharded"
-    finally:
-        global_server_args_dict["engram_host_table_layout"] = previous
+        assert engram.resolve_engram_host_alloc(tp) == EngramHostAlloc(
+            layout, "mmap", "writer"
+        )
 
 
 def test_host_sharded_table_matches_gpu_and_allreduces(tmp_path, monkeypatch):
@@ -1008,12 +990,8 @@ def test_host_sharded_table_matches_gpu_and_allreduces(tmp_path, monkeypatch):
     host_parts = []
     for rank in range(4):
         mapping = _mapping(rank, 4, 4)
-        gpu = RowShardedEngramEmbedding(
-            rows, width, mapping, "cpu", False, "gpu", None, 1
-        )
-        host = RowShardedEngramEmbedding(
-            rows, width, mapping, "cpu", True, "sharded", _MMAP, 1
-        )
+        gpu = RowShardedEngramEmbedding(rows, width, mapping, "cpu", None, 1)
+        host = RowShardedEngramEmbedding(rows, width, mapping, "cpu", _SHARDED_MMAP, 1)
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             gpu.load_sharded("weight", handle.get_slice("weight"), 4)
             gpu.load_sharded("scale", handle.get_slice("scale"), 4)
@@ -1058,7 +1036,12 @@ def test_host_table_gathers_each_packed_row_once(monkeypatch, layout, tp_size):
     expected = _dequant(codes, scales)[ids.clamp(0, rows - 1)]
     for rank in range(tp_size):
         table = RowShardedEngramEmbedding(
-            rows, width, _mapping(rank, tp_size, 4), "cpu", True, layout, _MMAP, 1
+            rows,
+            width,
+            _mapping(rank, tp_size, 4),
+            "cpu",
+            EngramHostAlloc(layout, "mmap", "writer"),
+            1,
         )
         table.weight_loader(table.weight, codes)
         table.weight_loader(table.scale, scales)
@@ -1076,7 +1059,7 @@ def test_host_table_gathers_each_packed_row_once(monkeypatch, layout, tp_size):
 
 def test_host_sharded_meta_keeps_rank_rows():
     table = RowShardedEngramEmbedding(
-        384016682, 256, _mapping(1, 4, 4), "meta", True, "sharded", _MMAP, 14
+        384016682, 256, _mapping(1, 4, 4), "meta", _SHARDED_MMAP, 14
     )
     assert table.weight.shape == (96004171, 256)
     assert table.row_start == 96004171
@@ -1163,12 +1146,12 @@ def test_checkpoint_filter_skips_engram_embed_only():
 def test_cuda_host_table_gather_matches_device_shard():
     codes, scales = _weights(72, 32)
     device_embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
+        72, 32, _mapping(0, 1, 1), "cuda:0", None, 1
     )
     device_embed.weight_loader(device_embed.weight, codes)
     device_embed.weight_loader(device_embed.scale, scales)
     host_embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cpu", True, "shared", _MMAP, 1
+        72, 32, _mapping(0, 1, 1), "cpu", _SHARED_MMAP, 1
     )
     host_embed.weight_loader(host_embed.weight, codes)
     host_embed.weight_loader(host_embed.scale, scales)
@@ -1208,7 +1191,7 @@ def test_cuda_shared_file_host_table_is_registered_and_gathers(tmp_path, monkeyp
     monkeypatch.setenv("LOCAL_RANK", "0")
     codes, scales = _weights(72, 32)
     device_embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
+        72, 32, _mapping(0, 1, 1), "cuda:0", None, 1
     )
     device_embed.weight_loader(device_embed.weight, codes)
     device_embed.weight_loader(device_embed.scale, scales)
@@ -1224,7 +1207,7 @@ def test_cuda_shared_file_host_table_is_registered_and_gathers(tmp_path, monkeyp
             patch.setattr(dist, "get_world_size", lambda group=None: 2)
             path = engram._engram_host_table_path(1, "packed", 72 * 33)
             host_embed = RowShardedEngramEmbedding(
-                72, 32, _mapping(0, 1, 1), "cpu", True, "shared", _MMAP, 1
+                72, 32, _mapping(0, 1, 1), "cpu", _SHARED_MMAP, 1
             )
     finally:
         dist.destroy_process_group()
@@ -1261,10 +1244,10 @@ def test_cuda_host_sharded_table_matches_device_shard_and_graph_replay(
     for rank in range(4):
         mapping = _mapping(rank, 4, 4)
         device_embed = RowShardedEngramEmbedding(
-            rows, width, mapping, "cuda:0", False, "gpu", None, 1
+            rows, width, mapping, "cuda:0", None, 1
         )
         host_embed = RowShardedEngramEmbedding(
-            rows, width, mapping, "cpu", True, "sharded", _MMAP, 1
+            rows, width, mapping, "cpu", _SHARDED_MMAP, 1
         )
         for embed in (device_embed, host_embed):
             embed.weight_loader(embed.weight, codes)
@@ -1291,7 +1274,7 @@ def test_cuda_cumem_host_table_gathers_and_outlives_its_module():
         pytest.skip(host_memory.probe_host_memory(0, False))
     codes, scales = _weights(72, 32)
     device_embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
+        72, 32, _mapping(0, 1, 1), "cuda:0", None, 1
     )
     device_embed.weight_loader(device_embed.weight, codes)
     device_embed.weight_loader(device_embed.scale, scales)
@@ -1300,9 +1283,7 @@ def test_cuda_cumem_host_table_gathers_and_outlives_its_module():
         32,
         _mapping(0, 1, 1),
         "cuda:0",
-        True,
-        "shared",
-        EngramHostAlloc("cumem", "interleave"),
+        EngramHostAlloc("shared", "cumem", "interleave"),
         1,
     )
     host_embed.weight_loader(host_embed.weight, codes)
@@ -1337,9 +1318,7 @@ def test_query_sharded_embedding_matches_full_lookup(monkeypatch, counts):
     # Only transport is mocked: each table computes its actual contribution.
     monkeypatch.setattr(engram, "all_reduce", lambda tensor, **kwargs: tensor)
     for rank in range(4):
-        table = RowShardedEngramEmbedding(
-            19, 64, _mapping(rank, 4, 4), "cpu", False, "gpu", None, 1
-        )
+        table = RowShardedEngramEmbedding(19, 64, _mapping(rank, 4, 4), "cpu", None, 1)
         table.weight_loader(table.weight, codes)
         table.weight_loader(table.scale, scales)
         tables.append(table)
@@ -1607,9 +1586,7 @@ def test_cumem_table_of_a_single_rank_is_private_and_matches_the_gpu_path(
         64,
         _mapping(0, 1, 1),
         "cpu",
-        True,
-        "shared",
-        EngramHostAlloc("cumem", "interleave"),
+        EngramHostAlloc("shared", "cumem", "interleave"),
         1,
     )
     table.weight_loader(table.weight, codes)
@@ -1636,9 +1613,7 @@ def test_cumem_table_mapping_outlives_the_module(file_chunks):
         64,
         _mapping(0, 1, 1),
         "cpu",
-        True,
-        "shared",
-        EngramHostAlloc("cumem", "writer"),
+        EngramHostAlloc("shared", "cumem", "writer"),
         1,
     )
     table.weight_loader(table.weight, codes)
@@ -1667,14 +1642,12 @@ def test_cumem_mode_raises_and_auto_falls_back_without_a_driver(monkeypatch):
             64,
             mapping,
             "cpu",
-            True,
-            "shared",
-            EngramHostAlloc("cumem", "writer"),
+            EngramHostAlloc("shared", "cumem", "writer"),
             1,
         )
     with _engram_warnings() as warnings:
         table = RowShardedEngramEmbedding(
-            19, 64, mapping, "cpu", True, "shared", EngramHostAlloc("auto", "writer"), 1
+            19, 64, mapping, "cpu", EngramHostAlloc("shared", "auto", "writer"), 1
         )
     assert table.cumem is None
     # The one warning gives the reason.
@@ -1714,35 +1687,18 @@ def test_mmap_sharded_and_non_nvidia_tables_never_touch_the_driver(monkeypatch):
                 64,
                 _mapping(0, 1, 1),
                 "cpu",
-                True,
-                layout,
-                EngramHostAlloc(mode, "interleave"),
+                EngramHostAlloc(layout, mode, "interleave"),
                 1,
             )
         assert table.cumem is None and not warnings
     with pytest.raises(ValueError, match="shared layout"):
-        RowShardedEngramEmbedding(
-            19,
-            64,
-            _mapping(0, 1, 1),
-            "cpu",
-            True,
-            "sharded",
-            EngramHostAlloc("cumem", "writer"),
-            1,
-        )
-    with pytest.raises(TypeError, match="EngramHostAlloc"):
-        RowShardedEngramEmbedding(
-            19, 64, _mapping(0, 1, 1), "cpu", True, "shared", None, 1
-        )
-    with pytest.raises(ValueError, match="no host allocation"):
-        RowShardedEngramEmbedding(
-            19, 64, _mapping(0, 1, 1), "cpu", False, "gpu", _MMAP, 1
-        )
+        EngramHostAlloc("sharded", "cumem", "writer")
+    with pytest.raises(ValueError, match="shared or sharded"):
+        EngramHostAlloc("gpu", "mmap", "writer")
     with pytest.raises(ValueError, match="auto, cumem or mmap"):
-        EngramHostAlloc("hugetlb", "writer")
+        EngramHostAlloc("shared", "hugetlb", "writer")
     with pytest.raises(ValueError, match="interleave or writer"):
-        EngramHostAlloc("auto", "local")
+        EngramHostAlloc("shared", "auto", "local")
     host_memory.probe_host_memory.cache_clear()
 
 
@@ -1774,9 +1730,7 @@ def test_cumem_table_keeps_the_numa_reserve_and_says_why_it_falls_back(
             64,
             _mapping(0, 1, 1),
             "cpu",
-            True,
-            "shared",
-            EngramHostAlloc("auto", "writer"),
+            EngramHostAlloc("shared", "auto", "writer"),
             1,
         )
     assert table.cumem is None
@@ -1793,9 +1747,7 @@ def test_cumem_table_keeps_the_numa_reserve_and_says_why_it_falls_back(
             64,
             _mapping(0, 1, 1),
             "cpu",
-            True,
-            "shared",
-            EngramHostAlloc("cumem", "writer"),
+            EngramHostAlloc("shared", "cumem", "writer"),
             1,
         )
 
@@ -1855,9 +1807,7 @@ def _cumem_rank(rank: int, directory: Path, scenario: str) -> None:
                 64,
                 _mapping(rank, 1, 4),
                 "cpu",
-                True,
-                "shared",
-                EngramHostAlloc("auto", numa),
+                EngramHostAlloc("shared", "auto", numa),
                 1,
             )
         # One warning for the whole job, with every rank's reason.
@@ -1967,9 +1917,7 @@ def test_torchrun_ranks_share_a_cumem_host_table(monkeypatch):
             64,
             _mapping(rank, 1, 4),
             device,
-            True,
-            "shared",
-            EngramHostAlloc("cumem", "interleave"),
+            EngramHostAlloc("shared", "cumem", "interleave"),
             1,
         )
         assert table.cumem is not None
@@ -2001,3 +1949,9 @@ def test_torchrun_ranks_share_a_cumem_host_table(monkeypatch):
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+def test_aligned_row_boundaries():
+    # Six-byte rows align every four rows: one empty owner and a partial final block.
+    bounds = engram.aligned_row_boundaries(11, 6, size=4, granularity=8)
+    assert bounds == (0, 0, 4, 8, 11)

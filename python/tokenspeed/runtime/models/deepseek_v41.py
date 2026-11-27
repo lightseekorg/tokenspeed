@@ -185,11 +185,11 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
+    EngramGroup,
     EngramHashState,
-    EngramHostAlloc,
+    EngramStorage,
     is_engram_embed_checkpoint_name,
     resolve_engram_host_alloc,
-    resolve_engram_host_layout,
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
@@ -2036,9 +2036,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         prefix: str,
         aux_stream,
         hc_stream: torch.cuda.Stream | None,
-        host_table: bool,
-        host_layout: str,
-        host_alloc: EngramHostAlloc | None,
+        engram_storage: EngramStorage,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -2084,9 +2082,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 dense_quant,
                 add_prefix("engram", prefix),
                 self.attn.wq_a_wkv.weight.device,
-                host_table,
-                host_layout,
-                host_alloc,
+                engram_storage,
             )
             if layer_id in config.engram_layer_ids
             else None
@@ -2509,8 +2505,6 @@ class DeepseekV41Model(nn.Module):
         quant_config: QuantizationConfig | None,
         prefix: str,
         host_table: bool,
-        host_layout: str,
-        host_alloc: EngramHostAlloc | None,
     ):
         super().__init__()
         if mapping.pp_size != 1:
@@ -2582,6 +2576,19 @@ class DeepseekV41Model(nn.Module):
             use_presharded_weights=False,
         )
         device = self.embed_tokens.weight.device
+        self.engram_group: EngramGroup | None = None
+        engram_storage: EngramStorage = None
+        group_size = global_server_args_dict["engram_group_size"]
+        if group_size is not None and config.engram_layer_ids:
+            self.engram_group = EngramGroup(
+                group_size,
+                global_server_args_dict["engram_group_store"],
+                device,
+                host=host_table,
+            )
+            engram_storage = self.engram_group
+        elif host_table and config.engram_layer_ids:
+            engram_storage = resolve_engram_host_alloc(mapping.attn.tp_size)
         self.aux_stream = (
             torch.cuda.Stream(device=device) if device.type == "cuda" else None
         )
@@ -2600,9 +2607,7 @@ class DeepseekV41Model(nn.Module):
                     add_prefix(f"layers.{layer_id}", prefix),
                     self.aux_stream,
                     self.hc_stream,
-                    host_table,
-                    host_layout,
-                    host_alloc,
+                    engram_storage,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -2619,13 +2624,15 @@ class DeepseekV41Model(nn.Module):
         )
 
     def initialize_engram(self, tokenizer) -> None:
-        """Initialize immutable tokenizer/hash constants once; never request history."""
+        """Initialize the hash constants and publish shared tables after weight loading."""
         if self.engram_hash is not None:
             raise RuntimeError("Engram tokenizer is already initialized")
         if self.config.engram_layer_ids:
             self.engram_hash = EngramHashState(
                 self.config, tokenizer, self.embed_tokens.weight.device
             )
+        if self.engram_group is not None:
+            self.engram_group.publish_loaded()
 
     def forward(
         self,
@@ -3258,16 +3265,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         )
 
     def resolve_model(self, config, mapping, quant_config, prefix):
-        host_table = global_server_args_dict["engram_host_table"]
-        host_layout = resolve_engram_host_layout(host_table, mapping.attn.tp_size)
         return self.model_cls(
             config.text_config,
             mapping,
             quant_config,
             add_prefix("model", prefix),
-            host_table,
-            host_layout,
-            resolve_engram_host_alloc(host_layout),
+            global_server_args_dict["engram_host_table"],
         )
 
     bind_checkpoint_dir = bind_checkpoint_dir
@@ -3782,6 +3785,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs
     ) -> None:
+        if (
+            isinstance(self.model, DeepseekV41Model)
+            and self.model.engram_group is not None
+            and self.model.engram_group.ready
+        ):
+            raise RuntimeError("Published Engram group shards are immutable")
         params = dict(self.vision.named_parameters()) if self.vision is not None else {}
         loaded = set()
 

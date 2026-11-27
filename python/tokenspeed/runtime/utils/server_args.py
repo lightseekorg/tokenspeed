@@ -788,6 +788,8 @@ class ServerArgs:
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     # DeepSeek V4.1 Engram host tables. Off by default (GPU-sharded).
     engram_host_table: bool = False
+    engram_group_size: int | None = None
+    engram_group_store: str | None = None
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
     engram_host_table_alloc: str = "auto"
@@ -1293,6 +1295,14 @@ class ServerArgs:
             download,
             download_dir=self.download_dir,
         )
+        if (
+            self.engram_group_size is not None
+            and architectures is not None
+            and "DeepseekV41ForCausalLM" not in architectures
+        ):
+            raise ValueError(
+                f"Engram group shards require a DeepSeek V4.1 target, got {architectures}"
+            )
         if (
             (
                 self.owned_attention_output != "reduce-scatter"
@@ -3507,9 +3517,45 @@ class ServerArgs:
                 "--init-expert-location or --expert-distribution-recorder-mode)."
             )
 
+    def validate_engram_group(self) -> None:
+        if self.engram_group_size is None and self.engram_group_store is None:
+            return
+        if (
+            type(self.engram_group_size) is not int
+            or self.engram_group_size < 2
+            or not self.engram_group_store
+        ):
+            raise ValueError(
+                "Engram group shards need --engram-group-size >= 2 and --engram-group-store"
+            )
+        if self.engram_group_size < self.mapping.world_size:
+            raise ValueError(
+                "Engram group size must include all GPUs of the participating engines"
+            )
+        if self.disaggregation_mode == "encode":
+            raise ValueError("An encoder-only engine has no Engram tables to share")
+        if self.enable_memory_saver or self.model_update_config is not None:
+            raise ValueError(
+                "Engram group shards are immutable and stay mapped while peers serve"
+            )
+        if self.load_format not in ("auto", "safetensors", "dummy"):
+            raise ValueError(
+                "Engram group shards require safetensors, auto or dummy loading"
+            )
+        if (
+            self.engram_host_table_layout != "auto"
+            or self.engram_host_table_alloc == "mmap"
+            or self.engram_host_table_dir is not None
+            or self.engram_host_table_numa != "interleave"
+        ):
+            raise ValueError(
+                "Engram group shards use one cuMem slice per GPU; use --engram-host-table to place it in host NUMA memory"
+            )
+
     def validate(self):
         # Disaggregation resolution can disable caching (the encode role).
         self.validate_prefix_cache_eviction()
+        self.validate_engram_group()
         self.validate_decode_extra_slots()
         if (
             type(self.ttft_trace_sampling_percentage) is not int
@@ -5092,6 +5138,18 @@ class ServerArgs:
                 "memory and gather rows through UVA. Frees HBM for KV cache. "
                 "See --engram-host-table-layout. Requires enough host RAM."
             ),
+        )
+        parser.add_argument(
+            "--engram-group-size",
+            type=int,
+            default=ServerArgs.engram_group_size,
+            help="Total GPUs sharing the V4.1 Engram tables in one NVLink domain. "
+            "All workers need access to the same IMEX channel.",
+        )
+        parser.add_argument(
+            "--engram-group-store",
+            default=ServerArgs.engram_group_store,
+            help="Fresh shared directory for the Engram group startup rendezvous.",
         )
         parser.add_argument(
             "--engram-host-table-dir",
