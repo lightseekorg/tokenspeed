@@ -865,7 +865,7 @@ def test_trace_context_provider_rejects_async_and_generators():
         registry.get_trace_provider("test-async-trace")
 
 
-def test_post_model_init_hooks_execute_in_name_order_and_roll_back():
+def test_post_model_init_hook_snapshot_order_and_rollback():
     calls = []
     before = registry.get_post_model_init_hooks()
 
@@ -878,27 +878,23 @@ def test_post_model_init_hooks_execute_in_name_order_and_roll_back():
                 "test.a", lambda context: calls.append("a")
             )
             snapshot = registry.get_post_model_init_hooks()
+            registry.register_post_model_init_hook(
+                "test.m", lambda context: calls.append("m")
+            )
             for hook in snapshot:
                 if hook not in before:
                     hook(None)
             assert calls == ["a", "z"]
-            assert record.names["post_model_init"] == ["test.z", "test.a"]
+            calls.clear()
+            for hook in registry.get_post_model_init_hooks():
+                if hook not in before:
+                    hook(None)
+            assert calls == ["a", "m", "z"]
+            assert record.names["post_model_init"] == ["test.z", "test.a", "test.m"]
             with pytest.raises(ValueError, match="already registered"):
                 registry.register_post_model_init_hook("test.a", lambda context: None)
             raise RuntimeError("undo hooks")
     assert registry.get_post_model_init_hooks() == before
-
-
-def test_post_model_init_hook_failure_propagates():
-    def fail(context):
-        raise RuntimeError("model startup failed")
-
-    with pytest.raises(RuntimeError, match="model startup failed"):
-        with registry.recording():
-            registry.register_post_model_init_hook("test.failure", fail)
-            for hook in registry.get_post_model_init_hooks():
-                if hook is fail:
-                    hook(None)
 
 
 def test_post_model_init_hook_rejects_async_and_generators():

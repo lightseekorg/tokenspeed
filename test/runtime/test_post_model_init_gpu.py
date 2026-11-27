@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 
-"""A loaded engine keeps serving after a plugin retires its checkpoint source."""
+"""Cache metadata survives source retirement and is prepared once, before profiling."""
 
 import json
 import os
@@ -69,6 +69,7 @@ def _checkpoint(directory):
             bos_token_id=0,
             eos_token_id=1,
             pad_token_id=2,
+            source_cache_dtype="bfloat16",
         )
     )
     model.save_pretrained(directory)
@@ -119,56 +120,24 @@ def _draft_checkpoint(directory):
     save_file(weights, str(directory / "model.safetensors"))
 
 
-def _source_plugin(directory):
-    directory.mkdir()
-    (directory / "source_lifetime_fixture.py").write_text("""
-import json
-import os
-import shutil
-from importlib.metadata import entry_points
-from pathlib import Path
-from tokenspeed.runtime.plugins.registry import register_post_model_init_hook
-
-def initialized(context):
-    with Path(os.environ["SOURCE_TEST_MARKER"]).open("a") as marker:
-        marker.write(json.dumps({
-            "model": context.model_config.model_path,
-            "draft": context.draft_model_config is not None,
-        }) + "\\n")
-    if os.environ["SOURCE_TEST_RETIRE"] == "1":
-        shutil.rmtree(context.model_config.model_path)
-
-def register():
-    register_post_model_init_hook("source_lifetime_fixture", initialized)
-""")
-    metadata = directory / "source_lifetime_fixture-1.0.dist-info"
+@pytest.fixture
+def launch(tmp_path):
+    fixture = tmp_path / "plugin"
+    fixture.mkdir()
+    shutil.copyfile(
+        Path(__file__).with_name("models") / "source_lifetime_plugin.py",
+        fixture / "source_lifetime_plugin.py",
+    )
+    metadata = fixture / "source_lifetime_fixture-1.0.dist-info"
     metadata.mkdir()
     (metadata / "METADATA").write_text(
         "Metadata-Version: 2.1\nName: source-lifetime-fixture\nVersion: 1.0\n"
     )
     (metadata / "entry_points.txt").write_text(
-        "[tokenspeed.plugins]\nsource-lifetime-fixture = source_lifetime_fixture:register\n"
+        "[tokenspeed.plugins]\nsource-lifetime-fixture = source_lifetime_plugin:register\n"
     )
 
-
-@pytest.mark.parametrize("with_draft", [False, True])
-def test_post_model_init_source_lifetime(tmp_path, with_draft):
-    original = tmp_path / "original"
-    _checkpoint(original)
-    if with_draft:
-        _draft_checkpoint(original / "draft")
-    fixture = tmp_path / "fixture"
-    _source_plugin(fixture)
-    bad = tmp_path / "bad"
-    bad.mkdir()
-    tensors = load_file(original / "model.safetensors")
-    tensors["model.embed_tokens.weight"] = torch.zeros(32, 128)
-    save_file(tensors, str(bad / "model.safetensors"))
-    outputs = []
-    for retire in (False, True):
-        source = tmp_path / f"source-{int(retire)}"
-        shutil.copytree(original, source)
-        marker = tmp_path / f"initialized-{int(retire)}.jsonl"
+    def start(source, *, with_draft, mode):
         args = [
             "--model",
             str(source),
@@ -207,7 +176,7 @@ def test_post_model_init_source_lifetime(tmp_path, with_draft):
             ]
         else:
             args += ["--cudagraph-capture-sizes", "1", "2"]
-        driver = WireDriver(
+        return WireDriver(
             args,
             num_engines=1,
             routing="round_robin",
@@ -217,21 +186,47 @@ def test_post_model_init_source_lifetime(tmp_path, with_draft):
                 "TOKENSPEED_DISABLE_PLUGINS": ",".join(
                     ep.name for ep in entry_points(group="tokenspeed.plugins")
                 ),
-                "SOURCE_TEST_MARKER": str(marker),
-                "SOURCE_TEST_RETIRE": str(int(retire)),
+                "SOURCE_TEST_METADATA": str(source.with_suffix(".json")),
+                "SOURCE_TEST_MODE": mode,
             },
         )
-        try:
-            assert source.exists() == (not retire)
-            calls = [json.loads(line) for line in marker.read_text().splitlines()]
-            assert calls == [{"model": str(source), "draft": with_draft}]
-            request = generate_request(
+
+    return start
+
+
+def _generate(driver):
+    [result] = driver.generate(
+        [
+            generate_request(
                 [3, 4, 5],
                 {"temperature": 0.0, "max_new_tokens": 4, "ignore_eos": True},
                 return_logprob=True,
             )
-            [result] = driver.generate([request])
-            outputs.append((result.output_ids, result.output_token_logprobs))
+        ]
+    )
+    return result.output_ids, result.output_token_logprobs
+
+
+@pytest.mark.parametrize("with_draft", [False, True], ids=["graphs", "draft"])
+def test_post_model_init_source_lifetime(tmp_path, launch, with_draft):
+    original = tmp_path / "original"
+    _checkpoint(original)
+    if with_draft:
+        _draft_checkpoint(original / "draft")
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    tensors = load_file(original / "model.safetensors")
+    tensors["model.embed_tokens.weight"] = torch.zeros(32, 128)
+    save_file(tensors, str(bad / "model.safetensors"))
+    outputs = []
+    for mode in ("keep", "retire"):
+        source = tmp_path / mode
+        shutil.copytree(original, source)
+        with launch(source, with_draft=with_draft, mode=mode) as driver:
+            assert source.exists() == (mode == "keep")
+            metadata = json.loads(source.with_suffix(".json").read_text())
+            assert metadata["has_draft"] == with_draft
+            outputs.append(_generate(driver))
             [paused] = driver.control(PauseSchedulerReqInput(mode="wait"))
             assert paused.success, paused.message
             [rejected] = driver.control(
@@ -244,17 +239,14 @@ def test_post_model_init_source_lifetime(tmp_path, with_draft):
             assert loaded.success, loaded.message
             [resumed] = driver.control(ResumeSchedulerReqInput())
             assert resumed.success, resumed.message
-            [after] = driver.generate(
-                [
-                    generate_request(
-                        [3, 4, 5],
-                        {"temperature": 0.0, "max_new_tokens": 4, "ignore_eos": True},
-                        return_logprob=True,
-                    )
-                ]
-            )
-            assert (after.output_ids, after.output_token_logprobs) == outputs[-1]
-            assert len(marker.read_text().splitlines()) == 1
-        finally:
-            driver.shutdown()
+            assert _generate(driver) == outputs[-1]
     assert outputs[0] == outputs[1]
+
+
+def test_post_model_init_failure_stops_startup(tmp_path, launch, capfd):
+    source = tmp_path / "source"
+    _checkpoint(source)
+    with pytest.raises(RuntimeError, match="the engine (exited|did not register)"):
+        with launch(source, with_draft=False, mode="fail"):
+            pytest.fail("an engine with a failed hook must not serve")
+    assert "source lifetime hook refused startup" in capfd.readouterr().err
