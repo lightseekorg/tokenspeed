@@ -29,7 +29,11 @@ from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
     _triton_mha_prefill_impl,
 )
 from tokenspeed_kernel.ops.attention.mha._triton.qkv_rotary import *  # noqa: F403
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -149,16 +153,11 @@ def triton_mha_extend_with_kvcache(
     )
 
 
-@register_kernel(
-    "attention",
-    "mha_decode_with_kvcache",
-    name="triton_mha_decode_with_kvcache",
+_DECODE = dict(
     solution="triton",
-    capability=_PORTABLE_CAPABILITY,
     signatures=format_signatures(
         ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
     ),
-    priority=Priority.PORTABLE,
     traits={
         "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
@@ -166,6 +165,16 @@ def triton_mha_extend_with_kvcache(
         "sliding_window": frozenset({False, True}),
         "window_sink": frozenset({False, True}),
     },
+)
+
+
+@register_kernel(
+    "attention",
+    "mha_decode_with_kvcache",
+    name="triton_mha_decode_with_kvcache",
+    capability=_PORTABLE_CAPABILITY,
+    priority=Priority.PORTABLE,
+    **_DECODE,
 )
 def triton_mha_decode_with_kvcache(
     q: torch.Tensor,
@@ -205,6 +214,25 @@ def triton_mha_decode_with_kvcache(
         v_scale=v_scale,
         enable_pdl=enable_pdl,
     )
+
+
+# The extend kernel is slow for single-token rows on RDNA4, so the decode
+# kernel also takes the decode rows of a mixed prefill/decode batch there.
+@register_kernel(
+    "attention",
+    "mha_decode_with_kvcache",
+    name="triton_mha_decode_with_kvcache_gfx120x",
+    features={"mixed_batch_rows"},
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(12, 0),
+        max_arch_version=ArchVersion(12, 0),
+        vendors=frozenset({"amd"}),
+    ),
+    priority=Priority.PORTABLE + 1,
+    **_DECODE,
+)
+def triton_mha_decode_with_kvcache_gfx120x(*args, **kwargs):
+    return triton_mha_decode_with_kvcache(*args, **kwargs)
 
 
 if current_platform().is_npu:
