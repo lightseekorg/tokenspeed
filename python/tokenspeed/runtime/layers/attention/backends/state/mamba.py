@@ -991,7 +991,7 @@ class MambaAttnBackend(AttentionBackend):
         """
         if validate is None:
             validate = cache_debug_enabled()
-        group_num_blocks = getattr(self, "_state_group_num_blocks", None) or {}
+        group_num_blocks = self._state_group_num_blocks
         state_in_blocks: dict[str, torch.Tensor] = {}
         state_out_blocks: dict[str, torch.Tensor] = {}
         for group_id in self._state_group_ids:
@@ -1021,7 +1021,7 @@ class MambaAttnBackend(AttentionBackend):
         """
         if not block_tables_cpu:
             return
-        group_num_blocks = getattr(self, "_state_group_num_blocks", None)
+        group_num_blocks = self._state_group_num_blocks
         if not group_num_blocks:
             return
         for group_id in self._state_group_ids:
