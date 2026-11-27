@@ -54,6 +54,7 @@ from tokenspeed.runtime.execution.drafter.base import (  # noqa: E402
 )
 from tokenspeed.runtime.execution.drafter.dspark import DSpark  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -97,6 +98,7 @@ def _drafter(
     drafter.input_buffers = SimpleNamespace(
         max_bs=max_bs,
         req_pool_indices_buf=torch.arange(max_bs, device=device),
+        all_extends_mid_chunk=False,
     )
     drafter.spec_num_tokens = WIDTH
     drafter.draft_query_width = WIDTH
@@ -206,7 +208,16 @@ def test_a_capture_without_warmup_is_refused() -> None:
 # ----------------------------------------------------------------------
 
 
-def _round(bs, num_extends, *, global_num_tokens=None, shard_size=None):
+def _round(
+    bs,
+    num_extends,
+    *,
+    global_num_tokens=None,
+    shard_size=None,
+    num_prefill_outputs=None,
+):
+    if num_prefill_outputs is None:
+        num_prefill_outputs = num_extends
     return SimpleNamespace(
         bs=bs,
         num_extends=num_extends,
@@ -214,6 +225,9 @@ def _round(bs, num_extends, *, global_num_tokens=None, shard_size=None):
         global_num_tokens=global_num_tokens,
         query_shard=None if shard_size is None else SimpleNamespace(size=shard_size),
         target_capture_sink=None,
+        output_layout=ForwardOutputLayout(
+            num_extends, num_prefill_outputs, bs - num_extends, WIDTH
+        ),
     )
 
 
@@ -280,6 +294,76 @@ def test_a_replayed_round_stages_its_block_then_replays(
         assert drafter.block_ids_buf[:2, 0].tolist() == [11, 12]
     else:
         assert [event for event, _ in events] == ["eager"]
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("via_layout", [False, True])
+def test_mid_chunk_extend_updates_context_and_skips_draft(
+    monkeypatch, dp_size: int, via_layout: bool
+) -> None:
+    """An incomplete prefill chunk still writes context KV and updates prefix
+    lengths, then skips block drafting (both graph replay and eager draft)."""
+    drafter = _drafter(dp_size=dp_size)
+    drafter.target_model = object()
+    drafter._context_written = False
+    drafter.next_tokens_buf.fill_(99)
+    events: list[str] = []
+    drafter._block_graphs[2] = dflash._BlockGraph(
+        capture=_ReplayRecorder(events), ctx=object()
+    )
+    monkeypatch.setattr(
+        DSpark,
+        "_update_native_cache_from_target",
+        lambda self, *args: events.append("context"),
+    )
+    monkeypatch.setattr(DSpark, "draft", lambda self, current: events.append("eager"))
+    if via_layout:
+        ctx = _round(2, 2, num_prefill_outputs=0)
+        output_tokens = torch.empty(0, dtype=torch.int32)
+        expected = [[0, 0, 0, 0], [0, 0, 0, 0]]
+    else:
+        drafter.input_buffers.all_extends_mid_chunk = True
+        ctx = _round(2, 2, num_prefill_outputs=2)
+        output_tokens = torch.tensor([11, 12], dtype=torch.int32)
+        expected = [[11, 0, 0, 0], [12, 0, 0, 0]]
+
+    result = drafter.run(ctx, None, output_tokens, torch.zeros(2, dtype=torch.int32))
+
+    assert events == ["context"]
+    assert result.shape == (2, WIDTH)
+    assert result.dtype == torch.int32
+    assert result.tolist() == expected
+
+
+def test_mixed_round_never_skips_draft_even_if_mid_chunk_flag_is_set(
+    monkeypatch,
+) -> None:
+    """A mixed round carries decode rows that need candidates and must draft."""
+    drafter = _drafter(dp_size=2)
+    drafter.target_model = object()
+    drafter._context_written = False
+    drafter.input_buffers.all_extends_mid_chunk = True
+    events: list[str] = []
+    monkeypatch.setattr(
+        DSpark,
+        "_update_native_cache_from_target",
+        lambda self, *args: events.append("context"),
+    )
+    monkeypatch.setattr(
+        DSpark,
+        "draft",
+        lambda self, current: (events.append("eager"), drafter.next_tokens_buf[:2])[1],
+    )
+    output_tokens = torch.tensor([11, 12, 13, 14, 15], dtype=torch.int32)
+
+    drafter.run(
+        _round(2, 1, num_prefill_outputs=0),
+        None,
+        output_tokens,
+        torch.tensor([0, 1], dtype=torch.int32),
+    )
+
+    assert events == ["context", "eager"]
 
 
 # ----------------------------------------------------------------------

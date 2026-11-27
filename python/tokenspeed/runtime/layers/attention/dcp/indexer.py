@@ -198,12 +198,12 @@ def merge_index_candidates_row_owner(
 
     Rank ``d`` owns the ``d``-th equal slice of the rows. One all-to-all sends
     every slice's candidates to its owner, the owner merges its rows over
-    every rank's candidates with the kernel the all-gather path uses, and two
-    all-gathers (positions, then counts) return every row's selection to
-    every rank. A row's merge reads the same rank-major candidates as on the
-    all-gather path, so the selection is the same up to the order of equal
-    scores, which neither path prescribes. Every rank must call with the same
-    ``rows`` and record shape.
+    every rank's candidates with the kernel the all-gather path uses, and one
+    all-gather of packed ``[positions | count]`` rows returns every row's
+    selection and valid count to every rank. A row's merge reads the same
+    rank-major candidates as on the all-gather path, so the selection is the
+    same up to the order of equal scores, which neither path prescribes. Every
+    rank must call with the same ``rows`` and record shape.
 
     Args:
         records: This rank's packed candidates
@@ -216,9 +216,8 @@ def merge_index_candidates_row_owner(
         group: The KVP group's ranks.
 
     Returns:
-        Global logical positions ``[rows, topk]`` (padding -1) and valid
-        counts ``[rows]``, int32 views of buffers with ``padded_rows`` rows,
-        identical on every rank.
+        Contiguous global logical positions ``[rows, topk]`` (padding -1) and
+        valid counts ``[rows]`` in int32, identical on every rank.
     """
     degree = len(group)
     if (
@@ -243,11 +242,12 @@ def merge_index_candidates_row_owner(
     # Equal splits: rank d gets slice d, laid out source-rank-major as the merge reads.
     all_to_all_single(received.flatten(), records.flatten(), group)
     positions, counts = dsa_merge_candidates(received, topk=topk, solution=None)
-    all_positions = positions.new_empty((padded, topk))
-    all_counts = counts.new_empty((padded,))
-    all_gather_single(all_positions, positions, group)
-    all_gather_single(all_counts, counts, group)
-    return all_positions[:rows], all_counts[:rows]
+    # Pack positions [local_rows, topk] and counts [local_rows] into one int32
+    # [local_rows, topk + 1] payload so every rank gets both in one all-gather.
+    packed_local = torch.cat((positions, counts.unsqueeze(1)), dim=1)
+    gathered = packed_local.new_empty((padded, topk + 1))
+    all_gather_single(gathered.flatten(), packed_local.flatten(), group)
+    return gathered[:rows, :topk].contiguous(), gathered[:rows, topk].contiguous()
 
 
 @dataclass(frozen=True)

@@ -1813,6 +1813,28 @@ class DFlash(BaseDrafter):
             )
         return True
 
+    def _skip_mid_chunk_draft(self, base_ctx: ForwardContext) -> bool:
+        """Whether this extend round has no request completing into decode.
+
+        A batch of only incomplete prefill chunks produces no verify round
+        after this forward, so any drafted candidates would be discarded
+        (context KV and prefix lengths are still updated beforehand). Under
+        attention DP a DFlash draft holds no cross-DP collectives (its dense
+        MLP is replicated and any vocab-sharded LM head is replicated at
+        setup), and every rank within an attention-TP group receives the same
+        batch lengths, so skipping is collective-safe.
+        """
+        if base_ctx.num_extends != base_ctx.bs:
+            return False
+        if self.input_buffers.all_extends_mid_chunk:
+            return True
+        layout = base_ctx.output_layout
+        return (
+            layout is not None
+            and layout.num_prefill_outputs == 0
+            and layout.num_decodes == 0
+        )
+
     @nvtx_range("drafter:dflash", color="purple")
     def run(
         self,
@@ -1856,6 +1878,13 @@ class DFlash(BaseDrafter):
                 max_draft_prefix=max_draft_prefix,
             )
             return self._draft_native(current_tokens, prepared=True)
+
+        if self._skip_mid_chunk_draft(base_ctx):
+            next_tokens = self.next_tokens_buf[:bs]
+            next_tokens.zero_()
+            if output_tokens.numel() >= bs:
+                next_tokens[:, 0].copy_(output_tokens[:bs].clamp(min=0))
+            return next_tokens
 
         self._current_tokens_from_output(
             output_tokens,
