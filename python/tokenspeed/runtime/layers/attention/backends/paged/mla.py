@@ -298,6 +298,12 @@ class MLAMetadataBackend(PagedMLABackend):
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
+        # Reinitialization must replace the block row buffers, and eager init
+        # keeps them out of torch.inference_mode() capture pools.
+        self._block_page_table_buf = None
+        self._block_seq_lens_buf = None
+        if self._expands_block:
+            self._ensure_block_row_buffers(max_bs)
         if self._dcp_active:
             self._init_dcp_state()
 

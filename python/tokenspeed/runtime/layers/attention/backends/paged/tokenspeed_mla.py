@@ -443,9 +443,12 @@ class CuteDSLMLABackend(PagedMLABackend):
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
         # These rows also belong to the initialization lifecycle, not a graph
-        # capture's allocation pool. Reinitialization must replace them too.
+        # capture's allocation pool. Reinitialization must replace them too,
+        # and eager init avoids lazy allocation inside torch.inference_mode().
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
+        if self.block_decode_active:
+            self._ensure_block_row_buffers()
         self._decode_split_kvs_buf = torch.ones(
             max_bs, dtype=torch.int32, device=self.device
         )
@@ -467,7 +470,6 @@ class CuteDSLMLABackend(PagedMLABackend):
         if self._dcp is None:
             return
         if self.block_decode_active:
-            self._ensure_block_row_buffers()
             table, lengths = self._block_page_table_buf, self._block_seq_lens_buf
         else:
             table, lengths = self.page_table_buf, self.seq_lens_buf

@@ -30,6 +30,7 @@ a stand-in, since the decode graph already records the real one.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 from test.runtime.drafter_prefill_graph_test_utils import RecordingObserver
@@ -560,6 +561,110 @@ def test_dflash2_draft_native_uses_zero_extends_for_mla() -> None:
     refresh = dflash2_drafter.attn_backend.refreshes[0]
     assert refresh["num_extends"] == 0
     assert refresh["forward_mode"] == ForwardMode.DECODE
+
+
+@pytest.mark.parametrize("backend_kind", ["tokenspeed_mla", "mla"])
+def test_mla_block_row_buffers_init_outside_inference_mode(
+    monkeypatch, backend_kind: str
+) -> None:
+    """Block row buffers must be eagerly initialized in init_cuda_graph_state.
+
+    When CUDA graph capture runs under ``torch.inference_mode()``, any buffer
+    allocated lazily during capture becomes an inference tensor and later raises
+    ``RuntimeError`` on in-place ``refresh_decode_metadata`` calls outside
+    ``inference_mode()``.
+    """
+    from tokenspeed.runtime.layers.attention.backends.paged import mla, tokenspeed_mla
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+
+    def fake_broadcast(lens, block, max_ctx, causal, rows_out, entries_out):
+        del causal
+        rows_out.copy_(lens.clamp(block, max_ctx))
+        entries_out.copy_(rows_out.unsqueeze(1))
+
+    monkeypatch.setattr(mla, "broadcast_block_lengths", fake_broadcast)
+    monkeypatch.setattr(tokenspeed_mla, "broadcast_block_lengths", fake_broadcast)
+    monkeypatch.setattr(tokenspeed_mla, "warmup_compile_prefill", lambda **kw: None)
+    monkeypatch.setattr(tokenspeed_mla, "get_num_sm", lambda _dev: 1)
+    monkeypatch.setattr(
+        tokenspeed_mla, "tokenspeed_mla_decode_workspace_size", lambda *a, **kw: 64
+    )
+    monkeypatch.setattr(
+        tokenspeed_mla, "tokenspeed_mla_decode_task_capacity", lambda *a, **kw: 16
+    )
+    monkeypatch.setattr(
+        tokenspeed_mla, "tokenspeed_mla_decode_split_kvs", lambda *a, **kw: None
+    )
+    orig_cuda_device = torch.cuda.device
+    monkeypatch.setattr(
+        torch.cuda,
+        "device",
+        lambda dev: (
+            contextlib.nullcontext() if str(dev) == "cpu" else orig_cuda_device(dev)
+        ),
+    )
+
+    spec = MLAConfig(
+        backend_name=backend_kind,
+        num_attention_heads=16,
+        num_kv_heads=1,
+        head_dim=576,
+        attn_tp_size=1,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        scaling=192**-0.5,
+        kv_cache_dim=576,
+    )
+    cfg = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="",
+        context_len=256,
+        max_bs=4,
+        max_resident_requests=4,
+        speculative_num_draft_tokens=WIDTH,
+        is_draft=True,
+        draft_block_decode=True,
+        components=(spec,),
+    )
+    backend_cls = (
+        tokenspeed_mla.CuteDSLMLABackend
+        if backend_kind == "tokenspeed_mla"
+        else mla.MLAMetadataBackend
+    )
+    backend = backend_cls(cfg, spec, kernel_page_size=64)
+    backend.init_cuda_graph_state(4)
+
+    assert backend._block_page_table_buf is not None
+    assert backend._block_seq_lens_buf is not None
+    assert not backend._block_page_table_buf.is_inference()
+    assert not backend._block_seq_lens_buf.is_inference()
+    first_table = backend._block_page_table_buf
+
+    capture_pages = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=torch.int32)
+    capture_lens = torch.tensor([12, 20], dtype=torch.int32)
+    with torch.inference_mode():
+        backend.refresh_decode_metadata(
+            2, 2, capture_lens, capture_pages, for_graph_replay=True
+        )
+        backend.fill_block_decode_seq_lens(2, capture_lens)
+
+    next_pages = torch.tensor([[10, 11, 12, 13], [14, 15, 16, 17]], dtype=torch.int32)
+    next_lens = torch.tensor([16, 24], dtype=torch.int32)
+    backend.refresh_decode_metadata(2, 0, next_lens, next_pages)
+
+    assert torch.equal(backend.forward_decode_metadata.block_page_table, next_pages)
+    expected_expanded = next_pages[:, None, :].expand(2, WIDTH, 4).reshape(-1, 4)
+    assert torch.equal(backend.forward_decode_metadata.page_table, expected_expanded)
+
+    backend.init_cuda_graph_state(2)
+    assert backend._block_page_table_buf is not first_table
+    assert backend._block_page_table_buf.shape[0] == 2
+    assert not backend._block_page_table_buf.is_inference()
 
 
 if __name__ == "__main__":
