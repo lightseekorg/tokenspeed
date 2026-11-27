@@ -94,6 +94,7 @@ def test_prepare_decode_exchange_forwards_dynamic_float_cap(monkeypatch):
         value_heads=None,
         decode_rows=128 * 6,
         float_words=False,
+        float_row_bytes=None,
     )
     assert calls == [
         (
@@ -119,3 +120,39 @@ def test_prepare_decode_exchange_forwards_dynamic_float_cap(monkeypatch):
             float_words=False,
             float_row_bytes=fp8_row,
         )
+
+
+def test_float_exchange_cap_overflow_warns_once_and_falls_back(monkeypatch, caplog):
+    import logging
+
+    import torch
+
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+
+    class _FakeExchangeState:
+        float_cap_bytes = 1024
+
+        def serves(self, payload: int, *, floats: bool) -> bool:
+            return floats and payload <= self.float_cap_bytes
+
+    backend = AutoBackend()
+    group = (0, 1)
+    backend._small_exchanges[group] = _FakeExchangeState()
+    fallbacks: list[int] = []
+    monkeypatch.setattr(
+        backend,
+        "all_gather_single",
+        lambda _out, inp, _group: fallbacks.append(inp.nbytes),
+    )
+
+    inp = torch.zeros(512, dtype=torch.float32)  # 2048 B > 1024 B cap
+    out = torch.zeros(1024, dtype=torch.float32)
+    with caplog.at_level(logging.WARNING):
+        backend.all_gather_float_words_single(out, inp, group)
+        backend.all_gather_float_words_single(out, inp, group)
+
+    assert fallbacks == [2048, 2048]
+    warnings = [
+        r for r in caplog.records if "exceeds the prepared one-hop cap" in r.message
+    ]
+    assert len(warnings) == 1

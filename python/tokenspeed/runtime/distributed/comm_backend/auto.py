@@ -136,6 +136,8 @@ class AutoBackend(CommBackend):
         self._shard_exchanges: dict[tuple[Group, int], object] = {}
         # One-hop LL exchanges of small payloads (prepare_small_exchange).
         self._small_exchanges: dict[Group, object] = {}
+        # Groups that have already logged a float-word exchange cap fallback.
+        self._float_cap_warned_groups: set[Group] = set()
 
     @property
     def nccl(self) -> NcclBackend:
@@ -781,6 +783,19 @@ class AutoBackend(CommBackend):
             or not state.serves(payload, floats=True)
             or received != payload * len(group)
         ):
+            if (
+                state is not None
+                and state.float_cap_bytes > 0
+                and payload > state.float_cap_bytes
+                and group not in self._float_cap_warned_groups
+            ):
+                self._float_cap_warned_groups.add(group)
+                logger.warning(
+                    f"KVP group {group} float-word all-gather payload "
+                    f"({payload >> 10} KiB per rank) exceeds the prepared "
+                    f"one-hop cap ({state.float_cap_bytes >> 10} KiB); "
+                    "falling back to all_gather_single"
+                )
             return self.all_gather_single(output, input, group)
         from tokenspeed_kernel.ops.communication.cute_dsl import (
             cute_dsl_ll_all_gather_floats,

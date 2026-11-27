@@ -116,7 +116,7 @@ def prepare_decode_exchange(
     value_heads: int | None,
     decode_rows: int,
     float_words: bool,
-    float_row_bytes: int | None = None,
+    float_row_bytes: int | None,
 ) -> bool:
     """Collectively prepare the KVP group's one-hop exchange of small payloads.
 
