@@ -2121,6 +2121,70 @@ state's latency instead of following it. State writes (non-ReplaySSM
 verify) replay the tokens on the FP32 state in a blocked
 layout; the ReplaySSM verify writes none.
 
+### gfx950 GDN chunked prefill
+
+`gluon_gdn_chunk_prefill_gfx950` runs `gdn_chunk_prefill`'s chunk recurrence
+and output (FLA's `chunk_gated_delta_rule_fwd_h` + `chunk_fwd_o`) as a
+two-level scan over chunk segments. FLA's Triton kernels still prepare the WY
+inputs (L2 norm, cumulative gates, `w`, `u`); `output_h` stays on Triton.
+
+#### Contract
+
+- q/k are `[1, T, H, 128]`, v is `[1, T, HV, 128]` with `HV` a multiple of
+  `H`; any float state dtype in the K-last `[N, HV, V, K]` layout. Outputs
+  are in q's dtype; the final state and checkpoints are FP32 K-last.
+- `cu_seqlens` is read on device; the launches are sized from the total
+  token count and sequence count only, and the segment length is a runtime
+  argument, so new lengths never recompile.
+- State checkpoints (`GdnStateCheckpoints`) land on 64-token chunk
+  boundaries at any multiple of 64 tokens, segment-aligned or not.
+
+#### Algorithm
+
+The recurrence is affine in the state: chunk `c` maps `h` to `A_c h + b_c`,
+so a segment of chunks maps its start state `S` to `M S + B`. Each sequence
+is cut into segments (never across sequences), and three launches run:
+
+1. transfer: per (value head, segment) except a sequence's last, the chunk
+   recurrence on `[M | B]` from `[I | 0]` (the first segment's `B` starts
+   from the initial state, so it is that segment's end state);
+2. carry: per (32 state rows, value head, sequence), `S_{j+1} = M_j S_j +
+   B_j` in FP32 (the MFMAs take hi/lo BF16 splits of both operands);
+3. output: per (value head, segment), the fused chunk recurrence from `S_j`
+   with the outputs, checkpoints and, for a sequence's last segment, the
+   final state. Per-chunk states never leave the chip.
+
+A program owns one value head (all 128 state columns) with 8 waves, so a
+chunk's q/k/w are fetched once per head. Chunk inputs stream into LDS with
+asynchronous copies two stages deep (q one stage, refilled once the chunk's
+products have read it); a chunk's output is stored after the next chunk's
+wait so no store sits between a copy and its wait. A program needs ~156 KiB
+of LDS, one per compute unit. The segment length aims at about one program
+per compute unit (`num_cus // HV` segments per call); when the average
+sequence is no longer than about that, a segment is the average sequence
+(sequences scan in parallel without transfer and carry), and calls of at most
+12 chunks run unsplit. With checkpoints, a length within 25% that divides or
+is a multiple of the interval is preferred. Segment `j` of sequence `i` takes
+slot `bos_i // P + i + j`; gap slots exit.
+
+The transfer pass doubles the recurrence work of the segments it covers, and
+the fused chunk step is bound by LDS operand traffic (~450 KiB per chunk and
+head) and its serial dependencies, not by MFMA (about 16% busy). Against
+FLA's serial chunk_h + chunk_o (Qwen3.8-Flash-Next TP1, 16/48 heads), the
+scan is faster from about 2048 tokens and for calls of several sequences, and
+slightly slower for single sequences of 512-1024 tokens.
+
+#### Tolerance
+
+The segment scan composes chunk transfers in a different order from the
+serial chunk scan, so states and outputs after a sequence's first segment
+differ by rounding. Both round the state to BF16 once per chunk for the
+products, and that dominates: against an FP64 recurrence on the same WY
+inputs the scan's error stays that of the serial scan (tests allow 1.25x).
+Against the serial Triton scan, the final state, every checkpoint and the
+output stay within 5e-3 relative Frobenius error (about 2e-3 is typical with
+weak decay and 5 segments).
+
 ### KDA chunked prefill (gfx950 / gfx1250)
 
 `gluon_kda_paged_prefill_gfx950` and `gluon_kda_paged_prefill_gfx1250` run

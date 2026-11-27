@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Registration shims for the AMD Gluon GDN decode / MTP-verify kernels."""
+"""Registration shims for the AMD Gluon GDN prefill, decode and MTP-verify kernels."""
 
 from __future__ import annotations
 
@@ -34,9 +34,23 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.attention.gdn import GdnStateCheckpoints
     from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
 
 if current_platform().is_amd:
+    from tokenspeed_kernel.ops.attention.gdn import GdnChunkPrefillResult
+    from tokenspeed_kernel.ops.attention.gdn._triton.chunk_scaled_dot_kkt import (
+        chunk_scaled_dot_kkt_fwd,
+    )
+    from tokenspeed_kernel.ops.attention.gdn._triton.cumsum import chunk_local_cumsum
+    from tokenspeed_kernel.ops.attention.gdn._triton.l2norm import l2norm_fwd
+    from tokenspeed_kernel.ops.attention.gdn._triton.solve_tril import solve_tril
+    from tokenspeed_kernel.ops.attention.gdn._triton.wy_fast import recompute_w_u_fwd
+    from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.chunk_prefill import (
+        GDN_CHUNK_PREFILL_CHUNK,
+        GDN_CHUNK_PREFILL_HEAD_DIM,
+        launch_gluon_gdn_chunk_prefill_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode_mtp import (
         GDN_DECODE_MTP_KEY_DIM,
         GDN_DECODE_MTP_MAX_TOKENS,
@@ -56,6 +70,89 @@ if current_platform().is_amd:
         max_arch_version=ArchVersion(9, 5),
         vendors=frozenset({"amd"}),
     )
+
+    @register_kernel(
+        "attention",
+        "gdn_chunk_prefill",
+        name="gluon_gdn_chunk_prefill_gfx950",
+        solution="gluon",
+        capability=_GFX950,
+        signatures=format_signatures(
+            ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "head_dim": frozenset({GDN_CHUNK_PREFILL_HEAD_DIM}),
+            "value_head_dim": frozenset({GDN_CHUNK_PREFILL_HEAD_DIM}),
+            "num_v_gte_num_q": frozenset({True}),
+            # Per-chunk states never leave the chip: no output_h.
+            "output_h": frozenset({False}),
+            "qk_l2norm": frozenset({False, True}),
+            "state_checkpoints": frozenset({False, True}),
+        },
+    )
+    def gluon_gdn_chunk_prefill_gfx950(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        *,
+        scale: float | None,
+        initial_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        qk_l2norm: bool,
+        output_final_state: bool,
+        output_h: bool,
+        state_checkpoints: GdnStateCheckpoints | None,
+    ) -> GdnChunkPrefillResult:
+        """gfx950 ``gdn_chunk_prefill``: FLA's Triton WY preparation, then the
+        chunk recurrence and output as a two-level segment scan.
+
+        The scan's states (final state, checkpoints) and the outputs after a
+        sequence's first segment differ from the serial chunk scan by
+        rounding; see the gfx950 kernel README for the tolerance.
+        """
+        if output_h:
+            raise NotImplementedError("the gfx950 GDN chunk prefill has no output_h")
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        if qk_l2norm:
+            q, k = l2norm_fwd(q), l2norm_fwd(k)
+        chunk = GDN_CHUNK_PREFILL_CHUNK
+        g = chunk_local_cumsum(g, chunk_size=chunk, cu_seqlens=cu_seqlens)
+        a = chunk_scaled_dot_kkt_fwd(
+            k=k,
+            beta=beta,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+            output_dtype=torch.float32,
+        )
+        a = solve_tril(A=a, cu_seqlens=cu_seqlens, output_dtype=k.dtype)
+        w, u = recompute_w_u_fwd(
+            k=k, v=v, beta=beta, A=a, g_cumsum=g, cu_seqlens=cu_seqlens
+        )
+        out, final_state = launch_gluon_gdn_chunk_prefill_gfx950(
+            q,
+            k,
+            w,
+            u,
+            g,
+            initial_state=initial_state.contiguous(),
+            cu_seqlens=cu_seqlens.to(torch.int32),
+            scale=q.shape[-1] ** -0.5 if scale is None else scale,
+            checkpoint_states=(
+                None if state_checkpoints is None else state_checkpoints.states
+            ),
+            checkpoint_cu_starts=(
+                None if state_checkpoints is None else state_checkpoints.cu_starts
+            ),
+            checkpoint_every_n_tokens=(
+                None if state_checkpoints is None else state_checkpoints.every_n_tokens
+            ),
+        )
+        return GdnChunkPrefillResult(
+            out=out, final_state=final_state if output_final_state else None
+        )
 
     @register_kernel(
         "attention",

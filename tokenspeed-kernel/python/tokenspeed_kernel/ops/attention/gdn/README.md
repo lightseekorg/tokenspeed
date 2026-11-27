@@ -286,6 +286,15 @@ transitions between single-request, uniform multi-request, and ragged indexing
 within one compiled kernel. Those selections use runtime values so startup
 warmup also covers batch layouts first seen during serving.
 
+## gfx950 segment-scan prefill
+
+On gfx950, `gdn_chunk_prefill` with 128-wide heads selects
+`gluon_gdn_chunk_prefill_gfx950`: FLA's Triton WY preparation, then the chunk
+recurrence and output as a two-level scan over chunk segments instead of one
+chunk after another. Its states and outputs differ from the serial Triton scan
+by rounding within a documented tolerance; see "gfx950 GDN chunked prefill" in
+`tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/README.md`.
+
 ## Accepted-prefix replay
 
 `triton_gdn_replay_commit` commits accepted prefixes for all layers in one
