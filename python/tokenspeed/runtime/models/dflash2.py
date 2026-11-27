@@ -29,6 +29,12 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.conv import dflash2_grouped_conv
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.kvcache.triton import (
+    LatentPlanes,
+    check_mla_latent_geometry,
+    mla_latent_norm_rope_scatter,
+)
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_manager import CommManager
@@ -38,6 +44,7 @@ from tokenspeed.runtime.distributed.process_group_manager import process_group_m
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.dense.fp8_weight_only import quantize_fp8_weight_rows
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import (
     should_apply_lm_head_quant_method,
@@ -60,6 +67,10 @@ from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import (
     enable_draft_monokernels,
 )
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+    TorchMemorySaverAdapter,
+)
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
@@ -505,6 +516,13 @@ class DFlash2DraftModel(DFlashDraftModel):
         # set when enable_draft_monokernels packs them after loading. None
         # runs every forward on the regular code.
         self.monokernel_state: DFlash2MonokernelState | None = None
+        # Stacked MLA context-injection weights (built in post_load_weights)
+        # and cached latent-plane pointers for one-launch context writes.
+        self._kv_a_weight: torch.Tensor | None = None
+        self._kv_norm_weight: torch.Tensor | None = None
+        self._kv_norm_eps: torch.Tensor | None = None
+        self._latent_planes: LatentPlanes | None = None
+        self._latent_planes_key: tuple | None = None
 
     def run_decoder(
         self,
@@ -614,6 +632,186 @@ class DFlash2DraftModel(DFlashDraftModel):
     def _uses_mla(self) -> bool:
         return _dflash2_uses_mla(self.config)
 
+    def clear_latent_planes(self) -> None:
+        """Drop cached cache-plane pointers when the draft cache pool changes."""
+        self._latent_planes = None
+        self._latent_planes_key = None
+
+    def post_load_weights(self) -> None:
+        """Precompute absorbed MLA factors and stacked context-write buffers."""
+        if not self._uses_mla:
+            return
+        for layer in self.layers:
+            absorb_mla_kv_b_proj(layer.self_attn)
+        if self.layers:
+            self._stack_latent_norms()
+            self._stack_latent_kv_rows()
+
+    def _stack_latent_norms(self) -> None:
+        """Stack every MLA layer's ``kv_a_layernorm`` for fused context writes.
+
+        A weight reload copies into the existing buffers so captured graphs
+        keep valid addresses. Unsupported geometries leave ``_kv_norm_weight``
+        as ``None`` so ``write_context_kv`` keeps the per-layer path.
+        """
+        attns = [layer.self_attn for layer in self.layers]
+        first = attns[0]
+        rotary = first.rotary_emb
+        if (
+            rotary is None
+            or int(rotary.cos_sin_cache.shape[-1]) != int(first.qk_rope_head_dim)
+            or any(
+                attn.rotary_emb is None
+                or attn.rotary_emb.cos_sin_cache.data_ptr()
+                != rotary.cos_sin_cache.data_ptr()
+                or attn.kv_lora_scale is not None
+                or int(attn.kv_lora_rank) != int(first.kv_lora_rank)
+                or int(attn.qk_rope_head_dim) != int(first.qk_rope_head_dim)
+                for attn in attns
+            )
+        ):
+            self._kv_norm_weight = None
+            self._kv_norm_eps = None
+            return
+        try:
+            check_mla_latent_geometry(
+                int(first.kv_lora_rank), int(first.qk_rope_head_dim)
+            )
+        except ValueError:
+            self._kv_norm_weight = None
+            self._kv_norm_eps = None
+            return
+        weight = torch.stack([attn.kv_a_layernorm.weight.detach() for attn in attns])
+        eps = torch.tensor(
+            [float(attn.kv_a_layernorm.variance_epsilon) for attn in attns],
+            dtype=torch.float32,
+            device=weight.device,
+        )
+        if (
+            self._kv_norm_weight is None
+            or self._kv_norm_weight.shape != weight.shape
+            or self._kv_norm_weight.dtype != weight.dtype
+            or self._kv_norm_weight.device != weight.device
+        ):
+            self._kv_norm_weight = weight
+            self._kv_norm_eps = eps
+            return
+        self._kv_norm_weight.copy_(weight)
+        self._kv_norm_eps.copy_(eps)
+
+    def _stack_latent_kv_rows(self) -> None:
+        """Stack every MLA layer's KV rows of ``fused_qkv_a_proj_with_mqa``.
+
+        Only unquantized BF16/FP16 fused weights stack; quantized layers keep
+        aligned per-layer projections into the fused norm+RoPE+scatter launch.
+        """
+        attns = [layer.self_attn for layer in self.layers]
+        weights = []
+        for attn in attns:
+            fused = attn.fused_qkv_a_proj_with_mqa
+            if (
+                fused is None
+                or not isinstance(fused.quant_method, UnquantizedLinearMethod)
+                or fused.weight.dtype not in (torch.bfloat16, torch.float16)
+            ):
+                self._kv_a_weight = None
+                return
+            weights.append(fused.weight)
+        width = int(attns[0].kv_lora_rank) + int(attns[0].qk_rope_head_dim)
+        stacked = torch.cat(
+            [
+                weight.detach()[attn.q_lora_rank : attn.q_lora_rank + width]
+                for attn, weight in zip(attns, weights, strict=True)
+            ]
+        )
+        if (
+            self._kv_a_weight is None
+            or self._kv_a_weight.shape != stacked.shape
+            or self._kv_a_weight.dtype != stacked.dtype
+            or self._kv_a_weight.device != stacked.device
+        ):
+            self._kv_a_weight = stacked
+            return
+        self._kv_a_weight.copy_(stacked)
+
+    def _latent_planes_for(self, buffers: list[torch.Tensor]) -> LatentPlanes:
+        """The pointer table of the bound cache's draft planes, built once per pool.
+
+        Allocates in the memory saver's CPU-backed ``cache_layout`` region so
+        the pointer table survives ``weights`` pause/resume without pinning an
+        ordinary Torch CUDA allocator segment.
+        """
+        if not all(isinstance(buffer, torch.Tensor) for buffer in buffers):
+            raise ValueError("DFlash2 MLA context writes need dense latent planes")
+        key = tuple(
+            (buffer.data_ptr(), buffer.dtype, tuple(buffer.shape), buffer.stride())
+            for buffer in buffers
+        )
+        if key != self._latent_planes_key:
+            device_type = buffers[0].device.type
+            if device_type == "cuda" and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "The DFlash2 MLA draft cache changed during graph capture; "
+                    "the eager warmup must write context into the bound pool first."
+                )
+            saver = TorchMemorySaverAdapter.create(
+                enable=device_type != "cpu"
+                and global_server_args_dict["enable_memory_saver"],
+                device=device_type,
+            )
+            with saver.named_region("cache_layout"):
+                self._latent_planes = LatentPlanes.from_buffers(buffers)
+            self._latent_planes_key = key
+        return self._latent_planes
+
+    def _can_fuse_mla_context_write(
+        self,
+        ctx_hidden: torch.Tensor,
+        token_to_kv_pool,
+        attns: list,
+        attn_backend,
+    ) -> bool:
+        """Whether all MLA draft layers can write context in one fused launch."""
+        if (
+            not ctx_hidden.is_cuda
+            or ctx_hidden.dtype != torch.bfloat16
+            or self._kv_norm_weight is None
+            or self._kv_norm_eps is None
+            or self._kv_norm_weight.device != ctx_hidden.device
+            or attns[0].rotary_emb.cos_sin_cache.device != ctx_hidden.device
+            or token_to_kv_pool.quant_method == "per_token_head"
+        ):
+            return False
+        placement = attn_backend.cache_placement(attns[0].attn_mqa)
+        return all(
+            attn_backend.cache_placement(attn.attn_mqa) == placement
+            for attn in attns[1:]
+        )
+
+    def _project_mla_context_latent(
+        self, ctx_hidden: torch.Tensor, attns: list
+    ) -> torch.Tensor:
+        """Project every MLA layer's pre-norm, pre-RoPE latent ``[rows, L, W]``."""
+        rows = ctx_hidden.shape[0]
+        width = int(attns[0].kv_lora_rank) + int(attns[0].qk_rope_head_dim)
+        stacked = self._kv_a_weight
+        if (
+            stacked is not None
+            and stacked.dtype == ctx_hidden.dtype
+            and stacked.device == ctx_hidden.device
+        ):
+            return kernel_mm(ctx_hidden.contiguous(), stacked).view(
+                rows, len(attns), width
+            )
+        # Each layer's rows start 512-byte aligned like a fresh allocation,
+        # so cuBLAS gets the problem the per-layer F.linear gave it.
+        layer_stride = -(-rows * width // 256) * 256
+        latent = ctx_hidden.new_empty((len(attns), layer_stride))
+        latent = latent[:, : rows * width]
+        for index, attn in enumerate(attns):
+            attn.project_latent_rows(ctx_hidden, latent[index].view(rows, width))
+        return latent.view(len(attns), rows, width).transpose(0, 1)
+
     @torch.no_grad()
     def write_context_kv(
         self,
@@ -632,10 +830,39 @@ class DFlash2DraftModel(DFlashDraftModel):
                 token_to_kv_pool,
                 attn_backend=attn_backend,
             )
-        if ctx_hidden.shape[0] == 0:
+        if ctx_hidden.shape[0] == 0 or not self.layers:
             return
-        for layer in self.layers:
-            attn = layer.self_attn
+        attns = [layer.self_attn for layer in self.layers]
+        if self._can_fuse_mla_context_write(
+            ctx_hidden, token_to_kv_pool, attns, attn_backend
+        ):
+            first = attns[0]
+            latent = self._project_mla_context_latent(ctx_hidden, attns)
+            placement = attn_backend.cache_placement(first.attn_mqa)
+            local_locs, write_mask = resolve_cache_slots(cache_locs, placement)
+            targets = [
+                token_to_kv_pool.kv_write_target(
+                    attn.attn_mqa.layer_id, local_locs, write_mask
+                )
+                for attn in attns
+            ]
+            rotary = first.rotary_emb
+            # Called directly: the kvcache family's one portable Triton solution
+            # has no registry entry.
+            mla_latent_norm_rope_scatter(
+                latent,
+                self._kv_norm_weight,
+                self._kv_norm_eps,
+                rotary.cos_sin_cache,
+                positions,
+                local_locs,
+                self._latent_planes_for([target.kv_cache for target in targets]),
+                write_mask=write_mask,
+                is_neox=rotary.is_neox_style,
+                sanitize=targets[0].sanitize,
+            )
+            return
+        for attn in attns:
             latent = attn.project_latent_kv(ctx_hidden)
             latent = attn.apply_latent_rope(positions, latent)
             # Context injection writes the same sharded cache as attention:
@@ -730,8 +957,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             raise ValueError(
                 f"DFlash2 MLA checkpoint is missing {len(missing)} weights: {missing[:8]}"
             )
-        for layer in self.layers:
-            absorb_mla_kv_b_proj(layer.self_attn)
+        self.post_load_weights()
         return loaded
 
     @torch.no_grad()

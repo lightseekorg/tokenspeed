@@ -1781,3 +1781,126 @@ def test_flashmla_backend_kvp_verify_rows_merge_to_dense_verify(monkeypatch, deg
     lses = torch.stack([p[1] for p in partials]).unsqueeze(-1)
     merged = (outputs * torch.softmax(lses, dim=0)).sum(0)
     torch.testing.assert_close(merged[:, :heads], ref[0].float(), atol=0.002, rtol=0.03)
+
+
+@pytest.mark.parametrize("degree", [2, 4, 8])
+@pytest.mark.parametrize("rows", [1, 5, 17, 64])
+def test_merge_index_candidates_row_owner_packed_gather_matches_replicated(
+    monkeypatch, degree: int, rows: int
+) -> None:
+    """Row-owner candidate merge packs positions and valid counts into one
+    all_gather_single and matches the replicated merge across KVP degrees."""
+    from tokenspeed.runtime.layers.attention.dcp import indexer
+
+    torch.manual_seed(100 + degree * 31 + rows)
+    topk = 8
+    padded = -(-rows // degree) * degree
+    local_rows = padded // degree
+    group = tuple(range(degree))
+
+    # Build distinct per-rank local candidates including padding and all-invalid rows.
+    per_rank_offsets = []
+    per_rank_scores = []
+    per_rank_records = []
+    for rank in range(degree):
+        offsets = torch.full((padded, topk), -1, dtype=torch.int32)
+        scores = torch.full((padded, topk), float("-inf"), dtype=torch.float32)
+        for row_idx in range(rows):
+            if row_idx % 7 == 0 and rank != 0:
+                continue  # sparse row: only rank 0 has candidates
+            if row_idx % 11 == 5:
+                continue  # empty row: no rank has valid candidates
+            valid_n = (row_idx + rank) % topk + 1
+            base = rank * 10_000 + row_idx * 100
+            offsets[row_idx, :valid_n] = torch.arange(
+                base, base + valid_n, dtype=torch.int32
+            )
+            # Strictly distinct scores so top-k order is uniquely determined.
+            scores[row_idx, :valid_n] = (
+                torch.rand(valid_n, dtype=torch.float32) * 10.0 + rank * 0.0137
+            )
+        packed = torch.stack((offsets, scores.view(torch.int32)), dim=-1).contiguous()
+        per_rank_offsets.append(offsets[:rows])
+        per_rank_scores.append(scores[:rows])
+        per_rank_records.append(packed)
+
+    # Exact reference merge over every rank's candidates.
+    all_offsets = torch.cat(per_rank_offsets, dim=1)
+    all_scores = torch.cat(per_rank_scores, dim=1)
+    valid = (all_offsets >= 0) & ~torch.isnan(all_scores) & (all_scores > -float("inf"))
+    masked_scores = torch.where(valid, all_scores, -float("inf"))
+    best_scores, order = torch.topk(masked_scores, topk, dim=-1)
+    ref_positions = torch.where(
+        best_scores > -float("inf"), all_offsets.gather(1, order), -1
+    ).to(torch.int32)
+    ref_counts = (best_scores > -float("inf")).sum(dim=-1, dtype=torch.int32)
+
+    def cpu_merge(received, *, topk: int, solution):
+        assert solution is None
+        # received: [degree, local_rows, cand, 2]
+        flat = received.transpose(0, 1).reshape(local_rows, -1, 2)
+        cand_offsets = flat[:, :, 0]
+        cand_scores = flat[:, :, 1].view(torch.float32)
+        is_valid = (
+            (cand_offsets >= 0)
+            & ~torch.isnan(cand_scores)
+            & (cand_scores > -float("inf"))
+        )
+        scores_clean = torch.where(is_valid, cand_scores, -float("inf"))
+        top_scores, top_order = torch.topk(scores_clean, topk, dim=-1)
+        top_pos = torch.where(
+            top_scores > -float("inf"), cand_offsets.gather(1, top_order), -1
+        ).to(torch.int32)
+        top_cnt = (top_scores > -float("inf")).sum(dim=-1, dtype=torch.int32)
+        return top_pos, top_cnt
+
+    # Run all ranks' local merges from the exact all-to-all exchange, then verify
+    # each rank executes one all_gather_single carrying both positions and counts.
+    merged_per_rank: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for owner_rank in range(degree):
+        owner_slice = slice(owner_rank * local_rows, (owner_rank + 1) * local_rows)
+        received = torch.stack(
+            [per_rank_records[src][owner_slice] for src in range(degree)], dim=0
+        )
+        merged_per_rank.append(cpu_merge(received, topk=topk, solution=None))
+
+    packed_per_rank = [
+        torch.cat((pos, cnt.unsqueeze(1)), dim=1).flatten()
+        for pos, cnt in merged_per_rank
+    ]
+    full_gathered = torch.cat(packed_per_rank, dim=0)
+
+    monkeypatch.setattr(indexer, "dsa_merge_candidates", cpu_merge)
+    for rank in range(degree):
+        a2a_count = 0
+        ag_shapes: list[tuple[int, int]] = []
+
+        def fake_a2a(output, input_tensor, grp, *, _rank=rank):
+            nonlocal a2a_count
+            assert grp == group
+            a2a_count += 1
+            owner_slice = slice(_rank * local_rows, (_rank + 1) * local_rows)
+            expected = torch.stack(
+                [per_rank_records[src][owner_slice] for src in range(degree)], dim=0
+            ).flatten()
+            output.copy_(expected)
+
+        def fake_ag(output, input_tensor, grp, *, _rank=rank):
+            assert grp == group
+            ag_shapes.append((input_tensor.numel(), output.numel()))
+            assert torch.equal(input_tensor, packed_per_rank[_rank])
+            output.copy_(full_gathered)
+
+        monkeypatch.setattr(indexer, "all_to_all_single", fake_a2a)
+        monkeypatch.setattr(indexer, "all_gather_single", fake_ag)
+
+        positions, counts = indexer.merge_index_candidates_row_owner(
+            per_rank_records[rank], rows, topk=topk, group=group
+        )
+        assert a2a_count == 1
+        assert ag_shapes == [(local_rows * (topk + 1), padded * (topk + 1))]
+        assert positions.is_contiguous() and positions.dtype == torch.int32
+        assert counts.is_contiguous() and counts.dtype == torch.int32
+        assert positions.shape == (rows, topk) and counts.shape == (rows,)
+        assert torch.equal(positions, ref_positions)
+        assert torch.equal(counts, ref_counts)

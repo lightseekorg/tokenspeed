@@ -48,6 +48,7 @@ from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 
@@ -173,6 +174,12 @@ class DFlash2(DFlash):
                 scale=self.output_multiplier,
                 softcap=self.final_logit_softcapping,
             )
+
+    @override
+    def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
+        """Drop cached MLA draft plane pointers before rebinding the pool."""
+        self.model.clear_latent_planes()
+        super().set_cache_pool(token_to_kv_pool)
 
     @override
     def _write_native_cache(

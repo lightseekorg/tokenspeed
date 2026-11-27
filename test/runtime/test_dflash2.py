@@ -1139,3 +1139,605 @@ def test_draft_capture_does_not_replace_persistent_residual(monkeypatch, initial
     assert not residual.any()
     if buffer is not None:
         assert torch.all(buffer == 3)
+
+
+def _mla_dflash2_config(
+    *,
+    num_layers: int = 2,
+    hidden_size: int = 128,
+    kv_lora_rank: int = 64,
+    qk_rope_head_dim: int = 16,
+):
+    from transformers import PretrainedConfig
+
+    return PretrainedConfig(
+        vocab_size=64,
+        hidden_size=hidden_size,
+        intermediate_size=128,
+        num_hidden_layers=num_layers,
+        num_attention_heads=2,
+        q_lora_rank=32,
+        kv_lora_rank=kv_lora_rank,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=qk_rope_head_dim,
+        v_head_dim=32,
+        rms_norm_eps=1e-6,
+        max_position_embeddings=4096,
+        rope_theta=10000.0,
+        layer_types=["sliding_attention"] * num_layers,
+        sliding_window=1024,
+        decode_monokernel=False,
+        dflash_config={
+            "attention_mode": "mla",
+            "block_size": 16,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "selector_rank": 8,
+            "selector_top_k": 4,
+            "target_layer_ids": [0],
+        },
+    )
+
+
+def _random_mla_dflash2_weights(
+    model: DFlash2DraftModel, config, *, seed: int
+) -> list[tuple[str, torch.Tensor]]:
+    gen = torch.Generator(device=next(model.parameters()).device).manual_seed(seed)
+    weights: list[tuple[str, torch.Tensor]] = []
+    q_rows = int(config.q_lora_rank)
+    for name, param in model.named_parameters():
+        value = (
+            torch.randn(
+                param.shape, dtype=param.dtype, device=param.device, generator=gen
+            )
+            * 0.1
+        )
+        if ".gate_up_proj." in name:
+            gate, up = value.chunk(2)
+            weights.append((name.replace("gate_up_proj", "gate_proj"), gate))
+            weights.append((name.replace("gate_up_proj", "up_proj"), up))
+        elif ".fused_qkv_a_proj_with_mqa." in name:
+            weights.append(
+                (name.replace("fused_qkv_a_proj_with_mqa", "q_a_proj"), value[:q_rows])
+            )
+            weights.append(
+                (
+                    name.replace("fused_qkv_a_proj_with_mqa", "kv_a_proj_with_mqa"),
+                    value[q_rows:],
+                )
+            )
+        else:
+            weights.append((name, value))
+    return weights
+
+
+def _cpu_mla_latent_scatter_ref(
+    latent,
+    norm_weight,
+    eps,
+    cos_sin_cache,
+    positions,
+    loc,
+    planes,
+    *,
+    write_mask,
+    is_neox,
+    sanitize,
+    layer_buffers,
+) -> None:
+    """CPU reference for the GPU-only Triton mla_latent_norm_rope_scatter kernel."""
+    del sanitize
+    rows, n_layers, width = latent.shape
+    kv_lora = norm_weight.shape[-1]
+    rope_dim = width - kv_lora
+    half = rope_dim // 2
+    cos = cos_sin_cache[positions, :half].float()
+    sin = cos_sin_cache[positions, half:].float()
+    for layer_idx in range(n_layers):
+        raw = latent[:, layer_idx, :]
+        x = raw[:, :kv_lora].float()
+        rstd = torch.rsqrt((x * x).mean(dim=-1, keepdim=True) + eps[layer_idx])
+        nope = (x * rstd * norm_weight[layer_idx].float()).to(raw.dtype)
+        rope_in = raw[:, kv_lora:].float()
+        if is_neox:
+            x1, x2 = rope_in[:, :half], rope_in[:, half:]
+            r1 = (x1 * cos - x2 * sin).to(raw.dtype)
+            r2 = (x2 * cos + x1 * sin).to(raw.dtype)
+            rope_out = torch.cat((r1, r2), dim=-1)
+        else:
+            x1, x2 = rope_in[:, 0::2], rope_in[:, 1::2]
+            r1 = (x1 * cos - x2 * sin).to(raw.dtype)
+            r2 = (x2 * cos + x1 * sin).to(raw.dtype)
+            rope_out = torch.stack((r1, r2), dim=-1).flatten(-2)
+        out_row = torch.cat((nope, rope_out), dim=-1)
+        buf = layer_buffers[layer_idx]
+        for row_idx in range(rows):
+            if write_mask is not None and not bool(write_mask[row_idx]):
+                continue
+            slot = int(loc[row_idx])
+            if buf.ndim == 4:
+                buf[slot // planes.page_size, slot % planes.page_size, 0] = out_row[
+                    row_idx
+                ].to(buf.dtype)
+            else:
+                buf[slot, 0] = out_row[row_idx].to(buf.dtype)
+
+
+@pytest.mark.parametrize("kvp_degree", [1, 4, 8])
+@pytest.mark.parametrize("stacked", [True, False])
+def test_dflash2_mla_post_load_stacks_and_fused_write_matches_per_layer(
+    monkeypatch, kvp_degree: int, stacked: bool
+) -> None:
+    """DFlash2 MLA stacks context weights in post_load_weights (preserving
+    addresses across reload) and fused write_context_kv matches the per-layer
+    reference across KVP placements."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.layers.attention.dcp.placement import (
+        CachePlacement,
+        resolve_cache_slots,
+    )
+    from tokenspeed.runtime.models import dflash2 as dflash2_mod
+
+    config = _mla_dflash2_config()
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1))
+
+        model.load_weights(_random_mla_dflash2_weights(model, config, seed=11))
+        assert model._kv_a_weight is not None
+        assert model._kv_norm_weight is not None
+        assert model._kv_norm_eps is not None
+        a_ptr = model._kv_a_weight.data_ptr()
+        norm_ptr = model._kv_norm_weight.data_ptr()
+        eps_ptr = model._kv_norm_eps.data_ptr()
+
+        # Reloading weights updates stacked tensors in place (graph-safe addresses).
+        model.load_weights(_random_mla_dflash2_weights(model, config, seed=29))
+        assert model._kv_a_weight.data_ptr() == a_ptr
+        assert model._kv_norm_weight.data_ptr() == norm_ptr
+        assert model._kv_norm_eps.data_ptr() == eps_ptr
+
+        width = int(config.kv_lora_rank) + int(config.qk_rope_head_dim)
+        kv_lora = int(config.kv_lora_rank)
+        rope_dim = int(config.qk_rope_head_dim)
+        half = rope_dim // 2
+        for idx, layer in enumerate(model.layers):
+            attn = layer.self_attn
+            expected_kv = attn.fused_qkv_a_proj_with_mqa.weight[
+                attn.q_lora_rank : attn.q_lora_rank + width
+            ]
+            torch.testing.assert_close(
+                model._kv_a_weight[idx * width : (idx + 1) * width],
+                expected_kv,
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(
+                model._kv_norm_weight[idx],
+                attn.kv_a_layernorm.weight,
+                rtol=0,
+                atol=0,
+            )
+
+        # CPU tensors keep _can_fuse_mla_context_write False by default.
+        torch.manual_seed(7)
+        num_tokens = 24
+        block_granularity = 4
+        virtual_blocks = 16
+        ctx_hidden = torch.randn(
+            num_tokens, int(config.hidden_size), dtype=torch.bfloat16
+        )
+        positions = torch.arange(num_tokens, dtype=torch.int64)
+        cache_locs = torch.arange(4, 4 + num_tokens, dtype=torch.int32)
+        placement = (
+            None
+            if kvp_degree == 1
+            else CachePlacement(
+                block_granularity=block_granularity,
+                virtual_block_count=virtual_blocks,
+                group=tuple(range(kvp_degree)),
+                rank=1 % kvp_degree,
+            )
+        )
+        attn_backend = SimpleNamespace(cache_placement=lambda layer: placement)
+        num_slots = virtual_blocks * block_granularity
+        sentinel = 3.25
+        ref_buffers = [
+            torch.full((num_slots, 1, width), sentinel, dtype=torch.bfloat16)
+            for _ in model.layers
+        ]
+        fused_buffers = [buf.clone() for buf in ref_buffers]
+
+        class _Pool:
+            def __init__(
+                self, buffers: list[torch.Tensor], quant_method: str = "none"
+            ) -> None:
+                self.buffers = buffers
+                self.quant_method = quant_method
+
+            def kv_write_target(self, layer_id: int, slots, write_mask):
+                del slots, write_mask
+                return SimpleNamespace(kv_cache=self.buffers[layer_id], sanitize=False)
+
+        attns = [layer.self_attn for layer in model.layers]
+        assert not model._can_fuse_mla_context_write(
+            ctx_hidden, _Pool(fused_buffers), attns, attn_backend
+        )
+
+        # Pure-PyTorch per-layer reference (RMSNorm and apply_k_rope are GPU kernels).
+        local_locs, write_mask = resolve_cache_slots(cache_locs, placement)
+        for layer_idx, attn in enumerate(attns):
+            kv_w = attn.fused_qkv_a_proj_with_mqa.weight[
+                attn.q_lora_rank : attn.q_lora_rank + width
+            ]
+            raw = torch.nn.functional.linear(ctx_hidden, kv_w)
+            x = raw[:, :kv_lora].float()
+            rstd = torch.rsqrt(
+                (x * x).mean(dim=-1, keepdim=True)
+                + float(attn.kv_a_layernorm.variance_epsilon)
+            )
+            nope = (x * rstd * attn.kv_a_layernorm.weight.float()).to(raw.dtype)
+            cos_sin = attn.rotary_emb.cos_sin_cache
+            cos = cos_sin[positions, :half].float()
+            sin = cos_sin[positions, half:].float()
+            rope_in = raw[:, kv_lora:].float()
+            if attn.rotary_emb.is_neox_style:
+                x1, x2 = rope_in[:, :half], rope_in[:, half:]
+                rope_out = torch.cat(
+                    (
+                        (x1 * cos - x2 * sin).to(raw.dtype),
+                        (x2 * cos + x1 * sin).to(raw.dtype),
+                    ),
+                    dim=-1,
+                )
+            else:
+                x1, x2 = rope_in[:, 0::2], rope_in[:, 1::2]
+                rope_out = torch.stack(
+                    (
+                        (x1 * cos - x2 * sin).to(raw.dtype),
+                        (x2 * cos + x1 * sin).to(raw.dtype),
+                    ),
+                    dim=-1,
+                ).flatten(-2)
+            rows = torch.cat((nope, rope_out), dim=-1)
+            buf = ref_buffers[layer_idx]
+            for row_idx in range(num_tokens):
+                if write_mask is not None and not bool(write_mask[row_idx]):
+                    continue
+                buf[int(local_locs[row_idx]), 0] = rows[row_idx]
+
+        # Exercise the fused write_context_kv path with CPU stand-ins for GPU-only
+        # kernel_mm and Triton scatter (stacked GEMM and unstacked fallback both tested).
+        if not stacked:
+            model._kv_a_weight = None
+        monkeypatch.setattr(
+            model,
+            "_can_fuse_mla_context_write",
+            lambda _h, pool, _attns, _backend: pool.quant_method != "per_token_head",
+        )
+        monkeypatch.setattr(
+            dflash2_mod, "kernel_mm", lambda x, w: torch.nn.functional.linear(x, w)
+        )
+        monkeypatch.setattr(
+            dflash2_mod,
+            "mla_latent_norm_rope_scatter",
+            lambda *args, **kwargs: _cpu_mla_latent_scatter_ref(
+                *args, **kwargs, layer_buffers=fused_buffers
+            ),
+        )
+        model.write_context_kv(
+            ctx_hidden,
+            positions,
+            cache_locs,
+            _Pool(fused_buffers),
+            attn_backend=attn_backend,
+        )
+
+        for ref_buf, fused_buf in zip(ref_buffers, fused_buffers, strict=True):
+            torch.testing.assert_close(
+                fused_buf.float(), ref_buf.float(), atol=2e-2, rtol=2e-2
+            )
+            # Non-owned slots retain the untouched sentinel value.
+            untouched = ref_buf[:, 0, 0] == sentinel
+            assert torch.all(fused_buf[untouched] == sentinel)
+
+        # Rebinding the cache pool through DFlash2 drops cached plane pointers.
+        assert model._latent_planes is not None
+        drafter = DFlash2.__new__(DFlash2)
+        drafter.model = model
+        monkeypatch.setattr(DFlash, "set_cache_pool", lambda self, pool: None)
+        drafter.set_cache_pool(None)
+        assert model._latent_planes is None
+        assert model._latent_planes_key is None
+    finally:
+        torch.set_default_dtype(prev_dtype)
+
+
+def _check_dflash2_mla_fused_context_write_cuda_and_zero_occupancy() -> None:
+    """CUDA subprocess check: real fused DFlash2 MLA write matches per-layer
+    for KVP 1/4/8 (stacked and unstacked, BF16 and FP8) and adds 0 B to pool (0, 0)."""
+    import gc
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+
+    def _ordinary_pool_bytes() -> int:
+        torch.cuda.synchronize()
+        gc.collect()
+        clear_cublas = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+        if clear_cublas is not None:
+            clear_cublas()
+        torch.cuda.empty_cache()
+        return sum(
+            seg["total_size"]
+            for seg in torch.cuda.memory_snapshot()
+            if seg["device"] == torch.cuda.current_device()
+            and tuple(seg["segment_pool_id"]) == (0, 0)
+        )
+
+    device = torch.device("cuda")
+    # Real MLA geometry: set_mla_kv_buffer_triton requires kv_lora_rank % 256 == 0.
+    config = _mla_dflash2_config(kv_lora_rank=512, qk_rope_head_dim=64)
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        # Warm any one-time GEMM/FlashInfer library workspace before measuring delta.
+        from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+
+        warm_x = torch.randn(32, int(config.hidden_size), device=device)
+        warm_w = torch.randn(
+            int(config.num_hidden_layers)
+            * (int(config.kv_lora_rank) + int(config.qk_rope_head_dim)),
+            int(config.hidden_size),
+            device=device,
+        )
+        _ = kernel_mm(warm_x, warm_w)
+        _ = torch.nn.functional.linear(warm_x, warm_w)
+        del _, warm_x, warm_w
+        baseline_bytes = _ordinary_pool_bytes()
+
+        def _run_fused_vs_per_layer() -> None:
+            with torch.device(device):
+                model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1))
+            model = model.cuda()
+            model.load_weights(_random_mla_dflash2_weights(model, config, seed=19))
+            width = int(config.kv_lora_rank) + int(config.qk_rope_head_dim)
+            ctx_hidden = torch.randn(
+                32, int(config.hidden_size), dtype=torch.bfloat16, device=device
+            )
+            positions = torch.arange(32, dtype=torch.int64, device=device)
+            cache_locs = torch.arange(4, 36, dtype=torch.int32, device=device)
+
+            class _CudaPool:
+                def __init__(self, buffers: list[torch.Tensor]) -> None:
+                    self.buffers = buffers
+                    self.quant_method = "none"
+
+                def kv_write_target(self, layer_id: int, slots, write_mask):
+                    del slots, write_mask
+                    return SimpleNamespace(
+                        kv_cache=self.buffers[layer_id], sanitize=False
+                    )
+
+                def set_mla_kv_buffer(
+                    self, layer, loc, cache_k_nope, cache_k_rope, *, write_mask
+                ) -> None:
+                    from tokenspeed_kernel.ops.kvcache.triton import (
+                        set_mla_kv_buffer_triton,
+                    )
+
+                    set_mla_kv_buffer_triton(
+                        self.buffers[layer.layer_id],
+                        loc,
+                        cache_k_nope,
+                        cache_k_rope,
+                        sanitize=False,
+                        write_mask=write_mask,
+                    )
+
+            saved_kv_a = model._kv_a_weight
+            for stacked in (True, False):
+                model._kv_a_weight = saved_kv_a if stacked else None
+                for cache_dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                    for degree in (1, 4, 8):
+                        placement = (
+                            None
+                            if degree == 1
+                            else CachePlacement(4, 16, tuple(range(degree)), 1 % degree)
+                        )
+                        backend = SimpleNamespace(
+                            cache_placement=lambda layer, p=placement: p
+                        )
+                        fused_bufs = [
+                            torch.full((64, 1, width), 3.25, device=device).to(
+                                cache_dtype
+                            )
+                            for _ in model.layers
+                        ]
+                        ref_bufs = [b.clone() for b in fused_bufs]
+                        model.write_context_kv(
+                            ctx_hidden,
+                            positions,
+                            cache_locs,
+                            _CudaPool(fused_bufs),
+                            attn_backend=backend,
+                        )
+                        saved_norm = model._kv_norm_weight
+                        model._kv_norm_weight = None
+                        try:
+                            model.write_context_kv(
+                                ctx_hidden,
+                                positions,
+                                cache_locs,
+                                _CudaPool(ref_bufs),
+                                attn_backend=backend,
+                            )
+                        finally:
+                            model._kv_norm_weight = saved_norm
+                        for fused_b, ref_b in zip(fused_bufs, ref_bufs, strict=True):
+                            torch.testing.assert_close(
+                                fused_b.float(), ref_b.float(), atol=2e-2, rtol=2e-2
+                            )
+                        del fused_b, ref_b, fused_bufs, ref_bufs
+
+            model._kv_a_weight = saved_kv_a
+            model.clear_latent_planes()
+
+        _run_fused_vs_per_layer()
+        # Outside TorchMemorySaver (weights region), get_rope caches cos_sin_cache
+        # in module-level _ROPE_DICT; clear it so only PR-owned leaks could remain.
+        from tokenspeed.runtime.layers import rotary_embedding
+
+        rotary_embedding._ROPE_DICT.clear()
+        ordinary_bytes = _ordinary_pool_bytes()
+        assert ordinary_bytes <= baseline_bytes, (ordinary_bytes, baseline_bytes)
+    finally:
+        torch.set_default_dtype(prev_dtype)
+
+
+def _check_dflash2_mla_fused_context_write_memory_saver() -> None:
+    """CUDA VMM memory-saver check: stacked context weights and lazily built
+    LatentPlanes survive 3 weights pause/resume cycles with 0 B in pool (0, 0)."""
+    import gc
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    device = torch.device("cuda")
+    # Real MLA geometry: set_mla_kv_buffer_triton requires kv_lora_rank % 256 == 0.
+    config = _mla_dflash2_config(kv_lora_rank=512, qk_rope_head_dim=64)
+    prev_dtype = torch.get_default_dtype()
+    prev_saver = global_server_args_dict["enable_memory_saver"]
+    global_server_args_dict["enable_memory_saver"] = True
+    saver = TorchMemorySaverAdapter.create(enable=True, device="cuda")
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with saver.region(tag="weights", enable_cpu_backup=True):
+            with torch.device(device):
+                model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1))
+            model = model.cuda()
+            model.load_weights(_random_mla_dflash2_weights(model, config, seed=23))
+
+        width = int(config.kv_lora_rank) + int(config.qk_rope_head_dim)
+        with saver.region(tag="kv_cache", enable_cpu_backup=False):
+            kv_buffers = [
+                torch.full((64, 1, width), 3.25, dtype=torch.bfloat16, device=device)
+                for _ in model.layers
+            ]
+
+        class _Pool:
+            def __init__(self, buffers: list[torch.Tensor]) -> None:
+                self.buffers = buffers
+                self.quant_method = "none"
+
+            def kv_write_target(self, layer_id: int, slots, write_mask):
+                del slots, write_mask
+                return SimpleNamespace(kv_cache=self.buffers[layer_id], sanitize=False)
+
+        placement = CachePlacement(4, 16, (0, 1, 2, 3), 1)
+        backend = SimpleNamespace(cache_placement=lambda layer: placement)
+
+        # Warm once to lazily build _latent_planes inside named_region("cache_layout").
+        ctx_hidden = torch.randn(
+            16, int(config.hidden_size), dtype=torch.bfloat16, device=device
+        )
+        positions = torch.arange(16, dtype=torch.int64, device=device)
+        cache_locs = torch.arange(4, 20, dtype=torch.int32, device=device)
+        model.write_context_kv(
+            ctx_hidden, positions, cache_locs, _Pool(kv_buffers), attn_backend=backend
+        )
+        expected_after_warm = [buf.cpu() for buf in kv_buffers]
+        assert model._latent_planes is not None
+        retained = [
+            model._kv_a_weight,
+            model._kv_norm_weight,
+            model._kv_norm_eps,
+            model._latent_planes.ptrs,
+        ]
+        snapshots = [(t, t.data_ptr(), t.cpu()) for t in retained]
+        ctx_cpu = ctx_hidden.cpu()
+        pos_cpu = positions.cpu()
+        locs_cpu = cache_locs.cpu()
+        del ctx_hidden, positions, cache_locs
+
+        for _ in range(3):
+            torch.cuda.synchronize()
+            gc.collect()
+            saver.pause(tag="kv_cache")
+            saver.pause(tag="weights")
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            ordinary_bytes = sum(
+                seg["total_size"]
+                for seg in torch.cuda.memory_snapshot()
+                if seg["device"] == torch.cuda.current_device()
+                and tuple(seg["segment_pool_id"]) == (0, 0)
+            )
+            assert ordinary_bytes == 0, ordinary_bytes
+            saver.resume(tag="weights")
+            saver.resume(tag="kv_cache")
+            for tensor, pointer, reference in snapshots:
+                assert tensor.data_ptr() == pointer
+                torch.testing.assert_close(tensor.cpu(), reference, rtol=0, atol=0)
+            for buf in kv_buffers:
+                buf.fill_(3.25)
+            model.write_context_kv(
+                ctx_cpu.to(device),
+                pos_cpu.to(device),
+                locs_cpu.to(device),
+                _Pool(kv_buffers),
+                attn_backend=backend,
+            )
+            for buf, expected in zip(kv_buffers, expected_after_warm, strict=True):
+                torch.testing.assert_close(buf.cpu(), expected, rtol=0, atol=0)
+    finally:
+        global_server_args_dict["enable_memory_saver"] = prev_saver
+        torch.set_default_dtype(prev_dtype)
+
+
+@_CUDA_ONLY
+def test_dflash2_mla_fused_context_write_cuda_and_zero_occupancy() -> None:
+    import subprocess
+    from pathlib import Path
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from test.runtime.test_dflash2 import "
+            "_check_dflash2_mla_fused_context_write_cuda_and_zero_occupancy; "
+            "_check_dflash2_mla_fused_context_write_cuda_and_zero_occupancy()",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        check=True,
+        timeout=300,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+def test_dflash2_mla_fused_context_write_survives_memory_saver_sleep() -> None:
+    import subprocess
+    from pathlib import Path
+
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_dflash2 import "
+                "_check_dflash2_mla_fused_context_write_memory_saver; "
+                "_check_dflash2_mla_fused_context_write_memory_saver()",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=120,
+        )
