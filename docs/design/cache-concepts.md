@@ -575,12 +575,16 @@ prompt-end state onto another request's canonical checkpoint before the
 rotation; slot 0 then pins that equivalent checkpoint through the finish.
 
 KDA keeps its FP32 decode records and their accepted count, one for all its
-layers, in the active request slot, outside the LCM arena. The live State
-block holds only the dense base and the convolution state, exactly as without
-retained history; the scheduler and the cache see nothing else. Prefill writes complete
+layers, in the active request slot, outside the LCM arena, beside a ring of
+each layer's last raw pre-convolution inputs (below). The live State block
+holds only the dense base and the convolution state, exactly as without
+retained history, once the slot is materialized into it; the scheduler and
+the cache see nothing else. Prefill writes complete
 checkpoints. The decode commit of the forward that ends a request (the
 sampling epilogue has set `RuntimeStates.stopped` for its slot) folds the
-slot's accepted records into the live block and clears the count. The block
+slot's accepted records into the live block, writes the ring's last three
+accepted inputs as its convolution state and clears the count and ring
+state. The block
 a finish publishes is thus a self-contained dense checkpoint before the host
 learns that the request ended. BF16 dense storage rounds at this boundary.
 A finish the device's stop criteria do not explain -- a grammar that ends
@@ -605,15 +609,18 @@ backend declares its State groups as deferring their decode state
 and the scheduler lists a decoded victim's live block in each of them, the
 one its decode steps write in place, in the plan's `state_folds`, by request
 slot. Before the plan's stores, copies, zeroing and forward, the data plane
-folds each listed slot's records into its block, layer by layer, then clears
-the slot's count once (`DeviceHandle.execute`, `fold_deferred_state`). The
+folds each listed slot's records into its block and writes a seeded ring's
+last three inputs as its convolution state, layer by layer, then clears the
+slot's count and ring state once (`DeviceHandle.execute`,
+`fold_deferred_state`). The
 list does not depend on the image: a retraction whose image the split refuses
 after the publication aborts the victim, but its publication stands, and the
 fold completes it before any reader. A
 block the publication swapped for another request's equal entry is not
 listed; that entry already holds the complete state. The FP32 records stay in
 the GPU workspace. Restore copies the complete dense and convolution states
-and starts the restored slot with an accepted count of zero. A remote peer
+and starts the restored slot with an accepted count of zero and an unseeded
+ring, so its first verify reads the restored block. A remote peer
 does not observe stream order: with peers, a plan whose retractions publish
 such an endpoint carries a `state_commit_fence`; the data plane acknowledges
 it on the execution stream right behind the folds, and the scheduler refuses
@@ -735,15 +742,30 @@ keys (K) and per-token decays; one INT32 count, which every layer shares,
 counts the updates accepted since the dense base of the request's input page.
 Batch reordering changes the mapping from batch rows to request slots.
 
+The slot also keeps the KDA retained pre-convolution workspace: per layer, a
+ring of the request's last raw QKV rows before the convolution, R = T + 3 rows
+for a verify window T (`draft_token_num`, one for standard decode), in the
+convolution state's dtype. Row r holds the input at position p with
+p mod R = r, counted from the slot's last seed. A second INT32, the ring
+state, which every layer shares, is 0 while the ring holds no rows (the
+block's convolution state is current) and otherwise the ring head plus one;
+with the count it forms the slot's replay state, and every reset clears
+both. The three rows before the head are the convolution's history, and a
+verify writes candidate t's raw row to `(head + t) mod R`, so a round's reads
+and writes never overlap. Between materializations the ring, not the block,
+holds a decoding request's convolution window: no decode round writes a
+block's convolution state.
+
 Verify replays the accepted updates in order to reconstruct the current
-state. It appends candidates after that accepted prefix. Commit updates the
-convolution windows, then sets the slot's count to the records the verify
-read plus the accepted count; it is the count's only writer in a decode round
-and writes it once, in a second launch after every layer has read it. For
-example, after four candidates and two acceptances, the next verify starts
-writing at index two. Generation stamps identify candidates from the current
-round. Eager execution and CUDA graphs use the same page and request-slot
-routing.
+state. It appends candidates after that accepted prefix. Commit is one launch
+per round: it sets the slot's count to the records the verify read plus the
+accepted count and moves the ring head past the accepted candidates; it is
+the only writer of both in a decode round, writes them once after every
+layer has read them, and writes no block for a request that keeps decoding.
+For example, after four candidates and two acceptances, the next verify
+starts writing records at index two and ring rows two past the old head.
+Generation stamps identify candidates from the current round. Eager execution
+and CUDA graphs use the same page and request-slot routing.
 
 Each layer has room for `--kda-history-capacity` records per slot, 16 by
 default; it must be at least the effective verify width, so a window wider
@@ -763,31 +785,67 @@ outside `[0, C - T]`: every layer then folds the records into its live block
 them (`eff = 0`, else `eff = H`). A request that fits but moves to a new live
 block in a State group gets the source's dense base copied there in that
 group's layers, with no record applied: the records still count from that
-base. Verify itself reads only live blocks and writes neither a block nor a
-count, and the commit derives the new count from `eff`. The base uses
+base. Both the overflow fold and the page move write the recurrent state
+only: the ring belongs to the slot, so it keeps its window across them. The
+same launch seeds an unseeded ring's rows 0..2 from the input block's three
+convolution taps (the first verify after a seed writes from row 3) and
+snapshots each row's `eff` and ring head. Verify reads only the snapshotted
+ring head: it derives `eff` itself from the slot's count H, which the commit
+alone writes. The commit reads both snapshotted fields and derives the new
+count from `eff`. Verify itself reads only live blocks and rings and writes
+neither a block nor a count. The base uses
 `--mamba-ssm-dtype` (FP32 or BF16). Replay accumulates in FP32 and rounds
 when it writes the dense base.
 
 Prefill starts from the logical state of its input page, then writes dense
-live and interior checkpoints. Every layer's gather reads the rows' counts,
-which clear once, after the last KDA layer's gather, in a launch ordered
-behind it. A decode commit only advances the count, except in the forward
-that ends the request, which folds the records into the live block; a
-retraction folds them before its image is stored (above). A published or imaged block is therefore a
+live and interior checkpoints. Every layer's gather reads the rows' counts
+and ring states, which clear once, after the last KDA layer's gather, in a
+launch ordered behind it. A decode commit only advances the count and the
+ring head, except in the forward that ends the request; a retraction
+materializes the slot before its image is stored (above). The ring's window
+reaches a block's convolution state at exactly these points, each before
+another reader can see the block:
+
+| Point | Writer | Afterwards |
+| --- | --- | --- |
+| Request end (`REQUEST_ENDED`) | The ending forward's commit folds the records and writes the ring's last three accepted inputs into the live block | Count and ring state 0. A layer that carried the request but rejects its commit (stale stamps) writes nothing and reports `REQUEST_ENDED_INCOMPLETE`, an engine error rather than a publication |
+| Retraction | `fold_deferred_state` writes both into each listed block before the image is stored | Count and ring state 0; restore starts unseeded |
+| Prefill continuation (an extend or a mixed forward's extend rows) | The gather writes the ring's window over the taps it copied into the live block, before the prefill convolution reads them | Count and ring state 0 after the last layer's gather; the next verify reseeds from the block the prefill wrote |
+
+Records overflow and page moves are not materialization points. Nor is a
+memory release: the ring and the replay state live in the backend's
+restorable region, so `weights` release and resume keep their addresses and
+contents. A published or imaged block is therefore a
 self-contained dense checkpoint, and prefill to decode transfer carries it
-unchanged. A recycled slot may still count records of an owner whose end the
-device did not see, so the runtime clears the count whenever a slot gets a
-new owner (`reset_request_workspace`): at its first forward
-(`RuntimeStates.bind_stop_criteria`) and, on a PD decode node, already at the
-landing of a prompt computed elsewhere, which a retraction may fold before
-any forward (`ModelExecutor.reset_remote_prefill_cache_lengths`). A restore
+unchanged. A recycled slot may still count records and hold a seeded ring of an owner
+whose end the device did not see, so the runtime clears the count and ring
+state whenever a slot gets a new owner (`reset_request_workspace`): at its
+first forward (`RuntimeStates.bind_stop_criteria`) and, on a PD decode node,
+already at the landing of a prompt computed elsewhere, which a retraction may
+fold before any forward (`ModelExecutor.reset_remote_prefill_cache_lengths`);
+its first verify then reads the landed block's convolution state. A restore
 starts the slot at zero itself (`import_slot_state`).
 
-The cache recipes reserve the record and count storage by resident request
-capacity, including the reserved slots in `RequestSlotLayout`. They budget
-original QKV, routing and generation stamps separately by verify batch size.
-Adding LCM pages increases the space for dense checkpoints while the record
-budget stays fixed. Prefill-only engines allocate no decode records.
+The cache recipes reserve the record, ring and replay-state storage by
+resident request capacity, including the reserved slots in
+`RequestSlotLayout` (`kda_request_slot_bytes`). They budget routing, the
+prepare's per-row snapshot and generation stamps separately by verify batch
+size. A ring row of one layer is `3 * heads * head_dim` values; the ring is
+independent of `--kda-history-capacity`. Per slot on a Kimi-K3 TP8 rank (69
+KDA layers, 12 heads of 128, BF16 convolution state, FP32 records):
+
+| Slot storage | Size | T = 4 (C = 16) |
+| --- | --- | --- |
+| Pre-convolution ring | (T + 3) rows x 69 layers x 4,608 channels x 2 B; one row over all layers is 635,904 B (0.6064 MiB) | 7 rows: 4,451,328 B (4.245 MiB) |
+| Records | 69 layers x 12 heads x C x (128 + 2 x 128) x 4 B | 20,348,928 B (19.41 MiB) |
+| Count and ring state | 2 x INT32 | 8 B |
+| Slot total | | 24,800,264 B (23.65 MiB) |
+
+The ring's T + 3 rows are the convolution's three past inputs plus one
+window; a ring of C + 3 rows would keep 19 rows (11.52 MiB) at the same
+settings. Adding LCM pages increases the space for dense checkpoints while
+the record budget stays fixed. Prefill-only engines allocate no decode
+records.
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 

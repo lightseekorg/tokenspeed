@@ -2100,7 +2100,14 @@ candidate goes to row 3 whatever the request's length. Beside H, the slot's
 INT32 ring state is 0 while the ring holds no rows, else the ring head plus
 one; the replay state `[slots, 2]` holds both, and every reset clears both.
 Between materializations a seeded ring, not the page, holds the request's
-convolution window: decode commits write no page's convolution state.
+convolution window: decode commits write no page's convolution state. The
+ring's last three inputs reach the page only at a request's end (the commit),
+a retraction (the fold) and a prefill continuation (the gather), each before
+another reader sees the page. Records overflow and page moves write the
+recurrent state only and leave the ring alone. A slot's new owner (its
+reset) and a restore start unseeded, so the next prepare reseeds the ring
+from the page. At T = 4 on a Kimi-K3 TP8 rank (69 layers, 4608 channels) the
+ring is 7 rows, 4,451,328 bytes (4.245 MiB) a slot.
 The launchers reject a ring whose rows or slots share memory (expanded or
 overlapping strides) or whose storage overlaps the projection inputs.
 

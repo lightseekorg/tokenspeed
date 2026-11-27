@@ -28,7 +28,9 @@ ring, not the page, holds the request's convolution window: decode rounds
 write no page's convolution state, and a request's end, a retraction fold
 and a prefill continuation write the ring's last three inputs into the page
 before anything else reads it. At T = 4 on a Kimi-K3 TP8 rank
-(69 layers, 4608 channels) the ring is 7 rows of 0.6064 MiB: 4.245 MiB a slot.
+(69 layers, 4608 channels) the ring is 7 rows of 0.6064 MiB: 4.245 MiB
+(4,451,328 bytes) a slot, beside 19.41 MiB of FP32 records at the default
+capacity of 16.
 
 ## CuTe prefill (`cutedsl_kda`)
 
@@ -259,7 +261,10 @@ listed page, whatever the history's live pages) and prefill materialization
 with and without a seeded ring, private/shared pages, stale stamps, graph metadata
 refresh, strided arenas, FP32/BF16 base, norm fusion, ring seeding, ring
 wrap, ring slots past 2**31 elements and scalar compile reuse. AMD uses the same retained
-contract through its registered Gluon kernels and the shared prepare.
+contract through its registered Gluon kernels and the shared prepare. The
+runtime's `test/runtime/test_kda_preconv_ring.py` drives the ring's lifecycle
+through the backend: each decode round must give the same bits as a run whose
+ring is materialized and reseeded every round.
 
 The `kda_fused_paged_verify` and `kda_retained_commit` benchmarks accept
 `history_capacity` (default 16, at least `draft_token_num`).
