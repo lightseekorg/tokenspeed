@@ -296,8 +296,10 @@ class DeepseekV4MoE(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("shared_experts", prefix),
             )
+            self.shared_tp_size: int = shared_tp_size
         else:
             self.shared_experts = None
+            self.shared_tp_size = 1
         # Set once MegaMoE runs the shared expert inside its own launch.
         self.shared_expert_fused = False
 
@@ -444,18 +446,23 @@ class DeepseekV4MoE(nn.Module):
         return padded_gate_up_w, padded_gate_up_s, padded_down_w, padded_down_s
 
     def fuse_shared_expert(self) -> None:
-        """Hand the shared expert to MegaMoE when its kernel can run it.
+        """Hand the unsharded shared expert to MegaMoE when its kernel can run it.
 
         The shared expert's weights are then laid out in place for MegaMoE and
-        its own forward is no longer used. When the routed experts were padded
-        to MegaMoE's intermediate alignment, the shared expert is zero-padded
-        to match so it fuses into the same launch losslessly.
+        its own forward is no longer used. When dense TP is 1 and routed experts
+        were padded to MegaMoE's intermediate alignment, the shared expert is
+        zero-padded to match so it fuses into the same launch losslessly.
         """
         shared = self.shared_experts
         if not self.use_mega_moe or shared is None or self.shared_expert_fused:
             return
         gate_up, down = shared.gate_up_proj, shared.down_proj
-        if (
+        if self.shared_tp_size != 1:
+            reason = (
+                f"it is sharded across {self.shared_tp_size} dense TP ranks "
+                "(fusing would skip its dense TP reduction)"
+            )
+        elif (
             gate_up.weight.dtype != torch.float8_e4m3fn
             or down.weight.dtype != torch.float8_e4m3fn
         ):

@@ -1888,6 +1888,7 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     quant_config=quant_config,
                     prefix=add_prefix("shared_experts", prefix),
                 )
+                self.shared_tp_size = mapping.dense.tp_size
 
     def _renormalize_routing_weights(self) -> bool:
         return self.config.norm_topk_prob and self.config.num_experts_per_tok > 1

@@ -5014,6 +5014,29 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
         torch.distributed.destroy_process_group()
 
 
+def _megamoe_unsharded_dense_mapping(rank: int = 1, world_size: int = 2):
+    return v41.Mapping(
+        rank=rank,
+        world_size=world_size,
+        attn_tp_size=1,
+        attn_dp_size=world_size,
+        dense_tp_size=1,
+        dense_dp_size=world_size,
+        moe_tp_size=1,
+        moe_ep_size=world_size,
+        moe_dp_size=1,
+        vision_tp_size=1,
+        vision_dp_size=world_size,
+        linear_attn_tp_size=1,
+        pp_size=1,
+        pp_layer_partition=None,
+        nprocs_per_node=world_size,
+        nnodes=1,
+        base_gpu_id=0,
+        gpu_id_step=1,
+    )
+
+
 @pytest.mark.parametrize("case", ["fused", "limit_differs", "kernel_declines"])
 def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
     """The MoE hands its FP8 shared expert to a kernel that fuses it, once, and
@@ -5023,7 +5046,7 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
     metadata["hidden_size"] = 256
     metadata["moe_intermediate_size"] = 256
     config = v41.DeepseekV41Config(text_config=metadata).text_config
-    mapping = _mapping(1, 1, 2)
+    mapping = _megamoe_unsharded_dense_mapping()
     _mock_loader_hardware(monkeypatch, mapping)
     platform = replace(
         current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
@@ -5081,7 +5104,7 @@ def test_mega_moe_pads_unaligned_shared_expert_losslessly(monkeypatch, accept):
     metadata["hidden_size"] = 256
     metadata["moe_intermediate_size"] = 576
     config = v41.DeepseekV41Config(text_config=metadata).text_config
-    mapping = _mapping(1, 1, 2)
+    mapping = _megamoe_unsharded_dense_mapping()
     _mock_loader_hardware(monkeypatch, mapping)
     platform = replace(
         current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
@@ -5179,6 +5202,48 @@ def test_mega_moe_pads_unaligned_shared_expert_losslessly(monkeypatch, accept):
     ):
         with pytest.raises(RuntimeError, match="Cannot reload fused MegaMoE shared"):
             param.weight_loader(param, param.data)
+
+
+@pytest.mark.parametrize("intermediate", [256, 576])
+def test_mega_moe_declines_fusing_dense_tp_sharded_shared_expert(
+    monkeypatch, caplog, intermediate
+):
+    """When shared experts are sharded by dense TP > 1, fusing into MegaMoE
+    would skip the dense TP reduction, so fuse_shared_expert must decline
+    without calling the pad/fuse hook."""
+    metadata = vars(_loader_config())
+    metadata["hidden_size"] = 256
+    metadata["moe_intermediate_size"] = intermediate
+    config = v41.DeepseekV41Config(text_config=metadata).text_config
+    mapping = _mapping(1, 1, 2)
+    assert mapping.dense.tp_size == 2
+    _mock_loader_hardware(monkeypatch, mapping)
+    platform = replace(
+        current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
+    )
+    monkeypatch.setattr(v41, "current_platform", lambda: platform)
+    moe = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    shared = moe.shared_experts
+    gate_up, down = shared.gate_up_proj, shared.down_proj
+    assert gate_up.weight.shape == (intermediate, 256)
+    assert down.weight.shape == (256, intermediate // 2)
+
+    seen = []
+
+    def fuse(plan, layer, *tensors):
+        seen.append(tensors)
+        return True
+
+    moe.experts.plan["fuse_shared_expert"] = fuse
+    moe.experts._weights_processed = True
+    caplog.set_level(logging.INFO, logger=v4.__name__)
+    moe.process_weights_after_loading(moe)
+
+    assert not moe.shared_expert_fused
+    assert seen == []
+    assert gate_up.weight.shape == (intermediate, 256)
+    assert down.weight.shape == (256, intermediate // 2)
+    assert any("dense TP ranks" in r.getMessage() for r in caplog.records)
 
 
 def test_pad_shared_expert_weights_validates_shapes_and_dtypes():
@@ -5365,6 +5430,18 @@ def _check_fused_padded_shared_expert_survives_release() -> None:
                 gu_w, gu_s, d_w, d_s = padded
                 assert mega_moe.fuse_deep_gemm_mxfp4_mega_moe_shared_expert(
                     plan, w, gu_w, gu_s, d_w, d_s
+                )
+                # Production WeightLoader.load_model runs post_quant_warmup
+                # inside the weights region, which initializes MegaMoE's
+                # persistent symmetric workspace buffer there.
+                mega_moe._get_symm_buffer(
+                    state=w._moe_backend_state,
+                    process_group=None,
+                    num_experts=experts,
+                    top_k=top_k,
+                    hidden_size=hidden,
+                    intermediate_size=target_inter,
+                    max_num_tokens=64,
                 )
                 del raw_gu_w, raw_gu_s, raw_d_w, raw_d_s
 
