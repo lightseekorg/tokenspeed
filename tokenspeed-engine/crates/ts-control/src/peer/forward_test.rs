@@ -21,8 +21,9 @@
 //! Real demux, eight native schedulers and a separate eight-member TCP mesh.
 //! The holder controls when the valid manifest goes on the wire. Device work
 //! is a sleep so the test runs on a CPU-only builder.
+use super::super::push::PushItem;
 use super::super::{
-    geometry::{DeviceField, RankGeometry},
+    geometry::{DeviceField, HostGroup, HostPool, RankGeometry},
     offers::{manifest, prefix},
     progress::Progress,
     registered::Member,
@@ -36,6 +37,13 @@ use pyo3::{prelude::*, types::PyDict};
 use std::{ffi::CString, thread, time::Duration};
 use ts_collective::{Group, Listener, Mesh};
 use ts_scheduler::{PeerPageView, PeerTier, RequestSpec};
+
+struct NoPush;
+impl PagePusher for NoPush {
+    fn push(&self, _: &str, _: &str, _: Duration, _: Vec<PushItem>) -> Result<(), String> {
+        panic!("device read issued a push")
+    }
+}
 
 fn scheduler(name: &str, budget: Duration) -> Arc<Mutex<Scheduler>> {
     crate::init_test_scheduler();
@@ -75,10 +83,10 @@ result = ts.Scheduler(cfg)
 }
 
 fn layout() -> Arc<Replica> {
-    layout_at(4096)
+    layout_at(4096, false)
 }
 
-fn layout_at(base: u64) -> Arc<Replica> {
+fn layout_at(base: u64, disk: bool) -> Arc<Replica> {
     let wire = serde_json::json!({
         "plan":{"prefix_granularity":4,"lcm_block_bytes":64,"num_lcm_blocks":63,
           "groups":[{"group_id":"full","cache_blocks_per_lcm_block":1,"page_count":64}],
@@ -100,13 +108,26 @@ fn layout_at(base: u64) -> Arc<Replica> {
                     page_stride: 64,
                     bytes: 64,
                 }],
-                host: None,
-                push: None,
+                host: disk.then(|| HostPool {
+                    address: address + 0x100000,
+                    groups: vec![HostGroup {
+                        parent_bytes: 64,
+                        packing: 1,
+                        block_bytes: 64,
+                        field_offsets: vec![("kv".into(), 0)],
+                    }],
+                }),
+                push: disk.then(|| format!("holder:{rank}")),
             };
             Member {
                 geometry,
                 bounds: vec![64],
-                regions: vec![(address, 4096)],
+                disk_bounds: if disk { vec![64] } else { vec![] },
+                regions: if disk {
+                    vec![(address, 4096), (address + 0x100000, 4096)]
+                } else {
+                    vec![(address, 4096)]
+                },
             }
             .encode(rank)
         })
@@ -198,7 +219,10 @@ fn exercise(delivery: Delivery, budget: Duration, start: impl FnOnce(), finish: 
             },
             channel.take(),
             Arc::default(),
+            Arc::new(NoPush),
             0,
+            5_000_000,
+            Duration::from_secs(1),
         );
         if i == 0 && matches!(delivery, Delivery::Recompute) {
             // Only the leader saw an expensive last-shard completion.
@@ -455,7 +479,16 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
             unreachable!()
         };
         let mut offers: Vec<_> = (0..8).map(|_| Offers::new(Arc::default())).collect();
-        let answer = offers[0].lookup(key, &holder, &layout, &query, &mut caches[0].lock(), 1);
+        let answer = offers[0].lookup(
+            key,
+            &holder,
+            &layout,
+            false,
+            &query,
+            &mut caches[0].lock(),
+            &NoPush,
+            1,
+        );
         for h in &mut offers[1..] {
             h.install(&query, &answer, 4, 8, 1);
         }
@@ -467,10 +500,10 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
         assert!(round.events[0].num_tokens > 0);
         sched.advance_peer(2, &round.events).unwrap();
         let now = 2 + wait();
-        a.tick(None, None, now, &mut round);
+        a.tick(None, None, Duration::from_secs(1), now, &mut round);
         assert!(a.finished());
         for (h, c) in offers.iter_mut().zip(&caches) {
-            h.expire(now, 0, &mut c.lock());
+            h.expire(now, 0, &mut c.lock(), &NoPush);
         }
         if let Some(rank) = evict {
             assert!(caches[rank].lock().clear_cache());
@@ -480,7 +513,7 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
             .peer_fetches()
             .pop()
             .unwrap();
-        let dest = layout_at(65536);
+        let dest = layout_at(65536, false);
         let mut readers = (0..8)
             .map(|_| Attempt::restore(&f, &reader, &(holder.clone(), layout.clone())).unwrap())
             .collect::<Vec<_>>();
@@ -495,14 +528,14 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
         let mut old_offer = None;
         for a in &mut readers {
             for (rank, v) in ready.iter().enumerate() {
-                if let Some(Message::Pin(_, o)) = a.vote(rank, v, now, &mut round) {
+                if let Some(Message::Pin(_, o)) = a.vote(rank, v, 5_000_000, now, &mut round) {
                     old_offer = Some(o);
                 }
             }
         }
         let old = old_offer.unwrap();
         let (Some(Message::Expired(_, expired)), None) =
-            offers[0].pin(key, &old, &mut caches[0].lock(), now)
+            offers[0].pin(key, &old, &mut caches[0].lock(), &NoPush, now)
         else {
             panic!("expected expired")
         };
@@ -514,7 +547,16 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
             unreachable!()
         };
         assert_eq!(*max_tokens, f.end_tokens);
-        let fresh = offers[0].lookup(key, &holder, &layout, &renew, &mut caches[0].lock(), now);
+        let fresh = offers[0].lookup(
+            key,
+            &holder,
+            &layout,
+            false,
+            &renew,
+            &mut caches[0].lock(),
+            &NoPush,
+            now,
+        );
         for h in &mut offers[1..] {
             h.install(&renew, &fresh, 4, 8, now);
         }
@@ -532,29 +574,20 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
         }
         let mut votes = Vec::new();
         for (rank, (h, c)) in offers.iter_mut().zip(&caches).enumerate() {
-            let (_, v) = h.pin(key, new, &mut c.lock(), now);
+            let (_, v) = h.pin(key, new, &mut c.lock(), &NoPush, now);
             let v = v.unwrap();
             assert_eq!(v.value != 0, evict != Some(rank));
             votes.push(v);
         }
         let ok = evict.is_none();
-        for h in &mut offers {
+        for (h, c) in offers.iter_mut().zip(&caches) {
             let mut grant = None;
             for (rank, v) in votes.iter().enumerate() {
-                grant = h.vote(rank, v, now).or(grant);
+                grant = h.vote(rank, v, &mut c.lock(), now).or(grant);
             }
             assert_eq!(grant, Some(Message::Grant(key.clone(), new.clone(), ok)));
         }
-        use super::super::{
-            push::{PagePusher, PushItem},
-            read::Arena,
-        };
-        struct NoPush;
-        impl PagePusher for NoPush {
-            fn push(&self, _: &str, _: &str, _: Duration, _: Vec<PushItem>) -> Result<(), String> {
-                panic!("device read issued a push")
-            }
-        }
+        use super::super::read::Arena;
         let arena = Arena::new(131072);
         let addr = |base: u64, block: i32| {
             base + 4096 * ((block - 1) % 8) as u64 + 64 * (1 + (block - 1) / 8) as u64
@@ -574,7 +607,9 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
             a.fence();
             let wait = Instant::now();
             loop {
-                if let (Some(v), _) = a.tick(Some(&pool), None, now, &mut round) {
+                if let (Some(v), _) =
+                    a.tick(Some(&pool), None, Duration::from_secs(1), now, &mut round)
+                {
                     done.push(v);
                     break;
                 }
@@ -590,7 +625,7 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
         for a in &mut readers {
             let mut release = None;
             for (rank, v) in done.iter().enumerate() {
-                release = a.vote(rank, v, now + 1, &mut round).or(release);
+                release = a.vote(rank, v, 5_000_000, now + 1, &mut round).or(release);
             }
             assert_eq!(
                 release,
@@ -599,16 +634,22 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
         }
         let mut closed = Vec::new();
         for (h, c) in offers.iter_mut().zip(&caches) {
-            let (_, v) = h.close(key, new.id, disposition, &mut c.lock(), now + 1);
+            let (_, v) = h.close(key, new.id, disposition, &NoPush, now + 1);
             closed.push(v.unwrap());
-            assert_eq!(c.lock().peer_stats().pinned_blocks, 0);
-            assert_eq!(h.pin(key, &old, &mut c.lock(), now + 1).1.unwrap().value, 0);
+            assert_eq!(
+                h.pin(key, &old, &mut c.lock(), &NoPush, now + 1)
+                    .1
+                    .unwrap()
+                    .value,
+                0
+            );
         }
         for (rank, (a, h)) in readers.iter_mut().zip(&mut offers).enumerate() {
             let mut ack = None;
-            for (rank, v) in closed.iter().enumerate() {
-                ack = h.vote(rank, v, now + 1).or(ack);
+            for (member, v) in closed.iter().enumerate() {
+                ack = h.vote(member, v, &mut caches[rank].lock(), now + 1).or(ack);
             }
+            assert_eq!(caches[rank].lock().peer_stats().pinned_blocks, 0);
             let Some(Message::Ack(k, id, d, c)) = ack else {
                 panic!("no closure")
             };
@@ -659,7 +700,10 @@ fn a_failed_progress_mesh_reports_the_error_before_worker_exit() {
         },
         None,
         Arc::default(),
+        Arc::new(NoPush),
         0,
+        5_000_000,
+        Duration::from_secs(1),
     );
     let progress = Progress::start(
         Some((follower, Group::new(0, (0..8).collect(), 1).unwrap())),
@@ -753,7 +797,7 @@ fn tiered_offer(
 
 #[test]
 fn slow_disk_reads_do_not_price_host_or_device_host_offers() {
-    let layout = layout();
+    let layout = layout_at(4096, true);
     let mut costs = [ReadCost::default(); 32];
     for slow in [
         [PeerTier::Disk, PeerTier::Disk],
@@ -824,7 +868,7 @@ fn tier_feedback_follows_the_reserved_suffix_once_per_business_outcome() {
             .unwrap();
         assert_eq!(vote.value, 2);
         for i in 0..8 {
-            a.vote(i, &vote, 20, &mut round);
+            a.vote(i, &vote, 5_000_000, 20, &mut round);
         }
         a.grant(&k, &offer, true, 25);
         assert!(a.take_read_sample(26).is_none());
@@ -832,7 +876,7 @@ fn tier_feedback_follows_the_reserved_suffix_once_per_business_outcome() {
         done.stage = DONE;
         done.value = if ack.is_none() { 2 } else { 1 };
         for i in 0..8 {
-            a.vote(i, &done, 50, &mut round);
+            a.vote(i, &done, 5_000_000, 50, &mut round);
         }
         if let Some(closure) = ack {
             assert!(a.take_read_sample(60).is_none());
@@ -847,7 +891,26 @@ fn tier_feedback_follows_the_reserved_suffix_once_per_business_outcome() {
                 ack == Some(Closure::Closed)
             ))
         );
-        a.tick(None, None, 100, &mut round);
+        a.tick(None, None, Duration::from_secs(1), 100, &mut round);
         assert!(a.take_read_sample(100).is_none());
     }
+}
+
+#[test]
+fn restoring_a_queued_disk_offer_requires_a_disk_capable_holder_descriptor() {
+    let disk = layout_at(4096, true);
+    let (a, k, offer, _, reply) = tiered_offer(&disk, [PeerTier::Device, PeerTier::Disk], 4);
+    let fetch = PeerFetchView {
+        lease: a.lookup.lease.clone(),
+        request_id: a.lookup.request_id.clone(),
+        holder: k.holder.name.clone(),
+        begin_tokens: 4,
+        end_tokens: offer.end,
+        tokens: a.lookup.tokens.clone(),
+        destinations: vec![],
+        prefix_hashes: vec![],
+        checkpoint: reply.encode(),
+    };
+    assert!(Attempt::restore(&fetch, &k.reader, &(k.holder.clone(), disk)).is_some());
+    assert!(Attempt::restore(&fetch, &k.reader, &(k.holder.clone(), layout())).is_none());
 }

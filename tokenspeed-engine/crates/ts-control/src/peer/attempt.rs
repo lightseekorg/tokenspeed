@@ -23,7 +23,8 @@ use super::{
     coordinated::ReadPath,
     geometry::Spans,
     layout::PeerReadPlan,
-    offers::{manifest, prefix, Vote, DONE, READY},
+    offers::{manifest, prefix, Vote, DONE, FREEZE, READY},
+    push::PushTarget,
     read::{MemberRead, ReadRetirement, Reads},
     registered::Replica,
     servicer::empty_event,
@@ -34,8 +35,22 @@ use super::{
 use std::{
     collections::HashMap,
     sync::{mpsc, Arc},
+    time::Duration,
 };
-use ts_scheduler::{PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, PeerPageView};
+use ts_scheduler::{
+    PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, PeerPageView, PeerTier,
+};
+
+struct MemberPlan {
+    reads: Vec<(String, Spans)>,
+    pushes: Vec<PushTarget>,
+}
+
+impl MemberPlan {
+    fn is_empty(&self) -> bool {
+        self.reads.is_empty() && self.pushes.is_empty()
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
@@ -46,6 +61,7 @@ enum Phase {
     Pin,
     Renewing,
     Reading,
+    Quarantine,
     Closing(Disposition),
     Finished,
 }
@@ -57,11 +73,12 @@ pub(super) struct Attempt {
     pages: Vec<PeerPageView>,
     phase: Phase,
     fetch: Option<PeerFetchView>,
-    batches: Option<Vec<(String, Spans)>>,
+    plan: Option<MemberPlan>,
     job: Option<MemberRead>,
     votes: [Option<u8>; 8],
     fenced: bool,
     voted: bool,
+    freeze_voted: bool,
     published_hit: Option<bool>,
     read_path: Option<ReadPath>,
     deadline: i64,
@@ -73,6 +90,7 @@ pub(super) struct Attempt {
     retire_wait: bool,
     invalid: bool,
     frozen: bool,
+    granted: bool,
 }
 
 fn event(kind: PeerEventKind, f: &PeerFetchView, end: i32) -> PeerEventView {
@@ -95,11 +113,12 @@ impl Attempt {
             pages: Vec::new(),
             phase: Phase::Discovery,
             fetch: None,
-            batches: None,
+            plan: None,
             job: None,
             votes: [None; 8],
             fenced: false,
             voted: false,
+            freeze_voted: false,
             published_hit: None,
             read_path: None,
             deadline,
@@ -111,6 +130,7 @@ impl Attempt {
             retire_wait: false,
             invalid: false,
             frozen: false,
+            granted: false,
         }
     }
     /// Once all DMA is retired and the business deadline has passed, only the
@@ -197,6 +217,7 @@ impl Attempt {
                 && manifest(pages) == offer.manifest
                 && self.source.as_ref().is_some_and(|s| {
                     super::layout::covers_interval(&s.contract, 0, offer.end, pages)
+                        && (s.can_push_disk() || pages.iter().all(|p| p.tier != PeerTier::Disk))
                 })
             {
                 if !economical {
@@ -238,6 +259,7 @@ impl Attempt {
             || f.tokens.len() != offer.end as usize
             || prefix(&f.tokens) != digest
             || manifest(&pages) != offer.manifest
+            || (!known.1.can_push_disk() && pages.iter().any(|p| p.tier == PeerTier::Disk))
             || !super::layout::covers_interval(&known.1.contract, 0, offer.end, &pages)
         {
             return None;
@@ -393,24 +415,41 @@ impl Attempt {
                 .collect::<Option<Vec<_>>>();
             if let Some(pairs) = pairs {
                 let endpoints: Vec<_> = src.members.iter().map(|m| m.endpoint()).collect();
+                let local_member = &local.members[rank];
                 match PeerReadPlan::new(&src.contract, &local.contract, endpoints.len(), 8, rank)
-                    .and_then(|planner| {
-                        planner.reads(&endpoints, &local.members[rank].endpoint(), &pairs)
-                    }) {
-                    Ok(batches) => {
-                        // All members pair the same logical slots, including slots
-                        // whose physical destination belongs to a different rank.
-                        self.read_path = ReadPath::from_tiers(
-                            k,
-                            endpoints.len(),
-                            pairs.iter().map(|(p, _)| p.tier),
-                        );
-                        plan = Some(
-                            batches
-                                .into_iter()
-                                .map(|(i, s)| (src.members[i].geometry.session.clone(), s))
-                                .collect::<Vec<_>>(),
-                        );
+                    .and_then(|planner| planner.plan(&endpoints, &local_member.endpoint(), &pairs))
+                {
+                    Ok(planned) => {
+                        let reads = planned
+                            .reads
+                            .into_iter()
+                            .map(|(i, s)| (src.members[i].geometry.session.clone(), s))
+                            .collect::<Vec<_>>();
+                        let pushes = planned
+                            .pushes
+                            .into_iter()
+                            .map(|(i, items)| {
+                                Some(PushTarget {
+                                    endpoint: src.members[i].geometry.push.clone()?,
+                                    session: local_member.geometry.session.clone(),
+                                    holder_incarnation: k.holder.incarnation,
+                                    offer_id: o.id,
+                                    items,
+                                })
+                            })
+                            .collect::<Option<Vec<_>>>();
+                        if let Some(pushes) = pushes {
+                            // All members pair the same logical slots, including slots
+                            // whose physical destination belongs to a different rank.
+                            self.read_path = ReadPath::from_tiers(
+                                k,
+                                endpoints.len(),
+                                pairs.iter().map(|(p, _)| p.tier),
+                            );
+                            plan = Some(MemberPlan { reads, pushes });
+                        } else {
+                            tracing::warn!("peer reservation push target missing push endpoint");
+                        }
                     }
                     Err(e) => tracing::warn!(%e, "peer reservation cannot be planned"),
                 }
@@ -418,13 +457,13 @@ impl Attempt {
         }
         let value = match &plan {
             None => 0,
-            Some(b) if b.is_empty() => 1,
+            Some(p) if p.is_empty() => 1,
             Some(_) => 2,
         };
         self.submit_until = std::time::Instant::now() + super::v1::SUBMIT_WINDOW;
         self.phase = Phase::Planning;
         self.fetch = Some(f);
-        self.batches = plan;
+        self.plan = plan;
         self.deadline = now.saturating_add(2_000_000);
         Some(Vote {
             key: k.clone(),
@@ -492,6 +531,7 @@ impl Attempt {
         &mut self,
         member: usize,
         v: &Vote,
+        quarantine_us: i64,
         now: i64,
         round: &mut PeerRound,
     ) -> Option<Message> {
@@ -499,9 +539,17 @@ impl Attempt {
             || self.offer.as_ref()?.id != v.offer
             || !matches!(
                 (self.phase, v.stage),
-                (Phase::Planning, READY) | (Phase::Reading, DONE)
+                (Phase::Planning, READY) | (Phase::Reading, DONE | FREEZE)
             )
         {
+            return None;
+        }
+        if v.stage == FREEZE {
+            // Early business fallback while Disk push cancels retry in the
+            // background: every member seals and freezes in the same round,
+            // while still awaiting final DONE votes for TargetRetired/RELEASE.
+            self.seal();
+            self.freeze(round);
             return None;
         }
         let entry = self.votes.get_mut(member)?;
@@ -528,6 +576,24 @@ impl Attempt {
             return Some(Message::Pin(v.key.clone(), self.offer.clone()?));
         }
         if self.votes.contains(&Some(2)) {
+            // All members reported retirement and at least one is Unknown.
+            // Keep target pages frozen (FetchFrozen) through the agreed
+            // quarantine interval before emitting TargetRetired and
+            // RELEASE(Abort), so write faults or vanished holders cannot
+            // permanently leak device KV blocks or holder pins.
+            let wait_us = quarantine_us.max(0);
+            tracing::warn!(
+                holder = %v.key.holder.name,
+                lease = v.key.lease,
+                offer = v.offer,
+                quarantine_us = wait_us,
+                "peer transfer retired with unknown write state; quarantining targets before TargetRetired and Release(Abort)"
+            );
+            self.pages.clear();
+            self.source = None;
+            self.plan = None;
+            self.phase = Phase::Quarantine;
+            self.deadline = now.saturating_add(wait_us);
             return None;
         }
         if self.frozen {
@@ -556,6 +622,7 @@ impl Attempt {
             self.seal();
             return None;
         }
+        self.granted = true;
         self.phase = Phase::Reading;
         self.deadline = now.saturating_add(30_000_000);
         None
@@ -586,6 +653,7 @@ impl Attempt {
         &mut self,
         reads: Option<&Reads>,
         meter: Option<(&Arc<ts_metrics::PeerMetrics>, usize)>,
+        push_timeout: Duration,
         now: i64,
         round: &mut PeerRound,
     ) -> (Option<Vote>, Option<Message>) {
@@ -598,17 +666,24 @@ impl Attempt {
             self.seal();
         }
         if self.phase == Phase::Reading {
-            if now >= self.deadline || self.invalid {
+            if self.granted && (now >= self.deadline || self.invalid) {
                 self.seal();
                 self.freeze(round);
             }
             let mut vote = None;
             if !self.voted {
                 if self.fenced && self.job.is_none() && !self.retire_wait {
-                    if let Some(b) = self.batches.take() {
+                    if let Some(p) = self.plan.take() {
                         let metrics = meter.map(|(m, rank)| (m, self.lookup.holder.as_str(), rank));
-                        self.job = reads
-                            .and_then(|w| w.submit_member_observed(b, self.submit_until, metrics));
+                        self.job = reads.and_then(|w| {
+                            w.submit_member_observed(
+                                p.reads,
+                                p.pushes,
+                                push_timeout,
+                                self.submit_until,
+                                metrics,
+                            )
+                        });
                     }
                 }
                 let result = if let Some(j) = &self.job {
@@ -620,15 +695,27 @@ impl Attempt {
                             Some(2)
                         }
                         Err(mpsc::TryRecvError::Disconnected) => Some(2),
-                        _ => None,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            if !self.freeze_voted && j.is_cancelling() {
+                                self.freeze_voted = true;
+                                vote = Some(Vote {
+                                    key: self.key.clone().unwrap(),
+                                    offer: self.offer.as_ref().unwrap().id,
+                                    stage: FREEZE,
+                                    value: 1,
+                                });
+                            }
+                            None
+                        }
                     }
-                } else if self.fenced && (self.retire_wait || self.batches.is_none()) {
+                } else if self.fenced && (self.retire_wait || self.plan.is_none()) {
                     Some(0)
                 } else {
                     None
                 };
                 if let Some(value) = result {
                     self.voted = true;
+                    self.job = None;
                     vote = Some(Vote {
                         key: self.key.clone().unwrap(),
                         offer: self.offer.as_ref().unwrap().id,
@@ -638,6 +725,18 @@ impl Attempt {
                 }
             }
             return (vote, None);
+        }
+        if self.phase == Phase::Quarantine {
+            if now >= self.deadline {
+                if self.frozen {
+                    if let Some(f) = &self.fetch {
+                        round.events.push(event(PeerEventKind::TargetRetired, f, 0));
+                    }
+                    self.frozen = false;
+                }
+                return (None, Some(self.close(Disposition::Abort, now)));
+            }
+            return (None, None);
         }
         if let Phase::Closing(d) = self.phase {
             if now >= self.deadline {
@@ -744,6 +843,7 @@ mod verification {
                 let (mut a, key, offer) = granted_candidate();
                 let mut round = PeerRound::default();
                 let mut release = None;
+                let quarantine_us = 500_000;
                 for i in 0..8 {
                     let rank = if reverse { 7 - i } else { i };
                     let vote = Vote {
@@ -752,22 +852,64 @@ mod verification {
                         stage: DONE,
                         value: values[rank],
                     };
-                    let action = a.vote(rank, &vote, 2, &mut round);
+                    let action = a.vote(rank, &vote, quarantine_us, 2, &mut round);
                     if i < 7 {
                         assert!(action.is_none());
                     }
                     if action.is_some() {
                         release = action;
                     }
-                    assert!(a.vote(rank, &vote, 3, &mut round).is_none());
+                    assert!(a.vote(rank, &vote, quarantine_us, 3, &mut round).is_none());
                 }
                 assert!(round.landed.is_empty());
                 if values.contains(&2) {
                     assert!(release.is_none());
+                    assert!(!a.finished());
+                    assert!(a.frozen);
+                    assert!(a.take_pending_release(i64::MAX).is_none());
                     assert!(round
                         .events
                         .iter()
                         .any(|e| e.kind == PeerEventKind::FetchFrozen));
+                    // Before quarantine deadline, stay frozen and emit nothing.
+                    round.events.clear();
+                    let (v_before, m_before) = a.tick(
+                        None,
+                        None,
+                        Duration::from_secs(1),
+                        2 + quarantine_us - 1,
+                        &mut round,
+                    );
+                    assert!(v_before.is_none() && m_before.is_none());
+                    assert!(round.events.is_empty());
+                    assert!(a.frozen && !a.finished());
+                    // Once quarantine elapses, emit TargetRetired and Release(Abort).
+                    let (v_after, m_after) = a.tick(
+                        None,
+                        None,
+                        Duration::from_secs(1),
+                        2 + quarantine_us,
+                        &mut round,
+                    );
+                    assert!(v_after.is_none());
+                    assert!(!a.frozen);
+                    assert_eq!(round.events.len(), 1);
+                    assert_eq!(round.events[0].kind, PeerEventKind::TargetRetired);
+                    assert_eq!(
+                        m_after,
+                        Some(Message::Release(key.clone(), offer.id, Disposition::Abort))
+                    );
+                    // Ack closes cleanly without emitting a duplicate FetchDone.
+                    round.events.clear();
+                    a.ack(
+                        &key,
+                        offer.id,
+                        Disposition::Abort,
+                        Closure::Closed,
+                        &mut round,
+                    );
+                    assert!(a.finished());
+                    assert!(round.events.is_empty());
                     continue;
                 }
                 let disposition = if values.contains(&0) {
@@ -822,7 +964,7 @@ mod verification {
         let (mut a, _, _) = granted_candidate();
         let release = a.close(Disposition::Abort, 10);
         assert!(a.take_pending_release(i64::MAX).is_none());
-        a.tick(None, None, 2_000_010, &mut round);
+        a.tick(None, None, Duration::from_secs(1), 2_000_010, &mut round);
         assert!(a.take_pending_release(2_000_009).is_none());
         assert_eq!(a.take_pending_release(2_000_010), Some(release));
         assert!(a.finished());
@@ -835,13 +977,129 @@ mod verification {
             let (mut a, key, offer) = granted_candidate();
             let release = a.close(Disposition::Complete, 1);
             let mut round = PeerRound::default();
-            let (_, retry) = a.tick(None, None, 3_000_001, &mut round);
+            let (_, retry) = a.tick(None, None, Duration::from_secs(1), 3_000_001, &mut round);
             assert_eq!(retry, Some(release));
             assert_eq!(round.events.len(), 1);
             assert_eq!(round.events[0].num_tokens, 0);
             a.ack(&key, offer.id, Disposition::Complete, closure, &mut round);
             assert!(a.finished());
             assert!(round.landed.is_empty());
+        }
+    }
+
+    #[test]
+    fn early_freeze_vote_unfreezes_and_aborts_once_background_cancel_retires() {
+        let (mut a, key, offer) = granted_candidate();
+        let mut round = PeerRound::default();
+        let freeze_vote = Vote {
+            key: key.clone(),
+            offer: offer.id,
+            stage: FREEZE,
+            value: 1,
+        };
+        assert!(a.vote(0, &freeze_vote, 500_000, 2, &mut round).is_none());
+        assert_eq!(round.events.len(), 1);
+        assert_eq!(round.events[0].kind, PeerEventKind::FetchFrozen);
+        assert!(a.frozen);
+
+        round.events.clear();
+        let mut release = None;
+        for rank in 0..8 {
+            let done_vote = Vote {
+                key: key.clone(),
+                offer: offer.id,
+                stage: DONE,
+                value: 0,
+            };
+            if let Some(m) = a.vote(rank, &done_vote, 500_000, 3, &mut round) {
+                release = Some(m);
+            }
+        }
+        assert!(!a.frozen);
+        assert_eq!(round.events.len(), 1);
+        assert_eq!(round.events[0].kind, PeerEventKind::TargetRetired);
+        assert_eq!(
+            release,
+            Some(Message::Release(key, offer.id, Disposition::Abort))
+        );
+    }
+
+    #[test]
+    fn quarantine_survives_invalidate_and_detaches_release_if_holder_is_dead() {
+        let (mut a, key, offer) = granted_candidate();
+        let mut round = PeerRound::default();
+        let quarantine_us = 5_000_000;
+        for rank in 0..8 {
+            let vote = Vote {
+                key: key.clone(),
+                offer: offer.id,
+                stage: DONE,
+                value: if rank == 0 { 2 } else { 0 },
+            };
+            assert!(a
+                .vote(rank, &vote, quarantine_us, 100, &mut round)
+                .is_none());
+        }
+        assert!(a.frozen && !a.finished());
+        // Weight invalidation must never shorten destination quarantine.
+        a.invalidate();
+        round.events.clear();
+        let (_, m) = a.tick(None, None, Duration::from_secs(1), 4_999_999, &mut round);
+        assert!(m.is_none() && round.events.is_empty() && a.frozen);
+        assert!(a.take_pending_release(i64::MAX).is_none());
+
+        // At quarantine expiry, emit TargetRetired and enter Closing(Abort).
+        let (_, release) = a.tick(None, None, Duration::from_secs(1), 5_000_100, &mut round);
+        assert!(!a.frozen);
+        assert_eq!(round.events.len(), 1);
+        assert_eq!(round.events[0].kind, PeerEventKind::TargetRetired);
+        let expected = Message::Release(key, offer.id, Disposition::Abort);
+        assert_eq!(release, Some(expected.clone()));
+
+        // If holder is dead and never ACKs, Closing detaches Release after 2s without
+        // emitting a duplicate FetchDone, reclaiming the Attempt slot cleanly.
+        round.events.clear();
+        a.tick(None, None, Duration::from_secs(1), 7_000_100, &mut round);
+        assert!(round.events.is_empty());
+        assert_eq!(a.take_pending_release(7_000_100), Some(expected));
+        assert!(a.finished());
+    }
+
+    #[test]
+    fn planning_or_pin_timeout_and_invalidate_do_not_freeze_before_grant() {
+        for pre_grant_phase in [Phase::Planning, Phase::Pin] {
+            let (mut a, _, _) = granted_candidate();
+            a.phase = pre_grant_phase;
+            a.granted = false;
+            a.deadline = 100;
+            let mut round = PeerRound::default();
+            // Simulate timeout before Grant ever arrived -> must abort cleanly, not freeze.
+            a.tick(None, None, Duration::from_secs(1), 200, &mut round);
+            assert!(!a.frozen, "pre-grant timeout must not mark attempt frozen");
+            assert!(
+                !round
+                    .events
+                    .iter()
+                    .any(|e| e.kind == PeerEventKind::FetchFrozen),
+                "pre-grant timeout must not emit FetchFrozen"
+            );
+
+            // Simulate invalidate() before Grant -> must also not freeze.
+            let (mut b, _, _) = granted_candidate();
+            b.phase = pre_grant_phase;
+            b.granted = false;
+            b.deadline = 10_000;
+            b.invalidate();
+            let mut round2 = PeerRound::default();
+            b.tick(None, None, Duration::from_secs(1), 200, &mut round2);
+            assert!(!b.frozen, "pre-grant invalidate must not freeze");
+            assert!(
+                !round2
+                    .events
+                    .iter()
+                    .any(|e| e.kind == PeerEventKind::FetchFrozen),
+                "pre-grant invalidate must not emit FetchFrozen"
+            );
         }
     }
 }

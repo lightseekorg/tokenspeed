@@ -140,7 +140,7 @@ public:
                                        .max_tokens = request.max_tokens};
         const std::size_t pending_new =
             unsynced_new_leases_.size() - (unsynced_new_leases_.contains(request.lease) ? 1u : 0u);
-        const PeerAnswer answer = holder_.AnswerPeerLookup(lookup, pending_new);
+        const PeerAnswer answer = holder_.AnswerPeerLookup(lookup, pending_new, /*include_disk=*/true);
         if (answer.num_tokens > 0 && !holder_.PeerLeaseCanPin(request.lease) && !holder_.PeerLeaseHeld(request.lease)) {
             unsynced_new_leases_.insert(request.lease);
         }
@@ -321,7 +321,7 @@ TEST_P(PeerSchedulerTest, RenewedPinRequiresExactCheckpointAndEveryOriginalBlock
                                  .prefix_hashes = request.prefix_hashes,
                                  .tokens = request.tokens,
                                  .max_tokens = request.max_tokens};
-    const auto answer = holder_.AnswerPeerLookup(checkpoint, /*pending_new_leases=*/0);
+    const auto answer = holder_.AnswerPeerLookup(checkpoint, /*pending_new_leases=*/0, /*include_disk=*/true);
     ASSERT_GT(answer.num_tokens, 0);
     checkpoint.max_tokens = answer.num_tokens;
     checkpoint.prefix_hashes.resize(answer.num_tokens / kP);

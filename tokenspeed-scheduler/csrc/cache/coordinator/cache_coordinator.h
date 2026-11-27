@@ -577,6 +577,10 @@ public:
     // each from whichever tier holds it (false for a model without State
     // groups).
     bool HoldsStateCheckpoint(const ContentHash& content_hash) const;
+    // Whether any non-replayable SWA block required at `boundary` resides on
+    // Disk without a Device or Host copy (e.g. partial Host eviction of a
+    // multi-block DFLASH SWA boundary).
+    bool HasDiskOnlySwaEntry(const CacheKey& boundary, std::int32_t tail_tokens) const;
 
     const CheckpointTree& Checkpoints() const { return store_.Checkpoints(); }
 

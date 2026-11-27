@@ -113,7 +113,7 @@ protected:
 
     // Answers a lookup and applies its soft pin, as the head after it does.
     PeerAnswer LookUp(const cache::PeerLookup& lookup, std::int64_t now_us = 0) {
-        const PeerAnswer answer = PeerExports::AnswerLookup(coordinator_, lookup);
+        const PeerAnswer answer = PeerExports::AnswerLookup(coordinator_, lookup, /*include_disk=*/true);
         exports_.Lookup(coordinator_, lookup, now_us);
         return answer;
     }
@@ -154,7 +154,7 @@ TEST_F(PeerExportsTest, ALookupIsAnsweredWithItsPagesAtTheirSlotsWithoutHoldingT
     Publish({tokens.begin(), tokens.begin() + 2 * kP});
     const std::vector<std::string> hashes = PageHashes(tokens);
 
-    const PeerAnswer answer = PeerExports::AnswerLookup(coordinator_, Lookup(1, tokens, 3 * kP));
+    const PeerAnswer answer = PeerExports::AnswerLookup(coordinator_, Lookup(1, tokens, 3 * kP), /*include_disk=*/true);
     EXPECT_EQ(answer.kind, PeerAnswerKind::kLookup);
     EXPECT_EQ(answer.num_tokens, 2 * kP);
     EXPECT_EQ(
@@ -257,7 +257,7 @@ TEST_F(PeerExportsTest, ExpirationHandlesSoftPinsHardPinsAndTombstonesTogether) 
 
     exports.Lookup(coordinator_, Lookup(1, tokens, 2 * kP), /*now_us=*/0);
     const cache::PeerLookup hard_pin = Lookup(2, tokens, 2 * kP);
-    const PeerAnswer answer = PeerExports::AnswerLookup(coordinator_, hard_pin);
+    const PeerAnswer answer = PeerExports::AnswerLookup(coordinator_, hard_pin, /*include_disk=*/true);
     exports.Lookup(coordinator_, hard_pin, /*now_us=*/0);
     exports.Pin(coordinator_,
                 cache::PeerPin{.lease = answer.lease, .num_tokens = answer.num_tokens, .pages = answer.pages},
@@ -298,8 +298,8 @@ TEST_F(PeerExportsTest, ALookupPastTheLeaseLimitOrNotCoveringItsBoundIsNoLease) 
     short_tokens.tokens.pop_back();
     cache::PeerLookup missing_hash = Lookup(4, tokens, 2 * kP);
     missing_hash.prefix_hashes.pop_back();
-    EXPECT_EQ(PeerExports::AnswerLookup(coordinator_, short_tokens).num_tokens, 0);
-    EXPECT_EQ(PeerExports::AnswerLookup(coordinator_, missing_hash).num_tokens, 0);
+    EXPECT_EQ(PeerExports::AnswerLookup(coordinator_, short_tokens, /*include_disk=*/true).num_tokens, 0);
+    EXPECT_EQ(PeerExports::AnswerLookup(coordinator_, missing_hash, /*include_disk=*/true).num_tokens, 0);
     EXPECT_FALSE(PeerExports::Matches(coordinator_, missing_hash, kP, {}));
 }
 
@@ -388,7 +388,7 @@ TEST(PeerExportsHostTest, AHostSuffixIsExportedAfterTheDevicesHits) {
                                       std::nullopt);
     host_block.reset();
 
-    const PeerAnswer answer = PeerExports::AnswerLookup(coordinator, Lookup(1, tokens, 2 * kP));
+    const PeerAnswer answer = PeerExports::AnswerLookup(coordinator, Lookup(1, tokens, 2 * kP), /*include_disk=*/true);
     ASSERT_EQ(answer.num_tokens, 2 * kP);
     ASSERT_EQ(answer.pages.size(), 2u);
     EXPECT_EQ(answer.pages[0].slot, 0);
