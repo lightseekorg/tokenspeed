@@ -15,6 +15,8 @@
 #include <ATen/cuda/detail/KernelUtils.h>
 
 #include <c10/macros/Macros.h>
+#include <cstdint>
+#include <type_traits>
 
 using namespace at::native;
 static_assert(CUB_SUPPORTS_SCAN_BY_KEY(), "SC selection requires CUB scan-by-key");
@@ -126,17 +128,37 @@ __global__ void radixFindKthValues(
       ? items_per_thread
       : at::ceil_div((int64_t)(slice_size - blk_idx_in_slice * items_per_block), (int64_t)BLOCK_THREADS);
 
-  // collect digit counts and store in shared memory
-  for (int i = 0; i < items_per_thread; ++i) {
-    // Find the start offset for this slice
-    IndexType idx = blk_idx_in_slice * items_per_block + i * BLOCK_THREADS + tidx;
-    if (idx < slice_size) {
-      idx *= withinSliceStride;
-      Bitwise val = TopKTypeConfig<T>::convert(doLdg(&data[idx]));
-      bool has_val = ((val & desiredMask) == (desired & desiredMask));
-      Bitwise digit = at::cuda::Bitfield<Bitwise>::getBitfield(val, current_bit, RADIX_BITS);
-      if (has_val) {
-        atomicAdd(&temp_storage.digit_counters[digit], 1);
+  static_assert(std::is_same_v<T, float>, "SC radix vector loads require FP32");
+  const IndexType block_start = blk_idx_in_slice * items_per_block;
+  const bool vector_aligned = withinSliceStride == 1 &&
+    (reinterpret_cast<uintptr_t>(data) % alignof(float4)) == 0;
+  for (int i = 0; i < items_per_thread; i += 4) {
+    // Use one mapping for the whole CTA. Partial chunks retain scalar indexing.
+    if (vector_aligned && i + 4 <= items_per_thread &&
+        block_start + (i + 4) * BLOCK_THREADS <= slice_size) {
+      IndexType idx = block_start + i * BLOCK_THREADS + tidx * 4;
+      const float4 loaded = doLdg(reinterpret_cast<const float4*>(data + idx));
+      const float values[4] = {loaded.x, loaded.y, loaded.z, loaded.w};
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        Bitwise val = TopKTypeConfig<T>::convert(values[j]);
+        if ((val & desiredMask) == (desired & desiredMask)) {
+          Bitwise digit = at::cuda::Bitfield<Bitwise>::getBitfield(val, current_bit, RADIX_BITS);
+          atomicAdd(&temp_storage.digit_counters[digit], 1);
+        }
+      }
+    } else {
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        IndexType idx = block_start + (i + j) * BLOCK_THREADS + tidx;
+        if (i + j < items_per_thread && idx < slice_size) {
+          idx *= withinSliceStride;
+          Bitwise val = TopKTypeConfig<T>::convert(doLdg(&data[idx]));
+          if ((val & desiredMask) == (desired & desiredMask)) {
+            Bitwise digit = at::cuda::Bitfield<Bitwise>::getBitfield(val, current_bit, RADIX_BITS);
+            atomicAdd(&temp_storage.digit_counters[digit], 1);
+          }
+        }
       }
     }
   }

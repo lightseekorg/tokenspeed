@@ -108,6 +108,33 @@ def test_empty_radix_prefix_blocks_refresh_in_graph(style):
         assert torch.count_nonzero(values[~active]) == 0
 
 
+@pytest.mark.parametrize(
+    ("rows", "vocab"),
+    [(8, 163840), (8, 163841), (8, 164863), (224, 167935), (224, 167936)],
+)
+@pytest.mark.parametrize("ties", [False, True])
+def test_radix_vector_loads_preserve_partial_chunks_on_graph_replay(rows, vocab, ties):
+    torch.manual_seed(71)
+    logits = torch.randn((rows, vocab), device="cuda")
+    if ties:
+        logits.round_()
+    original = logits.clone()
+    active = torch.arange(rows, device="cuda") % 3 == 0
+    full_vocab_scoring.topk(logits, active, 128)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        values, ids = full_vocab_scoring.topk(logits, active, 128)
+    for shift in [0, 3, 1031]:
+        logits.copy_(original.roll(shift, dims=1))
+        active.logical_not_()
+        expected_values, expected_ids = torch.topk(logits, 128, dim=-1)
+        graph.replay()
+        assert torch.equal(ids[active], expected_ids[active])
+        _bits(values[active], expected_values[active])
+        assert torch.count_nonzero(ids[~active]) == 0
+        assert torch.count_nonzero(values[~active]) == 0
+
+
 @pytest.mark.parametrize("rows", [1, 8, 32, 64, 128, 256])
 @pytest.mark.parametrize(
     "style", ["random", "bf16", "ties", "signed_zero", "large_offset", "extreme"]

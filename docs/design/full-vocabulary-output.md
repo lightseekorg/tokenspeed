@@ -94,7 +94,11 @@ The gather initializes skipped rows, avoiding separate output-fill launches.
 Later radix passes also skip a block whose previous histogram contains no
 entries in the selected prefix, writing the same zero histogram instead of
 reading the vocabulary again. The digit counts, threshold, gather order and
-tie handling are unchanged; this decision stays on the device.
+tie handling are unchanged; this decision stays on the device. Radix histogram
+loads read four FP32 elements together when the row is aligned and a complete
+chunk is present. Unaligned rows and partial chunks retain scalar indexing.
+Only integer histogram update order changes; thresholds, gather order, small
+sorts and floating-point reductions retain their existing operations.
 It is limited to SM90, contiguous FP32 large-vocabulary rows and tensors whose
 byte offsets fit below 2^31; other inputs retain the Torch implementation.
 Build its optional library **before serving** with the installed Torch ABI:
