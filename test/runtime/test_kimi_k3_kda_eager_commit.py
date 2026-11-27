@@ -352,7 +352,7 @@ def test_retained_commit_matches_torch_over_multiple_rounds_and_layers(
     windows fold after a round of full acceptance.
     """
     harness = _Harness(draft_tokens=T, seed=17, history_capacity=history_capacity)
-    expected_capacity = T + 12 if history_capacity is None else history_capacity
+    expected_capacity = 16 if history_capacity is None else history_capacity
     assert harness.backend._retained_records.shape[4] == expected_capacity
     rpis = [3, 1, 2]
     pages = {
@@ -2348,9 +2348,9 @@ def test_graph_replays_read_no_record_past_the_capacity_like_eager():
         captured.forward(stable_inputs, bs)
 
     # Verifies write candidates only past the count; both harnesses start
-    # from the same eleven records.
+    # from the same twelve records.
     capacity = captured.backend._retained_capacity
-    assert capacity == T + 12
+    assert capacity == 16
     for harness in (captured, eager):
         _seed_retained_history(harness, slot=1, length=capacity - T - 1)
     accepted = torch.full((bs,), T, dtype=torch.int32, device=DEV)
@@ -2386,9 +2386,11 @@ def test_graph_replays_read_no_record_past_the_capacity_like_eager():
         assert captured.backend._replay_length[1].item() == counts[-1]
         _assert_committed_pages_equal(captured, eager, pages, rpis)
         seq_lens = [seq_lens[0] + T]
-    # 11 + 3 = 14 is past the 12 records a 3-token window reads, so the next
-    # round reads none and counts its own 3; at 12 + 3 = 15 that repeats.
-    assert counts == [14, 3, 6, 9, 12, 15, 3]
+    # The twelve seeded records fit beside a 3-token window (a window reads
+    # up to 16 - 3 = 13), so the first round counts 12 + 3 = 15. That is past
+    # the 13 records, so the next round reads none and counts its own 3; at
+    # 12 + 3 = 15 that repeats.
+    assert counts == [15, 3, 6, 9, 12, 15, 3]
 
 
 def test_an_ended_request_some_layers_reject_reports_incomplete():

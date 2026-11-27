@@ -48,6 +48,7 @@ def _recipe(
     pd_disaggregation_enabled: bool = False,
     index_k_format: str = "fp8_scaled",
     mamba_ssm_dtype: str = "float32",
+    kda_history_capacity: int | None = None,
 ) -> Glm53FlashRecipe:
     linear_tp_size = linear_tp_size or tp_size
     dsa = DSAConfig(
@@ -77,6 +78,7 @@ def _recipe(
         conv_kernel_size=4,
         layer_ids=_LINEAR_LAYER_IDS,
         tp_size=linear_tp_size,
+        kda_history_capacity=kda_history_capacity,
     )
     attn_config = AttnConfig(
         device="cpu",
@@ -384,9 +386,18 @@ def test_lcm_parent_budget_preserves_heterogeneous_group_demand(
     assert recipe.select_num_lcm_blocks(layout, max_lcm_blocks=budgeted) == expected
 
 
-@pytest.mark.parametrize("width", [1, 4, 20])
-def test_glm_workspace_reserves_retained_verify_and_kpool_tail(width: int) -> None:
-    recipe = _recipe(tp_size=8, mla_cache_dtype=torch.float8_e4m3fn)
+@pytest.mark.parametrize(
+    ("width", "history_capacity", "capacity"),
+    [(1, None, 16), (4, None, 16), (20, 20, 20)],
+)
+def test_glm_workspace_reserves_retained_verify_and_kpool_tail(
+    width: int, history_capacity: int | None, capacity: int
+) -> None:
+    recipe = _recipe(
+        tp_size=8,
+        mla_cache_dtype=torch.float8_e4m3fn,
+        kda_history_capacity=history_capacity,
+    )
     recipe.attn_config = replace(
         recipe.attn_config, speculative_num_draft_tokens=width, max_resident_requests=24
     )
@@ -398,7 +409,7 @@ def test_glm_workspace_reserves_retained_verify_and_kpool_tail(width: int) -> No
     slots = 26
     expected = (
         layers * batch * width * conv_channels * 2
-        + slots * (layers * 3 * heads * (width + 12) * dim * 4 + 4)
+        + slots * (layers * 3 * heads * capacity * dim * 4 + 4)
         + layers * (12 * 8 + 4)
         + groups * 4 * 8
         + (2 * groups + 1) * batch * 4
@@ -410,10 +421,16 @@ def test_glm_workspace_reserves_retained_verify_and_kpool_tail(width: int) -> No
     assert recipe.workspace_bytes() == recipe.pool_options().workspace_bytes
 
 
-@pytest.mark.parametrize("width", [1, 4, 20])
-def test_glm_checkpoint_fields_are_independent_of_verify_width(width):
+@pytest.mark.parametrize(
+    ("width", "history_capacity"), [(1, None), (4, None), (20, 20)]
+)
+def test_glm_checkpoint_fields_are_independent_of_verify_width(width, history_capacity):
     """Retained decode history stays in the request-slot workspace."""
-    recipe = _recipe(tp_size=8, mla_cache_dtype=torch.float8_e4m3fn)
+    recipe = _recipe(
+        tp_size=8,
+        mla_cache_dtype=torch.float8_e4m3fn,
+        kda_history_capacity=history_capacity,
+    )
     schema = recipe.groups()
     recipe.attn_config = replace(recipe.attn_config, speculative_num_draft_tokens=width)
     assert recipe.groups() == schema

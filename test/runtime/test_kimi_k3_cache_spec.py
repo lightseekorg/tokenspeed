@@ -191,11 +191,11 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
     )
 
     # Four batch rows stage QKV. Twelve resident requests and the two
-    # reserved request slots each hold twenty (8 draft tokens + 12) FP32
+    # reserved request slots each hold sixteen (the default capacity) FP32
     # U/K/decay records per layer, plus one INT32 accepted count every layer
     # shares.
     qkv_bytes = 69 * 4 * 8 * 4608 * 2
-    retained_bytes = 14 * (69 * 12 * 20 * 128 * 3 * 4 + 4)
+    retained_bytes = 14 * (69 * 12 * 16 * 128 * 3 * 4 + 4)
     descriptor_bytes = 69 * (12 * 8 + 4) + 3 * 4 * 8
     page_and_step_bytes = (2 * 3 + 1) * 4 * 4
     record_metadata_bytes = 4 * 4 * 8 + 69 * 4 * 8 * 2 * 8
@@ -414,9 +414,25 @@ def test_kda_history_capacity_below_the_verify_window_is_refused():
         recipe.workspace_bytes()
 
 
-@pytest.mark.parametrize("width", [1, 4, 20])
-def test_kimi_checkpoint_is_independent_of_request_history(width):
-    recipe = kimi_recipe(speculative_num_draft_tokens=width, max_resident_requests=7)
+def test_default_kda_history_capacity_refuses_a_window_wider_than_16():
+    """The default of 16 does not stretch: a wider window sets the option."""
+    recipe = kimi_recipe(speculative_num_draft_tokens=20)
+    with pytest.raises(ValueError, match="at least the verify window"):
+        recipe.workspace_bytes()
+
+
+@pytest.mark.parametrize(
+    ("width", "history_capacity", "capacity"),
+    [(1, None, 16), (4, None, 16), (20, 20, 20)],
+)
+def test_kimi_checkpoint_is_independent_of_request_history(
+    width, history_capacity, capacity
+):
+    recipe = kimi_recipe(
+        speculative_num_draft_tokens=width,
+        max_resident_requests=7,
+        kda_history_capacity=history_capacity,
+    )
     schema = recipe.groups()
     assert schema == kimi_recipe().groups()
     fields = {
@@ -432,9 +448,13 @@ def test_kimi_checkpoint_is_independent_of_request_history(width):
     }
     # Increasing residency by one adds the FP32 records of that request's
     # slot and the count every layer shares.
-    smaller = kimi_recipe(speculative_num_draft_tokens=width, max_resident_requests=6)
+    smaller = kimi_recipe(
+        speculative_num_draft_tokens=width,
+        max_resident_requests=6,
+        kda_history_capacity=history_capacity,
+    )
     assert recipe.workspace_bytes() - smaller.workspace_bytes() == (
-        69 * 3 * 12 * (width + 12) * 128 * 4 + 4
+        69 * 3 * 12 * capacity * 128 * 4 + 4
     )
     recipe.server_args.disaggregation_mode = "prefill"
     assert recipe.groups() == schema

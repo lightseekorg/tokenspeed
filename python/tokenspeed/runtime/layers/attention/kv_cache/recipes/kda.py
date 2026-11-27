@@ -33,6 +33,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
 )
 
+# Accepted records a request slot keeps per KDA layer, counting the verify
+# window, when --kda-history-capacity is not set.
+KDA_DEFAULT_HISTORY_CAPACITY = 16
+
 
 def kda_recurrent_state_dtype(server_args) -> torch.dtype:
     """Return the dense-state dtype selected by ``--mamba-ssm-dtype``.
@@ -91,23 +95,24 @@ def kda_history_capacity(config: AttnConfig, draft_token_num: int) -> int:
     """Retained updates a request slot keeps per layer, counting the verify window.
 
     ``--kda-history-capacity`` (``LinearAttnConfig.kda_history_capacity``)
-    sets it; by default it is draft_token_num plus the kernel package's
-    ``KDA_DEFAULT_RETAINED_RECORDS`` (12, so 16 at a 4-token window).
-    A smaller capacity shrinks the request-slot workspace but folds the
-    accepted records into the dense state more often: at the window itself,
-    every round that accepts any.
+    sets it; the default is ``KDA_DEFAULT_HISTORY_CAPACITY`` (16). It must be
+    at least ``draft_token_num``, so a verify window wider than 16 needs the
+    option. A smaller capacity shrinks the request-slot workspace but folds
+    the accepted records into the dense state more often: at the window
+    itself, every round that accepts any.
 
     Raises:
-        ValueError: when the configured capacity is below the verify window.
+        ValueError: when the capacity, configured or default, is below the
+            verify window.
     """
-    from tokenspeed_kernel.ops.attention.kda import KDA_DEFAULT_RETAINED_RECORDS
-
     # Like the state backends' other linear flags, a config without the
     # linear component (a backend built for tests) keeps the default.
     linear = config.component(LinearAttnConfig)
-    configured = None if linear is None else linear.kda_history_capacity
-    if configured is None:
-        return draft_token_num + KDA_DEFAULT_RETAINED_RECORDS
+    configured = (
+        KDA_DEFAULT_HISTORY_CAPACITY
+        if linear is None or linear.kda_history_capacity is None
+        else linear.kda_history_capacity
+    )
     if configured < draft_token_num:
         raise ValueError(
             f"kda_history_capacity={configured} must be at least the verify "
@@ -163,8 +168,8 @@ def kda_request_slot_bytes(
     Args:
         config: Target attention configuration with model dimensions.
         groups: Cache declarations containing the target's KDA state fields.
-        draft_token_num: Effective verify width per request; it sets the
-            default history capacity (``kda_history_capacity``).
+        draft_token_num: Effective verify width per request; the history
+            capacity (``kda_history_capacity``) must be at least this.
 
     Returns:
         Bytes of the slot's FP32 correction, key and decay records for each

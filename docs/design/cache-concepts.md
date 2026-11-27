@@ -631,10 +631,11 @@ writing at index two. Generation stamps identify candidates from the current
 round. Eager execution and CUDA graphs use the same page and request-slot
 routing.
 
-Each layer has room for `--kda-history-capacity` records per slot (at least the
-verify width), by default `effective_verify_width + 12` (16 at a 4-token
-window), so a verify reads at most 12 accepted records whatever its width. A
-smaller capacity shrinks the request-slot workspace but folds more often. Every
+Each layer has room for `--kda-history-capacity` records per slot, 16 by
+default; it must be at least the effective verify width, so a window wider
+than 16 requires setting it. A verify reads at most the capacity minus its
+width in accepted records. A smaller capacity shrinks the request-slot
+workspace but folds more often. Every
 resident slot holds them, a decode role's extra slots included. When a whole
 candidate window will no longer fit, the accepted updates are folded into the
 dense base before the slot is reused, even for a request whose own window is

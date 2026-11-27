@@ -320,8 +320,8 @@ def test_set_kv_pool_binds_contract_state_groups() -> None:
     assert backend.state_paging_active
     assert backend._state_group_ids == _STATE_GROUPS
     assert backend.deferred_state_commit
-    # One-token decode keeps 12 accepted records beside its window.
-    assert backend._retained_capacity == 13
+    # The default capacity, whatever the window.
+    assert backend._retained_capacity == 16
 
 
 def test_retained_state_groups_defer_their_decode_state() -> None:

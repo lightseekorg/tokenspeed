@@ -581,10 +581,9 @@ def _require_state_pages(state_pages: int, required: int) -> None:
 
 
 def _history_capacity(window: int) -> int:
-    # The runtime's default history capacity for a verify window.
-    from tokenspeed_kernel.ops.attention.kda import KDA_DEFAULT_RETAINED_RECORDS
-
-    return window + KDA_DEFAULT_RETAINED_RECORDS
+    # The runtime's default history capacity (16); a wider window needs its
+    # own capacity there (--kda-history-capacity), here it is the window.
+    return max(16, window)
 
 
 def _retained_benchmark_layer(
