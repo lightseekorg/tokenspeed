@@ -31,6 +31,12 @@ from tokenspeed_kernel.ops.sampling.triton.dspark_block import (
     dspark_block_greedy_step,
     dspark_markov_shard_logits,
 )
+from tokenspeed_kernel.ops.sampling.triton.dspark_markov import (
+    DsparkMarkovSampleWorkspace,
+    dspark_markov_sample_workspace,
+    triton_dspark_markov_softmax,
+    triton_dspark_probs_scatter_and_sample,
+)
 from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
 from tokenspeed_kernel.ops.sampling.triton.rejection import (
     DRAFT_SAMPLE_OFFSET_SALT,
@@ -90,6 +96,10 @@ __all__ = [
     "dspark_block_greedy_resolve",
     "dspark_block_greedy_step",
     "dspark_markov_shard_logits",
+    "DsparkMarkovSampleWorkspace",
+    "dspark_markov_sample_workspace",
+    "triton_dspark_markov_softmax",
+    "triton_dspark_probs_scatter_and_sample",
     "min_p_renorm_prob",
     "apply_penalties_logit_bias_inplace",
     "accumulate_counts_inplace",

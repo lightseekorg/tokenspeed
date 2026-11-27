@@ -147,6 +147,29 @@ path the only difference is the FP32 summation order of the bias, which can
 flip a BF16 rounding and so a near-tie. In-shard exact ties go to the lowest
 id; `distributed_argmax`'s per-thread scan does not guarantee that.
 
+## Sampled DSpark Markov step (`dspark_markov_softmax`, `dspark_probs_scatter_and_sample`)
+
+When `--enable-speculative-sampling` is active on V4.1 DSpark, each draft step
+draws stochastically (or takes the canonical one-hot `top_k == 1` argmax) and
+records normalized FP32 probabilities in `RuntimeStates.draft_probs`.
+
+* `dspark_markov_softmax` folds the Markov bigram lookup (`embedding[anchor]`),
+  matrix product with `projection.T`, addition to `base_logits[:, step]`,
+  per-row temperature scaling (`exp2`), and normalization into a single
+  preallocated `workspace.probs` buffer (writing `1.0` at the lowest-index
+  argmax for `top_k == 1`), optionally prefetched from pool scalars on step 0.
+* Optional in-place Top-K / Top-P renormalization (`fused_topk_topp_renorm`
+  with `in_place_skip=True` for vocabularies `>= 1024`) operates directly on
+  `workspace.probs` using static scratch, leaving greedy and uncut rows
+  untouched.
+* `dspark_probs_scatter_and_sample` scatters normalized probabilities directly
+  into `draft_probs[write_slots, step, :vocab]` (using `int64` offsets for
+  tables above `2**31` elements), scans per-block masses, draws tokens using
+  the same `Philox4x32-10` counter contract (`RNG_TAG_DRAFT`) and strict
+  `CDF > u * mass` rule as `packed_verify.py` (with lowest-index argmax
+  fallback), writes `next_tokens_out[:, step]`, and prefetches the next step's
+  bigram embedding into `workspace.markov_embed`.
+
 ## Synthetic verify outputs (`write_synthetic_verify_outputs`)
 
 A benchmark run with a synthetic acceptance length `L` replaces each verify

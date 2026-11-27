@@ -73,8 +73,11 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_SWA_GROUP_ID,
 )
 from tokenspeed.runtime.models.deepseek_v41_dspark_heads import (
+    DsparkSampledWorkspace,
     dspark_greedy_workspace,
+    dspark_sampled_workspace,
     sample_dspark_block_greedy,
+    sample_dspark_block_sampled,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -200,6 +203,7 @@ class DeepseekV41DSpark(BaseDrafter):
         self._verify_candidates: torch.Tensor | None = None
         self._graph_query_tokens: int | None = None
         self._sample_proposals: Callable | None = None
+        self._sampled_workspace: DsparkSampledWorkspace | None = None
         self._verify_layout_counts: tuple[int, ...] | None = None
         self._verify_rows: torch.Tensor | None = None
         self._verify_indptr: torch.Tensor | None = None
@@ -273,6 +277,19 @@ class DeepseekV41DSpark(BaseDrafter):
                 "and attention TP1"
             )
         self._sample_proposals = sampling_backend.sample_dspark_proposals
+        vocab_size = int(self.vocab_size)
+        self._sampled_workspace = dspark_sampled_workspace(
+            max_rows=int(self.input_buffers.max_bs),
+            vocab_size=vocab_size,
+            rank=int(self.model.markov_embedding.embedding_dim),
+            embed_dtype=self.model.markov_embedding.weight.dtype,
+            pools=sampling_backend.speculative_sampling_pools(),
+            topk_topp_workspace_bytes=sampling_backend.dspark_topk_topp_workspace_size(
+                int(self.input_buffers.max_bs), vocab_size
+            ),
+            renorm_probs=sampling_backend.renorm_dspark_probabilities,
+            device=self.device,
+        )
 
     def export_slot_state(self, slot, out, stream, *, admission_id: int) -> None:
         if (
@@ -1194,6 +1211,27 @@ class DeepseekV41DSpark(BaseDrafter):
                 self.tp_group,
                 self.candidates,
                 self.partials,
+                next_tokens[num_extends:, 1:],
+            )
+        elif self._sampled_workspace is not None:
+            slots = self.input_buffers.req_pool_indices_buf[num_extends : base_ctx.bs]
+            write_slots = self.input_buffers.state_write_req_pool_indices_buf[
+                num_extends : base_ctx.bs
+            ]
+            assert (
+                self.runtime_states is not None
+                and self.runtime_states.draft_probs is not None
+            )
+            sample_dspark_block_sampled(
+                local_logits,
+                bonus,
+                self.model.markov_head,
+                slots,
+                write_slots,
+                start_pos,
+                self.runtime_states.draft_probs,
+                self._sampled_workspace,
+                int(self.vocab_size),
                 next_tokens[num_extends:, 1:],
             )
         else:
