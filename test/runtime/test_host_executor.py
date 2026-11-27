@@ -1095,6 +1095,14 @@ class TestGroupAwareWireTest:
         tracker = Mock()
         tracker.event_sets = [object()]
 
+        bound_geometry = SimpleNamespace(device_rows="bound")
+
+        def _make_unbound_geometry(**_kwargs):
+            unbound = SimpleNamespace(
+                device_rows=None, bind=Mock(return_value=bound_geometry)
+            )
+            return unbound
+
         with (
             patch.object(
                 executor_module,
@@ -1124,14 +1132,16 @@ class TestGroupAwareWireTest:
             patch.object(
                 lanes_module,
                 "build_host_transfer_geometry",
-                side_effect=lambda **_kwargs: SimpleNamespace(
-                    device_rows=None,
-                    bind=Mock(),
-                ),
+                side_effect=_make_unbound_geometry,
             ) as build_geometry,
         ):
-            for io_backend, device_type in (("direct", "cuda"), ("kernel", "npu")):
+            for io_backend, device_type, expect_bound in (
+                ("direct", "cuda", False),
+                ("direct", "npu", False),
+                ("kernel", "npu", True),
+            ):
                 with subtests.test(io_backend=io_backend, device_type=device_type):
+                    device = SimpleNamespace(type=device_type)
                     field = SimpleNamespace(
                         field_id="field",
                         device_buffer_index=0,
@@ -1141,9 +1151,7 @@ class TestGroupAwareWireTest:
                     )
                     layout = SimpleNamespace(
                         num_lcm_blocks=2,
-                        buffers=(
-                            SimpleNamespace(device=SimpleNamespace(type=device_type)),
-                        ),
+                        buffers=(SimpleNamespace(device=device),),
                         groups=(
                             SimpleNamespace(
                                 group_id="group",
@@ -1168,10 +1176,13 @@ class TestGroupAwareWireTest:
                         world_cpu_group=None,
                         block_alignment=1,
                     )
-                    assert (executor._transfer_geometry.device_rows) is None
-                    executor._transfer_geometry.bind.assert_not_called()
+                    if expect_bound:
+                        assert (executor._transfer_geometry) is (bound_geometry)
+                    else:
+                        assert (executor._transfer_geometry.device_rows) is None
+                        executor._transfer_geometry.bind.assert_not_called()
 
-        assert (build_geometry.call_count) == (2)
+        assert (build_geometry.call_count) == (3)
 
     def test_optional_dependency_shim_restores_existing_modules(self):
         protected_names = (
