@@ -46,6 +46,12 @@ from tokenspeed.runtime.execution.cudagraph_memory import (  # noqa: E402
 )
 from tokenspeed.runtime.layers.attention import registry  # noqa: E402
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import setup  # noqa: E402
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (  # noqa: E402
+    CacheRuntimeContract,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
+    CacheGroupSpec,
+)
 from tokenspeed.runtime.pd.host_peer import build_host_peer  # noqa: E402
 
 RUNTIME = pathlib.Path(__file__).resolve().parents[2] / "python/tokenspeed/runtime"
@@ -410,10 +416,27 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         free[0] -= 1 << 30
         return probe, views(probe)
 
+    history = CacheGroupSpec(
+        group_id="history",
+        attn_kind="full_history",
+        rows_per_page=1,
+        entry_stride_tokens=1,
+        shard_count=1,
+        replayable=False,
+    )
+    contract = CacheRuntimeContract(
+        prefix_granularity=1,
+        num_lcm_blocks=1,
+        token_capacity=1,
+        group_specs=(history,),
+        group_page_counts={"history": 2},
+        group_packing={"history": 1},
+    )
+
     def views(attention):
         return SimpleNamespace(
             token_to_kv_pool=SimpleNamespace(
-                arena=SimpleNamespace(runtime_contract=None)
+                arena=SimpleNamespace(runtime_contract=contract)
             ),
             draft_token_to_kv_pool=None,
             cache_geometry=SimpleNamespace(prefix_granularity=1),
