@@ -30,6 +30,7 @@ from __future__ import annotations
 import gc
 import sys
 from dataclasses import dataclass, fields, is_dataclass, replace
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -56,7 +57,6 @@ from tokenspeed.runtime.execution.input_buffer import InputBuffers  # noqa: E402
 from tokenspeed.runtime.execution.memory_delta import (  # noqa: E402
     NULL_MEMORY_DELTA_OBSERVER,
 )
-from tokenspeed.runtime.execution.prefill_graph import PrefillGraph  # noqa: E402
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import (  # noqa: E402
     TorchMemorySaverAdapter,
 )
@@ -85,17 +85,30 @@ def device_tensors(value):
 
 
 def sleep_wake(saver, persistent, run):
+    from tokenspeed.runtime.engine.memory_occupation import MemoryRegion
+    from tokenspeed.runtime.engine.rust_host import HostDataPlane
+
+    # A real data-plane transition over the graph's real allocator regions;
+    # this isolated workload has no model/communication lifecycle to initialize.
+    host = HostDataPlane.__new__(HostDataPlane)
+    host._device = torch.cuda
+    host._replica_memory_transitions = False
+    host._regions = {
+        tag: MemoryRegion(
+            release=partial(saver.pause, tag=tag),
+            resume=partial(saver.resume, tag=tag),
+        )
+        for tag in ("cuda_graph", "weights")
+    }
     addresses = [tensor.data_ptr() for tensor in persistent]
     for cycle in range(3):
         expected = run(cycle)
         contents = [tensor.cpu().clone() for tensor in persistent]
         gc.collect()
         torch.cuda.synchronize()
-        saver.pause(tag="cuda_graph")
-        saver.pause(tag="weights")
+        host.release_memory(["cuda_graph", "weights"])
         try:
             torch.cuda.synchronize()
-            torch.cuda.empty_cache()
             ordinary = sum(
                 segment["total_size"]
                 for segment in torch.cuda.memory_snapshot()
@@ -103,8 +116,7 @@ def sleep_wake(saver, persistent, run):
             )
             assert ordinary == 0, ordinary
         finally:
-            saver.resume(tag="weights")
-            saver.resume(tag="cuda_graph")
+            host.resume_memory(["weights", "cuda_graph"])
         assert addresses == [tensor.data_ptr() for tensor in persistent]
         for tensor, before in zip(persistent, contents, strict=True):
             torch.testing.assert_close(
@@ -232,6 +244,8 @@ def dflash(saver):
 
 
 def make_prefill(saver, inner, backend):
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
     config = replace(prefill_config(), query_shard_size=1, query_shard_rank=0)
     with saver.named_region("executor_inputs"):
         buffers = InputBuffers(2, 32, 2, device="cuda")
@@ -345,6 +359,7 @@ def capacity(saver):
             self.forward_metadata = None
             self._state_group_ids = ("state",)
             self.states = torch.zeros(4, 2, device="cuda")
+            self._prefill_metadata = {}
             self.init_prefill_graph_state(8, 2)
 
         def _admits_capacity_prefill(self):
@@ -432,15 +447,21 @@ def capacity(saver):
         graph._input_embeds_buf.fill_(cycle + 1)
         results = []
         for (bucket, bs), (capture, output) in graph._captures.items():
+            if bs is None:
+                # This consumer reads retained metadata inline; the production
+                # ordinary fallback instead runs attention at an eager break.
+                continue
             with saver.named_region("attention_state"):
-                graph.make_dummy_batch(bucket, 1)
+                graph.make_dummy_batch(bucket, bs)
             backend.prepare_prefill_metadata(
-                bucket, bs or 1, ForwardMode.EXTEND, capture=False
+                bucket, bs, ForwardMode.EXTEND, capture=False
             )
             with active_forward(contexts[bucket]):
                 capture.replay(valid_rows=bucket)
             result = output.hidden_states.cpu()
-            assert torch.equal(result, torch.full_like(result, cycle + 1 + bucket))
+            torch.testing.assert_close(
+                result, torch.full_like(result, cycle + 1 + bucket), rtol=0, atol=0
+            )
             results.append(result)
         return results
 

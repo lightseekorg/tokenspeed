@@ -1299,6 +1299,9 @@ def test_breakable_graph_storage_growth_survives_memory_release(case):
             ],
             check=True,
             timeout=180,
+            # The weight stubs use Torch GEMMs instead of runtime kernels.
+            # Their process-global BLAS workspace has no graph-buffer owner.
+            env={**os.environ, "CUBLAS_WORKSPACE_CONFIG": ":0:0"},
         )
 
 
