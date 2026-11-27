@@ -51,6 +51,16 @@ files with the checkpoint. Pass a custom filename pattern through
 `{"pattern": "model-rank-{rank}-part-{part}.safetensors"}`. The serving CLI does
 not expose this loader or its extra configuration.
 
+## Plugin server arguments
+
+Installed plugins may register typed options for the flat `--extra-server-args`
+JSON object, for example `--extra-server-args '{"extension_tile_size":64}'` when
+a plugin owns that field. Python callers pass the same dictionary through
+`ServerArgs(extra_server_args=...)`. Unknown fields, invalid values and duplicate
+field registrations are rejected. HF overrides remain for model definitions.
+See [plugin server arguments](../design/plugin-server-args.md) for registration
+and model-construction contracts.
+
 ## Sparse KV offloading
 
 `--kv-offload-config` accepts a JSON object with four required fields:
@@ -60,9 +70,10 @@ boolean enabling cross-layer prefetch). Omitting the argument disables offload.
 The model cache recipe validates supported fields, selection capacity, and
 execution constraints; unsupported recipes reject the configuration.
 
-Model-specific behavior stays in `--hf-overrides`. For a plugin supporting a
-window ring, set its `kv_offload_window_ring` option explicitly. Do not put
-`window_ring` in the runtime object or use the legacy `hf_overrides.kv_offload`
+Plugin execution options use `--extra-server-args`, a flat JSON object whose
+fields are registered and validated by the owning plugin. For a plugin supporting
+a window ring, set `kv_offload_window_ring` there explicitly. Do not put
+`window_ring` in the offload object or use the legacy `hf_overrides.kv_offload`
 entry; both are rejected. This option does not enable MTP, CUDA Graph, scheduler
 overlap, or change numerical settings implicitly.
 

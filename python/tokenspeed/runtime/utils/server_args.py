@@ -735,6 +735,7 @@ class ServerArgs:
 
     # Hugging Face model config overrides in JSON
     hf_overrides: str = "{}"
+    extra_server_args: dict[str, object] = dataclasses.field(default_factory=dict)
 
     # Kernel backend
     attention_backend: str | None = None
@@ -1016,6 +1017,18 @@ class ServerArgs:
     enable_expert_parallel: bool = False
 
     # Resolved in __post_init__; not options.
+    _extra_server_args_ready: bool = dataclasses.field(
+        default=False, init=False, repr=False, compare=False
+    )
+    _extra_server_args_cache: dict = dataclasses.field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    def __getstate__(self):
+        # A worker reconstructs its shared plugin arguments from plain launch
+        # values. Do not pickle plugin classes or another process's cache.
+        return {**self.__dict__, "_extra_server_args_cache": {}}
+
     _grammar_backend_unset: bool = dataclasses.field(
         default=False, init=False, repr=False
     )
@@ -1111,6 +1124,7 @@ class ServerArgs:
         self.validate_dp_local_cuda_graph()
         self.validate_dsv41_adaptive_dspark()
         self.validate()
+        self._extra_server_args_ready = True
 
     def validate_dp_local_cuda_graph(self):
         if not self.enable_dp_local_cuda_graph:
@@ -2563,6 +2577,9 @@ class ServerArgs:
         from tokenspeed.runtime.plugins import ensure_loaded
 
         ensure_loaded()
+        from tokenspeed.runtime.plugins.server_args import validate_extra_server_args
+
+        validate_extra_server_args(self)
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
         _require_choice(
             "--owned-attention-output",
@@ -3732,8 +3749,10 @@ class ServerArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         from tokenspeed.runtime.plugins import ensure_loaded
+        from tokenspeed.runtime.plugins.server_args import add_extra_server_args
 
         ensure_loaded()
+        add_extra_server_args(parser)
         parser.allow_abbrev = False
 
         # Model and port args
@@ -4150,7 +4169,7 @@ class ServerArgs:
             default=ServerArgs.kv_offload_config,
             help='Sparse KV offload JSON object with explicit "layers", "hot_tokens", '
             '"host_gb" (GiB), and "overlap". Model-specific options remain in '
-            "--hf-overrides; unsupported cache recipes reject this configuration.",
+            "--extra-server-args; unsupported cache recipes reject this configuration.",
         )
         parser.add_argument(
             "--disable-kvstore",
@@ -4978,17 +4997,8 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=[
-                "greedy",
-                "flashinfer",
-                "flashinfer_full",
-                "triton",
-                "triton_full",
-                "ascend_full",
-                "sonic",
-            ],
             default=ServerArgs.sampling_backend,
-            help="Sampling backend. "
+            help="Sampling backend, including names registered by runtime plugins. "
             "'greedy': argmax + verify_chain_greedy, zero sampling-param plumbing. "
             "'flashinfer': temperature/top_k/top_p via fused softmax + top_k_top_p_sampling_from_probs; "
             "min_p and penalties silently ignored. "
@@ -6279,6 +6289,9 @@ class ServerArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
+        from tokenspeed.runtime.plugins.server_args import collect_extra_server_args
+
+        args.extra_server_args = collect_extra_server_args(args)
         args.ep_size = args.expert_parallel_size
 
         # Resolve model (positional model arg vs --model)
