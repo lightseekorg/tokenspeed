@@ -20,6 +20,7 @@
 
 """Startup checkpoint metadata remains usable after the source is removed."""
 
+import json
 import os
 import shutil
 import sys
@@ -249,15 +250,32 @@ def test_rank_local_state_does_not_define_canonical_checkpoint_shapes(
 
 
 @pytest.mark.parametrize("startup_format", ["dummy", "auto"])
+@pytest.mark.parametrize(
+    "checkpoint_state,error",
+    [
+        ("truncated", ValueError),
+        ("index-ahead", RuntimeError),
+        ("missing-weight-map", KeyError),
+        ("invalid-weight-map", TypeError),
+    ],
+)
 def test_incomplete_checkpoint_only_prevents_real_weight_loading(
-    tmp_path, monkeypatch, caplog, startup_format
+    tmp_path, monkeypatch, caplog, startup_format, checkpoint_state, error
 ):
     _write_checkpoint(tmp_path, scale=1)
     shard = tmp_path / "model.safetensors"
-    shard.write_bytes(shard.read_bytes()[:-1])
+    if checkpoint_state == "truncated":
+        shard.write_bytes(shard.read_bytes()[:-1])
+    else:
+        index = {
+            "index-ahead": {"weight_map": {"weight": "pending.safetensors"}},
+            "missing-weight-map": {},
+            "invalid-weight-map": {"weight_map": None},
+        }[checkpoint_state]
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
     runner = _startup_runner(tmp_path, startup_format, _CheckpointLinear, monkeypatch)
     if startup_format == "auto":
-        with pytest.raises(ValueError, match="unreadable safetensors shard"):
+        with pytest.raises(error):
             runner.load_model()
     else:
         runner.load_model()

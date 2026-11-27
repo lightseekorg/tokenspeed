@@ -88,7 +88,7 @@ class WeightLoader:
                 ),
             )
             return safetensors_tensor_shapes(files)
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, RuntimeError, LookupError, TypeError) as error:
             logger.warning(
                 f"Cannot read optional dummy checkpoint metadata from {source}: {error}; "
                 "later reloads will validate new shards without a held-source shape comparison"

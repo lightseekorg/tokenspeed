@@ -127,6 +127,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
             return import_module("tokenspeed.runtime.cache.l2.executor")
     host_transfer = ModuleType("tokenspeed_kernel.ops.kvcache.host_transfer")
     host_transfer.HostTransferWorkspace = Mock
+    host_transfer.StagingBuffer = Mock
     host_transfer.build_host_transfer_geometry = Mock()
     host_transfer.transfer_cache_blocks = Mock()
     host_transfer.wait_layer_ready = Mock()
@@ -1063,7 +1064,7 @@ class TestGroupAwareWireTest:
         assert (executor._transfer_geometry) is (bound_geometry)
         assert ([count for count, _ in trackers]) == ([3, 1])
 
-    def test_direct_and_npu_init_keep_geometry_on_the_host(self, subtests):
+    def test_direct_keeps_host_geometry_and_npu_binds_device_geometry(self, subtests):
         executor_module = self._executor_module()
         lanes_module = _lanes_module()
         HostCacheExecutor = executor_module.HostCacheExecutor
@@ -1093,6 +1094,10 @@ class TestGroupAwareWireTest:
         )
         tracker = Mock()
         tracker.event_sets = [object()]
+        bound_geometry = object()
+        unbound_geometry = SimpleNamespace(
+            device_rows=None, bind=Mock(return_value=bound_geometry)
+        )
 
         with (
             patch.object(
@@ -1116,15 +1121,15 @@ class TestGroupAwareWireTest:
             patch.object(
                 executor_module.device_module, "stream", return_value=nullcontext()
             ),
+            # NPU allocations and warmup kernels are unavailable in this geometry test.
+            patch.object(executor_module, "StagingBuffer", side_effect=Mock),
+            patch.object(HostCacheExecutor, "_warmup_restore_transfers"),
             patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(
                 lanes_module,
                 "build_host_transfer_geometry",
-                side_effect=lambda **_kwargs: SimpleNamespace(
-                    device_rows=None,
-                    bind=Mock(),
-                ),
+                return_value=unbound_geometry,
             ) as build_geometry,
         ):
             for io_backend, device_type in (("direct", "cuda"), ("kernel", "npu")):
@@ -1165,8 +1170,15 @@ class TestGroupAwareWireTest:
                         world_cpu_group=None,
                         block_alignment=1,
                     )
-                    assert (executor._transfer_geometry.device_rows) is None
-                    executor._transfer_geometry.bind.assert_not_called()
+                    if io_backend == "direct":
+                        assert executor._transfer_geometry is unbound_geometry
+                        assert executor._transfer_geometry.device_rows is None
+                        unbound_geometry.bind.assert_not_called()
+                    else:
+                        assert executor._transfer_geometry is bound_geometry
+                        unbound_geometry.bind.assert_called_once_with(
+                            layout.buffers[0].device, non_blocking=False
+                        )
 
         assert (build_geometry.call_count) == (2)
 
