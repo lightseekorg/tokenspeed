@@ -183,9 +183,9 @@ def prepare_decode_tables(
     Each target is None or a disjoint
     (length buffer, page table, length floor) tuple owned by its leaf. Destinations
     must not alias live sources or each other. Length floors <= 1 preserve the input.
-    CUDA and NPU devices use the kernel registry. Other devices use the Torch reference.
+    Non-CUDA tensors use the Torch reference; GPU implementations use the registry.
     """
-    if not tables.is_cuda and tables.device.type != "npu":
+    if not tables.is_cuda:
         from tokenspeed_kernel.numerics.torch.metadata import (
             torch_prepare_decode_tables,
         )

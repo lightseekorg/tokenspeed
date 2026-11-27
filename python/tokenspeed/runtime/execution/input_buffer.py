@@ -27,12 +27,6 @@ import numpy as np
 import torch
 from tokenspeed_kernel.ops.metadata import PrepTape, Reg
 from tokenspeed_kernel.ops.metadata.ngram import NGramHashParams, prepare_ngram_inputs
-from tokenspeed_kernel.selection import (
-    NoKernelFoundError,
-    resolve_kernel_override,
-    select_kernel,
-)
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
@@ -46,19 +40,6 @@ if TYPE_CHECKING:
 
 
 logger = get_colorful_logger(__name__)
-
-
-def _optional_decode_kernel(mode, buffer):
-    if buffer.device.type != "npu":
-        return None
-    try:
-        return select_kernel(
-            "metadata", mode, format_signature(ids=dense_tensor_format(buffer.dtype))
-        )
-    except NoKernelFoundError:
-        if resolve_kernel_override("metadata", mode, None) is not None:
-            raise
-        return None
 
 
 class InputBuffers:
@@ -151,15 +132,6 @@ class InputBuffers:
         # State checkpoint, 0 for none.
         self.extend_state_checkpoint_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._pad_tape = self._record_pad_tape()
-        self._decode_prep = _optional_decode_kernel(
-            "decode_prep_and_scrub", self.input_ids_buf
-        )
-        self._load_decode_ids = _optional_decode_kernel(
-            "load_decode_input_ids", self.input_ids_buf
-        )
-        self._pad_idle = _optional_decode_kernel(
-            "dummy_decode_buffers", self.input_ids_buf
-        )
 
     def prepare_request_token_history_inputs(
         self,
@@ -453,49 +425,11 @@ class InputBuffers:
             (len(req_pool_indices), torch.int64), (len(input_lengths), torch.int32)
         )
         req_pool_indices_cpu.copy_(torch.as_tensor(req_pool_indices, dtype=torch.int64))
+        input_lengths_cpu.copy_(torch.as_tensor(input_lengths, dtype=torch.int32))
         self.req_pool_indices_buf[:batch_size].copy_(
             req_pool_indices_cpu,
             non_blocking=True,
         )
-        uniform_decode_len = input_lengths[0] if batch_size else 0
-        if (
-            num_extends == 0
-            and batch_size > 0
-            and uniform_decode_len > 0
-            and total_tokens == batch_size * uniform_decode_len
-            and self._decode_prep is not None
-            and all(n == uniform_decode_len for n in input_lengths)
-        ):
-            self.all_extends_mid_chunk = False
-            decode_width = (
-                runtime_states.future_input_map.shape[1]
-                if runtime_states.has_request_token_history
-                else 1
-            )
-            self._decode_prep(
-                req_pool_indices_buf=self.req_pool_indices_buf,
-                valid_cache_lengths=runtime_states.valid_cache_lengths,
-                input_ids_buf=self.input_ids_buf,
-                positions_buf=self.positions_buf,
-                mrope_positions_buf=self.mrope_positions_buf,
-                input_lengths_buf=self.input_lengths_buf,
-                state_write_req_pool_indices_buf=self.state_write_req_pool_indices_buf,
-                seq_lens_buf=self.seq_lens_buf,
-                hist_lengths_buf=self.request_token_history_input_lengths_buf,
-                hist_offsets_buf=self.input_start_offsets_buf,
-                active_request_mask_buf=self.active_request_mask_buf,
-                batch_size=batch_size,
-                total_tokens=total_tokens,
-                max_bs=self.max_bs,
-                max_num_tokens=self.max_num_tokens,
-                uniform_input_length=uniform_decode_len,
-                decode_width=decode_width,
-                pad_pool_idx=self.state_write_padding_pool_index,
-                write_history=runtime_states.has_request_token_history,
-            )
-            return decode_input_ids
-
-        input_lengths_cpu.copy_(torch.as_tensor(input_lengths, dtype=torch.int32))
         self.state_write_req_pool_indices_buf[:batch_size].copy_(
             req_pool_indices_cpu,
             non_blocking=True,
@@ -780,30 +714,6 @@ class InputBuffers:
                     "decode forward",
                 )
             width = runtime_states.future_input_map.shape[1]
-            if (
-                self._load_decode_ids is not None
-                and batch_size > 0
-                and total_tokens == batch_size * width
-            ):
-                clamp_all = self.ngram_previous_tokens_buf is None
-                self._load_decode_ids(
-                    future_input_map=runtime_states.future_input_map,
-                    req_pool_indices=req_pool_indices_device,
-                    out_input_ids=self.input_ids_buf[:total_tokens],
-                    total_tokens=total_tokens,
-                    width=width,
-                    input_vocab_size=runtime_states.input_vocab_size,
-                    vocab_size=runtime_states.vocab_size,
-                    clamp_all=clamp_all,
-                )
-                self.fill_ngram_inputs(
-                    ngram_inputs, total_tokens, runtime_states, forward_op
-                )
-                if not clamp_all:
-                    self.input_ids_buf[:total_tokens].clamp_(
-                        0, runtime_states.input_vocab_size - 1
-                    )
-                return
             torch.index_select(
                 runtime_states.future_input_map,
                 0,
@@ -873,20 +783,6 @@ class InputBuffers:
                 uniform_length=0,
                 hash_params=self.ngram_hash_params,
             )
-        if self._pad_idle is not None:
-            self._pad_idle(
-                input_ids_buf=self.input_ids_buf,
-                positions_buf=self.positions_buf,
-                mrope_positions_buf=self.mrope_positions_buf,
-                input_lengths_buf=self.input_lengths_buf,
-                req_pool_indices_buf=self.req_pool_indices_buf,
-                state_write_req_pool_indices_buf=self.state_write_req_pool_indices_buf,
-                seq_lens_buf=self.seq_lens_buf,
-                batch_size=batch_size,
-                total_tokens=total_tokens,
-                pad_pool_idx=self.state_write_padding_pool_index,
-            )
-            return
         if total_tokens > 0:
             self.input_ids_buf[:total_tokens].fill_(1)
             self.positions_buf[:total_tokens].fill_(0)
