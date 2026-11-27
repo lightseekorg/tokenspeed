@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
 )
 from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
 from tokenspeed_kernel.ops.embedding.triton import apply_rope_mla_set_kv_buffer_triton
+from tokenspeed_kernel.ops.kvcache.mla_mxfp4 import quantize_store_mla_latent_mxfp4
 from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
@@ -660,6 +661,52 @@ def triton_mla_prologue(
         enable_pdl=enable_pdl,
     )
     return MLAPrologueOutput(query=out, key=None, value=None)
+
+
+@register_kernel(
+    "attention",
+    "mla_prologue",
+    name="triton_mxfp4_mla_prologue",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures(("query",), "dense", {torch.float16, torch.bfloat16}),
+    priority=Priority.PERFORMANT,
+    traits={
+        "expanded": frozenset({False}),
+        "full_write": BOOLS,
+        "kv_format": frozenset({"mxfp4"}),
+        "kv_convert": frozenset({False}),
+        # NoPE MLA (Kimi-K3.1): the latent is stored as it arrives.
+        "rope_style": frozenset({"none"}),
+        "sanitize": BOOLS,
+        "store": frozenset({True}),
+    },
+)
+def triton_mxfp4_mla_prologue(
+    *,
+    query: torch.Tensor,
+    q_pe: torch.Tensor,
+    latent_cache: torch.Tensor,
+    expanded: None,
+    rotary: None,
+    cache: LatentKVCache,
+    enable_pdl: bool,
+) -> MLAPrologueOutput:
+    """One launch: quantize the leading ``cache.slots`` latent rows to MXFP4
+    rows in the cache and copy ``q_pe`` into the query's RoPE channels."""
+    del expanded, rotary, enable_pdl
+    rank = latent_cache.shape[-1] - q_pe.shape[-1]
+    quantize_store_mla_latent_mxfp4(
+        latent_cache[:, :rank],
+        latent_cache[:, rank:],
+        cache.kv_cache,
+        cache.slots,
+        write_mask=cache.write_mask,
+        sanitize=cache.sanitize,
+        q_pe=q_pe,
+        query=query,
+    )
+    return MLAPrologueOutput(query=query, key=None, value=None)
 
 
 @register_kernel(

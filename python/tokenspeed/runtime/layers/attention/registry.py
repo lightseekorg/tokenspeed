@@ -1305,6 +1305,16 @@ def _validate_mla_dcp_backend(
         )
 
 
+def _validate_mxfp4_kv_backend(name: str | None, arch: AttentionArch) -> None:
+    """MXFP4 latent rows are read by the GPU DSA sparse MLA leaf only."""
+    resolved = name or _get_default_backend_name(arch)
+    if resolved != "dsa":
+        raise ValueError(
+            "--kv-cache-dtype mxfp4 is read by the GPU DSA sparse MLA attention "
+            f"only; the full-attention layers resolve to {resolved!r}"
+        )
+
+
 def _draft_only_group_ids(
     spec: CachePoolSpec, *, num_target_layers: int
 ) -> frozenset[str]:
@@ -1420,6 +1430,10 @@ def create_attn_components(
     target_full_attn_backend_name = _resolve_full_attn_backend_name(
         target, softmax_attn, hybrid_request=target.requested_backend
     )
+    if config.kv_cache_mxfp4:
+        _validate_mxfp4_kv_backend(
+            target_full_attn_backend_name, model_config.attention_arch
+        )
     if (
         config.kvp_size > 1
         # V4.1 validates KVP in its config and specialized recipe.

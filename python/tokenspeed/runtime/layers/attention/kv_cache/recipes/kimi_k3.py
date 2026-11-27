@@ -47,6 +47,7 @@ from dataclasses import replace
 from functools import cached_property
 
 import torch
+from tokenspeed_kernel.ops.kvcache.mla_mxfp4 import mla_mxfp4_row_bytes
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
@@ -313,10 +314,12 @@ class KimiK3Recipe(CacheRecipe):
         recipe only validates the cache-dtype contract around them.
         """
         cache_dtype = self.attn_config.kv_cache_dtype
-        if cache_dtype not in (torch.float8_e4m3fn, torch.bfloat16):
+        # uint8 is the MXFP4 latent row (the config admits it only for mxfp4).
+        if cache_dtype not in (torch.float8_e4m3fn, torch.bfloat16, torch.uint8):
             raise ValueError(
                 "Kimi-K3 cache requires mla_cache_dtype in "
-                f"{{torch.float8_e4m3fn, torch.bfloat16}}, got {cache_dtype}"
+                f"{{torch.float8_e4m3fn, torch.bfloat16, torch.uint8}}, got "
+                f"{cache_dtype}"
             )
         if self.attn_config.kv_cache_quant_method == "per_token_head":
             raise ValueError("Kimi-K3 cache does not support per_token_head MLA cache")
@@ -367,7 +370,11 @@ class KimiK3Recipe(CacheRecipe):
                     config, self.prefix_granularity, layer_id, occurrence
                 )
             spec = config.component(MLAConfig)
-            latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
+            latent_width = (
+                mla_mxfp4_row_bytes(spec.kv_lora_rank, spec.qk_rope_head_dim)
+                if config.kv_cache_mxfp4
+                else spec.kv_lora_rank + spec.qk_rope_head_dim
+            )
             latent = CacheFieldSpec(
                 f"layer.{layer_id}.latent_kv",
                 plane_id,

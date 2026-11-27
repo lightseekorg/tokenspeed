@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
     reserve_flashinfer_trtllm_dsa_buffers,
     trtllm_sparse_mla_query_heads,
 )
+from tokenspeed_kernel.ops.attention.dsa.mxfp4 import mxfp4_sparse_mla_attention
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.metadata import expand_k_row_lengths
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -383,6 +384,9 @@ class DSABackend(PagedAttentionBackend):
         self.kv_cache_dim = spec.kv_cache_dim
         self.scaling = spec.scaling
         self.data_type = config.kv_cache_dtype
+        # MXFP4 latent rows (uint8): one Triton core attends them directly
+        # (``mxfp4_sparse_mla_attention``), outside the registry's cores.
+        self.kv_cache_mxfp4 = config.kv_cache_mxfp4
         self.q_data_type = config.dtype
         self.num_attention_heads = spec.num_attention_heads
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
@@ -826,8 +830,11 @@ class DSABackend(PagedAttentionBackend):
         Under DCP the indexer scores the model-dtype index query and head
         weights against packed index-K pages of this leaf's page size,
         without a solution pin (``select_dsa_topk``); an mxfp4 plane's
-        scorers take mxfp4 queries only.
+        scorers take mxfp4 queries only. An MXFP4 latent cache selects no
+        core: its forward launches ``mxfp4_sparse_mla_attention``.
         """
+        if self.kv_cache_mxfp4:
+            return []
         use_dcp = len(self.kvp_group) > 1
         q_dtype = (
             torch.float8_e4m3fn
@@ -940,6 +947,15 @@ class DSABackend(PagedAttentionBackend):
         """
         if current_platform().is_npu:
             # The Ascend leaf launches its own operators, not these facades.
+            return
+        if self.kv_cache_mxfp4:
+            if ("mxfp4",) not in _LOGGED_SPARSE_LEAVES:
+                _LOGGED_SPARSE_LEAVES.add(("mxfp4",))
+                logger.info(
+                    "DSA sparse leaves (kv_cache=mxfp4): "
+                    "dsa_prefill=dsa_decode=mxfp4_sparse_mla (Triton, "
+                    "MXFP8 x MXFP4 block-scaled QK, BF16 PV)"
+                )
             return
         try:
             if self.kvp_rank != 0:
@@ -1079,9 +1095,10 @@ class DSABackend(PagedAttentionBackend):
         ``topk`` selection merges its key splits straight into a
         ``value_projection`` it is given (``dsa_decode_projected_value``),
         rounding as a projection of its latent output would. Host sizes
-        only."""
+        only. Never over an MXFP4 latent cache, whose core returns the latent."""
         return (
-            len(self.kvp_group) == 1
+            not self.kv_cache_mxfp4
+            and len(self.kvp_group) == 1
             and self.decode_kernel_plan is None
             and self.kernel_page_size == DSA_SPARSE_PAGE_SIZE
             and dsa_decode_projected_value_supported(
@@ -2079,6 +2096,29 @@ class DSABackend(PagedAttentionBackend):
             **kwargs,
         )
 
+    def _mxfp4_attention(
+        self,
+        q_view: torch.Tensor,
+        layer,
+        kv_cache: torch.Tensor,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Sparse MLA of ``q_view`` over the MXFP4 latent rows ``kv_cache``
+        at ``topk_slots``: the latent product on gfx950's block-scaled MFMA
+        (MXFP8 query, MXFP4 keys), the values decoded to BF16."""
+        if layer.logit_cap and layer.logit_cap > 0:
+            raise RuntimeError("the MXFP4 latent cache's core has no logit cap")
+        return mxfp4_sparse_mla_attention(
+            q_view,
+            kv_cache,
+            topk_slots,
+            topk_lens,
+            kv_lora_rank=self.kv_lora_rank,
+            softmax_scale=layer.scaling,
+            qk_format="mxfp8",
+        )
+
     def forward_sparse_prefill(
         self,
         *,
@@ -2202,6 +2242,13 @@ class DSABackend(PagedAttentionBackend):
         use_dcp = len(self.kvp_group) > 1
         keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         topk_lens = topk_lens.to(device=q.device, dtype=torch.int32).contiguous()
+        if self.kv_cache_mxfp4:
+            # AttnConfig refuses KVP and QCP with it: no history, no partials.
+            # Causality rides on the selection (topk_lens), as in dsa_prefill.
+            out = self._mxfp4_attention(q_view, layer, kv_cache, topk_slots, topk_lens)
+            if self.step_counter is not None:
+                self.step_counter.record_cache()
+            return out.reshape(-1, heads * layer.v_head_dim)
         if self.history_prefill is not None:
             # Over gathered histories: topk_slots are gathered slots
             # (the plan's slot map), attended against each group's gathered
@@ -2713,6 +2760,11 @@ class DSABackend(PagedAttentionBackend):
         # gathers heads in and reduce-scatters them back.
         keep_all_heads = use_dcp and self._query_holds_every_head(heads)
         topk_slots = topk_indices.view(num_tokens, -1)
+        if self.kv_cache_mxfp4:
+            out = self._mxfp4_attention(q_view, layer, kv_cache, topk_slots, topk_lens)
+            return _projected(
+                out.reshape(-1, heads * layer.v_head_dim), heads, value_projection
+            )
         if (
             value_projection is not None
             and not use_dcp

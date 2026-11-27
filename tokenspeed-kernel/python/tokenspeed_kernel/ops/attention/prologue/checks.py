@@ -644,6 +644,17 @@ def _check_latent_cache(
             f"per-token-head planes are not dense [slots, 1, ·] of {kv_lora_rank} "
             f"latent, 1 scale and {rope_dim} RoPE channels"
         )
+    elif cache.format is KVCacheFormat.MXFP4:
+        if kv_lora_rank % 64 or rope_dim % 2:
+            raise ValueError(
+                f"MXFP4 latent rows take kv_lora_rank % 64 == 0, not {kv_lora_rank}"
+            )
+        row_bytes = kv_lora_rank // 2 + kv_lora_rank // 32 + 2 * rope_dim
+        rows = ((cache.kv_cache, row_bytes),)
+        malformed = (
+            f"MXFP4 latent cache rows require uint8 [slots, 1, {row_bytes}] "
+            "or [pages, page_size, 1, width]"
+        )
     else:
         rows = ((cache.kv_cache, kv_lora_rank + rope_dim),)
         malformed = (

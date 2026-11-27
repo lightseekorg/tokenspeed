@@ -261,6 +261,11 @@ def declare_glm53_flash_groups(
             dsa = _require_dsa_config(
                 config, "target" if layer_id < target_layers else "draft"
             )
+            if config.kv_cache_mxfp4:
+                raise ValueError(
+                    "--kv-cache-dtype mxfp4 is wired for the Kimi-K3.1 cache "
+                    "recipe only"
+                )
             return (
                 CacheFieldSpec(
                     f"layer.{layer_id}.latent_kv",

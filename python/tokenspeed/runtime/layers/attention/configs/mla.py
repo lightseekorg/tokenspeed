@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+from tokenspeed_kernel.ops.kvcache.mla_mxfp4 import mla_mxfp4_row_bytes
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
@@ -94,13 +95,19 @@ class MLAConfig(SoftmaxAttnConfig):
             model_config.hf_config
         )
         spec = cls(**cls._spec_kwargs(server_args, model_config, is_draft))
+        # MXFP4 latent rows are bytes (mla_mxfp4_row_bytes); AttnConfig
+        # refuses them outside DSA.
+        mxfp4 = server_args.kv_cache_dtype == "mxfp4"
         return AttnConfig(
             components=(spec,),
             **model_wide_kwargs(
                 server_args,
                 model_config,
                 is_draft,
-                kv_cache_dtype=resolve_dtype(server_args.kv_cache_dtype),
+                kv_cache_dtype=(
+                    torch.uint8 if mxfp4 else resolve_dtype(server_args.kv_cache_dtype)
+                ),
+                kv_cache_mxfp4=mxfp4,
                 draft_block_decode=draft_block_decode,
                 draft_block_causal=draft_block_causal,
                 # An MTP depth plans the target's own DSA attention and
@@ -118,6 +125,8 @@ class MLAConfig(SoftmaxAttnConfig):
                 + self.qk_rope_head_dim * torch._utils._element_size(config.dtype)
                 + 1 * torch._utils._element_size(torch.float32)
             )
+        elif config.kv_cache_mxfp4:
+            cell_size = mla_mxfp4_row_bytes(self.kv_lora_rank, self.qk_rope_head_dim)
         else:
             cell_size = (
                 self.kv_lora_rank + self.qk_rope_head_dim
