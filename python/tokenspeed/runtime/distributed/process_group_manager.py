@@ -20,12 +20,16 @@
 
 """Helpers for initializing and caching torch distributed process groups."""
 
+import os
 from datetime import timedelta
 
 import torch
 import torch.distributed as dist
 
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
+
+# NCCL/RCCL staging-buffer bytes per channel and protocol for a one-rank world.
+SINGLE_RANK_NCCL_BUFFSIZE = 1 << 16
 
 
 def _make_all_groups(group: Group) -> list[Group]:
@@ -127,6 +131,14 @@ class ProcessGroupManager:
 
             self._pg_timeout = timeout
             self._device_backend = backend
+            if world_size == 1 and backend == "nccl":
+                # A one-rank communicator never moves data between peers, but
+                # still allocates its per-channel staging buffers at the
+                # default NCCL_BUFFSIZE: about 2 GiB of device memory per RCCL
+                # communicator on gfx950, and startup creates several. NCCL
+                # reads the size once per process, before the first
+                # communicator; an operator's setting wins.
+                os.environ.setdefault("NCCL_BUFFSIZE", str(SINGLE_RANK_NCCL_BUFFSIZE))
 
             dist.init_process_group(
                 backend=backend,

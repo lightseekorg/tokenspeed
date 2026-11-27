@@ -84,7 +84,13 @@ _PLE_QUANT_CHUNK_ELEMENTS = 1 << 20
 def materialize_ngram_table_on_host(
     embedding: VocabParallelEmbedding, storage: torch.Tensor | None = None
 ) -> None:
-    """Give a meta-constructed n-gram table page-locked host storage."""
+    """Give a meta-constructed n-gram table page-locked host storage.
+
+    The table is marked ``host_resident``: lookups read it in place, so the
+    loader's post-load hooks must not stage it through device memory (a
+    multi-GB device copy that strands its allocator segment for the life of
+    the process, and a second pinned host copy).
+    """
 
     source = embedding.weight
     host_weight = nn.Parameter(
@@ -99,6 +105,7 @@ def materialize_ngram_table_on_host(
     )
     for name, value in vars(source).items():
         setattr(host_weight, name, value)
+    host_weight.host_resident = True
     del embedding.weight
     embedding.register_parameter("weight", host_weight)
 
@@ -211,7 +218,6 @@ class PLELookup(nn.Module):
             materialize_ngram_table_on_host(
                 self.ngram_embedding, self.shared_table.weight
             )
-            self.ngram_embedding.weight.ple_shared_storage = True
         elif offload:
             materialize_ngram_table_on_host(self.ngram_embedding)
         self._compute_device = (

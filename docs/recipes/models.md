@@ -1364,6 +1364,22 @@ after the Device cache evicts them, or drop the Host cache with
 compaction (`sysctl vm.compaction_proactiveness=0`) removes the background
 trigger.
 
+#### One GPU, high concurrency
+
+At TP1 with many long requests, KV cache capacity bounds throughput, so keep
+other device memory small:
+
+- Keep the PLE table in pinned host memory in FP8:
+  `--hf-overrides '{"ple_embed_dtype":"float8_e4m3fn","ple_offload_embedding":true}'`.
+- Prefill graphs cost device memory per capture bucket rather than per token,
+  mostly HIP driver memory held by each instantiated graph. Setting
+  `DEBUG_HIP_FORCE_GRAPH_QUEUES=0` in the server environment drops the graph
+  queues' per-graph kernel-argument pools and returns that memory to the KV
+  cache without a measured speed cost; it is a HIP runtime debug setting, so
+  recheck it after a ROCm upgrade. `--disable-prefill-graph` frees more but
+  costs prefill throughput; a shorter `--prefill-graph-capture-token-sizes`
+  ladder sits between the two.
+
 ### Optional `--hf-overrides`
 
 All keys are optional and can be combined in a single `--hf-overrides` JSON
