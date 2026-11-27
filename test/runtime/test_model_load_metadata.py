@@ -52,7 +52,9 @@ class _CheckpointLinear(torch.nn.Linear):
     def load_weights(self, weights):
         params = dict(self.named_parameters())
         for name, tensor in weights:
-            params[name].data.copy_(tensor.T if name == "weight" else tensor)
+            params[name].data.copy_(
+                tensor.reshape(3, 4).T if name == "weight" else tensor
+            )
 
 
 def _write_checkpoint(directory, scale):
@@ -244,3 +246,43 @@ def test_rank_local_state_does_not_define_canonical_checkpoint_shapes(
     assert ok, message
     assert torch.equal(runner.model.weight, expected["weight"].T)
     assert torch.equal(runner.model.bias, expected["bias"])
+
+
+@pytest.mark.parametrize("startup_format", ["dummy", "auto"])
+def test_incomplete_checkpoint_only_prevents_real_weight_loading(
+    tmp_path, monkeypatch, caplog, startup_format
+):
+    _write_checkpoint(tmp_path, scale=1)
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(shard.read_bytes()[:-1])
+    runner = _startup_runner(tmp_path, startup_format, _CheckpointLinear, monkeypatch)
+    if startup_format == "auto":
+        with pytest.raises(ValueError, match="unreadable safetensors shard"):
+            runner.load_model()
+    else:
+        runner.load_model()
+        assert runner._disk_reload_shapes == {}
+        assert torch.isfinite(runner.model.weight).all()
+        assert "optional dummy checkpoint metadata" in caplog.text
+
+
+def test_pt_reload_discards_the_previous_checkpoint_shapes(tmp_path, monkeypatch):
+    initial = tmp_path / "initial"
+    tensors = _write_checkpoint(initial, scale=1)
+    runner = _startup_runner(initial, "auto", _CheckpointLinear, monkeypatch)
+    runner.load_model()
+    shutil.rmtree(initial)
+
+    for file_format, scale in (("pt", 3), ("safetensors", 7)):
+        path = tmp_path / file_format
+        path.mkdir()
+        expected = {name: tensor * scale for name, tensor in tensors.items()}
+        expected["weight"] = expected["weight"].flatten()
+        save = torch.save if file_format == "pt" else save_file
+        save(expected, str(path / f"model.{file_format}"))
+        ok, message = runner.update_weights_from_disk(
+            UpdateWeightFromDiskReqInput(model_path=str(path), load_format=file_format)
+        )
+        assert ok, message
+        assert torch.equal(runner.model.weight, expected["weight"].reshape(3, 4).T)
+        assert torch.equal(runner.model.bias, expected["bias"])

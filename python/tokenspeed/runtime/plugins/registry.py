@@ -203,7 +203,9 @@ def record_external(kind: str, name: str, undo) -> None:
 
 @dataclass(frozen=True, kw_only=True)
 class PostModelInitContext:
-    """Startup inputs available after local model initialization.
+    """Startup inputs available after local language-model initialization.
+
+    Encode-only engines do not invoke these hooks.
 
     Target and local draft weights, multimodal runtimes and communication
     buffers are ready. The host has read its tokenizer and captured available
@@ -211,7 +213,7 @@ class PostModelInitContext:
     Cache profiling and allocation have not started. No device model escapes
     through this context; hooks must not retain it beyond startup.
 
-    ``world_cpu_group`` includes every engine rank, including pipeline stages
+    ``world_cpu_group`` includes every language-model engine rank, including pipeline stages
     without a local draft. It is None for a single-rank engine. Hooks own any
     synchronization they require and must use the same order on every rank.
     This group does not coordinate other engines sharing a checkpoint source.
@@ -234,7 +236,7 @@ _POST_MODEL_INIT_HOOKS: dict[str, PostModelInitHook] = {}
 def register_post_model_init_hook(name: str, hook: PostModelInitHook) -> None:
     """Register a synchronous callback before the first cache build.
 
-    Names are unique. Callbacks run once per engine rank, in name order, after
+    Names are unique. Callbacks run once per language-model engine rank, in name order, after
     both target and local draft initialization. Exceptions fail startup.
     """
     if not name or name != name.strip():

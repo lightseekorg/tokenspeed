@@ -165,7 +165,7 @@ class TestLoaderSkipsFilteredShards:
         assert set(weights) == {"target.weight"}
         assert torch.equal(weights["target.weight"], torch.arange(4))
 
-    def test_get_all_weights_reads_only_draft_shards(self):
+    def test_checkpoint_weights_read_only_draft_shards(self):
         from safetensors.torch import save_file
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -194,11 +194,15 @@ class TestLoaderSkipsFilteredShards:
                 fall_back_to_pt_during_load=False,
                 secondary_weights=(),
             )
-            model_config = SimpleNamespace(
-                model_path=tmpdir, revision=None, mapping=Mapping(rank=0)
-            )
-
-            names = [name for name, _ in loader._get_all_weights(model_config, model)]
+            names = [
+                name
+                for name, _ in loader.get_checkpoint_weights(
+                    tmpdir,
+                    None,
+                    model,
+                    Mapping(rank=0),
+                )
+            ]
             assert (names) == (["model.mtp.fc.weight"])
 
     def test_target_model_without_filter_reads_everything(self):
@@ -214,40 +218,50 @@ class TestLoaderSkipsFilteredShards:
                 fall_back_to_pt_during_load=False,
                 secondary_weights=(),
             )
-            model_config = SimpleNamespace(
-                model_path=tmpdir, revision=None, mapping=Mapping(rank=0)
-            )
-
-            names = [name for name, _ in loader._get_all_weights(model_config, model)]
+            names = [
+                name
+                for name, _ in loader.get_checkpoint_weights(
+                    tmpdir,
+                    None,
+                    model,
+                    Mapping(rank=0),
+                )
+            ]
             assert (names) == (["model.layers.0.w"])
 
-    def test_checkpoint_load_group_falls_back_to_the_load_config(self):
-        # A model reading a stage-specific checkpoint subset names its own
-        # group; otherwise the ranks the caller says load this model (a
-        # pipeline stage's draft) bound the distributed loader's collectives.
-        groups = []
+    def test_checkpoint_load_group_falls_back_to_the_load_config(self, tmp_path):
+        from safetensors.torch import save_file
 
-        def capture(source, weight_name_filter, checkpoint_load_group, mapping):
-            groups.append(checkpoint_load_group)
-            return iter(())
+        class StageWeights(torch.nn.Linear):
+            checkpoint_load_group = (4, 5)
 
+        expected = torch.arange(4)
+        save_file({"weight": expected}, tmp_path / "model.safetensors")
         loader = DefaultModelLoader(LoadConfig(checkpoint_load_group=(4, 5, 6, 7)))
-        loader._get_weights_iterator = capture
-        model_config = SimpleNamespace(
-            model_path="unused", revision=None, mapping=Mapping(rank=4, world_size=8)
-        )
-        declaring = SimpleNamespace(
-            checkpoint_load_group=(4, 5),
-            fall_back_to_pt_during_load=False,
-            secondary_weights=(),
-        )
-        silent = SimpleNamespace(
-            fall_back_to_pt_during_load=False, secondary_weights=()
-        )
-
-        list(loader._get_all_weights(model_config, declaring))
-        list(loader._get_all_weights(model_config, silent))
-        assert (groups) == ([(4, 5), (4, 5, 6, 7)])
+        # The model's group takes precedence; ranks outside it cannot load it.
+        with pytest.raises(ValueError):
+            list(
+                loader.get_checkpoint_weights(
+                    str(tmp_path),
+                    None,
+                    StageWeights(1, 1),
+                    Mapping(rank=6, world_size=8, nprocs_per_node=8),
+                )
+            )
+        # Without a model-specific group, the load config admits rank 6, not 0.
+        model = torch.nn.Linear(1, 1)
+        for rank in (6, 0):
+            weights = loader.get_checkpoint_weights(
+                str(tmp_path),
+                None,
+                model,
+                Mapping(rank=rank, world_size=8, nprocs_per_node=8),
+            )
+            if rank == 0:
+                with pytest.raises(ValueError):
+                    list(weights)
+            else:
+                assert torch.equal(dict(weights)["weight"], expected)
 
 
 class TestNextNModelFilters:

@@ -257,7 +257,7 @@ class TestWeightLoaderPrefetch:
                             None,
                             (4, 5),
                             Mapping(rank=rank, world_size=8, nprocs_per_node=4),
-                        )
+                        ).weights
                     )
                 assert Counter(call.args[0] for call in read.call_args_list) == Counter(
                     files
@@ -287,7 +287,7 @@ class TestWeightLoaderPrefetch:
                             lambda name, selected=path: name == selected,
                             None,
                             Mapping(rank=rank, world_size=2),
-                        )
+                        ).weights
                     )
                 assert Counter(call.args[0] for call in read.call_args_list) == Counter(
                     files

@@ -86,12 +86,11 @@ def test_checkpoint_loading_preserves_source_bytes(
             )
         )
         model = model_type()
-        loaded = dict(
-            loader.get_checkpoint_weights(
-                str(tmp_path), None, model, Mapping(rank=0, world_size=1)
-            )
+        [prepared] = loader._get_checkpoint_sources(
+            str(tmp_path), None, model, Mapping(rank=0, world_size=1)
         )
-        assert loader.checkpoint_shapes == {
+        loaded = dict(prepared.weights)
+        assert prepared.read_shapes() == {
             name: tuple(tensor.shape) for name, tensor in expected.items()
         }
         expected_names = set(expected)
@@ -126,12 +125,11 @@ def test_checkpoint_metadata_keeps_logical_subbyte_shapes(tmp_path):
     )
     loader = DefaultModelLoader(LoadConfig(weight_loader_prefetch_checkpoints=False))
     # Packed tensors have a different materialized shape; reloads compare headers.
-    list(
-        loader.get_checkpoint_weights(
-            str(tmp_path), None, _HostWeights(), Mapping(rank=0)
-        )
+    [prepared] = loader._get_checkpoint_sources(
+        str(tmp_path), None, _HostWeights(), Mapping(rank=0)
     )
-    assert loader.checkpoint_shapes == {"packed": (2, 2048)}
+    list(prepared.weights)
+    assert prepared.read_shapes() == {"packed": (2, 2048)}
 
 
 def test_checkpoint_metadata_ignores_unselected_shards(tmp_path):
@@ -149,11 +147,10 @@ def test_checkpoint_metadata_ignores_unselected_shards(tmp_path):
         )
     )
     loader = DefaultModelLoader(LoadConfig(weight_loader_prefetch_checkpoints=False))
-    loaded = dict(
-        loader.get_checkpoint_weights(
-            str(tmp_path), None, _FilteredHostWeights(), Mapping(rank=0)
-        )
+    [prepared] = loader._get_checkpoint_sources(
+        str(tmp_path), None, _FilteredHostWeights(), Mapping(rank=0)
     )
+    loaded = dict(prepared.weights)
     assert loaded.keys() == expected.keys()
     torch.testing.assert_close(loaded["host.table"], expected["host.table"])
-    assert loader.checkpoint_shapes == {"host.table": (2, 3)}
+    assert prepared.read_shapes() == {"host.table": (2, 3)}

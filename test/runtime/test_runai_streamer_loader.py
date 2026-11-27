@@ -203,7 +203,7 @@ class TestRunaiStreamerConfig:
         with pytest.raises(ValueError, match="checkpoint_load_group"):
             loader._get_weights_iterator(
                 source, None, (0, 1), Mapping(world_size=2, rank=0)
-            )
+            ).weights
 
 
 class TestL3Identity:
@@ -799,10 +799,14 @@ class TestRunaiStreamerLocalParity:
             )
 
             ref = dict(
-                ref_loader._get_weights_iterator(source, predicate, None, mapping)
+                ref_loader._get_weights_iterator(
+                    source, predicate, None, mapping
+                ).weights
             )
             got = dict(
-                stream_loader._get_weights_iterator(source, predicate, None, mapping)
+                stream_loader._get_weights_iterator(
+                    source, predicate, None, mapping
+                ).weights
             )
             assert set(got.keys()) == set(ref.keys())
             assert "skip.table" not in got
@@ -1351,7 +1355,7 @@ class TestRunaiStreamerDistributedContract:
             list(
                 loader._get_weights_iterator(
                     source, None, None, Mapping(world_size=1, rank=0)
-                )
+                ).weights
             )
 
         # 3. Non-NCCL CUDA backends (single or composite) must raise.

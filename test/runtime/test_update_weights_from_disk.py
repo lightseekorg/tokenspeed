@@ -165,7 +165,7 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
     # Resident weights (no peer sharing), so disk reloads are allowed.
     runner.mapping = Mapping(rank=0)
     runner.model_config = SimpleNamespace(
-        model_path=str(booted_from), mapping=runner.mapping
+        model_path=str(booted_from), mapping=runner.mapping, revision=None
     )
     runner.server_args = SimpleNamespace(
         enable_memory_saver=False,

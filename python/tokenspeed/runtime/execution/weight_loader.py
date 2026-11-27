@@ -74,18 +74,26 @@ class WeightLoader:
         source = Path(model_config.model_path)
         if not source.is_dir() or not any(source.glob("*.safetensors")):
             return {}
-        loader = DefaultModelLoader(LoadConfig(load_format=LoadFormat.SAFETENSORS))
-        _, files, _ = loader._prepare_weights(
-            str(source),
-            revision=None,
-            fall_back_to_pt=False,
-            weight_files=(
-                model.checkpoint_weight_files
-                if isinstance(model, CheckpointFileSelection)
-                else None
-            ),
-        )
-        return safetensors_tensor_shapes(files)
+        # Dummy startup can run while its checkpoint is still being written.
+        try:
+            loader = DefaultModelLoader(LoadConfig(load_format=LoadFormat.SAFETENSORS))
+            _, files, _ = loader._prepare_weights(
+                str(source),
+                revision=model_config.revision,
+                fall_back_to_pt=False,
+                weight_files=(
+                    model.checkpoint_weight_files
+                    if isinstance(model, CheckpointFileSelection)
+                    else None
+                ),
+            )
+            return safetensors_tensor_shapes(files)
+        except (OSError, ValueError) as error:
+            logger.warning(
+                f"Cannot read optional dummy checkpoint metadata from {source}: {error}; "
+                "later reloads will validate new shards without a held-source shape comparison"
+            )
+            return {}
 
     @staticmethod
     def load_model(

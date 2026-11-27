@@ -762,8 +762,7 @@ class ModelRunner:
             )
 
         self.model_config.model_path = model_path
-        if shapes is not None:
-            self._disk_reload_shapes = shapes
+        self._disk_reload_shapes = shapes or {}
         logger.info(f"weights reloaded from {model_path!s} ({consumed:d} tensors)")
         return True, (
             f"Succeeded to update model weights from {model_path} "
