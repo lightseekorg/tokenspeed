@@ -136,13 +136,14 @@ def test_cli_selects_storage_separately_from_execution():
     "replacement",
     [
         ["--disaggregation-mode", "decode"],
+        ["--disaggregation-mode", "null"],
+        ["--disaggregation-mode", "encode"],
         ["--pipeline-parallel-size", "2", "--data-parallel-size", "8"],
         ["--moe-weight-sharing-size", "3"],
         ["--moe-tp-size", "16"],
         ["--kvstore-storage-backend", "mooncake"],
         ["--enable-eplb"],
         ["--enable-memory-saver"],
-        ["--load-format", "dummy"],
         ["--load-format", "extensible"],
     ],
 )
@@ -234,12 +235,40 @@ def test_no_attention_dp_means_no_dp_group():
     )
 
 
-@pytest.mark.parametrize("load_format", ["auto", "safetensors"])
+@pytest.mark.parametrize("load_format", ["auto", "safetensors", "dummy"])
 def test_peer_weights_accept_supported_checkpoint_loaders(load_format):
     assert (
         prepare_server_args(BASE + ["--load-format", load_format]).load_format
         == load_format
     )
+
+
+@pytest.mark.parametrize("role", ["decode", "null"])
+def test_peer_weights_accept_eager_decode_and_aggregated_roles(role):
+    args = prepare_server_args(
+        BASE + ["--disaggregation-mode", role, "--enforce-eager"]
+    )
+    assert args.disaggregation_mode == role
+    assert args.enforce_eager
+    assert not args.mapping.requires_forward_coordination
+
+
+@pytest.mark.parametrize("policy", ["cpu_backup", "discard"])
+def test_peer_weights_accept_npu_memory_saver(policy):
+    args = prepare_server_args(
+        BASE
+        + [
+            "--device",
+            "npu",
+            "--disable-prefill-graph",
+            "--disable-pdl",
+            "--enable-memory-saver",
+            "--weight-memory-policy",
+            policy,
+        ]
+    )
+    assert args.enable_memory_saver
+    assert args.weight_memory_policy == policy
 
 
 @pytest.mark.parametrize(

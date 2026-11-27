@@ -1363,6 +1363,8 @@ def initialize_dummy_weights(
     low: float = -1e-3,
     high: float = 1e-3,
     seed: int = 1234,
+    *,
+    exclude_data_ptrs: set[int] | None = None,
 ) -> None:
     """Initialize model weights with random values.
 
@@ -1377,6 +1379,12 @@ def initialize_dummy_weights(
     the parameter's number of elements and its data type.
     """
     for param in model.state_dict().values():
+        if (
+            exclude_data_ptrs is not None
+            and param.numel()
+            and param.data_ptr() in exclude_data_ptrs
+        ):
+            continue
         if torch.is_floating_point(param):
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)

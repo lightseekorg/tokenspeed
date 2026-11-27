@@ -184,7 +184,10 @@ def _device_handle(runner, drafter=None) -> DeviceHandle:
     handle = DeviceHandle.__new__(DeviceHandle)
     # No drafter round is pending for ``settle`` to finish.
     handle._executor = SimpleNamespace(
-        model_runner=runner, drafter=drafter, complete_pending_drafting=lambda: None
+        model_runner=runner,
+        draft_model_runner=None,
+        drafter=drafter,
+        complete_pending_drafting=lambda: None,
     )
     handle._l2 = None
     # No memory saver: weight loads skip the validity state.
@@ -847,6 +850,39 @@ class TestPostLoadTransforms:
                 del module
 
         assert (self._transformed(layer=Repacked())) == (["layer (Repacked)"])
+
+    def test_reloadable_post_load_hooks_exempt_only_declared_hooks(self):
+        from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+
+        def checked_preprocessor(plan, w):
+            del plan, w
+
+        class Refreshable(torch.nn.Module):
+            def process_weights_after_loading(self, module) -> None:
+                del module
+
+        class Unknown(torch.nn.Module):
+            def process_weights_after_loading(self, module) -> None:
+                del module
+
+        class _ReloadableModel(BaseCausalLM):
+            def __init__(self):
+                torch.nn.Module.__init__(self)
+                self.ok = Refreshable()
+                self.experts = _moe(checked_preprocessor)
+                self.other = Unknown()
+
+            def reloadable_post_load_hooks(self):
+                return frozenset(
+                    {
+                        Refreshable.process_weights_after_loading,
+                        checked_preprocessor,
+                    }
+                )
+
+        assert loader_module.post_load_transformed_modules(_ReloadableModel()) == [
+            "other (Unknown)"
+        ]
 
     def test_unquantized_dense_layers_are_not(self):
         layers = {}

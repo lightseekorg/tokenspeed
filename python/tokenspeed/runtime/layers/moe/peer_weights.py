@@ -41,6 +41,15 @@ logger = logging.getLogger(__name__)
 class PeerWeightOwner(Protocol):
     def close_peer_weights(self) -> None: ...
 
+    def peer_weights_controller(self) -> MoEPeerWeights | None: ...
+
+
+def peer_weights_controller_for(model: object) -> MoEPeerWeights | None:
+    if not isinstance(model, PeerWeightOwner):
+        return None
+    controller = model.peer_weights_controller()
+    return controller if isinstance(controller, MoEPeerWeights) else None
+
 
 @dataclass
 class _LayerWeights:
@@ -124,6 +133,58 @@ class MoEPeerWeights:
             yield
         finally:
             self.release(layer)
+
+    @property
+    def finalized(self) -> bool:
+        return self._finalized
+
+    @property
+    def released(self) -> bool:
+        return self.store.released
+
+    def managed_parameters(self) -> tuple[torch.nn.Parameter, ...]:
+        return tuple(
+            binding.module.get_parameter(name)
+            for binding in self._layers.values()
+            for name in binding.names
+        )
+
+    def vmm_managed_storages(self) -> frozenset[tuple[int, int]]:
+        if not self._finalized:
+            raise RuntimeError("Finalize peer weights before inspecting storage")
+        storages = frozenset(
+            (tensor.untyped_storage().data_ptr(), tensor.untyped_storage().nbytes())
+            for tensor in self.store.vmm_managed_tensors()
+            if tensor.numel()
+        )
+        if storages and self.store.physical_bytes <= 0:
+            raise RuntimeError("Finalized peer weight store reports no physical memory")
+        return storages
+
+    def owned_weights(self, layer: int) -> dict[str, torch.Tensor]:
+        if not self._finalized:
+            raise RuntimeError("Finalize peer weights before accessing owned shards")
+        return self.store.owned_weights(layer)
+
+    def prepare_weight_update(self) -> None:
+        if not self._finalized:
+            raise RuntimeError("Finalize peer weights before updating weights")
+        self.store.prepare_weight_update()
+
+    def refresh_weights(self) -> None:
+        if not self._finalized:
+            raise RuntimeError("Finalize peer weights before refreshing weights")
+        self.store.refresh_weights()
+
+    def release_storage(self, *, backup: bool) -> None:
+        if not self._finalized:
+            raise RuntimeError("Finalize peer weights before releasing storage")
+        self.store.release_storage(backup=backup)
+
+    def resume_storage(self, *, backup: bool) -> None:
+        if not self._finalized:
+            raise RuntimeError("Finalize peer weights before resuming storage")
+        self.store.resume_storage(backup=backup)
 
     def close(self) -> None:
         self.store.close()

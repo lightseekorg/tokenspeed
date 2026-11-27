@@ -1699,15 +1699,17 @@ class ServerArgs:
         )
 
         if self.moe_weight_sharing_size is not None:
-            if self.load_format not in ("auto", "safetensors"):
+            if self.load_format not in ("auto", "safetensors", "dummy"):
                 raise ValueError(
-                    "Peer expert weights require auto or safetensors checkpoint loading"
+                    "Peer expert weights require auto, safetensors, or dummy loading"
                 )
-            if self.enable_memory_saver:
-                raise ValueError("Peer expert weights do not support memory saver")
-            if self.disaggregation_mode != "prefill":
+            if self.enable_memory_saver and self.device != "npu":
                 raise ValueError(
-                    "Peer expert weights currently require a prefill instance"
+                    "Peer expert weights memory saver is currently supported on NPU only"
+                )
+            if self.disaggregation_mode not in ("prefill", "decode", "null"):
+                raise ValueError(
+                    "Peer expert weights require prefill, decode, or aggregated serving"
                 )
             if self.mapping.requires_forward_coordination:
                 raise ValueError(
@@ -3528,6 +3530,14 @@ class ServerArgs:
             )
         if self.max_consecutive_prefill_rounds < 0:
             raise ValueError("--max-consecutive-prefill-rounds must be non-negative")
+        if (
+            self.moe_weight_sharing_size is not None
+            and self.disaggregation_mode != "prefill"
+            and not self.enforce_eager
+        ):
+            raise ValueError(
+                "Peer expert weights on decode or aggregated workers require --enforce-eager"
+            )
         if self.max_consecutive_prefill_rounds and not self.prefill_decode_interval:
             raise ValueError(
                 "--max-consecutive-prefill-rounds needs --prefill-decode-interval: "
