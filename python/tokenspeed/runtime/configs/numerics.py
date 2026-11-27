@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -55,18 +55,34 @@ _PLUGIN_ENVELOPES: dict[
 ] = {}
 
 
+class RLCheckpointValidator(Protocol):
+    def __call__(
+        self, *, quantization: str | None, vocab_size: int, architecture: str
+    ) -> None: ...
+
+
 @dataclass(frozen=True, kw_only=True)
 class RLNumericsPolicy:
     """A model's implementation of the common ``rl-bitwise`` contract.
 
-    ``resolve`` selects launch arithmetic before workers and process groups
-    start. ``validate`` checks the actual checkpoint's quantization and
-    vocabulary after model-profile admission, for target and draft alike.
-    Registration alone is not evidence of numerical correctness or alignment.
+    Attributes:
+        resolve: Called for the target model before workers and process groups
+            start, with the shared ``ServerArgs``. A draft does not run its
+            own resolver against that shared launch.
+        validate: Called after profile admission for target and draft alike,
+            with keyword arguments ``quantization`` (resolved storage format,
+            or None), ``vocab_size`` (actual vocabulary size), and
+            ``architecture`` (the loader's selected model name). Returning
+            accepts storage; raising rejects it. Validation must stand alone:
+            it cannot assume its paired resolver ran for a draft. A model's
+            ``configure_attention`` hook owns launch/role-dependent limits.
+
+    Registration is not evidence of numerical correctness or alignment;
+    qualification covers each supported target/draft deployment together.
     """
 
     resolve: Callable[[ServerArgs], None]
-    validate: Callable[..., None]
+    validate: RLCheckpointValidator
 
     def __post_init__(self) -> None:
         if not callable(self.resolve) or not callable(self.validate):
@@ -88,10 +104,12 @@ def register_model_rl_numerics(
     ``rl-bitwise`` in its verification profile. A failed plugin load rolls
     this registration back too.
     """
-    if not isinstance(architecture, str) or not architecture.strip():
-        raise ValueError("A numerical policy needs a model architecture")
-    if architecture != architecture.strip() or not callable(factory):
-        raise TypeError("A numerical policy needs an architecture and callable factory")
+    if not isinstance(architecture, str):
+        raise TypeError("A numerical policy architecture must be a string")
+    if not architecture or architecture != architecture.strip():
+        raise ValueError("A numerical policy needs a nonempty, unpadded architecture")
+    if not callable(factory):
+        raise TypeError("A numerical policy factory must be callable")
     if architecture in _MODEL_RL_POLICIES:
         raise ValueError(f"Numerical policy for {architecture!r} is already registered")
     _MODEL_RL_POLICIES[architecture] = factory
@@ -107,7 +125,17 @@ def register_model_rl_numerics(
 def model_rl_numerics(
     architecture: str, hf_config: PretrainedConfig | None
 ) -> RLNumericsPolicy:
-    """Select the policy of the architecture actually chosen by the loader."""
+    """Select arithmetic for the architecture actually chosen by the loader.
+
+    Args:
+        architecture: The registered architecture selected for this model.
+        hf_config: Its checkpoint configuration. None is accepted only when
+            the architecture has no registered policy factory.
+
+    Returns:
+        STANDARD_RL_NUMERICS for an unregistered architecture, otherwise the
+        RLNumericsPolicy returned by that architecture's factory.
+    """
     factory = _MODEL_RL_POLICIES.get(architecture)
     if factory is None:
         return STANDARD_RL_NUMERICS
@@ -122,7 +150,19 @@ def model_rl_numerics(
 
 
 def launch_rl_numerics(server_args: ServerArgs) -> RLNumericsPolicy:
-    """Return the model policy selected for this launch, without applying it."""
+    """Select the target policy without applying its resolver.
+
+    Args:
+        server_args: The launch arguments after plugin discovery. Model,
+            revision, download directory, and explicit HF overrides identify
+            the checkpoint metadata used to select its registered profile.
+
+    Returns:
+        The selected model policy. With no registered policy factories this
+        returns STANDARD_RL_NUMERICS without checkpoint IO. Otherwise it loads
+        checkpoint configuration and follows model-loader architecture order;
+        a checkpoint with no registered profile also selects the standard policy.
+    """
     if not _MODEL_RL_POLICIES:
         return STANDARD_RL_NUMERICS
 
@@ -279,8 +319,9 @@ def require_verified_numerics(
 
     Raises:
         ValueError: The envelope is not verified for this model, or its
-            checkpoint validator rejects the storage or vocabulary. The RL
-            policy requires unquantized weights and whole blockwise vocab blocks.
+            checkpoint validator rejects the storage or vocabulary. The selected model policy owns
+            checkpoint validation. The standard policy requires unquantized
+            weights and whole blockwise vocabulary blocks.
     """
     if numerics == "auto":
         return
@@ -348,6 +389,7 @@ __all__ = [
     "model_rl_numerics",
     "launch_rl_numerics",
     "RLNumericsPolicy",
+    "RLCheckpointValidator",
     "STANDARD_RL_NUMERICS",
     "resolve_numerics_envelope",
 ]

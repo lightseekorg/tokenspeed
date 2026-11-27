@@ -816,6 +816,10 @@ if __name__ == "__main__":
 
 @pytest.fixture
 def model_numerics_policy(tmp_path):
+    """Register a quantization-aware model; yield its path, config and profile.
+
+    Remove both model and policy registrations after each consuming test.
+    """
     from torch import nn
     from transformers import LlamaConfig
 
@@ -1010,6 +1014,46 @@ class TestModelNumericsPolicy:
         finally:
             for undo in reversed(record.undo):
                 undo()
+
+    def test_unregistered_checkpoint_uses_standard_policy(self, model_numerics_policy):
+        path, config, _ = model_numerics_policy
+        config.architectures = ["LlamaForCausalLM"]
+        config.save_pretrained(path)
+        args = ServerArgs(
+            model=str(path),
+            numerics="rl-bitwise",
+            kv_cache_dtype="bfloat16",
+            sampling_backend="greedy",
+        )
+        assert args.logprob_order == "blockwise"
+        assert args.batch_invariant_collectives
+
+    @pytest.mark.parametrize(
+        "architecture,error",
+        [
+            (None, TypeError),
+            (42, TypeError),
+            ("", ValueError),
+            (" ", ValueError),
+            (" PolicyModel ", ValueError),
+        ],
+    )
+    def test_registration_errors_describe_invalid_architecture(
+        self, architecture, error
+    ):
+        from tokenspeed.runtime.configs.numerics import STANDARD_RL_NUMERICS
+        from tokenspeed.runtime.plugins import registry
+
+        with pytest.raises(error, match="architecture"):
+            registry.register_model_rl_numerics(
+                architecture, lambda config: STANDARD_RL_NUMERICS
+            )
+
+    def test_registration_requires_a_callable_factory(self):
+        from tokenspeed.runtime.plugins import registry
+
+        with pytest.raises(TypeError, match="factory must be callable"):
+            registry.register_model_rl_numerics("NonCallablePolicyModel", None)
 
     def test_policy_registration_rolls_back_with_failed_plugin(
         self, model_numerics_policy

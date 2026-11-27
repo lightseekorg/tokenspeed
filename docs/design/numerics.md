@@ -707,10 +707,15 @@ the model select its verified arithmetic and parallel mapping before those
 choices become fixed. Standard models retain the existing RL resolver.
 Consumers with a narrower qualification scope can inspect the selected policy
 with `launch_rl_numerics(server_args)` without applying the resolver again.
+Only the target's resolver runs: its choices apply to the shared launch. A
+draft policy contributes a checkpoint validator, not another launch rewrite.
+Validators must stand alone from their paired resolver. Draft models enforce
+launch- and role-dependent restrictions in their `configure_attention` hook,
+and each target/draft combination needs end-to-end qualification.
 The target and draft still independently pass `ModelProfile.numerics_envelopes`
 admission. Their actual checkpoint quantization and vocabulary then pass the
 selected model validator; omitting the checkpoint context for a registered
-policy is an error. A quantized policy is opt-in per model, not a blanket
+policy is an error. Support for quantized checkpoints is opt-in per model, not a blanket
 relaxation of the standard unquantized gate. Plugin-load rollback removes
 model-policy registrations too.
 
