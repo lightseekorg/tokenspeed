@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.sampling import (
+from tokenspeed_kernel.ops.sampling._constants import (
     VOCAB_SHARD_DRAFT_BLOCK,
     VOCAB_SHARD_DRAFT_FIELDS,
 )

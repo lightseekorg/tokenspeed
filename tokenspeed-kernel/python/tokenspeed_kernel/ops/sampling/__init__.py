@@ -28,9 +28,18 @@ from __future__ import annotations
 import functools
 
 import torch as _torch
+from tokenspeed_kernel.ops.sampling._constants import (
+    SELECTED_LOGPROBS_BLOCK,
+    VOCAB_SHARD_DRAFT_BLOCK,
+    VOCAB_SHARD_DRAFT_FIELDS,
+)
 from tokenspeed_kernel.ops.sampling.logprob import blockwise_logprobs
 from tokenspeed_kernel.ops.sampling.positions import prepare_sampling_offsets
 from tokenspeed_kernel.ops.sampling.synthetic import write_synthetic_verify_outputs
+from tokenspeed_kernel.ops.sampling.triton.dspark_markov import (
+    DsparkMarkovSampleWorkspace,
+    dspark_markov_sample_workspace,
+)
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -460,11 +469,6 @@ def vocab_topk_merge(
     kernel(pairs, k, softcap, ids_out, values_out)
 
 
-# Columns of a shard each draft-stats block reduces, and the fp32 partials it writes.
-VOCAB_SHARD_DRAFT_BLOCK = 2048
-VOCAB_SHARD_DRAFT_FIELDS = 8
-
-
 def vocab_shard_draft_stats_width(shard_columns: int) -> int:
     """The fp32 columns per row of ``vocab_shard_draft_stats``' output for a shard of ``shard_columns``.
 
@@ -598,10 +602,6 @@ def vocab_shard_draft_record(
     )
 
 
-# Columns of one block of ``selected_token_logprobs``'s softmax denominator:
-# a row's denominator adds its block sums in order, which the shard form
-# (:func:`vocab_shard_logprob_blocks`) keeps.
-SELECTED_LOGPROBS_BLOCK = 1024
 # The row's block sums sit in one program's registers.
 _VOCAB_LOGPROBS_MAX_BLOCKS = 1 << 12
 
@@ -853,7 +853,3 @@ import tokenspeed_kernel.ops.sampling.triton.verify_coins  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_logprobs  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_shard_draft  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_topk  # noqa: E402,F401
-from tokenspeed_kernel.ops.sampling.triton.dspark_markov import (  # noqa: E402
-    DsparkMarkovSampleWorkspace,
-    dspark_markov_sample_workspace,
-)

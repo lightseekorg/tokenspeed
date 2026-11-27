@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.sampling import SELECTED_LOGPROBS_BLOCK
+from tokenspeed_kernel.ops.sampling._constants import SELECTED_LOGPROBS_BLOCK
 
 
 @triton.jit
@@ -73,7 +73,7 @@ def selected_token_logprobs(
 ) -> torch.Tensor:
     """Compute ``log_softmax(logits)[row, tokens[row]]`` without materializing it."""
     if logits.ndim != 2:
-        raise ValueError(f"selected_token_logprobs expects 2D logits")
+        raise ValueError("selected_token_logprobs expects 2D logits")
     if logits.device.type != "cuda":
         raise ValueError("selected_token_logprobs requires CUDA logits")
     if logits.stride(-1) != 1:

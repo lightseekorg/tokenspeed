@@ -37,10 +37,10 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.sampling import (
-    SELECTED_LOGPROBS_BLOCK,
     _logprob_owned_blocks,
     vocab_shard_logprob_layout,
 )
+from tokenspeed_kernel.ops.sampling._constants import SELECTED_LOGPROBS_BLOCK
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
