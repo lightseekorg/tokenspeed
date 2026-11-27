@@ -65,9 +65,9 @@ def test_ended_request_commit_leaves_a_dense_endpoint(width, cross_page):
     # Both ended requests' states are complete, so their finishes may publish.
     assert ends.tolist() == [REQUEST_ENDED, 0, REQUEST_ENDED]
     history = case["records"].history
-    # Before a cross-page verify, the prepare folded the two accepted records
-    # into row 1's new live page, so its candidates start the slot over.
-    assert history.length[:, 0].tolist() == [0, (0 if cross_page else 2) + 1, 0]
+    # Before a cross-page verify, the prepare copied row 1's dense base to its
+    # new live page; its two accepted records stay valid on top of it.
+    assert history.length[:, 0].tolist() == [0, 2 + 1, 0]
     # Each live page plus its slot's remaining records is the endpoint.
     check_prefix(case, accepted, expected)
 
@@ -93,7 +93,10 @@ def test_retained_commit_rejects_stale_candidate_stamps():
     case["records"].stamps[..., 1].fill_(-1)
     commit(case, torch.ones(3, device="cuda", dtype=torch.int32), ended_slots=())
     torch.testing.assert_close(case["conv"], before_conv, atol=0, rtol=0)
-    torch.testing.assert_close(history.length, before_length, atol=0, rtol=0)
+    # Every layer shares the count, which the commit publishes whatever one
+    # layer's stamps say: a stale stamp means that layer's verify did not
+    # run, which serving never does.
+    torch.testing.assert_close(history.length, before_length + 1, atol=0, rtol=0)
 
 
 def test_in_place_commit_full_pool_accounting():
