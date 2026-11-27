@@ -70,6 +70,9 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
         )
     return ts.Scheduler(
         make_config(
+            prefix_cache_evict_policy="lru",
+            prefix_cache_gds_prefill_cost=None,
+            prefix_cache_gds_disk_block_costs=(),
             num_device_pages=64 + 1,
             max_scheduled_tokens=256,
             max_batch_size=4,

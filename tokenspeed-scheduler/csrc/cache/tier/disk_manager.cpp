@@ -19,6 +19,8 @@
 // SOFTWARE.
 
 #include "cache/tier/disk_manager.h"
+#include "cache/coordinator/gds_tiered.h"
+#include "cache/coordinator/clean_host_copies.h"
 
 #include <algorithm>
 #include <limits>
@@ -81,7 +83,7 @@ bool DiskTransferManager::HasReadCredits() const {
 std::size_t DiskTransferManager::heldHostBlocks(DiskOpKind kind) const {
     std::size_t count = 0;
     for (const auto& [id, ticket] : operations_) {
-        if (ticket.kind == kind) count += ticket.host_blocks.size();
+        if (ticket.kind == kind) count += ticket.host_blocks.size() + ticket.cleaning_sources.size();
     }
     return count;
 }
@@ -89,6 +91,9 @@ std::size_t DiskTransferManager::heldHostBlocks(DiskOpKind kind) const {
 std::vector<const CacheBlockRef*> DiskTransferManager::HeldHostBlockRefs() const {
     std::vector<const CacheBlockRef*> refs;
     for (const auto& [id, ticket] : operations_) {
+        for (const auto& source : ticket.cleaning_sources) {
+            if (source) refs.push_back(&source.Block());
+        }
         for (const CacheBlockRef& block : ticket.host_blocks) {
             if (block) refs.push_back(&block);
         }
@@ -106,11 +111,12 @@ DiskOperation DiskTransferManager::command(std::uint64_t id, const Ticket& ticke
     for (std::size_t i = 0; i < ticket.keys.size(); ++i) {
         const auto group = static_cast<std::int32_t>(ticket.keys[i].group_id);
         const GroupAllocator& allocator = coordinator_.Allocator(group);
-        _assert(allocator.BucketOf(ticket.host_blocks[i]->Location()) ==
-                    allocator.BucketOf(ticket.disk_blocks[i]->Location()),
+        const auto& host =
+            ticket.kind == DiskOpKind::kWrite ? ticket.cleaning_sources[i].Block() : ticket.host_blocks[i];
+        _assert(allocator.BucketOf(host->Location()) == allocator.BucketOf(ticket.disk_blocks[i]->Location()),
                 "a Disk operation pairs blocks of different owners");
         op.group_ids.push_back(ticket.keys[i].group_id);
-        op.host_blocks.push_back(allocator.ResolveCacheBlockId(*ticket.host_blocks[i]));
+        op.host_blocks.push_back(allocator.ResolveCacheBlockId(*host));
         op.disk_blocks.push_back(allocator.ResolveCacheBlockId(*ticket.disk_blocks[i]));
     }
     return op;
@@ -133,8 +139,8 @@ DiskTransferManager::ReadStartResult DiskTransferManager::TryStartRead(const Pro
     // key the boundary needs and the Host lacks is then one the Disk holds.
     const std::size_t available_blocks = limit - held;
     const auto max_op_blocks = static_cast<std::size_t>(config_.max_blocks_per_operation);
-    StorageReservation reservation = coordinator_.Storage().ReserveStoragePrefix(
-        prompt, hits, std::min(available_blocks, max_op_blocks), coordinator_.Store().DiskPool());
+    StorageReservation reservation =
+        coordinator_.Storage().ReserveDiskPrefix(prompt, hits, std::min(available_blocks, max_op_blocks));
     if (reservation.keys.empty() || reservation.num_tokens <= local_tokens) {
         // If Host-block credits were partially consumed by other in-flight
         // operations, let the caller retry once credits return.
@@ -143,15 +149,10 @@ DiskTransferManager::ReadStartResult DiskTransferManager::TryStartRead(const Pro
     Ticket ticket{.kind = DiskOpKind::kRead,
                   .keys = std::move(reservation.keys),
                   .host_blocks = std::move(reservation.blocks),
+                  .disk_blocks = std::move(reservation.sources),
                   .tail_prior = std::move(reservation.tail_prior),
-                  .tail = std::move(reservation.tail)};
-    ticket.disk_blocks.reserve(ticket.keys.size());
-    for (const CacheKey& key : ticket.keys) {
-        CacheBlockRef source = coordinator_.Disk().AcquireDiskCachedBlock(key);
-        // The reservation evicts Host entries only.
-        FatalCheck(static_cast<bool>(source), "a prefetch's key left the Disk while its Host blocks were reserved");
-        ticket.disk_blocks.push_back(std::move(source));
-    }
+                  .tail = std::move(reservation.tail),
+                  .recovery_metadata = coordinator_.TrackRecoveryMetadata(prompt, reservation.num_tokens)};
     const std::uint64_t id = nextId();
     commands_.push_back(command(id, ticket));
     operations_.emplace(id, std::move(ticket));
@@ -166,6 +167,9 @@ StorageLease DiskTransferManager::StartRead(const PromptPrefix& prompt) {
 }
 
 void DiskTransferManager::QueueCleaning(std::span<const CacheKey> keys) {
+    // GDS discovers dirty entries from residency, including Disk removals;
+    // ACK notifications neither schedule its writes nor consume queue capacity.
+    if (coordinator_.Store().UsesGds()) return;
     for (const CacheKey& key : keys) {
         if (cleaning_.size() == static_cast<std::size_t>(config_.max_queued_cleanings)) {
             cleaning_.pop_front();
@@ -206,11 +210,12 @@ void DiskTransferManager::requeueReused() {
 }
 
 void DiskTransferManager::StartCleaning() {
+    CacheStore& store = coordinator_.Store();
     const auto max_ops = static_cast<std::size_t>(config_.max_operations);
     const std::size_t max_write_ops = std::max<std::size_t>(1, max_ops / 4);
     const std::size_t read_reserve = max_ops > 1 ? 1 : 0;
     requeueReused();
-    if (cleaning_.empty() || operations_.size() + read_reserve >= max_ops ||
+    if ((!store.UsesGds() && cleaning_.empty()) || operations_.size() + read_reserve >= max_ops ||
         numOperations(DiskOpKind::kWrite) >= max_write_ops) {
         return;
     }
@@ -222,7 +227,6 @@ void DiskTransferManager::StartCleaning() {
     const std::size_t credits =
         std::min({limit - held, write_limit - write_held, static_cast<std::size_t>(config_.max_blocks_per_operation)});
 
-    CacheStore& store = coordinator_.Store();
     const BlockPool& host_pool = *store.HostPool();
     std::unordered_set<CacheKey, CacheKeyHash> writing;
     for (const auto& [id, ticket] : operations_) {
@@ -230,7 +234,7 @@ void DiskTransferManager::StartCleaning() {
     }
     const auto dirty = [&](const CacheKey& key) {
         return coordinator_.Host().ContainsHostCachedBlock(key) && !coordinator_.Disk().ContainsDiskCachedBlock(key) &&
-               !writing.contains(key);
+               !writing.contains(key) && mayClean(key);
     };
     const auto skip_cleaning = [&](const CacheKey& key) {
         const auto loc = store.LocationOf(host_pool, key.group_id, key);
@@ -257,11 +261,11 @@ void DiskTransferManager::StartCleaning() {
     // short branches and single-hit cold tails without breaking ancestor chains
     // of qualifying long/reused branches.
     enum class Admission { kClean, kDrop, kAwaitReuse };
-    const auto admission_of = [&](const CacheKey& key, const BoundaryTree::Node& node) {
+    const auto admission_of = [&](const CacheKey& key, const BoundaryTree::Node& node, const BlockPool& pool) {
         if (config_.min_clean_tokens == 0 && !config_.require_reuse_for_cleaning) return Admission::kClean;
-        const auto loc = store.LocationOf(host_pool, key.group_id, key);
+        const auto loc = store.LocationOf(pool, key.group_id, key);
         if (!loc) return Admission::kDrop;
-        const auto meta = store.Groups()[key.group_id].Index().MetadataFor(host_pool, *loc);
+        const auto meta = store.Groups()[key.group_id].Index().MetadataFor(pool, *loc);
         if (!meta) return Admission::kDrop;
         if (config_.min_clean_tokens > 0) {
             std::int64_t branch_tokens = node.boundary_tokens;
@@ -279,54 +283,116 @@ void DiskTransferManager::StartCleaning() {
 
     Ticket ticket{.kind = DiskOpKind::kWrite};
     std::unordered_set<CacheKey, CacheKeyHash> chosen;
-    while (!cleaning_.empty() && ticket.keys.size() < credits) {
-        const CacheKey front = cleaning_.front();
-        const BoundaryTree::Node* node = store.Boundaries().Find(front.content_hash);
-        if (node == nullptr || !dirty(front) || (store.GroupIsState(front.group_id) && skip_cleaning(front)) ||
-            chosen.contains(front)) {
-            cleaning_.pop_front();
-            continue;
-        }
-        if (const Admission admission = admission_of(front, *node); admission != Admission::kClean) {
-            cleaning_.pop_front();
-            if (admission == Admission::kAwaitReuse) {
-                if (awaiting_reuse_.size() == static_cast<std::size_t>(config_.max_queued_cleanings)) {
-                    awaiting_reuse_.pop_front();
+    if (store.UsesGds()) {
+        // Maintain a clean reserve bounded by the configured write credits.
+        // Count parent-equivalent capacity, not raw bytes or Disk capacity.
+        double safe_capacity = host_pool.NumEmptyLcmBlocks();
+        for (const auto& group : store.Groups())
+            safe_capacity += static_cast<double>(host_pool.NumFreeSlots(group.Id())) / host_pool.Packing(group.Id());
+        for (const auto& copy : DiskCleanHostCopies(store))
+            for (const auto& [group, location] : copy.members) safe_capacity += 1.0 / host_pool.Packing(group);
+        const auto target = std::min(host_pool.NumLcmBlocks(), config_.max_write_host_blocks);
+        if (safe_capacity >= target) return;
+        std::unordered_set<CacheKey, CacheKeyHash> dependencies;
+        VisitGdsHostCleaningCandidates(store, [&](HostCleaningCandidate candidate) {
+            // Gate only the recovery point, not its cold ancestor dependencies.
+            // A skipped GDS candidate is rediscovered on the next cleaning pass.
+            if (config_.min_clean_tokens > 0 || config_.require_reuse_for_cleaning) {
+                const auto* node = store.Boundaries().Find(candidate.hash);
+                if (node == nullptr) return true;
+                const auto qualifies = [&](const CacheKey& key, const BlockPool& pool) {
+                    return key.content_hash == candidate.hash && admission_of(key, *node, pool) == Admission::kClean;
+                };
+                const bool host_tip =
+                    std::ranges::any_of(candidate.keys, [&](const CacheKey& key) { return qualifies(key, host_pool); });
+                // A published Disk tip already passed cleaning admission.
+                // Its new tier-local entry does not inherit was_acquired; it
+                // must still allow lost ancestor copies to be cleaned again.
+                const bool disk_tip = node->boundary_tokens >= config_.min_clean_tokens &&
+                                      std::ranges::any_of(candidate.disk_dependencies, [&](const CacheKey& key) {
+                                          return key.content_hash == candidate.hash;
+                                      });
+                if (!host_tip && !disk_tip) return true;
+            }
+            if (std::ranges::any_of(candidate.keys, [&](const CacheKey& key) { return !mayClean(key); })) return true;
+            // A queued write is not a published prerequisite: its ACK may
+            // fail. Retry this closure after the existing write retires.
+            if (std::ranges::any_of(candidate.keys, [&](const CacheKey& key) { return writing.contains(key); }))
+                return true;
+            std::ranges::sort(candidate.keys, [&](const CacheKey& a, const CacheKey& b) {
+                const auto* an = store.Boundaries().Find(a.content_hash);
+                const auto* bn = store.Boundaries().Find(b.content_hash);
+                return std::tuple{an->boundary_tokens, store.GroupIsState(a.group_id), a.group_id, a.page_offset} <
+                       std::tuple{bn->boundary_tokens, store.GroupIsState(b.group_id), b.group_id, b.page_offset};
+            });
+            bool added = false;
+            for (const auto& key : candidate.keys) {
+                if (!dirty(key) || !chosen.insert(key).second) continue;
+                ticket.keys.push_back(key);
+                added = true;
+                if (ticket.keys.size() == credits) break;
+            }
+            if (added) {
+                // A later Disk allocation must not evict a prerequisite of
+                // the very closure being cleaned.
+                for (const auto& key : candidate.disk_dependencies) dependencies.insert(key);
+                for (const auto& key : candidate.keys)
+                    if (coordinator_.Disk().ContainsDiskCachedBlock(key)) dependencies.insert(key);
+            }
+            return ticket.keys.size() < credits;
+        });
+        for (const auto& key : dependencies)
+            ticket.disk_dependencies.push_back(coordinator_.Disk().AcquireDiskCachedBlock(key));
+    } else {
+        while (!cleaning_.empty() && ticket.keys.size() < credits) {
+            const CacheKey front = cleaning_.front();
+            const BoundaryTree::Node* node = store.Boundaries().Find(front.content_hash);
+            if (node == nullptr || !dirty(front) || (store.GroupIsState(front.group_id) && skip_cleaning(front)) ||
+                chosen.contains(front)) {
+                cleaning_.pop_front();
+                continue;
+            }
+            if (const Admission admission = admission_of(front, *node, host_pool); admission != Admission::kClean) {
+                cleaning_.pop_front();
+                if (admission == Admission::kAwaitReuse) {
+                    if (awaiting_reuse_.size() == static_cast<std::size_t>(config_.max_queued_cleanings)) {
+                        awaiting_reuse_.pop_front();
+                        ++dropped_cleanings_;
+                    }
+                    awaiting_reuse_.push_back(front);
+                } else {
                     ++dropped_cleanings_;
                 }
-                awaiting_reuse_.push_back(front);
-            } else {
-                ++dropped_cleanings_;
+                continue;
             }
-            continue;
-        }
-        // The pages above it first, nearest the root first, so a cleaned page
-        // never waits on the Disk for a parent only the Host holds: a Host
-        // placement dropping that parent would leave it unresumable. The
-        // climb stops at a page on the Disk, whose own parents cleaning
-        // wrote before it, or one the Host does not hold.
-        std::vector<const BoundaryTree::Node*> chain{node};
-        for (const BoundaryTree::Node* above = node->parent; above != nullptr && above->OnHost() && !above->OnDisk();
-             above = above->parent) {
-            chain.push_back(above);
-        }
-        std::vector<CacheKey> batch;
-        for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
-            for (CacheKey& key : dirty_keys_of(**it)) {
-                if (!chosen.contains(key)) batch.push_back(std::move(key));
+            // The pages above it first, nearest the root first, so a cleaned page
+            // never waits on the Disk for a parent only the Host holds: a Host
+            // placement dropping that parent would leave it unresumable. The
+            // climb stops at a page on the Disk, whose own parents cleaning
+            // wrote before it, or one the Host does not hold.
+            std::vector<const BoundaryTree::Node*> chain{node};
+            for (const BoundaryTree::Node* above = node->parent;
+                 above != nullptr && above->OnHost() && !above->OnDisk(); above = above->parent) {
+                chain.push_back(above);
             }
-        }
-        if (!ticket.keys.empty() && ticket.keys.size() + batch.size() > credits) break;
-        cleaning_.pop_front();
-        if (batch.size() > credits) {
-            // A chain longer than one operation: its root-most part now, the
-            // rest when the key comes up again.
-            batch.resize(credits);
-            cleaning_.push_front(front);
-        }
-        for (CacheKey& key : batch) {
-            chosen.insert(key);
-            ticket.keys.push_back(std::move(key));
+            std::vector<CacheKey> batch;
+            for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+                for (CacheKey& key : dirty_keys_of(**it)) {
+                    if (!chosen.contains(key)) batch.push_back(std::move(key));
+                }
+            }
+            if (!ticket.keys.empty() && ticket.keys.size() + batch.size() > credits) break;
+            cleaning_.pop_front();
+            if (batch.size() > credits) {
+                // A chain longer than one operation: its root-most part now, the
+                // rest when the key comes up again.
+                batch.resize(credits);
+                cleaning_.push_front(front);
+            }
+            for (CacheKey& key : batch) {
+                chosen.insert(key);
+                ticket.keys.push_back(std::move(key));
+            }
         }
     }
     if (ticket.keys.empty()) return;
@@ -334,31 +400,35 @@ void DiskTransferManager::StartCleaning() {
     std::vector<std::uint32_t> groups;
     std::vector<std::int32_t> buckets;
     for (const CacheKey& key : ticket.keys) {
-        CacheBlockRef source = store.AcquireHostCachedBlock(key);
+        auto source = store.Groups()[key.group_id].Index().AcquireCleaningSource(host_pool, key);
         FatalCheck(static_cast<bool>(source), "a dirty Host entry has a block");
         const auto group = static_cast<std::int32_t>(key.group_id);
         groups.push_back(key.group_id);
         // The Disk copy lives in its Host source's bucket (same owner).
-        buckets.push_back(coordinator_.Allocator(group).BucketOf(source->Location()));
-        ticket.metadata.push_back(*store.Groups()[key.group_id].Index().MetadataFor(host_pool, source->Location()));
-        ticket.host_blocks.push_back(std::move(source));
+        buckets.push_back(coordinator_.Allocator(group).BucketOf(source.Block()->Location()));
+        ticket.metadata.push_back(
+            *store.Groups()[key.group_id].Index().MetadataFor(host_pool, source.Block()->Location()));
+        ticket.cleaning_sources.push_back(std::move(source));
     }
     DiskCache::DiskAllocationBatch allocation = coordinator_.Disk().AcquireDiskBlocks(groups, buckets);
-    // A row the Disk cannot place is not cleaned now.
+    // Keep only the dependency-ordered prefix. A later row may fit another
+    // group even when an earlier history row failed to place.
     std::size_t kept = 0;
     for (std::size_t row = 0; row < ticket.keys.size(); ++row) {
         if (!allocation.blocks[row]) {
-            ++dropped_cleanings_;
-            continue;
+            dropped_cleanings_ += ticket.keys.size() - row;
+            break;
         }
-        ticket.keys[kept] = std::move(ticket.keys[row]);
-        ticket.host_blocks[kept] = std::move(ticket.host_blocks[row]);
-        ticket.metadata[kept] = std::move(ticket.metadata[row]);
+        if (kept != row) {
+            ticket.keys[kept] = std::move(ticket.keys[row]);
+            ticket.cleaning_sources[kept] = std::move(ticket.cleaning_sources[row]);
+            ticket.metadata[kept] = std::move(ticket.metadata[row]);
+        }
         ticket.disk_blocks.push_back(std::move(allocation.blocks[row]));
         ++kept;
     }
     ticket.keys.resize(kept);
-    ticket.host_blocks.resize(kept);
+    ticket.cleaning_sources.resize(kept);
     ticket.metadata.resize(kept);
     if (kept == 0) return;
     const std::uint64_t id = nextId();
@@ -374,8 +444,6 @@ void DiskTransferManager::Complete(const cache::DiskDone& event) {
     Ticket& ticket = it->second;
     ticket.completed = true;
     if (ticket.kind == DiskOpKind::kRead) {
-        // The sources go first: a held entry is not dropped.
-        ticket.disk_blocks.clear();
         if (event.success) {
             read_blocks_ += ticket.keys.size();
             if (!ticket.detached) {
@@ -391,9 +459,11 @@ void DiskTransferManager::Complete(const cache::DiskDone& event) {
             ++failed_reads_;
             spdlog::warn("[Disk] read op_id={} of {} blocks failed; dropping their Disk entries", event.op_id,
                          ticket.keys.size());
-            for (const CacheKey& key : ticket.keys) coordinator_.Disk().DropUnreadableEntry(key);
+            for (std::size_t i = 0; i < ticket.keys.size(); ++i)
+                coordinator_.Disk().DropUnreadableEntry(ticket.keys[i], ticket.disk_blocks[i]);
             ticket.host_blocks.clear();
         }
+        ticket.disk_blocks.clear();
         // A request still holds the published Host entries until its
         // admission acquires them (the Ready hold); one that gave up let go.
         if (ticket.detached) operations_.erase(it);
@@ -401,11 +471,20 @@ void DiskTransferManager::Complete(const cache::DiskDone& event) {
     }
     if (event.success) {
         written_blocks_ += ticket.keys.size();
-        for (std::size_t i = 0; i < ticket.keys.size(); ++i) {
-            // A Host entry still there still describes these bytes.
-            if (coordinator_.Host().ContainsHostCachedBlock(ticket.keys[i])) {
-                coordinator_.Disk().CacheDiskBlock(ticket.disk_blocks[i], ticket.keys[i], ticket.metadata[i]);
+        const bool valid = std::ranges::all_of(ticket.keys, [&](const CacheKey& key) { return mayClean(key); });
+        if (valid) {
+            for (std::size_t i = 0; i < ticket.keys.size(); ++i) {
+                const auto& key = ticket.keys[i];
+                const auto& index = coordinator_.Store().Groups()[key.group_id].Index();
+                const auto* host = coordinator_.Store().HostPool();
+                if (index.Find(*host, key) != ticket.cleaning_sources[i].Block()) continue;
+                // Content is immutable while owned. Inherit a newer use,
+                // rather than resurrecting an older demotion at a late ACK.
+                const auto metadata = index.MetadataFor(*host, ticket.cleaning_sources[i].Block()->Location());
+                coordinator_.Disk().CacheDiskBlock(ticket.disk_blocks[i], key, *metadata);
             }
+        } else {
+            dropped_cleanings_ += ticket.keys.size();
         }
     } else {
         ++failed_writes_;
@@ -433,7 +512,38 @@ void DiskTransferManager::detach(std::uint64_t id) noexcept {
 }
 
 std::vector<DiskOperation> DiskTransferManager::TakeCommands() {
-    return std::exchange(commands_, {});
+    std::vector<DiskOperation> result;
+    for (auto& op : commands_) {
+        auto& ticket = operations_.at(op.op_id);
+        if (ticket.kind == DiskOpKind::kWrite) {
+            filterCleaning(ticket);
+            if (ticket.keys.empty()) {
+                operations_.erase(op.op_id);
+                continue;
+            }
+        }
+        result.push_back(std::move(op));
+    }
+    commands_.clear();
+    return result;
+}
+
+bool DiskTransferManager::mayClean(const CacheKey& key) const {
+    const auto& store = coordinator_.Store();
+    const auto entry = store.Groups()[key.group_id].Index().Inspect(*store.HostPool(), key);
+    return entry && !entry->metadata.demoted && !(entry->metadata.session && entry->metadata.session->demoted);
+}
+
+void DiskTransferManager::filterCleaning(Ticket& ticket) {
+    if (std::ranges::all_of(ticket.keys, [&](const CacheKey& key) { return mayClean(key); })) return;
+    // An unissued operation has no external writers. Once issued, Complete
+    // suppresses publication but the owning ticket stays until retirement.
+    dropped_cleanings_ += ticket.keys.size();
+    ticket.keys.clear();
+    ticket.cleaning_sources.clear();
+    ticket.disk_blocks.clear();
+    ticket.disk_dependencies.clear();
+    ticket.metadata.clear();
 }
 
 }  // namespace tokenspeed

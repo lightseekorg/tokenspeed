@@ -441,7 +441,7 @@ TEST(StorageQueryTest, ReservationRetriesClearKeysTailAndWarmReferences) {
     // Three credits must select 8: one warm Full block, one new Full block,
     // and one State checkpoint. Rejected keys, tail metadata and pins must
     // not leak from either longer candidate into that reservation.
-    auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 3, /*source_pool=*/nullptr);
+    auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 3);
     const std::vector<CacheKey> expected{
         {.group_id = 0, .content_hash = ContentHash{prompt.hashes[1]}},
         {.group_id = 1, .content_hash = ContentHash{prompt.hashes[1]}},
@@ -464,17 +464,15 @@ TEST(StorageQueryTest, ReservationBudgetIncludesWarmReferencesAndPreservesWarmNo
     };
     cache.Warm(warm);
     const std::vector<CacheKey> remote{{.group_id = 2, .content_hash = ContentHash{prompt.hashes[1]}}};
-    EXPECT_TRUE(
-        cache.coordinator.Storage().ReserveStoragePrefix(prefix, remote, 3, /*source_pool=*/nullptr).keys.empty());
+    EXPECT_TRUE(cache.coordinator.Storage().ReserveStoragePrefix(prefix, remote, 3).keys.empty());
     EXPECT_EQ(cache.coordinator.Host().NumPinnedHostCachedBlocks(), 0);
     {
-        auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prefix, remote, 4, /*source_pool=*/nullptr);
+        auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prefix, remote, 4);
         EXPECT_EQ(reservation.keys, remote);
         EXPECT_EQ(reservation.blocks.size(), 1u);
         EXPECT_EQ(cache.coordinator.Host().NumPinnedHostCachedBlocks(), 0);
     }
-    EXPECT_TRUE(
-        cache.coordinator.Storage().ReserveStoragePrefix(prefix, remote, 0, /*source_pool=*/nullptr).keys.empty());
+    EXPECT_TRUE(cache.coordinator.Storage().ReserveStoragePrefix(prefix, remote, 0).keys.empty());
     EXPECT_EQ(cache.coordinator.Host().NumPinnedHostCachedBlocks(), 0);
     cache.Warm(remote);
     const std::vector<CacheKey> shorter_remote{
@@ -483,9 +481,7 @@ TEST(StorageQueryTest, ReservationBudgetIncludesWarmReferencesAndPreservesWarmNo
     };
     // A wholly warm longer hit needs no read, even when its reference count
     // exceeds the quota. Do not turn it into an unnecessary shorter read.
-    EXPECT_TRUE(cache.coordinator.Storage()
-                    .ReserveStoragePrefix(prefix, shorter_remote, 3, /*source_pool=*/nullptr)
-                    .keys.empty());
+    EXPECT_TRUE(cache.coordinator.Storage().ReserveStoragePrefix(prefix, shorter_remote, 3).keys.empty());
     EXPECT_EQ(cache.coordinator.Host().NumPinnedHostCachedBlocks(), 0);
 }
 
@@ -528,10 +524,8 @@ TEST(StorageQueryTest, PreparedReservationMatchesFreshKeysAcrossBudgets) {
         prepared.prepared_keys = cache.coordinator.Prober().ProbePromptPrefix(plain).group_keys;
         const auto query = cache.coordinator.Storage().MissingStorageKeys(plain, 100);
         for (std::size_t budget = 0; budget <= 8; ++budget) {
-            auto fresh =
-                cache.coordinator.Storage().ReserveStoragePrefix(plain, query.keys, budget, /*source_pool=*/nullptr);
-            auto reused =
-                cache.coordinator.Storage().ReserveStoragePrefix(prepared, query.keys, budget, /*source_pool=*/nullptr);
+            auto fresh = cache.coordinator.Storage().ReserveStoragePrefix(plain, query.keys, budget);
+            auto reused = cache.coordinator.Storage().ReserveStoragePrefix(prepared, query.keys, budget);
             EXPECT_EQ(reused.keys, fresh.keys);
             EXPECT_EQ(reused.blocks.size(), fresh.blocks.size());
             EXPECT_EQ(reused.tail_prior, fresh.tail_prior);
@@ -558,12 +552,12 @@ TEST(StorageQueryTest, PreparedReservationObservesCacheChanges) {
     prompt.prepared_keys = cache.coordinator.Prober().ProbePromptPrefix(prompt).group_keys;
     ASSERT_TRUE(cache.coordinator.ClearCache());
     {
-        auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prompt, remote, 3, /*source_pool=*/nullptr);
+        auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prompt, remote, 3);
         EXPECT_EQ(reservation.keys, remote);
     }
     cache.Warm(std::span{&first, 1});
     {
-        auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prompt, remote, 3, /*source_pool=*/nullptr);
+        auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prompt, remote, 3);
         EXPECT_EQ(reservation.keys.size(), 2u);
         EXPECT_FALSE(Has(reservation.keys, first));
     }
@@ -646,8 +640,7 @@ TEST(StorageQueryTest, ADeviceKvPrefixReservesOnlyItsHostSuffix) {
                                      {.group_id = 1, .content_hash = ContentHash{prompt.hashes[4]}},
                                      {.group_id = 2, .content_hash = ContentHash{prompt.hashes[4]}},
                                      {.group_id = 3, .content_hash = ContentHash{prompt.hashes[4]}}};
-    const auto reservation =
-        cache.coordinator.Storage().ReserveStoragePrefix(prefix, hits, 64, /*source_pool=*/nullptr);
+    const auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prefix, hits, 64);
     EXPECT_EQ(reservation.keys, hits);
     EXPECT_EQ(reservation.blocks.size(), 5u);
     EXPECT_FALSE(reservation.tail);
@@ -749,8 +742,7 @@ TEST(StorageQueryTest, EvictedWarmObjectsCannotBeAssumedPresentByTheReadReservat
         ASSERT_TRUE(cache.coordinator.GroupPrefixIndex(0).Evict(cache.host, location));
     }
     EXPECT_EQ(cache.coordinator.Prober().ProbePromptPrefix(prefix).host.num_common_tokens, 0);
-    const auto reservation =
-        cache.coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 64, /*source_pool=*/nullptr);
+    const auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 64);
     EXPECT_TRUE(reservation.keys.empty());
     EXPECT_TRUE(reservation.blocks.empty());
     EXPECT_EQ(cache.device.NumEmptyLcmBlocks(), 64);
@@ -777,8 +769,7 @@ TEST(StorageQueryTest, APartialHostBoundaryUsesAlignedQueryFloorAndDeviceReserva
     ASSERT_EQ(query.keys.size(), 5u);
     EXPECT_TRUE(Has(query.keys, {.group_id = 0, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 0}));
     EXPECT_TRUE(Has(query.keys, {.group_id = 0, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 1}));
-    const auto reservation =
-        cache.coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 64, /*source_pool=*/nullptr);
+    const auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 64);
     EXPECT_EQ(reservation.keys.size(), 5u);
     EXPECT_EQ(cache.coordinator.Host().NumPinnedHostCachedBlocks(), 0);
     EXPECT_EQ(cache.coordinator.Prober().ProbePromptPrefix(prefix).host.num_common_tokens, 7);
@@ -838,8 +829,7 @@ TEST(StorageQuerySwaFloorTest, QuerySkipsBelowHostFloorAndWarmPinsEndWithReserva
     EXPECT_FALSE(Has(query.keys, {.group_id = 2, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 0}));
     EXPECT_FALSE(Has(query.keys, {.group_id = 2, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 1}));
 
-    const auto reservation =
-        cache.coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 64, /*source_pool=*/nullptr);
+    const auto reservation = cache.coordinator.Storage().ReserveStoragePrefix(prefix, query.keys, 64);
     EXPECT_EQ(pool_facts(cache.device), device_before);
     ASSERT_EQ(reservation.keys.size(), 7u);
     ASSERT_EQ(reservation.blocks.size(), 7u);

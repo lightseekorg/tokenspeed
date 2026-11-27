@@ -101,13 +101,15 @@ std::optional<PeerHostLandings::Started> PeerHostLandings::Start(const PromptPre
         });
     }
     const std::uint64_t id = nextId();
-    landings_.emplace(id, Landing{.request_id = request_id,
-                                  .begin_tokens = local_tokens,
-                                  .end_tokens = prompt.max_tokens,
-                                  .keys = std::move(reservation.keys),
-                                  .host_blocks = std::move(reservation.blocks),
-                                  .tail_prior = std::move(reservation.tail_prior),
-                                  .tail = std::move(reservation.tail)});
+    landings_.emplace(id,
+                      Landing{.request_id = request_id,
+                              .begin_tokens = local_tokens,
+                              .end_tokens = prompt.max_tokens,
+                              .keys = std::move(reservation.keys),
+                              .host_blocks = std::move(reservation.blocks),
+                              .tail_prior = std::move(reservation.tail_prior),
+                              .tail = std::move(reservation.tail),
+                              .recovery_metadata = coordinator_.TrackRecoveryMetadata(prompt, reservation.num_tokens)});
     by_request_.emplace(request_id, id);
     return Started{.lease = StorageLease{*this, id}, .fetch = std::move(fetch)};
 }

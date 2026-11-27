@@ -48,6 +48,7 @@ struct StorageReservation {
     // `keys` (holes before a sliding window included).
     std::vector<std::int32_t> logical_blocks;
     std::vector<CacheBlockRef> blocks;
+    std::vector<CacheBlockRef> sources;
     ContentHash tail_prior;
     std::optional<TailPublication> tail;
 };
@@ -83,11 +84,8 @@ public:
     // storage `hits` (with the Host) extend the Device-only hit to, under the
     // Host-suffix rule, whose missing keys get Host blocks within max_blocks
     // (warm Host hits counted). Empty when no boundary fits.
-    // When `source_pool` is non-null (local Disk tier), each missing key's Host
-    // destination is allocated in the same sharded owner bucket as its source
-    // block in `*source_pool` so every rank reads only its own local Disk file.
     StorageReservation ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
-                                            std::size_t max_blocks, const BlockPool* source_pool);
+                                            std::size_t max_blocks);
     // Longest boundary that `hits` (with Device and Host) can resume under the
     // Host-suffix rule, without allocating blocks or spending Host credits.
     std::int32_t ResumableStorageTokens(const PromptPrefix& prompt, std::span<const CacheKey> hits) const;
@@ -95,6 +93,8 @@ public:
     // an illegal boundary or a suffix exceeding the absolute limit does not.
     StorageReservation ReserveExactStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                                  std::size_t available, std::size_t limit, bool& retry);
+    StorageReservation ReserveDiskPrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
+                                         std::size_t max_blocks);
     // Peer sharing with a Disk tier (docs/rfcs/0006-disk-tier.md): what a
     // holder lists when `disk_hits`, keys its Disk holds, extend its local
     // hit -- the longest boundary the Device, the Host and the Disk resume

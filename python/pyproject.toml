@@ -98,6 +98,7 @@ ts = "tokenspeed.cli:main"
 ascend-memory-saver = ["torch-npu-memory-saver==0.1.6"]
 # Capped: 0.1.9 clones internally, so a release that stops would alias silently.
 instanttensor = ["instanttensor>=0.1.9,<0.2"]
+runai = ["runai-model-streamer>=0.16.1"]
 
 [tool.setuptools]
 license-files = ["LICENSE", "THIRDPARTYNOTICES"]

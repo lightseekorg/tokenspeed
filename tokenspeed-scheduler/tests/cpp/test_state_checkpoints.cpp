@@ -291,6 +291,20 @@ TEST_F(AlignedStateCheckpointSuite, A4097TokenRequestSavesItsInteriorCheckpointI
     EXPECT_EQ(hit.state_row.at(0), checkpoint);
 }
 
+TEST_F(AlignedStateCheckpointSuite, RejectsGdsWithoutPrefixCacheBeforeBuildingPools) {
+    auto cfg = MakeConfig();
+    cfg.state_checkpoint_in_forward = false;
+    cfg.disable_prefix_cache = true;
+    cfg.prefix_cache_evict_policy = "gds";
+    cfg.prefix_cache_gds_prefill_cost = std::array<double, 2>{1, 0};
+    try {
+        Scheduler scheduler{cfg};
+        FAIL() << "GDS cannot retain unpublished prefixes";
+    } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string{error.what()}.find("gds requires prefix caching"), std::string::npos);
+    }
+}
+
 TEST_F(AlignedStateCheckpointSuite, RejectsBudgetSmallerThanOneSegment) {
     auto cfg = MakeConfig();
     cfg.max_scheduled_tokens = 4095;

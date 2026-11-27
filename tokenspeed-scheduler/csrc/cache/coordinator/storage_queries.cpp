@@ -204,14 +204,20 @@ StorageQuery StorageQueries::MissingStorageKeys(const PromptPrefix& prompt, std:
 }
 
 StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
-                                                        std::size_t max_blocks, const BlockPool* source_pool) {
-    return reserveStoragePrefix(prompt, hits, max_blocks, max_blocks, nullptr, source_pool);
+                                                        std::size_t max_blocks) {
+    return reserveStoragePrefix(prompt, hits, max_blocks, max_blocks, nullptr, nullptr);
 }
 
 StorageReservation StorageQueries::ReserveExactStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                                              std::size_t available, std::size_t limit, bool& retry) {
     retry = false;
     return reserveStoragePrefix(prompt, hits, available, limit, &retry, nullptr);
+}
+
+StorageReservation StorageQueries::ReserveDiskPrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
+                                                     std::size_t max_blocks) {
+    FatalCheck(store_.DiskPool() != nullptr, "Disk prefix reservation requires a Disk pool");
+    return reserveStoragePrefix(prompt, hits, max_blocks, max_blocks, nullptr, store_.DiskPool());
 }
 
 StorageReservation StorageQueries::reserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
@@ -238,6 +244,7 @@ StorageReservation StorageQueries::reserveStoragePrefix(const PromptPrefix& prom
         result.keys.clear();
         result.logical_blocks.clear();
         result.blocks.clear();
+        result.sources.clear();
         result.tail.reset();
         result.tail_prior = ContentHash{};
         const auto suffix = prober_.ProbeHostSuffix(candidate, group_keys, store_.MatchOrder(),
@@ -278,7 +285,14 @@ StorageReservation StorageQueries::reserveStoragePrefix(const PromptPrefix& prom
         const auto needed = result.keys.size() + warm_blocks.size();
         if (exact_retry && needed > limit) return {};
         if (needed <= max_blocks) {
-            auto allocation = host_.AcquireHostBlocks(groups, buckets);
+            if (source_pool) {
+                for (const auto& key : result.keys) {
+                    auto source = store_.Groups()[key.group_id].Index().Find(*source_pool, key);
+                    if (!source) return {};
+                    result.sources.push_back(std::move(source));
+                }
+            }
+            auto allocation = host_.AcquireHostLanding(groups, buckets);
             if (allocation.stats.allocated == groups.size()) {
                 result.num_tokens = probe.num_common_tokens;
                 result.blocks = std::move(allocation.blocks);

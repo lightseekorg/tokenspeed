@@ -138,6 +138,12 @@ inline std::int64_t ParentsNeededForBucketsAndPairs(const BlockPlacementDemand& 
 // CacheBlock pointer, or ownership count.
 class BlockPool {
 public:
+    struct ReleaseCounts {
+        std::uint64_t child_slots{0};
+        std::uint64_t parents{0};
+    };
+    ReleaseCounts Released(std::uint32_t group_id) const noexcept { return placement(group_id).released; }
+
     explicit BlockPool(std::int32_t num_lcm_blocks, std::vector<std::int32_t> slots_per_group)
         : lcm_blocks_(checkedLcmBlockCount(num_lcm_blocks)), group_availability_(slots_per_group.size()) {
         for (std::size_t group_id = 0; group_id < slots_per_group.size(); ++group_id) {
@@ -363,9 +369,11 @@ public:
         removeAvailability(group, parent, location.lcm_block_id);
         parent.SetSlotOccupied(slot, false);
         --parent.occupied_count;
+        ++group.released.child_slots;
         const std::size_t buckets = group.parents_by_bucket.size();
         ++group.free_slots_by_bucket[slot % buckets];
         if (parent.occupied_count == 0) {
+            ++group.released.parents;
             // An unbound parent's slots leave the group: they belong to the
             // pool-wide empty FIFO again.
             const auto per_bucket = static_cast<std::int64_t>(static_cast<std::size_t>(parent.slots) / buckets);
@@ -389,6 +397,7 @@ private:
     using ParentOrder = std::pair<std::int32_t, std::int32_t>;  // -occupancy, parent ID
     struct GroupAvailability {
         std::int32_t packing{0};
+        ReleaseCounts released;
         // Holes in bound parents, per bucket (slot % shard_count); empty
         // parents remain pool-wide. The group total is derived from this, so
         // the two cannot disagree.

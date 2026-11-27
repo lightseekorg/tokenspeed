@@ -710,7 +710,7 @@ def test_record_copies_give_the_same_bits_as_register_loads(
     """A 64-row tile that bulk-copies its records stores what one loading them does.
 
     Batch 4 (12 heads) runs 64-row tiles, padding requests included; the
-    prepare leaves at most ``capacity - window`` records, which the longest
+    verify applies at most ``capacity - window`` records, which the longest
     histories fill.
     """
     assert history_length <= capacity - window
@@ -769,6 +769,70 @@ def test_far_record_slots_past_int32_copy_like_near_ones(monkeypatch):
     for got, want in zip(far_buffers, near, strict=True):
         _assert_same_bytes(got, want)
     assert (near[1] == history_length).all()
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("window", [2, 4, 8])
+@pytest.mark.parametrize("full", [False, True])
+def test_record_copies_read_none_of_an_overflowing_history(
+    state_dtype, window, full, monkeypatch
+):
+    """A count past ``capacity - window`` folds into the page and copies nothing.
+
+    The prepare applies every accepted record in the live page and leaves the
+    count as it was, so the verify applies none: copying the records, loading
+    them, or starting from that page with no records stores the same bits.
+    """
+    capacity = window + 12
+    # One record past what fits beside the window, or every row.
+    history_length = capacity if full else capacity - window + 1
+    x = _inputs(4, window, seed=340 + window + history_length)
+    x["state_pool"] = x["state_pool"].to(state_dtype)
+    assert window_kernel._value_tile_rows(4, HEADS, window, DIM) == 64
+    norm = _output_norm(x, torch.bfloat16)
+    pool = x["state_pool"].clone()
+    folded = pool.clone()
+    records, _ = _packed_records(dict(x, state_pool=folded), capacity, history_length)
+    prepare_history(
+        folded,
+        records.history,
+        x["state_indices"],
+        x["query_start_loc"],
+        draft_token_num=window,
+    )
+    assert not torch.equal(folded, pool)
+    taken = []
+
+    def verify(copies, start, length):
+        monkeypatch.setattr(
+            window_kernel, "_copies_records", lambda *_: taken.append(copies) or copies
+        )
+        run = dict(x, state_pool=start.clone())
+        out, buffers = _fused_packed(run, capacity, length, norm)
+        return out, buffers, run["state_pool"]
+
+    loaded = verify(False, pool, history_length)
+    copied = verify(True, pool, history_length)
+    empty = verify(True, folded, 0)
+    assert taken == [False, True, True]
+    for got, want in zip(copied, loaded, strict=True):
+        if isinstance(got, tuple):
+            for field, peer in zip(got, want, strict=True):
+                _assert_same_bytes(field, peer)
+        else:
+            _assert_same_bytes(got, want)
+    _assert_same_bytes(copied[2], folded)
+    _assert_same_bytes(copied[0], empty[0])
+    _assert_same_bytes(copied[2], empty[2])
+    # Live requests record the window from position 0, as without history;
+    # request r owns slot r, and padding requests record nothing.
+    live = (x["state_indices"] > 0).nonzero().flatten()
+    assert live.numel() == 2
+    window_rows = (live, slice(None), slice(None), slice(0, window))
+    _assert_same_bytes(copied[1][0][window_rows], empty[1][0][window_rows])
+    _assert_same_bytes(copied[1][2], empty[1][2])
+    # The prepare only read the count.
+    assert (copied[1][1] == history_length).all()
 
 
 def test_only_grids_of_one_cta_per_sm_copy_records_on_64_row_tiles():

@@ -23,8 +23,50 @@
 #include <cstdint>
 
 #include "cache/coordinator/cache_coordinator.h"
+#include "scheduler/types.h"
 
 namespace tokenspeed {
+
+// Production planning does not publish or retain anything. A positive offset
+// requests a third State output; zero leaves the existing chunk-end producer.
+struct CheckpointMaterializationPlan {
+    enum class Producer { kNatural, kInterior };
+    struct GroupOutput {
+        std::int32_t extra_blocks;
+        // Token intervals that must be published before history reclaim.
+        std::int32_t history_begin;
+        std::int32_t history_end;
+        std::int32_t sink_end;
+    };
+    std::int32_t target_tokens;
+    std::int32_t first_pos;
+    std::int32_t chunk_tokens;
+    std::int32_t checkpoint_offset;
+    Producer producer;
+    std::vector<GroupOutput> groups;
+    bool NeedsExtraOutput() const { return checkpoint_offset > 0; }
+    void ApplyOutputDemand(std::span<GroupDemand> demands) const {
+        _assert(demands.size() == groups.size(), "checkpoint demands cover every cache group");
+        for (std::size_t i = 0; i < demands.size(); ++i)
+            if (auto* state = std::get_if<StateStep>(&demands[i].extent))
+                state->checkpoint = groups[i].extra_blocks != 0;
+    }
+    CheckpointMaterializationPlan WithoutExtraOutput() const {
+        _assert(NeedsExtraOutput(), "only an interior checkpoint needs output fallback");
+        auto result = *this;
+        result.chunk_tokens = target_tokens - first_pos;
+        result.checkpoint_offset = 0;
+        result.producer = Producer::kNatural;
+        for (auto& group : result.groups) group.extra_blocks = 0;
+        return result;
+    }
+};
+CheckpointMaterializationPlan PlanCheckpointMaterialization(std::int32_t checkpoint, std::int32_t first_pos,
+                                                            std::int32_t tokens, std::int32_t junction,
+                                                            std::int32_t max_chunk_tokens,
+                                                            std::int32_t prefix_granularity,
+                                                            CheckpointProductionConfig production,
+                                                            std::span<const CacheGroupConfig> groups);
 
 // How a local prefill chunk is cut. A chunk is min(budget, unscheduled)
 // shaped by what the cache groups need: a junction cut when a hit's KV
