@@ -186,6 +186,54 @@ def _register_fixture() -> None:
     registry.register_model(FixtureForCausalLM)
 
 
+@pytest.mark.parametrize("cli_policy", [False, True])
+def test_model_numerics_complete_deferred_configuration(
+    monkeypatch, tmp_path, isolated, cli_policy
+):
+    from tokenspeed.runtime.configs import numerics
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    monkeypatch.setattr(numerics, "_MODEL_RL_POLICIES", {})
+    monkeypatch.setattr(plugins, "_loaded", True)
+
+    def resolve(args):
+        args.logprob_order = "blockwise-direct"
+        numerics.STANDARD_RL_NUMERICS.resolve(args)
+
+    def policy(config):
+        if not isinstance(config, FixtureConfig):
+            raise TypeError("The policy requires its registered checkpoint config")
+        return numerics.RLNumericsPolicy(
+            resolve=resolve, validate=numerics.STANDARD_RL_NUMERICS.validate
+        )
+
+    def cli_factory(config):
+        return numerics.STANDARD_RL_NUMERICS
+
+    def register():
+        _register_fixture()
+        registry.register_model_rl_numerics("FixtureForCausalLM", policy)
+
+    # Full registration owns the final policy. A provisional CLI factory must
+    # be undone before re-registration; a plugin may also register no CLI policy.
+    with registry.recording() as record:
+        if cli_policy:
+            registry.register_model_rl_numerics("FixtureForCausalLM", cli_factory)
+    monkeypatch.setattr(
+        plugins,
+        "_deferred_longcat",
+        (_EntryPoint("deferred_policy", register), record.undo),
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps({"architectures": ["FixtureForCausalLM"], "vocab_size": 65536})
+    )
+    args = ServerArgs(
+        model=str(tmp_path), numerics="rl-bitwise", sampling_backend="greedy"
+    )
+    assert args.logprob_order == "blockwise-direct"
+    assert args.disable_tf32 and args.batch_invariant_collectives
+
+
 def test_loader_registers_once_and_reports(monkeypatch, isolated) -> None:
     calls = []
 
@@ -911,3 +959,36 @@ def test_post_model_init_hook_rejects_async_and_generators():
     for hook in (async_hook, generator_hook, AsyncHook()):
         with pytest.raises(TypeError, match="synchronous"):
             registry.register_post_model_init_hook("test.invalid", hook)
+
+
+def test_non_ascend_backend_discovery_without_ascend_helpers():
+    import subprocess
+    import sys
+
+    from tokenspeed_kernel.platform import current_platform
+
+    if current_platform().is_npu:
+        pytest.skip("This check covers non-Ascend backend discovery")
+    program = """
+import importlib.abc
+import sys
+
+class MissingAscendHelpers(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in (
+            "tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa",
+            "tokenspeed.runtime.layers.attention.backends.paged.ascend_mla",
+            "tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace",
+        ):
+            raise ModuleNotFoundError("Ascend helpers are unavailable", name=fullname)
+
+sys.meta_path.insert(0, MissingAscendHelpers())
+from tokenspeed.runtime.layers.attention import backends
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -352,7 +352,8 @@ rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler) {
                                      .holder = rust::String(lookup.holder),
                                      .prefix_hashes = ToRustStrings(lookup.prefix_hashes),
                                      .tokens = ToRustVec(lookup.tokens),
-                                     .max_tokens = lookup.max_tokens});
+                                     .max_tokens = lookup.max_tokens,
+                                     .local_tokens = lookup.local_tokens});
     }
     return out;
 }
