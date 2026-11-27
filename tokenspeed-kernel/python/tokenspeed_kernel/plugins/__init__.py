@@ -35,6 +35,7 @@ import os
 import warnings
 from dataclasses import dataclass, field
 
+from tokenspeed_kernel.plugins._collisions import domains_may_overlap
 from tokenspeed_kernel.registry import KernelRegistry
 
 logger = logging.getLogger(__name__)
@@ -128,12 +129,22 @@ def _resolve_package_and_version(ep) -> tuple[str, str]:
     return package, version
 
 
-def _new_kernel_names(before: set[str], after: set[str]) -> tuple[str, ...]:
-    return tuple(sorted(after - before))
+def _new_kernel_names(before: set[str], registry: KernelRegistry) -> tuple[str, ...]:
+    # Entry-point imports may lazily register host kernels. Keep them in the
+    # registry without attributing them to the plugin or changing import order.
+    return tuple(
+        sorted(
+            name
+            for name, spec in registry._by_name.items()
+            if name not in before
+            and spec.registration_module != "tokenspeed_kernel"
+            and not spec.registration_module.startswith("tokenspeed_kernel.")
+        )
+    )
 
 
 def _check_priority_collisions(
-    registry: KernelRegistry, new_names: tuple[str, ...]
+    registry: KernelRegistry, new_names: tuple[str, ...], checked: set[tuple[str, str]]
 ) -> None:
     for name in new_names:
         spec = registry.get_by_name(name)
@@ -142,10 +153,17 @@ def _check_priority_collisions(
         peers = registry.get_for_operator(spec.family, spec.mode)
         same = [s for s in peers if s.priority == spec.priority and s.name != name]
         for other in same:
+            pair = tuple(sorted((name, other.name)))
+            if pair in checked:
+                continue
+            checked.add(pair)
+            if not domains_may_overlap(spec, other):
+                continue
             warnings.warn(
                 f"Plugin kernel '{name}' has equal priority ({spec.priority}) with "
                 f"existing kernel '{other.name}' for {spec.family}.{spec.mode}. "
-                "Set explicit priorities to make selection deterministic.",
+                "Their applicability domains may overlap; equal priority alone "
+                "does not determine the selection winner.",
                 stacklevel=3,
             )
 
@@ -163,6 +181,7 @@ def discover_plugins(*, force: bool = False) -> list[PluginInfo]:
     disabled = _disabled_plugins | _disabled_from_env()
     registry = KernelRegistry.get()
     loaded: list[PluginInfo] = []
+    checked: set[tuple[str, str]] = set()
 
     # Sort entry points alphabetically for deterministic load order. Plugins
     # registering with the same priority will then have a stable winner.
@@ -185,8 +204,8 @@ def discover_plugins(*, force: bool = False) -> list[PluginInfo]:
             )
             continue
 
-        new_names = _new_kernel_names(before, set(registry._by_name.keys()))
-        _check_priority_collisions(registry, new_names)
+        new_names = _new_kernel_names(before, registry)
+        _check_priority_collisions(registry, new_names, checked)
         package, version = _resolve_package_and_version(ep)
         info = PluginInfo(
             name=ep.name,

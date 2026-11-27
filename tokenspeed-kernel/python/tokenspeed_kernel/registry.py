@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -193,6 +194,9 @@ class KernelSpec:
     # lose to SPECIALIZED. Selection scoring clamps out-of-range values.
     priority: int = int(Priority.PERFORMANT) + 2
     weight_preprocessor: Callable | tuple[tuple[str, ...], Callable] | None = None
+    # Diagnostic provenance belongs to the registration, not the implementation
+    # (a plugin may register a function imported from the host).
+    registration_module: str = field(default="", compare=False, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -483,6 +487,7 @@ def register_kernel(
     """
     priority_int = _validate_priority(priority)
     normalized_weight_preprocessor = _validate_weight_preprocessor(weight_preprocessor)
+    registration_module = sys._getframe(1).f_globals["__name__"]
 
     def decorator(impl: Callable) -> Callable:
         kernel_name = name or f"{solution}_{family}_{mode}"
@@ -498,6 +503,7 @@ def register_kernel(
             traits=traits or {},
             priority=priority_int,
             weight_preprocessor=normalized_weight_preprocessor,
+            registration_module=registration_module,
         )
 
         KernelRegistry.get().register(spec, impl)
@@ -536,8 +542,6 @@ def describe_kernel(name: str) -> str:
 
 
 def load_builtin_kernels() -> None:
-    import sys
-
     if not KernelRegistry.get().list_kernels():
         # Registry was reset; clear cached ops modules so decorators re-run.
         for key in list(sys.modules.keys()):
