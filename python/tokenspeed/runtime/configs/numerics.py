@@ -60,7 +60,9 @@ class RLCheckpointValidator(Protocol):
 
     def __call__(
         self, *, quantization: str | None, vocab_size: int, architecture: str
-    ) -> None: ...
+    ) -> None:
+        """Validate checkpoint storage; return None to accept or raise to reject."""
+        ...
 
 
 @dataclass(frozen=True, kw_only=True)
