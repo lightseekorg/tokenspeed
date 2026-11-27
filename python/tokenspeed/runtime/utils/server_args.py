@@ -3988,7 +3988,8 @@ class ServerArgs:
             "--enable-short-prefill-first",
             action="store_true",
             default=ServerArgs.enable_short_prefill_first,
-            help="Compatibility selector for the short-prefill-first policy. "
+            help="Legacy flag temporarily retained for backward compatibility. "
+            "Use --prefill-policy short-prefill-first instead. "
             "Prefer new local prefill requests with less uncached work, with "
             "oldest-request starvation protection. Off by default; resident "
             "chunks retain priority. Applies to fused and prefill roles. "

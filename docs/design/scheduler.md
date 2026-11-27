@@ -325,9 +325,11 @@ capacity model (§1.4) states the same split.
 
 Local prefill scheduling is selected once when Scheduler is constructed.
 The PrefillPolicy factory selects fifo or short-prefill-first through
---prefill-policy. Omitting this selector preserves the existing default
-and the --enable-short-prefill-first opt-in; supplying both selectors is
-rejected. These are the two production policies. Their Schedule methods
+--prefill-policy. The --enable-short-prefill-first flag is temporarily
+retained for backward compatibility; use --prefill-policy short-prefill-first
+for new configurations and migrate existing uses to it. Omitting both
+selectors preserves the existing default; supplying both is rejected.
+These are the two production policies. Their Schedule methods
 run one shared serial template, and PrefillSchedulingContext reuses the
 scheduler's existing admission operations. Peer selection and the prefill
 gate run before carry probes, preserving the bounded probe window. Head-of-line stopping,
@@ -402,7 +404,7 @@ keeps the prompts within N or the budget left, whichever is more: N bounds
 what the chunk gives way to, not what completes beside it. A prompt sharing
 the junction the chunk ends at is not filled — the State there is published
 only when the next chunk is admitted — and resumes there later. With
-`--enable-short-prefill-first` the fill takes the ranked prompts instead of
+--prefill-policy short-prefill-first the fill takes the ranked prompts instead of
 the list (see the following paragraphs).
 No carried or filled prompt holds the head of line, so the round is still
 *completing prefills + at most one truncated prefill*, and the truncated one
@@ -436,7 +438,7 @@ carried prompt could make the chunk's own request that victim.
 
 
 **New prompts retain submission order by default.**
-`--enable-short-prefill-first` opts in to ordering by prompt tokens minus
+--prefill-policy short-prefill-first opts in to ordering by prompt tokens minus
 currently reusable Device or Host prefixes, plus any tokens replayed to
 regenerate replayable groups; equal work preserves submission order. Resident chunks retain priority. The policy applies to P and fused
 local prefill; D's remote admission and decode ordering are unchanged.

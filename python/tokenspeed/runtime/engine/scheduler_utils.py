@@ -165,9 +165,10 @@ def make_config(
     Args:
         num_device_pages: Device LCM blocks including the null page.
         max_scheduled_tokens: Per-step prefill token budget.
-        enable_short_prefill_first: Compatibility selector for remaining-work
-            ordering with oldest-request protection; False preserves submission
-            order when prefill_policy is omitted.
+        enable_short_prefill_first: Legacy selector temporarily retained for
+            compatibility. Prefer prefill_policy="short-prefill-first" in new
+            callers and migrate existing uses to that option. False preserves
+            submission order when prefill_policy is omitted.
         prefill_policy: Explicit "fifo" or "short-prefill-first"
             selection. None preserves enable_short_prefill_first and does not
             require a scheduler wheel that supports the explicit selector.
