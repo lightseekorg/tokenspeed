@@ -401,6 +401,7 @@ async fn abort_closes_a_silent_stream_after_queued_outputs() {
     assert!(terminal.output_ids.is_empty());
     assert!(terminal.output_token_logprobs.is_empty());
     assert!(terminal.output_token_cumulative_probs.is_empty());
+    assert!(terminal.output_full_vocab_topk.is_empty());
     assert_eq!(next(&mut stream).await, None);
 }
 
@@ -415,6 +416,7 @@ async fn abort_before_the_first_output_reports_the_submitted_prompt_length() {
     assert_eq!(chunks[0].prompt_tokens, 3);
     assert_eq!(chunks[0].completion_tokens, 0);
     assert!(chunks[0].output_ids.is_empty());
+    assert!(chunks[0].output_full_vocab_topk.is_empty());
     assert_eq!(client.in_flight(), [0]);
 }
 

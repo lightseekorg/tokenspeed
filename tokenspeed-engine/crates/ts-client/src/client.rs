@@ -90,6 +90,7 @@ pub struct OutputChunk {
     /// Request boundaries returned once on the terminal chunk.
     pub request_timing: Option<ts_wire::RequestTiming>,
     /// Packed full-vocabulary rows aligned with output_ids.
+    /// A tokenless synthetic abort chunk has no rows.
     pub output_full_vocab_topk: Vec<u8>,
 }
 
@@ -246,6 +247,7 @@ impl Pending {
             input_top_logprobs: None,
             output_top_logprobs: None,
             request_timing: None,
+            output_full_vocab_topk: Vec::new(),
         }
     }
 }
