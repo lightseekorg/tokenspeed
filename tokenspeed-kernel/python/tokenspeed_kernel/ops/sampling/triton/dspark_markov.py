@@ -35,7 +35,11 @@ from dataclasses import dataclass
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature, format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 __all__ = [
     "DsparkMarkovSampleWorkspace",
@@ -95,8 +99,12 @@ def dspark_markov_sample_workspace(
     return DsparkMarkovSampleWorkspace(
         markov_embed=torch.empty((max_rows, rank), dtype=embed_dtype, device=device),
         probs=torch.empty((max_rows, vocab_size), dtype=torch.float32, device=device),
-        partial_max=torch.empty((max_rows, block_p), dtype=torch.float32, device=device),
-        partial_sum=torch.empty((max_rows, block_p), dtype=torch.float32, device=device),
+        partial_max=torch.empty(
+            (max_rows, block_p), dtype=torch.float32, device=device
+        ),
+        partial_sum=torch.empty(
+            (max_rows, block_p), dtype=torch.float32, device=device
+        ),
         partial_idx=torch.empty((max_rows, block_p), dtype=torch.int32, device=device),
         temperatures=torch.empty((max_rows,), dtype=torch.float32, device=device),
         top_ks=torch.empty((max_rows,), dtype=torch.int32, device=device),
@@ -723,9 +731,7 @@ def triton_dspark_markov_softmax(
     "dspark_probs_scatter_and_sample",
     name="triton_dspark_probs_scatter_and_sample",
     solution="triton",
-    signatures=frozenset(
-        {format_signature(probs=dense_tensor_format(torch.float32))}
-    ),
+    signatures=frozenset({format_signature(probs=dense_tensor_format(torch.float32))}),
     priority=Priority.PORTABLE,
 )
 def triton_dspark_probs_scatter_and_sample(
@@ -755,12 +761,24 @@ def triton_dspark_probs_scatter_and_sample(
     if draft_probs.stride(2) != 1 or draft_probs.shape[2] < vocab_size:
         raise ValueError("draft_probs vocabulary axis must be contiguous and >= vocab")
     if not 0 <= step < draft_probs.shape[1]:
-        raise ValueError(f"step {step} is outside draft_probs width {draft_probs.shape[1]}")
+        raise ValueError(
+            f"step {step} is outside draft_probs width {draft_probs.shape[1]}"
+        )
     if rows == 0:
         return
-    if write_slots.shape != (rows,) or seeds.shape != (rows,) or base_positions.shape != (rows,):
-        raise ValueError("write_slots, seeds, and base_positions must have shape (rows,)")
-    if next_tokens_out.ndim != 2 or next_tokens_out.shape[0] != rows or next_tokens_out.shape[1] <= step:
+    if (
+        write_slots.shape != (rows,)
+        or seeds.shape != (rows,)
+        or base_positions.shape != (rows,)
+    ):
+        raise ValueError(
+            "write_slots, seeds, and base_positions must have shape (rows,)"
+        )
+    if (
+        next_tokens_out.ndim != 2
+        or next_tokens_out.shape[0] != rows
+        or next_tokens_out.shape[1] <= step
+    ):
         raise ValueError("next_tokens_out shape does not cover (rows, step)")
     if embedding.ndim != 2 or embedding.stride(1) != 1:
         raise ValueError("embedding must be 2D with contiguous rank axis")

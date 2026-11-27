@@ -152,7 +152,10 @@ def test_dspark_markov_softmax_and_scatter_match_reference(
     # Guarded token storage (extra rows & anchor col 0) and out-of-range anchor.
     tokens = torch.full((rows + 2, block + 1), -99, device="cuda", dtype=torch.int32)
     tokens[1 : 1 + rows, 0] = torch.tensor(
-        [-5 if i == 0 else (vocab + 7 if i == rows - 1 else (i * 11) % vocab) for i in range(rows)],
+        [
+            -5 if i == 0 else (vocab + 7 if i == rows - 1 else (i * 11) % vocab)
+            for i in range(rows)
+        ],
         device="cuda",
         dtype=torch.int32,
     )
@@ -310,7 +313,9 @@ def test_dspark_markov_no_triton_recompilation_and_empty_rows():
             strided_base = torch.cat(
                 [base_logits[:rows], torch.zeros_like(base_logits[:rows])], dim=-1
             )[:, :, :2112]
-            strided_out = torch.empty((rows, 10), device="cuda", dtype=torch.int32)[:, :5]
+            strided_out = torch.empty((rows, 10), device="cuda", dtype=torch.int32)[
+                :, :5
+            ]
             for step in range(5):
                 probs = dspark_markov_softmax(
                     strided_base,
@@ -364,7 +369,9 @@ def test_dspark_markov_scatter_beyond_2gb_and_matches_sample_probs():
     out = torch.empty((rows, block), device="cuda", dtype=torch.int32)
 
     try:
-        draft_probs = torch.empty((pool_rows, 1, vocab), device="cuda", dtype=torch.float32)
+        draft_probs = torch.empty(
+            (pool_rows, 1, vocab), device="cuda", dtype=torch.float32
+        )
         assert draft_probs.numel() * draft_probs.element_size() > (1 << 31)
         probs = dspark_markov_softmax(
             base_logits,

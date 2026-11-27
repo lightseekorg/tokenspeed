@@ -1070,10 +1070,11 @@ class FlashInferSamplingBackend(SamplingBackend):
     ) -> torch.Tensor:
         """Apply request Top-K / Top-P filtering to normalized DSpark probabilities.
 
-        Rows with ``top_k == 1`` are left unchanged by ``fused_topk_topp_renorm``
-        in ``in_place_skip=True`` mode and preserved explicitly in the
-        sub-1024-vocab fallback, assuming the caller normalized greedy rows to
-        canonical one-hot probabilities beforehand.
+        Callers must pass probabilities whose ``top_k == 1`` rows are already
+        canonical one-hot argmax (lowest-index tie-broken):
+        ``fused_topk_topp_renorm(..., in_place_skip=True)`` and the
+        sub-1024-vocab fallback both leave ``top_k == 1`` rows untouched rather
+        than recomputing ``argmax`` from ``logits``.
         """
         if _FUSED_TOPK_TOPP_AVAILABLE and probs.shape[1] >= 1024:
             return fused_topk_topp_renorm(

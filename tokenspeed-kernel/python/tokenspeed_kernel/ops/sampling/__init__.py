@@ -31,10 +31,6 @@ import torch as _torch
 from tokenspeed_kernel.ops.sampling.logprob import blockwise_logprobs
 from tokenspeed_kernel.ops.sampling.positions import prepare_sampling_offsets
 from tokenspeed_kernel.ops.sampling.synthetic import write_synthetic_verify_outputs
-from tokenspeed_kernel.ops.sampling.triton.dspark_markov import (
-    DsparkMarkovSampleWorkspace,
-    dspark_markov_sample_workspace,
-)
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -857,3 +853,7 @@ import tokenspeed_kernel.ops.sampling.triton.verify_coins  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_logprobs  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_shard_draft  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_topk  # noqa: E402,F401
+from tokenspeed_kernel.ops.sampling.triton.dspark_markov import (  # noqa: E402
+    DsparkMarkovSampleWorkspace,
+    dspark_markov_sample_workspace,
+)

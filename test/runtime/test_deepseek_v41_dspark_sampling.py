@@ -297,3 +297,65 @@ def test_fused_sampled_markov_matches_reference_with_filters_and_graph_replay(
     torch.testing.assert_close(
         captured_probs, fused_draft_probs[write_slots], atol=0, rtol=0
     )
+
+
+def test_small_vocab_topk1_matches_fused_topk_topp_renorm():
+    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+    from tokenspeed.runtime.sampling.backends.flashinfer import (
+        _FUSED_TOPK_TOPP_AVAILABLE,
+        FlashInferSamplingBackend,
+    )
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+    if not _FUSED_TOPK_TOPP_AVAILABLE:
+        pytest.skip("requires fused_topk_topp CUDA extension")
+
+    vocab = 1024
+    rows = 3
+    pool_rows = 4
+    backend = FlashInferSamplingBackend(
+        SamplingBackendConfig(
+            synthetic_acceptance_length=None,
+            enable_speculative_sampling=True,
+            sampling_stream="per-request",
+            logprob_order="torch",
+            max_bs=rows,
+            max_draft_tokens_per_req=2,
+            max_req_pool_size=pool_rows - 1,
+            vocab_size=vocab,
+            device="cuda",
+        )
+    )
+    params = [
+        SamplingParams(temperature=0.0, top_k=-1, top_p=1.0, seed=1),
+        SamplingParams(temperature=0.0, top_k=-1, top_p=1.0, seed=2),
+        SamplingParams(temperature=1.0, top_k=1, top_p=0.9, seed=3),
+    ]
+    for i, param in enumerate(params):
+        param.resolve_seed(f"topk1-{i}")
+        param.normalize(None)
+    slots_list = [1, 2, 3]
+    backend.prepare_step([f"topk1-{i}" for i in range(rows)], slots_list, params, 2)
+    slots = torch.tensor(slots_list, device="cuda", dtype=torch.int64)
+
+    logits = torch.full((rows, vocab), -4.0, device="cuda", dtype=torch.float32)
+    logits[0, 17] = 2.5
+    logits[1, [9, 255]] = 3.0
+    logits[2, [0, 512, 1023]] = 1.5
+
+    fused = backend._dspark_probabilities(logits, slots)
+    probabilities = torch.softmax(logits, dim=-1, dtype=torch.float32)
+    top_ks = backend._top_k_pool.index_select(0, slots)
+    top_ps = backend._top_p_pool.index_select(0, slots)
+    small_vocab = backend._apply_small_vocab_topk_topp(
+        probabilities,
+        top_ks,
+        top_ps,
+        greedy_one_hot=None,
+        logits=logits,
+        in_place=False,
+    )
+    torch.testing.assert_close(small_vocab, fused, atol=0, rtol=0)
+    assert torch.equal(
+        small_vocab.argmax(dim=-1), torch.tensor([17, 9, 0], device="cuda")
+    )
