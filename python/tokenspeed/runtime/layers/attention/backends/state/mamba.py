@@ -90,6 +90,7 @@ from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     compute_state_block_indices,
     in_forward_state_checkpoints,
     scan_checkpoint_plan,
+    validate_state_block_table_bounds,
 )
 from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
 from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
@@ -313,6 +314,7 @@ class MambaAttnBackend(AttentionBackend):
         self.speculative_num_draft_tokens = self.spec_num_tokens
         self.state_paging_active = False
         self._state_group_ids: tuple[str, ...] = ()
+        self._state_group_num_blocks: dict[str, int] = {}
         self._state_layer_geometry: _StateLayerGeometry = ()
         linear_attn = config.component(LinearAttnConfig)
         self.replay_ssm = linear_attn is not None and bool(linear_attn.replay_ssm)
@@ -428,6 +430,16 @@ class MambaAttnBackend(AttentionBackend):
         state_group_ids, layer_geometry = self._state_geometry(cache_pool)
         super()._publish_cache_pool(cache_pool)
         self._state_group_ids = state_group_ids
+        group_num_blocks: dict[str, int] = {}
+        for layer_id, group_id in cache_pool.state_group_by_layer.items():
+            conv = cache_pool.get_component(layer_id, "conv_state")
+            recurrent = cache_pool.get_component(layer_id, "recurrent_state")
+            layer_blocks = min(int(conv.shape[0]), int(recurrent.shape[0]))
+            prev = group_num_blocks.get(group_id)
+            group_num_blocks[group_id] = (
+                layer_blocks if prev is None else min(prev, layer_blocks)
+            )
+        self._state_group_num_blocks = group_num_blocks
         self.state_paging_active = True
         self._state_layer_geometry = layer_geometry
         # init_cuda_graph_state and preallocate_verify_workspace rebuild these for the new pool.
@@ -979,6 +991,7 @@ class MambaAttnBackend(AttentionBackend):
         """
         if validate is None:
             validate = cache_debug_enabled()
+        group_num_blocks = getattr(self, "_state_group_num_blocks", None) or {}
         state_in_blocks: dict[str, torch.Tensor] = {}
         state_out_blocks: dict[str, torch.Tensor] = {}
         for group_id in self._state_group_ids:
@@ -987,10 +1000,61 @@ class MambaAttnBackend(AttentionBackend):
                 tokens_before,
                 validate=validate,
                 group_id=group_id,
+                num_blocks=group_num_blocks.get(group_id),
             )
             state_in_blocks[group_id] = state_in
             state_out_blocks[group_id] = state_out
         return state_in_blocks, state_out_blocks
+
+    def _validate_host_state_block_bounds(
+        self,
+        bs: int,
+        block_tables: Mapping[str, torch.Tensor],
+        block_tables_cpu: Mapping[str, torch.Tensor] | None,
+    ) -> None:
+        """Always-on zero-GPU-sync bounds check on host state block tables.
+
+        Extend and mixed forwards deliver pinned host mirrors in
+        ``block_tables_cpu`` (2-3 int32 columns per state group). Checking them
+        on CPU before launching any GPU kernel fails fast on out-of-range block
+        IDs without a device sync, complementing the kernel-level arena guard.
+        """
+        if not block_tables_cpu:
+            return
+        group_num_blocks = getattr(self, "_state_group_num_blocks", None)
+        if not group_num_blocks:
+            return
+        for group_id in self._state_group_ids:
+            rows_cpu = block_tables_cpu.get(group_id)
+            num_blocks = group_num_blocks.get(group_id)
+            if rows_cpu is None or num_blocks is None:
+                continue
+            if rows_cpu.device.type != "cpu":
+                raise ValueError(
+                    f"state paging: block_tables_cpu[{group_id!r}] must be a CPU "
+                    f"tensor (got {rows_cpu.device})"
+                )
+            if rows_cpu.dtype != torch.int32:
+                raise ValueError(
+                    f"state paging: block_tables_cpu[{group_id!r}] must use int32 "
+                    f"(got {rows_cpu.dtype})"
+                )
+            device_rows = self._state_rows(block_tables, group_id)
+            if rows_cpu.ndim != 2 or rows_cpu.shape[0] < bs:
+                raise ValueError(
+                    f"state paging: block_tables_cpu[{group_id!r}] has shape "
+                    f"{tuple(rows_cpu.shape)}, expected a 2D table with at least "
+                    f"{bs} rows"
+                )
+            if tuple(rows_cpu.shape) != tuple(device_rows.shape):
+                raise ValueError(
+                    f"state paging: block_tables_cpu[{group_id!r}] shape "
+                    f"{tuple(rows_cpu.shape)} disagrees with device table shape "
+                    f"{tuple(device_rows.shape)}"
+                )
+            validate_state_block_table_bounds(
+                rows_cpu[:bs], num_blocks=num_blocks, group_id=group_id
+            )
 
     def init_forward_metadata(
         self,
@@ -1010,6 +1074,7 @@ class MambaAttnBackend(AttentionBackend):
         extend_with_prefix: bool,
         query_shard: QueryShardPlan | None,
         extend_state_checkpoint_lens_cpu: torch.Tensor | None = None,
+        block_tables_cpu: Mapping[str, torch.Tensor] | None = None,
         **kwargs,
     ) -> None:
         reject_query_shard(query_shard, "MambaStateBackend")
@@ -1052,6 +1117,9 @@ class MambaAttnBackend(AttentionBackend):
                 scan_query_start_loc=query_start_loc,
             )
             return
+
+        if bs > 0:
+            self._validate_host_state_block_bounds(bs, block_tables, block_tables_cpu)
 
         # The extend rows lead with their new-token counts; a MIXED round's
         # decode rows each carry spec_num_tokens verify tokens.

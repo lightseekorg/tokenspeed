@@ -218,6 +218,63 @@ class TestComputeStatePageIndicesTest:
         assert (state_in.tolist()) == ([0])
         assert (state_out.tolist()) == ([0])
 
+    @pytest.mark.parametrize(
+        ("rows", "num_blocks", "expected_fragment"),
+        [
+            ([[10, 4]], 10, "row 0, slot 0 is 10"),
+            ([[0, 10]], 10, "row 0, slot 1 is 10"),
+            ([[0, 4], [2, 13]], 10, "row 1, slot 1 is 13"),
+            ([[0, 4, 10]], 10, "row 0, slot 2 is 10"),
+            ([[-2, 4]], 10, "row 0, slot 0 is -2"),
+            ([[0, 4, -3]], 10, "row 0, slot 2 is -3"),
+        ],
+    )
+    def test_num_blocks_bound_rejects_out_of_range_entries(
+        self, rows, num_blocks, expected_fragment
+    ):
+        torch = self.torch
+        with pytest.raises(ValueError, match=expected_fragment):
+            self.fn(
+                torch.tensor(rows, dtype=torch.int32),
+                torch.tensor([4] * len(rows), dtype=torch.int32),
+                validate=True,
+                group_id="linear_attention",
+                num_blocks=num_blocks,
+            )
+
+    def test_num_blocks_bound_accepts_valid_pad_null_and_in_range_entries(self):
+        torch = self.torch
+        state_in, state_out = self.fn(
+            torch.tensor(
+                [[-1, -1, -1], [-1, -1, -1], [0, 9, -1], [3, 8, 9]], dtype=torch.int32
+            ),
+            torch.tensor([0, 4, 0, 64], dtype=torch.int32),
+            validate=True,
+            group_id="linear_attention",
+            num_blocks=10,
+        )
+        assert state_in.tolist() == [0, -1, 0, 3]
+        assert state_out.tolist() == [-1, -1, 9, 8]
+
+    def test_validate_state_block_table_bounds_rejects_invalid_shapes_and_sizes(self):
+        from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+            validate_state_block_table_bounds,
+        )
+
+        torch = self.torch
+        with pytest.raises(ValueError, match="must be positive"):
+            validate_state_block_table_bounds(
+                torch.tensor([[0, 1]], dtype=torch.int32),
+                num_blocks=0,
+                group_id="linear_attention",
+            )
+        with pytest.raises(ValueError, match="must be 2D"):
+            validate_state_block_table_bounds(
+                torch.tensor([0, 1], dtype=torch.int32),
+                num_blocks=4,
+                group_id="linear_attention",
+            )
+
 
 class TestCacheContractStateBlocksTest:
     """The backend resolves every declared group once per batch."""
@@ -284,7 +341,7 @@ class TestCacheContractMetadataTest:
             *_mamba_config_pair(torch, heads=16, head_dim=128, spec_tokens=1)
         )
         stub_pool = _ContractPool(
-            {0: ("linear_attention", torch.zeros(2, 3), torch.zeros(2, 5))},
+            {0: ("linear_attention", torch.zeros(8, 3), torch.zeros(8, 5))},
         )
         backend.set_kv_pool(stub_pool)
         assert backend.state_paging_active
@@ -1391,7 +1448,7 @@ class TestPrefillStateGuardPagesGPUTest:
         # SM10.7 with CUDA 13) stores in-forward checkpoints; the Triton scan
         # that runs elsewhere, e.g. on ROCm, does not.
         platform = current_platform()
-        self.checkpoint_kernel_available = (
+        checkpoint_kernel_available = (
             platform.is_nvidia
             and ArchVersion(9, 0) <= platform.arch_version <= ArchVersion(10, 7)
             and flashinfer_gdn.is_supported(128, torch.bfloat16, heads, heads)
@@ -1422,6 +1479,7 @@ class TestPrefillStateGuardPagesGPUTest:
             make,
             tokens,
             dict(dt_bias=torch.randn(heads, device="cuda") * 0.1),
+            checkpoint_kernel_available,
         )
 
     def _kda(self, solution):
@@ -1449,7 +1507,7 @@ class TestPrefillStateGuardPagesGPUTest:
         heads = 4
         # Both KDA solutions store in-forward checkpoints once their
         # prerequisites above pass.
-        self.checkpoint_kernel_available = True
+        checkpoint_kernel_available = True
         spec = MHAConfig(
             num_attention_heads=heads, num_kv_heads=heads, head_dim=128, attn_tp_size=1
         )
@@ -1501,12 +1559,12 @@ class TestPrefillStateGuardPagesGPUTest:
             b=None,
             lower_bound=-5.0,
         )
-        return heads, make, tokens, kwargs
+        return heads, make, tokens, kwargs, checkpoint_kernel_available
 
     def _family(self, family):
-        """(heads, make_backend(conv, ssm), per-token inputs, fixed kwargs)."""
+        """(heads, make_backend(conv, ssm), per-token inputs, fixed kwargs, ckpt_avail)."""
         torch = self.torch
-        heads, make, tokens, fixed = (
+        heads, make, tokens, fixed, checkpoint_kernel_available = (
             self._gdn()
             if family == "gdn"
             else self._kda({"kda-fla": "fla", "kda-cutedsl": "cutedsl_kda"}[family])
@@ -1525,9 +1583,20 @@ class TestPrefillStateGuardPagesGPUTest:
             A_log=torch.randn(heads, device="cuda") * 0.1,
             layer_id=0,
         )
-        return heads, make, tokens, fixed
+        return heads, make, tokens, fixed, checkpoint_kernel_available
 
-    def _prefill(self, make, slabs, rows, prefix, lens, checkpoint, inputs, fixed):
+    def _prefill(
+        self,
+        make,
+        slabs,
+        rows,
+        prefix,
+        lens,
+        checkpoint,
+        inputs,
+        fixed,
+        checkpoint_kernel_available,
+    ):
         """One EXTEND forward of ``rows`` (source, destination[, checkpoint]).
 
         Returns the ``[tokens, -1]`` output and the recurrent inputs and
@@ -1540,7 +1609,7 @@ class TestPrefillStateGuardPagesGPUTest:
         # stops advertising them fails.
         if (
             checkpoint
-            and not self.checkpoint_kernel_available
+            and not checkpoint_kernel_available
             and not backend.stores_in_forward_state_checkpoints
         ):
             pytest.skip("no chunk-prefill kernel stores in-forward checkpoints here")
@@ -1548,20 +1617,27 @@ class TestPrefillStateGuardPagesGPUTest:
         bs = len(rows)
         lens_cpu = torch.tensor(lens, dtype=torch.int32)
         prefix_cpu = torch.tensor(prefix, dtype=torch.int32)
-        backend.init_forward_metadata(
-            bs=bs,
-            num_extends=bs,
-            req_pool_indices=torch.arange(1, bs + 1, dtype=torch.int32, device="cuda"),
-            seq_lens=(prefix_cpu + lens_cpu).cuda(),
-            forward_mode=self.ForwardMode.EXTEND,
-            block_tables={
-                self.GROUP: torch.tensor(rows, dtype=torch.int32, device="cuda")
-            },
-            extend_state_checkpoint_lens_cpu=(
-                torch.full((bs,), checkpoint, dtype=torch.int32) if checkpoint else None
-            ),
-            **_extend_kwargs(torch, lens_cpu, prefix_cpu, "cuda"),
-        )
+        # Intentionally omit block_tables_cpu and disable TOKENSPEED_CACHE_DEBUG
+        # so these tests directly exercise the kernel-side arena guard.
+        with patch.dict(os.environ, {"TOKENSPEED_CACHE_DEBUG": "0"}):
+            backend.init_forward_metadata(
+                bs=bs,
+                num_extends=bs,
+                req_pool_indices=torch.arange(
+                    1, bs + 1, dtype=torch.int32, device="cuda"
+                ),
+                seq_lens=(prefix_cpu + lens_cpu).cuda(),
+                forward_mode=self.ForwardMode.EXTEND,
+                block_tables={
+                    self.GROUP: torch.tensor(rows, dtype=torch.int32, device="cuda")
+                },
+                extend_state_checkpoint_lens_cpu=(
+                    torch.full((bs,), checkpoint, dtype=torch.int32)
+                    if checkpoint
+                    else None
+                ),
+                **_extend_kwargs(torch, lens_cpu, prefix_cpu, "cuda"),
+            )
         # Pin the resolved blocks to the ids under test: the two-slot resolve
         # falls back to the live block when the input slot is not positive.
         metadata = backend.forward_metadata
@@ -1601,7 +1677,7 @@ class TestPrefillStateGuardPagesGPUTest:
     def _check(self, family, rows, lens, checkpoint=None):
         torch = self.torch
         pages, lead = self.PAGES, self.LEAD
-        heads, make, tokens, fixed = self._family(family)
+        heads, make, tokens, fixed, checkpoint_kernel_available = self._family(family)
 
         def valid(block):
             return 0 < block < pages
@@ -1640,9 +1716,18 @@ class TestPrefillStateGuardPagesGPUTest:
             checkpoint,
             inputs,
             fixed,
+            checkpoint_kernel_available,
         )
         expected_out, _, _ = self._prefill(
-            make, plain, delivered, prefix, lens, checkpoint, inputs, fixed
+            make,
+            plain,
+            delivered,
+            prefix,
+            lens,
+            checkpoint,
+            inputs,
+            fixed,
+            checkpoint_kernel_available,
         )
 
         # Only an in-range source is read; any other starts from exact zeros.
@@ -1832,3 +1917,248 @@ class TestReplayStateTapeGPUTest:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+class TestHostStateBlockBoundsTest:
+    """Always-on zero-GPU-sync host bounds check in MambaAttnBackend.init_forward_metadata."""
+
+    GROUP = "linear_attention"
+
+    def setup_method(self):
+        from importlib.util import find_spec
+
+        missing = [
+            name for name in ("torch", "tokenspeed_kernel") if not find_spec(name)
+        ]
+        if missing:
+            pytest.skip(f"needs {' + '.join(missing)}")
+        import torch
+
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            MambaAttnBackend,
+        )
+
+        self.torch = torch
+        self.ForwardMode = ForwardMode
+        self.MambaAttnBackend = MambaAttnBackend
+
+    def _make_backend(self, *, device="cpu", num_blocks=10, ssm_blocks=None):
+        torch = self.torch
+        ssm_blocks = num_blocks if ssm_blocks is None else ssm_blocks
+        backend = self.MambaAttnBackend(
+            *_mamba_config_pair(torch, heads=2, head_dim=4, max_bs=8, device=device)
+        )
+        backend.set_kv_pool(
+            _ContractPool(
+                {
+                    0: (
+                        self.GROUP,
+                        torch.zeros(num_blocks, 24, 3, device=device),
+                        torch.zeros(ssm_blocks, 2, 4, 4, device=device),
+                    )
+                }
+            )
+        )
+        return backend
+
+    def _init_extend(
+        self,
+        backend,
+        rows,
+        *,
+        device="cpu",
+        pass_cpu=True,
+        checkpoint=None,
+        debug=False,
+    ):
+        torch = self.torch
+        bs = len(rows)
+        lens_cpu = torch.full((bs,), 64, dtype=torch.int32)
+        prefix_cpu = torch.tensor(
+            [64 if row[0] > 0 else 0 for row in rows], dtype=torch.int32
+        )
+        table_cpu = torch.tensor(rows, dtype=torch.int32)
+        table_dev = table_cpu.to(device=device)
+        kwargs = _extend_kwargs(torch, lens_cpu, prefix_cpu, device)
+        if pass_cpu:
+            kwargs["block_tables_cpu"] = {self.GROUP: table_cpu}
+        with patch.dict(os.environ, {"TOKENSPEED_CACHE_DEBUG": "1" if debug else "0"}):
+            backend.init_forward_metadata(
+                bs=bs,
+                num_extends=bs,
+                req_pool_indices=torch.arange(
+                    1, bs + 1, dtype=torch.int32, device=device
+                ),
+                seq_lens=(prefix_cpu + lens_cpu).to(device=device),
+                forward_mode=self.ForwardMode.EXTEND,
+                block_tables={self.GROUP: table_dev},
+                extend_state_checkpoint_lens_cpu=(
+                    torch.full((bs,), checkpoint, dtype=torch.int32)
+                    if checkpoint
+                    else None
+                ),
+                **kwargs,
+            )
+
+    @pytest.mark.parametrize(
+        ("rows", "expected_fragment"),
+        [
+            ([[10, 4]], "row 0, slot 0 is 10"),
+            ([[0, 10]], "row 0, slot 1 is 10"),
+            ([[0, 4], [2, 15]], "row 1, slot 1 is 15"),
+            ([[0, 4, 10]], "row 0, slot 2 is 10"),
+            ([[-2, 4]], "row 0, slot 0 is -2"),
+            ([[0, -5]], "row 0, slot 1 is -5"),
+        ],
+    )
+    def test_host_table_oob_fails_fast_without_cache_debug(
+        self, rows, expected_fragment
+    ):
+        backend = self._make_backend(device="cpu", num_blocks=10)
+        with pytest.raises(ValueError, match=expected_fragment):
+            self._init_extend(backend, rows, device="cpu", pass_cpu=True, debug=False)
+
+    def test_host_table_uses_min_component_capacity(self):
+        backend = self._make_backend(device="cpu", num_blocks=12, ssm_blocks=8)
+        with pytest.raises(ValueError, match=r"slot 1 is 8.*pool has 8 blocks"):
+            self._init_extend(
+                backend, [[0, 8]], device="cpu", pass_cpu=True, debug=False
+            )
+
+    def test_host_table_valid_pad_null_and_in_range_pass(self):
+        backend = self._make_backend(device="cpu", num_blocks=10)
+        self._init_extend(
+            backend,
+            [[-1, -1], [0, 4], [3, 9]],
+            device="cpu",
+            pass_cpu=True,
+            debug=False,
+        )
+        md = backend.forward_metadata
+        assert md.state_in_blocks_by_group[self.GROUP].tolist() == [0, 0, 3]
+        assert md.state_out_blocks_by_group[self.GROUP].tolist() == [-1, 4, 9]
+
+    def test_cache_debug_without_host_table_also_rejects_oob(self):
+        backend = self._make_backend(device="cpu", num_blocks=10)
+        with pytest.raises(ValueError, match="row 0, slot 1 is 10"):
+            self._init_extend(
+                backend, [[0, 10]], device="cpu", pass_cpu=False, debug=True
+            )
+
+    def test_host_table_rejects_short_rows(self):
+        torch = self.torch
+        backend = self._make_backend(device="cpu", num_blocks=10)
+        lens_cpu = torch.tensor([64, 64], dtype=torch.int32)
+        prefix_cpu = torch.tensor([0, 0], dtype=torch.int32)
+        with patch.dict(os.environ, {"TOKENSPEED_CACHE_DEBUG": "0"}):
+            with pytest.raises(ValueError, match="at least 2 rows"):
+                backend.init_forward_metadata(
+                    bs=2,
+                    num_extends=2,
+                    req_pool_indices=torch.tensor([1, 2], dtype=torch.int32),
+                    seq_lens=lens_cpu,
+                    forward_mode=self.ForwardMode.EXTEND,
+                    block_tables={
+                        self.GROUP: torch.tensor([[0, 4], [0, 5]], dtype=torch.int32)
+                    },
+                    block_tables_cpu={
+                        self.GROUP: torch.tensor([[0, 4]], dtype=torch.int32)
+                    },
+                    **_extend_kwargs(torch, lens_cpu, prefix_cpu, "cpu"),
+                )
+
+    def test_host_table_rejects_shape_and_dtype_mismatch(self):
+        torch = self.torch
+        backend = self._make_backend(device="cpu", num_blocks=10)
+        lens_cpu = torch.tensor([64], dtype=torch.int32)
+        prefix_cpu = torch.tensor([0], dtype=torch.int32)
+        dev_table = torch.tensor([[0, 4, 5]], dtype=torch.int32)
+        with patch.dict(os.environ, {"TOKENSPEED_CACHE_DEBUG": "0"}):
+            with pytest.raises(ValueError, match="disagrees with device table shape"):
+                backend.init_forward_metadata(
+                    bs=1,
+                    num_extends=1,
+                    req_pool_indices=torch.tensor([1], dtype=torch.int32),
+                    seq_lens=lens_cpu,
+                    forward_mode=self.ForwardMode.EXTEND,
+                    block_tables={self.GROUP: dev_table},
+                    block_tables_cpu={
+                        self.GROUP: torch.tensor([[0, 4]], dtype=torch.int32)
+                    },
+                    **_extend_kwargs(torch, lens_cpu, prefix_cpu, "cpu"),
+                )
+            with pytest.raises(ValueError, match="must use int32"):
+                backend.init_forward_metadata(
+                    bs=1,
+                    num_extends=1,
+                    req_pool_indices=torch.tensor([1], dtype=torch.int32),
+                    seq_lens=lens_cpu,
+                    forward_mode=self.ForwardMode.EXTEND,
+                    block_tables={self.GROUP: dev_table},
+                    block_tables_cpu={
+                        self.GROUP: torch.tensor([[0, 4, 5]], dtype=torch.int64)
+                    },
+                    **_extend_kwargs(torch, lens_cpu, prefix_cpu, "cpu"),
+                )
+
+    def test_cuda_host_table_check_has_zero_gpu_sync_and_rejects_gpu_tensor(self):
+        torch = self.torch
+        if not torch.cuda.is_available():
+            pytest.skip("needs a CUDA device")
+        backend = self._make_backend(device="cuda", num_blocks=10)
+        # Warm up any lazy CUDA allocations outside the sync guard.
+        self._init_extend(
+            backend, [[0, 4], [2, 5]], device="cuda", pass_cpu=True, debug=False
+        )
+
+        def _prepare(rows):
+            bs = len(rows)
+            lens_cpu = torch.full((bs,), 64, dtype=torch.int32)
+            prefix_cpu = torch.tensor(
+                [64 if row[0] > 0 else 0 for row in rows], dtype=torch.int32
+            )
+            table_cpu = torch.tensor(rows, dtype=torch.int32)
+            return dict(
+                bs=bs,
+                num_extends=bs,
+                req_pool_indices=torch.arange(
+                    1, bs + 1, dtype=torch.int32, device="cuda"
+                ),
+                seq_lens=(prefix_cpu + lens_cpu).cuda(),
+                forward_mode=self.ForwardMode.EXTEND,
+                block_tables={self.GROUP: table_cpu.cuda()},
+                block_tables_cpu={self.GROUP: table_cpu},
+                **_extend_kwargs(torch, lens_cpu, prefix_cpu, "cuda"),
+            )
+
+        valid_call = _prepare([[-1, -1], [0, 4], [2, 9]])
+        oob_call = _prepare([[0, 4], [2, 10]])
+        torch.cuda.synchronize()
+        previous = torch.cuda.get_sync_debug_mode()
+        try:
+            with patch.dict(os.environ, {"TOKENSPEED_CACHE_DEBUG": "0"}):
+                torch.cuda.set_sync_debug_mode("error")
+                backend.init_forward_metadata(**valid_call)
+                with pytest.raises(ValueError, match="row 1, slot 1 is 10"):
+                    backend.init_forward_metadata(**oob_call)
+        finally:
+            torch.cuda.set_sync_debug_mode(previous)
+
+        lens_cpu = torch.tensor([64], dtype=torch.int32)
+        prefix_cpu = torch.tensor([0], dtype=torch.int32)
+        gpu_table = torch.tensor([[0, 4]], dtype=torch.int32, device="cuda")
+        with patch.dict(os.environ, {"TOKENSPEED_CACHE_DEBUG": "0"}):
+            with pytest.raises(ValueError, match="must be a CPU tensor"):
+                backend.init_forward_metadata(
+                    bs=1,
+                    num_extends=1,
+                    req_pool_indices=torch.tensor(
+                        [1], dtype=torch.int32, device="cuda"
+                    ),
+                    seq_lens=lens_cpu.cuda(),
+                    forward_mode=self.ForwardMode.EXTEND,
+                    block_tables={self.GROUP: gpu_table},
+                    block_tables_cpu={self.GROUP: gpu_table},
+                    **_extend_kwargs(torch, lens_cpu, prefix_cpu, "cuda"),
+                )
