@@ -238,6 +238,31 @@ def test_a_host_layout_out_of_the_schedulers_order_is_refused():
         )
 
 
+def test_device_only_holder_registers_target_and_draft_fields_without_host_pages():
+    groups = (
+        CacheGroupLayout("target", 1, (CacheField("k", 0, 0, 32, 24),)),
+        CacheGroupLayout("draft", 1, (CacheField("v", 0, 256, 16, 12),)),
+    )
+    geometry = build_peer_geometry(
+        scheduler_group_ids=("target", "draft"),
+        groups=groups,
+        field_addresses={"k": 4096, "v": 4352},
+        device_regions=((4096, 512),),
+        host_storage=None,
+        transfer_contract=b"target+draft",
+        semantic_id=bytes(range(32)),
+    )
+    assert geometry.host is None
+    assert geometry.host_virtual_bounds == (1, 1)
+    assert geometry.regions == ((4096, 512),)
+    assert [
+        (f.group, f.field_id, f.address, f.page_stride, f.bytes)
+        for f in geometry.device
+    ] == [(0, "k", 4096, 32, 24), (1, "v", 4352, 16, 12)]
+    assert geometry.transfer_contract == b"target+draft"
+    assert geometry.semantic_id == bytes(range(32))
+
+
 def test_an_incarnation_fits_the_schedulers_lease_ids():
     for _ in range(64):
         assert 0 < peer_incarnation() < 1 << 32
@@ -274,6 +299,32 @@ def test_peer_sharing_runs_with_the_host_tier_and_prefix_caching():
     ).validate_peer_prefix_options()
     with pytest.raises(ValueError, match="requires --peer-prefix-port"):
         _peer_args(peer_prefix_port=None).validate_peer_prefix_options()
+
+
+def test_decode_can_serve_device_history_with_l2_disabled():
+    _peer_args(
+        disaggregation_mode="decode", enable_kvstore=False
+    ).validate_peer_prefix_options()
+
+
+@pytest.mark.parametrize(
+    "role,tier,tp,kvp",
+    [
+        ("prefill", "device", 1, 1),
+        ("decode", "host", 1, 1),
+        ("decode", "device", 2, 1),
+        ("decode", "device", 2, 2),
+    ],
+)
+def test_device_only_serving_requires_a_tp1_decode_device_holder(role, tier, tp, kvp):
+    args = _peer_args(
+        enable_kvstore=False,
+        disaggregation_mode=role,
+        peer_prefix_landing_tier=tier,
+        mapping=Mapping(rank=0, world_size=tp, attn_tp_size=tp, attn_kvp_size=kvp),
+    )
+    with pytest.raises(ValueError, match="--disable-kvstore"):
+        args.validate_peer_prefix_options()
 
 
 @pytest.mark.parametrize("tier", [None, "disk"])

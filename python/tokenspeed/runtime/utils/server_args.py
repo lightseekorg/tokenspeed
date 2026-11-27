@@ -2812,7 +2812,16 @@ class ServerArgs:
         unsupported = [
             setting
             for setting, refused in (
-                ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                (
+                    "--disable-kvstore (no Host L2)",
+                    not self.enable_kvstore
+                    and not (
+                        self.disaggregation_mode == "decode"
+                        and self.peer_prefix_landing_tier == "device"
+                        and self.mapping.attn.tp_size == 1
+                        and self.mapping.attn.kvp_size == 1
+                    ),
+                ),
                 ("--disable-prefix-caching", not self.enable_prefix_caching),
                 (
                     "--kvstore-storage-backend",

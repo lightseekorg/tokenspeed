@@ -191,7 +191,7 @@ class PeerGeometry:
     into them, and the memory the transfer engine registers for that."""
 
     device: tuple[PeerDeviceField, ...]
-    host: PeerHostPool
+    host: PeerHostPool | None
     regions: tuple[tuple[int, int], ...]
     transfer_contract: bytes = b""
     semantic_id: bytes = b""
@@ -227,52 +227,58 @@ def build_peer_geometry(
     groups: Sequence[CacheGroupLayout],
     field_addresses: Mapping[str, int],
     device_regions: Sequence[tuple[int, int]],
-    host_storage: HostCacheStorage,
+    host_storage: HostCacheStorage | None,
     host_region_planner: PeerHostRegionPlanner | None = None,
     transfer_contract: bytes = b"",
     semantic_id: bytes = b"",
     host_virtual_bounds: tuple[int, ...] = (),
 ) -> PeerGeometry:
-    """This rank's geometry: the fields the Host tier stores (the target's
-    and the draft's), at their Device addresses and their offsets in the
-    Host pool.
+    """Register the target and draft Device fields and any local Host pool.
 
     Args:
         scheduler_group_ids: The cache groups in the scheduler's order, whose
             index the scheduler names a group by.
-        groups: The Host tier's layout groups (``HostCacheResources.groups``).
+        groups: Device transfer layout groups in scheduler order.
         field_addresses: Each field's Device page 0, by field id
             (``CacheArena.field_address``).
         device_regions: The Device ranges the cache lives in
             (``CacheArena.registration_regions``).
-        host_storage: The Host pool.
+        host_storage: The Host L2 pool, or None for a Device-only holder.
         host_region_planner: Optional device plugin supplying consecutive region sizes.
 
     Returns:
-        The geometry, registering the Device ranges and the Host pool.
+        The Device geometry and registered ranges, including Host L2 when present.
     """
-    # The scheduler names a group by its index; the Host lists every group,
-    # in the same order.
-    if tuple(host_storage.group_ids) != tuple(scheduler_group_ids):
-        raise ValueError(
-            "peer sharing needs every cache group in the Host layout, in the "
-            f"scheduler's order: {host_storage.group_ids} != "
-            f"{tuple(scheduler_group_ids)}"
+    group_ids = tuple(group.group_id for group in groups)
+    if group_ids != tuple(scheduler_group_ids):
+        raise ValueError("peer Device groups must follow the scheduler's order")
+    device = tuple(
+        PeerDeviceField(
+            group=index,
+            field_id=field.field_id,
+            address=int(field_addresses[field.field_id]),
+            page_stride=int(field.block_stride_bytes),
+            bytes=int(field.payload_bytes),
         )
-    device = []
+        for index, group in enumerate(groups)
+        for field in group.fields
+    )
+    regions = tuple((int(address), int(length)) for address, length in device_regions)
+    if host_storage is None:
+        # Page 0 is reserved. An exclusive bound of 1 admits no Host page.
+        return PeerGeometry(
+            device=device,
+            host=None,
+            regions=regions,
+            transfer_contract=transfer_contract,
+            semantic_id=semantic_id,
+            host_virtual_bounds=(1,) * len(groups),
+        )
+    if tuple(host_storage.group_ids) != group_ids:
+        raise ValueError("peer Host groups must follow the scheduler's order")
     host_groups = []
     for index, group in enumerate(groups):
         offsets = host_storage.host_field_offsets[index]
-        for field in group.fields:
-            device.append(
-                PeerDeviceField(
-                    group=index,
-                    field_id=field.field_id,
-                    address=int(field_addresses[field.field_id]),
-                    page_stride=int(field.block_stride_bytes),
-                    bytes=int(field.payload_bytes),
-                )
-            )
         host_groups.append(
             PeerHostGroup(
                 parent_bytes=int(host_storage.host_lcm_block_bytes),
@@ -293,15 +299,12 @@ def build_peer_geometry(
         host_region_planner,
     )
     return PeerGeometry(
-        device=tuple(device),
+        device=device,
         host=PeerHostPool(address=host_address, groups=tuple(host_groups)),
         transfer_contract=transfer_contract,
         semantic_id=semantic_id,
         host_virtual_bounds=host_virtual_bounds,
-        regions=(
-            *((int(address), int(length)) for address, length in device_regions),
-            *host_regions,
-        ),
+        regions=regions + host_regions,
     )
 
 

@@ -76,7 +76,7 @@ from tokenspeed.runtime.cache.disk import (
 )
 from tokenspeed.runtime.cache.host_storage import host_block_capacity
 from tokenspeed.runtime.cache.l3.config import L3Settings
-from tokenspeed.runtime.cache.l3.factory import cache_deployment_id, l3_settings
+from tokenspeed.runtime.cache.l3.factory import l3_settings
 from tokenspeed.runtime.cache.peer import (
     PUSH_TIMEOUT_S,
     QUARANTINE_S,
@@ -1299,22 +1299,12 @@ class MemoryMetricSampler(threading.Thread):
 
 def _peer_sharing_settings(
     server_args: ServerArgs,
-    model_config,
-    draft_model_config,
     *,
-    host_cache,
+    deployment_id: str,
     geometry,
 ) -> PeerSharingSettings:
     """Build the live cache namespace and agree on the TP replica's settings."""
     mapping = server_args.mapping
-    deployment_id = cache_deployment_id(
-        server_args,
-        model_config,
-        draft_model_config,
-        host_cache=host_cache,
-        world_cpu_group=None,
-        for_peer=True,
-    )
     protocol = mooncake_protocol()
     incarnation = [peer_incarnation()]
     if mapping.attn.tp_size > 1:
@@ -1531,11 +1521,10 @@ class HostBootstrap:
             self.peer_sharing = None
             peer_config = None
             if device.peer_geometry is not None:
+                assert device.peer_deployment_id is not None
                 self.peer_sharing = _peer_sharing_settings(
                     server_args,
-                    model_config,
-                    draft_model_config,
-                    host_cache=device.host_cache,
+                    deployment_id=device.peer_deployment_id,
                     geometry=device.peer_geometry,
                 )
                 peer_config = peer_scheduler_config(
@@ -1546,9 +1535,13 @@ class HostBootstrap:
                     landing_tier=server_args.peer_prefix_landing_tier,
                     versioned_shards=bool(self.peer_sharing.semantic_id)
                     and mapping.attn.kvp_size == 8,
-                    num_host_blocks=host_block_capacity(
-                        device.host_cache.storage,
-                        device.host_cache.ownership.shard_counts,
+                    num_host_blocks=(
+                        host_block_capacity(
+                            device.host_cache.storage,
+                            device.host_cache.ownership.shard_counts,
+                        )
+                        if device.host_cache is not None
+                        else 0
                     ),
                 )
             specs = device.specs

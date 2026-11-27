@@ -374,15 +374,15 @@ gain falls below a minimum fetch size.
 
 The first version covers every role, with
 attention TP and KV parallelism; replicated cache groups only, no KV-page
-sharding; no pipeline stages and no query context parallelism. It needs the
-Host tier (`--enable-kvstore`): the Host is half of the capacity a holder
-serves, and its layout is the field list both sides read by. A prefill
-replica that reuses a peer's prefix then transfers to its decode peer through
-the ordinary PD path. A decode replica holds and never reads: it serves the
-history it decoded, prompts and replies, so the next turn's prefill replica
-reads a reply instead of computing it, and its own prompts come from its
-prefill peer (RFC 0005, which also gives the decode role a Host tier under
-write-back). Hybrid models (sliding window, State checkpoints) are in scope
+sharding; no pipeline stages and no query context parallelism. A prefill replica keeps Host L2 and transfers to its decode peer
+through the ordinary PD path. A decode replica only serves history. With
+TP1/KVP1 it may use `--disable-kvstore` together with `--peer-prefix-port`
+and `--peer-prefix-landing-tier device`. Keep prefix caching enabled and
+omit the Host write-back policy. This holder registers only its Device
+arena, including draft cache fields when present. Once a prefix leaves
+Device memory, the holder cannot serve it from L2. Retraction snapshots, if
+configured, remain private. A TP8/KVP8 prefill reader can reuse the
+resident history through the sharded peer protocol. Hybrid models (sliding window, State checkpoints) are in scope
 through the holder's matchers.
 
 Out of scope: a storage tier, a central owner, sharing across namespaces, and
@@ -402,7 +402,7 @@ layout, pin, release) and `--peer-prefix-min-fetch-tokens` the smallest read
 worth a landing. Lease lifetimes, the lease limit and the read quarantine are
 fixed (`cache/peer.py`). A process draws a random nonzero 32-bit incarnation
 at startup, which its attention-TP members share. The engine host starts one
-transfer engine per rank with the Device arena and the Host pool registered,
+transfer engine per rank with the Device arena and any Host L2 pool registered,
 and the replica's members exchange their geometries over the rank mesh before
 serving.
 
