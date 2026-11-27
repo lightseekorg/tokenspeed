@@ -1083,11 +1083,12 @@ def test_engram_peer_gpu_alloc_and_server_args_validation():
         engram_peer_rendezvous_id="run-1",
         engram_peer_world_size=14,
         engram_peer_rank_offset=4,
-        tp_size=2,
+        attn_tp_size=2,
     )
     assert args.engram_gpu_peer_sharded is True
     assert args.engram_peer_rendezvous_id == "run-1"
     assert args.engram_peer_rank_offset == 4
+    assert args.mapping.world_size == 2
 
 
 def test_peer_gpu_embedding_meta_and_validation():

@@ -42,6 +42,7 @@ if not (is_nvidia() and torch.cuda.is_available()):
 pytest.importorskip("cuda.bindings.driver")
 
 from tokenspeed_kernel import peer_memory  # noqa: E402
+from tokenspeed_kernel.ops.communication.fabric import host_identity  # noqa: E402
 from tokenspeed_kernel.ops.embedding import host_gather  # noqa: E402
 
 
@@ -96,14 +97,29 @@ def peer_env():
 @pytest.fixture(scope="module", params=["fabric", "posix_fd"])
 def handle_type(request, peer_env):
     _, world_size, device = peer_env
+    local_host = host_identity()
     local_error = peer_memory.probe_peer_device_memory(device.index, request.param)
+    local_domain = (
+        peer_memory.query_peer_fabric_domain(device.index)
+        if request.param == "fabric"
+        else None
+    )
     if world_size > 1:
-        errors = [None] * world_size
-        dist.all_gather_object(errors, local_error)
-        if any(errors):
-            pytest.skip(f"{request.param} handles unavailable: {errors}")
-    elif local_error is not None:
-        pytest.skip(f"{request.param} handles unavailable: {local_error}")
+        gathered = [None] * world_size
+        dist.all_gather_object(gathered, (local_host, local_error, local_domain))
+        hosts = [int(entry[0]) for entry in gathered]
+        probes = [entry[1] for entry in gathered]
+        domains = (
+            [entry[2] for entry in gathered] if request.param == "fabric" else None
+        )
+    else:
+        hosts = [int(local_host)]
+        probes = [local_error]
+        domains = [local_domain] if request.param == "fabric" else None
+    try:
+        peer_memory.validate_peer_handle_type(request.param, hosts, probes, domains)
+    except (RuntimeError, ValueError) as exc:
+        pytest.skip(f"{request.param} handles unavailable: {exc}")
     return request.param
 
 

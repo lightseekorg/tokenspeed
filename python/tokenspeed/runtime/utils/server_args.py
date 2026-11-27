@@ -1192,14 +1192,7 @@ class ServerArgs:
                 raise ValueError(
                     "--engram-peer-rank-offset must be a non-negative integer"
                 )
-            local_world = (
-                self.mapping.world_size
-                if self.mapping is not None
-                else max(
-                    1,
-                    self.tp_size * self.dp_size * self.pp_size,
-                )
-            )
+            local_world = self.mapping.world_size
             if self.engram_peer_rank_offset + local_world > self.engram_peer_world_size:
                 raise ValueError(
                     f"--engram-peer-rank-offset ({self.engram_peer_rank_offset}) + "
