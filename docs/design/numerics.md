@@ -715,12 +715,12 @@ and each target/draft combination needs end-to-end qualification.
 The target and draft still independently pass `ModelProfile.numerics_envelopes`
 admission. Their actual checkpoint quantization and vocabulary then pass the
 selected model validator; omitting the checkpoint context for a registered
-policy is an error. Support for quantized checkpoints is opt-in per model, not a blanket
-relaxation of the standard unquantized gate. Plugin-load rollback removes
+policy is an error. Support for quantized checkpoints is opt-in per model,
+not a blanket relaxation of the standard unquantized gate. Plugin-load rollback removes
 model-policy registrations too.
 
 Registration does not establish numerical correctness. Each declared precision,
-layout and execution scope needs the invariance and independent trainer
+layout, and execution scope needs the invariance and independent trainer
 comparison below. Unsupported combinations must fail explicitly. Policy
 selection must preserve explicitly supplied launch choices or reject them;
 it must not silently switch a deployment to a different numerical reference.

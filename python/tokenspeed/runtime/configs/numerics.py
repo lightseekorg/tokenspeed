@@ -56,6 +56,8 @@ _PLUGIN_ENVELOPES: dict[
 
 
 class RLCheckpointValidator(Protocol):
+    """Check checkpoint storage; returning accepts it and raising rejects it."""
+
     def __call__(
         self, *, quantization: str | None, vocab_size: int, architecture: str
     ) -> None: ...
@@ -96,13 +98,21 @@ def register_model_rl_numerics(
     architecture: str,
     factory: Callable[[PretrainedConfig], RLNumericsPolicy],
 ) -> None:
-    """Register a checkpoint-aware policy for a model architecture.
+    """Register checkpoint-aware arithmetic for the shared RL contract.
 
-    ``architecture`` names the model registration the loader uses.
-    ``factory(hf_config)`` returns its policy, or ``STANDARD_RL_NUMERICS``
-    for variants using the built-in arithmetic. The model must still declare
-    ``rl-bitwise`` in its verification profile. A failed plugin load rolls
-    this registration back too.
+    Args:
+        architecture: The nonempty, unpadded model registration name used by
+            the loader.
+        factory: A callable receiving that model's checkpoint configuration
+            and returning an RLNumericsPolicy. It can return
+            STANDARD_RL_NUMERICS for variants using the standard arithmetic.
+
+    The model must still declare ``rl-bitwise`` in its verification profile.
+    A failed plugin load rolls this registration back too.
+
+    Raises:
+        TypeError: The architecture is not a string or the factory is not callable.
+        ValueError: The name is empty, padded, or already registered.
     """
     if not isinstance(architecture, str):
         raise TypeError("A numerical policy architecture must be a string")
@@ -135,6 +145,10 @@ def model_rl_numerics(
     Returns:
         STANDARD_RL_NUMERICS for an unregistered architecture, otherwise the
         RLNumericsPolicy returned by that architecture's factory.
+
+    Raises:
+        ValueError: A registered factory needs checkpoint context but none was given.
+        TypeError: A factory returned something other than RLNumericsPolicy.
     """
     factory = _MODEL_RL_POLICIES.get(architecture)
     if factory is None:
@@ -310,17 +324,18 @@ def require_verified_numerics(
         numerics: The launch's ``--numerics`` envelope.
         model_profile: The model's registered profile, or None for an in-tree
             model (none of which is verified under an envelope beyond auto).
-        architecture: The model's architecture name, for the error.
+        architecture: The exact registered architecture selected by the loader,
+            used for policy selection and error context.
         hf_config: Checkpoint metadata for a registered model policy. It may
-            be omitted only when no model-specific policy is registered.
+            be omitted when the supplied architecture has no registered policy.
         quantization: The checkpoint's resolved quantization method, or None.
-        vocab_size: The model's vocabulary size; the envelope's blockwise
-            logprobs fold fixed ``BLOCKWISE_VOCAB_BLOCK``-wide blocks of it.
+        vocab_size: The actual vocabulary size checked by the selected policy.
 
     Raises:
         ValueError: The envelope is not verified for this model, or its
-            checkpoint validator rejects the storage or vocabulary. The selected model policy owns
-            checkpoint validation. The standard policy requires unquantized
+            checkpoint validator rejects the storage or vocabulary. The
+            selected model policy owns checkpoint validation. The standard
+            policy requires unquantized
             weights and whole blockwise vocabulary blocks.
     """
     if numerics == "auto":

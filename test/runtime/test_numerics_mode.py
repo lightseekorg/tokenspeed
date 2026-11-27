@@ -816,7 +816,7 @@ if __name__ == "__main__":
 
 @pytest.fixture
 def model_numerics_policy(tmp_path):
-    """Register a quantization-aware model; yield its path, config and profile.
+    """Register a quantization-aware model; yield its path, config, and profile.
 
     Remove both model and policy registrations after each consuming test.
     """
