@@ -188,7 +188,7 @@ class BreakableCapture:
 
     Usage::
 
-        cap = BreakableCapture(pool=shared_pool)
+        cap = BreakableCapture(pool=shared_pool, memory_saver_adapter=adapter)
         with cap:
             model_forward(...)        # attention calls hit break_here()
         # later, after copying live inputs into the static buffers:
@@ -236,14 +236,10 @@ class BreakableCapture:
         handoff_storage: dict[HandoffSlot, torch.Tensor] | None = None,
         *,
         run_segments_while_capturing: bool = False,
-        memory_saver_adapter: TorchMemorySaverAdapter | None = None,
+        memory_saver_adapter: TorchMemorySaverAdapter,
     ) -> None:
         self.pool = pool
-        self.memory_saver_adapter = (
-            TorchMemorySaverAdapter.create(False)
-            if memory_saver_adapter is None
-            else memory_saver_adapter
-        )
+        self.memory_saver_adapter = memory_saver_adapter
         self._run_segments_while_capturing = run_segments_while_capturing
         self.segments: list[Callable[[], Any]] = []
         # Per entry of ``segments``, the (wait, layer) calls a replay makes
@@ -321,7 +317,9 @@ class BreakableCapture:
     def _begin_segment(self) -> None:
         assert not self._capturing
         graph = torch.cuda.CUDAGraph()
-        self._graph_context = self.memory_saver_adapter.cuda_graph(
+        # No segment is capturing here: the saver's public context may collect
+        # garbage or synchronize before entering its tagged graph pool.
+        self._graph_context = self.memory_saver_adapter.capture_segment(
             graph, pool=self.pool, stream=self._stream, tag="cuda_graph"
         )
         self._graph_context.__enter__()

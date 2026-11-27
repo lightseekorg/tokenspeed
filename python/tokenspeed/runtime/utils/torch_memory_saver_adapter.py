@@ -147,6 +147,14 @@ class TorchMemorySaverAdapter(ABC):
         """
         raise NotImplementedError
 
+    def capture_segment(self, graph, *, pool, stream, tag: str):
+        """Capture one warmed-up breakable segment on its existing stream.
+
+        The real saver uses its public graph API to tag private-pool storage.
+        The no-op owner needs no allocator setup or per-segment synchronization.
+        """
+        return self.cuda_graph(graph, pool=pool, stream=stream, tag=tag)
+
     def pause(self, tag: str | None = None):
         raise NotImplementedError
 
@@ -249,6 +257,17 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
 
     def cuda_graph(self, graph, *, pool, stream, tag: str):
         return torch.cuda.graph(graph, pool=pool, stream=stream)
+
+    @contextmanager
+    def capture_segment(self, graph, *, pool, stream, tag: str):
+        # BreakableCapture already collected garbage and ordered this stream
+        # after warmup. Do not repeat torch.cuda.graph's device sync/cache trim.
+        with torch.cuda.stream(stream):
+            graph.capture_begin(pool=pool)
+            try:
+                yield
+            finally:
+                graph.capture_end()
 
     def pause(self, tag: str | None = None):
         pass

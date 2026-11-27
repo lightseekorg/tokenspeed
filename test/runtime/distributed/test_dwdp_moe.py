@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
 @pytest.fixture(scope="module")
@@ -221,7 +222,9 @@ def test_peer_manager_breakable_graph_replay(device, num_layers):
 
         with torch.no_grad():
             forward(inputs)
-            capture = BreakableCapture()
+            capture = BreakableCapture(
+                memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            )
             with capture:
                 output = forward(inputs)
             for _ in range(8):
@@ -310,7 +313,9 @@ def test_owned_loading_and_full_expert_compute(device, quant, num_layers):
         warmup_route = routing()
         _run_layers(shared, static_inputs, warmup_route, manager)
 
-        capture = BreakableCapture()
+        capture = BreakableCapture(
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+        )
         with torch.no_grad():
             with capture:
                 graph_output = _run_layers(shared, static_inputs, warmup_route, manager)

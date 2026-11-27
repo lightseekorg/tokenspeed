@@ -1036,7 +1036,9 @@ count is a dummy extend of that many one-token requests, which the probe
 arena's floor covers. They are breakable graphs in one private pool, apart
 from the target's prefill and decode pools. Their static buffers are
 allocated outside the measured windows, like the target graph's static
-outputs, so the utilization headroom funds them. A drafter's single prefill
+outputs, so the utilization headroom funds them. These static buffers use the
+executor's CPU-backed regions, including lazy outputs and a growing K/V tile;
+graph-private scratch remains discardable. A drafter's single prefill
 graph of its own (`captures_prefill_graph`, the `prefill:drafter` ladder) is a
 separate hook with its own contract.
 

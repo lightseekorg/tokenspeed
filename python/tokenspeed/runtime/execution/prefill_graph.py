@@ -780,7 +780,8 @@ class PrefillGraph:
             bs = -(-rows // per_request)
             self._ctx = self.make_dummy_batch(rows, bs)
             self._input_embeds_buf[:rows].zero_()
-            statics = self._narrowing.allocate_decoder_state(rows)
+            with self.memory_saver_adapter.named_region("executor_inputs"):
+                statics = self._narrowing.allocate_decoder_state(rows)
             try:
                 with active_forward(self._ctx):
                     if self.dp_size == 1:
@@ -1279,13 +1280,14 @@ class PrefillGraph:
 
         query_shard = None
         if self.config.query_shard_size > 1:
-            query_shard = QueryShardPlan.from_forward(
-                total_tokens=num_tokens,
-                input_lengths=seq_lens,
-                size=self.config.query_shard_size,
-                rank=self.config.query_shard_rank,
-                device=self.config.device,
-            )
+            with self.memory_saver_adapter.named_region("attention_state"):
+                query_shard = QueryShardPlan.from_forward(
+                    total_tokens=num_tokens,
+                    input_lengths=seq_lens,
+                    size=self.config.query_shard_size,
+                    rank=self.config.query_shard_rank,
+                    device=self.config.device,
+                )
         ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,

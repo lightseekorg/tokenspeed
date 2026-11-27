@@ -40,6 +40,8 @@ import sys
 import pytest
 import torch
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from test.runtime.test_gdn_state_paging import (
@@ -461,7 +463,9 @@ class TestGdnStateCheckpointInForward:
 
         spare = torch.tensor([[61, 62]], dtype=torch.int32, device="cuda")
         self._init_metadata(backend, [3], 0, bucket, spare, [0])
-        capture = BreakableCapture()
+        capture = BreakableCapture(
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+        )
         with capture:
             layer()
         assert capture.num_segments == 3

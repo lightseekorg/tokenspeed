@@ -920,7 +920,14 @@ across weights sleep/wake; the graph's private temporary buffers remain
 discardable under the separate `cuda_graph` tag.
 Breakable prefill and draft captures use the same ownership: segment scratch
 is discardable, while input embeddings, output buffers, dummy row indices and
-eager-break handoffs retain CPU-backed addresses and contents. Memory release
+eager-break handoffs retain CPU-backed addresses and contents. Dummy query-shard
+row-index views share that ownership, including the staging storage they retain.
+This includes narrowing decoders' static row states, drafter extend inputs and
+outputs and K/V tiles, lazy draft sampling scratch, and recurrent capacity
+metadata and checkpoint scratch, including storage replaced during growth.
+The allocation owner is explicit at each capture site. Standalone captures
+begin/end warmed segments directly; managed captures use the memory saver
+public graph context to tag private-pool storage. Memory release
 also returns unused eager allocator segments after all requested regions pause.
 
 A resume containing NCCL uses the same-round operation gate: it waits until

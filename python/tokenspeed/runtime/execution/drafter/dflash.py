@@ -688,12 +688,15 @@ class DFlash(BaseDrafter):
             or self._greedy_gathered_max.device != device
             or self._greedy_gathered_ids.dtype != ids_dtype
         ):
-            self._greedy_gathered_max = torch.empty(
-                (cap,), dtype=max_dtype, device=device
-            )
-            self._greedy_gathered_ids = torch.empty(
-                (cap,), dtype=ids_dtype, device=device
-            )
+            with self.token_to_kv_pool.arena.memory_saver_adapter.named_region(
+                "workspace"
+            ):
+                self._greedy_gathered_max = torch.empty(
+                    (cap,), dtype=max_dtype, device=device
+                )
+                self._greedy_gathered_ids = torch.empty(
+                    (cap,), dtype=ids_dtype, device=device
+                )
             self._greedy_gather_cap = cap
         return self._greedy_gathered_max, self._greedy_gathered_ids
 

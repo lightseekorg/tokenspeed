@@ -43,6 +43,8 @@ import numpy as np
 import pytest
 import torch
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 # CI registration (AST-parsed, runtime no-op).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -1033,7 +1035,9 @@ def test_gpu_a_prefill_graph_replay_waits_for_its_load(writer, ranks):
 
     # A captured segment reads loaded pages; the capture notes the layer it
     # reaches instead of waiting.
-    capture = BreakableCapture()
+    capture = BreakableCapture(
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+    )
     with capture:
         reader.tracker.wait_for_layer(len(CONSUMERS) - 1)
         seen.copy_from(reader.arena)

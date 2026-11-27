@@ -27,6 +27,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
@@ -155,7 +157,9 @@ def test_ple_break_replays_ragged_rows_and_live_state_pages() -> None:
     for _ in range(2):
         forward(dummy)
     torch.cuda.synchronize()
-    capture = BreakableCapture()
+    capture = BreakableCapture(
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+    )
     with active_forward(dummy), capture:
         captured = forward(dummy)
     assert capture.num_segments == 3
@@ -265,7 +269,9 @@ def test_qsa_break_replays_live_rows_positions_and_cache_writes(monkeypatch) -> 
     for _ in range(2):
         forward(dummy)
     torch.cuda.synchronize()
-    capture = BreakableCapture()
+    capture = BreakableCapture(
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+    )
     with active_forward(dummy), capture:
         captured = forward(dummy)
     assert capture.num_segments == 3

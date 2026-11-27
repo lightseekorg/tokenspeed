@@ -29,6 +29,8 @@ import pytest
 import torch
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
@@ -449,7 +451,9 @@ def test_beam_triton_runtime_mixed_breakable_graph_refresh(width):
     # remains eager; A/B/A refreshes the SAME capture and runtime objects.
     harness.prepare(rounds[True], seed=72)
     torch.cuda.synchronize()
-    capture = BreakableCapture()
+    capture = BreakableCapture(
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+    )
     with capture:
         captured = harness.forward()
     segments = capture.num_segments

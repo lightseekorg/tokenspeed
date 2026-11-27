@@ -38,6 +38,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.paged_attention import PagedAttention, RMSNormOutputGate
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -164,7 +165,11 @@ def test_captured_extend_gates_without_pinning_the_gate():
             forward(rows)
             torch.cuda.synchronize()
             before = _pool_mib()
-            capture = BreakableCapture(pool=pool, handoff_storage=storage)
+            capture = BreakableCapture(
+                pool=pool,
+                handoff_storage=storage,
+                memory_saver_adapter=TorchMemorySaverAdapter.create(False),
+            )
             with capture:
                 forward(rows)
             torch.cuda.synchronize()

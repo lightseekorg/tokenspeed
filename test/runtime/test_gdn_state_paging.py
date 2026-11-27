@@ -45,7 +45,14 @@ class _ContractPool:
                 )
             ),
         )
-        self.arena = SimpleNamespace(runtime_contract=contract)
+        from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+            TorchMemorySaverAdapter,
+        )
+
+        self.arena = SimpleNamespace(
+            runtime_contract=contract,
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False),
+        )
         self._components = components
         self.state_group_by_layer = {
             layer_id: group_id for layer_id, (group_id, _, _) in components.items()

@@ -61,6 +61,8 @@ from test.runtime.drafter_prefill_graph_test_utils import (
 import pytest
 import torch
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
@@ -96,7 +98,7 @@ def test_run_eager_reruns_on_replay_with_live_host_state() -> None:
     def publish() -> None:
         published.copy_(buffers[chosen["index"]])
 
-    cap = BreakableCapture()
+    cap = BreakableCapture(memory_saver_adapter=TorchMemorySaverAdapter.create(False))
     with torch.inference_mode():
         with cap:
             x.add_(1)
