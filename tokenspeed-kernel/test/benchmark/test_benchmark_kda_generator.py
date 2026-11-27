@@ -290,6 +290,7 @@ def test_retained_benchmark_repetitions_restore_mutable_state(
     )
     prepared = prepare(request, current_platform())
     assert prepared.invocation.reset is not None
+    pages = [(layer["conv"].clone(), layer["state"].clone()) for layer in layers]
     snapshots = None
     for _ in range(3):
         prepared.invocation.reset()
@@ -333,6 +334,26 @@ def test_retained_benchmark_repetitions_restore_mutable_state(
         else:
             for value, saved in zip(current, snapshots):
                 torch.testing.assert_close(value, saved, atol=0, rtol=0)
+    if mode == "kda_retained_commit":
+        # No request ends: the ring keeps the convolution inputs, so the
+        # commit writes no page and runs as a single launch.
+        for layer, (conv, state) in zip(layers, pages):
+            torch.testing.assert_close(layer["conv"], conv, atol=0, rtol=0)
+            torch.testing.assert_close(layer["state"], state, atol=0, rtol=0)
+        from torch.autograd import DeviceType
+        from torch.profiler import ProfilerActivity, profile
+
+        prepared.invocation.reset()
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as trace:
+            prepared.invocation.invoke()
+            torch.cuda.synchronize()
+        launched = [
+            event.name
+            for event in trace.events()
+            if event.device_type == DeviceType.CUDA
+        ]
+        assert len(launched) == 1 and "retained_batched_commit" in launched[0]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")

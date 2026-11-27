@@ -170,6 +170,8 @@ def make_case(
     return dict(
         raw=raw,
         conv=conv,
+        # The pages' taps before any round: a decode commit leaves them.
+        initial_conv=conv.clone(),
         state=state,
         reads=reads,
         records=records,
@@ -445,7 +447,11 @@ def reference(case):
     for row, (begin, end) in enumerate(zip(starts[:-1], starts[1:])):
         page = int(case["reads"][row])
         running = endpoint(case["state"][page], records.history, row)
-        taps = case["conv"][page].float().clone()
+        # A seeded ring, not the page, holds a decoding request's taps.
+        taps = ring_taps(
+            records.history, records.preconv, int(records.history.record_slots[row])
+        )
+        taps = (case["conv"][page] if taps is None else taps).float().clone()
         row_states, row_windows = [running.clone()], [taps.clone()]
         for token in range(begin, end):
             joined = torch.cat((taps, case["raw"][token, :, None].float()), dim=-1)
@@ -737,12 +743,50 @@ def publish(
     )
 
 
-def check_prefix(case, accepted, expected):
+def materialize(case):
+    """Fold each live row's records and ring window into its live page, as a retraction does.
+
+    Then clear the rows' counts and ring states, as the backend does once
+    every layer has folded.
+    """
+    records = case["records"]
+    history = records.history
+    pages = torch.where(case["reads"] > 0, history.live_state_indices, 0).to(
+        history.live_state_indices.dtype
+    )
+    folded = kda.KdaRetainedHistory(
+        history.correction,
+        history.key,
+        history.decay,
+        history.length,
+        pages,
+        history.record_slots,
+    )
+    kda.kda_materialize_retained_pages(
+        case["state"],
+        history=folded,
+        source_indices=pages,
+        recurrent_layout="v_major",
+        conv_pool=case["conv"],
+        preconv=records.preconv.rows,
+        ring_state=replay_state(history)[:, 1:],
+    )
+    kda.kda_reset_retained_length(
+        replay_state(history),
+        write_indices=pages,
+        record_slots=history.record_slots,
+        page_count=case["state"].shape[0],
+    )
+
+
+def check_prefix(case, accepted, expected, *, ended_slots=()):
     """Check each live row's state and convolution window after its accepted prefix.
 
-    The live page's convolution state and, while the request's ring holds
-    rows, the three ring rows before its published head both equal the
-    window after the accepted prefix, bit for bit.
+    A request that keeps decoding holds the window after its accepted prefix
+    in the three ring rows before its published head, and the commit leaves
+    its live page's convolution state as it was. A request in
+    ``ended_slots`` ended: the commit wrote that window as its live page's
+    convolution state and cleared its ring state. Both bit for bit.
     """
     output, states, windows = expected
     records = case["records"]
@@ -754,7 +798,13 @@ def check_prefix(case, accepted, expected):
         actual = endpoint(case["state"][page], history, row)
         torch.testing.assert_close(actual, states[row][count], atol=2e-4, rtol=1e-2)
         window = windows[row][count].to(case["conv"].dtype)
-        torch.testing.assert_close(case["conv"][page], window, atol=0, rtol=0)
-        taps = ring_taps(history, records.preconv, int(history.record_slots[row]))
-        if taps is not None:
+        slot = int(history.record_slots[row])
+        taps = ring_taps(history, records.preconv, slot)
+        if slot in ended_slots:
+            assert taps is None
+            torch.testing.assert_close(case["conv"][page], window, atol=0, rtol=0)
+        else:
             torch.testing.assert_close(taps, window, atol=0, rtol=0)
+            torch.testing.assert_close(
+                case["conv"][page], case["initial_conv"][page], atol=0, rtol=0
+            )

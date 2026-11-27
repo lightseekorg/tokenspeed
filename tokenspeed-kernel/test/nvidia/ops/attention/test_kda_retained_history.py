@@ -277,9 +277,8 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
 def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
     """Catch source mutation, writes by empty/null rows, and stale GPU metadata."""
     from tokenspeed_kernel.ops.attention.kda._triton.retained import (
-        retained_batched_conv_kernel,
+        retained_batched_commit_kernel,
         retained_batched_prepare_kernel,
-        retained_batched_publish_kernel,
     )
     from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
         _kda_recoverssm_verify_kernel,
@@ -405,8 +404,7 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
         else:
             with assert_no_triton_compile(
                 retained_batched_prepare_kernel,
-                retained_batched_conv_kernel,
-                retained_batched_publish_kernel,
+                retained_batched_commit_kernel,
                 _kda_recoverssm_verify_kernel.fn,
             ):
                 run()

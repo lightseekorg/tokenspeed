@@ -823,7 +823,11 @@ def prepare_kda_fused_paged_verify(
 def prepare_kda_retained_commit(
     request: BenchmarkRequest, platform: PlatformInfo
 ) -> PreparedBenchmark:
-    """Time all-layer retained commit from fresh verify-derived records each replay."""
+    """Time the all-layer retained commit of a round in which no request ends.
+
+    The commit is one launch: it publishes each request's count and ring
+    state, and its end programs find no ended request, so it writes no page.
+    """
     common = _fused_common(request)
     profile, batch = common["profile"], common["batch"]
     window = _positive_parameter(request.parameters, "draft_token_num")
@@ -865,7 +869,7 @@ def prepare_kda_retained_commit(
     verified = replay_state[:, :1].clone()
     snapshot = torch.zeros(batch, 2, device="cuda", dtype=torch.int32)
     snapshot[:, 1] = 3
-    layer_inputs, descriptors, before = [], [], []
+    layer_inputs, descriptors = [], []
     for layer_idx in range(layers):
         layer = _retained_benchmark_layer(
             common,
@@ -898,7 +902,6 @@ def prepare_kda_retained_commit(
             ]
         )
         layer_inputs.append(layer)
-        before.append(conv.clone())
     descriptors = torch.tensor(descriptors, device="cuda", dtype=torch.uint64)
     initial_state = replay_state.clone()
     group_indices = torch.arange(layers, device="cuda", dtype=torch.int32) // (
@@ -919,8 +922,8 @@ def prepare_kda_retained_commit(
     request_ends = torch.zeros(batch, device="cuda", dtype=torch.int32)
 
     def reset():
-        for layer, conv in zip(layer_inputs, before):
-            layer["conv"].copy_(conv)
+        # Only the counts and ring states change: the ring keeps the requests'
+        # convolution inputs, so no page is written.
         replay_state.copy_(initial_state)
 
     def invoke():

@@ -252,8 +252,8 @@ def _assert_committed_pages_equal(left, right, pages, slots):
     for layer in left.layer_ids:
         ids = pages[left.pool.state_group_by_layer[layer]]
         torch.testing.assert_close(
-            left.pool.get_component(layer, "conv_state")[ids],
-            right.pool.get_component(layer, "conv_state")[ids],
+            _logical_conv(left, layer, ids, slots),
+            _logical_conv(right, layer, ids, slots),
             atol=0,
             rtol=0,
         )
@@ -268,8 +268,10 @@ def _assert_committed_pages_equal(left, right, pages, slots):
 @pytest.mark.parametrize("draft_tokens", [1, 4])
 def test_preconv_ring_holds_each_committed_convolution_window(draft_tokens):
     """Between materializations, the three ring rows before a request's head
-    are its last accepted raw inputs: every layer's live page holds them as
-    its convolution state after each commit, as the ring head wraps."""
+    are its last accepted raw inputs, as the ring head wraps; the decode
+    commits leave every layer's live page's convolution state as it was. A
+    retraction fold writes the ring's window into the page and clears the
+    ring state."""
     harness = _Harness(draft_tokens=draft_tokens, seed=517)
     width, rings = harness.width, harness.backend._preconv_ring
     rows = width + 3
@@ -280,24 +282,61 @@ def test_preconv_ring_holds_each_committed_convolution_window(draft_tokens):
     }
     seq_lens = [8 + width] * len(rpis)
     state = harness.backend._replay_state
-    # A fresh slot's ring holds nothing; its first prepare seeds it.
+    # A fresh slot's ring holds nothing; its first prepare seeds it with the
+    # page's taps.
     assert state[rpis, 1].tolist() == [0, 0]
+    pages_before = {
+        layer_id: harness.pool.get_component(layer_id, "conv_state").clone()
+        for layer_id in harness.layer_ids
+    }
+    windows = {
+        layer_id: [
+            pages_before[layer_id][
+                pages[harness.pool.state_group_by_layer[layer_id]][row]
+            ]
+            for row in range(len(rpis))
+        ]
+        for layer_id in harness.layer_ids
+    }
     heads = [3, 3]
     for round_index in range(5):
         accepted = [1 + (round_index + row) % width for row in range(len(rpis))]
-        harness.round(rpis, pages, seq_lens, 520 + round_index, accepted)
+        seed = 520 + round_index
+        raw = harness.inputs(len(rpis), seed)["mixed_qkv"].view(len(rpis), width, -1)
+        harness.round(rpis, pages, seq_lens, seed, accepted)
         heads = [(head + take) % rows for head, take in zip(heads, accepted)]
         assert state[rpis, 1].tolist() == [head + 1 for head in heads]
         for layer_id in harness.layer_ids:
             ring = rings[:, harness.backend._descriptor_row_by_layer[layer_id]]
             conv = harness.pool.get_component(layer_id, "conv_state")
-            group = harness.pool.state_group_by_layer[layer_id]
+            torch.testing.assert_close(conv, pages_before[layer_id], atol=0, rtol=0)
             for row, slot in enumerate(rpis):
+                windows[layer_id][row] = torch.cat(
+                    (windows[layer_id][row], raw[row, : accepted[row]].T), dim=-1
+                )[:, -3:]
                 past = [(heads[row] - 3 + i) % rows for i in range(3)]
                 torch.testing.assert_close(
-                    ring[slot, past].T, conv[pages[group][row]], atol=0, rtol=0
+                    ring[slot, past].T, windows[layer_id][row], atol=0, rtol=0
                 )
         seq_lens = [length + take for length, take in zip(seq_lens, accepted)]
+    harness.backend.fold_deferred_state(
+        {
+            group_id: torch.tensor(
+                [[slot, page] for slot, page in zip(rpis, pages[group_id])],
+                dtype=torch.int32,
+            )
+            for group_id in _STATE_GROUPS
+        },
+        stream=torch.cuda.current_stream(),
+    )
+    assert state[rpis].tolist() == [[0, 0], [0, 0]]
+    for layer_id in harness.layer_ids:
+        conv = harness.pool.get_component(layer_id, "conv_state")
+        group = harness.pool.state_group_by_layer[layer_id]
+        for row in range(len(rpis)):
+            torch.testing.assert_close(
+                conv[pages[group][row]], windows[layer_id][row], atol=0, rtol=0
+            )
 
 
 def test_packed_qkv_views_keep_projection_storage_and_stride():
@@ -347,7 +386,8 @@ def _reference_round(harness, pages, inputs, accepted, *, slots, prefill, layers
         if gate is None:
             gate = torch.nn.functional.linear(inputs["f_a_out"], params["f_b_weight"])
         raw = inputs["mixed_qkv"].view(batch, -1, harness.conv_dim)
-        conv = harness.pool.get_component(layer, "conv_state")[ids]
+        # A decoding request's window is in its ring, not in its page.
+        conv = _logical_conv(harness, layer, ids, slots)
         options = {}
         if prefill:
             reference = kda_prefill_reference
@@ -367,7 +407,7 @@ def _reference_round(harness, pages, inputs, accepted, *, slots, prefill, layers
             )[0]
         output, tape, windows = reference(
             inputs["mixed_qkv"].view(batch, -1, harness.conv_dim),
-            harness.pool.get_component(layer, "conv_state")[ids],
+            conv,
             _logical_state(harness, layer, ids, slots),
             inputs["beta_raw"],
             conv_weights=params["conv_weights"],
@@ -442,10 +482,7 @@ def test_retained_commit_matches_torch_over_multiple_rounds_and_layers(
                 rtol=2e-5,
             )
             torch.testing.assert_close(
-                harness.pool.get_component(layer_id, "conv_state")[ids],
-                conv,
-                atol=0,
-                rtol=0,
+                _logical_conv(harness, layer_id, ids, rpis), conv, atol=0, rtol=0
             )
         seq_lens = [length + max(1, count) for length, count in zip(seq_lens, accepted)]
 
@@ -739,15 +776,26 @@ def test_rebinding_the_pool_commits_like_a_fresh_bind():
             harness.round(rpis, pages, seq_lens, 200 + round_index, accepted)
         _assert_committed_pages_equal(rebound, fresh, pages, rpis)
         seq_lens = [length + count for length, count in zip(seq_lens, accepted)]
+    # Decode rounds keep the window in the ring; a retraction fold writes it
+    # and the records into the new pool's pages, which then alone hold both.
+    for harness in (rebound, fresh):
+        harness.backend.fold_deferred_state(
+            {
+                group_id: torch.tensor(
+                    [[slot, page] for slot, page in zip(rpis, pages[group_id])],
+                    dtype=torch.int32,
+                )
+                for group_id in _STATE_GROUPS
+            },
+            stream=torch.cuda.current_stream(),
+        )
+        assert harness.backend._replay_state[rpis].abs().sum().item() == 0
+    _assert_committed_pages_equal(rebound, fresh, pages, rpis)
     layer_id = fresh.layer_ids[0]
     page = pages[fresh.pool.state_group_by_layer[layer_id]][0]
     for harness in (rebound, fresh):
         for component in ("conv_state", "recurrent_state"):
-            value = (
-                _logical_state(harness, layer_id, [page], rpis[:1])[0]
-                if component == "recurrent_state"
-                else harness.pool.get_component(layer_id, component)[page]
-            )
+            value = harness.pool.get_component(layer_id, component)[page]
             assert value.abs().sum() > 0
 
 
@@ -1337,10 +1385,7 @@ def test_decode_records_commit_after_acceptance(draft_tokens, captured):
                 rtol=2e-5,
             )
             torch.testing.assert_close(
-                actual.pool.get_component(layer, "conv_state")[ids],
-                conv,
-                atol=0,
-                rtol=0,
+                _logical_conv(actual, layer, ids, rpis), conv, atol=0, rtol=0
             )
             for component in _CHECKPOINT_COMPONENTS:
                 committed = actual.pool.get_component(layer, component)
@@ -1457,10 +1502,7 @@ def test_record_decode_preserves_raw_gate_and_bias(draft_tokens, lower_bound):
                 rtol=2e-5,
             )
             torch.testing.assert_close(
-                harness.pool.get_component(layer, "conv_state")[ids],
-                conv,
-                atol=0,
-                rtol=0,
+                _logical_conv(harness, layer, ids, [1]), conv, atol=0, rtol=0
             )
 
 
@@ -1635,7 +1677,7 @@ def test_mixed_decode_commit_matches_separate_forwards(
             )
         ids = pages[actual.pool.state_group_by_layer[layer]]
         torch.testing.assert_close(
-            actual.pool.get_component(layer, "conv_state")[ids],
+            _logical_conv(actual, layer, ids, [1, 2]),
             torch.cat((prompt_states[layer][1], decode_states[layer][1])),
             atol=0,
             rtol=0,
@@ -1678,6 +1720,26 @@ def _logical_state(harness, layer, pages, slots, counts=None):
     return state
 
 
+def _logical_conv(harness, layer, pages, slots):
+    """Each request's convolution window, as its next verify reads it.
+
+    While a request slot's ring holds rows (ring state above 0), the three
+    ring rows before its head are the window and the page's convolution
+    state is stale; otherwise the page holds it.
+    """
+    conv = harness.pool.get_component(layer, "conv_state")[pages].clone()
+    rows = harness.width + 3
+    ring = harness.backend._preconv_ring[
+        :, harness.backend._descriptor_row_by_layer[layer]
+    ]
+    states = harness.backend._replay_state[slots, 1].tolist()
+    for row, (slot, ring_state) in enumerate(zip(slots, states, strict=True)):
+        if ring_state:
+            head = ring_state - 1
+            conv[row] = ring[slot, [(head - 3 + i) % rows for i in range(3)]].T
+    return conv
+
+
 @pytest.mark.parametrize("width", [1, T])
 @pytest.mark.parametrize("mamba_ssm_dtype", ["float32", "bfloat16"])
 def test_ending_round_commit_leaves_a_dense_live_page(width, mamba_ssm_dtype):
@@ -1713,7 +1775,7 @@ def test_ending_round_commit_leaves_a_dense_live_page(width, mamba_ssm_dtype):
         harness.backend.commit_verified_state(
             torch.tensor(accepted, dtype=torch.int32, device=DEV), accepted_path=None
         )
-        for layer, (state, _) in expected.items():
+        for layer, (state, conv) in expected.items():
             ids = pages[harness.pool.state_group_by_layer[layer]]
             dense = harness.pool.get_component(layer, "recurrent_state")[ids]
             torch.testing.assert_close(
@@ -1722,9 +1784,20 @@ def test_ending_round_commit_leaves_a_dense_live_page(width, mamba_ssm_dtype):
                 atol=2e-6 if mamba_ssm_dtype == "float32" else 2e-3,
                 rtol=2e-5 if mamba_ssm_dtype == "float32" else 2e-2,
             )
+            torch.testing.assert_close(
+                _logical_conv(harness, layer, ids, rpis), conv, atol=0, rtol=0
+            )
             counts = harness.backend._replay_length[rpis].flatten()
             if ending:
                 assert counts[0].item() == 0
+                # The ended request's live page alone holds its window too.
+                assert harness.backend._replay_state[rpis[0], 1].item() == 0
+                torch.testing.assert_close(
+                    harness.pool.get_component(layer, "conv_state")[ids[0]],
+                    conv[0],
+                    atol=0,
+                    rtol=0,
+                )
                 torch.testing.assert_close(
                     dense[0].float(),
                     state[0].to(dense.dtype).float(),
@@ -1889,7 +1962,7 @@ def test_retained_rounds_reconstruct_endpoint_and_reuse_rejected(width, captured
             rtol=2e-5,
         )
         torch.testing.assert_close(
-            actual.pool.get_component(layer, "conv_state")[page],
+            _logical_conv(actual, layer, page, [1]),
             expected[layer][1],
             atol=0,
             rtol=0,
@@ -1901,18 +1974,46 @@ def test_retained_rounds_reconstruct_endpoint_and_reuse_rejected(width, captured
 def test_retained_prefill_gathers_endpoint_and_resets_final_length(
     same_page, mamba_ssm_dtype
 ):
-    """Every layer's gather applies the records the row's count covers, and
-    the count clears once, after the last layer's gather has read it."""
+    """Every layer's gather applies the records the row's count covers and
+    writes the slot's seeded ring window over the taps it copied into the
+    live page, which the prefill convolution reads next; the count and ring
+    state clear once, after the last layer's gather has read them."""
     harness = _Harness(draft_tokens=4, mamba_ssm_dtype=mamba_ssm_dtype)
-    layer = harness.layer_ids[0]
+    # The State groups share page memory and every group lists these pages,
+    # so a later layer's writes land in an earlier layer's view: the page
+    # checks after all gathers use the last layer's.
+    layer = harness.layer_ids[-1]
     source, destination = 2, 2 if same_page else 3
     pool = harness.pool
     for each in harness.layer_ids:
         pool.get_component(each, "recurrent_state")[source].fill_(0.1)
-    # A distinct source is a published dense checkpoint. A continuation on
-    # its own live page can still have records in the request's slot.
+    # A distinct source is a dense base the request's page moved from. A
+    # continuation on its own live page can still have records in the
+    # request's slot.
     if same_page:
         _seed_retained_history(harness, slot=1, length=3)
+    # Either way the slot's ring is seeded (a page move leaves it as it is):
+    # its window, which wraps past the last ring row, holds positive inputs
+    # that neither page's stale convolution state (-1) has.
+    rows, head = harness.width + 3, 1
+    ring = harness.backend._preconv_ring
+    ring[1].copy_(torch.randint(1, 17, ring[1].shape, device=DEV) * 0.125)
+    harness.backend._replay_state[1, 1] = head + 1
+    for each in harness.layer_ids:
+        for page in {source, destination}:
+            pool.get_component(each, "conv_state")[page].fill_(-1)
+    windows = {
+        each: ring[
+            1,
+            harness.backend._descriptor_row_by_layer[each],
+            [(head - 3 + i) % rows for i in range(3)],
+        ].T.clone()
+        for each in harness.layer_ids
+    }
+    for each in harness.layer_ids:
+        for page in {source, destination}:
+            conv = pool.get_component(each, "conv_state")[page]
+            assert (conv != windows[each]).all(), (each, page)
     expected = {
         each: _logical_state(harness, each, [source], [1]) for each in harness.layer_ids
     }
@@ -1946,13 +2047,19 @@ def test_retained_prefill_gathers_endpoint_and_resets_final_length(
     writes = torch.tensor([destination], device=DEV, dtype=torch.int32)
     # Layers gather in model order; the count holds until the last one.
     for each in harness.layer_ids:
-        assert harness.backend._replay_length[1].item() == count, each
+        assert harness.backend._replay_state[1].tolist() == [count, head + 1], each
         conv, recurrent = harness.backend._state_components(each)
         gathered, _ = harness.backend._prepare_prefill_state_inputs(
             each, conv, recurrent, reads, writes, dtype=torch.float32
         )
         torch.testing.assert_close(gathered, expected[each], atol=2e-7, rtol=2e-6)
+        # The ring's window lands over the gathered taps, so the live page
+        # holds it when the prefill convolution reads the page.
+        torch.testing.assert_close(conv[destination], windows[each], atol=0, rtol=0)
     for name, snapshot in snapshots.items():
+        if same_page and name == "conv_state":
+            # The live page is the source: its taps are the ring's window now.
+            snapshot = windows[layer]
         torch.testing.assert_close(
             pool.get_component(layer, name)[source], snapshot, atol=0, rtol=0
         )
@@ -1961,7 +2068,7 @@ def test_retained_prefill_gathers_endpoint_and_resets_final_length(
     torch.testing.assert_close(
         recurrent[destination], final[0].to(recurrent.dtype), atol=0, rtol=0
     )
-    assert harness.backend._replay_length[1].item() == 0
+    assert harness.backend._replay_state[1].tolist() == [0, 0]
     if not same_page:
         for name, snapshot in snapshots.items():
             torch.testing.assert_close(
@@ -2071,7 +2178,7 @@ def test_retained_workspace_matches_recipe_and_rebind_invalidates_history():
         rtol=2e-5,
     )
     torch.testing.assert_close(
-        replacement.get_component(layer, "conv_state")[page],
+        _logical_conv(harness, layer, page, [13]),
         expected[layer][1],
         atol=0,
         rtol=0,
@@ -2175,7 +2282,7 @@ def test_retained_source_live_capacity_boundary(initial_length, same_page):
         rtol=2e-5,
     )
     torch.testing.assert_close(
-        actual.pool.get_component(layer, "conv_state")[destinations[own]],
+        _logical_conv(actual, layer, destinations[own], slots),
         expected[layer][1],
         atol=0,
         rtol=0,
@@ -2365,10 +2472,7 @@ def test_a_page_move_copies_the_base_and_keeps_the_count():
             _logical_state(harness, layer, ids, [1]), state, atol=2e-6, rtol=2e-5
         )
         torch.testing.assert_close(
-            harness.pool.get_component(layer, "conv_state")[ids],
-            conv,
-            atol=0,
-            rtol=0,
+            _logical_conv(harness, layer, ids, [1]), conv, atol=0, rtol=0
         )
     # The moved group's input checkpoint is read, never written.
     for layer, pool in before.items():
@@ -2490,18 +2594,32 @@ def test_an_ended_request_some_layers_reject_reports_incomplete():
 def test_a_masked_overlap_row_keeps_its_count():
     """A masked overlap row -- every State group's pages invalid, its request
     ended by an earlier forward -- carries no layer: it reports nothing new,
-    and its slot keeps its count and convolution windows."""
+    and its slot keeps its count, its ring head and its convolution windows,
+    in the ring and in its pages."""
     from tokenspeed_kernel.ops.metadata import REQUEST_ENDED
 
     harness = _Harness(draft_tokens=T, seed=1706)
     pages = {group: [2 + index] for index, group in enumerate(_STATE_GROUPS)}
     harness.round([1], pages, [8 + T], 1706, [T])
+    # The round left slot 1's window in its ring, past the head it seeded.
+    state_before = harness.backend._replay_state[1].tolist()
+    assert state_before == [T, (3 + T) % (harness.width + 3) + 1]
     harness.stopped[1] = True
     harness.request_ends[0] = REQUEST_ENDED
     conv_before = {
         layer: harness.pool.get_component(layer, "conv_state").clone()
         for layer in harness.layer_ids
     }
+    windows_before = {
+        layer: _logical_conv(
+            harness, layer, pages[harness.pool.state_group_by_layer[layer]], [1]
+        )
+        for layer in harness.layer_ids
+    }
+    # The window lives in the ring alone: the pages keep their stale taps.
+    for layer, window in windows_before.items():
+        ids = pages[harness.pool.state_group_by_layer[layer]]
+        assert not torch.equal(window, conv_before[layer][ids])
     tables = {
         group: np.asarray([[0, page] for page in pages[group]], dtype=np.int32)
         for group in _STATE_GROUPS
@@ -2523,9 +2641,18 @@ def test_a_masked_overlap_row_keeps_its_count():
     )
     assert harness.request_ends[0].item() == REQUEST_ENDED
     assert harness.backend._replay_length[1].item() == T
+    assert harness.backend._replay_state[1].tolist() == state_before
     for layer, before in conv_before.items():
         torch.testing.assert_close(
             harness.pool.get_component(layer, "conv_state"), before, atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            _logical_conv(
+                harness, layer, pages[harness.pool.state_group_by_layer[layer]], [1]
+            ),
+            windows_before[layer],
+            atol=0,
+            rtol=0,
         )
 
 

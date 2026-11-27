@@ -184,10 +184,13 @@ class KdaAttnBackend(CapacityPrefillBackend):
     """
 
     _prefill_needs_request_slots = True
-    # Retraction folds accepted records into the dense page before slot reuse
-    # (fold_deferred_state); the page's convolution state is current. A
-    # recycled or restored slot starts with an accepted count of zero and an
-    # unseeded ring, so its first verify reseeds the ring from its page.
+    # Between materializations a decoding request's accepted records and its
+    # last convolution inputs live in its slot, not in its page. Retraction
+    # (fold_deferred_state), a prefill continuation and the decode commit of
+    # an ended request write both into the dense page before another reader
+    # sees it. A recycled or restored slot starts with an accepted count of
+    # zero and an unseeded ring, so its first verify reseeds the ring from
+    # its page.
     workspace_slot_state = (
         "_retained_records",
         "_replay_state",
@@ -423,13 +426,17 @@ class KdaAttnBackend(CapacityPrefillBackend):
             self._retained_histories[key] = history
         return history
 
+    def _layer_preconv_ring(self, layer_id: int) -> torch.Tensor:
+        """The layer's [record slots, window + 3, channels] pre-convolution ring rows."""
+        return self._preconv_ring[:, self._descriptor_row_by_layer[layer_id]]
+
     def _preconv_ring_rows(self, layer_id: int, batch_size: int) -> KdaPreconvRing:
         """The layer's pre-convolution ring with the first batch_size rows' heads."""
         key = (layer_id, batch_size)
         ring = self._preconv_rings.get(key)
         if ring is None:
             ring = KdaPreconvRing(
-                self._preconv_ring[:, self._descriptor_row_by_layer[layer_id]],
+                self._layer_preconv_ring(layer_id),
                 self._replay_snapshot[:batch_size, 1],
             )
             self._preconv_rings[key] = ring
@@ -456,15 +463,19 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def fold_deferred_state(
         self, state_folds: Mapping[str, torch.Tensor], *, stream: torch.Stream
     ) -> None:
-        """Fold each listed slot's accepted records into its listed State block.
+        """Fold each listed slot's accepted records and ring inputs into its listed State block.
 
         The scheduler lists a retraction victim's live block per group, the
-        block its decode commits wrote in place, convolution state included;
-        a slot without records -- restored and not yet decoding -- leaves its
-        block unchanged. Every layer reads the slots' shared counts, which one
-        launch clears, with their ring states, once every layer has folded. A group the plan does not list for a victim
-        (its publication swapped in an equal, complete entry) needs none of
-        the victim's records, which the retracted slot no longer keeps.
+        block its decode rounds kept as their dense base. Each layer folds the slot's
+        records into the block's recurrent state and, when the slot's ring
+        is seeded, writes the ring's last three inputs as the block's
+        convolution state; a slot without records or ring rows -- restored
+        and not yet decoding -- leaves its block unchanged. Every layer reads
+        the slots' shared counts and ring states, which one launch clears
+        once every layer has folded. A group the plan does not list for a
+        victim (its publication swapped in an equal, complete entry) needs
+        none of the victim's records or inputs, which the retracted slot no
+        longer keeps.
         """
         if self._retained_records is None or not state_folds:
             return
@@ -484,12 +495,15 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 if fold is None:
                     continue
                 group_pages, group_slots = fold
-                _, recurrent = self._state_components(layer_id)
+                conv, recurrent = self._state_components(layer_id)
                 kda_materialize_retained_pages(
                     recurrent,
                     history=self._history_for_rows(layer_id, group_pages, group_slots),
                     source_indices=group_pages,
                     recurrent_layout=self.kda_recurrent_layout,
+                    conv_pool=conv,
+                    preconv=self._layer_preconv_ring(layer_id),
+                    ring_state=self._replay_state[:, 1:],
                 )
             kda_reset_retained_length(
                 self._replay_state,
@@ -519,18 +533,26 @@ class KdaAttnBackend(CapacityPrefillBackend):
         if self._retained_records is not None:
             slots = self.forward_metadata.req_pool_indices
             history = self._history_for_rows(layer_id, live_indices, slots)
+            # A continued request's slot may hold accepted records and, in a
+            # seeded ring, the convolution inputs its page lacks: the records
+            # go into the gathered state and the ring's last three inputs
+            # over the taps the gather copied into the live page, before the
+            # prefill convolution reads them.
             kda_materialize_retained_state(
                 recurrent,
                 history=history,
                 source_indices=source_indices,
                 recurrent_layout=self.kda_recurrent_layout,
+                conv_pool=conv_states,
+                preconv=self._layer_preconv_ring(layer_id),
+                ring_state=self._replay_state[:, 1:],
             )
             # The scan starts from the gathered logical state and stores a
             # dense one into the live page, so these rows' slots hold no
             # accepted records any more, and their rings no rows the page's
             # convolution state lacks. Every layer's gather reads the count
-            # they share, so it clears once, with the ring state, after the
-            # last layer's gather, in a launch ordered behind it.
+            # and ring state they share, so they clear once, after the last
+            # layer's gather, in a launch ordered behind it.
             if layer_id == self._state_layer_ids()[-1]:
                 kda_reset_retained_length(
                     self._replay_state,
@@ -1160,11 +1182,14 @@ class KdaAttnBackend(CapacityPrefillBackend):
         correction, key, decay = self._retained_records.unbind(2)
         # The planner clamps each active interval to at least one accepted
         # token. Every layer of a request shares its count and ring head,
-        # which the second launch writes once from the round's acceptance and
-        # the prepare's snapshot. A request that
-        # ended in this forward has its records folded into its live block,
-        # which its finish publishes; if a layer that carried it rejects its
-        # commit, its row in request_ends says the block is incomplete.
+        # which one launch writes once from the round's acceptance and the
+        # prepare's snapshot; the ring keeps the request's convolution inputs,
+        # so no block's convolution state is written while it decodes. A
+        # request that ended in this forward has, in the same launch, its
+        # records folded into its live block and the ring's last three inputs
+        # written as the block's convolution state, which its finish
+        # publishes; if a layer that carried it rejects its commit, its row
+        # in request_ends says the block is incomplete.
         self._batched_replay_kernel(
             descriptors=self._replay_descriptors,
             group_indices=self._replay_group_indices,

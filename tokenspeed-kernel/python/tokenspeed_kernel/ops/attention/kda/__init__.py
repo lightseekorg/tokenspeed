@@ -262,11 +262,12 @@ class KdaRetainedHistory:
 # state's dtype with unit channel stride (KdaPreconvRing).
 # A request's accepted count and ring state are not a layer's: every layer
 # shares them, and the prepare and the commit take them as a tensor.
-# Verify already stores U/K/decay records; commit reads them only to fold an
-# ended request's accepted records into its live page. Commit updates the
-# convolution state, then publishes the request's count and ring state. The
-# prepare ahead of a verify forward reads the page count, recurrent-state and
-# (to seed a ring) convolution and ring columns.
+# Verify already stores U/K/decay records and its candidates' ring rows; the
+# commit reads them only for a request that ended, to fold its accepted
+# records and write the ring's last three inputs into its live page. The same
+# launch publishes every carried request's count and ring state. The prepare
+# ahead of a verify forward reads the page count, recurrent-state and (to
+# seed a ring) convolution and ring columns.
 KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS = 13
 
 
@@ -804,15 +805,26 @@ def kda_materialize_retained_state(
     history: KdaRetainedHistory,
     source_indices: torch.Tensor,
     recurrent_layout: str,
+    conv_pool: torch.Tensor,
+    preconv: torch.Tensor,
+    ring_state: torch.Tensor,
 ) -> None:
-    """Apply accepted history to gathered dense state in place.
+    """Apply accepted history to gathered dense state and the ring to live pages in place.
 
     recurrent is the [request, head, V, K] gather output (K,V for k_major).
     source_indices holds each row's source page, and history.record_slots its
-    records and the count history.length gives. Rows with nonpositive source
-    pages are skipped. The count stays as it is: every layer of a request
-    shares it, so the caller clears it once every layer has gathered
-    (kda_reset_retained_length), on the same stream.
+    records and the count history.length gives. conv_pool is the layer's
+    [pages, channels, 3] convolution state, preconv the layer's
+    [record slots, window + 3, channels] pre-convolution ring and ring_state
+    the INT32 [record slots, 1] ring state every layer of a request shares
+    (0: the ring holds no rows; else the ring row of the next input plus
+    one). A row whose slot's ring is seeded gets the ring's last three
+    inputs, oldest first, written into its live page's
+    (history.live_state_indices) convolution state; the gather that copied
+    the source page's taps there ran before. Rows with nonpositive source
+    pages are skipped. The count and ring state stay as they are: every
+    layer of a request shares them, so the caller clears them once every
+    layer has gathered (kda_reset_retained_length), on the same stream.
     """
     from tokenspeed_kernel.ops.attention.kda._retained import materialize
 
@@ -822,6 +834,9 @@ def kda_materialize_retained_state(
         source_indices=source_indices,
         recurrent_layout=recurrent_layout,
         paged=False,
+        conv_pool=conv_pool,
+        preconv=preconv,
+        ring_state=ring_state,
     )
 
 
@@ -831,15 +846,23 @@ def kda_materialize_retained_pages(
     history: KdaRetainedHistory,
     source_indices: torch.Tensor,
     recurrent_layout: str,
+    conv_pool: torch.Tensor,
+    preconv: torch.Tensor,
+    ring_state: torch.Tensor,
 ) -> None:
-    """Fold each request's accepted records into its private page.
+    """Fold each request's accepted records and ring inputs into its private page.
 
     recurrent_pool holds [page, head, V, K] state (K,V for k_major).
-    source_indices lists one physical page per history.record_slots entry.
-    Positive pages and their slots must be unique. Rows with nonpositive pages
-    are skipped. Every layer of a request shares its count, which this leaves
-    as it is: the caller clears it once every layer has folded
-    (kda_reset_retained_length), on the same stream.
+    source_indices lists one physical page per history.record_slots entry;
+    the fold writes that page's recurrent and convolution state, whatever
+    history.live_state_indices holds. conv_pool, preconv and ring_state
+    follow kda_materialize_retained_state: a slot whose ring is seeded gets
+    the ring's last three inputs written into its listed page's convolution
+    state; an unseeded slot's page keeps its convolution state.
+    Positive pages and their slots must be unique. Rows with nonpositive
+    pages are skipped. Every layer of a request shares its count and ring
+    state, which this leaves as they are: the caller clears them once every
+    layer has folded (kda_reset_retained_length), on the same stream.
     """
     from tokenspeed_kernel.ops.attention.kda._retained import materialize
 
@@ -849,6 +872,9 @@ def kda_materialize_retained_pages(
         source_indices=source_indices,
         recurrent_layout=recurrent_layout,
         paged=True,
+        conv_pool=conv_pool,
+        preconv=preconv,
+        ring_state=ring_state,
     )
 
 
@@ -883,7 +909,7 @@ def kda_reset_retained_length(
 def resolve_kda_batched_retained_commit(
     dtype: torch.dtype, *, num_heads: int, head_dim: int, recurrent_layout: str
 ):
-    """Resolve retained cross-layer convolution and count publication.
+    """Resolve the retained cross-layer commit: one launch per verify round.
 
     Returns a callable or None for unsupported geometry/platform. Its uint64
     [layers, 13] descriptors hold the pre-convolution ring and conv
@@ -891,19 +917,19 @@ def resolve_kda_batched_retained_commit(
     strides, the recurrent state pointer and its page, head, value and key
     strides, then the ring's record-slot stride, in elements. record_slots
     selects each request's slot in replay_state, the count and ring state
-    every layer shares. The first launch writes each layer's convolution
-    state from the source page's taps and the accepted candidates' ring
-    rows, at the ring head of the prepare's snapshot (replay_snapshot); a
-    second,
-    one-dimensional launch then writes each carried request's count once:
-    the records its verify read (the snapshot's applied count) plus its
-    acceptance, and its ring state past the accepted candidates. A request
-    whose slot is set in request_stopped ended in this forward: its accepted
-    records are folded into its live page and its count and ring state are
-    cleared. One whose commit a layer that carried it rejects instead is
-    reported as ``REQUEST_ENDED_INCOMPLETE`` in request_ends, the forward's
-    per-row ``apply_stop_conditions`` report. Metadata and all pointers
-    remain stable during CUDA graph capture.
+    every layer shares. The launch writes each carried request's count once
+    -- the records its verify read (the prepare's snapshot, replay_snapshot)
+    plus its acceptance -- and its ring state past the accepted candidates;
+    between materializations the ring, not the page, holds a request's
+    convolution inputs, so no layer's convolution state is written for a
+    request that keeps decoding. A request whose slot is set in
+    request_stopped ended in this forward: in each layer its accepted
+    records are folded into its live page, the ring's last three accepted
+    inputs become that page's convolution state, and its count and ring
+    state are cleared. One whose commit a layer that carried it rejects
+    instead is reported as ``REQUEST_ENDED_INCOMPLETE`` in request_ends, the
+    forward's per-row ``apply_stop_conditions`` report. Metadata and all
+    pointers remain stable during CUDA graph capture.
     """
     return _resolve_batched_retained(
         "kda_retained_commit",

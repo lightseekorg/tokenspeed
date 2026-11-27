@@ -31,6 +31,12 @@ from tokenspeed_kernel.ops.metadata.stop_conditions import (
 )
 from tokenspeed_kernel.platform import current_platform
 
+# Request rows a commit program publishes, and the end programs' row and
+# channel block.
+_COMMIT_BLOCK = 256
+# At most this many end programs per layer share an ended request's heads.
+_END_SPLITS = 16
+
 
 def _kernels():
     if current_platform().is_amd:
@@ -68,7 +74,17 @@ def _check_snapshot(snapshot, *, batch, device):
         )
 
 
-def materialize(recurrent, *, history, source_indices, recurrent_layout, paged):
+def materialize(
+    recurrent,
+    *,
+    history,
+    source_indices,
+    recurrent_layout,
+    paged,
+    conv_pool,
+    preconv,
+    ring_state,
+):
     slots, heads, capacity, values = history.correction.shape
     keys = history.key.shape[-1]
     expected = (values, keys) if recurrent_layout == "v_major" else (keys, values)
@@ -89,6 +105,24 @@ def materialize(recurrent, *, history, source_indices, recurrent_layout, paged):
     ):
         raise ValueError(
             "gathered recurrent state and source indices must match retained history"
+        )
+    if (
+        preconv.ndim != 3
+        or preconv.shape[0] != slots
+        or preconv.shape[1] <= 3
+        or preconv.stride(2) != 1
+        or conv_pool.ndim != 3
+        or conv_pool.shape[1:] != (preconv.shape[2], 3)
+        or (paged and conv_pool.shape[0] != pages)
+        or conv_pool.dtype != preconv.dtype
+        or ring_state.shape != (slots, 1)
+        or ring_state.dtype != torch.int32
+        or any(x.device != recurrent.device for x in (conv_pool, preconv, ring_state))
+    ):
+        raise ValueError(
+            "convolution pool [pages, channels, 3], pre-convolution ring "
+            "[record slots, window + 3, channels] and INT32 [record slots, 1] "
+            "ring state must match the retained history"
         )
     if source_indices.numel() == 0:
         return
@@ -112,11 +146,23 @@ def materialize(recurrent, *, history, source_indices, recurrent_layout, paged):
         history.record_slots.stride(0),
         pages,
         slots,
+        conv_pool,
+        preconv,
+        ring_state,
+        history.live_state_indices,
+        history.live_state_indices.stride(0),
+        conv_pool.shape[0],
+        conv_pool.stride(),
+        preconv.stride(0),
+        preconv.stride(1),
+        ring_state.stride(0),
         PAGED=paged,
         K=keys,
         V=values,
         CAPACITY=capacity,
         V_MAJOR=recurrent_layout == "v_major",
+        CHANNELS=preconv.shape[2],
+        WINDOW=preconv.shape[1] - 3,
         BLOCK=256,
         num_warps=4,
         **options,
@@ -190,7 +236,7 @@ def batched_commit(
     conv_state_dtype,
     recurrent_state_dtype,
 ):
-    """Update all layers' convolution, then publish each request's count and ring state.
+    """Publish each request's count and ring state and materialize ended requests, in one launch.
 
     descriptors is contiguous UINT64 [layers, 13]: the pre-convolution ring
     and convolution pointers; page count; ring row, convolution page,
@@ -208,11 +254,8 @@ def batched_commit(
     query_start_loc is the packed [requests + 1] boundary vector. Acceptance is
     clamped to the actual interval and draft_token_num. metadata is contiguous
     INT64 [requests, 3]; stamps is INT64 [layers, slots, ring capacity, 2],
-    including strided layer subsets. In each layer, every accepted stamp must
-    match before that layer's convolution and fold write; the shared publish
-    does not inspect stamps and follows the carried rows, those paged in a
-    group a launched layer lists. history_capacity and stamp ring capacity
-    are independent.
+    including strided layer subsets. history_capacity and stamp ring
+    capacity are independent.
 
     retained_correction, retained_key and retained_decay are the FP32 records
     [record slots, layers, heads, history_capacity, head_dim]. Every layer of
@@ -223,21 +266,30 @@ def batched_commit(
     contiguous INT32 [requests, 2] the round's prepare wrote: the count its
     verify applied (H within [0, history_capacity - draft_token_num], else
     0: the prepare folded the records) and the ring row of its first
-    candidate. Each layer writes the source page's convolution taps followed
-    by the accepted candidates' ring rows, the window after them, into the
-    live page's convolution state; the second launch writes each carried
-    request's count once, to the applied count plus its acceptance, and its
-    ring state past the accepted candidates. request_stopped is a bool per request slot, set
-    for a request that ended in this forward. Such a request's accepted
-    records, through this round's acceptance, are folded into its live
-    page's dense state, and its count and ring state are cleared instead of
-    advanced. No other dense checkpoint or record is copied. request_ends is
-    the contiguous INT32 [requests] ``apply_stop_conditions`` report for
-    these rows, ``REQUEST_ENDED`` exactly for the requests set in
-    request_stopped: a request that ended but whose commit a layer that
-    carried it rejected (stale stamps) keeps records outside its live page,
-    and that layer raises its entry to ``REQUEST_ENDED_INCOMPLETE`` so its
-    finish publishes nothing.
+    candidate.
+
+    The launch's publish programs write each carried request's count once
+    -- carried rows are those paged in a group a launched layer lists --
+    to the applied count plus its acceptance, and its ring state past the
+    accepted candidates; they do not inspect stamps. The ring keeps a
+    request's convolution inputs between materializations, so no layer
+    writes a convolution state for a request that keeps decoding.
+    request_stopped is a bool per request slot, of any element stride, set
+    for a request that ended in this forward. Per layer, the launch's end
+    programs check every accepted stamp of such a request, then fold its
+    accepted records, through this round's acceptance, into its live page's
+    dense state and write the ring's last three accepted inputs, oldest
+    first, as that page's convolution state; the publish clears its count
+    and ring state instead of advancing them. No other dense checkpoint or record is
+    copied. request_ends is the contiguous INT32 [requests]
+    ``apply_stop_conditions`` report for these rows, ``REQUEST_ENDED``
+    exactly for the requests set in request_stopped: a request that ended
+    but whose commit a layer that carried it rejected (stale stamps) keeps
+    records and inputs outside its live page, and that layer raises its
+    entry to ``REQUEST_ENDED_INCOMPLETE`` so its finish publishes nothing.
+    End programs read only the snapshot, stamps, records and ring, and
+    publish programs write only the replay state, so the launch has no
+    read-after-write hazard.
     """
     if (
         num_heads <= 0
@@ -354,8 +406,12 @@ def batched_commit(
     if not layers or not batch:
         return
     kernels, options = _kernels()
-    kernels.retained_batched_conv_kernel[
-        (layers, batch, triton.cdiv(3 * num_heads * head_dim, 256))
+    # Publish programs first, then SPLITS end programs per layer: each loads
+    # the stop flags of the batch and materializes its share (heads h with
+    # h % SPLITS == split, and a channel slice) of the requests that ended.
+    splits = min(num_heads, _END_SPLITS)
+    kernels.retained_batched_commit_kernel[
+        (triton.cdiv(batch, _COMMIT_BLOCK) + layers * splits,)
     ](
         descriptors,
         group_indices,
@@ -369,42 +425,6 @@ def batched_commit(
         request_stopped,
         replay_snapshot,
         request_ends,
-        read_indices.shape[0],
-        *read_indices.stride(),
-        *write_indices.stride(),
-        accepted_length.stride(0),
-        query_start_loc.stride(0),
-        record_slots.stride(0),
-        record_slot_count,
-        record_stamps.stride(),
-        record_stamps.shape[1],
-        record_stamps.shape[2],
-        request_stopped.numel(),
-        *records,
-        *(x.stride() for x in records),
-        WINDOW=draft_token_num,
-        CHANNELS=3 * num_heads * head_dim,
-        CONV=types[conv_state_dtype],
-        STATE=types[recurrent_state_dtype],
-        HEADS=num_heads,
-        DIM=head_dim,
-        BLOCK=256,
-        ENDED=REQUEST_ENDED,
-        INCOMPLETE=REQUEST_ENDED_INCOMPLETE,
-        num_warps=4,
-        **options,
-    )
-    # A request's count and ring state publish once every layer committed.
-    kernels.retained_batched_publish_kernel[(triton.cdiv(batch, 256),)](
-        descriptors,
-        group_indices,
-        read_indices,
-        write_indices,
-        accepted_length,
-        query_start_loc,
-        record_slots,
-        request_stopped,
-        replay_snapshot,
         replay_state,
         batch,
         layers,
@@ -416,9 +436,26 @@ def batched_commit(
         record_slots.stride(0),
         record_slot_count,
         replay_state.stride(0),
+        record_stamps.stride(),
+        record_stamps.shape[1],
+        record_stamps.shape[2],
         request_stopped.numel(),
+        request_stopped.stride(0),
+        *records,
+        *(x.stride() for x in records),
         WINDOW=draft_token_num,
-        BLOCK=256,
+        CHANNELS=3 * num_heads * head_dim,
+        CONV=types[conv_state_dtype],
+        STATE=types[recurrent_state_dtype],
+        HEADS=num_heads,
+        DIM=head_dim,
+        SPLITS=splits,
+        # Model-fixed bounds of the group and layer counts.
+        GROUPS=triton.next_power_of_2(read_indices.shape[0]),
+        LAYERS=triton.next_power_of_2(layers),
+        BLOCK=_COMMIT_BLOCK,
+        ENDED=REQUEST_ENDED,
+        INCOMPLETE=REQUEST_ENDED_INCOMPLETE,
         num_warps=4,
         **options,
     )

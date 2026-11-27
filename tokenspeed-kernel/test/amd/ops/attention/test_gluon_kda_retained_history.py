@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     kda_fused_paged_verify,
     resolve_kda_batched_retained_commit,
 )
+from tokenspeed_kernel.ops.metadata import REQUEST_ENDED, REQUEST_ENDED_INCOMPLETE
 from utils import assert_no_triton_compile, is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
@@ -54,15 +55,12 @@ DECODE = importlib.import_module(
 from tokenspeed_kernel.ops.attention.kda._triton import retained as prepared
 from tokenspeed_kernel_amd.ops import _kda_records as records
 
-# The verify with the prepare ahead of it, then the commit's two launches.
+# The verify with the prepare ahead of it, then the commit's single launch.
 VERIFY_KERNELS = (
     getattr(DECODE, f"gluon_kda_fused_paged_verify_nostore_vmajor_{ARCH}"),
     prepared.retained_batched_prepare_kernel,
 )
-COMMIT_KERNELS = (
-    records.retained_batched_conv_kernel,
-    records.retained_batched_publish_kernel,
-)
+COMMIT_KERNELS = (records.retained_batched_commit_kernel,)
 KERNELS = VERIFY_KERNELS + COMMIT_KERNELS
 VERIFY = getattr(api, f"gluon_kda_retained_verify_{ARCH}")
 
@@ -446,9 +444,18 @@ def _case(
                 metadata[0, 2] = -1
         length_before = length.clone()
         conv_before = conv.clone()
-        # Serving commits all layers in one batched launch pair; commit this
+        # The commit checks stamps only for a request that ended in this
+        # forward, so a stale-stamp case ends row 0's request.
+        request_stopped = torch.zeros(
+            history.length.shape[0], device="cuda", dtype=torch.bool
+        )
+        request_ends = torch.zeros(batch, device="cuda", dtype=torch.int32)
+        if corruption:
+            request_stopped[int(slots[0])] = True
+            request_ends[0] = REQUEST_ENDED
+        # Serving commits all layers in one batched launch; commit this
         # test's one layer as kda_retained_reference.commit does, building
-        # every argument before a CUDA graph captures the launches.
+        # every argument before a CUDA graph captures the launch.
         commit = resolve_kda_batched_retained_commit(
             mixed.dtype, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
         )
@@ -487,11 +494,8 @@ def _case(
             retained_decay=history.decay[:, None],
             replay_state=replay_state(history),
             replay_snapshot=snapshot(history, batch),
-            # No request ends in these rounds.
-            request_stopped=torch.zeros(
-                history.length.shape[0], device="cuda", dtype=torch.bool
-            ),
-            request_ends=torch.zeros(batch, device="cuda", dtype=torch.int32),
+            request_stopped=request_stopped,
+            request_ends=request_ends,
             draft_token_num=width,
             history_capacity=capacity,
             num_heads=heads,
@@ -517,14 +521,43 @@ def _case(
             capture_commit.replay()
         else:
             commit(**commit_kwargs)
-        if corruption and corruption != "rejected":
-            # The layer rejects the commit and shifts no window. The count
-            # every layer shares still advances: a stale stamp means a layer's
-            # verify did not run, which serving never does.
-            torch.testing.assert_close(conv, conv_before, atol=0, rtol=0)
+        if corruption:
+            # Row 0's request ended: the publish clears its count and ring
+            # state whatever its stamps say, and the records stay as they are.
+            slot, dst = int(slots[0]), int(live[0])
+            assert replay_state(history)[slot].tolist() == [0, 0]
+            for actual, before_record in zip((u, key, decay), records_before):
+                torch.testing.assert_close(actual, before_record, atol=0, rtol=0)
+            if corruption != "rejected":
+                # A stale stamp in the accepted prefix: the layer rejects the
+                # commit, folds nothing, writes no convolution state and
+                # reports the request's state incomplete.
+                assert request_ends.tolist() == [REQUEST_ENDED_INCOMPLETE]
+                torch.testing.assert_close(state, dense_before, atol=0, rtol=0)
+                torch.testing.assert_close(conv, conv_before, atol=0, rtol=0)
+                return history
+            # The stale stamp lies past the acceptance: the layer folds the
+            # accepted records and writes the ring's window after them, so the
+            # live page holds the request's complete endpoint.
+            assert request_ends.tolist() == [REQUEST_ENDED]
             old = 0 if old_lengths[0] > capacity - width else old_lengths[0]
             take = max(0, min(accepted, lengths[0]))
-            assert int(length[int(slots[0]), 0]) == old + take
+            assert take and old + take > 0
+            begin = starts_list[0]
+            window = torch.cat((expected_conv[0], mixed[begin : begin + take].T), -1)[
+                :, -3:
+            ]
+            torch.testing.assert_close(conv[dst], window, atol=0, rtol=0)
+            torch.testing.assert_close(
+                state[dst].float(), references[0][1][take - 1], atol=4e-6, rtol=4e-5
+            )
+            others = [page for page in range(pages) if page != dst]
+            torch.testing.assert_close(
+                conv[others], conv_before[others], atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                state[others], dense_before[others], atol=0, rtol=0
+            )
             return history
         torch.testing.assert_close(state, dense_before, atol=0, rtol=0)
         for actual, before_record in zip((u, key, decay), records_before):
@@ -553,7 +586,15 @@ def _case(
                 expected_conv[r] = torch.cat(
                     (expected_conv[r], mixed[begin : begin + take].T), -1
                 )[:, -3:]
-            torch.testing.assert_close(conv[dst], expected_conv[r], atol=0, rtol=0)
+            # No request ended: the ring's three rows before the published
+            # head hold the window, and the commit leaves the live page's
+            # convolution state as it was.
+            torch.testing.assert_close(conv[dst], conv_before[dst], atol=0, rtol=0)
+            published = int(replay_state(history)[int(slots[r]), 1]) - 1
+            last = [(published - 3 + i) % ring_rows for i in range(3)]
+            torch.testing.assert_close(
+                preconv.rows[int(slots[r]), last].T, expected_conv[r], atol=0, rtol=0
+            )
             torch.testing.assert_close(
                 _reconstruct(state[dst], history, int(slots[r]), old + take),
                 expected[r],

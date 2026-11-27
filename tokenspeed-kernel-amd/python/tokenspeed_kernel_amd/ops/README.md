@@ -2099,6 +2099,8 @@ sequence position: seeding fills rows 0..2, so a reseeded slot's first
 candidate goes to row 3 whatever the request's length. Beside H, the slot's
 INT32 ring state is 0 while the ring holds no rows, else the ring head plus
 one; the replay state `[slots, 2]` holds both, and every reset clears both.
+Between materializations a seeded ring, not the page, holds the request's
+convolution window: decode commits write no page's convolution state.
 The launchers reject a ring whose rows or slots share memory (expanded or
 overlapping strides) or whose storage overlaps the projection inputs.
 
@@ -2140,18 +2142,17 @@ activation-dtype rounding, gate projection and state-panel scheduling are
 shared by one-token and speculative windows. The registered activation dtype
 is BF16.
 
-Retained commit clamps the accepted count to the actual window and writes the
-live page's convolution from the source page's taps and the accepted
-candidates' ring rows, at the ring head of the prepare's snapshot. It does not
-replay dense state or copy retained records, except to fold a request that
-ended. Zero acceptance still copies source convolution history to a distinct
-live page. Invalid accepted stamps prevent that layer's convolution writes;
-if the row's request ended in this forward, that layer raises its
+Retained commit (`retained_batched_commit_kernel`) is one launch per verify
+round, mirroring the NVIDIA Triton kernel line for line. It clamps the
+accepted count to the actual window. For a request that keeps decoding it
+writes no page: the ring keeps the window. For a request that ended in this
+forward, each layer folds its records into its live page and writes the
+ring's last three accepted inputs, rows `(head + take - 3 + i) mod R` from the
+prepare's snapshot head, as the page's convolution taps. Invalid accepted
+stamps prevent that layer's writes, and the layer raises the row's
 `request_ends` entry from `REQUEST_ENDED` to `REQUEST_ENDED_INCOMPLETE` with a
-compare-and-swap. It does so after the convolution window loads and reads no
-stop flag on that path, so the uniform descriptor fields stay scalar loads.
-Stamps validate the current candidate window; accepted history is
-independent of stamp-ring reuse.
+compare-and-swap. Stamps validate the current candidate window; accepted
+history is independent of stamp-ring reuse.
 
 The public adapter accepts `KdaRetainedRecords`, including its
 `KdaRetainedHistory`; the AMD package receives the tensors explicitly and has
@@ -2159,25 +2160,32 @@ no dependency on `tokenspeed-kernel`. Batched commit uses a 13-column
 descriptor: ring and convolution pointers, the page count, per-layer element
 strides, the v-major recurrent-state pointer and its strides, then the ring's
 record-slot stride; the count and ring state every layer shares are an INT32
-`[slots, 2]` tensor of their own, and record slots select each request's. One
-launch updates all layers' convolution and reads the prepare's snapshot; a
-second, one-dimensional launch then writes each carried request's count once,
-to `eff` plus its acceptance, and its ring state past the accepted
-candidates, with no scratch and no cross-program reduction. A request whose
-slot is set in `request_stopped` ended in this forward: the convolution launch
-also folds its records into its live page, each program taking some heads, and
-the count launch clears its count and ring state. Rows no layer carries (graph
-padding, a masked overlap row, a row paged only in groups no launched layer
-lists) keep their replay state.
+`[slots, 2]` tensor of their own, and record slots select each request's. The
+launch's first `cdiv(batch, 256)` programs publish: each writes the count of
+up to 256 carried requests once, to `eff` plus the acceptance, and their ring
+states past the accepted candidates, from the prepare's snapshot, with no
+scratch and no cross-program reduction; a request whose slot is set in
+`request_stopped` gets both cleared instead. The other `layers x min(heads,
+16)` programs, one per layer and head split, load the stop flags of up to
+256 rows at once and visit only the rows whose request ended, so the grid
+does not grow with the batch times the channel blocks; each folds its heads'
+records and writes its slice of the channels of the ring window. End
+programs read only the snapshot, stamps, records and ring and publish
+programs write only the replay state, so the launch has no read-after-write
+hazard. Rows no layer carries (graph padding, a masked overlap row, a row
+paged only in groups no launched layer lists) keep their replay state.
 Public verify requires retained records; unsupported configurations fail
 instead of selecting another checkpoint format.
 
-Prefill materializes source history into its existing gathered dense input;
-every layer reads the same counts, which clear once with the ring states,
-after the last KDA layer's gather. These utilities use wave64 on gfx950 and
-wave32 on gfx1250. Before a retraction stores its image, the victim's accepted
-records are materialized directly into its physical page, layer by layer,
-before its slot's count and ring state are reset once.
+Prefill materializes source history into its existing gathered dense input
+and writes a seeded ring's last three inputs over the taps the gather copied
+into the live page, before the prefill convolution reads them; every layer
+reads the same counts and ring states, which clear once after the last KDA
+layer's gather. These utilities use wave64 on gfx950 and wave32 on gfx1250.
+Before a retraction stores its image, the victim's accepted records and, for
+a seeded ring, its last three inputs are materialized directly into its
+physical page, layer by layer, before its slot's count and ring state are
+reset once.
 
 
 ## Transform
