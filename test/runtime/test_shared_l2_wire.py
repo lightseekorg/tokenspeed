@@ -23,6 +23,7 @@
 import os
 import sys
 import threading
+from types import ModuleType
 
 import msgspec
 import pytest
@@ -70,3 +71,54 @@ def test_owner_connection_round_trips_ipv6_loopback() -> None:
         assert reply == {"ok": True, "echo": "ping"}
     finally:
         rep.close(0)
+
+
+class _StopBeforeRegister(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("hostname", "initial_env", "expected_env"),
+    [
+        ("fd00::1", None, "1"),
+        ("10.0.0.1", None, None),
+        ("fd00::1", "0", "0"),
+    ],
+)
+def test_provider_sets_mooncake_ipv6_before_transfer_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    hostname: str,
+    initial_env: str | None,
+    expected_env: str | None,
+) -> None:
+    """run_provider enables MC_USE_IPV6 before initializing TransferEngine."""
+    monkeypatch.setenv("MC_USE_IPV6", "")
+    monkeypatch.delenv("MC_USE_IPV6")
+    if initial_env is not None:
+        monkeypatch.setenv("MC_USE_IPV6", initial_env)
+    monkeypatch.setenv("TOKENSPEED_MOONCAKE_LIBRARY", "/tmp/libfake.so")
+
+    seen_env: list[str | None] = []
+
+    class _FakeTransferEngine:
+        def __init__(self, **_kwargs: object) -> None:
+            seen_env.append(os.environ.get("MC_USE_IPV6"))
+            raise _StopBeforeRegister("stop after TransferEngine env check")
+
+    fake_engine = ModuleType("tokenspeed_engine")
+    fake_engine.TransferEngine = _FakeTransferEngine  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tokenspeed_engine", fake_engine)
+
+    from tokenspeed.runtime.cache.shared_l2 import provider
+
+    monkeypatch.setattr(provider, "tokenspeed_engine", fake_engine)
+
+    with pytest.raises(_StopBeforeRegister):
+        provider.run_provider(
+            owner_address="tcp://[::1]:47100",
+            hostname=hostname,
+            device_name="mlx5_0",
+            size_bytes=4096,
+            stop=threading.Event(),
+        )
+    assert seen_env == [expected_env]

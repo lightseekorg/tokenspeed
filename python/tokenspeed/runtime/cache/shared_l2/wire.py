@@ -33,10 +33,25 @@ number). A prompt's tokens travel as int32 bytes.
 
 from __future__ import annotations
 
+import ipaddress
+import os
 from typing import Any
 
 import msgspec
 import zmq
+
+
+def enable_mooncake_ipv6_for_host(hostname: str) -> None:
+    """Enable Mooncake IPv6 transport when ``hostname`` is an IPv6 literal.
+
+    Keeps the provider module free of runtime/device imports while matching the
+    rank-side IPv6 bootstrap contract (`MC_USE_IPV6=1` unless already set).
+    """
+    try:
+        ipaddress.IPv6Address(hostname)
+    except ValueError:
+        return
+    os.environ.setdefault("MC_USE_IPV6", "1")
 
 
 class OwnerError(RuntimeError):
