@@ -182,9 +182,7 @@ impl Holder {
         request: Request,
         now: Instant,
     ) -> (String, Reply) {
-        if !matches!(request, Request::Lookup { .. }) {
-            self.records.retain(|_, record| now < record.expires);
-        }
+        self.records.retain(|_, record| now < record.expires);
         match request {
             Request::Reading { .. } => {
                 unreachable!("read liveness belongs to the autonomous driver")
@@ -192,13 +190,29 @@ impl Holder {
             Request::Layout { reply_to } => (reply_to, self.layout()),
             Request::Lookup { lease, prompt } => {
                 let lookup = prompt.lookup_event(&lease);
-                self.lookup(
-                    lookup,
-                    cache.lease_can_pin(&lease),
-                    cache.lease_held(&lease),
-                    now,
-                    |q, pending| cache.answer_lookup(q, pending),
-                )
+                let pending_new_leases = self.unsynced_new_leases.len()
+                    - usize::from(self.unsynced_new_leases.contains(&lease));
+                let answer = cache.answer_lookup(&lookup, pending_new_leases);
+                if answer.num_tokens > 0
+                    && !cache.lease_can_pin(&lease)
+                    && !cache.lease_held(&lease)
+                {
+                    self.unsynced_new_leases.insert(lease.clone());
+                }
+                if answer.num_tokens > 0 || cache.lease_can_pin(&lease) {
+                    self.changes.push(lookup.clone());
+                }
+                self.records.insert(
+                    lease.clone(),
+                    Record {
+                        lookup,
+                        answer: answer.clone(),
+                        lookup_synced: false,
+                        pinned_at: None,
+                        expires: now + self.record_lifetime,
+                    },
+                );
+                self.reply(lease, answer)
             }
             Request::CheckpointPin { checkpoint, .. } => {
                 let answer = self.answer(&checkpoint.lease, PeerAnswerKind::Pin);
@@ -262,46 +276,8 @@ impl Holder {
         }
     }
 
-    pub(super) fn lookup(
-        &mut self,
-        lookup: PeerEventView,
-        soft: bool,
-        held: bool,
-        now: Instant,
-        query: impl FnOnce(&PeerEventView, usize) -> PeerAnswerView,
-    ) -> (String, Reply) {
-        self.records.retain(|_, record| now < record.expires);
-        let lease = lookup.lease.clone();
-        let pending_new_leases =
-            self.unsynced_new_leases.len() - usize::from(self.unsynced_new_leases.contains(&lease));
-        let answer = query(&lookup, pending_new_leases);
-        if answer.num_tokens > 0 && !soft && !held {
-            self.unsynced_new_leases.insert(lease.clone());
-        }
-        if answer.num_tokens > 0 || soft {
-            self.changes.push(lookup.clone());
-        }
-        self.records.insert(
-            lease.clone(),
-            Record {
-                lookup,
-                answer: answer.clone(),
-                lookup_synced: false,
-                pinned_at: None,
-                expires: now + self.record_lifetime,
-            },
-        );
-        self.reply(lease, answer)
-    }
-
-    pub(super) fn has_changes(&self) -> bool {
-        !self.changes.is_empty()
-    }
-
     pub(super) fn finish_record(&mut self, lease: &PeerLeaseView) {
         self.records.remove(lease);
-        self.unsynced_new_leases.remove(lease);
-        self.changes.retain(|c| &c.lease != lease);
     }
 
     /// The changes answered since the last take, in order, for the next head.

@@ -20,6 +20,7 @@
 
 //! Reader reservations, pin/GO agreement and asynchronous retirement.
 use super::{
+    coordinated::ReadPath,
     geometry::Spans,
     layout::PeerReadPlan,
     offers::{manifest, prefix, Vote, DONE, READY},
@@ -61,12 +62,14 @@ pub(super) struct Attempt {
     votes: [Option<u8>; 8],
     fenced: bool,
     voted: bool,
-    published: bool,
+    published_hit: Option<bool>,
+    read_path: Option<ReadPath>,
     deadline: i64,
     retry: i64,
     submit_until: std::time::Instant,
     renewed: bool,
     pin_started_us: Option<i64>,
+    retired_us: Option<i64>,
     retire_wait: bool,
     invalid: bool,
     frozen: bool,
@@ -97,12 +100,14 @@ impl Attempt {
             votes: [None; 8],
             fenced: false,
             voted: false,
-            published: false,
+            published_hit: None,
+            read_path: None,
             deadline,
             retry: 0,
             submit_until: std::time::Instant::now() + super::v1::SUBMIT_WINDOW,
             renewed: false,
             pin_started_us: None,
+            retired_us: None,
             retire_wait: false,
             invalid: false,
             frozen: false,
@@ -114,7 +119,7 @@ impl Attempt {
         let Phase::Closing(disposition) = self.phase else {
             return None;
         };
-        if !self.published || now < self.deadline {
+        if self.published_hit.is_none() || now < self.deadline {
             return None;
         }
         let release = Message::Release(self.key.take()?, self.offer.take()?.id, disposition);
@@ -310,18 +315,46 @@ impl Attempt {
         self.seal();
         None
     }
-    pub fn read_sample(&self, now: i64) -> Option<(i32, i64)> {
+    pub fn estimated_read_path(
+        &self,
+        key: &Key,
+        local: &Replica,
+        end: i32,
+        pages: &[PeerPageView],
+    ) -> Option<ReadPath> {
+        use ts_pd::layout::manifest::logical_slot_ranges;
+        let begin = self.lookup.local_tokens;
+        if begin < 0 || begin >= end {
+            return None;
+        }
+        let slots = local
+            .contract
+            .group_specs
+            .iter()
+            .map(|group| logical_slot_ranges(group, begin.into(), end.into(), false))
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        let tiers = pages.iter().filter_map(|page| {
+            let ranges = slots.get(page.group_id as usize)?;
+            ranges
+                .iter()
+                .any(|r| r.contains(&i64::from(page.slot)))
+                .then_some(page.tier)
+        });
+        ReadPath::from_tiers(key, self.source.as_ref()?.members.len(), tiers)
+    }
+
+    // A frozen landing has already fallen back even if DMA retirement or
+    // a release ACK arrives later. Consume the clock only once per attempt.
+    pub fn take_read_sample(&mut self, now: i64) -> Option<(ReadPath, i32, i64, bool)> {
+        let hit = self.published_hit?;
+        let path = self.read_path?;
         let f = self.fetch.as_ref()?;
-        Some((
-            f.end_tokens - f.begin_tokens,
-            now.checked_sub(self.pin_started_us?)?,
-        ))
-    }
-    pub fn source_width(&self) -> usize {
-        self.source.as_ref().map_or(0, |s| s.members.len())
-    }
-    pub fn pages(&self) -> &[PeerPageView] {
-        &self.pages
+        let elapsed = self
+            .retired_us
+            .unwrap_or(now)
+            .checked_sub(self.pin_started_us.take()?)?;
+        Some((path, f.end_tokens - f.begin_tokens, elapsed, hit))
     }
     pub fn reserve(
         &mut self,
@@ -365,6 +398,13 @@ impl Attempt {
                         planner.reads(&endpoints, &local.members[rank].endpoint(), &pairs)
                     }) {
                     Ok(batches) => {
+                        // All members pair the same logical slots, including slots
+                        // whose physical destination belongs to a different rank.
+                        self.read_path = ReadPath::from_tiers(
+                            k,
+                            endpoints.len(),
+                            pairs.iter().map(|(p, _)| p.tier),
+                        );
                         plan = Some(
                             batches
                                 .into_iter()
@@ -410,20 +450,20 @@ impl Attempt {
         }
     }
     fn freeze(&mut self, round: &mut PeerRound) {
-        if self.published {
+        if self.published_hit.is_some() {
             return;
         }
         if let Some(f) = &self.fetch {
             round.events.push(event(PeerEventKind::FetchFrozen, f, 0));
-            self.published = true;
+            self.published_hit = Some(false);
             self.frozen = true;
         }
     }
     fn finish(&mut self, ok: bool, round: &mut PeerRound) {
-        if self.published {
+        if self.published_hit.is_some() {
             return;
         }
-        self.published = true;
+        self.published_hit = Some(ok);
         if let Some(f) = &self.fetch {
             if ok {
                 round
@@ -438,6 +478,7 @@ impl Attempt {
         }
     }
     fn close(&mut self, d: Disposition, now: i64) -> Message {
+        self.retired_us = Some(now);
         self.phase = Phase::Closing(d);
         self.retry = now.saturating_add(50_000);
         self.deadline = now.saturating_add(2_000_000);

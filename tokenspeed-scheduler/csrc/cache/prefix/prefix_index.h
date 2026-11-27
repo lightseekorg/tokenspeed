@@ -350,7 +350,6 @@ public:
     // anything is registered; an index never bound holds nothing.
     void TrackBoundaries(BoundaryTree& tree, const BlockPool& device_pool, const BlockPool* host_pool,
                          const BlockPool* disk_pool, bool state, bool closed) {
-        peer_index_mutex_ = &tree.peer_index_mutex;
         const auto bind = [&](const BlockPool& pool, CacheTier tier) {
             CacheEntries& cache_index = cacheEntries(pool);
             _assert(cache_index.boundary_tree == nullptr && cache_index.entries.empty(),
@@ -389,7 +388,6 @@ public:
     void Register(const BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
                   std::int32_t logical_block_index, CacheBoundaryKind boundary_kind,
                   std::vector<std::pair<CacheKey, CacheBlockRef>>* newly_cached, SessionCacheOwner session) {
-        auto guard = lockPeerIndex();
         _assert(block_ref && block_ref.IsOwnedBy(pool), "cache block must belong to the target pool");
         _assert(pool.BoundGroup(block_ref->Location().lcm_block_id) == group_id_,
                 "cache block must belong to the prefix index group");
@@ -943,7 +941,6 @@ public:
     // follow. It is pinned while the caller's reference to `to` lives; the
     // old block is the caller's to release.
     void Relocate(const BlockPool& pool, CacheBlockLocation from, const CacheBlockRef& to) {
-        auto guard = lockPeerIndex();
         _assert(to && to.IsOwnedBy(pool), "the destination block must belong to the entry's pool");
         _assert(pool.BoundGroup(to->Location().lcm_block_id) == group_id_,
                 "the destination block must belong to the prefix index group");
@@ -1345,7 +1342,6 @@ private:
         return cache_index.by_location.Find(location);
     }
     void eraseEntry(CacheEntries& cache_index, CacheEntryIterator entry_it) {
-        auto guard = lockPeerIndex();
         if (CacheEntry* peer = entry_it->common_peer) {
             CacheEntries& source = cache_index.common_source ? cache_index : *cache_index.common_peer;
             CacheEntry& source_entry = cache_index.common_source ? *entry_it : *peer;
@@ -1363,10 +1359,6 @@ private:
         ++cache_index.membership;
     }
 
-    std::unique_lock<std::shared_mutex> lockPeerIndex() const {
-        return peer_index_mutex_ ? std::unique_lock(*peer_index_mutex_) : std::unique_lock<std::shared_mutex>{};
-    }
-    std::shared_mutex* peer_index_mutex_{nullptr};
     std::uint32_t group_id_;
     // One per pool this index serves (the coordinator's Device and Host
     // tiers): scanning these few addresses costs less than hashing one on

@@ -131,16 +131,6 @@ PeerAnswer PeerExports::AnswerLookup(const CacheCoordinator& coordinator, const 
     return answer;
 }
 
-PeerAnswer PeerLookupIndex::Answer(const cache::PeerLookup& lookup, std::size_t pending) const {
-    if (leases && !leases->CanAcceptLookup(lookup.lease, pending)) {
-        return PeerAnswer{.lease = lookup.lease, .kind = PeerAnswerKind::kLookup};
-    }
-    const auto& tree = cache.Store().Boundaries();
-    std::shared_lock index(tree.peer_index_mutex);
-    std::shared_lock tails(tree.peer_tail_mutex);
-    return PeerExports::AnswerLookup(cache, lookup);
-}
-
 bool PeerExports::Matches(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int32_t num_tokens,
                           std::span<const PeerPage> pages) {
     if (!WellFormed(lookup, coordinator.PrefixGranularity()) || num_tokens <= 0 || num_tokens > lookup.max_tokens) {
@@ -152,7 +142,6 @@ bool PeerExports::Matches(const CacheCoordinator& coordinator, const cache::Peer
 }
 
 bool PeerExports::CanAcceptLookup(const PeerLeaseId& lease, std::size_t pending_new_leases) const {
-    std::lock_guard guard(lookup_lease_mutex_);
     if (leases_.contains(lease)) {
         return true;
     }
@@ -161,7 +150,6 @@ bool PeerExports::CanAcceptLookup(const PeerLeaseId& lease, std::size_t pending_
 }
 
 bool PeerExports::CanPin(const PeerLeaseId& lease) const {
-    std::lock_guard guard(lookup_lease_mutex_);
     const auto it = leases_.find(lease);
     return it != leases_.end() && it->second.phase == Phase::kSoft;
 }
@@ -186,7 +174,6 @@ void PeerPinRelease::Close() noexcept {
 }
 
 std::shared_ptr<PeerPinRelease> PeerExports::ReleaseHandle(const PeerLeaseId& id) {
-    std::lock_guard guard(lookup_lease_mutex_);
     auto it = leases_.find(id);
     if (it == leases_.end() || it->second.phase != Phase::kHard) return {};
     auto& pins = it->second.pins;
@@ -195,14 +182,12 @@ std::shared_ptr<PeerPinRelease> PeerExports::ReleaseHandle(const PeerLeaseId& id
 }
 
 bool PeerExports::Held(const PeerLeaseId& lease) const {
-    std::lock_guard guard(lookup_lease_mutex_);
     const auto it = leases_.find(lease);
     return it != leases_.end() && it->second.phase == Phase::kHard &&
            !(it->second.pins.handle && it->second.pins.handle->Released());
 }
 
 void PeerExports::Lookup(CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int64_t now_us) {
-    std::lock_guard guard(lookup_lease_mutex_);
     // A lookup repeated under the same lease starts it over.
     leases_.erase(lookup.lease);
     if (!WellFormed(lookup, coordinator.PrefixGranularity()) ||
@@ -228,7 +213,6 @@ void PeerExports::Lookup(CacheCoordinator& coordinator, const cache::PeerLookup&
 
 void PeerExports::Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, std::int64_t now_us,
                       const cache::PeerLookup* checkpoint) {
-    std::lock_guard guard(lookup_lease_mutex_);
     auto it = leases_.find(pin.lease);
     if (checkpoint != nullptr) {
         if (!WellFormed(*checkpoint, coordinator.PrefixGranularity()) || checkpoint->lease != pin.lease ||
@@ -289,7 +273,6 @@ void PeerExports::Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, 
 }
 
 void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerRelease& release, std::int64_t now_us) {
-    std::lock_guard guard(lookup_lease_mutex_);
     const auto it = leases_.find(release.lease);
     if (it == leases_.end()) {
         return;
@@ -309,7 +292,6 @@ void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerReleas
 }
 
 void PeerExports::Expire(std::int64_t now_us, bool retain_hard) {
-    std::lock_guard guard(lookup_lease_mutex_);
     // Older libstdc++ versions pass const entries to erase_if predicates.
     // Expiration also updates hard pins, so walk the mutable entries directly.
     for (auto it = leases_.begin(); it != leases_.end();) {
