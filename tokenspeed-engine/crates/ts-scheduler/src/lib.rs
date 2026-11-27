@@ -1053,16 +1053,6 @@ mod ffi {
             events: &[PeerEventView],
         ) -> Result<()>;
         #[namespace = "tokenspeed"]
-        type PeerLookupIndex;
-        fn peer_lookup_index(scheduler: &Scheduler) -> UniquePtr<PeerLookupIndex>;
-        fn lookup_lease_can_pin(index: &PeerLookupIndex, lease: &PeerLeaseView) -> bool;
-        fn lookup_lease_held(index: &PeerLookupIndex, lease: &PeerLeaseView) -> bool;
-        fn query_peer_index(
-            index: &PeerLookupIndex,
-            lookup: &PeerEventView,
-            pending: usize,
-        ) -> PeerAnswerView;
-        #[namespace = "tokenspeed"]
         type PeerPinRelease;
         fn peer_release_handle(
             scheduler: Pin<&mut Scheduler>,
@@ -1356,7 +1346,7 @@ pub fn python_module(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyModule
 pub struct Scheduler {
     raw: NonNull<ffi::Scheduler>,
     /// Keeps the C++ scheduler alive.
-    _owner: std::sync::Arc<Py<PyAny>>,
+    _owner: Py<PyAny>,
 }
 
 // SAFETY: the scheduler has no thread affinity; exclusive access goes through
@@ -1364,28 +1354,6 @@ pub struct Scheduler {
 unsafe impl Send for Scheduler {}
 
 // Unpin and owner-side revocation synchronize inside the ticket.
-/// A read-only handle to the same native index. The Python owner outlives every query.
-pub struct PeerLookupIndex {
-    raw: cxx::UniquePtr<ffi::PeerLookupIndex>,
-    _owner: std::sync::Arc<Py<PyAny>>,
-}
-// Only the guarded native query is exposed.
-unsafe impl Send for ffi::PeerLookupIndex {}
-unsafe impl Sync for ffi::PeerLookupIndex {}
-impl PeerLookupIndex {
-    /// Check the holder's native soft and hard lease under its lease-table lock.
-    pub fn lease_state(&self, lease: &PeerLeaseView) -> (bool, bool) {
-        (
-            ffi::lookup_lease_can_pin(&self.raw, lease),
-            ffi::lookup_lease_held(&self.raw, lease),
-        )
-    }
-    /// Copy the matched prefix and its page IDs while the native indexes are stable.
-    pub fn answer(&self, lookup: &PeerEventView, pending: usize) -> PeerAnswerView {
-        ffi::query_peer_index(&self.raw, lookup, pending)
-    }
-}
-
 /// A revocable handle to one native lease's existing strong references.
 pub struct PeerReleaseHandle(cxx::SharedPtr<ffi::PeerPinRelease>);
 impl PeerReleaseHandle {
@@ -1399,14 +1367,6 @@ unsafe impl Send for PeerPinRelease {}
 unsafe impl Sync for PeerPinRelease {}
 
 impl Scheduler {
-    /// Borrow the live cache independently of the scheduling loop.
-    pub fn peer_lookup_index(&self) -> PeerLookupIndex {
-        PeerLookupIndex {
-            raw: ffi::peer_lookup_index(self.get()),
-            _owner: self._owner.clone(),
-        }
-    }
-
     /// A revocable, thread-safe release handle for an existing hard pin.
     pub fn peer_release_handle(&mut self, lease: &PeerLeaseView) -> PeerReleaseHandle {
         PeerReleaseHandle(ffi::peer_release_handle(self.pinned(), lease))
@@ -1420,7 +1380,7 @@ impl Scheduler {
         let raw = NonNull::new(raw).ok_or_else(|| PyErr::fetch(object.py()))?;
         Ok(Self {
             raw,
-            _owner: std::sync::Arc::new(object.clone().unbind()),
+            _owner: object.clone().unbind(),
         })
     }
 

@@ -387,8 +387,18 @@ fn four_seconds_after_lookup_repin_requires_every_original_shard() {
     delayed_checkpoint_reads(|| 4_000_001);
 }
 
-fn shard_request(id: &str, peer: &str) -> RequestSpec {
-    RequestSpec {
+fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
+    use super::super::{offers::Offers, v1::Disposition, wire::Prompt};
+    use ts_scheduler::{ForwardEvent, ForwardEventKind};
+    let layout = layout();
+    let generation = |name: &str| Generation {
+        name: name.into(),
+        incarnation: 1,
+        epoch: 1,
+    };
+    let reader = generation("reader:1");
+    let holder = generation("holder:1");
+    let spec = |id: &str, peer: &str| RequestSpec {
         admission_id: 0,
         request_id: id.into(),
         session_id: String::new(),
@@ -398,76 +408,44 @@ fn shard_request(id: &str, peer: &str) -> RequestSpec {
         tokens: (1..=133).collect(),
         max_new_tokens: 4,
         max_cached_prefix_tokens: i32::MAX,
-    }
-}
-fn shard_event(
-    kind: ts_scheduler::ForwardEventKind,
-    id: &str,
-    tokens: Vec<i32>,
-) -> ts_scheduler::ForwardEvent {
-    ts_scheduler::ForwardEvent {
+    };
+    let event = |kind, id: &str, tokens| ForwardEvent {
         kind,
         request_id: id.into(),
         tokens,
         spec_candidate_ids: vec![],
         reserve_num_tokens: 0,
         bootstrap_token: -1,
-    }
-}
-
-fn seeded_holder(name: &str) -> Vec<Arc<Mutex<Scheduler>>> {
-    use ts_scheduler::ForwardEventKind;
-    (0..8)
-        .map(|_| {
-            let s = scheduler(name, Duration::from_secs(1));
-            let mut c = s.lock();
-            c.submit_requests(&[shard_request("seed", "")]).unwrap();
-            c.advance(&[shard_event(
-                ForwardEventKind::PdBootstrapped,
-                "seed",
-                vec![],
-            )])
-            .unwrap();
-            assert!(!c
-                .next_execution_plan(true, false)
-                .forward_batches()
-                .is_empty());
-            c.advance(&[shard_event(ForwardEventKind::ExtendResult, "seed", vec![1])])
-                .unwrap();
-            c.next_execution_plan(true, false);
-            c.advance(&[shard_event(ForwardEventKind::PdSucceeded, "seed", vec![])])
-                .unwrap();
-            drop(c);
-            s
-        })
-        .collect()
-}
-
-fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
-    use super::super::{offers::Offers, v1::Disposition, wire::Prompt};
-    use ts_scheduler::ForwardEventKind;
-    let layout = layout();
-    let generation = |name: &str| Generation {
-        name: name.into(),
-        incarnation: 1,
-        epoch: 1,
     };
-    let reader = generation("reader:1");
-    let holder = generation("holder:1");
     for evict in [None, Some(7)] {
-        let caches = seeded_holder(&holder.name);
+        let caches: Vec<_> = (0..8)
+            .map(|_| {
+                let s = scheduler(&holder.name, Duration::from_secs(1));
+                let mut c = s.lock();
+                c.submit_requests(&[spec("seed", "")]).unwrap();
+                c.advance(&[event(ForwardEventKind::PdBootstrapped, "seed", vec![])])
+                    .unwrap();
+                assert!(!c
+                    .next_execution_plan(true, false)
+                    .forward_batches()
+                    .is_empty());
+                c.advance(&[event(ForwardEventKind::ExtendResult, "seed", vec![1])])
+                    .unwrap();
+                c.next_execution_plan(true, false);
+                c.advance(&[event(ForwardEventKind::PdSucceeded, "seed", vec![])])
+                    .unwrap();
+                drop(c);
+                s
+            })
+            .collect();
         let sched = scheduler(&reader.name, Duration::from_millis(50));
         let mut sched = sched.lock();
         assert!(sched.enable_async_device_peer(false));
         sched
-            .submit_requests(&[shard_request("follow", &holder.name)])
+            .submit_requests(&[spec("follow", &holder.name)])
             .unwrap();
         sched
-            .advance(&[shard_event(
-                ForwardEventKind::PdBootstrapped,
-                "follow",
-                vec![],
-            )])
+            .advance(&[event(ForwardEventKind::PdBootstrapped, "follow", vec![])])
             .unwrap();
         sched.next_execution_plan(true, false);
         let q = sched.take_peer_lookups().pop().unwrap();
@@ -477,14 +455,7 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
             unreachable!()
         };
         let mut offers: Vec<_> = (0..8).map(|_| Offers::new(Arc::default())).collect();
-        let answer = offers[0].lookup(
-            key,
-            &holder,
-            &layout,
-            &query,
-            |q| caches[0].lock().answer_peer_lookup_bounded(q, 0),
-            1,
-        );
+        let answer = offers[0].lookup(key, &holder, &layout, &query, &mut caches[0].lock(), 1);
         for h in &mut offers[1..] {
             h.install(&query, &answer, 4, 8, 1);
         }
@@ -543,14 +514,7 @@ fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
             unreachable!()
         };
         assert_eq!(*max_tokens, f.end_tokens);
-        let fresh = offers[0].lookup(
-            key,
-            &holder,
-            &layout,
-            &renew,
-            |q| caches[0].lock().answer_peer_lookup_bounded(q, 0),
-            now,
-        );
+        let fresh = offers[0].lookup(key, &holder, &layout, &renew, &mut caches[0].lock(), now);
         for h in &mut offers[1..] {
             h.install(&renew, &fresh, 4, 8, now);
         }
@@ -737,91 +701,153 @@ fn a_worker_forwards_attribution_even_without_scheduler_events() {
     assert!(round.has_feedback());
 }
 
-#[test]
-fn sharded_holder_answers_while_all_eight_schedulers_stay_locked() {
-    use ts_scheduler::ForwardEventKind;
-    let layout = layout();
-    let mut listener = PeerListener::bind("127.0.0.1", 0).unwrap();
-    listener.set_registered_layout(layout.clone());
-    let holder = Generation {
-        name: format!("127.0.0.1:{}", listener.port()),
-        epoch: 1,
+fn tiered_offer(
+    layout: &Arc<Replica>,
+    tiers: [PeerTier; 2],
+    local_tokens: i32,
+) -> (Attempt, Key, Offer, Vec<PeerPageView>, Message) {
+    let generation = |name: &str| Generation {
+        name: name.into(),
         incarnation: 1,
-    };
-    let caches = seeded_holder(&holder.name);
-    let ch = listener.versioned_channel();
-    let (tx, replies) = mpsc::channel();
-    let net = super::super::net::PeerNet::start("127.0.0.1", 0, tx).unwrap();
-    let reader = Generation {
-        name: format!("127.0.0.1:{}", net.port()),
         epoch: 1,
-        incarnation: 1,
     };
-    let sched = scheduler(&reader.name, Duration::from_millis(50));
-    let mut cache = sched.lock();
-    cache
-        .submit_requests(&[shard_request("follow", &holder.name)])
-        .unwrap();
-    cache
-        .advance(&[shard_event(
-            ForwardEventKind::PdBootstrapped,
-            "follow",
-            vec![],
-        )])
-        .unwrap();
-    cache.next_execution_plan(true, false);
-    let query = Attempt::new(cache.take_peer_lookups().pop().unwrap())
-        .query(&reader, &layout, &holder, layout.clone())
-        .unwrap();
-    let (mut control, _) = Control::new(
-        Instant::now(),
-        layout.clone(),
-        0,
-        holder.clone(),
-        Some(ch),
-        Arc::default(),
-        0,
-    );
-    control
-        .start_lookups(caches[0].lock().peer_lookup_index())
-        .unwrap();
-    let _endpoint = start_endpoint(
-        &PeerSettings {
-            name: holder.name.clone(),
-            incarnation: 1,
-            deployment_id: "deployment".into(),
-            weight_version: "1".into(),
-            timeouts: Timeouts {
-                answer_us: 50000,
-                quarantine_us: 10000,
-                push_us: 2000000,
-            },
-            record_lifetime: Duration::from_secs(5),
+    let reader = generation("reader:1234");
+    let holder = generation("holder:1234");
+    let mut a = Attempt::new(PeerLookupView {
+        request_id: "follow".into(),
+        lease: ts_scheduler::PeerLeaseView {
+            reader: reader.name.clone(),
+            id: 2,
         },
-        PeerProgress::Coordinated,
-        layout.members.iter().map(|m| m.geometry.clone()).collect(),
-        listener,
-        caches[0].clone(),
-    )
-    .unwrap();
-    let locks = caches.iter().map(|s| s.lock()).collect::<Vec<_>>();
-    let start = Instant::now();
-    net.versioned(&holder.name, &query).unwrap();
-    let frames = replies.recv_timeout(Duration::from_millis(50)).unwrap();
-    let elapsed = start.elapsed();
-    let Some(Message::Offered(_, Some((offer, _, pages)))) = Message::decode(&frames[1], true)
-    else {
-        panic!("missing sharded hit")
+        holder: holder.name.clone(),
+        prefix_hashes: vec![],
+        tokens: vec![42; 8],
+        max_tokens: 8,
+        local_tokens,
+        deadline_us: 50_000,
+    });
+    let Some(Message::Lookup(key, ..)) = a.query(&reader, layout, &holder, layout.clone()) else {
+        panic!("expected lookup")
     };
-    assert_eq!(offer.end, 132);
-    assert_eq!(pages.len(), 33);
-    assert!(elapsed < Duration::from_millis(50), "{elapsed:?}");
-    thread::sleep(Duration::from_millis(100).saturating_sub(start.elapsed()));
-    eprintln!(
-        "sharded holder: reply {elapsed:?}, eight scheduler locks held {:?}",
-        start.elapsed()
+    let pages = tiers
+        .into_iter()
+        .enumerate()
+        .map(|(i, tier)| PeerPageView {
+            group_id: 0,
+            slot: i as i32,
+            block_id: i as i32 + 1,
+            tier,
+        })
+        .collect::<Vec<_>>();
+    let offer = Offer {
+        id: 1,
+        end: 8,
+        manifest: manifest(&pages),
+    };
+    let reply = Message::Offered(
+        key.clone(),
+        Some((offer.clone(), prefix(&a.lookup.tokens), pages.clone())),
     );
-    drop(locks);
-    let (_, reports) = Control::unpack(&[control.report(Vec::new())]).unwrap();
-    assert_eq!(reports[0].proposals.len(), 1);
+    (a, key, offer, pages, reply)
+}
+
+#[test]
+fn slow_disk_reads_do_not_price_host_or_device_host_offers() {
+    let layout = layout();
+    let mut costs = [ReadCost::default(); 32];
+    for slow in [
+        [PeerTier::Disk, PeerTier::Disk],
+        [PeerTier::Device, PeerTier::Disk],
+    ] {
+        let (a, k, _, pages, _) = tiered_offer(&layout, slow, 0);
+        let path = a.estimated_read_path(&k, &layout, 8, &pages).unwrap();
+        costs[path.bucket].observe(8, path.remote, 500_000);
+    }
+    for (tiers, recompute) in [
+        ([PeerTier::Disk, PeerTier::Disk], true),
+        ([PeerTier::Device, PeerTier::Disk], true),
+        ([PeerTier::Host, PeerTier::Host], false),
+        ([PeerTier::Device, PeerTier::Host], false),
+    ] {
+        let (mut a, k, _, pages, reply) = tiered_offer(&layout, tiers, 0);
+        let path = a.estimated_read_path(&k, &layout, 8, &pages).unwrap();
+        let economical = costs[path.bucket].economical(8, path.remote, 1000);
+        let mut round = PeerRound::default();
+        a.answer(&reply, 1000, economical, &mut round);
+        assert_eq!(round.events[0].num_tokens, if recompute { 0 } else { 8 });
+        assert_eq!(
+            round
+                .decisions
+                .iter()
+                .any(|(_, reason)| *reason == "adaptive_recompute"),
+            recompute
+        );
+    }
+}
+
+#[test]
+fn tier_feedback_follows_the_reserved_suffix_once_per_business_outcome() {
+    let layout = layout();
+    for (local_tokens, ack) in [
+        (0, Some(Closure::Closed)),
+        (4, Some(Closure::Gone)),
+        (4, None),
+    ] {
+        let (mut a, k, offer, pages, reply) =
+            tiered_offer(&layout, [PeerTier::Host, PeerTier::Device], local_tokens);
+        let device = ReadPath::from_tiers(&k, 8, [PeerTier::Device].into_iter()).unwrap();
+        let estimated = a.estimated_read_path(&k, &layout, 8, &pages).unwrap();
+        assert_eq!(estimated == device, local_tokens == 4);
+        let mut round = PeerRound::default();
+        a.answer(&reply, 2, true, &mut round);
+        // Even when lookup saw no local hit, by reservation time slot zero is local.
+        let vote = a
+            .reserve(
+                PeerFetchView {
+                    request_id: a.lookup.request_id.clone(),
+                    lease: a.lookup.lease.clone(),
+                    holder: k.holder.name.clone(),
+                    begin_tokens: 4,
+                    end_tokens: 8,
+                    destinations: vec![PeerPageView {
+                        block_id: 1,
+                        ..pages[1]
+                    }],
+                    checkpoint: vec![],
+                    tokens: vec![],
+                    prefix_hashes: vec![],
+                },
+                &layout,
+                0,
+                10,
+            )
+            .unwrap();
+        assert_eq!(vote.value, 2);
+        for i in 0..8 {
+            a.vote(i, &vote, 20, &mut round);
+        }
+        a.grant(&k, &offer, true, 25);
+        assert!(a.take_read_sample(26).is_none());
+        let mut done = vote;
+        done.stage = DONE;
+        done.value = if ack.is_none() { 2 } else { 1 };
+        for i in 0..8 {
+            a.vote(i, &done, 50, &mut round);
+        }
+        if let Some(closure) = ack {
+            assert!(a.take_read_sample(60).is_none());
+            a.ack(&k, offer.id, Disposition::Complete, closure, &mut round);
+        }
+        assert_eq!(
+            a.take_read_sample(70),
+            Some((
+                device,
+                4,
+                if ack.is_none() { 50 } else { 30 },
+                ack == Some(Closure::Closed)
+            ))
+        );
+        a.tick(None, None, 100, &mut round);
+        assert!(a.take_read_sample(100).is_none());
+    }
 }

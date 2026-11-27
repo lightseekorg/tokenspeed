@@ -139,19 +139,10 @@ private:
         std::uint64_t access_epoch{0};
     };
 
-    mutable std::mutex lookup_lease_mutex_;
     std::int32_t max_leases_;
     std::int64_t soft_pin_us_;
     std::int64_t hard_pin_us_;
     std::unordered_map<PeerLeaseId, Lease, PeerLeaseIdHash> leases_;
-};
-
-// Borrows the scheduler-owned cache for the lifetime of its owner. Only these
-// lookup operations may run concurrently with the scheduler.
-struct PeerLookupIndex {
-    const CacheCoordinator& cache;
-    const PeerExports* leases;
-    PeerAnswer Answer(const cache::PeerLookup& lookup, std::size_t pending) const;
 };
 
 }  // namespace tokenspeed

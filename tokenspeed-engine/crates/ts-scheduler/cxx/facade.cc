@@ -321,19 +321,6 @@ void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::S
     scheduler.Advance(execution_event);
 }
 
-std::unique_ptr<tokenspeed::PeerLookupIndex> peer_lookup_index(const tokenspeed::Scheduler& scheduler) {
-    return std::make_unique<tokenspeed::PeerLookupIndex>(scheduler.PeerLookup());
-}
-bool lookup_lease_can_pin(const tokenspeed::PeerLookupIndex& index, const PeerLeaseView& lease) {
-    return index.leases && index.leases->CanPin(FromView(lease));
-}
-bool lookup_lease_held(const tokenspeed::PeerLookupIndex& index, const PeerLeaseView& lease) {
-    return index.leases && index.leases->Held(FromView(lease));
-}
-PeerAnswerView query_peer_index(const tokenspeed::PeerLookupIndex& index, const PeerEventView& lookup, std::size_t pending) {
-    return ToView(index.Answer(LookupFromView(lookup), pending));
-}
-
 PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup,
                                   std::size_t pending_new_leases) {
     return ToView(scheduler.AnswerPeerLookup(LookupFromView(lookup), pending_new_leases));

@@ -1886,26 +1886,20 @@ forwards request attribution even when it has no scheduler events or landings.
 Device submission still requires the local plan fence.
 The reader publishes a landing only after member retirement and holder closure.
 
-Single-member and registered holders answer the initial lookup from the same
-scheduler-owned prefix indexes. The lookup handle keeps the native owner alive.
-It guards index membership, page locations and published tails through the copy
-of the page list. No scheduler window is needed to answer. A single-member
-holder applies queued soft exports before pinning. A registered holder queues
-the offer for installation on the other members before replying. Their next
-round installs proposals before processing PIN. Both paths revalidate the pages
-before granting a read.
-
 Rank zero timestamps lookup dispatch and receipt on its monotonic clock. The
 receipt must precede the deadline, even if admission happens several rounds
 later. The protocol delivers an explicit miss for unanswered and suppressed
 lookups. This keeps the scheduler from expiring a request while a timely reply
 awaits replica agreement.
 
-For a timely offer, the reader leader compares the tokens saved beyond its
-local prefix with the observed time from the group's PIN request through the
-last necessary member's READ retirement. Its choice travels with the offer in
-the existing replica report before HBM reservation. Cold paths collect a sample;
-estimates distinguish holder width, source tiers and node locality.
+For a timely offer, the reader leader prices the source pages needed beyond
+its local prefix. The decision travels with the offer in the replica report
+before HBM reservation. Estimates distinguish holder width, node locality and
+each combination of Device, Host and Disk source tiers. Reservation binds the
+feedback bucket to the source pages paired with the actual destination slots.
+The leader records one sample when the request lands or falls back. The sample
+runs from PIN through group read retirement, or through fallback if retirement
+is still unknown. A late close or retirement cannot charge the request again.
 
 The scheduler retains the original offer with a waiting request. At admission
 the reader can reconstruct an expired attempt from that checkpoint. If the
