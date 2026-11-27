@@ -69,7 +69,8 @@ public:
     explicit PeerExports(const PeerConfig& config);
 
     // The answers.
-    static PeerAnswer AnswerLookup(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup);
+    static PeerAnswer AnswerLookup(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup,
+                                   bool include_disk);
     // Whether the lookup's prompt, up to num_tokens, still resolves to
     // exactly `pages`.
     static bool Matches(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int32_t num_tokens,

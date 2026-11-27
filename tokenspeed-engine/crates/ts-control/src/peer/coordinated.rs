@@ -21,7 +21,8 @@
 //! V1 control traffic and votes advance from a common replica report on either CPU mesh.
 use super::{
     attempt::Attempt,
-    offers::{Offers, Vote, CLOSED, DONE, PINNED, READY},
+    offers::{Offers, Vote, CLOSED, DONE, FREEZE, PINNED, READY},
+    push::PagePusher,
     read::Reads,
     registered::Replica,
     servicer::empty_event,
@@ -32,13 +33,15 @@ use crate::codec::{Reader, Writer};
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{mpsc, Arc},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use ts_scheduler::{PeerEventKind, PeerEventView, PeerFetchView, PeerLookupView, Scheduler};
 
 pub(super) struct Report {
     legacy: Vec<u8>,
     retirement_bound_ms: u32,
+    quarantine_us: i64,
+    can_serve_disk: bool,
     proposals: Vec<(i64, Message, Message)>,
     messages: Vec<(i64, bool, Message)>,
     deadlines: Vec<(u64, i64)>,
@@ -57,6 +60,8 @@ impl Report {
         let mut w = Writer::new();
         w.bytes(&self.legacy);
         w.u32(self.retirement_bound_ms);
+        w.i64(self.quarantine_us);
+        w.flag(self.can_serve_disk);
         w.count(self.proposals.len());
         for (issued_at, q, a) in self.proposals {
             w.i64(issued_at);
@@ -87,6 +92,8 @@ impl Report {
         let mut r = Reader::new(b);
         let legacy = r.bytes()?.to_vec();
         let retirement_bound_ms = r.u32()?;
+        let quarantine_us = r.i64()?;
+        let can_serve_disk = r.flag()?;
         let proposals = (0..r.count()?)
             .map(|_| Some((r.i64()?, msg(&mut r)?, msg(&mut r)?)))
             .collect::<Option<Vec<_>>>()?;
@@ -109,6 +116,8 @@ impl Report {
         r.finish(Self {
             legacy,
             retirement_bound_ms,
+            quarantine_us,
+            can_serve_disk,
             proposals,
             deadlines,
             messages,
@@ -277,6 +286,7 @@ pub(super) struct Control {
     rediscover: HashSet<String>,
     attempts: BTreeMap<u64, Attempt>,
     offers: Offers,
+    pusher: Arc<dyn PagePusher>,
     pending_releases: PendingReleases,
     cap_warn_after_us: i64,
     votes: Vec<Vote>,
@@ -285,10 +295,15 @@ pub(super) struct Control {
     signaled: mpsc::Receiver<Instant>,
     missing: Vec<PeerEventView>,
     admission: bool,
+    replica_can_serve_disk: bool,
     retirement_bound_ms: u32,
+    quarantine_us: i64,
+    push_timeout: Duration,
     pub meter: Option<Arc<ts_metrics::PeerMetrics>>,
+    pub logical_meter: Option<Arc<ts_metrics::PeerMetrics>>,
 }
 impl Control {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         origin: Instant,
         layout: Arc<Replica>,
@@ -296,8 +311,12 @@ impl Control {
         gen: Generation,
         ch: Option<VersionedChannel>,
         device_pin_gate: Arc<super::servicer::DevicePinGate>,
+        pusher: Arc<dyn PagePusher>,
         retirement_bound_ms: u32,
+        quarantine_us: i64,
+        push_timeout: Duration,
     ) -> (Self, PeerFence) {
+        let replica_can_serve_disk = layout.can_push_disk();
         let (tx, signaled) = mpsc::channel();
         (
             Self {
@@ -312,6 +331,7 @@ impl Control {
                 rediscover: HashSet::new(),
                 attempts: BTreeMap::new(),
                 offers: Offers::new(device_pin_gate),
+                pusher,
                 pending_releases: PendingReleases::default(),
                 cap_warn_after_us: 0,
                 votes: Vec::new(),
@@ -320,8 +340,12 @@ impl Control {
                 signaled,
                 missing: Vec::new(),
                 admission: true,
+                replica_can_serve_disk,
                 retirement_bound_ms,
+                quarantine_us: quarantine_us.max(0),
+                push_timeout,
                 meter: None,
+                logical_meter: None,
             },
             PeerFence(tx),
         )
@@ -491,6 +515,8 @@ impl Control {
         Report {
             legacy,
             retirement_bound_ms: self.retirement_bound_ms,
+            quarantine_us: self.quarantine_us,
+            can_serve_disk: self.pusher.can_serve_disk(),
             messages,
             votes: std::mem::take(&mut self.votes),
             deadlines: std::mem::take(&mut self.deadlines),
@@ -550,7 +576,16 @@ impl Control {
             Message::Lookup(k, ..) if self.rank == 0 => {
                 let previous = self.offers.offer_id(k);
                 let reply = if self.admission {
-                    self.offers.lookup(k, &self.gen, &self.layout, &m, s, now)
+                    self.offers.lookup(
+                        k,
+                        &self.gen,
+                        &self.layout,
+                        self.replica_can_serve_disk,
+                        &m,
+                        s,
+                        self.pusher.as_ref(),
+                        now,
+                    )
                 } else {
                     Message::Offered(k.clone(), None)
                 };
@@ -603,7 +638,7 @@ impl Control {
                     self.send(Message::Grant(k.clone(), o.clone(), false));
                     return;
                 }
-                let (reply, v) = self.offers.pin(k, o, s, now);
+                let (reply, v) = self.offers.pin(k, o, s, self.pusher.as_ref(), now);
                 if let Some(v) = v {
                     self.votes.push(v);
                 }
@@ -642,7 +677,7 @@ impl Control {
                     self.send(Message::Ack(k.clone(), *id, *d, Closure::Stale));
                     return;
                 }
-                let (reply, v) = self.offers.close(k, *id, *d, s, now);
+                let (reply, v) = self.offers.close(k, *id, *d, self.pusher.as_ref(), now);
                 if let Some(v) = v {
                     self.votes.push(v);
                 }
@@ -676,8 +711,29 @@ impl Control {
         if reports.len() != self.layout.members.len() {
             return Err(PeerError::Report);
         }
+        let all_can_serve_disk = reports.iter().all(|r| r.can_serve_disk);
+        if self.layout.can_push_disk()
+            && self.replica_can_serve_disk
+            && !all_can_serve_disk
+            && self.rank == 0
+        {
+            tracing::error!(
+                holder = %self.gen.name,
+                "holder member quarantined Disk push serving; truncating future peer offers to Device/Host"
+            );
+        }
+        self.replica_can_serve_disk = all_can_serve_disk;
+        if let Some(meter) = &self.logical_meter {
+            if self.rank == 0 {
+                meter.snapshot(
+                    "disk_push_quarantined",
+                    usize::from(self.layout.can_push_disk() && !all_can_serve_disk),
+                );
+            }
+        }
         let first = &mut reports[0];
         let retirement_bound_ms = first.retirement_bound_ms;
+        let quarantine_us = first.quarantine_us.max(0);
         // Coordinated rounds share rank zero's reported clock. Use it for both
         // proposal timestamps and expiry, even if member process origins differ.
         let now = round.now_us;
@@ -704,11 +760,11 @@ impl Control {
         for (i, r) in reports.iter().enumerate() {
             for v in &r.votes {
                 let reply = match v.stage {
-                    PINNED | CLOSED => self.offers.vote(i, v, now),
-                    READY | DONE => self
+                    PINNED | CLOSED => self.offers.vote(i, v, s, now),
+                    READY | DONE | FREEZE => self
                         .attempts
                         .get_mut(&v.key.lease)
-                        .and_then(|a| a.vote(i, v, now, round)),
+                        .and_then(|a| a.vote(i, v, quarantine_us, now, round)),
                     _ => return Err(PeerError::Report),
                 };
                 if let Some(m) = reply {
@@ -716,8 +772,13 @@ impl Control {
                         // Consensus refused this offer. No reader could have
                         // obtained GO, so each holder can roll back its own ticket
                         // even if the reader disappeared before sending RELEASE.
-                        let (_, vote) =
-                            self.offers.close(key, offer.id, Disposition::Abort, s, now);
+                        let (_, vote) = self.offers.close(
+                            key,
+                            offer.id,
+                            Disposition::Abort,
+                            self.pusher.as_ref(),
+                            now,
+                        );
                         self.votes.extend(vote);
                     }
                     self.send(m);
@@ -736,6 +797,7 @@ impl Control {
             let (v, m) = a.tick(
                 reads,
                 self.meter.as_ref().map(|m| (m, self.rank)),
+                self.push_timeout,
                 now,
                 round,
             );
@@ -774,8 +836,10 @@ impl Control {
         for m in outgoing {
             self.send(m);
         }
-        self.votes
-            .extend(self.offers.expire(now, retirement_bound_ms, s));
+        let expired = self
+            .offers
+            .expire(now, retirement_bound_ms, s, self.pusher.as_ref());
+        self.votes.extend(expired);
         round.events.append(&mut self.missing);
         Ok(())
     }
