@@ -1,5 +1,8 @@
 # Weight memory policies
 
+For Ascend-specific policies, dependencies and disk replacement, see the
+[Ascend guide](ascend-memory-saver.md). The CUDA/ROCm contract follows.
+
 Enable memory saving with an explicit `--weight-memory-policy cpu_backup` or
 `--weight-memory-policy discard`. Both use the existing memory tags and control
 routes. Rebuild the Python runtime, native host and kernel package together;
@@ -58,7 +61,7 @@ Allocation sites use `named_region(name)` to describe their owner:
 | `executor_inputs` | executor inputs and ngram input buffers | `persistent_buffers` |
 | `runtime_states` | request history and runtime state | `persistent_buffers` |
 | `attention_state` | attention backend and graph metadata | `persistent_buffers` |
-| `workspace` | shared scratch allocations, including growth | `persistent_buffers` |
+| `workspace` | shared scratch and kernel-cached workspaces, including growth | `persistent_buffers` |
 
 The adapter resolves these aliases centrally. The executor owns its adapter
 and passes it to the prefill graph; their buffers do not depend on the KV

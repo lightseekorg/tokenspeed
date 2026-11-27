@@ -737,6 +737,21 @@ def qwen4_exp_qsa_block_topk(
     if path == "auto":
         # Keep shape routing independent of live device frontiers.
         min_stream_rows = 512 if num_blocks >= 16384 else 8192
+        # Odd request widths cannot share K in the power-of-two logits tile:
+        # gcd(width, tile width) is one. Streaming shares K across queries.
+        # Smaller grids retain logits; widths above three need more rows to
+        # offset the partially filled streaming query tiles on SM107.
+        if (
+            queries_per_request is not None
+            and queries_per_request > 1
+            and queries_per_request % 2
+            and num_blocks >= 8192
+        ):
+            min_stream_rows = 192 if queries_per_request == 3 else 384
+        # Four-query requests keep logits for shorter contexts and small
+        # grids; past these bounds, avoiding the logits pass is faster.
+        elif queries_per_request == 4 and num_blocks >= 32768:
+            min_stream_rows = 384
         prefer_stream = supported_layout and rows >= min_stream_rows
         fits_logits = rows * num_blocks * 4 <= max_logits_bytes
         path = "stream" if prefer_stream or not fits_logits else "logits"

@@ -377,9 +377,10 @@ from one first bound to that pool:
   pool's specs, page counts, and request-slot capacity), `init_cuda_graph_state`,
   `init_prefill_graph_state` and `preallocate_verify_workspace` again after
   a rebind, as after a first bind. A probe pool must still hold `max_bs`
-  state rows: the KDA raw-gate verify scratch is the bound pool's own conv
-  slab. The backend tree covers only itself: the executor's own pool
-  references (`token_to_kv_pool`, its cache runtime contract, the drafter's
+  state rows for live dense checkpoints. KDA stores its FP32 records and one
+  accepted count per request slot in a separate allocation. The backend tree
+  covers only itself: the executor's own pool references
+  (`token_to_kv_pool`, its cache runtime contract, the drafter's
   pool) and the layer-to-group stamps `bind_cache_groups` writes on the
   model are the caller's to re-publish, as are the graph owners' own pool
   references and the placeholder tables the decode runner sizes from the
@@ -421,9 +422,13 @@ from one first bound to that pool:
   one pool, was reserved 11.64 GB and booted with 6.64 GB more device memory
   free than the same launch without the ladder.
   The result is reduced across ranks with MAX. The orchestrator
-  releases the probe's graphs and collects the cycles they sit in, then
-  rebuilds on the memory profile the probe build took -- where a boot without
-  a reserve takes it -- minus the projection. The reserve covers the bytes
+  releases the probe's graphs and collects the cycles they sit in. It then
+  discards the probe arena's backing storage before allocating the serving
+  arena, including sparse offload's Host history, device hot KV, residency
+  metadata and prepared batch tensors. The old views can still carry geometry
+  into the rebind, but must not read or write retired storage. The serving
+  pool is sized from the profile the probe build took minus the projection.
+  The reserve covers the bytes
   inside the capture windows as projected -- what a boot without a probe
   captures there, one-time bytes the first captures take included; the
   probe releases them and the serving capture pays them again. On CUDA, what
@@ -483,32 +488,37 @@ backend; forward operations dispatch through that same backend.
 Generic projection operations use the backend's ordinary collectives.
 `AutoBackend` composes the optimized projection dispatcher and reuses those
 generic operations for fallback.
-Sequential layers share model-private scratch on one stream, sized for the
-largest projection; matching configurations also share native resources.
-Concurrent streams or models use separate workspaces. Intermediate tensors
-borrow storage only for the current projection, so consumers finish before
-another projection reuses it. Final outputs belong to the caller and
-remain valid across later forwards. Graphs referencing a workspace are destroyed
-before it is released.
+Sequential layers on one stream share model-private scratch sized for the
+largest projection. They share native resources only when the projection
+configuration and weight dtype match. Concurrent streams or models use separate
+workspaces. Same-stream consumers must finish using borrowed intermediates,
+including eligible Kimi MLA QKV-A outputs, before the next projection reuses
+the workspace. Caller-owned outputs remain valid across later forwards.
+Destroy graphs that reference a workspace before releasing it.
 
-Fused projection runs communication, quantization, and FP8 GEMM in one kernel.
+Fused projection combines communication and GEMM in one kernel.
 Column projection combines all-gather, GEMM, and all-to-all.
 Row projection combines all-to-all, GEMM, and reduce-scatter.
 
-Use `DPColumnParallelLinear` or `DPRowParallelLinear` with `AutoBackend`.
-The backend selects fusion for supported TP2 and TP4 groups within one node.
-Fusion requires FP8 weights with FP32 scales for each 128 × 128 block.
-At least one rank must have 64 physical input rows.
-Smaller batches, batch-invariant collectives, and unsupported configurations use
-the ordinary projection operations. All ranks use their physical row counts to
-select the same path.
+`AutoBackend` uses the subgroup's largest physical row count so every rank
+selects the same path. Smaller batches, batch-invariant collectives, and
+unsupported configurations use ordinary projection operations. See
+[projection TP support](../serving/parallelism.md#tensor-parallel-subgroups-within-dp)
+for supported devices, shapes, and row-count thresholds.
 
-Both fused kernels accept BF16 inputs and return BF16 outputs.
-Row projection also accepts E4M3 inputs with FP32 scales per 128 channels.
-Pass the scales to `DPRowParallelLinear.forward` through its `scale` argument.
-The kernel skips input quantization in this case. All ranks must use the same
-input format. For FP8 inputs, empty ranks must supply empty E4M3 inputs and
-FP32 scales.
+Kimi-K3.1 sparse MLA uses the same projection layers. Empty token owners run
+the parent MLA projection collectives and skip local DSA work.
+
+Fused projections return BF16. The BF16-weight path takes BF16 inputs without
+scales. The block-FP8 path quantizes BF16 activations in the kernel when needed.
+With FP8 weights, row projection also accepts E4M3 inputs and FP32 scales per 128
+channels through the `scale` argument to `DPRowParallelLinear.forward`. All ranks
+use the same input format. Empty ranks on the E4M3 path supply empty inputs and
+scales.
+
+Fused projections require contiguous tensors with 16-byte aligned data
+pointers. An invalid layout raises before the local kernel launch. Callers
+must treat this as failure of the TP group.
 
 Prepared FP8 row buckets can transpose activation scales inside 128-row blocks
 so each K group's scales occupy consecutive shared-memory banks. The exchange
@@ -533,9 +543,9 @@ Supply runtime row counts within the prepared workspace capacity.
 Use each workspace on one stream.
 Do not run other distributed kernels at the same time.
 
-Row projection rounds partial results to BF16, sums them in fixed rank order
-in FP32, and returns BF16. This result can differ from an ordinary BF16
-collective reduction.
+Row projection rounds GEMM partials to BF16, sums them in FP32 in fixed rank
+order, then rounds the result to BF16. This result can differ from an ordinary
+BF16 collective reduction.
 
 ### Padding contract
 
@@ -628,8 +638,16 @@ groups; the tape loops over rows, so it covers every captured batch size.
 Target verify writes each group's committed-state blocks straight into the
 captured `state_in` buffers and its live blocks into `state_out`, every group
 and the graph padding rows in one launch (`verify_state_groups`, up to four
-groups). The commit enqueued after the replay reads those buffers before the
-next refresh rewrites them.
+groups). Each batch size's buffers are the rows of one `[groups, bs]` table
+(`state_in_tables`, `state_out_tables`). The commit enqueued after the replay
+reads those buffers before the next refresh rewrites them. KDA's refresh then
+readies every layer's retained history in one launch, outside the graph and
+ahead of the replay, the eager forward or a mixed forward's decode rows: a
+request whose accepted count would overflow the history capacity folds its
+records into its live blocks, and one that moves to a live block gets its
+dense base copied there, so verify only reads live blocks
+(`KdaAttnBackend._prepare_retained_history`). An extend clears its rows'
+counts once, after the last KDA layer's gather, eager or replayed.
 
 After verification, GDN, KDA, and PLE resolve the accepted state's destination
 with `commit_state_pages`, once per state group and only for live requests:
@@ -710,7 +728,11 @@ must fit the selected function's measured resident capacity. Local pipelines
 share a physical CTA; their logical tiles are counted separately from that
 capacity. A rank-ordered FP32 merge completes Down before SiLU and publishes
 activation tiles through per-invocation epochs. Persistent scratch is allocated
-independently of the inference-mode context that first warms a layout.
+independently of the inference-mode context that first warms a layout. With the
+memory saver enabled, the executor registers the CPU-backed workspace region
+before warmup. Activation, partials, and epoch buffers for every layout,
+including layouts first reached in eager execution, survive `weights` release
+and resume.
 
 Down and Up reuse one shared-memory operand arena after Down's MMA completion.
 Up uses separate weight and activation rings when their stage counts differ;
@@ -719,13 +741,12 @@ tiles can retain two Up accumulators, publishing the first only after its final
 K tiles complete while the second continues. Readers acknowledge TMEM before
 reuse or deallocation. PDL, mutable weights and eager/graph calls use these same
 ownership and publication edges. Startup warms the bounded tactic variants
-through the ordinary operator. The validated model dimensions `(4, 2560, 320)`
-and `(4, 8192, 1024)` use the same parameterized implementation, with
-model-specific tile geometry, Up K width and cache policy. Token tiles for the
-existing model preserve resident parallelism and bound per-thread gate state
-for larger batches. Row-derived reduction groups and token pairing belong
-only to the wider model. Other dimensions keep ordinary kernel selection;
-the fused work budget still bounds automatic selection.
+selected by the ordinary operator for each token row count. The parameterized
+kernel accepts hidden sizes divisible by 64 and bottleneck ranks divisible
+by 8 within signed 32-bit layout byte extents. The cooperative grid and the
+per-worker work budget bound automatic selection for each geometry. The
+dimensions `(4, 2560, 320)` and `(4, 8192, 1024)` have tuned tile geometry,
+Up K widths and cache policies within this implementation.
 
 Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
@@ -1618,8 +1639,10 @@ differs from the model's single-page geometry before cache allocation.
 The indexer owns its query/sequence metadata and borrows the full-KV table
 and kernel page size from
 `router.group_view`. Layer-shared layout and top-k still use `SparseTopKShare`
-with the existing forward and MTP reuse boundaries. The router clears this
-share before the root prepares its indexer child; the indexer does not clear it again.
+with the existing forward and MTP reuse boundaries. The layout kernel writes
+batch-local request IDs as `int32` once per forward so every PrimTS layer can
+consume them directly. The router clears the share before the root prepares
+its indexer child; the indexer does not clear it again.
 
 QSA block selection carries an explicit uniform query width into its kernel
 API. Decode derives it from its uniform row contract; extend metadata checks
@@ -1699,7 +1722,12 @@ dense attention. The prologue has written the full KV cache before either
 path runs.
 Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
-the selected top-k rows with the queries.
+the selected physical slots and logical metadata with the same `gather_ids`
+as the queries. The sparse reader sees one row per request and the published
+accepted KV lengths, so kernels using logical blocks can serve step zero.
+The backend memoizes the gathered row layout per forward and the gathered
+blocks per indexer selection. The draft drops these temporary tensors after
+the model forward. Captured gathers are rebuilt on replay in the graph pool.
 
 QSA uses positive `decode_query_lengths` for uniform decode/verification and
 `None` for prefill or mixed/ragged queries, including one-token prefill.
@@ -1721,6 +1749,11 @@ The QSA leaf owns PrimTS plans and per-device scratch for its current KV pool.
 Calls, including graph replays, are ordered across streams. Rebinding drops
 eager plans; capture sessions retain graph plans and allocations until release.
 Scratch may grow without moving graph inputs. Each run regenerates its data.
+Plan offsets and shared scratch use the CPU-backed named workspace region on
+a plan miss. Their addresses survive memory release and resume. The adapter
+clears the initial metadata tensor defaults in FlashInfer's single-query plan
+in place. Each launch passes the current logical candidates and row layout to
+the initialized plan.
 
 QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and the direct-slot
 CuTe kernel read invalid candidates from the zero-initialized slot 1 of the
@@ -2536,7 +2569,10 @@ The contract a model (in tree or a plugin) implements:
   collectives — and projects nothing.
 * The model exit hands the logits processor the shard's rows with the plan
   on `LogitsMetadata.query_shard` (`BaseCausalLM.exit_logits` is that one
-  call; a model with its own exit does the same). The shard is a parameter
+  call; a model with its own exit does the same). The eager executor computes
+  packed last-token indices in int32 within the scheduler's token budget.
+  Mixed speculative batches also store their decode verify row indices in
+  int32. The shard is a parameter
   of the processor's row selection: it scores the planned prompt rows
   first, then selects the sampled rows — `hidden_states[gather_ids]` on
   whole rows, `gather_sampled_rows` over the group on a shard (one
@@ -2963,3 +2999,40 @@ frontier and Engram commit remain shared. Proposal distributions belong to
 RuntimeStates, are invalidated at PD landing and slot reuse, and are exported
 with retraction state. Query capacity does not shorten the scheduler's
 reserved write extent. The sampled path currently requires attention TP1.
+
+## Deferred GDN accepted state
+
+`--enable-deferred-gdn-state` opts NVIDIA BF16 K128/V128 chain T4 verify into
+accepted recurrent replay at the next layer's WY read. Convolution still
+commits during acceptance. Token and KV frontiers advance normally; pending
+recurrent state is a separate fact, never an artificially shortened frontier.
+
+Eager and graph decode execute the same device metadata operations. Two
+maximum-decode-batch payload banks retain `[k, v, a, b]` across forwards.
+Stable slot records carry a generation, bank/row, logical frontier and current
+batch membership. The preceding accepted pages remain in the payload bank's
+metadata. A new forward toggles the destination bank, matches its slots against
+the old generation and materializes rows absent from the new batch before
+convolution can reuse their bank. Each layer consumes the matched old row;
+acceptance retires that generation and records the new one. Padding owns no
+pending row. Batch counts, strides, bank choices and accepted lengths are
+runtime kernel inputs, including when the graph bucket changes. Acceptance
+refreshes its execution choice from the current forward. This lets graph
+replays defer acceptance again after an eager prefill.
+
+Only an in-place live state may be deferred. A first decode or checkpoint
+rotation with distinct source/destination blocks commits immediately, as do
+stopped rows. Acceptance and immediate replay use the same resolved live
+page tables as convolution commit, including when the verify graph is padded.
+Mixed, prefill, tree verification and other unsupported
+forwards materialize existing pending rows before execution. Monokernels
+keep the immediate path. Pending work is not flushed from ordinary `settle()`;
+that would remove the opportunity to share the next WY state read. The runtime
+retires replay before consumers use the live state
+([scheduler](scheduler.md#deferred-recurrent-state)).
+
+At a request exit, the device looks up the affected slots in the same records
+to select replay for writeback. The pinned slot
+uploads remain alive through the completion event. All metadata stages,
+including acceptance and exit operations outside target capture, are warmed
+before serving. Pipeline-parallel execution commits immediately.

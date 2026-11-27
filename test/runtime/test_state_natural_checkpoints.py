@@ -53,8 +53,18 @@ def _groups(with_state: bool) -> list:
     return groups
 
 
-def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: bool):
+def _scheduler(
+    *,
+    token_budget: int,
+    with_state: bool,
+    disable_prefix_cache: bool,
+    eviction_policy: str,
+    prefill_cost,
+):
     cfg = make_config(
+        prefix_cache_evict_policy=eviction_policy,
+        prefix_cache_gds_prefill_cost=prefill_cost,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=64,
         max_scheduled_tokens=token_budget,
         max_batch_size=1,
@@ -71,6 +81,7 @@ def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: boo
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
         storage_config=None,
         enable_kv_cache_events=False,
         decode_input_tokens=1,
@@ -103,6 +114,8 @@ def test_chunks_follow_the_budget_alone(
     """A state group does not shape the prefill chunk: chunks end where the
     token budget says, on a page boundary or not, and decode follows."""
     scheduler = _scheduler(
+        eviction_policy="lru",
+        prefill_cost=None,
         token_budget=token_budget,
         with_state=with_state,
         disable_prefix_cache=disable_prefix_cache,
@@ -151,7 +164,11 @@ def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
     decode evolves the live block in place from the first step. Every later
     decode evolves the live block in place with slot 0 null."""
     scheduler = _scheduler(
-        token_budget=300, with_state=True, disable_prefix_cache=disable_prefix_cache
+        eviction_policy="lru",
+        prefill_cost=None,
+        token_budget=300,
+        with_state=True,
+        disable_prefix_cache=disable_prefix_cache,
     )
     request = ts.RequestSpec()
     request.request_id = "r"
@@ -197,3 +214,25 @@ def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
     plan = scheduler.next_execution_plan()
     (decode,) = [op for op in plan.forward if op.request_ids]
     assert _state_row(decode) == [0, decode_row[1]]
+
+
+@pytest.mark.parametrize("prefill_cost", [[0.25, 0.5], (0.25, 0.5)])
+def test_gds_cost_sequence_reaches_a_real_hybrid_scheduler(prefill_cost):
+    scheduler = _scheduler(
+        token_budget=1024,
+        with_state=True,
+        disable_prefix_cache=False,
+        eviction_policy="gds",
+        prefill_cost=prefill_cost,
+    )
+    request = ts.RequestSpec()
+    request.request_id = "gds"
+    request.tokens = list(range(129))
+    request.max_new_tokens = 2
+    scheduler.submit_requests([request])
+    plan = scheduler.next_execution_plan()
+    (batch,) = [op for op in plan.forward if op.request_ids]
+    assert list(batch.input_lengths) == [129]
+    assert list(batch.extend_prefix_lens) == [0]
+    state = _state_row(batch)
+    assert state[0] > 0 and state[1] > 0 and state[0] != state[1]

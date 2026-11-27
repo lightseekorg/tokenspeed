@@ -64,6 +64,55 @@ def store_row_words(xl, words, first, K: gl.constexpr):
 
 
 @gluon.jit
+def gated_rows_loads(core, gate, norm_w, S: gl.constexpr, GATE_STRIDE: gl.constexpr):
+    """Issue :func:`gated_rows_store`'s loads: the norm weight, then each
+    32-head-row chunk's attention output and gate logits."""
+    # _rmsnorm_gated_kernel's layout over a head's 128 values, so each head
+    # reduces in its order; a lane's 8 values are the 8 that rows_to_lds
+    # gives it, so the words go to store_row_words unmoved.
+    NL: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [8, 1], [1, 0])
+    HEADS: gl.constexpr = 1536 // 128
+    CHUNKS: gl.constexpr = S * HEADS // 32
+    gl.static_assert(S * HEADS % 32 == 0)
+    d = gl.arange(0, 128, layout=gl.SliceLayout(0, NL))
+    w = gl.load(norm_w + d)
+    xs = ()
+    gs = ()
+    for i in gl.static_range(CHUNKS):
+        head_row = i * 32 + gl.arange(0, 32, layout=gl.SliceLayout(1, NL))
+        t = head_row // HEADS
+        h = head_row % HEADS
+        xs += (gl.load(core + (t * 1536 + h * 128)[:, None] + d[None, :]),)
+        gs += (gl.load(gate + (t * GATE_STRIDE + h * 128)[:, None] + d[None, :]),)
+    return w, xs, gs
+
+
+@gluon.jit
+def gated_rows_store(loaded, xl, S: gl.constexpr, EPS: gl.constexpr):
+    """Stage ``rmsnorm_gated_sigmoid(core, gate, norm_w)``'s rows as
+    ``rows_to_lds`` stages rows, bit for bit, from the raw 1536-column
+    attention output and its gate logits that :func:`gated_rows_loads`
+    loaded."""
+    CHUNKS: gl.constexpr = S * (1536 // 128) // 32
+    w, xs, gs = loaded
+    w = w.to(gl.float32)
+    for i in gl.static_range(CHUNKS):
+        x = xs[i].to(gl.float32)
+        g = gs[i].to(gl.float32)
+        rsig = gl.rsqrt(gl.sum(x * x, axis=1) / 128 + EPS)
+        y = x * rsig[:, None] * w[None, :] * (1 / (1 + gl.exp(-g)))
+        bits = y.to(gl.bfloat16).to(gl.uint16, bitcast=True).to(gl.uint32)
+        lo, hi = gl.split(gl.reshape(bits, [32, 64, 2]))
+        words = gl.convert_layout(
+            gl.reshape(lo | (hi << 16), [2048]),
+            gl.BlockedLayout([4], [64], [8], [0]),
+            assert_trivial=True,
+        )
+        store_row_words(xl, words, i * 4096, 1536)
+    gl.barrier()
+
+
+@gluon.jit
 def rows_to_lds(
     src,
     xl,

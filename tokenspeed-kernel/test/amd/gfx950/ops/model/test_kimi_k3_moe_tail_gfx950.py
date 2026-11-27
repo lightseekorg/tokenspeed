@@ -33,6 +33,7 @@ from tokenspeed_kernel.numerics.torch.activation import torch_situ_and_mul
 from tokenspeed_kernel.numerics.torch.moe import DequantizedExperts
 from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from tokenspeed_kernel.ops.activation.triton import attnres_combine, attnres_partial
+from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm, apply_kda_output_norm
 from tokenspeed_kernel.ops.gemm import (
     kimi3_latent_projection_add3,
     kimi3_shared_down_projection,
@@ -83,6 +84,9 @@ SHAPE = KimiK3MoeTailShape(
 EPS = 1e-5
 # Kimi-K3.1's AttnRes snapshot bank: 93 layers in blocks of 12.
 BANK_BLOCKS = 8
+# Kimi-K3.1's merged KDA input projection on one rank, whose fourth 1536
+# columns are the attention output's gate logits.
+KDA_PROJECTION = 6288
 
 # The router logits of the two paths differ only by FP32 summation order, so
 # a row whose 16th and 17th biased scores lie closer than this may still route
@@ -161,10 +165,13 @@ def _inputs(
     rows: int,
     num_blocks: int,
     restarts_prefix: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    gated_norm: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, KdaOutputNorm | None]:
     """One step's inputs: this rank's gated attention output, and the incoming
     stream and the snapshot bank, equal on every rank. A layer that restarts
-    the prefix has stored its incoming stream as the newest snapshot."""
+    the prefix has stored its incoming stream as the newest snapshot. With
+    ``gated_norm`` the attention output is a KDA layer's raw recurrence output
+    instead, and the step also has the layer's gated output norm."""
     replicated = torch.Generator(device=device).manual_seed(3000 + step)
     local = torch.Generator(device=device).manual_seed(4000 + 16 * step + rank)
     hidden = SHAPE.hidden_size
@@ -178,7 +185,19 @@ def _inputs(
     ).bfloat16()
     if restarts_prefix:
         blocks[num_blocks - 1] = stream
-    return attn_output, stream, blocks
+    attn_norm = None
+    if gated_norm:
+        # The tail compiles in the gate's row stride.
+        projection = torch.randn(
+            (rows, KDA_PROJECTION), device=device, generator=local
+        ).bfloat16()
+        weight = torch.rand(SHAPE.head_dim, device=device, generator=replicated)
+        attn_norm = KdaOutputNorm(
+            projection[:, 3 * attention_width : 4 * attention_width],
+            (weight + 0.5).bfloat16(),
+            EPS,
+        )
+    return attn_output, stream, blocks, attn_norm
 
 
 def _tail_mlp_input(layer: KimiK3MoeTailLayer) -> torch.Tensor:
@@ -373,6 +392,7 @@ def _check(
     restarts_prefix: bool,
     writes_next_mix: bool,
     rows: int,
+    gated_norm: bool,
 ) -> None:
     from tokenspeed_kernel_amd.ops.gfx950.kimi_k3.moe_tail import (
         gluon_kimi_k3_moe_tail_gfx950,
@@ -449,8 +469,8 @@ def _check(
     ).bfloat16()
 
     for step, layer in enumerate(layers):
-        attn_output, stream, blocks = _inputs(
-            rank, device, step, rows, num_blocks, restarts_prefix
+        attn_output, stream, blocks, attn_norm = _inputs(
+            rank, device, step, rows, num_blocks, restarts_prefix, gated_norm
         )
         next_mix = None
         if writes_next_mix:
@@ -477,7 +497,24 @@ def _check(
                 blocks,
                 torch.empty_like(stream),
                 next_mix=next_mix,
+                attn_norm=attn_norm,
             )
+        if attn_norm is not None:
+            # The regular decode applies the norm in a launch of its own; the
+            # tail on its rows, here a step later, must give the same bits.
+            # The other cases check that tail against the regular ops.
+            regular = kimi_k3_moe_tail(
+                layer,
+                apply_kda_output_norm(attn_output, attn_norm),
+                incoming,
+                blocks,
+                torch.empty_like(stream),
+                next_mix=next_mix,
+            )
+            torch.testing.assert_close(
+                actual.view(torch.int16), regular.view(torch.int16), atol=0, rtol=0
+            )
+            continue
         tail_hidden = _tail_mlp_input(layer)
         prefix, hidden_rows = _regular_seam(
             weights, attn_output, incoming, blocks, num_blocks, group
@@ -505,7 +542,7 @@ def _check(
                 actual, score_weight, input_norm, EPS, next_mix.partial, zeros.clone()
             )
             _assert_rows_close(next_mix.out, expected_next, zeros, every_row)
-    assert int(tail.workspace.steps[0]) == 1
+    assert int(tail.workspace.steps[0]) == (3 if gated_norm else 1)
     # Peers read this rank's memory until their last launch ends.
     torch.cuda.synchronize()
     dist.barrier()
@@ -519,6 +556,7 @@ def _worker(
     restarts_prefix: bool,
     writes_next_mix: bool,
     rows: int,
+    gated_norm: bool,
 ) -> None:
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -543,25 +581,42 @@ def _worker(
             restarts_prefix,
             writes_next_mix,
             rows,
+            gated_norm,
         )
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize(
-    ("rows", "layer_index", "num_blocks", "restarts_prefix", "writes_next_mix"),
+    (
+        "rows",
+        "layer_index",
+        "num_blocks",
+        "restarts_prefix",
+        "writes_next_mix",
+        "gated_norm",
+    ),
     [
         # Mixes four snapshots and the incoming stream, and writes the next
         # layer's attention input: at one request's decode (1 row) and
         # speculative verify widths (4 and 8 rows).
-        (1, 37, 4, False, True),
-        (4, 37, 4, False, True),
-        (8, 37, 4, False, True),
+        (1, 37, 4, False, True, False),
+        (4, 37, 4, False, True, False),
+        (8, 37, 4, False, True, False),
         # Starts snapshot 4: mixes five snapshots and a prefix that restarts
         # from zero.
-        (8, 48, 5, True, False),
+        (8, 48, 5, True, False, False),
+        # Also applies the KDA layer's gated output norm, which the tail takes
+        # at 8 rows only.
+        (8, 37, 4, False, True, True),
     ],
-    ids=["plain-rows1", "plain-rows4", "plain-rows8", "block_write-rows8"],
+    ids=[
+        "plain-rows1",
+        "plain-rows4",
+        "plain-rows8",
+        "block_write-rows8",
+        "gated_norm-rows8",
+    ],
 )
 def test_kimi_k3_moe_tail_matches_regular_ops(
     rows: int,
@@ -569,13 +624,22 @@ def test_kimi_k3_moe_tail_matches_regular_ops(
     num_blocks: int,
     restarts_prefix: bool,
     writes_next_mix: bool,
+    gated_norm: bool,
 ) -> None:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     mp.spawn(
         _worker,
-        args=(port, layer_index, num_blocks, restarts_prefix, writes_next_mix, rows),
+        args=(
+            port,
+            layer_index,
+            num_blocks,
+            restarts_prefix,
+            writes_next_mix,
+            rows,
+            gated_norm,
+        ),
         nprocs=SHAPE.tp_size,
         join=True,
     )

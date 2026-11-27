@@ -74,8 +74,21 @@ class QSASelection:
 
 
 @dataclass(frozen=True)
+class QSADraftRows:
+    """Logical candidates and row geometry gathered for draft step zero."""
+
+    selection: QSASelection
+    selected_blocks: torch.Tensor
+    request_indices: torch.Tensor
+    query_positions: torch.Tensor
+
+
+@dataclass(frozen=True)
 class QSALayout:
-    """Layer-invariant cache geometry for one QSA model forward."""
+    """Layer-invariant cache geometry for one QSA model forward.
+
+    `request_indices` stores the int32 batch-local request ID of each query row.
+    """
 
     seq_lens: torch.Tensor
     logical_positions: torch.Tensor

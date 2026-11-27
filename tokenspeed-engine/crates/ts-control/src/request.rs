@@ -229,6 +229,8 @@ pub struct PeerUsage {
     pub actual: Option<u64>,
     /// Last authoritative peer lifecycle result observed by this request.
     pub disposition: &'static str,
+    /// Scheduler choice at local admission, when observed.
+    pub local_reason: Option<String>,
     /// Time of the first lookup dispatch.
     pub lookup_at: Option<std::time::Instant>,
     /// Time at which a successful lookup advanced to admission.
@@ -343,6 +345,8 @@ pub struct RequestState {
     pub(crate) stream_output_timing: Option<StreamOutputTiming>,
     /// Its lifecycle timestamps, with `--enable-log-request-stats`.
     pub timings: Option<crate::request_stats::RequestTimings>,
+    /// Boundaries returned once on the final response; independent of logging.
+    pub(crate) request_timing: crate::request_timing::RequestTimingState,
     /// Sampled PD timings, consumed at the first output or terminal release.
     pub(crate) ttft: Option<Box<crate::request_stats::TtftTrace>>,
     /// The matcher of its grammar, once compiled.
@@ -425,6 +429,7 @@ impl RequestState {
             first_token_time: 0.0,
             stream_output_timing: None,
             timings: None,
+            request_timing: crate::request_timing::RequestTimingState::default(),
             ttft: None,
             grammar: None,
             admission: 0,
@@ -712,6 +717,28 @@ mod tests {
         let mut unmarked = ReasoningTokens::new(&reasoning(None, None), &[]);
         unmarked.push([10, 11]);
         assert_eq!(unmarked.count(), 0);
+    }
+
+    #[test]
+    fn reasoning_usage_is_independent_of_stream_chunking() {
+        // The LongCat adapter supplies the ids of <longcat_think> and
+        // </longcat_think>; the counter uses the same path as other parsers.
+        let grammar = reasoning(Some((1, 2)), None);
+        for (prompt, output, expected) in [
+            (vec![1], vec![10, 11, 2, 12, 13], 2),
+            (vec![1, 2], vec![12, 13], 0),
+            (vec![], vec![1, 10, 11, 2, 12], 2),
+            (vec![1, 10, 2, 12, 1], vec![10, 11], 2),
+            (vec![1], vec![2, 12], 0),
+        ] {
+            for chunk_size in 1..=output.len() {
+                let mut tokens = ReasoningTokens::new(&grammar, &prompt);
+                for chunk in output.chunks(chunk_size) {
+                    tokens.push(chunk.iter().copied());
+                }
+                assert_eq!(tokens.count(), expected, "prompt: {prompt:?}");
+            }
+        }
     }
 
     #[test]

@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "cache/coordinator/admission_planner.h"
+#include "cache/coordinator/gds_tiered.h"
 #include "cache/core/block_placement_demand.h"
 #include "core/profile_span.h"
 #include "utils.h"
@@ -91,13 +92,17 @@ public:
     // a slot the retry reclaims as the request's own: the candidate pass
     // excludes those through AdmissionCandidateConstraints, so a compaction never clears
     // them either.
-    std::optional<VictimSet> PlanBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
-                                            const AdmissionCandidateConstraints& constraints,
-                                            AdmissionSelectionState& selection) const {
+    std::optional<PlannedEviction> PlanBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
+                                                  const AdmissionCandidateConstraints& constraints,
+                                                  AdmissionSelectionState& selection) const {
         if (!groups_[group_id].Index().UnpinnedKeyAt(pool_, location) ||
             constraints.protected_locations.contains(location) ||
             constraints.request_reclaim_locations.contains(location)) {
             return std::nullopt;
+        }
+        if (store_.UsesGds() && store_.HostPool()) {
+            return PlanTieredCompaction(store_, constraints, *groups_[group_id].Index().UnpinnedKeyAt(pool_, location),
+                                        selection.member_resource);
         }
         std::optional<ExpandedVictimSet> expanded = expandCandidatePastSegments(
             CacheEvictionCandidates::MakeCandidate(groups_[group_id], location,
@@ -109,7 +114,9 @@ public:
         _assert(std::ranges::find(expanded->set.members, location, &VictimSet::Member::location) !=
                     expanded->set.members.end(),
                 "a victim set holds the candidate it was chosen for");
-        return std::move(expanded->set);
+        PlannedEviction result;
+        result.victims.push_back(std::move(expanded->set));
+        return result;
     }
 
 protected:
@@ -193,7 +200,8 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
         return planAdmissionWith<LoneRequestPlanner>(
                    store, coordinator_.History().CheckpointAgingFor(CacheTier::kDevice), PrefixProbe{prefix}, demands,
                    progress.num_computed_tokens, reserve_point, /*shapes=*/{},
-                   /*planned_claim_locations=*/{}, write_back)
+                   /*planned_claim_locations=*/{}, write_back,
+                   progress.completed_pages ? &*progress.completed_pages : nullptr)
             .has_value();
     };
 
@@ -368,7 +376,7 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
                                      demands,       progress.num_computed_tokens,
                                      reserve_point, prefix,
                                      /*shapes=*/{}, /*planned_claim_locations=*/{},
-                                     write_back};
+                                     write_back,    progress.completed_pages ? &*progress.completed_pages : nullptr};
     // Not fragmentation: the bound's own caveats, which compacting would
     // only churn at. The request waits as before. The count covers the
     // groups compaction gathers and the demand, not the parents the probe
@@ -381,7 +389,8 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
 
     AdmissionSelectionState selection{store, member_resource.get()};
     const AdmissionCandidateConstraints constraints = BuildAdmissionCandidateConstraints(
-        store, demands, progress.num_computed_tokens, prefix, /*planned_claim_locations=*/{}, &selection.scratch);
+        store, demands, progress.num_computed_tokens, prefix, /*planned_claim_locations=*/{}, &selection.scratch,
+        progress.completed_pages ? &*progress.completed_pages : nullptr);
     AdmissionResult result{
         .new_page_ids = std::vector<std::vector<std::int32_t>>(store.Groups().size()),
         .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(store.Groups().size()),
@@ -476,7 +485,7 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
                 std::size_t member{0};
                 CacheBlockLocation destination;
                 // The cache entry at the destination and what it takes along.
-                std::optional<VictimSet> clearing;
+                std::optional<PlannedEviction> clearing;
             };
             std::vector<Move> moves;
             std::vector<CacheBlockLocation> reserved;
@@ -505,7 +514,7 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
                         if (!store.DevicePool().IsOccupied(candidate)) {
                             return Move{.destination = candidate};
                         }
-                        if (std::optional<VictimSet> clearing =
+                        if (std::optional<PlannedEviction> clearing =
                                 planner.PlanBlockAlone(group_id, candidate, constraints, selection)) {
                             return Move{.destination = candidate, .clearing = std::move(clearing)};
                         }
@@ -567,7 +576,7 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
                 Member& member = members[i][move.member];
                 if (move.clearing && store.DevicePool().IsOccupied(move.destination)) {
                     evictor.EvictPlanned(
-                        std::span{&*move.clearing, 1}, write_back,
+                        *move.clearing, write_back,
                         CacheEvictor::VictimReasons{.victim = &CacheEvictor::DeviceEvictionStats::compaction,
                                                     .stranded_suffix = &CacheEvictor::DeviceEvictionStats::compaction,
                                                     .request_reclaim = &CacheEvictor::DeviceEvictionStats::compaction});

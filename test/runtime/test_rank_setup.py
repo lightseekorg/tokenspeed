@@ -100,6 +100,7 @@ def _config(args: ServerArgs, specs):
         enable_kv_cache_events=False,
         prefix_replay_tokens=0,
         peer_config=None,
+        shared_l2_config=None,
         num_disk_pages=0,
         disk_config=None,
     )
@@ -116,6 +117,72 @@ def test_an_engine_without_l3_passes_no_prefetch_threshold():
     assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
     assert cfg.host_write_policy == ts.SchedulerConfig.HostWritePolicy.WriteThrough
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == (5, 8)
+
+
+def test_a_shared_l2_pools_write_limits_reach_the_scheduler_config():
+    args = ServerArgs(model="x", max_num_seqs=8)
+    # A pool requires --disable-kvstore.
+    args.enable_kvstore = False
+    specs = _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    without = _config(args, specs)
+    assert without.shared_l2_config is None and without.disable_l2_cache is True
+    # The rank joined a pool (--shared-l2-config).
+    args.shared_l2_config = json.dumps(
+        {
+            "owner_address": "tcp://127.0.0.1:1",
+            "device_names": [""],
+            "request_timeout_ms": 1000,
+            "join_timeout_s": 5,
+            "read_workers": 1,
+            "write_workers": 1,
+            "scheduler": {"max_writes_in_flight": 3, "max_keys_per_write": 16},
+        }
+    )
+    cfg = scheduler_config_from_args(
+        args,
+        specs,
+        storage_config=None,
+        num_disk_pages=0,
+        disk_config=None,
+        max_scheduled_tokens=args.chunked_prefill_size,
+        max_batch_size=8,
+        max_resident_requests=8,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+        enable_kv_cache_events=False,
+        prefix_replay_tokens=0,
+        peer_config=None,
+        shared_l2_config=ts.SharedL2Config(
+            max_writes_in_flight=3, max_keys_per_write=16
+        ),
+    )
+    limits = cfg.shared_l2_config
+    assert (limits.max_writes_in_flight, limits.max_keys_per_write) == (3, 16)
+    # The pool is the Host L2: the local one is off, the proxy tier stays.
+    assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
+
+
+def test_default_cache_policy_starts_and_schedules_without_host():
+    args = ServerArgs(model="x", max_num_seqs=8, disable_kvstore=True)
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="full",
+            block_granularity=16,
+            total_pages=64,
+            attn_kind=ts.AttnKind.Full,
+            transfer_policy=ts.CacheTransferPolicy.FullSuffix,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+    request = ts.RequestSpec()
+    request.request_id = "default-policy"
+    request.tokens = list(range(32))
+    request.max_new_tokens = 1
+    scheduler.submit_requests([request])
+    plan = scheduler.next_execution_plan()
+    assert plan.forward[0].request_ids == [request.request_id]
+    assert plan.forward[0].input_lengths == [32]
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -168,6 +235,9 @@ def test_short_prefill_flag_controls_real_scheduler_order(enabled, role, interva
 
 def test_make_config_requires_and_maps_the_host_write_policy():
     fields = dict(
+        prefix_cache_evict_policy="lru",
+        prefix_cache_gds_prefill_cost=None,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
@@ -186,6 +256,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -248,6 +319,38 @@ def test_the_prefill_round_cap_reaches_the_scheduler():
     assert cfg.max_consecutive_prefill_rounds == 2
 
 
+def test_the_prefill_interval_min_decoding_defaults_to_always_owed():
+    args = prepare_server_args(
+        ["--model", "x", "--max-num-seqs", "8", "--prefill-decode-interval", "4"]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_interval_min_decoding == 0
+
+
+def test_the_prefill_interval_min_decoding_reaches_the_scheduler():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--prefill-decode-interval",
+            "128",
+            "--max-consecutive-prefill-rounds",
+            "1",
+            "--prefill-interval-min-decoding",
+            "6",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_interval_min_decoding == 6
+    assert cfg.max_consecutive_prefill_rounds == 1
+
+
 @pytest.mark.parametrize(
     "flags,error",
     [
@@ -285,6 +388,30 @@ def test_the_prefill_round_cap_reaches_the_scheduler():
                 "64",
             ],
             "--prefill-decode-min-interval cannot be combined",
+        ),
+        (
+            [
+                "--prefill-decode-interval",
+                "64",
+                "--max-consecutive-prefill-rounds",
+                "1",
+                "--prefill-interval-min-decoding",
+                "-1",
+            ],
+            "--prefill-interval-min-decoding must be non-negative",
+        ),
+        (
+            ["--prefill-decode-interval", "64", "--prefill-interval-min-decoding", "8"],
+            "--prefill-interval-min-decoding needs --max-consecutive-prefill-rounds",
+        ),
+        (
+            [
+                "--prefill-decode-min-interval",
+                "2",
+                "--prefill-interval-min-decoding",
+                "8",
+            ],
+            "--prefill-interval-min-decoding needs --max-consecutive-prefill-rounds",
         ),
     ],
 )
@@ -588,41 +715,23 @@ def test_a_decode_server_demotes_no_checkpoint():
     assert not cfg.demote_superseded_state_checkpoints
 
 
-def test_an_older_scheduler_wheel_starts_without_the_implied_policies(monkeypatch):
-    # tokenspeed-scheduler 0.1.49 has neither field, so setting them would
-    # raise AttributeError: a prefill server with in-forward checkpoints on
-    # starts without the demotion and the short prompt-end drop instead.
-    class OldSchedulerConfig:
-        state_checkpoint_in_forward = False
-
-    warnings = []
-    monkeypatch.setattr(rank_setup, "SchedulerConfig", OldSchedulerConfig)
-    monkeypatch.setattr(
-        rank_setup, "logger", SimpleNamespace(warning=lambda *a: warnings.append(a))
-    )
-    args = prepare_server_args(
-        [
-            "--model",
-            "x",
-            "--max-num-seqs",
-            "8",
-            "--disaggregation-mode",
-            "prefill",
-            "--disaggregation-transfer-backend",
-            "mooncake",
-            "--enable-state-checkpoint-in-forward",
-        ]
+def test_gds_keeps_production_and_filters_without_superseded_hints():
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="prefill",
+        disaggregation_transfer_backend="mooncake",
+        enable_state_checkpoint_in_forward=True,
+        prefix_cache_evict_policy="gds",
+        prefix_cache_gds_prefill_cost=[1, 0],
+        prefix_cache_gds_disk_read_cost=None,
     )
     cfg = _config(
         args, _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
     )
     assert cfg.state_checkpoint_in_forward
-    # Read as such a wheel would hold them: absent, or left at their default.
-    assert not getattr(cfg, "demote_superseded_state_checkpoints", False)
-    assert not getattr(cfg, "drop_short_prompt_end_checkpoints", False)
-    assert len(warnings) == 2
-    assert "SchedulerConfig.demote_superseded_state_checkpoints" in warnings[0][0]
-    assert "SchedulerConfig.drop_short_prompt_end_checkpoints" in warnings[1][0]
+    assert cfg.drop_short_prompt_end_checkpoints
+    assert not cfg.demote_superseded_state_checkpoints
 
 
 @pytest.mark.parametrize(
@@ -1099,6 +1208,9 @@ def test_the_prefill_chunk_yield_is_refused_where_it_cannot_run(flags, match):
 
 def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
     fields = dict(
+        prefix_cache_evict_policy="lru",
+        prefix_cache_gds_prefill_cost=None,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
@@ -1118,6 +1230,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (

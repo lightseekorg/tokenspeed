@@ -55,6 +55,18 @@ def _fused_config(decode_input_tokens: int) -> "ts.SchedulerConfig":
     return cfg
 
 
+def _retraction_config() -> "ts.SchedulerConfig":
+    """Host and snapshot pools, and a forced retraction of the oldest decoder."""
+    cfg = _fused_config(decode_input_tokens=1)
+    cfg.disable_l2_cache = False
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
+    cfg.num_host_pages = cfg.num_snapshot_pages = 33
+    cfg.host_group_packing = [1] * len(cfg.cache_groups)
+    cfg.max_retracted_requests = 1
+    cfg.debug_force_retraction_interval = 1
+    return cfg
+
+
 def _spec(request_id: str, tokens: list[int], max_new_tokens: int) -> "ts.RequestSpec":
     spec = ts.RequestSpec()
     spec.request_id = request_id
@@ -219,6 +231,86 @@ class TestFusedStateTwoSlots:
         assert all(
             not pairs for pairs in dict(plan.pages_to_copy).values()
         ), "an aligned hit copies nothing"
+
+
+class TestDeferredDecodeState:
+    """State groups whose decode state the runtime commits to the live block
+    only at a retraction (``CacheGroupConfig.deferred_decode_state``)."""
+
+    def test_only_a_state_group_defers_its_decode_state(self):
+        cfg = _fused_config(decode_input_tokens=1)
+        groups = cfg.cache_groups
+        for group in groups:
+            group.deferred_decode_state = group.group_id not in K3_STATE_GROUPS
+        cfg.cache_groups = groups
+        with pytest.raises(ValueError, match="only a state group can defer"):
+            ts.Scheduler(cfg)
+
+    @pytest.mark.parametrize("peers", [False, True])
+    def test_a_retraction_fences_its_deferred_endpoints_only_for_peers(self, peers):
+        cfg = _retraction_config()
+        if peers:
+            cfg.peer_config = ts.PeerConfig(
+                name="holder",
+                incarnation=1,
+                max_leases=4,
+                soft_pin_us=1000,
+                hard_pin_us=1000,
+                lookup_timeout_us=100,
+                min_fetch_tokens=cfg.prefix_granularity,
+                landing_tier=ts.PeerLandingTier.Device,
+                max_host_landing_blocks=0,
+                host_ready_timeout_us=0,
+                versioned_shards=False,
+            )
+        groups = cfg.cache_groups
+        for group in groups:
+            group.deferred_decode_state = group.group_id in K3_STATE_GROUPS
+        cfg.cache_groups = groups
+        scheduler = ts.Scheduler(cfg)
+        scheduler.submit_requests([_spec("seed", [10, 11], MAX_NEW_TOKENS)])
+        assert scheduler.next_execution_plan().state_commit_fence is None
+        _advance(scheduler, "seed", [12])
+        assert _dispatched(scheduler.next_execution_plan())
+        _advance(scheduler, "seed", [13])
+        _reserve(scheduler, "seed", 1)
+        retraction = scheduler.next_execution_plan()
+        assert scheduler.retracted_size() == 1
+        # Local readers order behind the runtime's commit on the device; only
+        # a peer, which reads outside device order, waits for its ACK.
+        assert (retraction.state_commit_fence is not None) == peers
+        if peers:
+            ack = ts.Cache.StateCommitDoneEvent()
+            ack.op_id = retraction.state_commit_fence
+            scheduler.advance(ts.ExecutionEvent().add_event(ack))
+            assert scheduler.next_execution_plan().state_commit_fence is None
+
+    @pytest.mark.parametrize("deferred", [False, True])
+    def test_a_retraction_lists_the_victims_live_blocks_to_fold(self, deferred):
+        """The runtime folds a decoding victim's accepted records into the live
+        block (slot 1) its decode steps wrote, as the plan's state_folds say."""
+        cfg = _retraction_config()
+        groups = cfg.cache_groups
+        for group in groups:
+            group.deferred_decode_state = deferred and group.group_id in K3_STATE_GROUPS
+        cfg.cache_groups = groups
+        scheduler = ts.Scheduler(cfg)
+        scheduler.submit_requests([_spec("seed", [10, 11], MAX_NEW_TOKENS)])
+        scheduler.next_execution_plan()
+        _advance(scheduler, "seed", [12])
+        [decode] = _dispatched(scheduler.next_execution_plan())
+        slot = list(decode.request_pool_indices)[list(decode.request_ids).index("seed")]
+        live = {group: row[1] for group, row in _state_rows(decode, "seed").items()}
+        _advance(scheduler, "seed", [13])
+        _reserve(scheduler, "seed", 1)
+        retraction = scheduler.next_execution_plan()
+        assert scheduler.retracted_size() == 1
+        folds = {
+            group: pairs.tolist()
+            for group, pairs in retraction.state_folds_arrays().items()
+        }
+        expected = {group: [[slot, page]] for group, page in live.items()}
+        assert folds == (expected if deferred else {})
 
 
 class TestStateCheckpointInForward:

@@ -100,7 +100,8 @@ cfg.num_disk_pages = {disk_pages}
 cfg.disk_config = ts.DiskConfig(max_operations=4, max_blocks_per_operation=64,
                                 max_host_blocks=4, max_write_host_blocks=2,
                                 max_queued_cleanings=64, min_prefetch_tokens=1,
-                                wait_timeout_us=10_000_000, ready_timeout_us=10_000_000)
+                                wait_timeout_us=10_000_000, ready_timeout_us=10_000_000,
+                                min_clean_tokens=0, require_reuse_for_cleaning=False)
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full", block_granularity={PAGE},
                                         total_pages=9, attn_kind=ts.AttnKind.Full)]
 result = ts.Scheduler(cfg)

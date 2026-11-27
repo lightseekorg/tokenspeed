@@ -1297,3 +1297,51 @@ def test_dflash2_grouped_conv_matches_reference(
             x, projection[:, side], base[side], block_size, group_size
         )
         torch.testing.assert_close(y, expected, atol=ATOL, rtol=RTOL)
+
+
+def test_banked_conv_replay_addresses_past_int32(device):
+    from tokenspeed_kernel.ops.conv import BankedConvReplayPayload, causal_conv1d_update
+
+    torch.manual_seed(31)
+    x = torch.randn(1, 32, 4, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(32, 4, device=device, dtype=torch.bfloat16) * 0.1
+    state = torch.zeros(6, 32, 3, device=device, dtype=torch.bfloat16)
+    source = torch.tensor([1], device=device, dtype=torch.int32)
+    destinations = torch.arange(2, 6, device=device, dtype=torch.int32)[None]
+    a, b = (torch.randn(4, 2, device=device, dtype=torch.bfloat16) for _ in range(2))
+    expected_payload = torch.empty(4, 20, device=device, dtype=torch.bfloat16)
+    expected = causal_conv1d_update(
+        x.clone(),
+        state.clone(),
+        weight,
+        activation="silu",
+        conv_state_indices=source,
+        output_state_indices=destinations,
+        parent_indices=None,
+        replay_payload=(expected_payload, a, b),
+    )
+    # Reserve a large virtual allocation but touch only the two small payloads.
+    bank_stride = 2**31 + 128
+    backing = torch.empty(
+        bank_stride + expected_payload.numel(), device=device, dtype=torch.bfloat16
+    )
+    bank_zero = backing[: expected_payload.numel()].view_as(expected_payload)
+    bank_zero.fill_(float("nan"))
+    bank_one = backing[bank_stride:].view_as(expected_payload)
+    bank_one.zero_()
+    payload = BankedConvReplayPayload(
+        bank_zero, a, b, torch.ones(1, device=device, dtype=torch.int32), bank_stride
+    )
+    actual = causal_conv1d_update(
+        x.clone(),
+        state,
+        weight,
+        activation="silu",
+        conv_state_indices=source,
+        output_state_indices=destinations,
+        parent_indices=None,
+        replay_payload=payload,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(bank_one, expected_payload, rtol=0, atol=0)
+    assert torch.isnan(bank_zero).all().item()

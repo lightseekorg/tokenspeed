@@ -365,8 +365,8 @@ class QwenGDNRecipe(CacheRecipe):
         draft position in the model dtype, plus the per-layer fp32
         ``A_log``/``dt_bias`` pair.
         """
-        conv_shape, _, ssm_shape, _ = self._state_shapes
-        num_v_heads, head_v_dim, _ = ssm_shape
+        conv_shape, _, ssm_shape, state_dtype = self._state_shapes
+        num_v_heads, head_v_dim, head_k_dim = ssm_shape
         key_width = (conv_shape[0] - num_v_heads * head_v_dim) // 2
         row_width = key_width + num_v_heads * head_v_dim + 2 * num_v_heads
         num_layers = sum(
@@ -377,4 +377,36 @@ class QwenGDNRecipe(CacheRecipe):
         )
         payload = num_layers * rows * row_width * self.attn_config.dtype.itemsize
         parameters = num_layers * 2 * num_v_heads * torch.float32.itemsize
+        if (
+            self.server_args.enable_deferred_gdn_state
+            and not self.server_args.decode_monokernel
+            and self.server_args.pipeline_parallel_size == 1
+            and not self.draft_tree
+            and int(self.server_args.speculative_num_draft_tokens) == 4
+        ):
+            from tokenspeed_kernel.ops.attention.gdn import gdn_pending_replay_supported
+
+            from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
+            from tokenspeed.runtime.layers.attention.backends.state.gdn_pending import (
+                deferred_gdn_metadata_bytes,
+            )
+
+            if gdn_pending_replay_supported(
+                self.attn_config.dtype,
+                geometry=(key_width // head_k_dim, num_v_heads, head_k_dim, head_v_dim),
+                state_dtype={"bfloat16": torch.bfloat16, "float32": torch.float32}[
+                    state_dtype
+                ],
+            ):
+                # The second payload bank is batch-sized; only ownership
+                # records are indexed by the whole request pool.
+                capacity = self.attn_config.max_bs
+                metadata = deferred_gdn_metadata_bytes(
+                    layers=num_layers,
+                    capacity=capacity,
+                    slot_count=RequestSlotLayout(
+                        self.attn_config.max_resident_requests
+                    ).capacity,
+                )
+                return 2 * payload + parameters + metadata
         return payload + parameters

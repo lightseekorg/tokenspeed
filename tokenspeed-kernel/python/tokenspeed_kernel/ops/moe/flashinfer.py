@@ -665,7 +665,7 @@ if platform.is_nvidia:
 
 
 # ===-----------------------------------------------------------------------===#
-# FP8 block-scaled experts: CUTLASS (NVIDIA SM90+)
+# FP8 block-scaled experts: CUTLASS (NVIDIA SM90)
 # ===-----------------------------------------------------------------------===#
 
 
@@ -726,6 +726,8 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(9, 0),
+            # FlashInfer runs block-scaled FP8 in the CUTLASS fused MoE on SM90 only.
+            max_arch_version=ArchVersion(9, 0),
         ),
         signatures=format_signatures(
             "x",
@@ -915,11 +917,8 @@ if platform.is_nvidia:
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
         ),
-        signatures=format_signatures(
-            "x",
-            "dense",
-            {torch.float16, torch.bfloat16},
-        ),
+        # The TRT-LLM 1x128 activation quantizer reads BF16 only.
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
         traits={
             "weight_dtype": frozenset({"fp8"}),
             "activation": frozenset({"silu"}),
@@ -1077,11 +1076,8 @@ if platform.is_nvidia:
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
         ),
-        signatures=format_signatures(
-            "x",
-            "dense",
-            {torch.float16, torch.bfloat16},
-        ),
+        # The TRT-LLM 1x128 activation quantizer reads BF16 only.
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
         traits={
             "weight_dtype": frozenset({"fp8"}),
             "activation": frozenset({"swiglu"}),
@@ -4126,6 +4122,7 @@ if platform.is_nvidia:
             "weight_dtype": frozenset({"nvfp4"}),
             "activation": frozenset({"situ"}),
             "routing_mode": frozenset({"precomputed_topk"}),
+            "topk_weights_dtype": frozenset({torch.bfloat16}),
             "supports_deferred_finalize": frozenset({True, False}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),

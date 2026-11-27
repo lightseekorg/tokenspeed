@@ -43,7 +43,25 @@ from tokenspeed.runtime.cache.l3.identity import (
     l3_checkpoint_id,
     share_l3_checkpoint_ids,
     storage_deployment_id,
+    warn_if_unpinned_peer_weights,
 )
+
+
+@pytest.mark.parametrize(
+    ("weight_version", "revisions", "warns"),
+    [
+        ("default", [""], True),
+        ("default", ["main"], True),
+        ("default", ["a" * 40], False),
+        ("default", ["a" * 40, ""], True),
+        ("default", ["", "b" * 40], True),
+        ("default", ["a" * 40, "b" * 40], False),
+        ("release-17", ["", ""], False),
+    ],
+)
+def test_live_peer_weight_identity_warning(weight_version, revisions, warns, caplog):
+    warn_if_unpinned_peer_weights(weight_version, revisions)
+    assert ("--weight-version" in caplog.text) == warns
 
 
 @contextmanager
@@ -1245,6 +1263,103 @@ class TestStorageKeyTest:
                 )
             assert (first) == (second)
             assert (digest.call_count) == (2)
+
+    def test_checkpoint_id_fingerprints_object_store_versions_without_heavy_imports(
+        self,
+    ):
+        from tokenspeed.runtime.cache.l3 import identity as l3_identity
+
+        uri = "gs://example-bucket/org/model"
+        base_entries = (
+            ("__pycache__/cached.py", "gen:1"),
+            ("config.json", "gen:10"),
+            ("hf_quant_config.json", "gen:20"),
+            ("model-00001-of-00002.safetensors", "gen:30"),
+            ("model-00002-of-00002.safetensors", "gen:40"),
+            ("model.safetensors.index.json", "gen:50"),
+            ("modeling_custom.py", "gen:60"),
+            ("README.md", "gen:70"),
+            ("unlisted.gguf", "gen:80"),
+        )
+
+        def compute(
+            entries,
+            *,
+            target_uri: str = uri,
+            load_format: str = "runai_streamer",
+            extra: dict | None = None,
+        ) -> str:
+            l3_identity._object_store_checkpoint_fingerprint.cache_clear()
+            with mock.patch.object(
+                l3_identity,
+                "_list_object_store_versions",
+                return_value=entries,
+            ):
+                return l3_checkpoint_id(
+                    target_uri,
+                    hf_config=SimpleNamespace(),
+                    revision="",
+                    load_format=load_format,
+                    model_loader_extra_config=extra or {},
+                    ext_yaml="",
+                )
+
+        id_prefill = compute(
+            base_entries,
+            target_uri=uri + "/",
+            extra={
+                "concurrency": 16,
+                "distributed": True,
+                "distributed_scope": "global",
+            },
+        )
+        id_decode = compute(
+            base_entries,
+            extra={
+                "concurrency": 8,
+                "memory_limit": 4 * 1024**3,
+                "distributed": False,
+            },
+        )
+        id_safetensors = compute(base_entries, load_format="safetensors")
+        assert id_prefill.startswith("objstore-")
+        assert id_prefill.endswith(":safetensors")
+        assert id_prefill == id_decode == id_safetensors
+
+        # Unrelated non-metadata / __pycache__ object changes must not split L3.
+        unrelated_changed = tuple(
+            (
+                rel,
+                (
+                    "gen:999"
+                    if rel in ("README.md", "unlisted.gguf", "__pycache__/cached.py")
+                    else ver
+                ),
+            )
+            for rel, ver in base_entries
+        )
+        assert compute(unrelated_changed) == id_prefill
+
+        # Weight, metadata, or custom Python version changes must rotate the id.
+        for critical in (
+            "config.json",
+            "hf_quant_config.json",
+            "model-00002-of-00002.safetensors",
+            "model.safetensors.index.json",
+            "modeling_custom.py",
+        ):
+            mutated = tuple(
+                (rel, "gen:999" if rel == critical else ver)
+                for rel, ver in base_entries
+            )
+            assert compute(mutated) != id_prefill
+
+        # Missing weight shards for non-dummy formats must fail explicitly.
+        metadata_only = tuple(
+            (rel, ver) for rel, ver in base_entries if not rel.endswith(".safetensors")
+        )
+        with pytest.raises(ValueError, match="no weight objects matched"):
+            compute(metadata_only)
 
     def test_share_l3_checkpoint_ids_combines_rank_local_digests(self):
         seen = []

@@ -60,7 +60,7 @@ def worker(configuration):
     ):
         return False
     assert original_settings["expandable_segments"]
-    saver = TorchMemorySaverAdapter.create(enable=True)
+    saver = TorchMemorySaverAdapter.create(enable=True, device="cuda")
 
     def assert_restored():
         assert torch.cuda.memory._snapshot()["allocator_settings"] == original_settings
@@ -158,7 +158,9 @@ def test_expandable_allocations_around_managed_storage(configuration):
     pytest.importorskip("torch_memory_saver")
     if Version(version("torch-memory-saver")) < Version("0.0.10"):
         pytest.skip("requires memory saver with managed-pointer teardown support")
-    with TorchMemorySaverAdapter.create(enable=True).configure_subprocess():
+    with TorchMemorySaverAdapter.create(
+        enable=True, device="cuda"
+    ).configure_subprocess():
         env = dict(os.environ)
         for name in _ENV_NAMES:
             env.pop(name, None)

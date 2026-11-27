@@ -40,7 +40,7 @@
 #include <vector>
 
 #include "cache/coordinator/cache_store.h"
-#include "cache/coordinator/victim_set.h"
+#include "cache/coordinator/planned_eviction.h"
 #include "cache/core/cache_block_ref.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/boundary_tree.h"
@@ -63,7 +63,8 @@ public:
         PendingHostStore() noexcept = default;
         // Records an eviction write-back of `key`'s block under `node` (a
         // State checkpoint when `checkpoint`).
-        PendingHostStore(CacheEvictor& evictor, BoundaryTree::Node& node, const CacheKey& key, bool checkpoint);
+        PendingHostStore(CacheEvictor& evictor, BoundaryTree::Node& node, const CacheKey& key, bool checkpoint,
+                         bool reserved);
         PendingHostStore(const PendingHostStore&) = delete;
         PendingHostStore& operator=(const PendingHostStore&) = delete;
         PendingHostStore(PendingHostStore&& other) noexcept;
@@ -79,9 +80,10 @@ public:
     private:
         CacheEvictor* evictor_{nullptr};
         BoundaryTree::Hold node_;
-        // The key's element of the evictor's pending_eviction_keys_, which
+        // The key's element of the store's pending_host_keys_, which
         // is node-based, so it stays put while any record holds it.
         const CacheKey* key_{nullptr};
+        bool reserved_{false};
     };
     // A Device entry an admission, a restore or a compaction evicted under the write-back
     // policy, captured before the index let the block go: its page may be
@@ -100,6 +102,9 @@ public:
         // Accounting only: an earlier write-back published this hash's block of
         // this group on the Host, so copying it again is a recopy.
         bool written_back_before{false};
+        // A preallocated, unpublished destination supplied by a joint plan.
+        bool copy_required{false};
+        std::shared_ptr<std::vector<CacheBlockRef>> preservation_holds;
         // Held from the eviction until the segment settles.
         PendingHostStore pending;
     };
@@ -114,6 +119,7 @@ public:
         // The newest Device access epoch among the members, raised as each
         // member is recorded.
         std::uint64_t newest_access_epoch{0};
+        bool reserved{false};
     };
     // Device entries evicted for one reason, each also counted as
     // host_resident when the Host index still held its key (never without a
@@ -171,6 +177,7 @@ public:
         CacheBlockLocation location;
         DeviceEvictionCounts DeviceEvictionStats::*reason;
         EvictedSegment* write_back_segment;
+        bool exact_removal;
     };
     // What EvictCachedBlockAlone took out of the index.
     struct EvictedEntry {
@@ -219,6 +226,12 @@ public:
         // A segment plan reclaimed a prefix-closed KV copy independently of
         // the boundary's checkpoints, while the Device still held its key.
         HostEvictionCounts duplicate_kv;
+        // A segment plan took it as clean Host-only cache -- the Disk holds
+        // its key too -- before any dirty entry (docs/rfcs/0006-disk-tier.md).
+        HostEvictionCounts clean;
+        // A shared L2 rank's proxy entry nothing held any more
+        // (HostCache::TryEvictHostEntry): the pool keeps the page it stood for.
+        HostEvictionCounts released;
     };
 
     // Disk entries evicted for one reason, each also counted as host_resident
@@ -257,6 +270,10 @@ public:
     // an admission's, a restore's, a compaction's or a cache clear's victims;
     // it prefetches for the victims a few places ahead (hints only).
     std::vector<UnevictedVictim> EvictPlanned(std::span<const VictimSet> victims, bool write_back,
+                                              const VictimReasons& reasons);
+    // GDS prepares reservations and fresh rejections before Device removal,
+    // then commits the plan's watermarks and diagnostics once afterward.
+    std::vector<UnevictedVictim> EvictPlanned(const PlannedEviction& plan, bool write_back,
                                               const VictimReasons& reasons);
     // Device eviction of a planned or flushed victim, with its cascade (its
     // tail's companions or, for a page's KV block or one State group's
@@ -311,7 +328,7 @@ public:
     void ClearSegments() { evicted_segments_.clear(); }
     // The keys of the recorded write-backs, from recording through
     // settlement: probes take them as keys the Host holds.
-    const std::unordered_set<CacheKey, CacheKeyHash>& PendingKeys() const { return pending_eviction_keys_; }
+    const std::unordered_set<CacheKey, CacheKeyHash>& PendingKeys() const { return store_.PendingHostKeys(); }
 
     // Demoted entries (SetCheckpointDemotion) are never written back.
     void SetCheckpointDemotion(bool enabled) { demotes_checkpoints_ = enabled; }
@@ -340,6 +357,7 @@ public:
     // Evicts an unpinned Disk entry and, for a State checkpoint, the other
     // State groups' unpinned entries at its hash, as EvictHostCachedBlock does
     // on the Host. False when the entry itself is pinned or gone.
+    bool InvalidateDiskEntry(const CacheKey& key);
     bool EvictDiskCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                               DiskEvictionCounts DiskEvictionStats::*reason);
     // ClearCache's eviction of one Disk entry, once the whole Disk tier was
@@ -360,7 +378,10 @@ private:
     void EvictTailEntries(const ContentHash& hash, std::int32_t tail_tokens,
                           DeviceEvictionCounts DeviceEvictionStats::*reason, EvictedSegment* write_back_segment);
     // Releases a pending store's key (PendingHostStore).
-    void releasePendingKey(const CacheKey& key) noexcept;
+    void releasePendingKey(const CacheKey& key, bool reserved) noexcept;
+    void prepareTieredPlan(const TieredGdsPlan& plan);
+    std::optional<CacheKey> evictHostEntry(std::uint32_t group_id, CacheBlockLocation location,
+                                           HostEvictionCounts HostEvictionStats::*reason);
 
     CacheStore& store_;
     // The segments this plan's admissions, restores and compactions recorded
@@ -374,7 +395,6 @@ private:
     // PendingHostStore adds and removes them. Probes take the set as keys the
     // Host holds, so it stays a set; a key recorded more than once counts its
     // additional records beside it.
-    std::unordered_set<CacheKey, CacheKeyHash> pending_eviction_keys_;
     std::unordered_map<CacheKey, std::size_t, CacheKeyHash> pending_eviction_extra_refs_;
     bool demotes_checkpoints_{false};
     std::uint64_t dead_entries_not_written_back_{0};

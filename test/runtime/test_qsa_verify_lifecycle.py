@@ -72,6 +72,7 @@ def _runner(
     wrapper = object.__new__(ForwardStepRunner)
     wrapper.moe_source_rows = ()
     wrapper.dp_local_graph = False
+    wrapper.runtime_states = None
     wrapper.config = SimpleNamespace(
         spec_algo="MTP", max_req_pool_size=8, spec_draft_tree=False
     )
@@ -455,6 +456,7 @@ def test_runner_arms_mega_moe_counts_only_for_whole_batch_layouts(
         attention_tp_size=attn_tp_size,
         moe_tp_ep_size=moe_ep_size,
         world_size=world_size,
+        acl_graph_memory_policy="discard",
     )
     runner = ForwardStepRunner(
         forward_func=lambda *args, **kwargs: None,

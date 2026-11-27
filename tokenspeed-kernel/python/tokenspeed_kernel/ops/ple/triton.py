@@ -275,6 +275,7 @@ def _ple_host_gather_rows(
     ROW_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     SORTED: tl.constexpr,
+    SHARD_ROWS: tl.constexpr = 0,
 ):
     """Gather a tile of n-gram rows straight out of pinned host memory.
 
@@ -297,6 +298,10 @@ def _ple_host_gather_rows(
     global_id = tl.load(ids_ptr + row, mask=row < rows, other=0).to(tl.int64)
     in_range = (row < rows) & (global_id >= vocab_start) & (global_id < vocab_end)
     local_id = tl.where(in_range, global_id - vocab_start, 0)
+    if SHARD_ROWS:
+        owner = local_id // SHARD_ROWS
+        local_id = local_id % SHARD_ROWS
+        table_address = tl.load(table_address + owner)
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < head_dim
     out_dtype = out_ptr.dtype.element_ty
@@ -305,7 +310,9 @@ def _ple_host_gather_rows(
     else:
         table = table_address.to(tl.int64).to(tl.pointer_type(out_dtype))
     values = tl.load(
-        table + local_id[:, None] * head_dim + offsets[None, :],
+        (table[:, None] if SHARD_ROWS else table)
+        + local_id[:, None] * head_dim
+        + offsets[None, :],
         mask=mask[None, :] & in_range[:, None],
         other=0.0,
     ).to(tl.float32)
@@ -345,6 +352,7 @@ def _ple_host_gather_kernel(
     ROW_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
+    SHARD_ROWS: tl.constexpr = 0,
 ):
     """Gather ``rows`` n-gram ids straight out of pinned host memory.
 
@@ -371,6 +379,7 @@ def _ple_host_gather_kernel(
         ROW_SCALE,
         BLOCK_D,
         False,
+        SHARD_ROWS,
     )
 
 

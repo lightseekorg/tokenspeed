@@ -27,6 +27,7 @@ from enum import Enum
 import torch
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
+from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
@@ -610,6 +611,128 @@ def _chain_rows_dense(*tensors: torch.Tensor) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class GdnPendingReplay:
+    """Previous accepted prefixes consumed by the next layer's WY verify.
+
+    ``payload`` holds two contiguous batch banks, ``[2,L,B*T,width]``.
+    ``layer`` selects this layer; ``rows`` maps current requests to flattened
+    bank/row ids (-1 for committed state). ``steps`` and ``pages`` retain the
+    accepted lengths and live pages of those rows, independently of refresh.
+    ``write_bank`` is a device scalar selecting the current payload destination.
+    Only BF16, K=V=128, four-token chains with in-place state are supported.
+    """
+
+    payload: torch.Tensor
+    layer: int
+    rows: torch.Tensor
+    steps: torch.Tensor
+    pages: torch.Tensor
+    write_bank: torch.Tensor
+
+
+def _validate_pending_replay(pending, q, k, v, a, b, state, indices) -> None:
+    batch, tokens, heads, dim = q.shape
+    vheads = v.shape[2]
+    width = heads * dim + vheads * v.shape[-1] + 2 * vheads
+    payload = pending.payload
+    if payload.ndim != 4 or pending.steps.ndim != 2:
+        raise ValueError(
+            "pending replay needs two payload banks and two accepted-length rows"
+        )
+    capacity = pending.steps.shape[1]
+    layers = payload.shape[1]
+    if (
+        tokens != 4
+        or dim != 128
+        or v.shape[-1] != 128
+        or heads < 1
+        or vheads < heads
+        or vheads % heads
+        or batch > capacity
+        or not 0 <= pending.layer < layers
+        or payload.shape != (2, layers, capacity * 4, width)
+        or pending.steps.shape != (2, capacity)
+        or pending.pages.shape != (2, layers, capacity)
+        or pending.rows.shape != (batch,)
+        or pending.write_bank.shape != (1,)
+        or k.shape != q.shape
+        or v.shape[:2] != q.shape[:2]
+        or a.shape != (batch, 4, vheads)
+        or b.shape != a.shape
+        or state.ndim != 4
+        or state.shape[1:] != (vheads, 128, 128)
+        or indices.shape != (batch,)
+    ):
+        raise ValueError(
+            "pending replay requires matching batch banks and BF16 H/HV K128/V128 T4 geometry"
+        )
+    for tensor in (payload, q, k, v, state):
+        if tensor.dtype != torch.bfloat16 or tensor.device != q.device:
+            raise ValueError(
+                "pending replay activations, payload and state must be BF16 on one device"
+            )
+    for tensor in (pending.steps, pending.pages, pending.rows, pending.write_bank):
+        if (
+            tensor.dtype != torch.int32
+            or tensor.device != q.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError("pending replay metadata must be contiguous device int32")
+    if not payload.is_contiguous():
+        raise ValueError("pending replay payload banks must be contiguous")
+    if any(t.device != q.device for t in (a, b, indices)):
+        raise ValueError(
+            "pending replay gates and state indices must share the query device"
+        )
+
+
+def gdn_pending_replay_supported(
+    dtype: torch.dtype, *, geometry: tuple[int, int, int, int], state_dtype: torch.dtype
+) -> bool:
+    """Return registry support for activation/state dtypes and (H, HV, K, V).
+
+    The contract is output-only four-token chain verify with in-place BF16
+    state. No payloads are allocated or device data read by this query.
+    """
+    heads, vheads, _, _ = geometry
+    if (
+        dtype != torch.bfloat16
+        or state_dtype != torch.bfloat16
+        or geometry[2:] != (128, 128)
+        or heads < 1
+        or vheads < heads
+        or vheads % heads
+        or vheads % 4
+    ):
+        return False
+    signature = _attention_format_signature(
+        q=torch.empty((), dtype=dtype),
+        k=torch.empty((), dtype=dtype),
+        v=torch.empty((), dtype=dtype),
+    )
+    try:
+        kernel = select_kernel(
+            "attention",
+            "gdn_decode_mtp",
+            signature,
+            traits={
+                "head_dim": 128,
+                "value_head_dim": 128,
+                "verify_tokens": 4,
+                "output_only": True,
+                "tree": False,
+                "varlen": False,
+                "pending_replay": True,
+            },
+        )
+    except NoKernelFoundError:
+        return False
+    return True in KernelRegistry.get().get_by_name(kernel.name).traits.get(
+        "pending_replay", ()
+    )
+
+
 def gdn_decode_mtp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -628,6 +751,7 @@ def gdn_decode_mtp(
     output_state_indices: torch.Tensor | None = None,
     output_state: torch.Tensor | None = None,
     tree_ancestors: torch.Tensor | None,
+    pending_replay: GdnPendingReplay | None,
     replay_payload: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
@@ -691,6 +815,8 @@ def gdn_decode_mtp(
             needs ``disable_state_update``, and an ``intermediate_states_buffer``
             is given exactly when ``gdn_tree_verify_needs_node_states(T)``.
             Kernel selection requires tree support; ``None`` is a chain.
+        pending_replay: Previous accepted prefixes to materialize while reading
+            the state for WY. Pass None explicitly for committed-state verify.
         replay_payload: Optional contiguous ``[B * T, num_q_heads * head_dim +
             num_v_heads * head_v_dim + 2 * num_v_heads]`` ReplaySSM payload, in
             the inputs' dtype, that a chunked ReplaySSM tree verify fills with
@@ -786,9 +912,22 @@ def gdn_decode_mtp(
         )
         and _chain_rows_dense(q, k, v, a, b),
         "replay_payload": replay_payload is not None,
+        "pending_replay": pending_replay is not None,
         "strided_state": not initial_state.is_contiguous()
         or (output_state is not None and not output_state.is_contiguous()),
     }
+    extra = {}
+    if pending_replay is not None:
+        if not output_only or tree_ancestors is not None:
+            raise ValueError("pending replay requires uniform output-only chain verify")
+        if replay_payload is not None:
+            raise ValueError(
+                "pending replay consumes payload banks written by convolution"
+            )
+        _validate_pending_replay(
+            pending_replay, q, k, v, a, b, initial_state, initial_state_indices
+        )
+        extra["pending_replay"] = pending_replay
     if solution != "flashinfer" and not output_only:
         # Only the legacy FlashInfer solution retains its old padding contract;
         # other named solutions must still accept the actual state dtype. A
@@ -807,6 +946,10 @@ def gdn_decode_mtp(
         solution=solution,
         override=override,
     )
+    if pending_replay is not None and True not in KernelRegistry.get().get_by_name(
+        kernel.name
+    ).traits.get("pending_replay", ()):
+        raise ValueError("selected GDN verify kernel does not support pending replay")
     ShapeCapture.get().record(
         "attention",
         "gdn_decode_mtp",
@@ -849,6 +992,7 @@ def gdn_decode_mtp(
             output_state=output_state,
             tree_ancestors=tree_ancestors,
             replay_payload=replay_payload,
+            **extra,
         )
 
 
@@ -1040,6 +1184,7 @@ def gdn_decode_supports(
             ),
         )
         traits.setdefault("replay_payload", False)
+        traits.setdefault("pending_replay", False)
     try:
         default = select_kernel(
             "attention",
@@ -1109,6 +1254,63 @@ def validate_replay_commit_args(
     return True
 
 
+def gdn_pending_metadata(
+    *,
+    operation: str,
+    buffers: dict[str, torch.Tensor],
+    input_slots: torch.Tensor,
+    input_frontier: torch.Tensor,
+    input_stopped: torch.Tensor,
+    input_accepted: torch.Tensor,
+    input_reads: torch.Tensor,
+    input_writes: torch.Tensor,
+    batch: int,
+    requested: int,
+) -> None:
+    """Dispatch stream-ordered pending ownership metadata.
+
+    ``buffers`` is the stable workspace allocated by GdnPendingState; each
+    operation writes only its defined metadata fields. ``batch`` and
+    ``requested`` are runtime counts.
+    No operation reads recurrent states or synchronizes with the host.
+
+    Args:
+        operation: One of begin, snapshot, dropouts, retire, accept_facts,
+            accept, materialize, select_slots, or discard_slots.
+        buffers: Stable device slot records, two batch metadata banks,
+            current row mappings and group indices; payload determines dtype.
+        input_slots: Current padded request slots for snapshot, or requested
+            unique slots for select_slots and discard_slots.
+        input_frontier: Slot-indexed logical cache lengths for snapshot/facts.
+        input_stopped: Slot-indexed stop flags for accept_facts.
+        input_accepted: Current batch's stop-truncated accepted lengths.
+        input_reads: Group-major state read indices for snapshot, or layer-major
+            accepted state read indices for accept.
+        input_writes: Layer-major accepted state destinations for accept.
+        batch: Current padded request count for snapshot/accept.
+        requested: Number of slots for select_slots or discard_slots.
+
+    Returns:
+        None. Updates the workspace metadata on the current stream.
+    """
+    signature = _attention_format_signature(
+        q=buffers["payload"], k=buffers["payload"], v=buffers["payload"]
+    )
+    kernel = select_kernel("attention", "gdn_pending_metadata", signature)
+    kernel(
+        operation=operation,
+        buffers=buffers,
+        input_slots=input_slots,
+        input_frontier=input_frontier,
+        input_stopped=input_stopped,
+        input_accepted=input_accepted,
+        input_reads=input_reads,
+        input_writes=input_writes,
+        batch=batch,
+        requested=requested,
+    )
+
+
 def gdn_replay_commit(
     payload: torch.Tensor,
     parameters: torch.Tensor,
@@ -1118,6 +1320,9 @@ def gdn_replay_commit(
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     accepted_length: torch.Tensor,
+    request_mask: torch.Tensor | None,
+    selected_requests: torch.Tensor | None,
+    request_workspace: torch.Tensor | None = None,
     draft_token_num: int,
     geometry: tuple[int, int, int, int],
     state_dtype: torch.dtype,
@@ -1125,7 +1330,7 @@ def gdn_replay_commit(
     override: str | None = None,
     solution: str | None = None,
 ) -> None:
-    """Replay every GDN layer's accepted prefix in one kernel launch.
+    """Replay every GDN layer's accepted prefix in one batched commit.
 
     K/V/a/b share one layer-major allocation. Recurrent slabs may remain
     physically disjoint: ``state_addresses`` and ``state_row_strides`` expose
@@ -1144,6 +1349,13 @@ def gdn_replay_commit(
         read_indices: Committed-state pages shaped ``[L, B]``.
         write_indices: Accepted-state destination pages shaped ``[L, B]``.
         accepted_length: Accepted verified-token count per request, shaped ``[B]``.
+        request_mask: Optional contiguous device bool [B] selection. Unselected
+            CTAs skip before reading the state or payload.
+        selected_requests: Optional precompacted device int32 [B+1] selection.
+            The first count entries contain unique row indices and the last
+            entry contains the count. Specify at most one selection.
+        request_workspace: Optional device int32 [B+1] compaction scratch.
+            Omission allocates scratch for this call. Requires request_mask.
         draft_token_num: Number of verify positions per request (``T``).
         geometry: ``(num_k_heads, num_v_heads, head_k_dim, head_v_dim)``.
         state_dtype: Element dtype shared by all recurrent-state pools.
@@ -1167,6 +1379,33 @@ def gdn_replay_commit(
         state_dtype=state_dtype,
     ):
         return
+    if request_mask is not None and (
+        request_mask.shape != accepted_length.shape
+        or request_mask.dtype != torch.bool
+        or request_mask.device != payload.device
+        or not request_mask.is_contiguous()
+    ):
+        raise ValueError("request_mask must be contiguous device bool [B]")
+    if request_workspace is not None and (
+        request_mask is None
+        or request_workspace.shape != (accepted_length.numel() + 1,)
+        or request_workspace.dtype != torch.int32
+        or request_workspace.device != payload.device
+        or not request_workspace.is_contiguous()
+    ):
+        raise ValueError(
+            "request_workspace requires a mask and contiguous device int32 [B+1]"
+        )
+    if selected_requests is not None and (
+        request_mask is not None
+        or selected_requests.shape != (accepted_length.numel() + 1,)
+        or selected_requests.dtype != torch.int32
+        or selected_requests.device != payload.device
+        or not selected_requests.is_contiguous()
+    ):
+        raise ValueError(
+            "selected_requests requires no mask and contiguous device int32 [B+1]"
+        )
     num_layers = payload.shape[0]
     batch_size = accepted_length.numel()
     num_k_heads, num_v_heads, head_k_dim, head_v_dim = geometry
@@ -1200,6 +1439,9 @@ def gdn_replay_commit(
             read_indices=read_indices,
             write_indices=write_indices,
             accepted_length=accepted_length,
+            request_mask=request_mask,
+            request_workspace=request_workspace,
+            selected_requests=selected_requests,
             draft_token_num=draft_token_num,
             num_k_heads=num_k_heads,
             num_v_heads=num_v_heads,
@@ -1257,6 +1499,7 @@ __all__ = [
     "GDN_STATE_CHECKPOINT_GRANULARITY",
     "GdnChainVerifyForm",
     "GdnStateCheckpoints",
+    "GdnPendingReplay",
     "gdn_chain_verify",
     "gdn_chain_verify_form",
     "gdn_chain_verify_supported",
@@ -1266,6 +1509,8 @@ __all__ = [
     "gdn_decode_step",
     "gdn_decode_mtp",
     "gdn_decode_supports",
+    "gdn_pending_metadata",
+    "gdn_pending_replay_supported",
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
     "gdn_tree_verify_needs_node_states",

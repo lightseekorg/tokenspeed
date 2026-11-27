@@ -222,6 +222,7 @@ pub fn processor(config: &Config) -> OutputProcessor {
         1,
         Some((config.prompt + config.steps + 1) as i64),
         Role::Plain,
+        false,
         FinishLog {
             enabled: false,
             request_stats: false,

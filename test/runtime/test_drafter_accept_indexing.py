@@ -1077,7 +1077,7 @@ def test_sample_draft_step_keeps_argmax_when_the_flag_is_off():
     assert drafter.draft_sampler is None
 
 
-def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
+def test_bind_refuses_greedy_drafters_and_arms_chain_drafters(monkeypatch):
     from tokenspeed.runtime.execution.drafter import speculative_sampling as spec
     from tokenspeed.runtime.execution.drafter.base import BaseDrafter
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
@@ -1087,7 +1087,10 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
     )
 
     assert Eagle.supports_speculative_sampling and Mtp.supports_speculative_sampling
-    assert not DFlash.supports_speculative_sampling
+    # Base DFLASH samples its block and records the dense q; a drafter that
+    # proposes greedily (the base class) refuses the flag.
+    assert DFlash.supports_speculative_sampling
+    assert not BaseDrafter.supports_speculative_sampling
 
     states = RuntimeStates(POOL, VOCAB, VOCAB, N, "cpu")
     states.init_draft_probs(spec_num_tokens=N, reject_threshold=2.0)
@@ -1177,6 +1180,161 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
         step=1,
     )
     assert seen == dict(step=1, rows=3)
+
+
+# --- Base DFLASH: sampled block drafting -------------------------------------
+
+HIDDEN = 4
+
+
+def _dflash_block(monkeypatch, *, top_k_rows, temperatures):
+    """A DFlash holding just what ``_sample_block`` reads, over a real head and
+    logits processor and a real sampler; only the sampling kernels are stood in.
+
+    ``DFlash.__init__`` needs a model runner with loaded weights, so the
+    instance is built without it (as test_dflash_replicated_head does).
+    """
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+    from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
+
+    sampler, states, buffers, pools, calls = _draft_sampler(
+        monkeypatch, top_k_rows=top_k_rows, temperatures=temperatures
+    )
+    head = ParallelLMHead(
+        VOCAB,
+        HIDDEN,
+        bias=False,
+        params_dtype=torch.float32,
+        org_num_embeddings=VOCAB,
+        padding_size=1,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        prefix="lm_head",
+    )
+    torch.manual_seed(1)
+    head.weight_loader(head.weight, torch.randn(VOCAB, HIDDEN))
+    drafter = DFlash.__new__(DFlash)
+    drafter.spec_num_tokens = N
+    drafter.hidden_size = HIDDEN
+    drafter.lm_head = head
+    drafter.logits_processor = LogitsProcessor(
+        PretrainedConfig(vocab_size=VOCAB),
+        skip_all_gather=True,
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
+    )
+    drafter.draft_sampler = sampler
+    return drafter, states, buffers, head, calls
+
+
+def test_dflash_block_samples_every_row_and_records_each_step_at_its_column(
+    monkeypatch,
+):
+    from tokenspeed.runtime.execution.drafter.speculative_sampling import (
+        DRAFT_SAMPLE_OFFSET_SALT,
+    )
+
+    top_k = [1 << 30] * (POOL + 1)
+    temps = [1.0] * (POOL + 1)
+    temps[2] = 0.5
+    drafter, states, buffers, head, calls = _dflash_block(
+        monkeypatch, top_k_rows=top_k, temperatures=temps
+    )
+    slots = torch.tensor([1, 2], dtype=torch.int64)
+    bs = slots.numel()
+    buffers.req_pool_indices_buf[:bs] = slots
+    buffers.state_write_req_pool_indices_buf[:bs] = slots
+    states.valid_cache_lengths[slots] = torch.tensor([10, 20], dtype=torch.int32)
+    torch.manual_seed(2)
+    hidden = torch.randn(bs, N, HIDDEN)  # row 0 is the anchor
+    block_ids = torch.tensor([[5, 0, 0], [6, 0, 0]], dtype=torch.int32)
+    next_tokens = torch.zeros(bs, N, dtype=torch.int32)
+
+    drafter._sample_block(hidden, block_ids, next_tokens)
+
+    logits = hidden[:, 1:, :] @ head.weight.T  # [bs, N - 1, V]
+    temperature = torch.tensor([1.0, 0.5]).view(bs, 1)
+    # The anchor column is the verified token; every other column is sampled.
+    assert next_tokens[:, 0].tolist() == [5, 6]
+    # q for the token proposed in column k + 1 is row k's distribution, at the
+    # request's own slot and temperature; the bonus column stays zero.
+    for step in range(N - 1):
+        want = torch.softmax(logits[:, step] / temperature, -1)
+        torch.testing.assert_close(states.draft_probs[slots, step], want)
+        # The stand-in draw is the second-highest logit of that row.
+        second = logits[:, step].topk(2, dim=-1).indices[:, 1]
+        assert next_tokens[:, step + 1].tolist() == second.tolist()
+    assert torch.count_nonzero(states.draft_probs[slots, -1]) == 0
+    # One draw per row, each with its own noise offset (step salted), so no two
+    # positions of a request share a draw.
+    assert len(calls) == N - 1
+    offsets = [c["offsets"][slots] for c in calls]
+    for step, got in enumerate(offsets):
+        want = states.valid_cache_lengths[slots].long() * N
+        assert torch.equal(got, want + DRAFT_SAMPLE_OFFSET_SALT + step)
+    assert len({tuple(o.tolist()) for o in offsets}) == N - 1
+
+
+def test_dflash_block_keeps_greedy_rows_as_argmax_with_a_one_hot_q(monkeypatch):
+    top_k = [1 << 30] * (POOL + 1)
+    top_k[3] = 1  # slot 3 is greedy
+    drafter, states, buffers, head, _ = _dflash_block(
+        monkeypatch, top_k_rows=top_k, temperatures=[1.0] * (POOL + 1)
+    )
+    slots = torch.tensor([3, 1], dtype=torch.int64)
+    bs = slots.numel()
+    buffers.req_pool_indices_buf[:bs] = slots
+    buffers.state_write_req_pool_indices_buf[:bs] = slots
+    torch.manual_seed(3)
+    hidden = torch.randn(bs, N, HIDDEN)
+    next_tokens = torch.zeros(bs, N, dtype=torch.int32)
+
+    drafter._sample_block(hidden, torch.zeros(bs, N, dtype=torch.int32), next_tokens)
+
+    logits = hidden[:, 1:, :] @ head.weight.T
+    for step in range(N - 1):
+        argmax = logits[0, step].argmax().item()
+        one_hot = torch.zeros(VOCAB)
+        one_hot[argmax] = 1.0
+        # Verify then checks the greedy row by exact match, as without the flag.
+        assert next_tokens[0, step + 1].item() == argmax
+        assert torch.equal(states.draft_probs[3, step], one_hot)
+        # The sampling row beside it is not forced to its argmax.
+        assert states.draft_probs[1, step].max() < 1.0
+
+
+def test_dflash_block_without_a_sampler_stays_greedy(monkeypatch):
+    drafter, states, buffers, head, calls = _dflash_block(
+        monkeypatch, top_k_rows=[1 << 30] * (POOL + 1), temperatures=[1.0] * (POOL + 1)
+    )
+    drafter.draft_sampler = None
+    bs = 2
+    torch.manual_seed(4)
+    hidden = torch.randn(bs, N, HIDDEN)
+    block_ids = torch.tensor([[5, 0, 0], [6, 0, 0]], dtype=torch.int32)
+    next_tokens = torch.zeros(bs, N, dtype=torch.int32)
+    argmax_inputs = []
+
+    # The vocab-parallel argmax needs the process group and buffers that
+    # ``DFlash.__init__`` sets up; stand in a plain argmax over the same head.
+    def greedy(hidden_states, out=None):
+        argmax_inputs.append(hidden_states)
+        out.copy_((hidden_states @ head.weight.T).argmax(-1).view_as(out))
+        return out
+
+    monkeypatch.setattr(drafter, "_greedy_sample_from_vocab_parallel_head", greedy)
+
+    drafter._sample_block(hidden, block_ids, next_tokens)
+
+    logits = hidden[:, 1:, :] @ head.weight.T
+    assert next_tokens[:, 1:].tolist() == logits.argmax(-1).tolist()
+    assert len(argmax_inputs) == 1
+    # No draw happened and nothing was recorded: every row still holds the sentinel.
+    assert not calls
+    assert torch.all(states.draft_probs[:, :-1] == states.draft_probs_sentinel)
 
 
 if __name__ == "__main__":
