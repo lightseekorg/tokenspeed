@@ -102,7 +102,5 @@ def test_warm_ll_bf16_splitk_is_noop_on_cpu_and_narrow_weights(monkeypatch):
     monkeypatch.setattr(ll_bf16_router, "warm_splitk", fail_if_called)
     x = torch.zeros((64, 7168), dtype=torch.bfloat16)
     w = torch.zeros((896, 7168), dtype=torch.bfloat16)
-    warm_ll_bf16_splitk(
-        x, w, out_dtype=torch.float32, has_bias=False, enable_pdl=False
-    )
+    warm_ll_bf16_splitk(x, w, out_dtype=torch.float32, has_bias=False, enable_pdl=False)
     assert not called

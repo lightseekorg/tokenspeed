@@ -213,17 +213,44 @@ def test_splitk_first_compile_warms_every_m_threshold() -> None:
             kimi3_router_projection(a[:m], b, solution="ll_bf16")
 
 
-def test_prefill_kernel_warmup_warms_splitk_for_small_serving_batches() -> None:
-    """Large-M startup warmup (M > MAX_M) must still precompile LLBf16SplitK."""
+def test_prefill_kernel_warmup_warms_splitk_for_small_serving_batches(
+    monkeypatch,
+) -> None:
+    """Large-M startup warmup (M > MAX_M) must precompile LLBf16SplitK for serving."""
+    from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
+    from tokenspeed_kernel.ops.moe.block_scaled import block_scaled_router_mm
+
+    monkeypatch.setattr(compile_monitor, "_hooks", None)
     a_large, b = _inputs(MAX_M * 2, seed=37)
     device_idx = a_large.device.index or 0
     enable_pdl = pdl_enabled()
-    for cfg in splitk_configs():
-        ll_bf16_router._splitk.pop(
-            (device_idx, *cfg, torch.float32, False, enable_pdl), None
-        )
-    with kernel_warmup(enabled=True):
-        kimi3_router_projection(a_large, b, solution="auto")
-    with assert_no_cute_compile():
-        for m in (5, 8, 16, 17, 24, 32):
-            kimi3_router_projection(a_large[:m], b, solution="auto")
+
+    call_sites = [
+        (
+            "kimi3_router_projection",
+            lambda x: kimi3_router_projection(x, b, solution="auto"),
+            (5, 8, 16, 17, 24, 32),
+        ),
+        (
+            "dsv4_linear_fp32",
+            lambda x: dsv4_linear_fp32(x, b),
+            (5, 8, 16, 17, 24, 32),
+        ),
+        (
+            "block_scaled_router_mm",
+            lambda x: block_scaled_router_mm(x, b, solution=None),
+            (5, 8, 16),
+        ),
+    ]
+    for _name, call, serving_ms in call_sites:
+        monkeypatch.setattr(compile_monitor, "_serving", False)
+        for cfg in splitk_configs():
+            ll_bf16_router._splitk.pop(
+                (device_idx, *cfg, torch.float32, False, enable_pdl), None
+            )
+        with kernel_warmup(enabled=True):
+            call(a_large)
+        compile_monitor.mark_serving()
+        with assert_no_cute_compile():
+            for m in serving_ms:
+                call(a_large[:m])
