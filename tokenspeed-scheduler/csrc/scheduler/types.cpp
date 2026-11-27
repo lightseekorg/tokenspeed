@@ -60,6 +60,18 @@ void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroup
 
 void SchedulerConfig::Validate() const {
     ValidateCapacityInputs();
+    if (prefill_policy) {
+        if (enable_short_prefill_first) {
+            throw std::invalid_argument("Scheduler: prefill_policy conflicts with enable_short_prefill_first");
+        }
+        switch (*prefill_policy) {
+            case PrefillPolicyKind::kFifo:
+            case PrefillPolicyKind::kShortPrefillFirst:
+                break;
+            default:
+                throw std::invalid_argument("Scheduler: prefill_policy must be fifo or short-prefill-first");
+        }
+    }
     if (max_kv_page_num < 0) {
         throw std::invalid_argument("Scheduler: max_kv_page_num must be >= 0");
     }

@@ -323,7 +323,17 @@ capacity model (§1.4) states the same split.
 
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
-`holdsHeadOfLine` breaks the candidate loop after scheduling a chunk of a
+Local prefill scheduling is selected once when Scheduler is constructed.
+The PrefillPolicy factory selects fifo or short-prefill-first through
+--prefill-policy. Omitting this selector preserves the existing default
+and the --enable-short-prefill-first opt-in; supplying both selectors is
+rejected. These are the two production policies. Their Schedule methods
+run one shared serial template, and PrefillSchedulingContext reuses the
+scheduler's existing admission operations. Peer selection and the prefill
+gate run before carry probes, preserving the bounded probe window. Head-of-line stopping,
+oldest-request protection and P-role carry/fill retain the rules below.
+
+The serial policy stops selecting candidates after scheduling a chunk of a
 prefill that is still incomplete. Nothing behind it is scheduled that round
 (on the P role, whole prompts complete beside it in the budget its chunk
 leaves; see the end of this section). A resident chunk that fails
@@ -346,7 +356,7 @@ inside the same plan build (`SchedulePrefillEvent` picks the successor state
 by whether the window reaches `PrefillSize()`), so a prompt scheduled in full
 never holds the line. A round can therefore carry **several prefills that
 complete this round plus at most one truncated one — and the truncated one is
-necessarily last**, because `holdsHeadOfLine` seals the phase the moment it
+necessarily last**, because the serial policy seals the phase the moment it
 appears; a chunk that carries whole prompts (end of this section) is admitted
 before them, but its row moves behind theirs. The runtime relies on this order
 (`unified_path.md`, "Prefill requests without generated outputs"). With 6K of

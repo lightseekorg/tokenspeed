@@ -36,6 +36,8 @@
 
 namespace tokenspeed {
 
+enum class PrefillPolicyKind : std::uint8_t { kFifo, kShortPrefillFirst };
+
 struct SchedulerConfig {
     std::int32_t prefix_granularity{};
     struct AllocatorConfig {
@@ -167,6 +169,9 @@ struct SchedulerConfig {
     // cap and the next round decodes (docs/design/scheduler.md §3.3). 0
     // always owes them.
     std::int32_t prefill_interval_min_decoding{0};
+    // Explicit selector. Omission preserves the legacy boolean below.
+    std::optional<PrefillPolicyKind> prefill_policy;
+    // Legacy selector, used only when prefill_policy is absent.
     // P and fused roles: rank new local prefills by work after Device/Host
     // prefix reuse, keeping stable ties and resident chunks first. Only the
     // oldest waiting prompt counts successful later first admissions; after

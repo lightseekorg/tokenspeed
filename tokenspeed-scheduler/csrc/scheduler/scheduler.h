@@ -54,6 +54,7 @@
 #include "scheduler/kv_cache_events.h"
 #include "scheduler/lone_request_recovery.h"
 #include "scheduler/operations/cache.h"
+#include "scheduler/prefill_policy.h"
 #include "scheduler/request.h"
 #include "scheduler/types.h"
 
@@ -114,6 +115,7 @@ struct HostCacheStats {
 class Scheduler {
 public:
     explicit Scheduler(SchedulerConfig config);
+    Scheduler(SchedulerConfig config, std::unique_ptr<PrefillPolicy> prefill_policy);
 
     // The stall diagnostic (docs/design/scheduler.md §2): consecutive plans
     // built empty with nothing in flight before the first warning, which
@@ -828,61 +830,33 @@ private:
                                                              std::int32_t kv_page_budget, std::int32_t yield_tokens,
                                                              bool must_complete);
 
-    // A Submitted prompt a P-role chunk that cannot finish may carry in its
-    // forward (docs/design/scheduler.md §1.1) -- one it gives way to
-    // (SchedulerConfig::prefill_chunk_yield_tokens) or one filling the budget
-    // it leaves, whatever that option: its position in the round's
-    // candidates, and the tokens (replay included) and KV pages the whole
-    // prompt takes.
-    struct WholePrompt {
-        std::size_t index{0};
-        Request* request{nullptr};
-        std::int32_t tokens{0};
-        std::int32_t pages{0};
-    };
-    // The tokens a Submitted request's first chunk takes to complete its
-    // prompt, replay included; nullopt when that chunk could not complete it
-    // whatever the budget -- its prefix waits for an eviction store, a
-    // junction cuts it, or it spans its in-forward checkpoint from inside a
-    // page -- and, on a model with a State group (`has_state_group`), when it
-    // shares the first page its KV lacks with the pages `resident_holder`'s
-    // admission is about to publish. A probe only: no KV event is registered
-    // and nothing is admitted.
     std::optional<std::int32_t> wholePromptTokens(Request& request, Request* resident_holder, bool has_state_group);
-    // The round's whole prompts, probed once: the Submitted candidates from
-    // position `from` on that no phase scheduled yet and whose whole prompt
-    // takes at most prefill_chunk_yield_tokens or the budget left, whichever
-    // is more, in candidate order, after at most kMaxYieldProbesPerRound
-    // probes; `resident_holder` is the resident chunk they are probed for
-    // before its admission, null otherwise.
-    std::vector<WholePrompt> wholePromptsAfter(std::span<Request* const> candidates, std::size_t from,
-                                               const PlanBuild& build, Request* resident_holder);
-    // The whole prompts a holder gives way to: from the round's list, those
-    // from position `from` on still Submitted, unscheduled and taking at most
-    // prefill_chunk_yield_tokens, in order, while their tokens together fit
-    // it and they and the holder fit the batch, the free request slots (one
-    // more for a new holder, `holder_is_new`) and, with max_kv_page_num, the
-    // KV page budget beside the holder's most pages (`holder_max_pages`).
-    std::vector<WholePrompt> carriedPrompts(std::span<const WholePrompt> whole_prompts, std::size_t from,
-                                            const PlanBuild& build, bool holder_is_new,
-                                            std::int32_t holder_max_pages) const;
-    // Admits the carried prompts beside a holder that kept the head of line
-    // (its operation the last pushed) -- those it gave way to, or those
-    // filling the budget it leaves (with enable_short_prefill_first one at a
-    // time, in rank order) -- each only if its first chunk completes it on
-    // the budget left, and skips one whose `tokens` exceed that budget; stops
-    // at the first capacity failure, and admits none once the plan is a
-    // lone-request compaction's (the holder's own;
-    // LoneRequestRecovery::ActedInPlan). Of each prompt it reads only
-    // `request` and `tokens`. Nothing it admits holds the head of line, and
-    // the holder's operation then moves behind theirs: the completing
-    // prefills run first, the incomplete one last. candidates supplies the
-    // round's FIFO order. With enable_short_prefill_first, a successful
-    // carried first admission that overtakes the oldest waiting prompt
-    // increments that prompt's bypass count.
-    // Returns how many of `carried` it admitted.
-    std::int32_t carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                                   std::span<const WholePrompt> carried, std::int32_t decode_reserve);
+
+    class PrefillContext final : public PrefillSchedulingContext {
+    public:
+        PrefillContext(Scheduler& scheduler, AdmissionFeedback& feedback, PlanBuild& build,
+                       std::span<Request* const> candidates, bool new_prompts_sealed, std::int32_t decode_reserve);
+        std::span<Request* const> Candidates() const override;
+        const SchedulerConfig& Config() const override;
+        PrefillBudget Budget() const override;
+        bool Eligible(const Request& request) const override;
+        bool TryPeerLanding(Request& request) override;
+        bool PrefillAllowed(const Request& request) const override;
+        std::int32_t EstimateRemaining(Request& request) override;
+        std::optional<std::int32_t> WholePromptTokens(Request& request, Request* resident_holder) override;
+        PrefillAdmission Admit(const PrefillAllocation& allocation) override;
+
+    private:
+        Scheduler& scheduler_;
+        AdmissionFeedback& feedback_;
+        PlanBuild& build_;
+        const std::span<Request* const> candidates_;
+        const bool new_prompts_sealed_;
+        const std::int32_t decode_reserve_;
+        Request* serial_holder_{nullptr};
+        std::size_t serial_holder_row_{0};
+        Request* blocked_resident_{nullptr};
+    };
 
     // The readmissions this round may restore, in rank order: among the
     // retracted requests whose image has landed, victims with generated
@@ -998,6 +972,7 @@ private:
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
 
     SchedulerConfig config_;
+    std::unique_ptr<PrefillPolicy> prefill_policy_;
     // Declared before the allocator, tickets and requests: they release their
     // slots before the sink's last reference can be destroyed.
     std::shared_ptr<CacheEventSink> cache_event_sink_;

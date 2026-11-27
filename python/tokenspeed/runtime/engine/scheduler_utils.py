@@ -146,6 +146,7 @@ def make_config(
     cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
     enable_short_prefill_first: bool = False,
+    prefill_policy: str | None = None,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
     demote_superseded_state_checkpoints: bool = False,
@@ -161,8 +162,13 @@ def make_config(
     Args:
         num_device_pages: Device LCM blocks including the null page.
         max_scheduled_tokens: Per-step prefill token budget.
-        enable_short_prefill_first: Opt in to remaining-work ordering with
-            oldest-request protection; False preserves submission order.
+        enable_short_prefill_first: Compatibility selector for remaining-work
+            ordering with oldest-request protection; False preserves submission
+            order when prefill_policy is omitted.
+        prefill_policy: Explicit "fifo" or "short-prefill-first"
+            selection. None preserves enable_short_prefill_first and does not
+            require a scheduler wheel that supports the explicit selector.
+            Cannot be combined with enable_short_prefill_first=True.
         max_batch_size: Per-rank batch slots -- the most requests this rank
             runs at once (``--max-num-seqs`` over the attention-DP ranks).
         max_resident_requests: Per-rank requests that may own a request slot,
@@ -287,6 +293,11 @@ def make_config(
             ``SharedL2Config``: the Host pages are then the pool's proxy and
             hold no bytes. None without a pool.
     """
+    if prefill_policy is not None and enable_short_prefill_first:
+        raise ValueError(
+            "--prefill-policy cannot be combined with "
+            "--enable-short-prefill-first; choose one prefill policy"
+        )
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
             "prefix_replay_tokens must fit a non-negative int32; "
@@ -383,6 +394,14 @@ def make_config(
     if prefill_interval_min_decoding:
         # Set only when on, for the same reason.
         cfg.prefill_interval_min_decoding = prefill_interval_min_decoding
+    if prefill_policy is not None:
+        # Resolve only an explicit selection: older wheels keep their default
+        # and legacy flag behavior, but must reject an unsupported new choice.
+        policies = {
+            "fifo": SchedulerConfig.PrefillPolicy.Fifo,
+            "short-prefill-first": SchedulerConfig.PrefillPolicy.ShortPrefillFirst,
+        }
+        cfg.prefill_policy = policies[prefill_policy]
     if enable_short_prefill_first:
         # Older scheduler wheels retain FIFO and reject an explicit opt-in.
         cfg.enable_short_prefill_first = True
