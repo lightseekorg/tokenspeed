@@ -976,8 +976,12 @@ class PrefillGraph:
                     )
                 )
             self._reserve_outputs(spec)
+            # Rearm on the capture stream before synchronizing: under DP > 1,
+            # the narrowing stage runs eager EP/TP NCCL collectives whose
+            # background ProcessGroupNCCL event-query callbacks invalidate a
+            # global CUDA stream capture if left in flight across capture_begin.
+            rearm()
         torch.cuda.synchronize()
-        rearm()
         with observer, cap:
             output = self._land_output(
                 CapturedForward(*self._narrowing.decoder_forward(statics, self._ctx))

@@ -390,7 +390,10 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
     wrapper = SimpleNamespace(stream=capture_stream) if explicit_stream else None
     observer = _Recorder("observe")
 
+    rearm_streams = []
+
     def rearm():
+        rearm_streams.append(active_stream)
         order.append("rearm")
 
     if stage == "bucket":
@@ -407,8 +410,8 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
         "forward",
         *before_forward,
         "forward",
-        "synchronize",
         *before_forward,
+        "synchronize",
         "observe enter",
         "capture enter",
         "allocate pool",
@@ -418,6 +421,16 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
         *before_forward,
         "replay",
     ]
+    if stage == "decoder":
+        # Pre-capture rearms run on capture_stream before synchronize so eager
+        # collectives finish before capture_begin; smoke-replay rearm runs on
+        # entry_stream alongside cap.replay(), matching serving.
+        assert rearm_streams == [
+            capture_stream,
+            capture_stream,
+            capture_stream,
+            entry_stream,
+        ]
     assert active_stream is entry_stream
     assert graph._pool == "pool"
 
