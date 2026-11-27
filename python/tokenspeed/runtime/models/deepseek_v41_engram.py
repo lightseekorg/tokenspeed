@@ -96,7 +96,10 @@ from tokenspeed.runtime.distributed.comm_ops import (
     token_reduce_scatter,
 )
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
-from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.fp8 import (
+    Fp8LinearMethod,
+    fp8_activation_scale_layouts,
+)
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.fp8 import Mxfp8Config
@@ -425,41 +428,60 @@ class EngramHostAlloc:
 class EngramPeerGpuAlloc:
     """Allocation and rendezvous configuration for peer-sharded GPU Engram tables.
 
-    handle_type: ``"fabric"`` (MNNVL/IMEX), ``"posix_fd"`` (single-node Unix
-        socket FD passing), or ``"auto"`` (fabric when every peer supports it,
-        else posix_fd on a single host).
-    rendezvous: Optional ``host:port`` or ``[ipv6]:port`` TCPStore endpoint for
-        cross-process peer sharding across independent workers. When set,
-        ``peer_world_size`` and ``peer_rank_offset`` must both be specified;
+    handle_type: Explicit CUDA VMM handle type: ``"fabric"`` (MNNVL/IMEX) or
+        ``"posix_fd"`` (single-node Unix socket FD passing).
+    rendezvous: Optional ``host:port`` or ``[ipv6]:port`` address of an
+        externally hosted standalone ``TCPStore`` for cross-process peer
+        sharding across independent workers. When set, ``rendezvous_id``,
+        ``peer_world_size``, and ``peer_rank_offset`` must all be specified;
         when None, peers are the ranks of ``torch.distributed.group.WORLD``.
     """
 
     handle_type: str
     rendezvous: str | None
+    rendezvous_id: str | None
     peer_world_size: int | None
     peer_rank_offset: int | None
 
     def __post_init__(self) -> None:
-        if self.handle_type not in ("auto", "fabric", "posix_fd"):
+        if self.handle_type not in ("fabric", "posix_fd"):
             raise ValueError(
-                "Engram peer GPU handle type must be auto, fabric, or posix_fd; "
+                "Engram peer GPU handle type must be fabric or posix_fd; "
                 f"got {self.handle_type!r}"
             )
-        cross = (self.rendezvous, self.peer_world_size, self.peer_rank_offset)
+        cross = (
+            self.rendezvous,
+            self.rendezvous_id,
+            self.peer_world_size,
+            self.peer_rank_offset,
+        )
         if any(field is not None for field in cross):
             if any(field is None for field in cross):
                 raise ValueError(
                     "Engram cross-process peer sharding requires rendezvous, "
-                    "peer_world_size, and peer_rank_offset together"
+                    "rendezvous_id, peer_world_size, and peer_rank_offset together"
                 )
             assert self.rendezvous is not None
+            assert self.rendezvous_id is not None
             assert self.peer_world_size is not None
             assert self.peer_rank_offset is not None
             peer_memory.parse_host_port(self.rendezvous)
+            if not self.rendezvous_id or "/" in self.rendezvous_id:
+                raise ValueError(
+                    "Engram rendezvous_id must be a non-empty string without '/'"
+                )
             if self.peer_world_size < 1:
                 raise ValueError("Engram peer_world_size must be positive")
             if self.peer_rank_offset < 0:
                 raise ValueError("Engram peer_rank_offset must be non-negative")
+
+
+@dataclass(frozen=True)
+class EngramPeerGpuBinding:
+    """Validated peer GPU allocation bound once to a live ``PeerMemoryExchange``."""
+
+    alloc: EngramPeerGpuAlloc
+    exchange: peer_memory.PeerMemoryExchange
 
 
 def resolve_engram_host_alloc(
@@ -469,9 +491,16 @@ def resolve_engram_host_alloc(
     if host_layout == "gpu":
         return None
     if host_layout == "peer_gpu":
+        handle_type = global_server_args_dict["engram_gpu_peer_handle_type"]
+        if handle_type is None:
+            raise ValueError(
+                "Peer-sharded GPU Engram tables require explicit "
+                "--engram-gpu-peer-handle-type (fabric or posix_fd)"
+            )
         return EngramPeerGpuAlloc(
-            handle_type=global_server_args_dict["engram_gpu_peer_handle_type"],
+            handle_type=handle_type,
             rendezvous=global_server_args_dict["engram_peer_rendezvous"],
+            rendezvous_id=global_server_args_dict["engram_peer_rendezvous_id"],
             peer_world_size=global_server_args_dict["engram_peer_world_size"],
             peer_rank_offset=global_server_args_dict["engram_peer_rank_offset"],
         )
@@ -481,13 +510,14 @@ def resolve_engram_host_alloc(
     )
 
 
-def create_engram_peer_exchange(
+def bind_engram_peer_gpu(
     alloc: EngramPeerGpuAlloc,
     mapping: Mapping,
     device: torch.device | str,
-) -> tuple[peer_memory.PeerMemoryExchange, str]:
-    """Create the shared peer exchange and resolve the VMM handle type once."""
+) -> EngramPeerGpuBinding:
+    """Connect the shared peer exchange and validate handle support across all peers."""
     if alloc.rendezvous is not None:
+        assert alloc.rendezvous_id is not None
         assert alloc.peer_world_size is not None
         assert alloc.peer_rank_offset is not None
         peer_rank = alloc.peer_rank_offset + mapping.rank
@@ -501,6 +531,7 @@ def create_engram_peer_exchange(
                 alloc.rendezvous,
                 rank=peer_rank,
                 world_size=alloc.peer_world_size,
+                rendezvous_id=alloc.rendezvous_id,
                 namespace="ts-engram-peer",
             )
         )
@@ -509,18 +540,24 @@ def create_engram_peer_exchange(
             torch.distributed.group.WORLD, namespace="ts-engram-peer"
         )
     device_index = _host_table_device_index(torch.device(device))
-    fabric_probe = peer_memory.probe_peer_device_memory(device_index, "fabric")
-    posix_probe = peer_memory.probe_peer_device_memory(device_index, "posix_fd")
+    local_probe = peer_memory.probe_peer_device_memory(device_index, alloc.handle_type)
+    local_fabric_domain = (
+        peer_memory.query_peer_fabric_domain(device_index)
+        if alloc.handle_type == "fabric" and local_probe is None
+        else None
+    )
     gathered = exchange.all_gather_object(
-        "probe", (host_identity(), fabric_probe, posix_probe)
+        "probe", (host_identity(), local_probe, local_fabric_domain)
     )
     hosts = [int(entry[0]) for entry in gathered]
-    fabric_probes = [entry[1] for entry in gathered]
-    posix_probes = [entry[2] for entry in gathered]
-    handle_type = peer_memory.resolve_peer_handle_type(
-        alloc.handle_type, hosts, fabric_probes, posix_probes
+    probes = [entry[1] for entry in gathered]
+    fabric_domains = (
+        [entry[2] for entry in gathered] if alloc.handle_type == "fabric" else None
     )
-    return exchange, handle_type
+    peer_memory.validate_peer_handle_type(
+        alloc.handle_type, hosts, probes, fabric_domains
+    )
+    return EngramPeerGpuBinding(alloc=alloc, exchange=exchange)
 
 
 def _cleanup_host_files() -> None:
@@ -797,11 +834,8 @@ class RowShardedEngramEmbedding(nn.Module):
         device: torch.device | str,
         host_table: bool,
         host_layout: str,
-        host_alloc: EngramHostAlloc | EngramPeerGpuAlloc | None,
+        host_alloc: EngramHostAlloc | EngramPeerGpuAlloc | EngramPeerGpuBinding | None,
         layer_id: int,
-        *,
-        peer_exchange: peer_memory.PeerMemoryExchange | None = None,
-        peer_handle_type: str | None = None,
     ):
         super().__init__()
         if (
@@ -824,16 +858,11 @@ class RowShardedEngramEmbedding(nn.Module):
                     "cuMem Engram host tables require the shared layout; sharded "
                     "tables use anonymous memory"
                 )
-            if peer_exchange is not None or peer_handle_type is not None:
-                raise ValueError("Host Engram tables take no peer GPU exchange")
         elif host_layout == "peer_gpu":
-            if not isinstance(host_alloc, EngramPeerGpuAlloc):
+            if not isinstance(host_alloc, (EngramPeerGpuAlloc, EngramPeerGpuBinding)):
                 raise TypeError(
-                    "Peer-sharded GPU Engram tables require an EngramPeerGpuAlloc"
-                )
-            if (peer_exchange is None) != (peer_handle_type is None):
-                raise ValueError(
-                    "peer_exchange and peer_handle_type must be passed together"
+                    "Peer-sharded GPU Engram tables require an EngramPeerGpuAlloc "
+                    "or EngramPeerGpuBinding"
                 )
         elif host_layout != "gpu":
             raise ValueError(
@@ -841,8 +870,6 @@ class RowShardedEngramEmbedding(nn.Module):
             )
         elif host_alloc is not None:
             raise ValueError("GPU Engram tables take no host allocation")
-        elif peer_exchange is not None or peer_handle_type is not None:
-            raise ValueError("TP-sharded GPU Engram tables take no peer GPU exchange")
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.tp_group = mapping.attn.tp_group
@@ -888,10 +915,6 @@ class RowShardedEngramEmbedding(nn.Module):
         self.cumem: host_memory.HostMemory | None = None
         # Peer-sharded GPU HBM VMM mapping when host_layout == "peer_gpu".
         self.peer_memory: peer_memory.PeerDeviceMemory | None = None
-        self._peer_cross_process = (
-            isinstance(host_alloc, EngramPeerGpuAlloc)
-            and host_alloc.rendezvous is not None
-        )
         resolved_device = torch.device(device)
         if host_table:
             packed_shape = (
@@ -937,18 +960,17 @@ class RowShardedEngramEmbedding(nn.Module):
                     raise ValueError(
                         "Peer-sharded GPU Engram tables require a CUDA device"
                     )
-                assert isinstance(host_alloc, EngramPeerGpuAlloc)
-                if peer_exchange is None:
-                    peer_exchange, peer_handle_type = create_engram_peer_exchange(
-                        host_alloc, mapping, resolved_device
+                if not isinstance(host_alloc, EngramPeerGpuBinding):
+                    raise TypeError(
+                        "Peer-sharded GPU Engram tables on CUDA require an "
+                        "EngramPeerGpuBinding from bind_engram_peer_gpu()"
                     )
-                assert peer_handle_type is not None
-                scoped_exchange = peer_exchange.scoped(f"L{layer_id}")
+                scoped_exchange = host_alloc.exchange.scoped(f"L{layer_id}")
                 device_index = _host_table_device_index(resolved_device)
                 self.peer_memory = peer_memory.create_peer_device_memory(
                     packed_bytes,
                     device_index=device_index,
-                    handle_type=peer_handle_type,
+                    handle_type=host_alloc.alloc.handle_type,
                     exchange=scoped_exchange,
                 )
                 self.packed = self.peer_memory.tensor.view(packed_shape)
@@ -961,7 +983,8 @@ class RowShardedEngramEmbedding(nn.Module):
                 )
                 logger.info(
                     f"Engram layer {layer_id}: peer-sharded GPU HBM table "
-                    f"({peer_handle_type}), {packed_bytes / 2**30:.2f} GiB total, "
+                    f"({host_alloc.alloc.handle_type}), "
+                    f"{packed_bytes / 2**30:.2f} GiB total, "
                     f"{self.peer_memory.layout.local_length / 2**30:.2f} GiB local "
                     f"on peer {self.peer_memory.layout.peer_rank}/"
                     f"{self.peer_memory.layout.peer_world_size} "
@@ -1051,7 +1074,7 @@ class RowShardedEngramEmbedding(nn.Module):
     def close_peer_storage(self) -> None:
         """Permanently free peer VMM handles and virtual address at shutdown."""
         if self.peer_memory is not None:
-            self.peer_memory.close(sync_peers=not self._peer_cross_process)
+            self.peer_memory.close()
 
     def _allocate_mmap_rows(
         self,
@@ -1280,6 +1303,80 @@ class RowShardedEngramEmbedding(nn.Module):
         return values
 
 
+class EngramPeerWeightsController:
+    """Peer-storage controller managing peer-sharded GPU VMM Engram tables.
+
+    Implements the ``PeerStorageController`` lifecycle used by ``DeviceHandle``,
+    ``DummyModelLoader``, ``ModelExecutor``, and ``weight_update_session``.
+    """
+
+    def __init__(
+        self,
+        embeds: tuple[RowShardedEngramEmbedding, ...],
+        exchange: peer_memory.PeerMemoryExchange,
+    ) -> None:
+        self._embeds = embeds
+        self._exchange = exchange
+
+    @property
+    def finalized(self) -> bool:
+        return bool(self._embeds)
+
+    @property
+    def released(self) -> bool:
+        return any(
+            embed.peer_memory is not None and embed.peer_memory.released
+            for embed in self._embeds
+        )
+
+    def managed_parameters(self) -> tuple[nn.Parameter, ...]:
+        params: list[nn.Parameter] = []
+        for embed in self._embeds:
+            params.append(embed.weight)
+            params.append(embed.scale)
+        return tuple(params)
+
+    def vmm_managed_storages(self) -> frozenset[tuple[int, int]]:
+        storages: set[tuple[int, int]] = set()
+        for embed in self._embeds:
+            if embed.peer_memory is not None and embed.peer_memory.tensor.numel():
+                storage = embed.peer_memory.tensor.untyped_storage()
+                storages.add((storage.data_ptr(), storage.nbytes()))
+        return frozenset(storages)
+
+    def prepare_weight_update(self) -> None:
+        if self._exchange.is_cross_process:
+            raise RuntimeError(
+                "Cross-process peer-sharded Engram tables are immutable; "
+                "restart the peer group with a new --engram-peer-rendezvous-id "
+                "to update weights"
+            )
+        for embed in self._embeds:
+            if embed.peer_memory is not None:
+                torch.cuda.synchronize(embed.peer_memory.device_index)
+                break
+        self._exchange.barrier("weight-update-prepare")
+
+    def refresh_weights(self) -> None:
+        for embed in self._embeds:
+            if embed.peer_memory is not None:
+                torch.cuda.synchronize(embed.peer_memory.device_index)
+                break
+        self._exchange.barrier("weight-update-refresh")
+
+    def release_storage(self, *, backup: bool) -> None:
+        for embed in self._embeds:
+            embed.release_peer_storage(backup=backup)
+
+    def resume_storage(self, *, backup: bool) -> None:
+        for embed in self._embeds:
+            embed.resume_peer_storage(backup=backup)
+
+    def close(self) -> None:
+        for embed in self._embeds:
+            embed.close_peer_storage()
+
+
 @dataclass(frozen=True)
 class EngramPrefetchTask:
     """Explicit next-layer Engram MXFP8 gather launched on a dedicated stream."""
@@ -1324,10 +1421,7 @@ class DeepseekV41Engram(nn.Module):
         device: torch.device | str,
         host_table: bool,
         host_layout: str,
-        host_alloc: EngramHostAlloc | EngramPeerGpuAlloc | None,
-        *,
-        peer_exchange: peer_memory.PeerMemoryExchange | None = None,
-        peer_handle_type: str | None = None,
+        host_alloc: EngramHostAlloc | EngramPeerGpuAlloc | EngramPeerGpuBinding | None,
     ):
         """Construct with the V4.1 runtime quant config selected by the caller.
 
@@ -1389,8 +1483,6 @@ class DeepseekV41Engram(nn.Module):
             host_layout,
             host_alloc,
             layer_id,
-            peer_exchange=peer_exchange,
-            peer_handle_type=peer_handle_type,
         )
         self.q_weight.weight_loader = default_weight_loader
         self.k_weight.weight_loader = default_weight_loader
@@ -1414,11 +1506,9 @@ class DeepseekV41Engram(nn.Module):
                 )
 
     def wkv_scale_layout(self) -> str:
-        """Return wkv's MXFP8 activation scale layout from its prepared scales."""
-        method = self.wkv.quant_method
+        """Return wkv's MXFP8 activation scale layout from the shared FP8 predicate."""
         if (
-            isinstance(method, Fp8LinearMethod)
-            and method.projection_weight_scales is not None
+            "packed" in fp8_activation_scale_layouts(self.wkv)
             and (self.n_hash_cols * self.embed.embedding_dim) % 128 == 0
         ):
             return "packed"

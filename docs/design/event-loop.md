@@ -931,13 +931,18 @@ across weights sleep/wake; the graph's private temporary buffers remain
 discardable under the separate `cuda_graph` tag.
 
 Models owning peer-sharded CUDA VMM storage outside PyTorch's ordinary caching
-allocator (such as peer-sharded Engram tables) implement `PeerStorageOwner`
-(`execution/peer_storage.py`). `DeviceHandle.release_weights` unmaps and frees
-their physical VMM handles while keeping their virtual addresses reserved (and
-backs up each peer's owned slice to CPU RAM under `cpu_backup`), `resume_weights`
-remaps and restores them at the exact same virtual addresses so captured graphs
-remain valid, `check_weight_update` refuses updates while released, and
-`shutdown_model` permanently closes the mappings after local readers drain.
+allocator (such as peer-sharded Engram tables) expose their controllers through
+`PeerStorageControllerOwner` (`layers/moe/peer_weights.py`), reusing the same
+`PeerStorageController` lifecycle as DWDP peer weights. In intra-job mode,
+`DeviceHandle.release_weights` unmaps and frees physical VMM handles while
+keeping virtual addresses reserved (backing up each peer's owned slice to CPU
+RAM in a single allocation under `cpu_backup`), `resume_weights` remaps and
+restores them at the exact same virtual addresses so captured graphs remain
+valid, `check_weight_update` refuses updates while released, and
+`shutdown_model` closes local mappings without blocking on peer barriers.
+Cross-process peer groups (`--engram-peer-rendezvous`) are immutable serving
+units because independent engines share VMM mappings to each peer's HBM:
+`--enable-memory-saver` and online weight updates are refused there.
 
 A resume containing NCCL uses the same-round operation gate: it waits until
 every attention-DP engine holds its resume before entering device collectives.

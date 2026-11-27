@@ -869,13 +869,17 @@ class DeviceHandle:
         collectively. Called by the forward thread as its last task, after
         the last forward's readers: the release joins the other weight
         owners, who must all reach it."""
-        from tokenspeed.runtime.layers.moe.peer_weights import PeerWeightOwner
+        from tokenspeed.runtime.layers.moe.peer_weights import (
+            PeerStorageControllerOwner,
+            PeerWeightOwner,
+        )
 
         model = self._executor.model_runner.model
         if isinstance(model, PeerWeightOwner):
             model.close_peer_weights()
-        for owner in self._peer_storage_owners():
-            owner.close_peer_storage()
+        if isinstance(model, PeerStorageControllerOwner):
+            for controller in model.peer_storage_controllers():
+                controller.close()
 
     def shutdown_cache(self) -> None:
         """Close the Host cache (the L2 tier and the snapshot pool), once the
@@ -982,7 +986,7 @@ class DeviceHandle:
 
     def _peer_weight_controllers(self) -> list:
         from tokenspeed.runtime.layers.moe.peer_weights import (
-            peer_weights_controller_for,
+            peer_weight_controllers_for,
         )
 
         models = [self._executor.model_runner.model]
@@ -991,29 +995,13 @@ class DeviceHandle:
             models.append(draft_runner.model)
         controllers = []
         for model in models:
-            controller = peer_weights_controller_for(model)
-            if controller is not None:
-                controllers.append(controller)
+            controllers.extend(peer_weight_controllers_for(model))
         return controllers
-
-    def _peer_storage_owners(self) -> list:
-        from tokenspeed.runtime.execution.peer_storage import PeerStorageOwner
-
-        models = [self._executor.model_runner.model]
-        draft_runner = self._executor.draft_model_runner
-        if draft_runner is not None:
-            models.append(draft_runner.model)
-        return [
-            model
-            for model in models
-            if isinstance(model, PeerStorageOwner) and model.peer_storage_parameters()
-        ]
 
     def release_weights(self, adapter) -> None:
         """Discard or back up weights only after device and KV work drained."""
         self.synchronize()
         controllers = self._peer_weight_controllers()
-        peer_storage = self._peer_storage_owners()
         backup = (
             self._weight_memory is None or self._weight_memory.policy == "cpu_backup"
         )
@@ -1021,8 +1009,6 @@ class DeviceHandle:
         def operation() -> None:
             for controller in controllers:
                 controller.release_storage(backup=backup)
-            for owner in peer_storage:
-                owner.release_peer_storage(backup=backup)
             adapter.pause(tag="weights")
 
         if self._weight_memory is None:
@@ -1033,7 +1019,6 @@ class DeviceHandle:
     def resume_weights(self, adapter) -> None:
         """Remap storage and restore constants; discarded parameters stay invalid."""
         controllers = self._peer_weight_controllers()
-        peer_storage = self._peer_storage_owners()
         backup = (
             self._weight_memory is None or self._weight_memory.policy == "cpu_backup"
         )
@@ -1042,8 +1027,6 @@ class DeviceHandle:
             adapter.resume(tag="weights")
             for controller in controllers:
                 controller.resume_storage(backup=backup)
-            for owner in peer_storage:
-                owner.resume_peer_storage(backup=backup)
 
         if self._weight_memory is None:
             operation()
@@ -1291,8 +1274,6 @@ class DeviceHandle:
                 )
             if any(controller.released for controller in controllers):
                 return False, "Resume weight storage before updating"
-        if any(owner.peer_storage_released() for owner in self._peer_storage_owners()):
-            return False, "Resume weight storage before updating"
         state = self._weight_memory
         if state is None:
             return True, "ready for weight update"

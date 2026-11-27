@@ -38,10 +38,42 @@ logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
+class PeerStorageController(Protocol):
+    """Lifecycle controller for peer-sharded VMM storage owned by a model."""
+
+    @property
+    def finalized(self) -> bool: ...
+
+    @property
+    def released(self) -> bool: ...
+
+    def managed_parameters(self) -> tuple[torch.nn.Parameter, ...]: ...
+
+    def vmm_managed_storages(self) -> frozenset[tuple[int, int]]: ...
+
+    def prepare_weight_update(self) -> None: ...
+
+    def refresh_weights(self) -> None: ...
+
+    def release_storage(self, *, backup: bool) -> None: ...
+
+    def resume_storage(self, *, backup: bool) -> None: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
 class PeerWeightOwner(Protocol):
     def close_peer_weights(self) -> None: ...
 
     def peer_weights_controller(self) -> MoEPeerWeights | None: ...
+
+
+@runtime_checkable
+class PeerStorageControllerOwner(Protocol):
+    """Model owning additional peer-sharded VMM storage controllers (e.g. Engram)."""
+
+    def peer_storage_controllers(self) -> tuple[PeerStorageController, ...]: ...
 
 
 def peer_weights_controller_for(model: object) -> MoEPeerWeights | None:
@@ -49,6 +81,17 @@ def peer_weights_controller_for(model: object) -> MoEPeerWeights | None:
         return None
     controller = model.peer_weights_controller()
     return controller if isinstance(controller, MoEPeerWeights) else None
+
+
+def peer_weight_controllers_for(model: object) -> tuple[PeerStorageController, ...]:
+    """Return all active peer-storage controllers owned by ``model``."""
+    controllers: list[PeerStorageController] = []
+    moe_controller = peer_weights_controller_for(model)
+    if moe_controller is not None:
+        controllers.append(moe_controller)
+    if isinstance(model, PeerStorageControllerOwner):
+        controllers.extend(model.peer_storage_controllers())
+    return tuple(controllers)
 
 
 @dataclass

@@ -123,38 +123,49 @@ def test_parse_host_port_ipv4_ipv6_and_errors():
             peer_memory.parse_host_port(bad)
 
 
-def test_resolve_peer_handle_type_rules():
+def test_validate_peer_handle_type_rules():
+    domain_a = ("a" * 32, 1)
+    domain_b = ("b" * 32, 1)
+    domain_a2 = ("a" * 32, 2)
     assert (
-        peer_memory.resolve_peer_handle_type("auto", [1, 2], [None, None], [None, None])
+        peer_memory.validate_peer_handle_type(
+            "fabric", [1, 2], [None, None], [domain_a, domain_a]
+        )
         == "fabric"
     )
     assert (
-        peer_memory.resolve_peer_handle_type(
-            "auto", [1, 1], [None, "no fabric"], [None, None]
-        )
+        peer_memory.validate_peer_handle_type("posix_fd", [1, 1], [None, None])
         == "posix_fd"
     )
-    with pytest.raises(RuntimeError, match="multi-host"):
-        peer_memory.resolve_peer_handle_type(
-            "auto", [1, 2], [None, "no fabric"], [None, None]
+    with pytest.raises(RuntimeError, match="fabric handles unavailable"):
+        peer_memory.validate_peer_handle_type("fabric", [1, 1], [None, "no IMEX"])
+    with pytest.raises(RuntimeError, match="same NVLink fabric cluster and clique"):
+        peer_memory.validate_peer_handle_type(
+            "fabric", [1, 2], [None, None], [domain_a, domain_b]
         )
-    with pytest.raises(RuntimeError, match="fabric"):
-        peer_memory.resolve_peer_handle_type(
-            "fabric", [1, 1], [None, "no IMEX"], [None, None]
+    with pytest.raises(RuntimeError, match="same NVLink fabric cluster and clique"):
+        peer_memory.validate_peer_handle_type(
+            "fabric", [1, 2], [None, None], [domain_a, domain_a2]
         )
-    with pytest.raises(RuntimeError, match="single host"):
-        peer_memory.resolve_peer_handle_type(
-            "posix_fd", [1, 2], [None, None], [None, None]
+    with pytest.raises(RuntimeError, match="same NVLink fabric cluster and clique"):
+        peer_memory.validate_peer_handle_type(
+            "fabric", [1, 2], [None, None], [domain_a, None]
         )
-    with pytest.raises(ValueError, match="handle_type"):
-        peer_memory.resolve_peer_handle_type("invalid", [1], [None], [None])
+    with pytest.raises(RuntimeError, match="one host"):
+        peer_memory.validate_peer_handle_type("posix_fd", [1, 2], [None, None])
+    with pytest.raises(RuntimeError, match="posix_fd handles unavailable"):
+        peer_memory.validate_peer_handle_type("posix_fd", [1, 1], [None, "no fd"])
+    for bad in ("auto", "invalid"):
+        with pytest.raises(ValueError, match="handle_type"):
+            peer_memory.validate_peer_handle_type(bad, [1], [None])
 
 
-def _tcp_exchange_worker(rank: int, port: int) -> None:
+def _tcp_exchange_worker(rank: int, port: int, rendezvous_id: str) -> None:
     exchange = peer_memory.TCPStorePeerExchange.connect(
         f"127.0.0.1:{port}",
         rank=rank,
         world_size=2,
+        rendezvous_id=rendezvous_id,
         namespace="test-peer-mem",
     )
     gathered = exchange.all_gather_object(
@@ -164,12 +175,25 @@ def _tcp_exchange_worker(rank: int, port: int) -> None:
         {"rank": 0, "payload": b"\x01\x02"},
         {"rank": 1, "payload": b"\x01\x02"},
     ]
+    # Repeated exchanges and barriers with the same logical key must use
+    # distinct monotonic sequence keys and never read stale values.
+    gathered_again = exchange.all_gather_object("hello", {"rank": rank, "round": 2})
+    assert gathered_again == [{"rank": 0, "round": 2}, {"rank": 1, "round": 2}]
     scoped = exchange.scoped("L1")
     assert scoped.all_gather_object("round", rank * 10) == [0, 10]
-    scoped.barrier("done-0")
-    scoped.barrier("done-1")
+    assert scoped.all_gather_object("round", rank * 100) == [0, 100]
+    scoped.barrier("load-complete")
+    scoped.barrier("load-complete")
 
 
-def test_tcp_store_peer_exchange_all_gather_and_barriers():
+def test_tcp_store_peer_exchange_standalone_store_and_relaunch_isolation():
     port = _free_port()
-    mp.spawn(_tcp_exchange_worker, args=(port,), nprocs=2, join=True)
+    # Standalone store hosted independently of any worker rank.
+    store = peer_memory.serve_peer_rendezvous(f"127.0.0.1:{port}")
+    try:
+        # Two consecutive launches against the same standalone store stay
+        # isolated because every key carries its rendezvous_id.
+        mp.spawn(_tcp_exchange_worker, args=(port, "launch-1"), nprocs=2, join=True)
+        mp.spawn(_tcp_exchange_worker, args=(port, "launch-2"), nprocs=2, join=True)
+    finally:
+        del store

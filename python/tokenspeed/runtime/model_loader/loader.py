@@ -773,16 +773,20 @@ class DummyModelLoader(BaseModelLoader):
             # post-processing. Peer VMM storage parameters (e.g. peer-sharded
             # Engram tables) initialize only their local peer slice through
             # dummy_initializer and must not be cast whole-table to FP16.
-            from tokenspeed.runtime.execution.peer_storage import PeerStorageOwner
+            from tokenspeed.runtime.layers.moe.peer_weights import (
+                peer_weight_controllers_for,
+            )
 
-            peer_storage_ptrs: set[int] = set()
-            if isinstance(model, PeerStorageOwner):
-                peer_storage_ptrs = {
-                    p.data_ptr() for p in model.peer_storage_parameters() if p.numel()
-                }
+            pre_exclude_ptrs = {
+                p.data_ptr()
+                for controller in peer_weight_controllers_for(model)
+                if controller.finalized
+                for p in controller.managed_parameters()
+                if p.numel()
+            }
             initialize_dummy_weights(
                 model,
-                exclude_data_ptrs=peer_storage_ptrs or None,
+                exclude_data_ptrs=pre_exclude_ptrs or None,
             )
             initialize_dummy_integer_weights(model)
             # An EAGLE3 draft cannot share a vocab-sharded target embedding,
@@ -812,16 +816,13 @@ class DummyModelLoader(BaseModelLoader):
             # match it afterwards. Skip composite peer-weight views: finalize
             # already copied and distributed the initialized owned shards and
             # shared staging pools must not be overwritten across layers.
-            from tokenspeed.runtime.layers.moe.peer_weights import (
-                peer_weights_controller_for,
-            )
-
-            exclude_data_ptrs: set[int] = set(peer_storage_ptrs)
-            controller = peer_weights_controller_for(model)
-            if controller is not None and controller.finalized:
-                exclude_data_ptrs.update(
-                    p.data_ptr() for p in controller.managed_parameters() if p.numel()
-                )
+            exclude_data_ptrs = {
+                p.data_ptr()
+                for controller in peer_weight_controllers_for(model)
+                if controller.finalized
+                for p in controller.managed_parameters()
+                if p.numel()
+            }
             initialize_dummy_weights(
                 model,
                 exclude_data_ptrs=exclude_data_ptrs or None,

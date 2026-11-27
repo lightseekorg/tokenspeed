@@ -794,8 +794,9 @@ class ServerArgs:
     engram_host_table_alloc: str = "auto"
     engram_host_table_numa: str = "interleave"
     engram_gpu_peer_sharded: bool = False
-    engram_gpu_peer_handle_type: str = "auto"
+    engram_gpu_peer_handle_type: str | None = None
     engram_peer_rendezvous: str | None = None
+    engram_peer_rendezvous_id: str | None = None
     engram_peer_world_size: int | None = None
     engram_peer_rank_offset: int | None = None
     # Run each decoder layer's small decode steps as one persistent
@@ -1120,38 +1121,65 @@ class ServerArgs:
         self.validate()
 
     def validate_engram_table_options(self) -> None:
-        if self.engram_gpu_peer_handle_type not in ("auto", "fabric", "posix_fd"):
-            raise ValueError(
-                "--engram-gpu-peer-handle-type must be auto, fabric, or posix_fd; "
-                f"got {self.engram_gpu_peer_handle_type!r}"
-            )
         if self.engram_host_table and self.engram_gpu_peer_sharded:
             raise ValueError(
                 "--engram-host-table and --engram-gpu-peer-sharded are mutually "
                 "exclusive"
             )
+        if self.engram_gpu_peer_handle_type is not None:
+            if not self.engram_gpu_peer_sharded:
+                raise ValueError(
+                    "--engram-gpu-peer-handle-type requires --engram-gpu-peer-sharded"
+                )
+            if self.engram_gpu_peer_handle_type not in ("fabric", "posix_fd"):
+                raise ValueError(
+                    "--engram-gpu-peer-handle-type must be fabric or posix_fd; "
+                    f"got {self.engram_gpu_peer_handle_type!r}"
+                )
+        elif self.engram_gpu_peer_sharded:
+            raise ValueError(
+                "--engram-gpu-peer-sharded requires explicit "
+                "--engram-gpu-peer-handle-type (fabric or posix_fd)"
+            )
         cross_process_fields = (
             self.engram_peer_rendezvous,
+            self.engram_peer_rendezvous_id,
             self.engram_peer_world_size,
             self.engram_peer_rank_offset,
         )
         if any(field is not None for field in cross_process_fields):
             if not self.engram_gpu_peer_sharded:
                 raise ValueError(
-                    "--engram-peer-rendezvous, --engram-peer-world-size, and "
-                    "--engram-peer-rank-offset require --engram-gpu-peer-sharded"
+                    "--engram-peer-rendezvous, --engram-peer-rendezvous-id, "
+                    "--engram-peer-world-size, and --engram-peer-rank-offset "
+                    "require --engram-gpu-peer-sharded"
                 )
             if any(field is None for field in cross_process_fields):
                 raise ValueError(
-                    "--engram-peer-rendezvous, --engram-peer-world-size, and "
-                    "--engram-peer-rank-offset must all be set together"
+                    "--engram-peer-rendezvous, --engram-peer-rendezvous-id, "
+                    "--engram-peer-world-size, and --engram-peer-rank-offset "
+                    "must all be set together"
+                )
+            if self.enable_memory_saver:
+                raise ValueError(
+                    "--enable-memory-saver is not supported with cross-process "
+                    "--engram-peer-rendezvous; restart the peer group with a new "
+                    "--engram-peer-rendezvous-id instead"
                 )
             from tokenspeed_kernel.peer_memory import parse_host_port
 
             assert self.engram_peer_rendezvous is not None
+            assert self.engram_peer_rendezvous_id is not None
             assert self.engram_peer_world_size is not None
             assert self.engram_peer_rank_offset is not None
             parse_host_port(self.engram_peer_rendezvous)
+            if (
+                not self.engram_peer_rendezvous_id
+                or "/" in self.engram_peer_rendezvous_id
+            ):
+                raise ValueError(
+                    "--engram-peer-rendezvous-id must be a non-empty string without '/'"
+                )
             if (
                 type(self.engram_peer_world_size) is not int
                 or self.engram_peer_world_size < 1
@@ -5230,13 +5258,13 @@ class ServerArgs:
         parser.add_argument(
             "--engram-gpu-peer-handle-type",
             type=str,
-            choices=["auto", "fabric", "posix_fd"],
+            choices=["fabric", "posix_fd"],
             default=ServerArgs.engram_gpu_peer_handle_type,
             help=(
-                "CUDA VMM shareable handle type for --engram-gpu-peer-sharded. "
-                "fabric: IMEX/MNNVL handles across hosts or one host. posix_fd: "
-                "single-node Unix socket FD passing. auto: fabric when every "
-                "peer supports it, else posix_fd on a single host."
+                "Explicit CUDA VMM shareable handle type required with "
+                "--engram-gpu-peer-sharded. fabric: IMEX/MNNVL handles across "
+                "hosts or one host within a single NVLink fabric cluster/clique. "
+                "posix_fd: single-node Unix socket FD passing."
             ),
         )
         parser.add_argument(
@@ -5244,11 +5272,22 @@ class ServerArgs:
             type=str,
             default=ServerArgs.engram_peer_rendezvous,
             help=(
-                "Optional host:port (or [ipv6]:port) TCPStore rendezvous for "
-                "cross-process --engram-gpu-peer-sharded tables shared across "
-                "independent workers in one NVLink domain (e.g. multiple DEP2 "
-                "prefill engines). Requires --engram-peer-world-size and "
+                "Optional host:port (or [ipv6]:port) of a standalone TCPStore "
+                "(started via python -m tokenspeed_kernel.peer_memory --serve) "
+                "for cross-process --engram-gpu-peer-sharded tables shared "
+                "across independent workers in one NVLink domain. Requires "
+                "--engram-peer-rendezvous-id, --engram-peer-world-size, and "
                 "--engram-peer-rank-offset."
+            ),
+        )
+        parser.add_argument(
+            "--engram-peer-rendezvous-id",
+            type=str,
+            default=ServerArgs.engram_peer_rendezvous_id,
+            help=(
+                "Per-launch identifier scoping all TCPStore keys for a "
+                "cross-process --engram-peer-rendezvous group; use a fresh ID "
+                "whenever restarting the group."
             ),
         )
         parser.add_argument(

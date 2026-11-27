@@ -27,21 +27,32 @@ descriptor (single-node without IMEX), and maps every peer's shard back-to-back
 into one reserved virtual address range. GPU kernels then index the resulting
 tensor directly across peers over NVLink without an all-reduce or host memory.
 
-Supports memory-saver ``release_storage`` / ``resume_storage``: release copies
-only this peer's local shard to CPU (when ``backup=True``), unmaps and releases
-all physical handles while keeping the virtual address reserved, and resume
-remaps fresh handles at the exact same address so captured CUDA graphs stay
-valid.
+In intra-job mode (``DistributedPeerExchange``), supports memory-saver
+``release_storage`` / ``resume_storage``: release copies only this peer's local
+shard to CPU (when ``backup=True``), unmaps and releases all physical handles
+while keeping the virtual address reserved, and resume remaps fresh handles at
+the exact same address so captured CUDA graphs stay valid.
+
+In cross-process mode (``TCPStorePeerExchange``), independent engine processes
+connect as clients to a standalone ``TCPStore`` (started via
+:func:`serve_peer_rendezvous` or ``python -m tokenspeed_kernel.peer_memory
+--serve host:port``) using a per-launch ``rendezvous_id``. Cross-process peer
+groups are immutable serving units: per-engine ``release_storage`` /
+``resume_storage`` is rejected, and recovering or updating a group restarts all
+peers with a fresh ``rendezvous_id``.
 """
 
 from __future__ import annotations
 
+import argparse
 import functools
 import logging
 import os
 import pickle
+import signal
 import socket
 import struct
+import time
 import uuid
 import weakref
 from collections.abc import Sequence
@@ -56,6 +67,7 @@ from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
     "DistributedPeerExchange",
+    "LocalPeerExchange",
     "PeerDeviceLayout",
     "PeerDeviceMemory",
     "PeerMemoryExchange",
@@ -66,13 +78,16 @@ __all__ = [
     "plan_peer_row_range",
     "platform_supported",
     "probe_peer_device_memory",
-    "resolve_peer_handle_type",
+    "query_peer_fabric_domain",
+    "serve_peer_rendezvous",
+    "validate_peer_handle_type",
 ]
 
 logger = logging.getLogger(__name__)
 
 _FD_EXCHANGE_TIMEOUT_S = 300.0
 _SUPPORTED_HANDLE_TYPES = frozenset({"fabric", "posix_fd"})
+_NVML_GPU_FABRIC_STATE_COMPLETED = 3
 
 
 def platform_supported() -> bool:
@@ -225,7 +240,7 @@ def plan_peer_row_range(
             f"Peer row range requires num_rows >= 0 and row_bytes >= 1; "
             f"got num_rows={num_rows}, row_bytes={row_bytes}"
         )
-    if num_rows == 0 or layout.local_length == 0:
+    if num_rows == 0:
         return (0, 0)
     if num_rows * row_bytes > layout.nbytes:
         raise ValueError(
@@ -236,6 +251,10 @@ def plan_peer_row_range(
         if byte_offset <= 0:
             return 0
         return min(num_rows, (byte_offset + row_bytes - 1) // row_bytes)
+
+    if layout.local_length == 0:
+        boundary = _boundary_row(layout.local_offset)
+        return (boundary, boundary)
 
     row_start = 0 if layout.peer_rank == 0 else _boundary_row(layout.local_offset)
     if layout.peer_rank == layout.peer_world_size - 1:
@@ -285,6 +304,32 @@ def parse_host_port(endpoint: str) -> tuple[str, int]:
     return host, port
 
 
+def serve_peer_rendezvous(
+    endpoint: str,
+    *,
+    timeout_s: float = 300.0,
+) -> dist.TCPStore:
+    """Start a standalone ``TCPStore`` server independent of any engine worker.
+
+    Args:
+        endpoint: ``host:port`` or ``[ipv6]:port`` bind address.
+        timeout_s: Store socket timeout in seconds.
+
+    Returns:
+        The live master :class:`torch.distributed.TCPStore`. Keep the returned
+        object alive for the duration of the peer group.
+    """
+    host, port = parse_host_port(endpoint)
+    return dist.TCPStore(
+        host_name=host,
+        port=port,
+        world_size=None,
+        is_master=True,
+        timeout=timedelta(seconds=timeout_s),
+        wait_for_workers=False,
+    )
+
+
 @runtime_checkable
 class PeerMemoryExchange(Protocol):
     """Control-plane exchange used to share VMM handles and barriers across peers."""
@@ -303,6 +348,36 @@ class PeerMemoryExchange(Protocol):
     def all_gather_object(self, key: str, value: object) -> list[object]: ...
 
     def barrier(self, key: str) -> None: ...
+
+
+class LocalPeerExchange:
+    """Single-rank peer exchange with no process group (world_size == 1)."""
+
+    def __init__(self, *, namespace: str = "") -> None:
+        self._namespace = namespace
+
+    @property
+    def rank(self) -> int:
+        return 0
+
+    @property
+    def world_size(self) -> int:
+        return 1
+
+    @property
+    def is_cross_process(self) -> bool:
+        return False
+
+    def scoped(self, namespace: str) -> LocalPeerExchange:
+        prefix = f"{self._namespace}/{namespace}" if self._namespace else namespace
+        return LocalPeerExchange(namespace=prefix)
+
+    def all_gather_object(self, key: str, value: object) -> list[object]:
+        del key
+        return [value]
+
+    def barrier(self, key: str) -> None:
+        del key
 
 
 class DistributedPeerExchange:
@@ -351,11 +426,13 @@ class DistributedPeerExchange:
 
 
 class TCPStorePeerExchange:
-    """Cross-process peer exchange over ``torch.distributed.TCPStore``.
+    """Cross-process peer exchange over an externally hosted ``TCPStore``.
 
-    Allows independent engine processes (e.g. multiple co-located or
-    multi-host DEP2 workers inside one NVLink domain) to exchange CUDA VMM
-    FABRIC/POSIX handles and synchronize without forming an extra NCCL group.
+    Every peer connects as a client (``is_master=False``) to a standalone store
+    created via :func:`serve_peer_rendezvous`, isolating the rendezvous server
+    from individual worker restarts. Every key carries the per-launch
+    ``rendezvous_id`` and a per-scope monotonic call sequence so repeated
+    exchanges or barriers never collide with earlier keys.
     """
 
     def __init__(
@@ -364,16 +441,24 @@ class TCPStorePeerExchange:
         *,
         rank: int,
         world_size: int,
+        rendezvous_id: str,
         namespace: str,
     ) -> None:
         if world_size < 1 or not 0 <= rank < world_size:
             raise ValueError(
                 f"Invalid TCPStore peer rank {rank} for world_size={world_size}"
             )
+        if not rendezvous_id or "/" in rendezvous_id:
+            raise ValueError(
+                "TCPStorePeerExchange requires a non-empty rendezvous_id without '/'; "
+                f"got {rendezvous_id!r}"
+            )
         self._store = store
         self._rank = rank
         self._world_size = world_size
+        self._rendezvous_id = rendezvous_id
         self._namespace = namespace
+        self._seq = 0
 
     @classmethod
     def connect(
@@ -382,20 +467,32 @@ class TCPStorePeerExchange:
         *,
         rank: int,
         world_size: int,
+        rendezvous_id: str,
         timeout_s: float = 300.0,
         namespace: str = "engram-peer",
     ) -> TCPStorePeerExchange:
-        """Connect to (or host on rank 0) the rendezvous ``TCPStore``."""
+        """Connect as a client to an externally hosted standalone ``TCPStore``."""
+        if not rendezvous_id or "/" in rendezvous_id:
+            raise ValueError(
+                "TCPStorePeerExchange requires a non-empty rendezvous_id without '/'; "
+                f"got {rendezvous_id!r}"
+            )
         host, port = parse_host_port(endpoint)
         store = dist.TCPStore(
             host_name=host,
             port=port,
-            world_size=world_size,
-            is_master=(rank == 0),
+            world_size=None,
+            is_master=False,
             timeout=timedelta(seconds=timeout_s),
-            wait_for_workers=True,
+            wait_for_workers=False,
         )
-        return cls(store, rank=rank, world_size=world_size, namespace=namespace)
+        return cls(
+            store,
+            rank=rank,
+            world_size=world_size,
+            rendezvous_id=rendezvous_id,
+            namespace=namespace,
+        )
 
     @property
     def rank(self) -> int:
@@ -409,31 +506,99 @@ class TCPStorePeerExchange:
     def is_cross_process(self) -> bool:
         return True
 
+    @property
+    def rendezvous_id(self) -> str:
+        return self._rendezvous_id
+
     def scoped(self, namespace: str) -> TCPStorePeerExchange:
         prefix = f"{self._namespace}/{namespace}" if self._namespace else namespace
         return TCPStorePeerExchange(
             self._store,
             rank=self._rank,
             world_size=self._world_size,
+            rendezvous_id=self._rendezvous_id,
             namespace=prefix,
         )
 
-    def _full_key(self, key: str, peer: int) -> str:
-        return f"{self._namespace}/{key}/{peer}"
+    def _next_seq(self) -> int:
+        seq = self._seq
+        self._seq += 1
+        return seq
+
+    def _full_key(self, key: str, seq: int, peer: int) -> str:
+        return f"{self._namespace}/{self._rendezvous_id}/{key}/s{seq}/{peer}"
 
     def all_gather_object(self, key: str, value: object) -> list[object]:
+        seq = self._next_seq()
         payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-        self._store.set(self._full_key(key, self._rank), payload)
-        keys = [self._full_key(key, peer) for peer in range(self._world_size)]
+        self._store.set(self._full_key(key, seq, self._rank), payload)
+        keys = [self._full_key(key, seq, peer) for peer in range(self._world_size)]
         self._store.wait(keys)
         return [pickle.loads(self._store.get(item)) for item in keys]
 
     def barrier(self, key: str) -> None:
-        self._store.set(self._full_key(f"barrier/{key}", self._rank), b"1")
+        seq = self._next_seq()
+        self._store.set(self._full_key(f"barrier/{key}", seq, self._rank), b"1")
         keys = [
-            self._full_key(f"barrier/{key}", peer) for peer in range(self._world_size)
+            self._full_key(f"barrier/{key}", seq, peer)
+            for peer in range(self._world_size)
         ]
         self._store.wait(keys)
+
+
+@functools.cache
+def query_peer_fabric_domain(device_index: int) -> tuple[str, int] | None:
+    """Return ``(cluster_uuid_hex, clique_id)`` from NVML GPU fabric info, or None.
+
+    Returns ``None`` when NVML or the GPU fabric query is unavailable on this
+    host (for example on single-node GPUs without an NVLink fabric manager).
+    Raises ``RuntimeError`` when NVML reports an unhealthy or incomplete fabric
+    registration so cross-slice mismatches fail before VMM handle import.
+    """
+    if not platform_supported():
+        return None
+    nvml_initialized = False
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        nvml_initialized = True
+        props = torch.cuda.get_device_properties(device_index)
+        pci_bus_id = (
+            f"{props.pci_domain_id:08X}:{props.pci_bus_id:02X}:"
+            f"{props.pci_device_id:02X}.0"
+        )
+        handle = pynvml.nvmlDeviceGetHandleByPciBusId(pci_bus_id)
+        query_fn = getattr(pynvml, "nvmlDeviceGetGpuFabricInfoV", None) or getattr(
+            pynvml, "nvmlDeviceGetGpuFabricInfo", None
+        )
+        if query_fn is None:
+            return None
+        info = query_fn(handle)
+        cluster_uuid = bytes(info.clusterUuid)
+        if not any(cluster_uuid):
+            return None
+        state = int(info.state)
+        status = int(info.status)
+        if status != 0 or state != _NVML_GPU_FABRIC_STATE_COMPLETED:
+            raise RuntimeError(
+                f"GPU {device_index} NVLink fabric is not ready "
+                f"(state={state}, status={status})"
+            )
+        return (cluster_uuid.hex(), int(info.cliqueId))
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        logger.debug(
+            f"NVML GPU fabric domain query unavailable on device {device_index}: {exc!s}"
+        )
+        return None
+    finally:
+        if nvml_initialized:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
 
 
 @functools.cache
@@ -457,6 +622,8 @@ def probe_peer_device_memory(device_index: int, handle_type: str) -> str | None:
         return "peer GPU VMM memory needs an NVIDIA GPU and cuda.bindings"
     try:
         _ensure_driver_context(device_index)
+        if handle_type == "fabric":
+            query_peer_fabric_domain(device_index)
         gran = vmm.granularity(device_index, handle_type=handle_type)
         handle = vmm.allocate(gran, device_index, handle_type=handle_type)
         try:
@@ -470,73 +637,70 @@ def probe_peer_device_memory(device_index: int, handle_type: str) -> str | None:
     return None
 
 
-def resolve_peer_handle_type(
-    requested: str,
+def validate_peer_handle_type(
+    handle_type: str,
     peer_hosts: Sequence[int],
-    peer_fabric_probes: Sequence[str | None],
-    peer_posix_probes: Sequence[str | None],
+    peer_probes: Sequence[str | None],
+    peer_fabric_domains: Sequence[tuple[str, int] | None] | None = None,
 ) -> str:
-    """Select ``"fabric"`` or ``"posix_fd"`` from per-peer probes, or raise.
+    """Validate that every peer supports the explicitly requested VMM handle type.
 
     Args:
-        requested: Explicit mode (``"auto"``, ``"fabric"``, or ``"posix_fd"``).
+        handle_type: Explicit shareable handle type (``"fabric"`` or ``"posix_fd"``).
         peer_hosts: Per-peer host identity integers.
-        peer_fabric_probes: Per-peer :func:`probe_peer_device_memory` results
-            for ``"fabric"`` (``None`` means supported).
-        peer_posix_probes: Per-peer :func:`probe_peer_device_memory` results
-            for ``"posix_fd"`` (``None`` means supported).
+        peer_probes: Per-peer :func:`probe_peer_device_memory` results for
+            ``handle_type`` (``None`` means supported).
+        peer_fabric_domains: Optional per-peer ``(cluster_uuid, clique_id)``
+            tuples from :func:`query_peer_fabric_domain`. When ``handle_type``
+            is ``"fabric"`` and any peer reports a domain, all peers must share
+            the exact same domain.
 
     Returns:
-        ``"fabric"`` or ``"posix_fd"``.
+        The validated ``handle_type``.
     """
-    if requested not in ("auto", "fabric", "posix_fd"):
+    if handle_type not in _SUPPORTED_HANDLE_TYPES:
         raise ValueError(
-            f"Peer handle type must be auto, fabric, or posix_fd; got {requested!r}"
+            f"Peer handle_type must be fabric or posix_fd; got {handle_type!r}"
         )
-    if not peer_hosts or not (
-        len(peer_hosts) == len(peer_fabric_probes) == len(peer_posix_probes)
-    ):
+    if not peer_hosts or len(peer_hosts) != len(peer_probes):
         raise ValueError("Peer host and probe lists must be nonempty and equal length")
-    single_host = len(set(peer_hosts)) == 1
-    fabric_errors = [
-        f"peer {rank}: {err}"
-        for rank, err in enumerate(peer_fabric_probes)
-        if err is not None
+    if peer_fabric_domains is not None and len(peer_fabric_domains) != len(peer_hosts):
+        raise ValueError(
+            "Peer fabric domain list must have the same length as peer_hosts"
+        )
+    errors = [
+        f"peer {rank}: {err}" for rank, err in enumerate(peer_probes) if err is not None
     ]
-    posix_errors = [
-        f"peer {rank}: {err}"
-        for rank, err in enumerate(peer_posix_probes)
-        if err is not None
-    ]
-    if requested == "fabric":
-        if fabric_errors:
-            raise RuntimeError(
-                "Peer GPU VMM fabric handles unavailable: " + "; ".join(fabric_errors)
-            )
-        return "fabric"
-    if requested == "posix_fd":
-        if not single_host:
+    if handle_type == "posix_fd":
+        distinct_hosts = len(set(peer_hosts))
+        if distinct_hosts != 1:
             raise RuntimeError(
                 "Peer GPU VMM posix_fd handles require all peers on one host "
-                f"(found {len(set(peer_hosts))} hosts); use fabric handles for MNNVL"
+                f"(found {distinct_hosts} distinct hosts); use fabric handles for MNNVL"
             )
-        if posix_errors:
+        if errors:
             raise RuntimeError(
-                "Peer GPU VMM posix_fd handles unavailable: " + "; ".join(posix_errors)
+                "Peer GPU VMM posix_fd handles unavailable: " + "; ".join(errors)
             )
         return "posix_fd"
-    if not fabric_errors:
-        return "fabric"
-    if single_host and not posix_errors:
-        return "posix_fd"
-    reasons = [f"fabric unavailable ({'; '.join(fabric_errors)})"]
-    if not single_host:
-        reasons.append(
-            f"posix_fd unavailable across {len(set(peer_hosts))} distinct hosts"
+    if errors:
+        raise RuntimeError(
+            "Peer GPU VMM fabric handles unavailable: " + "; ".join(errors)
         )
-    elif posix_errors:
-        reasons.append(f"posix_fd unavailable ({'; '.join(posix_errors)})")
-    raise RuntimeError("Peer GPU VMM memory unavailable: " + "; ".join(reasons))
+    if peer_fabric_domains is not None and any(
+        domain is not None for domain in peer_fabric_domains
+    ):
+        domains = set(peer_fabric_domains)
+        if None in domains or len(domains) > 1:
+            summary = ", ".join(
+                f"peer {rank}={domain}"
+                for rank, domain in enumerate(peer_fabric_domains)
+            )
+            raise RuntimeError(
+                "Peer GPU VMM fabric handles require all peers in the same NVLink "
+                f"fabric cluster and clique: {summary}"
+            )
+    return "fabric"
 
 
 def _check_peer_uid(connection: socket.socket, uid: int) -> None:
@@ -647,6 +811,11 @@ class PeerDeviceMemory:
         self._epoch = 0
         self._released = False
         self._closed = False
+
+    @property
+    def is_cross_process(self) -> bool:
+        """Whether this peer allocation spans independent engine processes."""
+        return self._exchange.is_cross_process
 
     @property
     def released(self) -> bool:
@@ -767,10 +936,21 @@ class PeerDeviceMemory:
     def release_storage(self, *, backup: bool) -> None:
         """Unmap and release physical GPU HBM handles while keeping the VA reserved.
 
+        Only supported for intra-job peer groups where every rank enters
+        release together. Cross-process peer groups cannot release per engine
+        because other independent processes hold live VMM mappings to this
+        peer's physical memory.
+
         Args:
             backup: When True, copies this peer's owned byte slice to CPU RAM
-                before unmapping so :meth:`resume_storage` restores it.
+                in a single allocation before unmapping so :meth:`resume_storage`
+                restores it.
         """
+        if self._exchange.is_cross_process:
+            raise RuntimeError(
+                "Cross-process peer GPU memory does not support per-engine "
+                "release_storage; restart the peer group with a new rendezvous_id"
+            )
         if self._closed:
             raise RuntimeError("Cannot release closed PeerDeviceMemory")
         if self._released:
@@ -780,7 +960,9 @@ class PeerDeviceMemory:
         live = self.layout.local_live_bytes
         if backup and live > 0:
             start = self.layout.local_offset
-            self._backup = self.tensor[start : start + live].detach().cpu().clone()
+            # .cpu() on a CUDA view allocates one owning host buffer and copies
+            # once without duplicating peak host RAM.
+            self._backup = self.tensor[start : start + live].detach().cpu()
             torch.cuda.synchronize(self.device_index)
         else:
             self._backup = None
@@ -801,6 +983,11 @@ class PeerDeviceMemory:
             backup: When True, restores this peer's CPU backup into its local
                 slice before completing the peer barrier.
         """
+        if self._exchange.is_cross_process:
+            raise RuntimeError(
+                "Cross-process peer GPU memory does not support per-engine "
+                "resume_storage; restart the peer group with a new rendezvous_id"
+            )
         if self._closed:
             raise RuntimeError("Cannot resume closed PeerDeviceMemory")
         if not self._released:
@@ -826,20 +1013,21 @@ class PeerDeviceMemory:
             raise RuntimeError("Cannot barrier on closed PeerDeviceMemory")
         self._exchange.barrier(tag)
 
-    def close(self, *, sync_peers: bool) -> None:
-        """Unmap, free virtual address, and release all physical handles.
+    def close(self) -> None:
+        """Unmap, free virtual address, and release local physical handles.
 
-        Args:
-            sync_peers: When True, synchronizes CUDA and barriers across peers
-                before unmapping so remote readers finish first. Pass False for
-                independent cross-process shutdowns where peers may exit
-                asynchronously.
+        Never blocks on a cross-rank peer barrier during teardown so shutdown
+        cannot hang if another peer has already exited or crashed. The CUDA
+        driver reference-counts exported physical allocations until all peers
+        unmap or exit.
         """
         if self._closed:
             return
-        if sync_peers and not self._released:
-            torch.cuda.synchronize(self.device_index)
-            self._exchange.barrier(f"close-{self._epoch}")
+        if not self._released:
+            try:
+                torch.cuda.synchronize(self.device_index)
+            except Exception:
+                pass
         self._backup = None
         self._finalizer.detach()
         _cleanup_vmm(self._resources)
@@ -917,3 +1105,40 @@ def create_peer_device_memory(
             finalizer.detach()
         _cleanup_vmm(resources)
         raise
+
+
+def _main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run a standalone TCPStore rendezvous server for peer GPU VMM memory."
+    )
+    parser.add_argument(
+        "--serve",
+        required=True,
+        help="Bind host:port or [ipv6]:port for the standalone TCPStore.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="TCPStore socket timeout in seconds.",
+    )
+    args = parser.parse_args()
+    store = serve_peer_rendezvous(args.serve, timeout_s=args.timeout)
+    stop = False
+
+    def _handle_signal(_signum, _frame) -> None:
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    logger.info(f"Serving peer GPU VMM TCPStore rendezvous on {args.serve}")
+    try:
+        while not stop:
+            time.sleep(0.5)
+    finally:
+        del store
+
+
+if __name__ == "__main__":
+    _main()

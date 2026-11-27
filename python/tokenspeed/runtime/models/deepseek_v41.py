@@ -77,7 +77,6 @@ from weakref import WeakValueDictionary
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel import peer_memory
 from tokenspeed_kernel.ops.attention.dsv41 import (
     IndexKeyInput,
     IndexQueryInput,
@@ -149,7 +148,10 @@ from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41RowPlan,
 )
-from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.fp8 import (
+    Fp8LinearMethod,
+    fp8_activation_scale_layouts,
+)
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -163,6 +165,7 @@ from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
+from tokenspeed.runtime.layers.moe.peer_weights import PeerStorageController
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
@@ -189,10 +192,12 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     EngramHashState,
     EngramHostAlloc,
     EngramPeerGpuAlloc,
+    EngramPeerGpuBinding,
+    EngramPeerWeightsController,
     EngramPrefetchedRows,
     EngramPrefetchTask,
     RowShardedEngramEmbedding,
-    create_engram_peer_exchange,
+    bind_engram_peer_gpu,
     is_engram_embed_checkpoint_name,
     resolve_engram_host_alloc,
     resolve_engram_host_layout,
@@ -502,21 +507,8 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
 
 
 def _scale_layouts(layer: nn.Module) -> frozenset[str]:
-    """The group-32 activation scale layouts this layer's GEMMs read as given.
-
-    Canonical is always among them: every path takes it, and it is the only one
-    a caller can select rows of. A prepared layer adds the layout of whichever
-    GEMM holds its weight scales.
-    """
-    method = layer.quant_method
-    if not isinstance(method, _ReferenceFp8LinearMethod):
-        return frozenset({"canonical"})
-    layouts = {"canonical"}
-    if method.prepared_weight_scales is not None:
-        layouts.add("swizzled")
-    if method.projection_weight_scales is not None:
-        layouts.add("packed")
-    return frozenset(layouts)
+    """The group-32 activation scale layouts this layer's GEMMs read as given."""
+    return fp8_activation_scale_layouts(layer)
 
 
 def _replicated(input_size, output_size, dtype, quant_config, prefix):
@@ -2044,10 +2036,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         hc_stream: torch.cuda.Stream | None,
         host_table: bool,
         host_layout: str,
-        host_alloc: EngramHostAlloc | EngramPeerGpuAlloc | None,
-        *,
-        peer_exchange: peer_memory.PeerMemoryExchange | None = None,
-        peer_handle_type: str | None = None,
+        host_alloc: EngramHostAlloc | EngramPeerGpuAlloc | EngramPeerGpuBinding | None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -2096,8 +2085,6 @@ class DeepseekV41DecoderLayer(nn.Module):
                 host_table,
                 host_layout,
                 host_alloc,
-                peer_exchange=peer_exchange,
-                peer_handle_type=peer_handle_type,
             )
             if layer_id in config.engram_layer_ids
             else None
@@ -2672,8 +2659,10 @@ class DeepseekV41Model(nn.Module):
         self._engram_join_event = (
             torch.cuda.Event() if self.engram_stream is not None else None
         )
-        self._engram_peer_exchange: peer_memory.PeerMemoryExchange | None = None
-        self._engram_peer_handle_type: str | None = None
+        self._engram_peer_binding: EngramPeerGpuBinding | None = None
+        layer_host_alloc: (
+            EngramHostAlloc | EngramPeerGpuAlloc | EngramPeerGpuBinding | None
+        ) = host_alloc
         if (
             host_layout == "peer_gpu"
             and device.type != "meta"
@@ -2683,10 +2672,10 @@ class DeepseekV41Model(nn.Module):
                 raise TypeError(
                     "Peer-sharded GPU Engram tables require an EngramPeerGpuAlloc"
                 )
-            (
-                self._engram_peer_exchange,
-                self._engram_peer_handle_type,
-            ) = create_engram_peer_exchange(host_alloc, mapping, device)
+            self._engram_peer_binding = bind_engram_peer_gpu(
+                host_alloc, mapping, device
+            )
+            layer_host_alloc = self._engram_peer_binding
         self.layers = nn.ModuleList(
             [
                 DeepseekV41DecoderLayer(
@@ -2700,9 +2689,7 @@ class DeepseekV41Model(nn.Module):
                     self.hc_stream,
                     host_table,
                     host_layout,
-                    host_alloc,
-                    peer_exchange=self._engram_peer_exchange,
-                    peer_handle_type=self._engram_peer_handle_type,
+                    layer_host_alloc,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -3865,50 +3852,28 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             ) as tensor_slice:
                 embed.load_sharded(field, tensor_slice, 65536)
             loaded.add(raw)
-        if self.model._engram_peer_exchange is not None:
+        if self.model._engram_peer_binding is not None:
             torch.cuda.synchronize(self.model.embed_tokens.weight.device)
-            self.model._engram_peer_exchange.barrier("load-complete")
+            self.model._engram_peer_binding.exchange.barrier("load-complete")
         elif torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-    def _peer_engram_embeds(self) -> tuple[RowShardedEngramEmbedding, ...]:
-        if self.model is None:
+    def peer_storage_controllers(self) -> tuple[PeerStorageController, ...]:
+        """Return the active peer-sharded Engram controller, if any."""
+        if self.model is None or self.model._engram_peer_binding is None:
             return ()
-        return tuple(
+        embeds = tuple(
             layer.engram.embed
             for layer in self.model.layers
             if layer.engram is not None and layer.engram.embed.peer_memory is not None
         )
-
-    def peer_storage_parameters(self) -> tuple[nn.Parameter, ...]:
-        """Return parameters backed by peer-sharded CUDA VMM storage."""
-        params: list[nn.Parameter] = []
-        for embed in self._peer_engram_embeds():
-            params.append(embed.weight)
-            params.append(embed.scale)
-        return tuple(params)
-
-    def peer_storage_released(self) -> bool:
-        """Whether any peer-sharded Engram VMM table is currently released."""
-        return any(
-            embed.peer_memory is not None and embed.peer_memory.released
-            for embed in self._peer_engram_embeds()
+        if not embeds:
+            return ()
+        return (
+            EngramPeerWeightsController(
+                embeds, self.model._engram_peer_binding.exchange
+            ),
         )
-
-    def release_peer_storage(self, *, backup: bool) -> None:
-        """Unmap and release physical peer VMM storage while keeping VAs reserved."""
-        for embed in self._peer_engram_embeds():
-            embed.release_peer_storage(backup=backup)
-
-    def resume_peer_storage(self, *, backup: bool) -> None:
-        """Reallocate and remap peer VMM storage at the same virtual addresses."""
-        for embed in self._peer_engram_embeds():
-            embed.resume_peer_storage(backup=backup)
-
-    def close_peer_storage(self) -> None:
-        """Permanently free peer VMM storage at model shutdown."""
-        for embed in self._peer_engram_embeds():
-            embed.close_peer_storage()
 
     def post_load_weights(self) -> None:
         for module in self.modules():
@@ -3955,7 +3920,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 and module.wkv_scale_layout() == "packed"
             ):
                 method = module.wkv.quant_method
-                assert isinstance(method, _ReferenceFp8LinearMethod)
+                assert isinstance(method, Fp8LinearMethod)
                 assert method.projection_weight_scales is not None
                 key = (module.wkv.weight.device, tuple(module.wkv.weight.shape))
                 if key not in engram_warmed:

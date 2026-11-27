@@ -68,6 +68,8 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     EngramHostAlloc,
     EngramLayout,
     EngramPeerGpuAlloc,
+    EngramPeerGpuBinding,
+    EngramPeerWeightsController,
     RowShardedEngramEmbedding,
     build_compressed_token_map,
     compute_hash_multipliers,
@@ -969,12 +971,14 @@ def test_resolve_engram_host_alloc_follows_the_cli(monkeypatch):
     monkeypatch.setitem(
         global_server_args_dict, "engram_peer_rendezvous", "127.0.0.1:29500"
     )
+    monkeypatch.setitem(global_server_args_dict, "engram_peer_rendezvous_id", "run-1")
     monkeypatch.setitem(global_server_args_dict, "engram_peer_world_size", 14)
     monkeypatch.setitem(global_server_args_dict, "engram_peer_rank_offset", 2)
     assert engram.resolve_engram_host_alloc("gpu") is None
     assert engram.resolve_engram_host_alloc("peer_gpu") == EngramPeerGpuAlloc(
         handle_type="fabric",
         rendezvous="127.0.0.1:29500",
+        rendezvous_id="run-1",
         peer_world_size=14,
         peer_rank_offset=2,
     )
@@ -1008,52 +1012,86 @@ def test_resolve_engram_host_layout_auto_and_explicit():
 def test_engram_peer_gpu_alloc_and_server_args_validation():
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
-    assert EngramPeerGpuAlloc("auto", None, None, None).handle_type == "auto"
-    assert EngramPeerGpuAlloc("fabric", "[::1]:47100", 16, 0).peer_world_size == 16
-    with pytest.raises(ValueError, match="handle type"):
-        EngramPeerGpuAlloc("invalid", None, None, None)
+    assert EngramPeerGpuAlloc("posix_fd", None, None, None, None).handle_type == (
+        "posix_fd"
+    )
+    assert (
+        EngramPeerGpuAlloc("fabric", "[::1]:47100", "run-1", 16, 0).peer_world_size
+        == 16
+    )
+    for bad in ("auto", "invalid"):
+        with pytest.raises(ValueError, match="handle type"):
+            EngramPeerGpuAlloc(bad, None, None, None, None)
     with pytest.raises(ValueError, match="together"):
-        EngramPeerGpuAlloc("auto", "127.0.0.1:29500", 14, None)
+        EngramPeerGpuAlloc("fabric", "127.0.0.1:29500", "run-1", 14, None)
+    with pytest.raises(ValueError, match="rendezvous_id"):
+        EngramPeerGpuAlloc("fabric", "127.0.0.1:29500", "bad/id", 14, 0)
     with pytest.raises(ValueError, match="positive"):
-        EngramPeerGpuAlloc("auto", "127.0.0.1:29500", 0, 0)
+        EngramPeerGpuAlloc("fabric", "127.0.0.1:29500", "run-1", 0, 0)
     with pytest.raises(ValueError, match="non-negative"):
-        EngramPeerGpuAlloc("auto", "127.0.0.1:29500", 4, -1)
+        EngramPeerGpuAlloc("fabric", "127.0.0.1:29500", "run-1", 4, -1)
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         ServerArgs(
             model_path="dummy",
             engram_host_table=True,
             engram_gpu_peer_sharded=True,
+            engram_gpu_peer_handle_type="fabric",
+        )
+    with pytest.raises(ValueError, match="requires explicit"):
+        ServerArgs(
+            model_path="dummy",
+            engram_gpu_peer_sharded=True,
+        )
+    with pytest.raises(ValueError, match="requires --engram-gpu-peer-sharded"):
+        ServerArgs(
+            model_path="dummy",
+            engram_gpu_peer_handle_type="fabric",
         )
     with pytest.raises(ValueError, match="require --engram-gpu-peer-sharded"):
         ServerArgs(
             model_path="dummy",
             engram_peer_rendezvous="127.0.0.1:29500",
+            engram_peer_rendezvous_id="run-1",
             engram_peer_world_size=14,
             engram_peer_rank_offset=0,
         )
-    with pytest.raises(ValueError, match="must all be specified together"):
+    with pytest.raises(ValueError, match="must all be set together"):
         ServerArgs(
             model_path="dummy",
             engram_gpu_peer_sharded=True,
+            engram_gpu_peer_handle_type="fabric",
             engram_peer_rendezvous="127.0.0.1:29500",
+        )
+    with pytest.raises(ValueError, match="--enable-memory-saver is not supported"):
+        ServerArgs(
+            model_path="dummy",
+            engram_gpu_peer_sharded=True,
+            engram_gpu_peer_handle_type="fabric",
+            engram_peer_rendezvous="127.0.0.1:29500",
+            engram_peer_rendezvous_id="run-1",
+            engram_peer_world_size=14,
+            engram_peer_rank_offset=0,
+            enable_memory_saver=True,
         )
     args = ServerArgs(
         model_path="dummy",
         engram_gpu_peer_sharded=True,
         engram_gpu_peer_handle_type="fabric",
         engram_peer_rendezvous="[::1]:29500",
+        engram_peer_rendezvous_id="run-1",
         engram_peer_world_size=14,
         engram_peer_rank_offset=4,
         tp_size=2,
     )
     assert args.engram_gpu_peer_sharded is True
+    assert args.engram_peer_rendezvous_id == "run-1"
     assert args.engram_peer_rank_offset == 4
 
 
 def test_peer_gpu_embedding_meta_and_validation():
     mapping = _mapping(0, 1, 1)
-    alloc = EngramPeerGpuAlloc("auto", None, None, None)
+    alloc = EngramPeerGpuAlloc("fabric", None, None, None, None)
     table = RowShardedEngramEmbedding(
         72, 64, mapping, "meta", False, "peer_gpu", alloc, 1
     )
@@ -2089,11 +2127,18 @@ def test_torchrun_ranks_share_a_cumem_host_table(monkeypatch):
         dist.destroy_process_group()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+    reason="requires Blackwell CUDA GPU for packed MXFP8 wkv projection",
+)
 def test_cuda_peer_gpu_engram_prefetch_packed_and_release_resume(tmp_path):
-    """End-to-end GPU test of peer-sharded Engram, packed scales, prefetch, and release/resume."""
+    """End-to-end SM100+ GPU test of peer-sharded Engram, packed vs canonical
+    wkv parity, async prefetch, and PeerStorageController release/resume."""
     pytest.importorskip("cuda.bindings.driver")
     from tokenspeed_kernel import peer_memory
+
+    from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+    from tokenspeed.runtime.layers.moe.peer_weights import PeerStorageController
 
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
@@ -2126,7 +2171,13 @@ def test_cuda_peer_gpu_engram_prefetch_packed_and_release_resume(tmp_path):
         scale_fmt="ue8m0",
     )
     mapping = _mapping(0, 1, 1)
-    alloc = EngramPeerGpuAlloc(handle_type, None, None, None)
+    alloc = EngramPeerGpuAlloc(handle_type, None, None, None, None)
+    # Unbound EngramPeerGpuAlloc on CUDA must fail explicitly (no per-layer fallback).
+    with pytest.raises(TypeError, match="EngramPeerGpuBinding"):
+        RowShardedEngramEmbedding(72, 64, mapping, device, False, "peer_gpu", alloc, 1)
+
+    exchange = peer_memory.LocalPeerExchange(namespace="test-engram-peer")
+    binding = EngramPeerGpuBinding(alloc=alloc, exchange=exchange)
 
     torch.cuda.empty_cache()
     module = DeepseekV41Engram(
@@ -2138,8 +2189,13 @@ def test_cuda_peer_gpu_engram_prefetch_packed_and_release_resume(tmp_path):
         device,
         False,
         "peer_gpu",
-        alloc,
+        binding,
     )
+    controller = EngramPeerWeightsController((module.embed,), exchange)
+    assert isinstance(controller, PeerStorageController)
+    assert controller.finalized
+    assert len(controller.managed_parameters()) == 2
+    assert len(controller.vmm_managed_storages()) == 1
     try:
         assert module.embed.peer_memory is not None
         assert module.embed.serves_mxfp8_rows
@@ -2173,6 +2229,10 @@ def test_cuda_peer_gpu_engram_prefetch_packed_and_release_resume(tmp_path):
             module.wkv.weight_scale_inv, wkv_scales
         )
         module.wkv.quant_method.process_weights_after_loading(module.wkv)
+        module.wkv.quant_method.prepare_weight_scales(module.wkv)
+
+        assert isinstance(module.wkv.quant_method, Fp8LinearMethod)
+        assert module.wkv_scale_layout() == "packed"
 
         hidden = torch.randn(5, 4, 128, dtype=torch.bfloat16, device=device)
         hash_ids = torch.randint(0, 72, (5, 6), dtype=torch.int64, device=device)
@@ -2180,46 +2240,46 @@ def test_cuda_peer_gpu_engram_prefetch_packed_and_release_resume(tmp_path):
         hash_ids[4, 5] = 72
         token_mask = torch.tensor([True, True, False, True, True], device=device)
 
-        expected = module(hidden, hash_ids, token_mask, query_shard=None)
-        from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+        assert module.can_prefetch_mxfp8(hash_ids)
+        packed_out = module(hidden, hash_ids, token_mask, query_shard=None)
+        canonical_rows = module.embed.mxfp8_rows(hash_ids, scale_layout="canonical")
+        canonical_out = module(
+            hidden,
+            hash_ids,
+            token_mask,
+            query_shard=None,
+            prefetched=canonical_rows,
+        )
+        torch.testing.assert_close(packed_out, canonical_out, rtol=1e-2, atol=1e-2)
 
-        if isinstance(module.wkv.quant_method, Fp8LinearMethod):
-            assert module.can_prefetch_mxfp8(hash_ids)
-            side_stream = torch.cuda.Stream(device=device)
-            fork_ev = torch.cuda.Event()
-            join_ev = torch.cuda.Event()
-            main_stream = torch.cuda.current_stream()
-            fork_ev.record(main_stream)
-            with torch.cuda.stream(side_stream):
-                side_stream.wait_event(fork_ev)
-                prefetched = module.prefetch_mxfp8_rows(hash_ids)
-                join_ev.record(side_stream)
-            main_stream.wait_event(join_ev)
-            prefetched[0].record_stream(main_stream)
-            prefetched[1].record_stream(main_stream)
-            actual = module(
-                hidden, hash_ids, token_mask, query_shard=None, prefetched=prefetched
-            )
-            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        else:
-            assert not module.can_prefetch_mxfp8(hash_ids)
-            packed_codes, packed_scales = module.embed.mxfp8_rows(
-                hash_ids, scale_layout="packed"
-            )
-            assert packed_codes.shape == (5, 384)
-            assert packed_scales.dtype == torch.int32
-            assert packed_scales.shape == (5, 3)
+        side_stream = torch.cuda.Stream(device=device)
+        fork_ev = torch.cuda.Event()
+        join_ev = torch.cuda.Event()
+        main_stream = torch.cuda.current_stream()
+        fork_ev.record(main_stream)
+        with torch.cuda.stream(side_stream):
+            side_stream.wait_event(fork_ev)
+            prefetched = module.prefetch_mxfp8_rows(hash_ids)
+            join_ev.record(side_stream)
+        main_stream.wait_event(join_ev)
+        prefetched[0].record_stream(main_stream)
+        prefetched[1].record_stream(main_stream)
+        prefetched_out = module(
+            hidden, hash_ids, token_mask, query_shard=None, prefetched=prefetched
+        )
+        torch.testing.assert_close(prefetched_out, packed_out, rtol=0, atol=0)
 
-        # Release/resume cycles must preserve the virtual address and output.
+        # Release/resume cycles through EngramPeerWeightsController must
+        # preserve the virtual address and output bit-for-bit.
         for _ in range(2):
-            module.embed.release_peer_storage(backup=True)
-            assert module.embed.peer_memory.released
+            controller.release_storage(backup=True)
+            assert controller.released
             assert module.embed.peer_memory.local_physical_bytes == 0
             assert module.embed.peer_memory.tensor.data_ptr() == original_ptr
-            module.embed.resume_peer_storage(backup=True)
-            assert not module.embed.peer_memory.released
+            controller.resume_storage(backup=True)
+            assert not controller.released
             assert module.embed.peer_memory.tensor.data_ptr() == original_ptr
             resumed = module(hidden, hash_ids, token_mask, query_shard=None)
-            torch.testing.assert_close(resumed, expected, rtol=0, atol=0)
+            torch.testing.assert_close(resumed, packed_out, rtol=0, atol=0)
     finally:
-        module.embed.close_peer_storage()
+        controller.close()

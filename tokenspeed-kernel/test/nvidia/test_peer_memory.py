@@ -21,12 +21,14 @@
 """GPU tests for peer-sharded CUDA VMM memory and release/resume lifecycle.
 
 Run single-GPU directly with ``pytest <this file>`` or multi-GPU with
-``torchrun --nproc-per-node=2 -m pytest <this file>``.
+``torchrun --nproc-per-node=4 -m pytest <this file>``.
 """
 
 from __future__ import annotations
 
 import os
+import socket
+import tempfile
 from datetime import timedelta
 
 import pytest
@@ -52,6 +54,12 @@ def _default_pool_reserved_bytes() -> int:
     return total
 
 
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 @pytest.fixture(scope="module")
 def peer_env():
     if not torch.cuda.is_available():
@@ -62,12 +70,27 @@ def peer_env():
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     initialized = False
-    if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group("gloo", timeout=timedelta(minutes=5))
+    tmp_ctx = None
+    if not dist.is_initialized():
+        if world_size > 1:
+            dist.init_process_group("gloo", timeout=timedelta(minutes=5))
+        else:
+            tmp_ctx = tempfile.TemporaryDirectory()
+            dist.init_process_group(
+                "gloo",
+                init_method=f"file://{tmp_ctx.name}/rendezvous",
+                rank=0,
+                world_size=1,
+                timeout=timedelta(minutes=5),
+            )
         initialized = True
-    yield rank, world_size, device
-    if initialized:
-        dist.destroy_process_group()
+    try:
+        yield rank, world_size, device
+    finally:
+        if initialized:
+            dist.destroy_process_group()
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
 
 
 @pytest.fixture(scope="module", params=["fabric", "posix_fd"])
@@ -87,7 +110,7 @@ def handle_type(request, peer_env):
 def test_peer_device_memory_gather_and_release_resume(peer_env, handle_type):
     _, world_size, device = peer_env
     exchange = peer_memory.DistributedPeerExchange(
-        dist.group.WORLD if world_size > 1 else None,
+        dist.group.WORLD,
         namespace=f"test-peermem-{handle_type}",
     )
     # 70,000 rows x 66 bytes (~4.62 MiB) spans multiple 2 MiB VMM granules
@@ -171,7 +194,41 @@ def test_peer_device_memory_gather_and_release_resume(peer_env, handle_type):
         )
         assert torch.equal(actual_codes.view(torch.uint8).cpu(), expected_codes_cpu)
         assert torch.equal(actual_scales.cpu(), expected_scales_cpu)
+        if world_size > 1:
+            memory.barrier("pre-close")
     finally:
-        memory.close(sync_peers=world_size > 1)
+        memory.close()
     assert memory.closed
     assert memory.local_physical_bytes == 0
+
+
+def test_cross_process_peer_memory_refuses_per_engine_release(peer_env, handle_type):
+    rank, world_size, device = peer_env
+    if world_size != 1:
+        pytest.skip("single-rank cross-process refusal check")
+    port = _free_port()
+    store = peer_memory.serve_peer_rendezvous(f"127.0.0.1:{port}")
+    try:
+        exchange = peer_memory.TCPStorePeerExchange.connect(
+            f"127.0.0.1:{port}",
+            rank=rank,
+            world_size=1,
+            rendezvous_id="gpu-test-1",
+            namespace=f"test-xproc-{handle_type}",
+        )
+        memory = peer_memory.create_peer_device_memory(
+            2 << 20,
+            device_index=device.index,
+            handle_type=handle_type,
+            exchange=exchange,
+        )
+        try:
+            assert memory.is_cross_process
+            with pytest.raises(RuntimeError, match="Cross-process peer GPU memory"):
+                memory.release_storage(backup=True)
+            with pytest.raises(RuntimeError, match="Cross-process peer GPU memory"):
+                memory.resume_storage(backup=True)
+        finally:
+            memory.close()
+    finally:
+        del store

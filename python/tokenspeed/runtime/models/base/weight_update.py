@@ -43,8 +43,8 @@ import torch.distributed as dist
 from torch import nn
 
 from tokenspeed.runtime.layers.moe.peer_weights import (
-    MoEPeerWeights,
-    peer_weights_controller_for,
+    PeerStorageController,
+    peer_weight_controllers_for,
 )
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 
@@ -114,7 +114,7 @@ def weight_update_session(
             ``cpu_group`` before yielding or quiescing peer weight owners.
     """
     opened: list[BaseCausalLM] = []
-    peer_controllers: list[MoEPeerWeights] = []
+    peer_controllers: list[PeerStorageController] = []
     setup_error: BaseException | None = None
     try:
         if require_complete and not models:
@@ -126,9 +126,7 @@ def weight_update_session(
                         f"{type(model).__name__} cannot validate "
                         "a complete weight update"
                     )
-                controller = peer_weights_controller_for(model)
-                if controller is not None:
-                    peer_controllers.append(controller)
+                peer_controllers.extend(peer_weight_controllers_for(model))
                 continue
             if model._weight_update_active:
                 raise RuntimeError(
@@ -142,9 +140,7 @@ def weight_update_session(
                 model.abort_weight_update()
                 raise
             opened.append(model)
-            controller = peer_weights_controller_for(model)
-            if controller is not None:
-                peer_controllers.append(controller)
+            peer_controllers.extend(peer_weight_controllers_for(model))
             if require_complete:
                 names = model.required_weight_update_names()
                 if not isinstance(names, set) or any(
