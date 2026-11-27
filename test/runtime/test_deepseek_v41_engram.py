@@ -1073,6 +1073,7 @@ def test_engram_peer_gpu_alloc_and_server_args_validation():
             engram_peer_world_size=14,
             engram_peer_rank_offset=0,
             enable_memory_saver=True,
+            weight_memory_policy="cpu_backup",
         )
     args = ServerArgs(
         model="dummy",
