@@ -99,7 +99,9 @@ def test_public_argument_defaults():
             if (name, parameter.name) in {
                 ("index_topk", "index_metadata"),
                 ("index_topk", "slots"),
+                ("index_query_rope_quant", "num_live_rows"),
                 ("selected_attention_fp8", "out"),
+                ("swa_rope_scatter", "prefill_counts"),
             }:
                 assert parameter.default is None
                 continue
@@ -1030,6 +1032,76 @@ def test_fused_swa_matches_rope_quantization_and_page_bytes(device, fmt, normali
     else:
         torch.testing.assert_close(out, reference, rtol=0, atol=0)
         torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+
+
+def test_swa_graph_snapshots_old_prefix_before_publishing_live_rows(device):
+    values = torch.randn(8, 640, device=device, dtype=torch.bfloat16)[:, 128:]
+    positions = torch.arange(8, device=device)
+    slots = positions + 8 * 64
+    rope = _rope_table(device, positions=8)
+    rotated = dsv41.rope_inplace(values.clone(), positions, rope, None)
+    initial = _make_cache(torch.randn(9 * 64, 512, device=device).bfloat16(), "swa")
+    # Page 8 begins past 2**31 bytes even though its index and stride fit int32.
+    cache = torch.empty_strided(
+        initial.shape, (2**28 + 16, 528, 1), dtype=initial.dtype, device=device
+    )
+    current = torch.empty_like(values)
+    descriptor = torch.zeros(6, dtype=torch.int64, device=device)
+
+    def publish(cache_pages, rows):
+        dsv41.snapshot_swa_prefix(cache_pages, descriptor, "swa")
+        dsv41.swa_rope_scatter(
+            values[:rows],
+            positions[:rows],
+            rope,
+            cache_pages,
+            slots[:rows],
+            "swa",
+            current[:rows],
+            None,
+            0.0,
+            descriptor[4:],
+        )
+
+    publish(cache, len(values))
+    with assert_no_triton_compile(
+        implementation._snapshot_swa_prefix, implementation._swa_rope_insert
+    ):
+        publish(cache[:2], 4)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        publish(cache, len(values))
+
+    for live, prefill, prefix_rows in ((7, 3, 259), (2, 1, 2)):
+        # The first prefix spans more than the snapshot grid's 256 programs.
+        prefix = slots[live - 1] - torch.arange(prefix_rows, device=device)
+        workspace = values.new_full((prefix_rows + 1, 512), -7)
+        descriptor.copy_(
+            descriptor.new_tensor(
+                [
+                    prefix.data_ptr(),
+                    workspace.data_ptr(),
+                    len(prefix),
+                    len(workspace),
+                    prefill,
+                    live,
+                ]
+            )
+        )
+        expected_prefix = dsv41.cache_gather(initial, prefix, "swa", None)
+        expected_cache = initial.clone()
+        dsv41.cache_scatter(rotated[:live], expected_cache, slots[:live], "swa")
+        expected_current = dsv41.cache_gather(
+            expected_cache, slots[:prefill], "swa", None
+        )
+        cache.copy_(initial)
+        current.fill_(-7)
+        graph.replay()
+        torch.testing.assert_close(workspace[:-1], expected_prefix, rtol=0, atol=0)
+        assert torch.all(workspace[-1] == -7)
+        torch.testing.assert_close(cache, expected_cache, rtol=0, atol=0)
+        torch.testing.assert_close(current[:prefill], expected_current, rtol=0, atol=0)
+        assert torch.all(current[prefill:] == -7)
 
 
 @pytest.mark.parametrize("fmt", ["swa_v4", "global_v4"])

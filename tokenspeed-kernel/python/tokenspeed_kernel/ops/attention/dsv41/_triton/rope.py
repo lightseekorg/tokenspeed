@@ -423,7 +423,10 @@ def triton_dsv41_index_key_norm_rope_scatter(
         )
 
 
-@triton.jit(do_not_specialize=["N"], do_not_specialize_on_alignment=["POS"])
+@triton.jit(
+    do_not_specialize=["N", "Q0", "Q1", "Q2", "W0", "W1", "P0", "CS0"],
+    do_not_specialize_on_alignment=["POS"],
+)
 def _index_query_rope_quant(
     Q,
     W,
@@ -432,35 +435,62 @@ def _index_query_rope_quant(
     DATA,
     SCALES,
     WEIGHTS,
+    NUM_LIVE_ROWS,
     N,
     H: tl.constexpr,
-    Q0: tl.constexpr,
-    Q1: tl.constexpr,
-    Q2: tl.constexpr,
-    W0: tl.constexpr,
-    W1: tl.constexpr,
-    P0: tl.constexpr,
-    CS0: tl.constexpr,
+    Q0,
+    Q1,
+    Q2,
+    W0,
+    W1,
+    P0,
+    CS0,
     SCALE: tl.constexpr,
     MAX_POS: tl.constexpr,
     ROWS: tl.constexpr,
+    DENSE_QUERY: tl.constexpr,
+    DENSE_WEIGHTS: tl.constexpr,
+    DENSE_POSITIONS: tl.constexpr,
+    DENSE_ROPE: tl.constexpr,
 ):
-    rows = (tl.program_id(0) * ROWS + tl.arange(0, ROWS)).to(tl.int64)
+    # Layout specialization restores vector addressing without putting live
+    # counts or arbitrary strides in the compilation key.
+    if DENSE_QUERY:
+        Q0, Q1, Q2 = H * 128, 128, 1
+    if DENSE_WEIGHTS:
+        W0, W1 = H, 1
+    if DENSE_POSITIONS:
+        P0 = 1
+    if DENSE_ROPE:
+        CS0 = 64
+    first = tl.program_id(0).to(tl.int64) * ROWS
+    rows = first + tl.arange(0, ROWS)
     token, head = rows // H, rows % H
+    live = rows < N
+    if NUM_LIVE_ROWS is not None:
+        num_live_rows = tl.load(NUM_LIVE_ROWS)
+        if first // H >= num_live_rows:
+            tl.store(
+                DATA + rows[:, None] * 64 + tl.arange(0, 64)[None, :],
+                0,
+                (rows < N)[:, None],
+            )
+            tl.store(SCALES + rows, 0x01010101, rows < N)
+            tl.store(WEIGHTS + rows, 0, rows < N)
+            return
+        live = live & (token < num_live_rows)
     d = tl.arange(0, 128)
     q = tl.load(
         Q + token[:, None] * Q0 + head[:, None] * Q1 + d[None, :] * Q2,
-        (rows < N)[:, None],
+        live[:, None],
         0,
     ).to(tl.float32)
     partner = tl.gather(q, tl.broadcast_to((d ^ 1)[None, :], (ROWS, 128)), 1)
-    position = tl.maximum(tl.load(POS + token * P0, rows < N, 0).to(tl.int64), 0)
+    position = tl.maximum(tl.load(POS + token * P0, live, 0).to(tl.int64), 0)
     valid = position < MAX_POS
-    tl.device_assert(
-        valid | (rows >= N), "RoPE position is outside the cosine/sine table"
-    )
+    tl.device_assert(valid | ~live, "RoPE position is outside the cosine/sine table")
     pair = (d - 64) // 2
-    mask = (rows < N)[:, None] & valid[:, None] & (d >= 64)[None, :]
+    mask = live[:, None] & valid[:, None] & (d >= 64)[None, :]
     cosine = tl.load(CS + position[:, None] * CS0 + pair[None, :], mask, 1.0)
     sine = tl.load(CS + position[:, None] * CS0 + 32 + pair[None, :], mask, 0.0)
     rotated = _rotate_interleaved(q, partner, cosine, sine, (d[None, :] & 1) != 0)
@@ -468,15 +498,16 @@ def _index_query_rope_quant(
     groups = tl.reshape(q, (ROWS, 4, 32))
     amax = tl.maximum(tl.max(tl.abs(groups), 2), 6 * 2.0**-126)
     packed, exponent = _mxfp4_index_rows(groups, tl.div_rn(amax, 6.0), ROWS)
+    weight = tl.load(W + token * W0 + head * W1, live, 0).to(tl.float32)
+    scaled = (weight * tl.full((), SCALE, tl.float32)).to(tl.bfloat16)
+    scale_words = _ue8m0_word(exponent)
     tl.store(
         DATA + rows[:, None] * 64 + tl.arange(0, 64)[None, :],
         packed,
         (rows < N)[:, None],
     )
-    tl.store(SCALES + rows, _ue8m0_word(exponent), rows < N)
-    weight = tl.load(W + token * W0 + head * W1, rows < N, 0).to(tl.float32)
-    scaled = (weight * tl.full((), SCALE, tl.float32)).to(tl.bfloat16)
-    tl.store(WEIGHTS + rows, scaled.to(tl.float32), rows < N)
+    tl.store(SCALES + rows, scale_words, rows < N)
+    tl.store(WEIGHTS + rows, scaled, rows < N)
 
 
 @register_kernel(
@@ -489,12 +520,18 @@ def _index_query_rope_quant(
     priority=Priority.PORTABLE,
 )
 def triton_dsv41_index_query_rope_quant(
-    query, head_weights, positions, cos_sin_cache, weight_scale, output_dtype
+    query,
+    head_weights,
+    positions,
+    cos_sin_cache,
+    weight_scale,
+    output_dtype,
+    num_live_rows=None,
 ):
     """Fuse index-Q RoPE, MXFP4 packing and BF16-rounded head-weight scaling.
 
-    Args and returns match dsv41.index_query_rope_quant. Both FP32 Full and
-    BF16 sparse head weights are produced directly in this same launch.
+    Args and returns match dsv41.index_query_rope_quant. Head weights are
+    rounded to BF16 and written in the requested scorer dtype.
     """
     _validate_index_query_inputs(query, head_weights, positions, cos_sin_cache)
     if output_dtype not in (torch.bfloat16, torch.float32):
@@ -502,6 +539,12 @@ def triton_dsv41_index_query_rope_quant(
     data = torch.empty((*query.shape[:2], 64), dtype=torch.uint8, device=query.device)
     scales = torch.empty(query.shape[:2], dtype=torch.int32, device=query.device)
     weights = torch.empty(query.shape[:2], dtype=output_dtype, device=query.device)
+    if num_live_rows is not None and (
+        num_live_rows.numel() != 1
+        or num_live_rows.dtype != torch.int64
+        or num_live_rows.device != query.device
+    ):
+        raise ValueError("num_live_rows must be a single int64 on the query device")
     count = query.shape[0] * query.shape[1]
     if count:
         _index_query_rope_quant[(triton.cdiv(count, 4),)](
@@ -512,6 +555,7 @@ def triton_dsv41_index_query_rope_quant(
             data,
             scales,
             weights,
+            num_live_rows,
             count,
             query.shape[1],
             *query.stride(),
@@ -521,6 +565,10 @@ def triton_dsv41_index_query_rope_quant(
             weight_scale,
             cos_sin_cache.shape[0],
             4,
+            query.stride() == (query.shape[1] * 128, 128, 1),
+            head_weights.stride() == (query.shape[1], 1),
+            positions.stride(0) == 1,
+            cos_sin_cache.stride(0) == 64,
             num_warps=4,
             enable_fp_fusion=False,
             debug=True,

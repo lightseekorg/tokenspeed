@@ -1854,3 +1854,65 @@ def test_deep_select_leaves_short_rows_unchecked():
         rtol=0,
         atol=0,
     )
+
+
+def test_prepared_index_query_replays_for_dense_and_sparse_scoring():
+    q, weights, cache, table, lengths, _, _, _, candidates = _fused_selection_inputs(
+        "sparse", 12
+    )
+    positions = torch.arange(len(q), device=q.device)
+    angles = positions[:, None] * torch.linspace(0.001, 1, 32, device=q.device)
+    raw = dsv41.IndexQueryInput(
+        q, positions, torch.cat((angles.cos(), angles.sin()), -1), 0.023456789
+    )
+    live = positions.new_tensor(len(q))
+
+    def prepare():
+        return dsv41.prepare_index_query(
+            raw, weights, cache, candidate_consumer=True, num_live_rows=live
+        )
+
+    prepare()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        packed, scaled = prepare()
+    q.normal_()
+    weights.normal_()
+    live.fill_(len(q) - 1)
+    graph.replay()
+    assert isinstance(packed, dsv41.PreparedIndexQuery)
+    assert scaled.dtype == torch.bfloat16
+    assert not packed.data[-1].any() and not scaled[-1].any()
+    assert (packed.scales[-1] == 0x01010101).all()
+
+    # Score the same strided live queries against one history, with and without candidates.
+    rows = slice(0, len(q) - 1, 2)
+    visible = lengths[rows].contiguous()
+    pages = table[-1:].expand(len(visible), -1)
+    dense = dsv41.new_index_metadata(pages, visible, None, history_rows=(len(visible),))
+
+    def select(query, head_weights, blocks, solution):
+        return dsv41.index_topk(
+            query,
+            head_weights,
+            cache,
+            pages,
+            visible,
+            blocks,
+            topk=64,
+            candidate_topk=0,
+            candidate_block_size=8,
+            query_chunk_size=32,
+            score_chunk_size=256,
+            process_group=None,
+            out=None,
+            solution=solution,
+            index_metadata=dense if blocks is None else None,
+        )
+
+    for blocks in (None, candidates[rows]):
+        expected = select(raw[rows], weights[rows], blocks, "deep_gemm")
+        actual = select(packed[rows], scaled[rows], blocks, "deep_gemm")
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="cannot consume prepared"):
+        select(packed[rows], scaled[rows], None, "triton")
