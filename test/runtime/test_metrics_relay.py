@@ -212,6 +212,7 @@ def relay_environment(tmp_path):
 
 
 def _run_relay_subprocess(command, *, env, cwd=None):
+    """Run a launcher subprocess, reap surviving relay children, and return output."""
     record = Path(env["RELAY_RECORD"])
     record.touch()
     try:
@@ -294,6 +295,7 @@ def test_metrics_relay_kills_child_when_sink_exceeds_shutdown_budget(
 
 
 def _write_runtime_path_plugin(plugin_dir: Path) -> None:
+    """Write the runtime-path reporter plugin and dist-info metadata in plugin_dir."""
     plugin_dir.mkdir()
     (plugin_dir / "runtime_path_probe.py").write_text(textwrap.dedent(r"""
         import json
@@ -343,6 +345,10 @@ def _write_runtime_path_plugin(plugin_dir: Path) -> None:
 
 
 def _write_runtime_path_launcher(launcher: Path, runtime_paths: list[str]) -> None:
+    """Write a launcher that prepends runtime_paths to sys.path and tests the relay.
+
+    The generated script sends one event through MetricsRelay and closes it.
+    """
     launcher.write_text(textwrap.dedent(f"""
         import os
         import sys
