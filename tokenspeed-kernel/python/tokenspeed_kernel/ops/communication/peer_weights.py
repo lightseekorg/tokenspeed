@@ -96,17 +96,56 @@ class PeerWeightStore(Protocol):
 
     def weights(self, layer: int) -> dict[str, torch.Tensor]: ...
 
-    def owned_weights(self, layer: int) -> dict[str, torch.Tensor]: ...
+    def owned_weights(self, layer: int) -> dict[str, torch.Tensor]:
+        """Return writable local-shard tensors for ``layer`` keyed by field name.
 
-    def vmm_managed_tensors(self) -> tuple[torch.Tensor, ...]: ...
+        Requires ``finalize()`` and resident storage (not released).
+        """
+        ...
 
-    def prepare_weight_update(self) -> None: ...
+    def vmm_managed_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return all VMM-backed full-expert view tensors owned by this store.
 
-    def refresh_weights(self) -> None: ...
+        Requires ``finalize()``; returned tensors are exempt from ordinary
+        device-allocator tracking while keeping their virtual addresses.
+        """
+        ...
 
-    def release_storage(self, *, backup: bool) -> None: ...
+    def prepare_weight_update(self) -> None:
+        """Quiesce active readers and peer copy streams before rewriting owned shards.
 
-    def resume_storage(self, *, backup: bool) -> None: ...
+        Requires ``finalize()`` and resident storage; call across the storage
+        group before mutating tensors returned by ``owned_weights()``.
+        """
+        ...
+
+    def refresh_weights(self) -> None:
+        """Repopulate boundary/replicated slices and invalidate staging after shard updates.
+
+        Requires ``finalize()`` and resident storage; must run collectively
+        after all ranks finish writing their owned shards.
+        """
+        ...
+
+    def release_storage(self, *, backup: bool) -> None:
+        """Unmap and free VMM physical handles while retaining VA reservations.
+
+        Requires ``finalize()`` and non-released storage. When ``backup=True``,
+        copies owned shards to CPU so ``resume_storage(backup=True)`` restores
+        the exact contents; when ``backup=False``, owned shard contents are
+        discarded and must be repopulated via a full weight update after resume.
+        """
+        ...
+
+    def resume_storage(self, *, backup: bool) -> None:
+        """Reallocate physical handles and remap them into the preserved VA views.
+
+        Requires ``finalize()`` and released storage. Preserves tensor virtual
+        addresses across sleep/wake; when ``backup=True``, restores owned shards
+        from CPU and refreshes boundary/replicated slices, whereas
+        ``backup=False`` leaves storage ready for a subsequent full weight load.
+        """
+        ...
 
     def prefetch(self, layer: int) -> None: ...
 
