@@ -694,10 +694,11 @@ class HostCacheExecutor:
     def _warmup_restore_transfers(self) -> None:
         """Warm each Host tier's unflagged H2D restore, preserving Device bytes."""
         # Host blocks must still be unassigned for this scratch round trip.
-        # Use one group so compact Host-parent writes cannot overlap.
-        group_index = next(
+        # Warm one field-bearing group at a time so compact Host-parent writes
+        # never overlap while every group's alignment variant compiles at init.
+        group_indices = [
             i for i, group in enumerate(self.layout.groups) if group.fields
-        )
+        ]
         for storage, geometry, lane in (
             (self.host_storage, self._transfer_geometry, self._restore_l2_lane),
             (
@@ -716,9 +717,10 @@ class HostCacheExecutor:
                 prerequisite_stream=device_module.current_stream(),
                 backend=self.transfer_backend,
             )
-            lane.start_d2h([(group_index, 1, 1)], **launch)
-            lane.start_h2d([(group_index, 1, 1)], **launch)
-            self.load_stream.synchronize()
+            for group_index in group_indices:
+                lane.start_d2h([(group_index, 1, 1)], **launch)
+                lane.start_h2d([(group_index, 1, 1)], **launch)
+                self.load_stream.synchronize()
 
     def submit_write_backs(
         self, cache_ops: Sequence, *, prerequisite_stream, fence_stream

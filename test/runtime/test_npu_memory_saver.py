@@ -230,42 +230,66 @@ def test_npu_host_transfer_staging_uses_discardable_kv_pool():
     stream.synchronize()
 
     try:
-        saver.pause("kv_cache")
-        matching = [
-            block
-            for block in saver.stats()["blocks"]
-            if 0 <= staging_ptr - int(block["ptr"], 16) < block["aligned_bytes"]
-        ]
-        assert len(matching) == 1
-        assert matching[0]["tag"] == "kv_cache"
-        assert not matching[0]["mapped"] and not matching[0]["physical_live"]
-        assert not matching[0]["backup_valid"]
-        saver.resume("kv_cache")
+        for cycle in range(2):
+            saver.pause("kv_cache")
+            matching = [
+                block
+                for block in saver.stats()["blocks"]
+                if 0 <= staging_ptr - int(block["ptr"], 16) < block["aligned_bytes"]
+            ]
+            assert len(matching) == 1
+            assert matching[0]["tag"] == "kv_cache"
+            assert not matching[0]["mapped"] and not matching[0]["physical_live"]
+            assert not matching[0]["backup_valid"]
+            saver.resume("kv_cache")
 
-        pattern = (
-            torch.arange(payload, dtype=torch.int64).remainder(251).to(torch.uint8)
-        )
-        device_buf[payload : 2 * payload].copy_(pattern.npu())
-        num_blocks, _ = workspace.load_block_transfers(((0, 1, 1),), geometry=geometry)
-        with torch.npu.stream(stream), saver.named_region("cache_transfer"):
-            workspace.commit_block_transfers(
-                num_blocks, device_buf.device, non_blocking=True
+            pattern = (
+                torch.arange(payload, dtype=torch.int64)
+                .add(cycle * 37 + 1)
+                .remainder(251)
+                .to(torch.uint8)
             )
-        host_transfer.transfer_cache_blocks(
-            "d2h",
-            (device_buf,),
-            host,
-            geometry,
-            workspace,
-            stream,
-            num_blocks=num_blocks,
-            geometry_offset=0,
-            num_geometry_rows=1,
-            backend="auto",
-            grid_cap=None,
-            layer_ready_flags=None,
-        )
-        stream.synchronize()
-        assert torch.equal(host[:payload], pattern)
+            num_blocks, _ = workspace.load_block_transfers(
+                ((0, 1, 1),), geometry=geometry
+            )
+            with torch.npu.stream(stream):
+                device_buf[payload : 2 * payload].copy_(pattern, non_blocking=False)
+                with saver.named_region("cache_transfer"):
+                    workspace.commit_block_transfers(
+                        num_blocks, device_buf.device, non_blocking=True
+                    )
+            host_transfer.transfer_cache_blocks(
+                "d2h",
+                (device_buf,),
+                host,
+                geometry,
+                workspace,
+                stream,
+                num_blocks=num_blocks,
+                geometry_offset=0,
+                num_geometry_rows=1,
+                backend="auto",
+                grid_cap=None,
+                layer_ready_flags=None,
+            )
+            with torch.npu.stream(stream):
+                device_buf[payload : 2 * payload].zero_()
+            host_transfer.transfer_cache_blocks(
+                "h2d",
+                (device_buf,),
+                host,
+                geometry,
+                workspace,
+                stream,
+                num_blocks=num_blocks,
+                geometry_offset=0,
+                num_geometry_rows=1,
+                backend="auto",
+                grid_cap=None,
+                layer_ready_flags=None,
+            )
+            stream.synchronize()
+            assert torch.equal(host[:payload], pattern)
+            assert torch.equal(device_buf[payload : 2 * payload].cpu(), pattern)
     finally:
         saver.resume("kv_cache")

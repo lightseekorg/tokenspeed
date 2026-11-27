@@ -45,6 +45,7 @@ import torch
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferGeometry,
     HostTransferWorkspace,
+    StagingBuffer,
     build_host_transfer_geometry,
     transfer_cache_blocks,
 )
@@ -417,7 +418,7 @@ class HostTransferLane:
         self,
         memory_saver_adapter: TorchMemorySaverAdapter,
         *,
-        staging_buffer=None,
+        staging_buffer: StagingBuffer | None = None,
     ) -> None:
         self.workspace = HostTransferWorkspace()
         if staging_buffer is not None:
