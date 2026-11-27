@@ -24,7 +24,11 @@ can also share.
 `mxfp8_row_gather` reads `[D E4M3 codes | D/32 UE8M0 scales]` rows and writes
 them as a GEMM's group-32 MXFP8 activation: the codes and canonical scales that
 quantizing the dequantized BF16 rows (1e-4 amax floor) would produce, without
-materializing BF16.
+materializing BF16. When a host table is consumed exclusively through MXFP8
+gathers, `canonicalize_mxfp8_table` rewrites its rows in place once after load
+(zero extra persistent host memory) so `canonical_mxfp8_row_gather` can copy
+the pre-canonicalized bytes and scales directly on every forward without
+repeating the FP8->FP32->amax->FP8 round trip.
 
 Large `mxfp8_row_gather` lookups (at least `_SORT_MIN_ROWS` rows) sort the ids
 first, so neighbouring rows share GPU page walks, and read each distinct row

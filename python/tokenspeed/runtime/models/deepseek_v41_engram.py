@@ -730,6 +730,7 @@ class RowShardedEngramEmbedding(nn.Module):
         self.layer_id = layer_id
         self._mmap_keep: list[object] = []
         self._host_gpu_registered = False
+        self._mxfp8_canonical = False
         # A host table holding every row its rank looks up (one shared copy, or
         # a single attention-TP rank) needs no reduction, so its rows can feed
         # wkv as MXFP8 directly.
@@ -897,6 +898,7 @@ class RowShardedEngramEmbedding(nn.Module):
             rows = rows.view(torch.uint8)
         elif rows.dtype != torch.float8_e4m3fn:
             raise TypeError("Engram table weights must stay FP8 E4M3")
+        self._mxfp8_canonical = False
         param.data[local_start : local_start + rows.shape[0]].copy_(rows)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -937,6 +939,9 @@ class RowShardedEngramEmbedding(nn.Module):
         """
         if parameter_name not in ("weight", "scale") or chunk_rows < 1:
             raise ValueError("Expected weight/scale and a positive row chunk size")
+        # Clear on every rank, including followers that skip the host copy, so
+        # a later prepare_mxfp8_rows() enters any shared barrier in lockstep.
+        self._mxfp8_canonical = False
         if self.host_table and not self._shared_writer:
             return
         param = getattr(self, parameter_name)
@@ -949,6 +954,49 @@ class RowShardedEngramEmbedding(nn.Module):
                 raise ValueError("Open Engram safetensors on CPU before slicing")
             self._copy_rows(param, rows, start - self.row_start)
 
+    def prepare_mxfp8_rows(self) -> None:
+        """Canonicalize packed host rows in place once after loading.
+
+        Rewrites ``self.packed`` in place to the group-32 UE8M0 activation
+        contract (1e-4 amax floor) with zero extra persistent host memory, so
+        :meth:`mxfp8_rows` can copy bytes directly on every forward instead of
+        dequantizing and re-quantizing every looked-up row. Collective when
+        ``host_layout == "shared"`` across distributed ranks.
+        """
+        if (
+            not self.serves_mxfp8_rows
+            or self._mxfp8_canonical
+            or self.packed is None
+            or self.packed.device.type == "meta"
+        ):
+            return
+        local_rows = self.row_end - self.row_start
+        if self._shared_writer and local_rows > 0:
+            if torch.cuda.is_available() and self._host_gpu_registered:
+                exec_device = torch.device("cuda", torch.cuda.current_device())
+                host_gather.canonicalize_mxfp8_table(
+                    self.packed,
+                    start_row=0,
+                    end_row=local_rows,
+                    device=exec_device,
+                )
+                # Flush UVA stores to host memory before peers or CPU read them.
+                torch.cuda.synchronize(exec_device)
+            else:
+                host_gather.canonicalize_mxfp8_table(
+                    self.packed,
+                    start_row=0,
+                    end_row=local_rows,
+                    device=torch.device("cpu"),
+                )
+        if (
+            self.host_layout == "shared"
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            torch.distributed.barrier()
+        self._mxfp8_canonical = True
+
     def mxfp8_rows(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather CUDA [T, hash columns] IDs as the MXFP8 input of wkv.
 
@@ -959,6 +1007,10 @@ class RowShardedEngramEmbedding(nn.Module):
         """
         if not self.serves_mxfp8_rows:
             raise RuntimeError("This Engram table needs its rows reduced across TP")
+        if self._mxfp8_canonical:
+            return host_gather.canonical_mxfp8_row_gather(
+                self.packed, indices, None, None
+            )
         return host_gather.mxfp8_row_gather(self.packed, indices, None, None)
 
     def forward(
@@ -1144,6 +1196,13 @@ class DeepseekV41Engram(nn.Module):
                     f"{prefix!s}: one-shot all-reduce lane of width {width:d} not "
                     "armed; the Engram embedding reduce falls back to NCCL"
                 )
+
+    def prepare_mxfp8_rows(self) -> None:
+        """Canonicalize a shared host table in place for direct MXFP8 gathers."""
+        if self.embed.serves_mxfp8_rows and isinstance(
+            self.wkv.quant_method, Fp8LinearMethod
+        ):
+            self.embed.prepare_mxfp8_rows()
 
     def checkpoint_weight_aliases(self) -> dict[str, str]:
         """Return raw layers.<id>.engram checkpoint names to runtime param paths.

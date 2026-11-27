@@ -217,3 +217,148 @@ def test_cuda_mxfp8_row_gather_sorted_path_does_not_recompile_per_batch():
                 table, ids[:tokens, 1], codes[:tokens], scales[:tokens]
             )
     torch.cuda.synchronize()
+
+
+def test_cpu_canonicalize_mxfp8_table_exhaustive_matches_reference():
+    # Cover every non-NaN E4M3 byte across every E8M0 exponent whose products
+    # stay finite in FP32 (0..245: max 448 * 2^118 < FP32 max), including
+    # exponent 0/1 sub-floor rows, signed zeros, and partial slices.
+    valid_codes = torch.tensor(
+        [b for b in range(256) if (b & 0x7F) != 0x7F], dtype=torch.uint8
+    )
+    # Pad to 256 elements (8 groups of 32) per row so every code appears in every
+    # exponent row; repeat across all finite-product E8M0 scale exponents.
+    row_codes = torch.cat([valid_codes, torch.zeros(2, dtype=torch.uint8)])
+    exponents = torch.arange(246, dtype=torch.uint8)
+    codes = row_codes.unsqueeze(0).expand(246, -1).clone()
+    scales = exponents.unsqueeze(1).expand(-1, 8).clone()
+    # Add two guard rows outside [start_row, end_row) to verify slice isolation.
+    raw = torch.cat([codes, scales], dim=1)
+    sentinel = torch.full((2, raw.shape[1]), 0x3C, dtype=torch.uint8)
+    table = torch.cat([sentinel[:1], raw, sentinel[1:]], dim=0).contiguous()
+    original_ptr = table.data_ptr()
+
+    expected_codes, expected_scales = _quantized_rows(
+        raw, torch.arange(raw.shape[0], dtype=torch.int64).unsqueeze(1)
+    )
+    returned = host_gather.canonicalize_mxfp8_table(
+        table, start_row=1, end_row=1 + raw.shape[0], device="cpu"
+    )
+    assert returned is table
+    assert table.data_ptr() == original_ptr
+    assert torch.equal(table[0], sentinel[0])
+    assert torch.equal(table[-1], sentinel[1])
+    assert torch.equal(table[1:-1, :256], expected_codes)
+    assert torch.equal(table[1:-1, 256:], expected_scales)
+
+    # Idempotency: a second pass over already-canonical rows is a no-op.
+    snapshot = table.clone()
+    host_gather.canonicalize_mxfp8_table(
+        table, start_row=1, end_row=1 + raw.shape[0], device="cpu"
+    )
+    assert torch.equal(table, snapshot)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("sorted_path", [False, True])
+def test_cuda_canonical_mxfp8_row_gather_matches_mxfp8_row_gather(
+    index_dtype, sorted_path
+):
+    generator = torch.Generator().manual_seed(11 if sorted_path else 10)
+    raw = _mxfp8_table(97, 256, generator).pin_memory()
+    canonical = raw.clone().pin_memory()
+    ptr = canonical.data_ptr()
+    host_gather.canonicalize_mxfp8_table(canonical, device="cuda:0")
+    assert canonical.data_ptr() == ptr
+
+    columns = 24
+    tokens = (triton_host_gather._SORT_MIN_ROWS // columns + 3) if sorted_path else 7
+    ids = torch.randint(0, 97, (tokens, 2, columns), generator=generator)
+    ids[0, 1, 0], ids[1, 1, 0], ids[-1, 1, -1] = -1, -1, 97
+    ids[2, 1, 3], ids[3, 1, 4], ids[4, 1, 5] = 0, 1, 2
+    indices = ids.to(device="cuda:0", dtype=index_dtype)[:, 1]
+    assert (indices.numel() >= triton_host_gather._SORT_MIN_ROWS) == sorted_path
+
+    ref_codes, ref_scales = host_gather.mxfp8_row_gather(raw, indices, None, None)
+    got_codes, got_scales = host_gather.canonical_mxfp8_row_gather(
+        canonical, indices, None, None
+    )
+    assert torch.equal(got_codes.view(torch.uint8), ref_codes.view(torch.uint8))
+    assert torch.equal(got_scales, ref_scales)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_canonicalize_and_gather_reads_rows_past_2gib():
+    rows = (1 << 31) // 264 + 2
+    table = torch.zeros(rows, 264, dtype=torch.uint8, device="cuda:0")
+    tail = _mxfp8_table(3, 256, torch.Generator().manual_seed(12))
+    table[-2:] = tail[1:].cuda()
+    host_gather.canonicalize_mxfp8_table(
+        table, start_row=rows - 2, end_row=rows, device="cuda:0"
+    )
+    indices = torch.tensor([[rows - 1, rows - 2, -1, rows]], device="cuda:0")
+    codes, scales = host_gather.canonical_mxfp8_row_gather(table, indices, None, None)
+    expected_codes, expected_scales = _quantized_rows(
+        tail, torch.tensor([[2, 1, -1, 3]])
+    )
+    assert torch.equal(codes.view(torch.uint8).cpu(), expected_codes)
+    assert torch.equal(scales.cpu(), expected_scales)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_canonical_mxfp8_does_not_recompile_per_batch():
+    table = _mxfp8_table(64, 256, torch.Generator().manual_seed(13)).pin_memory()
+    host_gather.canonicalize_mxfp8_table(table, start_row=0, end_row=8, device="cuda:0")
+    with assert_no_triton_compile(triton_host_gather._canonicalize_mxfp8_table_kernel):
+        host_gather.canonicalize_mxfp8_table(
+            table, start_row=8, end_row=37, device="cuda:0"
+        )
+        host_gather.canonicalize_mxfp8_table(
+            table, start_row=37, end_row=64, device="cuda:0"
+        )
+
+    columns = 24
+    base = triton_host_gather._SORT_MIN_ROWS // columns + 1
+    ids = torch.randint(0, 64, (base + 32, 2, columns), device="cuda:0")
+    codes = torch.empty(
+        base + 32, columns * 256, dtype=torch.float8_e4m3fn, device="cuda:0"
+    )
+    scales = torch.empty(base + 32, columns * 8, dtype=torch.uint8, device="cuda:0")
+    host_gather.canonical_mxfp8_row_gather(table, ids[:3, 0], codes[:3], scales[:3])
+    host_gather.canonical_mxfp8_row_gather(
+        table, ids[:base, 0], codes[:base], scales[:base]
+    )
+    with assert_no_triton_compile(
+        triton_host_gather._host_mxfp8_row_gather_kernel,
+        triton_host_gather._copy_duplicate_rows_kernel,
+    ):
+        for tokens in (1, 5, 16, 64, base + 2, base + 17, base + 32):
+            host_gather.canonical_mxfp8_row_gather(
+                table, ids[:tokens, 1], codes[:tokens], scales[:tokens]
+            )
+    torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_canonical_mxfp8_zero_ordinary_pool_occupancy():
+    def _ordinary_pool_bytes() -> int:
+        return sum(
+            seg["active_size"]
+            for seg in torch.cuda.memory_snapshot()
+            if seg.get("segment_pool_id") == (0, 0)
+        )
+
+    table = _mxfp8_table(64, 256, torch.Generator().manual_seed(14)).pin_memory()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    baseline = _ordinary_pool_bytes()
+
+    for _ in range(3):
+        host_gather.canonicalize_mxfp8_table(table, device="cuda:0")
+        ids = torch.randint(0, 64, (16, 24), device="cuda:0")
+        codes, scales = host_gather.canonical_mxfp8_row_gather(table, ids, None, None)
+        del ids, codes, scales
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        assert _ordinary_pool_bytes() == baseline

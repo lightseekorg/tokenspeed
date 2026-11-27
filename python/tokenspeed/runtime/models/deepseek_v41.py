@@ -3737,6 +3737,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             elif isinstance(module, DeepseekV41Attention):
                 module.prepare_output_projections()
                 module.prepare_fused_decode()
+            elif isinstance(module, DeepseekV41Engram):
+                module.prepare_mxfp8_rows()
 
     def post_quant_warmup(self) -> None:
         # Every loader calls this once the loaded state is final. The sharded

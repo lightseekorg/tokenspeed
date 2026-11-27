@@ -691,6 +691,80 @@ def test_cuda_host_table_feeds_wkv_its_mxfp8_rows(alloc):
         captured, gpu(hidden, ids, mask, query_shard=None), rtol=0, atol=0
     )
 
+    # Canonicalizing the shared host table in place preserves bit-for-bit output
+    # eagerly and under CUDA graph replay, with zero extra host allocation.
+    packed_ptr = host.embed.packed.data_ptr()
+    host.prepare_mxfp8_rows()
+    assert host.embed._mxfp8_canonical
+    assert host.embed.packed.data_ptr() == packed_ptr
+    torch.testing.assert_close(
+        host(hidden, ids, mask, query_shard=None),
+        gpu(hidden, ids, mask, query_shard=None),
+        rtol=0,
+        atol=0,
+    )
+    torch.cuda.synchronize()
+    canonical_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(canonical_graph):
+        canonical_captured = host(hidden, ids, mask, query_shard=None)
+    hashes.copy_(torch.randint(0, 72, (5, 2, 6), device="cuda:0"))
+    canonical_graph.replay()
+    torch.testing.assert_close(
+        canonical_captured, gpu(hidden, ids, mask, query_shard=None), rtol=0, atol=0
+    )
+
+
+def test_host_table_prepare_mxfp8_rows_canonicalizes_in_place():
+    quant = Mxfp8Config.from_config(
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [32, 32],
+            "scale_fmt": "ue8m0",
+        }
+    )
+    torch.manual_seed(19)
+    codes, scales = _weights(72, 32)
+    model = DeepseekV41Engram(
+        _config(),
+        1,
+        _mapping(0, 1, 1),
+        v41_mxfp8_config(quant),
+        "model.layers.1.engram",
+        "cpu",
+        True,
+        "shared",
+        EngramHostAlloc("mmap", "writer"),
+    )
+    model.embed.weight_loader(model.embed.weight, codes)
+    model.embed.weight_loader(model.embed.scale, scales)
+    assert model.embed.serves_mxfp8_rows
+    assert not model.embed._mxfp8_canonical
+    packed_ptr = model.embed.packed.data_ptr()
+
+    expected = model.embed.packed.clone()
+    from tokenspeed_kernel.ops.embedding import host_gather
+
+    host_gather.canonicalize_mxfp8_table(expected, device="cpu")
+    model.prepare_mxfp8_rows()
+    assert model.embed._mxfp8_canonical
+    assert model.embed.packed.data_ptr() == packed_ptr
+    assert torch.equal(model.embed.packed, expected)
+
+    # Reloading weights resets canonical state on both writer and follower paths.
+    model.embed.weight_loader(model.embed.weight, codes)
+    assert not model.embed._mxfp8_canonical
+    model.prepare_mxfp8_rows()
+    assert model.embed._mxfp8_canonical
+
+    class _DummySlice:
+        def get_shape(self):
+            return (72, 32)
+
+    model.embed._shared_writer = False
+    model.embed.load_sharded("weight", _DummySlice(), 16)
+    assert not model.embed._mxfp8_canonical
+
 
 def test_distributed_four_way_lookup(monkeypatch):
     from tokenspeed.runtime.utils.env import global_server_args_dict
