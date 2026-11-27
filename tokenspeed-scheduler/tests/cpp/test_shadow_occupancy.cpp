@@ -621,12 +621,13 @@ TEST(AdmissionCandidateConstraints, ReturnedReclaimsRespectClaimsWithoutChanging
     const PrefixProbe prefix = coordinator.Prober().ProbePrefix({});
     const std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{0}}};
     std::pmr::monotonic_buffer_resource resource;
-    const auto all = BuildAdmissionCandidateConstraints(coordinator.Store(), demands, 20, prefix, {}, &resource);
+    const auto all =
+        BuildAdmissionCandidateConstraints(coordinator.Store(), demands, 20, prefix, {}, &resource, nullptr);
     ASSERT_EQ(all.request_reclaim_candidates.size(), 4u);
     const CacheBlockLocation first = tables[0].Blocks()[0]->Location();
     const std::vector<std::pair<std::uint32_t, CacheBlockLocation>> claimed{{0, first}};
     const auto protected_first =
-        BuildAdmissionCandidateConstraints(coordinator.Store(), demands, 20, prefix, claimed, &resource);
+        BuildAdmissionCandidateConstraints(coordinator.Store(), demands, 20, prefix, claimed, &resource, nullptr);
     EXPECT_TRUE(protected_first.protected_locations.contains(first));
     EXPECT_FALSE(protected_first.request_reclaim_locations.contains(first));
     EXPECT_EQ(protected_first.request_reclaim_candidates.size(), 3u);
@@ -652,22 +653,29 @@ TEST(AdmissionPlanner, RepeatedPlansReturnIndependentDecisionsWithoutChangingThe
     std::vector<BlockTable> request(1);
     const PrefixProbe prefix = coordinator.Prober().ProbePrefix({});
     const std::vector<GroupDemand> demands{{.table = &request[0], .extent = DenseGrowth{4}}};
-    const AdmissionPlanner planner{
-        coordinator.Store(),      CheckpointAging{}, demands, std::nullopt, std::nullopt, prefix, {}, {},
-        /*evicts_segments=*/false};
+    const AdmissionPlanner planner{coordinator.Store(),
+                                   CheckpointAging{},
+                                   demands,
+                                   std::nullopt,
+                                   std::nullopt,
+                                   prefix,
+                                   {},
+                                   {},
+                                   /*evicts_segments=*/false,
+                                   nullptr};
     std::pmr::monotonic_buffer_resource first_resource;
     std::pmr::monotonic_buffer_resource second_resource;
     auto first = planner.Plan(&first_resource);
     auto second = planner.Plan(&second_resource);
     ASSERT_TRUE(first);
     ASSERT_TRUE(second);
-    ASSERT_EQ(first->victims.size(), 1u);
-    ASSERT_EQ(second->victims.size(), 1u);
-    ASSERT_EQ(first->victims[0].members.size(), 1u);
-    ASSERT_EQ(second->victims[0].members.size(), 1u);
-    EXPECT_EQ(first->victims[0].members[0].location, second->victims[0].members[0].location);
-    first->victims.clear();
-    EXPECT_EQ(second->victims[0].members.size(), 1u);
+    ASSERT_EQ(first->eviction.victims.size(), 1u);
+    ASSERT_EQ(second->eviction.victims.size(), 1u);
+    ASSERT_EQ(first->eviction.victims[0].members.size(), 1u);
+    ASSERT_EQ(second->eviction.victims[0].members.size(), 1u);
+    EXPECT_EQ(first->eviction.victims[0].members[0].location, second->eviction.victims[0].members[0].location);
+    first->eviction.victims.clear();
+    EXPECT_EQ(second->eviction.victims[0].members.size(), 1u);
     EXPECT_EQ(request[0].NumBlocks(), 0);
     EXPECT_EQ(pool.NumOccupiedSlots(), 2);
 }

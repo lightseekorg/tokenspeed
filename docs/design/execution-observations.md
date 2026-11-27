@@ -116,6 +116,8 @@ None entries. Both `OutputChunk` conversion paths and the Python chunk expose it
 adding counters again. Empty final chunks preserve it. Identity changes,
 regressing counters/histograms, missing pre-stop data and unknown versions fail
 validation before mutating completion output.
+A client's local abort chunk carries no new execution snapshot; it cannot
+establish that the engine completed or closed an observed admission.
 
 A version-1 snapshot contains engine/rank/admission identity and origin,
 assigned/completed/missing round counts, `through_round`, committed-token total,

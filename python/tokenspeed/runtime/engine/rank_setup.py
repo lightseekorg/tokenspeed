@@ -20,13 +20,15 @@
 
 """What building one engine rank needs before its data plane exists: the
 model config, the process groups, the request length limits and the C++
-scheduler's config. ``rust_host.bootstrap`` runs them in this order."""
+scheduler's config. The native host runs these steps during rank startup."""
+
+from collections.abc import Callable
 
 import torch
 from tokenspeed_engine.scheduler import (
     DiskConfig,
     PeerConfig,
-    SchedulerConfig,
+    SharedL2Config,
     StorageConfig,
 )
 
@@ -46,24 +48,6 @@ from tokenspeed.runtime.utils.server_args import (
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
-
-
-def _implied_scheduler_policy(on: bool, field: str) -> bool:
-    """Whether to turn on a scheduler policy that ``--enable-state-checkpoint-in-forward``
-    implies, rather than an option of its own.
-
-    A tokenspeed-scheduler wheel released before the policy's
-    ``SchedulerConfig`` field (0.1.49 lacks the superseded-checkpoint demotion
-    and the short prompt-end drop) would raise AttributeError when it is set;
-    such a wheel serves the in-forward checkpoints without the policy instead.
-    """
-    if on and not hasattr(SchedulerConfig(), field):
-        logger.warning(
-            f"the installed tokenspeed-scheduler has no SchedulerConfig.{field}; "
-            "serving the in-forward State checkpoints without that policy"
-        )
-        return False
-    return on
 
 
 def rank_process_title(mapping) -> str:
@@ -173,6 +157,7 @@ def init_distributed(
     gpu_id: int,
     global_rank: int,
     hidden_size: int,
+    before_memory_profile: Callable[[], None] | None = None,
 ) -> float:
     """Initialize this rank's process groups; return the free-memory floor
     the KV budget is sized against."""
@@ -194,7 +179,9 @@ def init_distributed(
         hidden_size=hidden_size,
         max_num_tokens=max_num_input_tokens,
     )
-    return DistributedInitializer.initialize(distributed_config)
+    return DistributedInitializer.initialize(
+        distributed_config, before_memory_profile=before_memory_profile
+    )
 
 
 def request_length_limits(
@@ -268,6 +255,7 @@ def scheduler_config_from_args(
     enable_kv_cache_events: bool,
     prefix_replay_tokens: int,
     peer_config: PeerConfig | None,
+    shared_l2_config: SharedL2Config | None,
 ):
     """Build scheduler config from Device facts and separate Host-storage limits.
 
@@ -290,6 +278,8 @@ def scheduler_config_from_args(
         prefix_replay_tokens: DSpark prefix replay tokens, 0 without.
         peer_config: Peer prefix sharing's limits (``cache/peer.py``), or
             None without peer sharing.
+        shared_l2_config: With a shared L2 pool as the Host tier, the
+            scheduler's ``SharedL2Config``; None without a pool.
     """
     # Both explicit batching policy and allocated device workspace constrain the
     # same summed-page budget. Decode capacity remains the cache arena's limit.
@@ -315,7 +305,8 @@ def scheduler_config_from_args(
         max_resident_requests=max_resident_requests,
         prefix_granularity=geometry.prefix_granularity,
         num_host_pages=specs.num_host_pages,
-        disable_l2_cache=not server_args.enable_kvstore,
+        # A shared L2 pool is the Host L2: the scheduler keeps its proxy tier.
+        disable_l2_cache=not server_args.has_host_tier,
         enable_l3_storage=has_l3,
         role=server_args.disaggregation_mode,
         num_snapshot_pages=specs.num_snapshot_pages,
@@ -341,17 +332,23 @@ def scheduler_config_from_args(
         prefill_interval_min_decoding=server_args.prefill_interval_min_decoding,
         enable_short_prefill_first=server_args.enable_short_prefill_first,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
-        demote_superseded_state_checkpoints=_implied_scheduler_policy(
-            server_args.writes_state_checkpoints_in_forward,
-            "demote_superseded_state_checkpoints",
-        ),
-        drop_short_prompt_end_checkpoints=_implied_scheduler_policy(
-            server_args.drops_short_prompt_end_checkpoints,
-            "drop_short_prompt_end_checkpoints",
+        demote_superseded_state_checkpoints=server_args.checkpoint_config.retention.demote_superseded,
+        drop_short_prompt_end_checkpoints=server_args.checkpoint_config.publication.drop_short_prompt_end,
+        prefix_cache_evict_policy=server_args.prefix_cache_evict_policy,
+        prefix_cache_gds_prefill_cost=server_args.prefix_cache_gds_prefill_cost,
+        prefix_cache_gds_disk_block_costs=(
+            [
+                server_args.prefix_cache_gds_disk_read_cost[0]
+                + server_args.prefix_cache_gds_disk_read_cost[1] * size
+                for size in specs.host_cache_block_bytes
+            ]
+            if server_args.prefix_cache_gds_disk_read_cost is not None
+            else ()
         ),
         checkpoint_retention_requests=server_args.checkpoint_retention_requests,
         checkpoint_retention_leaf_distance=server_args.checkpoint_retention_leaf_distance,
         prefill_chunk_yield_tokens=server_args.scheduler_prefill_chunk_yield_tokens,
+        shared_l2_config=shared_l2_config,
     )
     config.peer_config = peer_config
     return config

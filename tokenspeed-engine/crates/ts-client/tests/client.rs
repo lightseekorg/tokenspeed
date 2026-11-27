@@ -290,15 +290,14 @@ async fn a_pinned_decode_request_goes_to_its_rank_not_the_rooms() {
 }
 
 #[tokio::test]
-async fn abort_preserves_an_engines_terminal_output() {
+async fn abort_preserves_a_queued_engine_finish() {
     let (client, _engines) = connect(1, Routing::Aggregated(LoadBalance::RoundRobin)).await;
-    let mut stream = client.generate(request("r1", None)).await.unwrap();
-    assert_eq!(next(&mut stream).await.unwrap().unwrap().output_ids, [1]);
-    assert!(client.abort("r1").await.unwrap());
-    let last = next(&mut stream).await.unwrap().unwrap();
-    assert_eq!(last.finish_reason.as_deref(), Some("abort"));
-    assert!(next(&mut stream).await.is_none());
+    let stream = client.generate(request("r1", Some(1))).await.unwrap();
+    collect(client.generate(request("barrier", Some(1))).await.unwrap()).await;
     assert!(!client.abort("r1").await.unwrap());
+    let chunks = collect(stream).await;
+    assert_eq!(tokens(&chunks), [1]);
+    assert_eq!(chunks[0].finish_reason.as_deref(), Some("length"));
     assert_eq!(client.in_flight(), [0]);
 }
 
@@ -358,11 +357,25 @@ async fn cancel_closes_a_silent_abort_stream_and_preserves_survivors_and_control
 }
 
 #[tokio::test]
-async fn abort_keeps_a_silent_stream_attached_until_explicit_cancel() {
+async fn abort_closes_a_silent_stream_after_queued_outputs() {
     let (client, mut engines) = connect_silent(1).await;
-    let mut stream = client.generate(request("r", None)).await.unwrap();
-    next(&mut stream).await.unwrap().unwrap();
+    let mut stream = client
+        .generate(TokenizedGenerateReqInput {
+            return_logprob: true,
+            ..request("r", None)
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        engines[0].next_received().await,
+        EngineRequest::Add(_)
+    ));
+    engines[0].output("r", 2, None).await;
+    collect(client.generate(request("barrier", Some(1))).await.unwrap()).await;
+    assert_eq!(client.in_flight(), [1]);
     assert!(client.abort("r").await.unwrap());
+    assert_eq!(client.in_flight(), [0]);
+    assert!(!client.abort("r").await.unwrap());
     assert!(matches!(
         engines[0].next_received().await,
         EngineRequest::Add(_)
@@ -371,15 +384,40 @@ async fn abort_keeps_a_silent_stream_attached_until_explicit_cancel() {
         engines[0].next_received().await,
         EngineRequest::Abort(vec!["r".into()])
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(50), stream.next())
-            .await
-            .is_err()
-    );
-    assert_eq!(client.in_flight(), [1]);
-    assert!(client.cancel("r").await.unwrap());
-    assert_eq!(next(&mut stream).await, Some(Err(StreamError::Cancelled)));
+    let first = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(first.output_ids, [1]);
+    assert_eq!(first.finish_reason, None);
+    assert_eq!(first.output_token_logprobs, [-0.1]);
+    let latest = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(latest.output_ids, [2]);
+    assert_eq!(latest.finish_reason, None);
+    let terminal = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(terminal.finish_reason.as_deref(), Some("abort"));
+    assert_eq!(terminal.prompt_tokens, latest.prompt_tokens);
+    assert_eq!(terminal.completion_tokens, latest.completion_tokens);
+    assert_eq!(terminal.cached_tokens, latest.cached_tokens);
+    assert_eq!(terminal.reasoning_tokens, latest.reasoning_tokens);
+    assert_eq!(terminal.spec_verify_ct, latest.spec_verify_ct);
+    assert!(terminal.output_ids.is_empty());
+    assert!(terminal.output_token_logprobs.is_empty());
+    assert!(terminal.output_token_cumulative_probs.is_empty());
+    assert!(terminal.execution_observations.is_none());
     assert_eq!(next(&mut stream).await, None);
+}
+
+#[tokio::test]
+async fn abort_before_the_first_output_reports_the_submitted_prompt_length() {
+    let (client, _engines) = connect_silent(1).await;
+    let stream = client.generate(request("r", Some(0))).await.unwrap();
+    assert!(client.abort("r").await.unwrap());
+    let chunks = collect(stream).await;
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].finish_reason.as_deref(), Some("abort"));
+    assert_eq!(chunks[0].prompt_tokens, 3);
+    assert_eq!(chunks[0].completion_tokens, 0);
+    assert!(chunks[0].output_ids.is_empty());
+    assert!(chunks[0].execution_observations.is_none());
+    assert_eq!(client.in_flight(), [0]);
 }
 
 #[tokio::test]
@@ -456,7 +494,7 @@ async fn dropping_send_futures_preserves_their_respective_owners() {
 }
 
 #[tokio::test]
-async fn a_finish_during_cancel_send_preserves_a_later_local_owner() {
+async fn a_finish_during_abort_send_preserves_a_later_local_owner() {
     use std::{
         future::{poll_fn, Future},
         task::Poll,
@@ -474,12 +512,12 @@ async fn a_finish_during_cancel_send_preserves_a_later_local_owner() {
     assert!(poll_fn(|cx| Poll::Ready(blocker.as_mut().poll(cx)))
         .await
         .is_pending());
-    let mut cancel = Box::pin(client.cancel("r"));
-    assert!(poll_fn(|cx| Poll::Ready(cancel.as_mut().poll(cx)))
+    let mut abort = Box::pin(client.abort("r"));
+    assert!(poll_fn(|cx| Poll::Ready(abort.as_mut().poll(cx)))
         .await
         .is_pending());
 
-    // Output completion wins while cancel still owns its original channel.
+    // Output completion wins while the abort send waits.
     engines[0].output("r", 2, Some("length")).await;
     tokio::time::timeout(Duration::from_secs(5), async {
         while client.in_flight()[0] != 1 {
@@ -496,11 +534,11 @@ async fn a_finish_during_cancel_send_preserves_a_later_local_owner() {
     }));
     let first_poll = poll_fn(|cx| Poll::Ready(replacement.as_mut().poll(cx))).await;
     assert_eq!(client.in_flight(), [1, 1]);
-    drop(old); // The cancellation snapshot still keeps the old sender alive.
+    drop(old); // The abort still keeps the old sender alive.
     assert_eq!(client.in_flight(), [1, 1]);
     drop(blocker);
     engines[0].pause_input(false).await;
-    assert!(!cancel.await.unwrap());
+    assert!(abort.await.unwrap());
     let mut later = match first_poll {
         Poll::Ready(result) => result.unwrap(),
         Poll::Pending => replacement.await.unwrap(),
@@ -604,6 +642,10 @@ async fn send_failure_retains_cancel_ownership_and_cleans_failed_submissions() {
     .unwrap();
     assert!(matches!(
         client.cancel("r").await,
+        Err(Error::Zmq(_)) | Err(Error::SendTimeout { .. })
+    ));
+    assert!(matches!(
+        client.abort("r").await,
         Err(Error::Zmq(_)) | Err(Error::SendTimeout { .. })
     ));
     assert_eq!(client.in_flight(), [1, 1]);

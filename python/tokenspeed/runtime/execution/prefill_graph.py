@@ -1411,6 +1411,9 @@ class PrefillGraph:
         All three consume the same static buffer. Then the inner stack replays
         over the padded bucket and the model's eager logits tail finishes on
         the real-token rows.
+
+        Raises:
+            ValueError: ``observe_execution`` is True for a narrowed prefill model.
         """
         if observe_execution and self._narrowing is not None:
             raise ValueError(

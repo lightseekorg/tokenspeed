@@ -29,7 +29,7 @@ use std::{
     collections::HashMap,
     ffi::CString,
     path::PathBuf,
-    sync::{Arc, Once},
+    sync::{mpsc, Arc, Once},
     time::{Duration, Instant},
 };
 
@@ -40,9 +40,13 @@ use ts_control::{
     peer::{
         geometry::{DeviceField, HostGroup, HostPool, RankGeometry, Spans},
         landing::Timeouts,
+        net::PeerNet,
         push::{PageWriter, PushEndpoint, PushSource},
         read::Arena,
-        Peer, PeerListener, PeerSettings,
+        registered::{Member, Replica as RegisteredReplica},
+        v1::{Generation, Key, Message},
+        wire::Prompt,
+        Peer, PeerListener, PeerProgress, PeerSettings, PeerTransfers,
     },
 };
 use ts_disk::{Backend, ExecutorConfig, Memory};
@@ -90,7 +94,7 @@ fn interpreter() {
 /// A fused scheduler with peer sharing: the holder's with eight usable
 /// Device blocks over a write-back Host tier and a Disk tier, the reader's
 /// with a Device cache alone.
-fn scheduler(name: &str, holder: bool) -> Scheduler {
+fn scheduler(name: &str, incarnation: u64, holder: bool) -> Scheduler {
     interpreter();
     let tiers = if holder {
         format!(
@@ -105,7 +109,8 @@ fn scheduler(name: &str, holder: bool) -> Scheduler {
              cfg.disk_config = ts.DiskConfig(max_operations=4, max_blocks_per_operation=64,\n\
                                              max_host_blocks=4, max_write_host_blocks=2,\n\
                                              max_queued_cleanings=64, min_prefetch_tokens=1,\n\
-                                             wait_timeout_us=10_000_000, ready_timeout_us=10_000_000)\n\
+                                             wait_timeout_us=10_000_000, ready_timeout_us=10_000_000,\n\
+                                             min_clean_tokens=0, require_reuse_for_cleaning=False)\n\
              device_pages = {DEVICE_PAGES}",
             host_pages = HOST_BLOCKS + 1,
             disk_pages = DISK_BLOCKS + 1,
@@ -131,11 +136,11 @@ cfg.max_resident_requests = 8
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full", block_granularity={PAGE},
                                         total_pages=device_pages, attn_kind=ts.AttnKind.Full,
                                         transfer_policy=ts.CacheTransferPolicy.FullSuffix)]
-cfg.peer_config = ts.PeerConfig(name="{name}", incarnation=1, max_leases=8,
+cfg.peer_config = ts.PeerConfig(name="{name}", incarnation={incarnation}, max_leases=8,
                                 soft_pin_us=1_000_000, hard_pin_us=1_000_000,
                                 lookup_timeout_us=1_000_000, min_fetch_tokens={PAGE},
                                 landing_tier=ts.PeerLandingTier.Device, max_host_landing_blocks=0,
-                                host_ready_timeout_us=0)
+                                host_ready_timeout_us=0, versioned_shards=False)
 result = ts.Scheduler(cfg)
 "#
         );
@@ -217,10 +222,10 @@ impl Drop for ScratchFile {
     }
 }
 
-fn settings(name: &str) -> PeerSettings {
+fn settings(name: &str, incarnation: u64) -> PeerSettings {
     PeerSettings {
         name: name.to_owned(),
-        incarnation: 1,
+        incarnation,
         deployment_id: "deployment".into(),
         weight_version: "v1".into(),
         timeouts: Timeouts {
@@ -250,9 +255,10 @@ struct Replica {
 
 impl Replica {
     fn start(holder: bool, arena: &Arena) -> Self {
-        let listener = PeerListener::bind("127.0.0.1", 0).unwrap();
+        let incarnation = if holder { 1 } else { 2 };
+        let mut listener = PeerListener::bind("127.0.0.1", 0).unwrap();
         let name = format!("127.0.0.1:{}", listener.port());
-        let push = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 1).unwrap();
+        let push = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", incarnation).unwrap();
         let disk = holder.then(|| {
             let dir = std::env::var_os("TS_DISK_TEST_DIR")
                 .map(PathBuf::from)
@@ -296,19 +302,51 @@ impl Replica {
             .unwrap();
             (tier, host, file)
         });
-        let scheduler = Arc::new(Mutex::new(scheduler(&name, holder)));
+        let scheduler = Arc::new(Mutex::new(scheduler(&name, incarnation, holder)));
         // The holder's Device pages are never read: its prefix is on Disk.
         let base = if holder { 1 << 30 } else { READER_BASE };
-        let peer = Peer::start(
-            settings(&name),
+        let geometry = geometry(base, push.name());
+        let registered = holder.then(|| {
+            let wire = serde_json::json!({
+                "plan": {"prefix_granularity": PAGE, "lcm_block_bytes": BLOCK_BYTES,
+                    "num_lcm_blocks": DEVICE_PAGES - 1,
+                    "groups": [{"group_id":"full","cache_blocks_per_lcm_block":1,"page_count":DEVICE_PAGES}],
+                    "planes": [{"plane_id":"kv","bytes_per_lcm_block":BLOCK_BYTES,"arena_offset_bytes":0}],
+                    "fields": [{"group_id":"full","field_id":"layer.0.kv","plane_id":"kv",
+                        "shape":[PAGE, BLOCK_BYTES / PAGE as usize],"dtype":"uint8","field_offset_bytes":0,
+                        "page_stride_bytes":BLOCK_BYTES}], "resident_block_bytes":null},
+                "group_specs":[{"group_id":"full","attn_kind":"full_history","rows_per_page":PAGE,
+                    "entry_stride_tokens":1,"sliding_window_tokens":null,"replayable":false,
+                    "transfer_policy":"full_suffix","shard_count":1}],
+                "transfer_schema":{"fields":[]},"field_addresses":null
+            });
+            let member = Member {
+                geometry: geometry.clone(),
+                bounds: vec![(HOST_BLOCKS + 1) as i64],
+                disk_bounds: Vec::new(),
+                regions: vec![(base, (DEVICE_PAGES * BLOCK_BYTES) as u64)],
+            };
+            let layout = Arc::new(RegisteredReplica::register([7; 32], wire.to_string().as_bytes(), &[member.encode(0)]).unwrap());
+            listener.set_registered_layout(layout.clone());
+            (layout, listener.versioned_channel())
+        });
+        let mut peer = Peer::start(
+            settings(&name, incarnation),
+            PeerProgress::Coordinated,
             0,
-            vec![geometry(base, push.name())],
+            vec![geometry],
             Some(listener),
             scheduler.clone(),
-            Arc::new(arena.clone()),
-            Arc::new(push),
+            PeerTransfers {
+                reader: Arc::new(arena.clone()),
+                pusher: Arc::new(push),
+            },
         )
         .unwrap();
+        if let Some((layout, channel)) = registered {
+            peer.enable_versioned(layout, name.clone(), incarnation, Some(channel), 0)
+                .unwrap();
+        }
         Self {
             name,
             scheduler,
@@ -342,7 +380,10 @@ impl Replica {
             scheduler.advance_head(&storage, &acks).unwrap();
         }
         let report = self.peer.report();
-        let round = self.peer.agree(&[report]).unwrap();
+        let round = self
+            .peer
+            .agree_with_scheduler(&[report], &mut scheduler)
+            .unwrap();
         scheduler.advance_peer(round.now_us, &round.events).unwrap();
         let plan = scheduler.next_execution_plan(true, false);
         let fetches = plan.peer_fetches();
@@ -461,6 +502,28 @@ impl Replica {
     }
 }
 
+/// Exercise the sharded reader's wire messages against the same real holder as the legacy push.
+fn v1_exchange(
+    holder: &mut Replica,
+    reader: &PeerNet,
+    replies: &mpsc::Receiver<Vec<bytes::Bytes>>,
+    request: Message,
+) -> Message {
+    reader.versioned(&holder.name, &request).unwrap();
+    let start = Instant::now();
+    loop {
+        holder.round();
+        if let Ok(frames) = replies.recv_timeout(Duration::from_millis(2)) {
+            assert_eq!(&frames[0][..], b"r");
+            return Message::decode(&frames[1], true).expect("a versioned reply");
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "versioned lookup timed out"
+        );
+    }
+}
+
 #[test]
 fn a_holder_pushes_a_prefix_only_its_disk_holds_into_the_readers_landing() {
     let arena = Arena::new(64 * BLOCK_BYTES);
@@ -468,12 +531,65 @@ fn a_holder_pushes_a_prefix_only_its_disk_holds_into_the_readers_landing() {
     let mut reader = Replica::start(false, &arena);
     let seed: Vec<i32> = (1..=8).collect();
     holder.compute("seed", seed.clone());
+    let (tx, replies) = mpsc::channel();
+    let client = PeerNet::start("127.0.0.1", 0, tx).unwrap();
+    let reply_to = format!("127.0.0.1:{}", client.port());
+    let Message::LayoutReply(_, generation, semantic, digest, _) = v1_exchange(
+        &mut holder,
+        &client,
+        &replies,
+        Message::LayoutReq(1, reply_to.clone()),
+    ) else {
+        panic!("holder did not return its layout")
+    };
+    // Ask a real scheduler to construct the canonical lookup hashes for the seeded prefix.
+    let probe = Replica::start(false, &arena);
+    probe.submit("probe", (1..=9).collect(), &holder.name);
+    let mut scheduler = probe.scheduler.lock();
+    let _ = scheduler.next_execution_plan(true, false);
+    let lookup = scheduler.take_peer_lookups().pop().expect("reader lookup");
+    drop(scheduler);
+    let prompt = Prompt {
+        tokens: lookup.tokens,
+        max_tokens: lookup.max_tokens,
+        prefix_hashes: lookup.prefix_hashes,
+    };
+    let query = |lease| {
+        Message::Lookup(
+            Key {
+                reader: Generation {
+                    name: reply_to.clone(),
+                    incarnation: 3,
+                    epoch: 1,
+                },
+                holder: generation.clone(),
+                lease,
+            },
+            semantic,
+            [2; 32],
+            digest,
+            prompt.clone(),
+        )
+    };
+    assert!(
+        matches!(v1_exchange(&mut holder,&client,&replies,query(1)), Message::Offered(_,Some((offer,_,_))) if offer.end == 8)
+    );
     // Each 23-token prompt evicts what came before it from the holder's
     // Device into its Host, which drops its oldest entries, already on Disk.
     for (index, base) in [100, 200, 300].into_iter().enumerate() {
         holder.compute(&format!("pressure-{index}"), (base..base + 23).collect());
         holder.settle();
     }
+
+    // The holder registered without `disk_bounds` (`!can_push_disk()`), so a
+    // Disk-only prefix still misses cleanly on v1 before PIN or DMA, while
+    // legacy Disk push remains available on the same holder.
+    assert!(matches!(
+        v1_exchange(&mut holder, &client, &replies, query(2)),
+        Message::Offered(_, None)
+    ));
+    let stats = holder.scheduler.lock().peer_stats();
+    assert_eq!((stats.leases, stats.pinned_blocks), (0, 0));
 
     let mut hit = seed;
     hit.push(9);

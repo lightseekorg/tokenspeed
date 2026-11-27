@@ -230,8 +230,9 @@ TEST(CheckpointDemotionCoordinatorTest, ADemotedCheckpointIsNotQueuedForHost) {
     const std::vector<std::string> hashes{"h0"};
     const std::vector<CacheKey> keys = coordinator.BoundaryCheckpointKeys(hashes, /*kept_boundaries=*/{});
     ASSERT_EQ(keys, std::vector<CacheKey>{Key("h0", 1)}) << "the State entry alone, never the KV page";
-    EXPECT_EQ(coordinator.DemoteEntries(keys), 1);
-    EXPECT_EQ(coordinator.DemoteEntries(keys), 0) << "dated back already";
+    EXPECT_EQ(coordinator.DemoteEntries(keys, CacheCoordinator::DemotionCause::kSupersededCheckpoint), 1);
+    EXPECT_EQ(coordinator.DemoteEntries(keys, CacheCoordinator::DemotionCause::kSupersededCheckpoint), 0)
+        << "dated back already";
     coordinator.Host().QueueCachedBlocksForStore(hashes);
     EXPECT_EQ(coordinator.Host().TakePendingStores().size(), 2u) << "demotion off: nothing is skipped";
     coordinator.SetCheckpointDemotion(true);
@@ -414,7 +415,9 @@ TEST_F(CheckpointDemotionWriteBackTest, ADemotedCheckpointIsDroppedNeverWrittenB
         coordinator_.SetCheckpointDemotion(demotion);
         const std::vector<std::string> shorter = Publish(MakeTokens(8));
         const std::vector<std::string> longer = Publish(MakeTokens(16));
-        ASSERT_EQ(coordinator_.DemoteEntries(CheckpointKeys(shorter)), 1);
+        ASSERT_EQ(
+            coordinator_.DemoteEntries(CheckpointKeys(shorter), CacheCoordinator::DemotionCause::kSupersededCheckpoint),
+            1);
         const CacheEvictor::DeviceEvictionStats before = coordinator_.DeviceEvictions();
         const std::uint64_t dropped_before = coordinator_.DemotedEntriesNotWrittenBack();
         AdmitOneBlockOnAFullDevice();
@@ -436,7 +439,8 @@ TEST_F(CheckpointDemotionWriteBackTest, ADemotedCheckpointIsDroppedNeverWrittenB
 TEST_F(CheckpointDemotionWriteBackTest, NoEvictionCauseWritesADemotedEntryBack) {
     const std::vector<std::string> shorter = Publish(MakeTokens(8));
     const std::vector<std::string> longer = Publish(MakeTokens(16));
-    ASSERT_EQ(coordinator_.DemoteEntries(CheckpointKeys(shorter)), 1);
+    ASSERT_EQ(
+        coordinator_.DemoteEntries(CheckpointKeys(shorter), CacheCoordinator::DemotionCause::kSupersededCheckpoint), 1);
     const auto location_of = [&](const std::string& hash) {
         return *CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, kState, Key(hash, kState));
     };
@@ -466,7 +470,10 @@ TEST_F(CheckpointDemotionWriteBackTest, ACheckpointDemotedWhileItsCopyIsOutLands
         const std::optional<WriteBackOperation> store = transfers_.StartEvictionStores();
         ASSERT_TRUE(store.has_value()) << "the checkpoint at 8 goes to the Host";
         ASSERT_EQ(store->transfers.size(), 1u);
-        ASSERT_EQ(coordinator_.DemoteEntries(CheckpointKeys(shorter)), 0) << "neither tier holds it yet";
+        ASSERT_EQ(
+            coordinator_.DemoteEntries(CheckpointKeys(shorter), CacheCoordinator::DemotionCause::kSupersededCheckpoint),
+            0)
+            << "neither tier holds it yet";
         if (demoted_in_flight) {
             EXPECT_EQ(transfers_.DemoteInFlightEvictions(CheckpointKeys(shorter)), 1);
         }
@@ -497,7 +504,9 @@ TEST_F(CheckpointDemotionWriteBackTest, AHostEntryTheCopyHoldsIsDemotedWithIt) {
         const std::optional<WriteBackOperation> store = transfers_.StartEvictionStores();
         ASSERT_TRUE(store.has_value());
         ASSERT_EQ(store->transfers.size(), 2u) << "the KV pages; the Host holds the checkpoint";
-        ASSERT_EQ(coordinator_.DemoteEntries(CheckpointKeys(shorter)), 0)
+        ASSERT_EQ(
+            coordinator_.DemoteEntries(CheckpointKeys(shorter), CacheCoordinator::DemotionCause::kSupersededCheckpoint),
+            0)
             << "the Device entry is gone, the copy holds the Host entry";
         if (demoted_in_flight) {
             EXPECT_EQ(transfers_.DemoteInFlightEvictions(CheckpointKeys(shorter)), 1) << "the Host entry";
@@ -543,7 +552,10 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementTakesADemotedCheckpo
                 }
             }
             if (demote) {
-                ASSERT_EQ(coordinator_.DemoteEntries(CheckpointKeys(d)), 1) << "the Host's checkpoint";
+                ASSERT_EQ(coordinator_.DemoteEntries(CheckpointKeys(d),
+                                                     CacheCoordinator::DemotionCause::kSupersededCheckpoint),
+                          1)
+                    << "the Host's checkpoint";
             }
             HoldFreeCapacity(host_);
             const std::array<std::uint32_t, 1> groups{kState};
@@ -587,7 +599,9 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementTakesADemotedCheckpo
                 coordinator_, kState,
                 *CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, kState, Key(pages->back(), kState))));
         }
-        ASSERT_EQ(coordinator_.DemoteEntries(CheckpointKeys(d)), 1) << "the Host's checkpoint";
+        ASSERT_EQ(coordinator_.DemoteEntries(CheckpointKeys(d), CacheCoordinator::DemotionCause::kSupersededCheckpoint),
+                  1)
+            << "the Host's checkpoint";
         std::vector<CacheBlockRef> request;
         for (const std::string& page : d) {
             request.push_back(coordinator_.GroupPrefixIndex(kFull).Find(device_, Key(page, kFull)));
@@ -673,7 +687,8 @@ TEST_F(CheckpointDemotionWriteBackTest, ASessionsDemotedEntriesKeepTheirOwnRules
 TEST_F(CheckpointDemotionWriteBackTest, ADemotionMarksAnEntryASessionsDemotionDatedBack) {
     const std::vector<std::string> hashes = PublishInSession(MakeTokens(8), "s");
     ASSERT_EQ(coordinator_.DemoteSession("s", /*ended=*/false), 3u);
-    EXPECT_EQ(coordinator_.DemoteEntries(CheckpointKeys(hashes)), 1);
+    EXPECT_EQ(
+        coordinator_.DemoteEntries(CheckpointKeys(hashes), CacheCoordinator::DemotionCause::kSupersededCheckpoint), 1);
     coordinator_.Host().QueueCachedBlocksForStore(hashes);
     EXPECT_EQ(coordinator_.Host().TakePendingStores().size(), 2u) << "the pages alone";
 }

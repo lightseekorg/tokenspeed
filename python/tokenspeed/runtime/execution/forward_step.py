@@ -415,10 +415,9 @@ class ForwardStepRunner:
         self.disable_padding = config.disable_cuda_graph_padding
         self.device = config.device
         self.device_module = torch.get_device_module(self.device)
-        # Decode graphs capture into the memory saver's ``cuda_graph`` region
-        # so a sleep release can free their pool (a no-op adapter otherwise).
+        # The memory saver can release the decode graph's private pool.
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=config.enable_memory_saver
+            enable=config.enable_memory_saver, device=self.device
         )
         self.gpu_id = config.gpu_id
         self.global_rank = config.global_rank
@@ -785,6 +784,18 @@ class ForwardStepRunner:
     def _has_cuda_graph_for_bs(self, bs: int) -> bool:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
 
+    def _snapshot_graph_metadata(self, graph_key: tuple[str, int]) -> None:
+        """Record target and draft tensor identities for a graph variant and batch.
+
+        ACL replay refreshes the views present at capture entry. Later draft
+        steps can publish narrower views over the same write-slot storage.
+        CUDA and ROCm take the snapshot after capture has finished.
+        """
+        snapshots = {"target": snapshot_graph_metadata(self.attn_backend)}
+        if self.draft_attn_backend is not None:
+            snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
+        self._metadata_snapshots[graph_key] = snapshots
+
     def _verify_graph_metadata(self, graph_key: tuple[str, int]) -> None:
         """Assert the refresh rebound the tensors the captured graph reads."""
         snapshots = self._metadata_snapshots.get(graph_key)
@@ -1000,12 +1011,25 @@ class ForwardStepRunner:
         # them again immediately before graph capture records the final views.
         self._init_capture_metadata(bs, query_tokens=query_tokens)
 
+        if self._graph_debug and self.device == "npu":
+            self._snapshot_graph_metadata((variant, bs))
+
         self.deepep_adapter.capture()
 
         global _is_capture_mode
         _is_capture_mode = True
         global global_graph_memory_pool
-        if self.device == "npu":
+        if self.device == "npu" and self.config.enable_memory_saver:
+            graph_capture = self.memory_saver_adapter.npu_graph(
+                graph,
+                pool=global_graph_memory_pool,
+                stream=self.stream,
+                tag="acl_graph",
+                policy=self.config.acl_graph_memory_policy,
+                pool_scope="decode",
+                auto_dispatch_capture=True,
+            )
+        elif self.device == "npu":
             graph_capture = self.device_module.graph(
                 graph,
                 pool=global_graph_memory_pool,
@@ -1048,14 +1072,8 @@ class ForwardStepRunner:
 
         global_graph_memory_pool = graph.pool()
 
-        if self._graph_debug:
-            # The slots bound by the last _init_capture_metadata are exactly
-            # what the graph recorded; snapshot their tensor identities so
-            # every replay can assert the refresh still writes them.
-            snapshots = {"target": snapshot_graph_metadata(self.attn_backend)}
-            if self.draft_attn_backend is not None:
-                snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
-            self._metadata_snapshots[(variant, bs)] = snapshots
+        if self._graph_debug and self.device != "npu":
+            self._snapshot_graph_metadata((variant, bs))
 
         if self.drafter is not None:
             self.drafter.set_decode_graph_query_extent(None)

@@ -36,14 +36,19 @@ class _CpuStore:
 
     def __init__(self):
         self.sources: dict[int, torch.Tensor] = {}
+        self.owned: dict[int, torch.Tensor] = {}
+        self.backups: dict[int, torch.Tensor] = {}
         self.slots = [torch.empty(4, 3), torch.empty(4, 3)]
         self.resident: list[int | None] = [None, None]
         self.reader: int | None = None
+        self._released = False
+        self.events: list[str] = []
 
     def publish_layer(self, layer, shards, *, layout):
         assert layout == "cpu-test"
         (shard,) = shards
         owned = shard.tensor.clone()
+        self.owned[layer] = owned
         self.sources[layer] = torch.cat((owned, owned + 10))
         return {shard.name: owned}
 
@@ -53,13 +58,60 @@ class _CpuStore:
     def weights(self, layer):
         return {"weight": self.slots[layer % 2]}
 
+    def owned_weights(self, layer):
+        assert not self._released
+        return {"weight": self.owned[layer]}
+
+    def vmm_managed_tensors(self):
+        return tuple(self.slots[layer % 2] for layer in self.sources)
+
+    def prepare_weight_update(self):
+        assert not self._released and self.reader is None
+        self.resident = [None, None]
+        self.events.append("prepare")
+
+    def refresh_weights(self):
+        assert not self._released and self.reader is None
+        for layer, owned in self.owned.items():
+            self.sources[layer] = torch.cat((owned, owned + 10))
+        self.resident = [None, None]
+        self.events.append("refresh")
+
+    def release_storage(self, *, backup):
+        assert not self._released and self.reader is None
+        if backup:
+            self.backups = {layer: t.clone() for layer, t in self.owned.items()}
+        for t in self.owned.values():
+            t.fill_(float("nan"))
+        self.resident = [None, None]
+        self._released = True
+        self.events.append(f"release:{backup}")
+
+    def resume_storage(self, *, backup):
+        assert self._released
+        if backup:
+            for layer, t in self.owned.items():
+                t.copy_(self.backups[layer])
+            self.backups.clear()
+            for layer, owned in self.owned.items():
+                self.sources[layer] = torch.cat((owned, owned + 10))
+        self.resident = [None, None]
+        self._released = False
+        self.events.append(f"resume:{backup}")
+
+    @property
+    def released(self):
+        return self._released
+
     def prefetch(self, layer):
+        assert not self._released
         slot = layer % 2
         assert self.reader is None or self.reader % 2 != slot
         self.slots[slot].copy_(self.sources[layer])
         self.resident[slot] = layer
 
     def acquire(self, layer):
+        assert not self._released
         assert self.reader is None
         assert self.resident[layer % 2] == layer
         self.reader = layer
@@ -73,10 +125,14 @@ class _CpuStore:
 
     @property
     def physical_bytes(self):
+        if self._released:
+            return 0
         return sum(t.numel() * t.element_size() for t in self.sources.values())
 
     @property
     def staging_bytes(self):
+        if self._released:
+            return 0
         return sum(t.numel() * t.element_size() for t in self.slots)
 
 
@@ -129,4 +185,106 @@ def test_reader_exception_releases_before_another_forward(failed_layer):
     for index, layer in enumerate(layers):
         with manager.read(index):
             torch.testing.assert_close(layer.weight, store.sources[index])
+    manager.close()
+
+
+def test_peer_weight_update_and_sleep_wake_preserve_view_addresses():
+    from tokenspeed.runtime.model_loader.weight_utils import initialize_dummy_weights
+    from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+    from tokenspeed.runtime.models.base.weight_update import weight_update_session
+
+    manager, layers, store = _manager(2)
+    addresses = [layer.weight.data_ptr() for layer in layers]
+    assert len(manager.vmm_managed_storages()) == 2
+
+    class _PeerModel(BaseCausalLM):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.dense = torch.nn.Linear(3, 3, bias=False)
+            self.layers = torch.nn.ModuleList(layers)
+            self.events: list[str] = []
+
+        def peer_weights_controller(self):
+            return manager
+
+        def close_peer_weights(self):
+            manager.close()
+
+        def load_weights(self, weights):
+            self.events.append("load")
+            for name, value in weights:
+                manager.owned_weights(int(name))["weight"].fill_(float(value.item()))
+            self.post_load_weights()
+
+        def post_load_weights(self):
+            self.events.append("post_load")
+
+    model = _PeerModel()
+    before_peer = [layer.weight.clone() for layer in layers]
+    before_dense = model.dense.weight.clone()
+    initialize_dummy_weights(
+        model,
+        exclude_data_ptrs={
+            p.data_ptr() for p in manager.managed_parameters() if p.numel()
+        },
+    )
+    assert not torch.equal(model.dense.weight, before_dense)
+    for layer, expected in zip(layers, before_peer, strict=True):
+        assert torch.equal(layer.weight, expected)
+
+    # Preflight failure aborts before quiescing peer storage.
+    with pytest.raises(ValueError, match="bad checkpoint"):
+        with weight_update_session(
+            [model],
+            require_complete=False,
+            cpu_group=None,
+            preflight=lambda: (_ for _ in ()).throw(ValueError("bad checkpoint")),
+        ):
+            raise AssertionError("body must not run after preflight failure")
+    assert store.events == []
+    assert not model._weight_update_active
+
+    # Failure in prepare_weight_update aborts opened models so later updates still work.
+    real_prepare = store.prepare_weight_update
+
+    def _fail_prepare() -> None:
+        raise RuntimeError("peer quiesce failed")
+
+    store.prepare_weight_update = _fail_prepare
+    try:
+        with pytest.raises(RuntimeError, match="peer quiesce failed"):
+            with weight_update_session([model], require_complete=False, cpu_group=None):
+                raise AssertionError("body must not run after prepare failure")
+    finally:
+        store.prepare_weight_update = real_prepare
+    assert not model._weight_update_active
+
+    # Resident live update refreshes owned shards and derived state in order.
+    with weight_update_session([model], require_complete=False, cpu_group=None):
+        model.load_weights([("0", torch.tensor(21.0)), ("1", torch.tensor(22.0))])
+    assert store.events == ["prepare", "refresh"]
+    assert model.events == ["load", "post_load"]
+    assert [layer.weight.data_ptr() for layer in layers] == addresses
+
+    # CPU-backup sleep/wake preserves weights and addresses.
+    manager.release_storage(backup=True)
+    assert manager.released and store.physical_bytes == 0
+    manager.resume_storage(backup=True)
+    assert not manager.released and store.physical_bytes > 0
+    manager.prefetch_first()
+    for index, layer in enumerate(layers):
+        with manager.read(index):
+            torch.testing.assert_close(layer.weight, store.sources[index])
+
+    # Discard sleep/wake requires reload to restore valid contents.
+    manager.release_storage(backup=False)
+    manager.resume_storage(backup=False)
+    with weight_update_session([model], require_complete=False, cpu_group=None):
+        model.load_weights([("0", torch.tensor(31.0)), ("1", torch.tensor(32.0))])
+    manager.prefetch_first()
+    for index, layer in enumerate(layers):
+        with manager.read(index):
+            assert float(layer.weight[0, 0]) == 31.0 + index
+            assert float(layer.weight[2, 0]) == 41.0 + index
+    assert [layer.weight.data_ptr() for layer in layers] == addresses
     manager.close()

@@ -353,7 +353,10 @@ def test_fused_step_matches_split_with_mixed_retained_lengths(
         torch.testing.assert_close(field, peer, atol=5e-5, rtol=2e-3)
     assert torch.equal(records.stamps, reference.stamps)
     assert torch.equal(records.original_qkv, buffers[3][:, : 3 * WIDTH])
-    assert history.length[:13, 0].tolist() == [0, 5, 7, 1, 2, 3, 8, 9, 15, 16, 17, 0, 0]
+    # The prepare only reads the counts: row 11's overflowing count folded
+    # into its page and the verify read none of it; row 12's copy keeps its 8.
+    counts = [0, 5, 7, 1, 2, 3, 8, 9, 15, 16, 17, 32, 8]
+    assert history.length[:13, 0].tolist() == counts
     assert torch.equal(history.length, reference.history.length)
     torch.testing.assert_close(
         x["state_pool"].float(), ref_x["state_pool"].float(), atol=2e-6, rtol=2e-5

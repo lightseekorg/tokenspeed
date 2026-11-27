@@ -225,8 +225,13 @@ def get_hf_text_config(config: PretrainedConfig):
     if text_config is None:
         return config
 
-    if hasattr(config, "quantization_config") and not hasattr(
-        text_config, "quantization_config"
+    if (
+        hasattr(config, "quantization_config")
+        and config.quantization_config is not None
+        and (
+            not hasattr(text_config, "quantization_config")
+            or text_config.quantization_config is None
+        )
     ):
         quantization_config = config.quantization_config
         for key in ["ignore", "ignored_layers", "modules_to_not_convert"]:
@@ -415,6 +420,7 @@ def get_config(
     model_override_args: dict | None = None,
     is_draft_worker: bool | None = False,
     speculative_algorithm: str | None = None,
+    download_dir: str | None = None,
     **kwargs,
 ):
     """Load one config from one revision-pinned metadata snapshot.
@@ -450,7 +456,14 @@ def get_config(
     config = None
     raw_config = None
     raw_config_converted = False
-    is_remote_model = not os.path.isdir(model)
+    from tokenspeed.runtime.model_loader.object_store import (
+        resolve_checkpoint_metadata_dir,
+    )
+
+    resolved_dir = resolve_checkpoint_metadata_dir(
+        model, download_dir=download_dir, sync=True
+    )
+    is_remote_model = resolved_dir is None
     if is_remote_model:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
@@ -509,7 +522,7 @@ def get_config(
                         "Remote-code sibling imports may fail in this layout.",
                     )
     else:
-        model_path = model
+        model_path = resolved_dir
 
     if raw_config is None:
         raw_config, raw_config_converted = load_raw_config(model_path)
@@ -539,7 +552,12 @@ def get_config(
 
     # quantization config will copy to text_config
     if hasattr(text_config, "quantization_config"):
-        if "modules_to_not_convert" in text_config.quantization_config:
+        # An explicit null describes an unquantized checkpoint, just like
+        # omitted metadata. Some registered config classes declare it eagerly.
+        if (
+            text_config.quantization_config is not None
+            and "modules_to_not_convert" in text_config.quantization_config
+        ):
             text_config.quantization_config["ignored_layers"] = (
                 text_config.quantization_config["modules_to_not_convert"]
             )
@@ -667,12 +685,21 @@ def get_generation_config(
     model: str,
     trust_remote_code: bool,
     revision: str | None = None,
+    download_dir: str | None = None,
     **kwargs,
 ):
     """Load generation metadata from one revision-pinned local snapshot."""
+    from tokenspeed.runtime.model_loader.object_store import (
+        resolve_checkpoint_metadata_dir,
+    )
+
+    resolved_dir = resolve_checkpoint_metadata_dir(
+        model, download_dir=download_dir, sync=True
+    )
     try:
-        model_path = model
-        if not os.path.isdir(model):
+        if resolved_dir is not None:
+            model_path = resolved_dir
+        else:
             from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
             def download_generation_config() -> str:
@@ -857,6 +884,7 @@ def get_tokenizer(
     tokenizer_revision: str | None = None,
     revision: str | None = None,
     architectures: list[str] | None = None,
+    download_dir: str | None = None,
     **kwargs,
 ) -> PreTrainedTokenizer | PreTrainedTokenizerFast:
     """Gets a tokenizer for the given model name via Huggingface.
@@ -957,7 +985,16 @@ def get_tokenizer(
             )
         return loaded_tokenizer
 
-    if not os.path.isdir(tokenizer_name):
+    from tokenspeed.runtime.model_loader.object_store import (
+        resolve_checkpoint_metadata_dir,
+    )
+
+    resolved_dir = resolve_checkpoint_metadata_dir(
+        tokenizer_name, download_dir=download_dir, sync=True
+    )
+    if resolved_dir is not None:
+        tokenizer_path = resolved_dir
+    else:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
 
         def download_tokenizer_files() -> str:

@@ -20,15 +20,34 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cache/core/cache_types.h"
 
 namespace tokenspeed {
+
+// Canonicalize DP0's non-canonical "<host>:<port>/0", "/00", "/+0", etc.
+// aliases to "<host>:<port>", matching Rust `u32::parse() == Ok(0)`.
+inline std::string_view CanonicalPeerEndpoint(std::string_view endpoint) {
+    const std::size_t slash = endpoint.find('/');
+    if (slash == 0 || slash == std::string_view::npos) {
+        return endpoint;
+    }
+    std::string_view rank = endpoint.substr(slash + 1);
+    if (rank.starts_with('+')) {
+        rank.remove_prefix(1);
+    }
+    if (!rank.empty() && std::ranges::all_of(rank, [](char c) { return c == '0'; })) {
+        return endpoint.substr(0, slash);
+    }
+    return endpoint;
+}
 
 // Sharing cached prefixes between engine replicas
 // (docs/rfcs/0004-peer-prefix-sharing.md). A reader asks a holder for a
@@ -68,6 +87,7 @@ struct PeerConfig {
     // Device landings, which use neither.
     std::int32_t max_host_landing_blocks;
     std::int64_t host_ready_timeout_us;
+    bool versioned_shards{false};
     void Validate() const;
 };
 
@@ -114,6 +134,8 @@ struct PeerLookupRequest {
     std::vector<std::int32_t> tokens;
     std::int32_t max_tokens{0};
 
+    std::int32_t local_tokens{0};
+
     bool operator==(const PeerLookupRequest&) const = default;
 };
 
@@ -144,6 +166,9 @@ struct PeerFetchOperation {
     std::int32_t begin_tokens{0};
     std::int32_t end_tokens{0};
     std::vector<PeerPage> destinations;
+    std::vector<std::uint8_t> checkpoint;
+    std::vector<std::string> prefix_hashes;
+    std::vector<std::int32_t> tokens;
 
     bool operator==(const PeerFetchOperation&) const = default;
 };
@@ -151,8 +176,12 @@ struct PeerFetchOperation {
 namespace cache {
 
 // The peer clock, agreed by the replica's members; it times leases and waits.
+// Setting expire=false advances peer_now_us_ without sweeping leases/waits yet
+// so holder events answered against the pre-tick state (Lookup, Pin, Release)
+// can be applied at now_us before expiration runs.
 struct PeerTick {
     std::int64_t now_us{0};
+    bool expire{true};
 };
 
 // Holder: a reader's lookup, pin and release, as every member applies them
@@ -184,10 +213,20 @@ struct PeerRelease {
 struct PeerLookupAnswered {
     PeerLeaseId lease;
     std::int32_t num_tokens{0};
+    unsigned source_mask{0};  // Device=1, Host=2, Disk=4; mixed sources combine bits.
+    std::vector<std::uint8_t> checkpoint;
 };
 struct PeerFetchDone {
     std::string request_id;
     std::int32_t num_tokens{0};
+    std::int64_t dispatch_us{0};
+    std::int64_t writable_us{0};
+    std::int64_t terminal_us{0};
+    PeerLeaseId lease;
+    bool frozen{false};
+};
+struct PeerTargetRetired {
+    PeerLeaseId lease;
 };
 
 }  // namespace cache

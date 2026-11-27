@@ -361,7 +361,7 @@ fn step(
         finished_reasons: vec![finish.unwrap_or("").to_owned()],
         prompt_tokens: vec![prompt],
         completion_tokens: vec![k],
-        cached_tokens: vec![0],
+        cached_tokens: vec![prompt / 2],
         output_token_logprobs_val: vec![if return_logprob {
             vec![-(k as f64) / 10.0]
         } else {
@@ -382,7 +382,7 @@ fn step(
         num_resident_tokens: Some(if running.is_empty() { 0 } else { prompt + k }),
         num_waiting_uncached_tokens: Some(0),
         finish_reason_details: vec![None],
-        spec_verify_ct: vec![],
+        spec_verify_ct: vec![k - 1],
         accept_draft_tokens: vec![],
         execution_observations: Vec::new(),
         input_token_logprobs_val: vec![],

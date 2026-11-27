@@ -260,11 +260,15 @@ fn actual_host_preserves_ack_and_labels_completed_physical_copy() {
         let (writer, guard, capture) = writer();
         let context = install(&mut scheduler, writer);
         let plane = plane();
+        // The rank joined no shared L2 pool.
+        let shared_l2_handle =
+            Python::attach(|py| Py::new(py, crate::shared_l2::Handle::new()).unwrap());
         let mut host = PythonDataPlane::start(
             Python::attach(|py| plane.clone_ref(py)),
             None,
             Some(context.clone()),
             false,
+            shared_l2_handle,
         )
         .unwrap();
         assert!(host.poll_cache_events().unwrap().is_empty());
@@ -312,7 +316,12 @@ fn malformed_or_lost_observation_invalidates_evidence_without_changing_ack() {
             plane.setattr(py, "ready", true).unwrap();
             plane.setattr(py, mode, 1).unwrap();
         });
-        let mut host = PythonDataPlane::start(plane, None, Some(context.clone()), false).unwrap();
+        // The rank joined no shared L2 pool.
+        let shared_l2_handle =
+            Python::attach(|py| Py::new(py, crate::shared_l2::Handle::new()).unwrap());
+        let mut host =
+            PythonDataPlane::start(plane, None, Some(context.clone()), false, shared_l2_handle)
+                .unwrap();
         let ack = host.poll_cache_events().unwrap();
         assert_eq!(ack.len(), 1);
         assert_eq!(ack[0].op_id, 7);

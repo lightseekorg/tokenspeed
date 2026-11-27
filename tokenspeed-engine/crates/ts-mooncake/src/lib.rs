@@ -273,6 +273,11 @@ impl Engine {
         let raw = NonNull::new(raw).ok_or_else(|| Error::Create(hostname.to_owned()))?;
         // SAFETY: `raw` is a started engine.
         let port = unsafe { (library.rpc_port)(raw.as_ptr()) };
+        if port < 0 {
+            // SAFETY: `raw` was just returned by `create` and is not wrapped in `Self` yet.
+            unsafe { (library.destroy)(raw.as_ptr()) };
+            return Err(Error::Create(hostname.to_owned()));
+        }
         let session_id = if hostname.contains(':') && !hostname.starts_with('[') {
             format!("[{hostname}]:{port}")
         } else {

@@ -35,20 +35,18 @@ and the host launcher remains `ts-host`, backed by the `_host` extension. For ex
 ts-client = { package = "tokenspeed-client", version = "0.2.0" }
 ```
 
+The [GDS cost calibration tools](../test/cache_gds_calibration/README.md) sample
+aligned block reads through the serving Disk executor for offline cost fitting.
+
 ## Wire conformance
 
-The native frontend offers two distinct request operations. `abort(rid)`
-only sends the engine's abort and does not guarantee a terminal output.
-`cancel(rid)` also closes that client's output stream after a successful send:
-Rust receives `StreamError::Cancelled`; Python's `next_outputs()` receives
-`(rid, RequestCancelled)`, an `EngineError` subclass, after already queued
-chunks.
-
-A finish is preserved when it wins the race. A failed or interrupted cancel
-send leaves ownership attached for retry unless the stream ended independently.
-
-Cancellation changes no engine retirement fence or engine-reported load; use
-fresh request ids for subsequent submissions. See the
+The native frontend's `abort(rid)` sends the engine's abort and ends the
+local stream with a terminal chunk whose `finish_reason` is `"abort"`.
+`cancel(rid)` delivers `StreamError::Cancelled` in Rust and
+`(rid, RequestCancelled)` in Python's `next_outputs()`. Both deliver the
+terminal result after queued chunks and preserve a concurrent result that
+closed the stream first. Use fresh request ids for subsequent submissions.
+See the
 [request lifecycle contract](../docs/design/event-loop.md#request-identity-and-submission-failures).
 
 `tokenspeed-client` 0.2 makes `StreamError` non-exhaustive and adds `Cancelled`.
@@ -108,8 +106,15 @@ The native crates target Linux and need a C++ compiler, CMake, OpenSSL
 development headers, and Python development headers. Set `PYO3_PYTHON` to
 an interpreter with `nanobind>=2.13.0` and `tokenspeed-spdlog==1.15.1`
 installed. The scheduler source is bundled in its crate; the grammar build
-downloads the pinned, SHA256-checked xgrammar source release and therefore
-needs network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
+downloads the pinned, SHA256-checked tokenspeed-xgrammar source release and needs
+network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
+Keep that source pin aligned with the Python dependency, which still imports as
+`xgrammar`, and regenerate the tokenizer fixtures with
+`python tokenspeed-engine/crates/ts-grammar/tests/fixtures/generate.py` when upgrading.
+Rebuild the engine alongside the Python dependency so their tokenizer serialization
+formats agree.
+In an existing environment, uninstall the upstream `xgrammar` distribution before
+installing `tokenspeed-xgrammar`; both own the `xgrammar` module.
 
 For `cargo test --locked`, install `numpy` and `prometheus-client` in that
 interpreter too. The metrics tests read the real Prometheus multiprocess files.

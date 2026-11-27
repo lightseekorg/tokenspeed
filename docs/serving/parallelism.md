@@ -1015,6 +1015,15 @@ pipeline, context or attention data parallelism, an MoE TP x EP size other
 than the attention TP size, `--mm-encoder-tp-mode data`, PD disaggregation,
 fused all-reduce, or an `--all2all-backend` transport.
 
+## Headless plugin registration
+
+A compatible headless launcher can register a plugin's numerical profiles
+before parsing, start the engine ranks, and finish the supervisor's plugin
+registration while the ranks initialize. The full registration must finish
+before the supervisor reports readiness. Compatibility requires the plugin's
+`register_cli_options()` hook and a supported set of enabled plugins. Other
+installations use eager plugin loading.
+
 ## Runtime notes
 
 Overlap scheduling can prepare the next forward on the CPU while the previous
