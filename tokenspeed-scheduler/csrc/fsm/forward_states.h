@@ -144,9 +144,18 @@ struct AdmissionResources {
     std::int32_t cached_prefix_tokens{0};
     bool storage_prepared{false};
     std::optional<StorageReadyHold> storage_hold;
+    // The Ready hold a peer Host landing extended: the landing's hold took
+    // `storage_hold`, and the prefix below it stays held for as long.
+    std::optional<StorageReadyHold> storage_base_hold;
     // The request has asked its peer holder once (or has none to ask), and
     // what the holder answered.
     bool peer_prepared{false};
+    std::int32_t disk_wait_plans{0};
+    // Backoff gate when a partial Host-credit reservation retries in prepareDisk:
+    // skip re-probing until held Host blocks drop below this watermark, with
+    // `disk_read_retries` capping total retry attempts.
+    std::optional<std::size_t> disk_retry_below_held_blocks;
+    std::uint8_t disk_read_retries{0};
     std::optional<PeerHit> peer_hit;
     // Successful later first admissions while this is the oldest waiting prompt.
     std::int32_t prefill_bypasses{0};

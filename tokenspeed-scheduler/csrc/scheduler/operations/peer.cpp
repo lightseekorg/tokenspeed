@@ -78,6 +78,8 @@ bool Scheduler::awaitsStateCommit(std::uint32_t group, std::int32_t page) const 
 
 namespace {
 
+constexpr std::int32_t kMaxPeerDiskWaitPlans = 4;
+
 std::int64_t Deadline(std::int64_t now_us, std::int64_t lifetime_us) {
     return now_us + std::min(lifetime_us, std::numeric_limits<std::int64_t>::max() - now_us);
 }
@@ -92,6 +94,10 @@ Scheduler::PeerStats Scheduler::GetPeerStats() const {
         stats.leases = peer_exports_->NumLeases();
         stats.pinned_blocks = peer_exports_->NumPinnedBlocks();
     }
+    if (peer_offer_tickets_) {
+        stats.leases += peer_offer_tickets_->NumLeases();
+        stats.pinned_blocks += peer_offer_tickets_->NumPinnedBlocks();
+    }
     for (const auto& request : requests_) {
         stats.looking_requests += request->Is<fsm::PeerLooking>();
         stats.landing_requests += request->Is<fsm::PeerLanding>();
@@ -104,6 +110,9 @@ void Scheduler::handleEvent(const cache::PeerTick& event) {
     if (!peer_exports_) throw std::invalid_argument("a peer tick without configured peer sharing");
     if (event.now_us < peer_now_us_) throw std::invalid_argument("the peer clock moved backwards");
     peer_now_us_ = event.now_us;
+    if (!event.expire) {
+        return;
+    }
     peer_exports_->Expire(peer_now_us_, async_host_peer_ || async_device_peer_);
     std::erase_if(peer_host_grants_, [](const auto& entry) { return entry.second.expired(); });
     for (const auto& request : requests_) {
@@ -121,6 +130,7 @@ void Scheduler::handleEvent(const cache::PeerTick& event) {
             peer_now_us_ >= admission->storage_hold->deadline_us) {
             spdlog::debug("[Peer] rid={} Host landing's ready hold expired before admission", request->Id());
             admission->storage_hold.reset();
+            admission->storage_base_hold.reset();
         }
     }
 }
@@ -146,8 +156,8 @@ void Scheduler::handleEvent(const cache::PeerLookupAnswered& event) {
         if (looking == nullptr || looking->lease != event.lease) {
             continue;
         }
-        if (async_host_peer_ && event.num_tokens > 0) {
-            if (looking->host_grant) looking->host_grant->lookup_answered = true;
+        if (async_host_peer_ && looking->host_grant && event.num_tokens > 0) {
+            looking->host_grant->lookup_answered = true;
             return;
         }
         request->Apply(fsm::FinishPeerLookupEvent{event.num_tokens > 0
@@ -183,6 +193,14 @@ void Scheduler::recordPeerDispatch(Request& request) {
 }
 
 void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
+    if (config_.peer_config && config_.peer_config->versioned_shards) {
+        auto attempt = peer_target_attempts_.find(event.request_id);
+        if (attempt == peer_target_attempts_.end() || attempt->second != event.lease) return;
+        // A frozen landing can publish only a fallback, never readable tokens.
+        if (event.frozen && event.num_tokens != 0) return;
+        peer_target_attempts_.erase(attempt);
+        if (!event.frozen) RetirePeerTarget(event.lease);
+    }
     Request* request = findRequest(event.request_id);
     if (auto attempt = device_attempts_.extract(event.request_id); !attempt.empty()) {
         const auto& a = attempt.mapped();
@@ -211,16 +229,23 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
         const auto* prefetch = request == nullptr ? nullptr : request->GetIf<fsm::Prefetching>();
         const bool waiting = prefetch != nullptr && prefetch->lease.IssuedBy(*peer_host_landings_);
         auto* active = request ? request->GetIf<fsm::PeerLooking>() : nullptr;
+        std::optional<fsm::StorageReadyHold> saved_base;
         if (active && active->host_grant && active->host_grant->landing) {
-            active->admission.storage_hold =
-                fsm::StorageReadyHold{.lease = std::move(active->host_grant->landing), .deadline_us = peer_now_us_};
+            // Preserve any prior Disk/L3 Ready hold so the peer landing's Ready
+            // hold does not clobber it: on success it steps aside into
+            // `storage_base_hold`; on failure it is restored to `storage_hold`.
+            saved_base = std::exchange(
+                active->admission.storage_hold,
+                fsm::StorageReadyHold{.lease = std::move(active->host_grant->landing), .deadline_us = peer_now_us_});
         }
         if (const std::optional<std::int32_t> landed =
                 peer_host_landings_->Finish(event.request_id, event.num_tokens)) {
             const auto* owner = request ? request->GetIf<fsm::PeerLooking>() : nullptr;
+            const bool owns_landing = owner && owner->admission.storage_hold &&
+                                      owner->admission.storage_hold->lease.IssuedBy(*peer_host_landings_);
             if (*landed == 0) {
                 ++peer_failed_landings_;
-            } else if (async_host_peer_ && !(owner && owner->admission.storage_hold)) {
+            } else if (async_host_peer_ && !owns_landing) {
                 ++peer_unused_host_landings_;
             } else {
                 peer_landed_tokens_ += static_cast<std::uint64_t>(*landed);
@@ -232,16 +257,29 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
                 if (*landed > 0) {
                     looking->admission.storage_hold->deadline_us =
                         Deadline(peer_now_us_, config_.peer_config->host_ready_timeout_us);
+                    if (saved_base) {
+                        looking->admission.storage_base_hold = std::move(saved_base);
+                    }
                 } else {
-                    looking->admission.storage_hold.reset();
+                    looking->admission.storage_hold = std::move(saved_base);
                 }
                 request->Apply(fsm::FinishPeerLookupEvent{std::nullopt});
             } else if (waiting) {
+                // The landing's hold takes the request's one hold slot. A Ready
+                // hold already there covers the prefix the landing extends: it
+                // steps aside and lives as long as the landing's hold, or the
+                // landed suffix would lose its base to Host eviction.
+                std::optional<fsm::StorageReadyHold> base;
+                if (*landed > 0) base = std::exchange(request->AdmissionResourcesPtr()->storage_hold, std::nullopt);
                 request->Apply(fsm::FinishPrefetchEvent{
                     *landed > 0 ? std::optional{Deadline(peer_now_us_, config_.peer_config->host_ready_timeout_us)}
                                 : std::nullopt});
+                if (base) request->AdmissionResourcesPtr()->storage_base_hold = std::move(base);
             }
             return;
+        }
+        if (active && saved_base) {
+            active->admission.storage_hold = std::move(saved_base);
         }
     }
     if (request == nullptr) {
@@ -335,6 +373,21 @@ bool Scheduler::ApplyPeerExport(const cache::PeerLookup& event, std::int64_t now
     if (peer_exports_->Held(event.lease)) return false;
     peer_exports_->Lookup(coordinator_, event, now_us);
     return peer_exports_->HasLease(event.lease);
+}
+
+bool Scheduler::PinPeerOffer(const cache::PeerLookup& checkpoint, const cache::PeerPin& pin, std::int64_t now_us) {
+    if (!config_.peer_config || pin.pages.empty() || !peerPagesReady(pin.pages)) return false;
+    if (!peer_offer_tickets_) peer_offer_tickets_ = std::make_unique<PeerExports>(*config_.peer_config);
+    if (peer_offer_tickets_->HasLease(pin.lease)) return false;
+    peer_offer_tickets_->Pin(coordinator_, pin, now_us, &checkpoint);
+    return peer_offer_tickets_->Held(pin.lease);
+}
+
+bool Scheduler::ClosePeerOffer(const PeerLeaseId& lease, std::int64_t now_us) {
+    // Absence is a completed close, including a retry after local release.
+    if (!peer_offer_tickets_ || !peer_offer_tickets_->Held(lease)) return true;
+    peer_offer_tickets_->Release(coordinator_, cache::PeerRelease{.lease = lease, .demote = false}, now_us);
+    return true;
 }
 void Scheduler::ApplyPeerExport(const cache::PeerPin& event, std::int64_t now_us, const cache::PeerLookup* checkpoint) {
     peer_exports_->Expire(now_us, /*retain_hard=*/true);
@@ -446,15 +499,29 @@ void Scheduler::preparePeer(Request& request) {
     if (submitted->admission.peer_prepared) {
         return;
     }
-    submitted->admission.peer_prepared = true;
     const PeerConfig& limits = *config_.peer_config;
     const std::string& holder = request.PeerHolder();
     // The D role computes no prompt: what it lacks comes from its PD peer,
     // so it never reads from a holder, whatever the request names.
-    if (holder.empty() || holder == limits.name || config_.role == Role::kD) {
-        if (holder == limits.name && !holder.empty()) request.peer_local_reason = "self_holder";
+    const bool self_holder = !holder.empty() && CanonicalPeerEndpoint(holder) == CanonicalPeerEndpoint(limits.name);
+    if (holder.empty() || self_holder || config_.role == Role::kD) {
+        if (self_holder) request.peer_local_reason = "self_holder";
+        submitted->admission.peer_prepared = true;
         return;
     }
+    // When a request is still queued behind resident capacity and local Disk
+    // genuinely has resumable blocks beyond `local` waiting on transient in-flight
+    // Disk I/O credits, wait briefly for `prepareDisk` before querying the peer
+    // holder; never defer when forward admission has free slots right now (which
+    // would admit the request locally without querying the peer) or indefinitely.
+    if (disk_transfers_ && storage_allowed_ && coordinator_.Disk().NumDiskCachedBlocks() > 0 &&
+        !submitted->admission.storage_prepared && disk_transfers_->HasProgressPending() &&
+        (!forward_allowed_ || req_pool_allocator_.AvailableSlots() == 0) &&
+        submitted->admission.disk_wait_plans < kMaxPeerDiskWaitPlans) {
+        ++submitted->admission.disk_wait_plans;
+        return;
+    }
+    submitted->admission.peer_prepared = true;
     const std::int32_t grain = config_.prefix_granularity;
     const std::int32_t max_tokens = cacheablePrefixTokens(request);
     const std::span<const std::string> hashes = request.PromptPrefixHashes(max_tokens / grain);
@@ -469,6 +536,10 @@ void Scheduler::preparePeer(Request& request) {
         request.peer_local_reason = "lookup_below_min";
         return;
     }
+    if (static_cast<std::uint32_t>(next_peer_lease_) == std::numeric_limits<std::uint32_t>::max()) {
+        request.peer_local_reason = "lease_id_exhausted";
+        return;
+    }
     PeerLeaseId lease{.reader = limits.name, .id = ++next_peer_lease_};
     peer_lookups_.push_back(PeerLookupRequest{.request_id = request.Id(),
                                               .deadline_us = Deadline(peer_now_us_, limits.lookup_timeout_us),
@@ -479,7 +550,7 @@ void Scheduler::preparePeer(Request& request) {
                                               .max_tokens = max_tokens});
     spdlog::debug("[Peer] rid={} lookup {} to {} local_tokens={} bound_tokens={}", request.Id(), lease.id, holder,
                   local, max_tokens);
-    const bool grant_host = async_host_peer_ && !submitted->admission.storage_hold;
+    const bool grant_host = async_host_peer_;
     request.Apply(fsm::StartPeerLookupEvent{lease, Deadline(peer_now_us_, limits.lookup_timeout_us)});
     if (grant_host) {
         const auto shared = request.SharedPrefixTokens();
@@ -511,6 +582,11 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
         }
         if (!prefillAllowed(*request, build)) {
             return;
+        }
+        // A reused request id must not displace an older landing awaiting retirement.
+        if (peer_target_attempts_.contains(request->Id())) {
+            submitted->admission.peer_hit.reset();
+            continue;
         }
         fsm::PeerHit hit = *submitted->admission.peer_hit;
         std::size_t path = 0;
@@ -597,6 +673,14 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
         build.scheduled.insert(request);
 
         const auto& landing = *request->GetIf<fsm::PeerLanding>();
+        if (config_.peer_config->versioned_shards) {
+            peer_target_attempts_.emplace(request->Id(), hit.lease);
+            auto& holds = peer_target_holds_[hit.lease];
+            for (const auto& table : landing.resources.block_tables) {
+                for (const auto& block : table.Blocks())
+                    if (block) holds.push_back(block);
+            }
+        }
         PeerFetchOperation fetch{.request_id = request->Id(),
                                  .lease = hit.lease,
                                  .holder = request->PeerHolder(),

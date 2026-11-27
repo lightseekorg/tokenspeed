@@ -98,7 +98,9 @@ def test_run_eager_reruns_on_replay_with_live_host_state() -> None:
     def publish() -> None:
         published.copy_(buffers[chosen["index"]])
 
-    cap = BreakableCapture(memory_saver_adapter=TorchMemorySaverAdapter.create(False))
+    cap = BreakableCapture(
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
+    )
     with torch.inference_mode():
         with cap:
             x.add_(1)

@@ -451,7 +451,7 @@ def capacity(saver):
 
 
 if __name__ == "__main__":
-    saver = TorchMemorySaverAdapter.create(True)
+    saver = TorchMemorySaverAdapter.create(True, device="cuda")
     with torch.inference_mode():
         case = sys.argv[1]
         if case in ("eagle", "split_eagle"):

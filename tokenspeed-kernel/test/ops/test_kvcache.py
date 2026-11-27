@@ -74,6 +74,7 @@ from utils import (
     arena_caches,
     arena_slots,
     assert_no_triton_compile,
+    assert_warmup_covers,
     needs_amd_arena_key,
     skip_without_arena_memory,
 )
@@ -484,7 +485,8 @@ def test_store_state_rows_skips_negative_blocks_without_recompiling(
             )
         expected = slab.clone()
         for row, block in enumerate(blocks):
-            if block >= 0:
+            # Block 0 is the null block; it and padding stay untouched.
+            if block > 0:
                 expected[2 * block] = states[row].to(dtype)
         store_state_rows(
             states, strided, torch.tensor(blocks, dtype=torch.int32, device=device)
@@ -504,6 +506,110 @@ def test_store_state_rows_skips_negative_blocks_without_recompiling(
             strided,
             torch.zeros(3, dtype=torch.int32, device=device),
         )
+
+
+def _assert_bitwise(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Compare raw bytes so NaN payloads and signed zeros must match too."""
+    assert actual.dtype == expected.dtype and actual.shape == expected.shape
+    assert torch.equal(
+        actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8)
+    )
+
+
+@pytest.mark.parametrize("store_device", ["cpu", "cuda"])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_store_state_rows_skips_destinations_outside_the_slab(
+    store_device: str, index_dtype: torch.dtype, transposed: bool
+) -> None:
+    torch.manual_seed(0)
+    num_blocks, heads, key, value = 6, 2, 7, 9
+    # The slab is viewed from the middle of a larger backing: the page before
+    # block 0 and the page after the last block are real memory an
+    # out-of-range id would reach. The null block 0 holds a NaN sentinel.
+    backing = torch.randn(
+        num_blocks + 2, heads, key, value, dtype=torch.bfloat16, device=store_device
+    )
+    backing[1].fill_(float("nan"))
+    slab = backing[1:-1]
+    blocks = [3, -1, 0, 1, num_blocks, -7, num_blocks - 1, num_blocks + 5, 0]
+    if transposed:
+        states = torch.randn(
+            len(blocks), heads, value, key, dtype=torch.float32, device=store_device
+        ).transpose(-1, -2)
+    else:
+        states = torch.randn(
+            len(blocks), heads, key, value, dtype=torch.float32, device=store_device
+        )
+
+    # Expected bytes written out per row, independent of the implementation.
+    expected = backing.clone()
+    for row, block in enumerate(blocks):
+        if 0 < block < num_blocks:
+            expected[1 + block] = states[row].to(torch.bfloat16)
+    store_state_rows(
+        states, slab, torch.tensor(blocks, dtype=index_dtype, device=store_device)
+    )
+    # Covers both guard pages, the NaN null block, and the valid rows.
+    _assert_bitwise(backing, expected)
+    assert backing[1].isnan().all()
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_store_state_rows_cpu_accepts_slabs_past_int32_block_count(
+    index_dtype: torch.dtype,
+) -> None:
+    num_blocks = 2**31
+    # Untouched CPU pages stay unmapped, so this costs a few pages, not 2 GiB.
+    slab = torch.empty(num_blocks, dtype=torch.uint8).view(num_blocks, 1, 1, 1)
+    probes = [0, 1, 2, num_blocks - 1]
+    for block in probes:
+        slab[block].fill_(7)
+    blocks = [1, 0, -1, num_blocks - 1]
+    if index_dtype == torch.int64:
+        blocks.append(num_blocks)
+    states = torch.arange(10, 10 + len(blocks), dtype=torch.float32).view(-1, 1, 1, 1)
+    store_state_rows(states, slab, torch.tensor(blocks, dtype=index_dtype))
+    assert [int(slab[block].item()) for block in probes] == [7, 10, 7, 13]
+
+
+def test_store_state_rows_no_recompile_across_slab_sizes_and_index_offsets(
+    device: str,
+) -> None:
+    heads, key, value = 2, 7, 9
+
+    def launch(num_blocks: int, offset: int, index_dtype: torch.dtype) -> None:
+        slab = torch.randn(
+            num_blocks, heads, key, value, dtype=torch.bfloat16, device=device
+        )
+        slab[0].fill_(float("nan"))
+        states = torch.randn(4, heads, key, value, dtype=torch.float32, device=device)
+        # Offset slices of a larger index buffer, as the runtime hands them over.
+        blocks = torch.zeros(8, dtype=index_dtype, device=device)[offset : offset + 4]
+        blocks.copy_(torch.tensor([num_blocks - 1, 0, -1, num_blocks]))
+        expected = slab.clone()
+        expected[num_blocks - 1] = states[0].to(torch.bfloat16)
+        store_state_rows(states, slab, blocks)
+        _assert_bitwise(slab, expected)
+
+    index_dtypes = (torch.int32, torch.int64)
+
+    def warm() -> None:
+        for index_dtype in index_dtypes:
+            launch(8, 0, index_dtype)
+        torch.cuda.synchronize()
+
+    assert_warmup_covers(
+        [_store_state_rows_kernel],
+        warm,
+        lambda case: launch(*case),
+        [
+            (num_blocks, offset, index_dtype)
+            for num_blocks in (16, 17, 32, 65)
+            for offset in (1, 2, 3)
+            for index_dtype in index_dtypes
+        ],
+    )
 
 
 def test_store_state_rows_large_offsets(device: str) -> None:

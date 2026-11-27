@@ -40,6 +40,7 @@
 #include "core/profile_span.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
+#include "fsm/storage_events.h"
 #include "scheduler/capacity_model.h"
 #include "scheduler/operations/admission.h"
 #include "scheduler/operations/forward.h"
@@ -224,6 +225,10 @@ bool Scheduler::ClearL1Cache() {
     return clearCache(false);
 }
 
+bool Scheduler::CanClearL1Cache() const {
+    return cacheIsClearable(false);
+}
+
 bool Scheduler::ClearCache() {
     return clearCache(true);
 }
@@ -234,7 +239,20 @@ void Scheduler::CancelStorageBackups() {
 }
 
 void Scheduler::CancelStorageForClear() {
-    for (auto& request : requests_) releaseStorage(*request);
+    for (auto& request : requests_) {
+        releaseStorage(*request);
+        if (peer_host_landings_) {
+            if (const auto* prefetch = request->GetIf<fsm::Prefetching>();
+                prefetch != nullptr && prefetch->lease.IssuedBy(*peer_host_landings_)) {
+                request->Apply(fsm::FinishPrefetchEvent{std::nullopt});
+            }
+            if (auto* admission = request->AdmissionResourcesPtr();
+                admission != nullptr && admission->storage_hold &&
+                admission->storage_hold->lease.IssuedBy(*peer_host_landings_)) {
+                admission->storage_hold.reset();
+            }
+        }
+    }
     CancelStorageBackups();
 }
 
@@ -250,6 +268,10 @@ bool Scheduler::CanPrepareStorageClear() const {
     if (disk_transfers_) {
         const std::vector<const CacheBlockRef*> disk_refs = disk_transfers_->HeldHostBlockRefs();
         storage_refs.insert(storage_refs.end(), disk_refs.begin(), disk_refs.end());
+    }
+    if (peer_host_landings_) {
+        const std::vector<const CacheBlockRef*> peer_refs = peer_host_landings_->HeldHostBlockRefs();
+        storage_refs.insert(storage_refs.end(), peer_refs.begin(), peer_refs.end());
     }
     return coordinator_.CacheIsClearableAfterStorageDrain(storage_refs);
 }
@@ -271,6 +293,9 @@ bool Scheduler::CanClearCacheRetainingStorage() const {
             if (const auto* admission = request->AdmissionResourcesPtr(); admission && admission->storage_hold) {
                 leases.push_back(admission->storage_hold->lease.OperationId());
             }
+            if (const auto* admission = request->AdmissionResourcesPtr(); admission && admission->storage_base_hold) {
+                leases.push_back(admission->storage_base_hold->lease.OperationId());
+            }
         }
         if (!storage_transfers_->CanRetainForClear(leases)) return false;
         retained = storage_transfers_->HeldBlockRefs();
@@ -283,6 +308,7 @@ bool Scheduler::ClearCacheRetainingStorage() {
     CancelStorageForClear();
     if (storage_transfers_) storage_transfers_->RetainForClear();
     coordinator_.ClearCacheRetainingStorage();
+    ++plan_calls_;
     spdlog::info("[Scheduler] flush completed with old storage references retained; remaining L3 capacity available");
     return true;
 }
@@ -322,6 +348,7 @@ bool Scheduler::clearCache(bool include_host) {
         spdlog::info("[Scheduler] flush {}cache rejected: cached blocks are still pinned", include_host ? "" : "L1 ");
         return false;
     }
+    ++plan_calls_;
     if (include_host && storage_transfers_) storage_transfers_->ClearMetadata();
     spdlog::info("[Scheduler] flush {}cache completed", include_host ? "" : "L1 ");
     return true;
@@ -546,7 +573,7 @@ std::size_t Scheduler::BootstrappingSize() const {
 
 std::size_t Scheduler::WaitingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Submitted, fsm::Prefetching, fsm::Retracted, fsm::Restoring>() &&
+        return request->IsAnyOf<fsm::Submitted, fsm::Prefetching, fsm::PeerLooking, fsm::Retracted, fsm::Restoring>() &&
                !request->AwaitsBootstrap();
     }));
 }
@@ -562,6 +589,8 @@ std::int64_t Scheduler::PendingPrefillTokens() const {
     for (const auto& request : requests_) {
         if (const auto* admission = request->AdmissionResourcesPtr()) {
             tokens += std::int64_t{request->PrefillSize()} - admission->cached_prefix_tokens;
+        } else if (const auto* landing = request->GetIf<fsm::PeerLanding>()) {
+            tokens += std::int64_t{request->PrefillSize()} - (landing->window.begin + landing->window.size);
         } else if (request->Is<fsm::Prefilling>()) {
             tokens += std::int64_t{request->PrefillSize()} - request->NumComputedTokens();
         }
@@ -585,7 +614,7 @@ std::size_t Scheduler::ReadyWaitingSize() const {
 
 std::size_t Scheduler::PrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult,
+        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PeerLanding, fsm::PrefillAwaitingResult,
                                 fsm::PrefillAwaitingDestination, fsm::PrefillDone>();
     }));
 }
@@ -703,7 +732,7 @@ std::int32_t Scheduler::RequestTokenSize(const std::string& id) const {
 bool Scheduler::CanAbortBeforeAdmission(const std::string& id) const {
     const auto it = requests_by_id_.find(id);
     return config_.role == Role::kFused && it != requests_by_id_.end() &&
-           it->second->IsAnyOf<fsm::Submitted, fsm::Prefetching>();
+           it->second->IsAnyOf<fsm::Submitted, fsm::Prefetching, fsm::PeerLooking>();
 }
 
 std::vector<std::int64_t> Scheduler::AdmissionCapacityCurve(std::int32_t token_step) const {
@@ -852,6 +881,10 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         else
             disk_transfers_->DropCleaning();
         disk_operations = disk_transfers_->TakeCommands();
+        // StartCleaning() may evict a last Disk State checkpoint via Disk LRU,
+        // leaving checkpoint-less Host History entries dead; collect them in the
+        // same round before DrainKvEventBatch reconciles residency.
+        coordinator_.CollectDeadEntries();
     }
 
     std::vector<SharedL2Operation> shared_l2_operations;

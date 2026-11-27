@@ -219,7 +219,8 @@ public:
                 using State = std::remove_cvref_t<decltype(state)>;
                 if constexpr (std::same_as<State, fsm::Prefetching>) {
                     return &state.Admission();
-                } else if constexpr (std::same_as<State, fsm::Submitted> || std::same_as<State, fsm::Bootstrapping>) {
+                } else if constexpr (std::same_as<State, fsm::Submitted> || std::same_as<State, fsm::Bootstrapping> ||
+                                     std::same_as<State, fsm::PeerLooking>) {
                     return &state.admission;
                 }
                 return nullptr;
@@ -233,7 +234,8 @@ public:
                 using State = std::remove_cvref_t<decltype(state)>;
                 if constexpr (std::same_as<State, fsm::Prefetching>) {
                     return &state.Admission();
-                } else if constexpr (std::same_as<State, fsm::Submitted> || std::same_as<State, fsm::Bootstrapping>) {
+                } else if constexpr (std::same_as<State, fsm::Submitted> || std::same_as<State, fsm::Bootstrapping> ||
+                                     std::same_as<State, fsm::PeerLooking>) {
                     return &state.admission;
                 }
                 return nullptr;

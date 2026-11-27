@@ -1036,7 +1036,7 @@ def test_gpu_a_prefill_graph_replay_waits_for_its_load(writer, ranks):
     # A captured segment reads loaded pages; the capture notes the layer it
     # reaches instead of waiting.
     capture = BreakableCapture(
-        memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
     )
     with capture:
         reader.tracker.wait_for_layer(len(CONSUMERS) - 1)

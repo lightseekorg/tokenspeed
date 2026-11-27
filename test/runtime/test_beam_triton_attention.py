@@ -452,7 +452,7 @@ def test_beam_triton_runtime_mixed_breakable_graph_refresh(width):
     harness.prepare(rounds[True], seed=72)
     torch.cuda.synchronize()
     capture = BreakableCapture(
-        memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
     )
     with capture:
         captured = harness.forward()

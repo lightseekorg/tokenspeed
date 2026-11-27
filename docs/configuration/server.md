@@ -340,6 +340,7 @@ restores whatever is released:
 | `kv_cache` | the cache arena's device regions | zeroed; a PD engine registers it with the transfer engine again |
 | `weights` | model and draft parameters, persistent attention/runtime buffers and shared workspaces | parameters use CPU backup or remain invalid until a complete update; frozen drafts and attention/runtime buffers retain CPU backup |
 | `cuda_graph` | the decode CUDA graphs' memory pool | discarded; replays rewrite it |
+| `acl_graph` | Ascend decode graph private pools | `--acl-graph-memory-policy` selects `discard` (default) or `cpu_backup`; see [Ascend Memory Saver](../serving/ascend-memory-saver.md) for eligibility, dependencies and wake order |
 | `nccl` | NCCL communicator buffers (`ProcessGroupNCCL.suspend`); requires a PyTorch build with suspend support and NCCL 2.29.7 or later | resumed in place |
 
 A release waits until the scheduler is drained, and on a disaggregated
@@ -558,7 +559,7 @@ LCM blocks when possible. Other policies keep their original allocation sizes.
 | `--inkling2-loop-num-passes` | Looped Inkling 2 checkpoints with `loop_config.is_varloop=true`: run the looped core this many times (at least 1) instead of the checkpoint's `num_passes`. Each pass is 12 more layer visits, each with its own KV cache and convolution state unless `--inkling2-loop-share-cache` is set. DSpark drafts read hidden states at fixed visits, so with a draft model only the checkpoint's count is accepted; model-free `DUMMY` drafting serves any count. With `--decode-monokernel` each visit takes one of a step's 64 launch tags, so the 24-layer checkpoint serves at most 4 passes there. Unset by default; other checkpoints refuse it. |
 | `--inkling2-loop-share-cache` | Looped Inkling 2 checkpoints with `loop_config.is_varloop=true`: every pass of a core layer reads and writes that layer's one KV cache, so the KV pool holds one cache layer per decoder layer regardless of the pass count; each visit keeps its own convolution state. Off by default; other checkpoints refuse it. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
-| `--kda-history-capacity` | KDA models: how many accepted decode records each request keeps per KDA layer, counting the verify window, before they are folded into the dense recurrent state. Defaults to 16, or the verify width (`--speculative-num-draft-tokens`) when larger; it must be at least the verify width. A smaller capacity shrinks the per-request workspace taken from the KV cache budget but folds more often (at the verify width, every round that accepts a token). Cache checkpoints are the same either way. |
+| `--kda-history-capacity` | KDA models: how many accepted decode records each request keeps per KDA layer, counting the verify window, before they are folded into the dense recurrent state. Defaults to 16; it must be at least the verify width (`--speculative-num-draft-tokens`), so a window wider than 16 requires setting it. A smaller capacity shrinks the per-request workspace taken from the KV cache budget but folds more often (at the verify width, every round that accepts a token). Cache checkpoints are the same either way. |
 | `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost and, on CUDA, what startup keeps resident. |
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
@@ -2297,8 +2298,9 @@ than computing it; it never reads itself, since its prefill server sends what
 it lacks ([RFC 0005](../rfcs/0005-runtime-pd-roles.md)). Run it with
 `--kvstore-write-policy write_back` for its Host to hold what its GPU evicts.
 Peer sharing is refused with
-`--kvstore-storage-backend`, `--pipeline-parallel-size > 1` and
-`--query-context-parallel-size > 1`; the
+`--kvstore-storage-backend`, `--pipeline-parallel-size > 1`,
+`--query-context-parallel-size > 1` and `--enable-memory-saver` (releasing
+Device KV memory invalidates registered Mooncake MRs); the
 scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded
 groups). RDMA devices come from `--disaggregation-ib-device`. Replicas read
 each other within one namespace when their configured model and draft revisions,
@@ -2333,7 +2335,7 @@ that supports `O_DIRECT` (XFS or ext4, not tmpfs).
 | `queue_depth` | 32 | Requests in flight on the drive; with `psync`, threads. |
 | `write_queue_depth` | 8 | Of those, at most this many writes. |
 | `max_io_bytes` | 4194304 | Longer ranges are issued as several requests; a multiple of 4096. |
-| `max_operations` | 16 | Disk operations in flight, reads and writes. |
+| `max_operations` | 16 | Disk operations in flight, reads and writes. Cleaning writes are capped at `max(1, max_operations / 4)` concurrent operations, and one operation is reserved for reads when `max_operations > 1`. |
 | `max_blocks_per_operation` | 4096 | Blocks one operation moves. |
 | `host_blocks_fraction` | 0.25 | The share of Host L2 blocks Disk operations may hold at once. |
 | `write_host_blocks_fraction` | 0.5 | Of those, the share writes may hold. |
@@ -2342,6 +2344,8 @@ that supports `O_DIRECT` (XFS or ext4, not tmpfs).
 | `wait_timeout_ms` | 10000 | How long a prompt waits for its read before it runs from the local hit. |
 | `ready_timeout_ms` | 5000 | How long a finished read is held for its prompt. |
 | `push_ring_mb` | 512 | With `--peer-prefix-port`, the staging memory a peer push reads Disk blocks into, rounded up to whole blocks. |
+| `min_clean_tokens` | 0 | Minimum prefix branch length (in tokens) required to clean a Host tip to Disk when the branch length is known; `0` disables the length filter. |
+| `require_reuse_for_cleaning` | false | When `true`, skip cleaning Host tips that were never reused after initial publication. |
 
 The Disk tier needs `--kvstore-write-policy write_back` and prefix caching,
 and is refused with `--kvstore-storage-backend` and

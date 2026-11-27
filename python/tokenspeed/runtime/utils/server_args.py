@@ -719,7 +719,7 @@ class ServerArgs:
     min_kv_split: int | None = None
     kda_backend: str = "auto"
     # Records a request keeps per KDA layer between dense-state folds,
-    # including the verify window; None keeps max(16, draft tokens).
+    # including the verify window; None keeps 16. At least the draft tokens.
     kda_history_capacity: int | None = None
     drafter_attention_backend: str | None = None
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
@@ -944,6 +944,9 @@ class ServerArgs:
     # Dev: permit the reload_forward control call; nothing reloads until it arrives.
     allow_reload_forward: bool = False
     weight_memory_policy: Literal["cpu_backup", "discard"] | None = None
+    acl_graph_memory_policy: Literal["discard", "cpu_backup"] = dataclasses.field(
+        default="discard", kw_only=True
+    )
     disable_cudagraph_memory_reserve: bool = False
     mla_disable_ragged: bool = False
 
@@ -1029,6 +1032,16 @@ class ServerArgs:
         self.resolve_kernel_backends()
         self.resolve_cache()
         self.resolve_speculative_decoding()
+        if self.enable_memory_saver and self.device == "npu":
+            from tokenspeed.runtime.utils.ascend_memory_saver_state import (
+                validate_memory_saver_scope,
+            )
+
+            validate_memory_saver_scope(
+                has_draft_weights=self.speculative_draft_model_path is not None,
+                weight_policy=self.weight_memory_policy,
+                draft_policy=self.model_update_draft_weights,
+            )
         self.resolve_communication()
         self.resolve_numerics()
         self.resolve_disaggregation()
@@ -2826,6 +2839,10 @@ class ServerArgs:
                     "--query-context-parallel-size > 1",
                     self.query_context_parallel_size > 1,
                 ),
+                (
+                    "--enable-memory-saver (Peer Mooncake MRs do not yet re-register across TorchMemorySaver HBM unmap/remap)",
+                    self.enable_memory_saver,
+                ),
             )
             if refused
         ]
@@ -3033,6 +3050,15 @@ class ServerArgs:
                 "one request"
             )
 
+    @property
+    def backup_device_kv(self) -> bool:
+        """An Ascend CPU-backed target can reuse its prefixes across sleep."""
+        return (
+            self.device == "npu"
+            and self.enable_memory_saver
+            and self.weight_memory_policy == "cpu_backup"
+        )
+
     def validate_weight_memory_policy(self):
         """Memory saving chooses its weight semantics explicitly."""
         if self.weight_memory_policy not in (None, "cpu_backup", "discard"):
@@ -3040,14 +3066,18 @@ class ServerArgs:
         if self.enable_memory_saver and self.weight_memory_policy is None:
             raise ValueError("--enable-memory-saver requires --weight-memory-policy")
         if self.weight_memory_policy == "discard":
-            if not self.enable_memory_saver or self.model_update_config is None:
-                raise ValueError(
-                    "Weight discard requires memory saver and Model Updater configuration"
-                )
-            if self.model_update_draft_weights not in ("retain", "refresh"):
-                raise ValueError(
-                    "Weight discard requires an explicit draft update policy"
-                )
+            if self.device == "npu":
+                if not self.enable_memory_saver:
+                    raise ValueError("Weight discard requires memory saver")
+            else:
+                if not self.enable_memory_saver or self.model_update_config is None:
+                    raise ValueError(
+                        "Weight discard requires memory saver and Model Updater configuration"
+                    )
+                if self.model_update_draft_weights not in ("retain", "refresh"):
+                    raise ValueError(
+                        "Weight discard requires an explicit draft update policy"
+                    )
             # Quantization is checked against the resolved model config by
             # WeightMemoryState; CLI names alone cannot prove safe regeneration.
             if self.enable_eplb:
@@ -3078,6 +3108,13 @@ class ServerArgs:
             "--model-update-draft-weights": self.model_update_draft_weights,
         }
         if self.model_update_config is None:
+            if (
+                self.device == "npu"
+                and self.enable_memory_saver
+                and self.weight_memory_policy == "discard"
+                and self.model_update_draft_weights == "retain"
+            ):
+                companions.pop("--model-update-draft-weights")
             given = [flag for flag, value in companions.items() if value is not None]
             if given:
                 raise ValueError(f"{', '.join(given)} require --model-update-config")
@@ -3329,6 +3366,15 @@ class ServerArgs:
             )
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
+        if self.acl_graph_memory_policy not in ("discard", "cpu_backup"):
+            raise ValueError("--acl-graph-memory-policy must be discard or cpu_backup")
+        if self.acl_graph_memory_policy == "cpu_backup" and (
+            self.device != "npu" or not self.enable_memory_saver
+        ):
+            raise ValueError(
+                "--acl-graph-memory-policy cpu_backup requires --device npu "
+                "and --enable-memory-saver"
+            )
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.input_logprob_chunk_tokens <= 0:
@@ -4654,10 +4700,11 @@ class ServerArgs:
             default=ServerArgs.kda_history_capacity,
             help="Accepted KDA records each request keeps per layer between "
             "dense-state folds, counting the verify window (the speculative draft "
-            "tokens). Default: max(16, draft tokens); it must be at least the "
-            "draft tokens. A smaller capacity shrinks the per-request verify "
-            "workspace but folds the records into the dense state more often: at "
-            "the draft tokens themselves, every round that accepts any.",
+            "tokens). Default: 16; it must be at least the draft tokens, so a "
+            "window wider than 16 needs this option. A smaller capacity shrinks "
+            "the per-request verify workspace but folds the records into the "
+            "dense state more often: at the draft tokens themselves, every round "
+            "that accepts any.",
         )
         parser.add_argument(
             "--drafter-attention-backend",
@@ -5447,8 +5494,15 @@ class ServerArgs:
             default=None,
             help=(
                 "Required with memory saver: back up weights to CPU, or discard "
-                "them until a complete SDK update. Frozen draft weights retain CPU backup."
+                "them until a complete update. Frozen draft weights retain CPU backup."
             ),
+        )
+        parser.add_argument(
+            "--acl-graph-memory-policy",
+            choices=["discard", "cpu_backup"],
+            default=ServerArgs.acl_graph_memory_policy,
+            help="Ascend memory saver policy for the decode graph private pool. "
+            "Discard temporaries on release (default), or back them up to CPU.",
         )
         parser.add_argument(
             "--disable-cudagraph-memory-reserve",
@@ -6017,7 +6071,8 @@ class ServerArgs:
             default=ServerArgs.model_update_draft_weights,
             help="Whether a Mooncake weight update also streams the "
             "speculative draft model's weights: 'retain' updates the target "
-            "only, 'refresh' updates target and draft.",
+            "only, 'refresh' updates target and draft. For Ascend disk weight "
+            "discard with a draft model, pass 'retain' explicitly.",
         )
 
     @classmethod

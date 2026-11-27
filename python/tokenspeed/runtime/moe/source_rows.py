@@ -39,9 +39,11 @@ class MoESourceRows:
         self.mapping = mapping
         self.max_rows_per_rank = max_rows_per_rank
         self.counts: tuple[int, ...] | None = None
+        device_type = torch.device(device).type
         saver = TorchMemorySaverAdapter.create(
-            enable=torch.device(device).type == "cuda"
-            and global_server_args_dict["enable_memory_saver"]
+            enable=device_type == "cuda"
+            and global_server_args_dict["enable_memory_saver"],
+            device=device_type,
         )
         with saver.named_region("runtime_states"):
             self.source_token_counts = torch.zeros(

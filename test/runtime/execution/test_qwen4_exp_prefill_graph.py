@@ -158,7 +158,7 @@ def test_ple_break_replays_ragged_rows_and_live_state_pages() -> None:
         forward(dummy)
     torch.cuda.synchronize()
     capture = BreakableCapture(
-        memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
     )
     with active_forward(dummy), capture:
         captured = forward(dummy)
@@ -270,7 +270,7 @@ def test_qsa_break_replays_live_rows_positions_and_cache_writes(monkeypatch) -> 
         forward(dummy)
     torch.cuda.synchronize()
     capture = BreakableCapture(
-        memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
     )
     with active_forward(dummy), capture:
         captured = forward(dummy)

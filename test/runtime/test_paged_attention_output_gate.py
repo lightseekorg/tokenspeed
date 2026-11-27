@@ -168,7 +168,9 @@ def test_captured_extend_gates_without_pinning_the_gate():
             capture = BreakableCapture(
                 pool=pool,
                 handoff_storage=storage,
-                memory_saver_adapter=TorchMemorySaverAdapter.create(False),
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    False, device="cuda"
+                ),
             )
             with capture:
                 forward(rows)

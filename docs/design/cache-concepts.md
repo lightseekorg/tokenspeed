@@ -6,6 +6,48 @@ concepts are *logical* (token-based, storage-agnostic) and which are *physical*
 reference for naming, code placement, and layering decisions in both the C++
 scheduler (`tokenspeed-scheduler`) and the Python runtime.
 
+## Cross-layout peer prefix reads
+
+A coordinated peer reader matches a digest of the serving model namespace,
+immutable weight generation, and the active recipe's state encoding. An explicit
+shared serving name lets replicas mount the same weights at different paths.
+Compute precision, fusion and parallelism are local choices. The transfer planner
+checks both descriptors before constructing member reads. Persistent storage has
+its own identity.
+
+All source members must pin the proposed checkpoint before the holder grants a
+read. All reader members must report retirement before sending RELEASE.
+Only the original holder's matching CLOSED/COMPLETE reply can publish a hit.
+Unknown retirement freezes the landing. A restarted holder or a conflicting
+close ends the business attempt with zero reused tokens.
+
+Wire revision 2 bounds the start of each member's last native read. Its local
+30-second monotonic submission window starts before the member votes READY.
+Workers check the same deadline at each batch, including after queue and
+destination-fence waits. The holder starts its own 30-second interval at
+GRANT, after all READY votes. A delayed GRANT cannot restart the reader clock.
+Mixed wire revisions fall back to local prefill.
+
+A deployment with a guaranteed upper bound on the time from the reader's
+final submission check through the last possible source-memory access can
+set `TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS` on the holder. Include host
+scheduling pauses after the check, native queues, reconnects, retries, DMA
+drain after process failure, and timer drift/margin. All ranks follow their
+holder leader's configured value. After the submission interval plus this
+bound, the holder initiates an ABORT and releases its own source references
+even if the reader disappeared. This never releases a reader's frozen target.
+If the backend has no verified bound, leave the setting unset: a granted
+source remains pinned pending explicit closure. A timeout for polling one
+Mooncake batch alone does not establish the bound. No heartbeats extend it.
+
+After all reader members have retired their reads, a missing RELEASE reply
+can still force the request to recompute. Once its closing deadline passes,
+the reader drops the finished request and keeps the exact release message.
+New lookups to that holder pause until its pending closes receive terminal
+replies. Cleanup retries rotate among those leases and do not occupy active
+attempt slots. Healthy holders can continue serving requests. An unknown DMA
+retirement keeps the original landing frozen and cannot enter this retry path.
+
 ## Two worlds: logical tokens vs. physical storage
 
 ### Logical world (token units, storage-agnostic)
@@ -466,10 +508,10 @@ prompt end from slot 0: slot 1 is the fresh block the padding row never wrote
 prompt-end state onto another request's canonical checkpoint before the
 rotation; slot 0 then pins that equivalent checkpoint through the finish.
 
-KDA keeps its FP32 decode records and their accepted count in the active
-request slot, outside the LCM arena. The live State block holds only the
-dense base and the convolution state, exactly as without retained history;
-the scheduler and the cache see nothing else. Prefill writes complete
+KDA keeps its FP32 decode records and their accepted count, one for all its
+layers, in the active request slot, outside the LCM arena. The live State
+block holds only the dense base and the convolution state, exactly as without
+retained history; the scheduler and the cache see nothing else. Prefill writes complete
 checkpoints. The decode commit of the forward that ends a request (the
 sampling epilogue has set `RuntimeStates.stopped` for its slot) folds the
 slot's accepted records into the live block and clears the count. The block
@@ -487,7 +529,9 @@ it publishes nothing, as for a numerically corrupted forward, and the slot's
 next admission clears the count (`reset_request_workspace`). A request the
 device ended but could not complete -- records left outside the live block --
 is an engine error (`CommitError::IncompleteDecodeState`): the engine stops
-rather than publish an incomplete state.
+rather than publish an incomplete state. An ending request whose commit a
+KDA layer that carried it rejected reports `REQUEST_ENDED_INCOMPLETE`; a row
+no KDA layer carries (graph padding, a masked overlap row) reports nothing.
 
 A retraction publishes and images the victim's computed frontier. The
 backend declares its State groups as deferring their decode state
@@ -495,10 +539,11 @@ backend declares its State groups as deferring their decode state
 and the scheduler lists a decoded victim's live block in each of them, the
 one its decode steps write in place, in the plan's `state_folds`, by request
 slot. Before the plan's stores, copies, zeroing and forward, the data plane
-folds each listed slot's records into its block (`DeviceHandle.execute`,
-`fold_deferred_state`). The list does not depend on the image: a retraction
-whose image the split refuses after the publication aborts the victim, but
-its publication stands, and the fold completes it before any reader. A
+folds each listed slot's records into its block, layer by layer, then clears
+the slot's count once (`DeviceHandle.execute`, `fold_deferred_state`). The
+list does not depend on the image: a retraction whose image the split refuses
+after the publication aborts the victim, but its publication stands, and the
+fold completes it before any reader. A
 block the publication swapped for another request's equal entry is not
 listed; that entry already holds the complete state. The FP32 records stay in
 the GPU workspace. Restore copies the complete dense and convolution states
@@ -614,37 +659,49 @@ KDA uses retained history for ordinary decode and speculative verification.
 Each KDA State page holds the convolution window and a dense recurrent base,
 and nothing else. Each resident request has a stable slot outside the LCM
 arena. For each KDA layer, the slot holds FP32 corrections (U), normalized
-keys (K) and per-token decays, plus an INT32 count of the updates accepted
-since the dense base of the request's input page. Batch reordering changes
-the mapping from batch rows to request slots.
+keys (K) and per-token decays; one INT32 count, which every layer shares,
+counts the updates accepted since the dense base of the request's input page.
+Batch reordering changes the mapping from batch rows to request slots.
 
 Verify replays the accepted updates in order to reconstruct the current
-state. It appends candidates after that accepted prefix. Commit advances the
-slot's count by the accepted count and updates the convolution window. For
+state. It appends candidates after that accepted prefix. Commit updates the
+convolution windows, then sets the slot's count to the records the verify
+read plus the accepted count; it is the count's only writer in a decode round
+and writes it once, in a second launch after every layer has read it. For
 example, after four candidates and two acceptances, the next verify starts
 writing at index two. Generation stamps identify candidates from the current
 round. Eager execution and CUDA graphs use the same page and request-slot
 routing.
 
-Each layer has room for `max(16, effective_verify_width)` records per slot, or
-for `--kda-history-capacity` records when set (at least the verify width): a
-smaller capacity shrinks the request-slot workspace but folds more often. Every
+Each layer has room for `--kda-history-capacity` records per slot, 16 by
+default; it must be at least the effective verify width, so a window wider
+than 16 requires setting it. A verify reads at most the capacity minus its
+width in accepted records. A smaller capacity shrinks the request-slot
+workspace but folds more often. Every
 resident slot holds them, a decode role's extra slots included. When a whole
 candidate window will no longer fit, the accepted updates are folded into the
 dense base before the slot is reused, even for a request whose own window is
-shorter. A change of live page likewise starts from a materialized base. Both
-folds run before the verify forward, in one launch pair for every layer, once
-the metadata refresh has resolved the round's pages
-(`KdaAttnBackend._prepare_retained_history`): verify itself reads only live
-blocks and writes neither a block nor a count. The base uses `--mamba-ssm-dtype`
-(FP32 or BF16). Replay accumulates in FP32 and rounds when it writes the dense
-base.
+shorter. A change of live page likewise starts from a copy of the dense base.
+Both run before the verify forward, in one launch for every layer, once the
+metadata refresh has resolved the round's pages
+(`KdaAttnBackend._prepare_retained_history`), and the launch only reads the
+count H. With a verify window T and the capacity C, H overflows when it lies
+outside `[0, C - T]`: every layer then folds the records into its live block
+(in place when its pages did not move), and verify and commit apply none of
+them (`eff = 0`, else `eff = H`). A request that fits but moves to a new live
+block in a State group gets the source's dense base copied there in that
+group's layers, with no record applied: the records still count from that
+base. Verify itself reads only live blocks and writes neither a block nor a
+count, and the commit derives the new count from `eff`. The base uses
+`--mamba-ssm-dtype` (FP32 or BF16). Replay accumulates in FP32 and rounds
+when it writes the dense base.
 
 Prefill starts from the logical state of its input page, then writes dense
-live and interior checkpoints and clears the rows' counts. A decode commit
-only advances the count, except in the forward that ends the request, which
-folds the records into the live block; a retraction folds them before its
-image is stored (above). A published or imaged block is therefore a
+live and interior checkpoints. Every layer's gather reads the rows' counts,
+which clear once, after the last KDA layer's gather, in a launch ordered
+behind it. A decode commit only advances the count, except in the forward
+that ends the request, which folds the records into the live block; a
+retraction folds them before its image is stored (above). A published or imaged block is therefore a
 self-contained dense checkpoint, and prefill to decode transfer carries it
 unchanged. A recycled slot may still count records of an owner whose end the
 device did not see, so the runtime clears the count whenever a slot gets a

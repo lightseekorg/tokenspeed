@@ -275,7 +275,7 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
     configure_prefill(leaf)
     leaf.cache_pool = SimpleNamespace(
         arena=SimpleNamespace(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
     )
     leaf.forward_metadata = metadata("cuda", 1)
@@ -303,7 +303,7 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
     forward()
     torch.cuda.synchronize()
     ordinary = BreakableCapture(
-        memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
     )
     with ordinary:
         forward()
@@ -313,7 +313,7 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
     forward()
     torch.cuda.synchronize()
     merged = BreakableCapture(
-        memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
     )
     with merged:
         output = forward()
@@ -359,7 +359,7 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
     configure_prefill(backend)
     backend.cache_pool = SimpleNamespace(
         arena=SimpleNamespace(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
     )
     original = metadata("cuda", 1)
@@ -433,13 +433,18 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
     correction.copy_((0.01 * torch.arange(1, 11, device="cuda")).view(10, 1, 1, 1))
     key.fill_(0.02)
     decay.fill_(0.9)
+    # The accepted count every layer shares; this forward's only KDA layer
+    # gathers with it and then clears it.
     length = torch.zeros(10, 1, device="cuda", dtype=torch.int32)
-    backend._retained_lengths = {0: length}
+    backend._replay_length = length
+    backend._state_layer_ids = lambda: [0]
     backend.__dict__.update(
         is_draft=False,
         cache_pool=SimpleNamespace(
             arena=SimpleNamespace(
-                memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    False, device="cuda"
+                )
             )
         ),
         kda_backend=backend_name,
@@ -775,12 +780,14 @@ def test_plain_metadata_norms_the_zero_padded_bucket():
     )
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
-    backend._retained_lengths = {0: torch.zeros(4, 1, device="cuda", dtype=torch.int32)}
+    backend._replay_length = torch.zeros(4, 1, device="cuda", dtype=torch.int32)
     backend.__dict__.update(
         is_draft=False,
         cache_pool=SimpleNamespace(
             arena=SimpleNamespace(
-                memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    False, device="cuda"
+                )
             )
         ),
         kda_backend="auto",
@@ -1340,7 +1347,9 @@ def kimi_host_cache():
     owner = object.__new__(PrefillGraph)
     owner.disable = False
     owner.capture_buckets = [_BUCKET]
-    owner.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+    owner.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     owner.num_warmup = 1
     owner._narrowing = None
     owner._expert_load_rows = None
@@ -1581,7 +1590,7 @@ def test_an_inline_kda_replay_reads_a_loaded_state_after_the_load(kimi_host_cach
     forward()
     torch.cuda.synchronize()
     inline = BreakableCapture(
-        memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
     )
     with maybe_inference_mode(), inline:
         inline_output = forward()

@@ -223,7 +223,9 @@ def test_peer_manager_breakable_graph_replay(device, num_layers):
         with torch.no_grad():
             forward(inputs)
             capture = BreakableCapture(
-                memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    False, device="cuda"
+                )
             )
             with capture:
                 output = forward(inputs)
@@ -314,7 +316,7 @@ def test_owned_loading_and_full_expert_compute(device, quant, num_layers):
         _run_layers(shared, static_inputs, warmup_route, manager)
 
         capture = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
         with torch.no_grad():
             with capture:

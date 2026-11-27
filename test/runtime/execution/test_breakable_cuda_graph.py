@@ -108,7 +108,7 @@ class TestTupleBreakOutputs:
         cap = BreakableCapture(
             pool=pool,
             handoff_storage=storage,
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False),
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda"),
         )
         with active_forward(dummy), cap:
             output, leaves = forward()
@@ -182,7 +182,7 @@ class TestTupleBreakOutputs:
             forward()
         torch.cuda.synchronize()
         cap = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
         with cap:
             output = forward()
@@ -223,7 +223,7 @@ class TestBreakableCudaGraph:
     def _build_capture(self):
         """Capture the same forward with relu as an eager break."""
         cap = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
 
         def forward():
@@ -288,7 +288,7 @@ class TestBreakableCudaGraph:
             forward()
         torch.cuda.synchronize()
         cap = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
         with cap:
             captured_out = forward()
@@ -325,7 +325,7 @@ class TestBreakableCudaGraph:
         torch.cuda.synchronize()
         seen.clear()
         cap = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
         with cap:
             captured_out = forward()
@@ -357,7 +357,7 @@ class TestBreakableCudaGraph:
             return h
 
         cap = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
 
         def forward():
@@ -400,7 +400,7 @@ class TestBreakableCudaGraph:
         dst = torch.empty(3, device=self.dev, dtype=self.dtype)
         cap = BreakableCapture(
             run_segments_while_capturing=True,
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False),
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda"),
         )
         with cap:
             rows = offsets * 10 + 7
@@ -416,11 +416,13 @@ class TestBreakableCudaGraph:
 
     def test_nested_capture_rejected(self):
         with BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         ):
             with pytest.raises((RuntimeError)):
                 with BreakableCapture(
-                    memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+                    memory_saver_adapter=TorchMemorySaverAdapter.create(
+                        False, device="cuda"
+                    )
                 ):
                     pass
 
@@ -503,7 +505,9 @@ class TestBucketedCapture:
             torch.cuda.synchronize()
             cap = BreakableCapture(
                 pool=self._pool,
-                memory_saver_adapter=TorchMemorySaverAdapter.create(False),
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    False, device="cuda"
+                ),
             )
             with cap:
                 out = self._inner(bucket)
@@ -570,7 +574,7 @@ class TestSharedHandoffStorage:
         cap = BreakableCapture(
             pool=pool,
             handoff_storage=storage,
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False),
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda"),
         )
         with cap:
             out = self._inner(n)
@@ -656,7 +660,9 @@ class TestPrefillGraphSharedOutputs:
             TorchMemorySaverAdapter,
         )
 
-        graph.memory_saver_adapter = TorchMemorySaverAdapter.create(False)
+        graph.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            False, device="cuda"
+        )
         graph.num_warmup, graph._pool, graph._ctx = 2, None, None
         graph.capture_buckets, graph.decoder_buckets = [8, 16], []
         graph._narrowing, graph._outputs, graph._handoff_storage = None, None, {}
@@ -760,7 +766,7 @@ class TestBreakPointAndAmbientCtx:
                 outer()
         torch.cuda.synchronize()
         cap = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
         with active_forward(dummy):
             with cap:
@@ -807,7 +813,7 @@ class TestBreakPointAndAmbientCtx:
                 outer()
         torch.cuda.synchronize()
         cap = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
         with active_forward(dummy):
             with cap:
@@ -850,7 +856,7 @@ class TestBreakPointAndAmbientCtx:
                 outer()
         torch.cuda.synchronize()
         cap = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
         with active_forward(dummy):
             with cap:
@@ -889,7 +895,7 @@ class TestBreakPointAndAmbientCtx:
             outer()
         torch.cuda.synchronize()
         cap = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
         with cap:
             captured = outer()
@@ -931,7 +937,7 @@ class TestBreakPointAndAmbientCtx:
             fwd()
         torch.cuda.synchronize()
         cap = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
         with cap:
             captured = fwd()
@@ -1155,7 +1161,10 @@ class TestPoolReuseAcrossCaptures:
             torch.cuda.synchronize()
             before = self._pool_mb()
             cap = BreakableCapture(
-                pool=pool, memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+                pool=pool,
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    False, device="cuda"
+                ),
             )  # shared default capture stream
             with cap:
                 out = fwd(n)
@@ -1246,7 +1255,9 @@ class TestPoolReuseAcrossCaptures:
             cap = BreakableCapture(
                 pool=pool,
                 handoff_storage=handoff_storage,
-                memory_saver_adapter=TorchMemorySaverAdapter.create(False),
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    False, device="cuda"
+                ),
             )
             with cap:
                 fwd(n)
@@ -1273,7 +1284,7 @@ class TestPoolReuseAcrossCaptures:
 )
 def test_breakable_graph_storage_growth_survives_memory_release(case):
     pytest.importorskip("torch_memory_saver")
-    saver = TorchMemorySaverAdapter.create(True)
+    saver = TorchMemorySaverAdapter.create(True, device="cuda")
     with saver.configure_subprocess():
         script = (
             "breakable_graph_memory.py"

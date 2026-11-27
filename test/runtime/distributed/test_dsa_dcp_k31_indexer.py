@@ -1205,7 +1205,9 @@ def _padded_replay_worker(rank, degree, rendezvous):
             backend.begin(capture_table, capture_prefill, device)
             dummy = extend_ctx(backend, pool, capture_prefill)
             capture = BreakableCapture(
-                memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    False, device="cuda"
+                )
             )
             capture.stream.wait_stream(torch.cuda.current_stream())
             with torch.no_grad():

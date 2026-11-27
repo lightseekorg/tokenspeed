@@ -131,7 +131,7 @@ def _capture(drafter, plan, *, entries, num_warmup=1, stream=None, prepare=None)
             series: ladder_from_plan(graphs, entries) for series, graphs in plan.items()
         },
         stream=stream,
-        memory_saver_adapter=TorchMemorySaverAdapter.create(False),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda"),
         num_warmup=num_warmup,
         target_hidden_width=0,
         target_hidden_dtype=torch.bfloat16,

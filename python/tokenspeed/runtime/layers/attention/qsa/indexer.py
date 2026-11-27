@@ -213,11 +213,10 @@ class QSAIndexer(nn.Module):
         the rows whose logical position lies under the published accepted
         frontier (``valid_cache_len + accept_len``)."""
 
-        request_rows = request_indices.to(torch.long)
         frontier = (
             accepted_seq_lens[: ctx.bs]
             .to(logical_positions.dtype)
-            .index_select(0, request_rows)
+            .index_select(0, request_indices)
         )
         return (recent_locs > 0) & (
             (request_indices < ctx.num_extends) | (logical_positions < frontier)

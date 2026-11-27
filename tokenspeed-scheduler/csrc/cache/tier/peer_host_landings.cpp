@@ -50,6 +50,16 @@ std::size_t PeerHostLandings::NumHeldHostBlocks() const {
     return held;
 }
 
+std::vector<const CacheBlockRef*> PeerHostLandings::HeldHostBlockRefs() const {
+    std::vector<const CacheBlockRef*> refs;
+    for (const auto& [id, landing] : landings_) {
+        for (const CacheBlockRef& block : landing.host_blocks) {
+            if (block) refs.push_back(&block);
+        }
+    }
+    return refs;
+}
+
 std::optional<PeerHostLandings::Started> PeerHostLandings::Start(const PromptPrefix& prompt,
                                                                  const std::string& request_id,
                                                                  const PeerLeaseId& lease, const std::string& holder,

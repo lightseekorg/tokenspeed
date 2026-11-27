@@ -91,10 +91,14 @@ bool enable_async_host_peer(tokenspeed::Scheduler& scheduler);
 bool enable_async_device_peer(tokenspeed::Scheduler& scheduler, bool adaptive);
 rust::Vec<PeerFetchView> reserve_peer_host(tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease, std::int32_t tokens, bool& retry);
 bool apply_peer_export(tokenspeed::Scheduler& scheduler, const PeerEventView& event, std::int64_t now_us);
+bool pin_peer_offer(tokenspeed::Scheduler& scheduler, const PeerEventView& event, std::int64_t now_us);
+bool close_peer_offer(tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease, std::int64_t now_us);
 rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler);
-PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup);
+PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup,
+                                  std::size_t pending_new_leases);
 bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup, std::int32_t num_tokens,
                       rust::Slice<const PeerPageView> pages);
+bool peer_lease_can_pin(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease);
 bool peer_lease_held(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease);
 std::int64_t plan_calls(const tokenspeed::Scheduler& scheduler);
 rust::Vec<PinSampleView> take_peer_pin_samples(tokenspeed::Scheduler& scheduler);
@@ -143,6 +147,7 @@ bool can_clear_cache_retaining_storage(const tokenspeed::Scheduler& scheduler);
 bool clear_cache_retaining_storage(tokenspeed::Scheduler& scheduler);
 bool storage_has_retained_operations(const tokenspeed::Scheduler& scheduler);
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler);
+bool can_clear_l1_cache(const tokenspeed::Scheduler& scheduler);
 bool can_clear_cache(const tokenspeed::Scheduler& scheduler);
 std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler);
 rust::Vec<SharedL2LookupView> start_shared_l2_lookups(tokenspeed::Scheduler& scheduler);
@@ -151,6 +156,7 @@ rust::Vec<SharedL2ProxyBlockView> apply_shared_l2_answers(tokenspeed::Scheduler&
 rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<rust::String> plan_completed_prompts(const tokenspeed::ExecutionPlan& plan);
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan);
+bool plan_has_pages_to_copy(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_decode(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_prefill(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<TransferBatchView> plan_forward_transfer(const tokenspeed::ExecutionPlan& plan);

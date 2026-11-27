@@ -464,7 +464,7 @@ class TestGdnStateCheckpointInForward:
         spare = torch.tensor([[61, 62]], dtype=torch.int32, device="cuda")
         self._init_metadata(backend, [3], 0, bucket, spare, [0])
         capture = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
         with capture:
             layer()

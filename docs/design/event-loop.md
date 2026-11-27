@@ -635,10 +635,10 @@ Consequences:
 
 ## Principle 3: scheduler feedback is explicit and centralized
 
-The scheduler advances in exactly two places, both in `EventLoop::round`
-itself — never in a helper or subsystem. Helpers RETURN their events, or push
-them into the round's `events` list. Reading the round alone must reveal
-every point where the scheduler's state advances, and why:
+The scheduler advances at three explicit points in `EventLoop` — never hidden
+inside a subsystem. Helpers RETURN their events, or push them into the round's
+`events` list. Reading `EventLoop` must reveal every point where the
+scheduler's state advances, and why:
 
 * **Head of the round** — completed Host cache ops (`CacheOps::acknowledged`:
   `WriteBackDone`, `LoadBackDone`, `SnapshotDone`, `RestoreDone`, each
@@ -656,9 +656,17 @@ every point where the scheduler's state advances, and why:
 * **Tail of the round** — forward results and PD transfer events, funneled
   through the round's single `events` list, through `advance`; all events
   must advance before the *next* round plans.
+* **Peer holder synchronization** — in coordinated mode, after a lock-release
+  window where `ts-peer-servicer` may have answered `Lookup`/`Pin`/`Release`
+  RPCs (`warm_up`, `gate()` when single-member with no in-flight forward or
+  unconfirmed device copy batch, and `finish_drain`), `sync_peer_holder_changes`
+  drains queued holder events and applies them through `advance_peer` before
+  the next plan or cache clear runs. Single-member replicas in autonomous mode
+  apply holder exports directly on the peer worker thread without using this
+  point.
 
 Anything that produces scheduler events (a new transfer backend, a new async
-op kind) either returns events into one of these two points or adds a new
+op kind) either returns events into one of these points or adds a new
 explicit call site in `round` with a comment stating why the existing points
 don't fit. It must not advance the scheduler itself.
 
@@ -876,9 +884,13 @@ address used by EPD. A release is refused while transfers are in
 flight, and refused for a paused PD engine with buffered requests, whose
 transfers cannot drain until those requests are admitted; their transfer
 registration is deferred until resume admits them, and aborted buffered
-requests never register one. An empty memory-resume request is a successful
+requests never register one. An explicit empty release list is refused before
+the scheduler drains. Omitting the list releases all configured regions.
+An empty memory-resume request is a successful
 no-op while a drain is pending; it preserves that drain's admission hold
 until the owning pause or memory-release operation finishes.
+
+The following memory-release and NCCL coordination uses protocol 2.
 
 With attention DP, memory release waits for every rank to stop admissions
 and drain its requests, forwards, cancelled embedding receives, cache copies,
@@ -946,6 +958,29 @@ Until all regions are restored on every rank, it withholds forward permission
 through the scheduler's storage tick and suppresses idle forwards. This covers
 staggered and partial resumes without building a batch that cannot execute;
 control operations and cache acknowledgments continue to progress.
+
+**Coordinated memory transitions (protocol 3)** extend the same control gate
+from 12 columns under protocol 2 to 15. The three added values coordinate
+call readiness, cancellation and timeout over the replica, or the existing
+attention-DP domain when present, including shared MoE TP/EP. All members
+must match direction, canonical tags and any transition ID before pause or
+allocator changes. Normal and idle forwards can progress while a call waits
+for missing participants. Cancellation and timeout refuse the whole observed
+batch at that gate; cancellation preserves the current device mappings.
+
+Release checks device prerequisites before its drain and again after the
+domain drains requests, forwards, cache work and PD transfers. Every stage
+must retire its KV transfers before source KV is released. Readiness is MIN-reduced directly
+over this domain. All members must report L1 clearability before any index
+is cleared; resume checks local prerequisites, including valid weights before
+KV wake. Successful tags and replies are published only after every member
+confirms device completion. A device-apply failure or L1-clear failure after
+readiness agreement is fatal to the entire domain through the host failure
+path, including otherwise healthy ranks; deployment supervision owns recovery.
+
+Protocol selection, startup compatibility, the timeout/retry contract and
+NCCL participation requirements are defined in the
+[memory-transition serving contract](../serving/ascend-memory-saver.md#memory-transition-protocol).
 
 **The same-round gate** (`EventLoop::gate`, every round on every rank).
 Weight-update `flush_cache` and a standalone flush first MAX-reduce

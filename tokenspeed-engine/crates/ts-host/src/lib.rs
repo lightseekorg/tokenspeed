@@ -86,6 +86,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// to connect.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(600);
 
+// Protocol 3 extends weight-load agreement with replica-wide memory transitions.
+const WEIGHT_UPDATE_PROTOCOL: u32 = 2;
+const WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL: u32 = 3;
+
 /// Collective group ids. Replicas are disjoint, and so are pipelines, so each
 /// kind shares one id.
 const DP_GROUP: u32 = 0;
@@ -520,6 +524,7 @@ impl HostConfig {
         config: &Bound<'_, PyAny>,
         requires_bootstrap: bool,
         role: Role,
+        replica_memory_transitions: bool,
     ) -> PyResult<Self> {
         let l3 = {
             let l3 = config.getattr("l3")?;
@@ -607,7 +612,9 @@ impl HostConfig {
             collective_bind_host: config.getattr("collective_bind_host")?.extract()?,
             controls: ControlConfig {
                 memory_saver: config.getattr("memory_saver")?.extract()?,
+                replica_memory_transitions,
                 memory_regions: config.getattr("memory_regions")?.extract()?,
+                backup_device_kv: config.getattr("backup_device_kv")?.extract()?,
                 // With L3, its namespace's weight version; peer sharing,
                 // which excludes L3, sets its own in `serve`.
                 shared_weight_version: l3.as_ref().map(|l3| l3.weight_version.clone()),
@@ -729,6 +736,32 @@ fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Select the rank's memory protocol before Python initializes the device.
+fn bootstrap_worker<'py>(
+    runtime: &Bound<'py, pyo3::types::PyModule>,
+    control_fd: i32,
+    outbox: &Bound<'py, PyAny>,
+    host_spans: &Bound<'py, PyAny>,
+    peer_outbox: &Bound<'py, PyAny>,
+    shared_l2_handle: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, bool)> {
+    let prepared = runtime.call_method1("prepare_bootstrap", (control_fd,))?;
+    let (replica_memory_transitions, start): (bool, Py<PyAny>) = prepared.extract()?;
+    let protocol = if replica_memory_transitions {
+        WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL
+    } else {
+        WEIGHT_UPDATE_PROTOCOL
+    };
+    let bootstrap = start.bind(runtime.py()).call1((
+        outbox,
+        protocol,
+        host_spans,
+        peer_outbox,
+        shared_l2_handle,
+    ))?;
+    Ok((bootstrap, replica_memory_transitions))
+}
+
 fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     let cache_writer = args
         .cache_events
@@ -744,36 +777,34 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
-    let (bootstrap, outbox, peer_outbox, shared_l2_handle, mode) = Python::attach(|py| {
-        let built = (|| {
-            let outbox = Bound::new(py, pd::Outbox::new())?;
-            let peer_outbox = Bound::new(py, peer::Outbox::new())?;
-            let shared_l2_handle = Bound::new(py, shared_l2::Handle::new())?;
-            let host_spans = Bound::new(py, host_spans::HostSpans)?;
-            let bootstrap = py
-                .import("tokenspeed.runtime.engine.rust_host")?
-                .call_method1(
-                    "bootstrap",
-                    (
-                        args.control_fd,
-                        outbox.clone(),
-                        2_u32,
-                        host_spans,
-                        peer_outbox.clone(),
-                        shared_l2_handle.clone(),
-                    ),
+    let (bootstrap, outbox, peer_outbox, shared_l2_handle, mode, replica_memory_transitions) =
+        Python::attach(|py| {
+            let built = (|| {
+                let outbox = Bound::new(py, pd::Outbox::new())?;
+                let peer_outbox = Bound::new(py, peer::Outbox::new())?;
+                let shared_l2_handle = Bound::new(py, shared_l2::Handle::new())?;
+                let host_spans = Bound::new(py, host_spans::HostSpans)?;
+                let runtime = py.import("tokenspeed.runtime.engine.rust_host")?;
+                let (bootstrap, replica_memory_transitions) = bootstrap_worker(
+                    &runtime,
+                    args.control_fd,
+                    outbox.as_any(),
+                    host_spans.as_any(),
+                    peer_outbox.as_any(),
+                    shared_l2_handle.as_any(),
                 )?;
-            let mode: String = bootstrap.getattr("mode")?.extract()?;
-            Ok((
-                bootstrap.unbind(),
-                outbox.unbind(),
-                peer_outbox.unbind(),
-                shared_l2_handle.unbind(),
-                mode,
-            ))
-        })();
-        built.map_err(|error| python_error(py, error))
-    })?;
+                let mode: String = bootstrap.getattr("mode")?.extract()?;
+                Ok((
+                    bootstrap.unbind(),
+                    outbox.unbind(),
+                    peer_outbox.unbind(),
+                    shared_l2_handle.unbind(),
+                    mode,
+                    replica_memory_transitions,
+                ))
+            })();
+            built.map_err(|error| python_error(py, error))
+        })?;
     if mode == "encode" {
         let result = encode::serve(bootstrap, &stop);
         Python::attach(|py| {
@@ -820,8 +851,12 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                     transfer_metrics,
                 )?;
                 let role = peers.role;
-                let mut config =
-                    HostConfig::from_python(&python_config, peers.transfer.is_some(), role)?;
+                let mut config = HostConfig::from_python(
+                    &python_config,
+                    peers.transfer.is_some(),
+                    role,
+                    replica_memory_transitions,
+                )?;
                 if let Some(peer) = &peer_sharing {
                     config.controls.shared_weight_version = Some(peer.weight_version().to_owned());
                 }
@@ -1153,7 +1188,9 @@ fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyRe
     // Reject explicit incompatible settings before any Python model bootstrap.
     let cache_events = cache_events::Settings::from_env(enable_async_logging)
         .map_err(pyo3::exceptions::PyValueError::new_err)?;
-    py.detach(|| {
+    // Triton-Ascend exit handlers may release Python objects even without memory saving.
+    let restore_gil_for_exit = std::env::var("TS_HOST_DEVICE").as_deref() == Ok("npu");
+    let code = py.detach(|| {
         let args = Args {
             control_fd,
             enable_async_logging,
@@ -1182,8 +1219,14 @@ fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyRe
         // process::exit skips Rust drops and Python finalization. Drain native
         // logging explicitly; stuck Python threads must not keep a rank alive.
         drop(log_guard);
-        std::process::exit(code)
-    })
+        if !restore_gil_for_exit {
+            std::process::exit(code);
+        }
+        code
+    });
+    // Returning through detach restores the calling Python thread's saved
+    // state and GIL before native Ascend exit handlers can release objects.
+    std::process::exit(code)
 }
 
 /// Cache observation protocol implemented by the linked native scheduler.

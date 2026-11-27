@@ -714,6 +714,10 @@ mod ffi {
         LookupAnswered,
         /// Reader: a landing's outcome (`cache::PeerFetchDone`).
         FetchDone,
+        /// Business fallback while the independently retained target may still be written.
+        FetchFrozen,
+        /// All members certified retirement of a previously frozen target.
+        TargetRetired,
     }
 
     /// A peer event the replica agreed on. Fields other kinds do not use
@@ -972,14 +976,29 @@ mod ffi {
             event: &PeerEventView,
             now_us: i64,
         ) -> Result<bool>;
+        fn pin_peer_offer(
+            scheduler: Pin<&mut Scheduler>,
+            event: &PeerEventView,
+            now_us: i64,
+        ) -> Result<bool>;
+        fn close_peer_offer(
+            scheduler: Pin<&mut Scheduler>,
+            lease: &PeerLeaseView,
+            now_us: i64,
+        ) -> Result<bool>;
         fn take_peer_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<PeerLookupView>;
-        fn answer_peer_lookup(scheduler: &Scheduler, lookup: &PeerEventView) -> PeerAnswerView;
+        fn answer_peer_lookup(
+            scheduler: &Scheduler,
+            lookup: &PeerEventView,
+            pending_new_leases: usize,
+        ) -> PeerAnswerView;
         fn peer_pages_match(
             scheduler: &Scheduler,
             lookup: &PeerEventView,
             num_tokens: i32,
             pages: &[PeerPageView],
         ) -> bool;
+        fn peer_lease_can_pin(scheduler: &Scheduler, lease: &PeerLeaseView) -> bool;
         fn peer_lease_held(scheduler: &Scheduler, lease: &PeerLeaseView) -> bool;
         fn plan_calls(scheduler: &Scheduler) -> i64;
         fn take_peer_pin_samples(scheduler: Pin<&mut Scheduler>) -> Vec<PinSampleView>;
@@ -1040,6 +1059,7 @@ mod ffi {
         fn clear_cache_retaining_storage(scheduler: Pin<&mut Scheduler>) -> bool;
         fn storage_has_retained_operations(scheduler: &Scheduler) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn can_clear_l1_cache(scheduler: &Scheduler) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
         fn start_shared_l2_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<SharedL2LookupView>;
@@ -1051,6 +1071,7 @@ mod ffi {
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_completed_prompts(plan: &ExecutionPlan) -> Vec<String>;
         fn plan_needs_device(plan: &ExecutionPlan) -> bool;
+        fn plan_has_pages_to_copy(plan: &ExecutionPlan) -> bool;
         fn plan_remote_decode(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_remote_prefill(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_forward_transfer(plan: &ExecutionPlan) -> Vec<TransferBatchView>;
@@ -1395,15 +1416,39 @@ impl Scheduler {
         ffi::apply_peer_export(self.pinned(), event, now_us)
     }
 
+    /// Acquire one exact v1 member ticket, isolated from legacy timers.
+    pub fn pin_peer_offer(
+        &mut self,
+        event: &PeerEventView,
+        now_us: i64,
+    ) -> Result<bool, cxx::Exception> {
+        ffi::pin_peer_offer(self.pinned(), event, now_us)
+    }
+
+    /// Release this member's exact v1 ticket without demoting the source.
+    pub fn close_peer_offer(
+        &mut self,
+        lease: &PeerLeaseView,
+        now_us: i64,
+    ) -> Result<bool, cxx::Exception> {
+        ffi::close_peer_offer(self.pinned(), lease, now_us)
+    }
+
     /// A reader's lookups since the last take, to send to their holders.
     pub fn take_peer_lookups(&mut self) -> Vec<PeerLookupView> {
         ffi::take_peer_lookups(self.pinned())
     }
 
     /// A holder's answer to `lookup` (a [`PeerEventKind::Lookup`] event),
-    /// read from the cache as it stands; it changes nothing.
-    pub fn answer_peer_lookup(&self, lookup: &PeerEventView) -> PeerAnswerView {
-        ffi::answer_peer_lookup(self.get(), lookup)
+    /// read from the cache as it stands; it changes nothing. Bounded by the
+    /// `pending_new_leases` unsynced lookup hits already queued in the holder
+    /// servicer.
+    pub fn answer_peer_lookup_bounded(
+        &self,
+        lookup: &PeerEventView,
+        pending_new_leases: usize,
+    ) -> PeerAnswerView {
+        ffi::answer_peer_lookup(self.get(), lookup, pending_new_leases)
     }
 
     /// Whether `lookup`'s prompt, up to `num_tokens`, still resolves to
@@ -1415,6 +1460,11 @@ impl Scheduler {
         pages: &[PeerPageView],
     ) -> bool {
         ffi::peer_pages_match(self.get(), lookup, num_tokens, pages)
+    }
+
+    /// Whether `lease` still holds an active soft pin eligible to become hard.
+    pub fn peer_lease_can_pin(&self, lease: &PeerLeaseView) -> bool {
+        ffi::peer_lease_can_pin(self.get(), lease)
     }
 
     /// Whether `lease`'s pin holds its pages now.
@@ -1609,6 +1659,11 @@ impl Scheduler {
     /// Drop the Device L1 prefix index only, under the same refusals.
     pub fn clear_l1_cache(&mut self) -> bool {
         ffi::clear_l1_cache(self.pinned())
+    }
+
+    /// Whether [`Scheduler::clear_l1_cache`] would succeed now; changes nothing.
+    pub fn can_clear_l1_cache(&self) -> bool {
+        ffi::can_clear_l1_cache(self.get())
     }
 
     /// Whether current references permit a full clear, without cancelling
@@ -1860,6 +1915,13 @@ impl ExecutionPlan {
     /// the pool client's, not the data plane's.
     pub fn needs_device(&self) -> bool {
         ffi::plan_needs_device(&self.0)
+    }
+
+    /// Whether the plan relocates or copies any Device cache blocks
+    /// (`pages_to_copy`), whose destinations enter `PrefixCacheIndex` during
+    /// `next_execution_plan` before `copy_cache_pages` runs on the device.
+    pub fn has_pages_to_copy(&self) -> bool {
+        ffi::plan_has_pages_to_copy(&self.0)
     }
 
     /// P role: the prompts whose KV goes to their decode node now.

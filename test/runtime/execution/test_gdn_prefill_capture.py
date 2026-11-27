@@ -194,7 +194,7 @@ def test_admission_follows_the_selected_scan():
     backend = _backend(writes_state_checkpoints_in_forward=False)
     backend.cache_pool = SimpleNamespace(
         arena=SimpleNamespace(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
     )
     assert backend.admits_prefill_graph(512, 1, ForwardMode.EXTEND) == _capturable()
@@ -227,7 +227,7 @@ def test_uncaptured_shapes_keep_the_scheduler_metadata():
     backend = _backend(writes_state_checkpoints_in_forward=False)
     backend.cache_pool = SimpleNamespace(
         arena=SimpleNamespace(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
     )
     if not backend.admits_prefill_graph(512, 1, ForwardMode.EXTEND):
@@ -245,7 +245,7 @@ def test_outer_graph_replays_gdn_lengths_pages_and_states(batch_size):
     backend = _backend(writes_state_checkpoints_in_forward=False)
     backend.cache_pool = SimpleNamespace(
         arena=SimpleNamespace(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
     )
     if not backend.admits_prefill_graph(2048, batch_size, ForwardMode.EXTEND):
@@ -370,7 +370,7 @@ class _StatePool:
 
     def __init__(self, slabs, prefix_granularity=PAGE):
         self.arena = SimpleNamespace(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False),
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda"),
             runtime_contract=SimpleNamespace(
                 prefix_granularity=prefix_granularity,
                 group_specs=(SimpleNamespace(group_id="state", attn_kind="state"),),
@@ -701,7 +701,7 @@ def test_qwen4_exp_composite_captures_gdn_inline_around_full_attention():
         forward()
         torch.cuda.synchronize()
         graph = BreakableCapture(
-            memory_saver_adapter=TorchMemorySaverAdapter.create(False)
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
         )
         with active_forward(ctx), graph:
             output = forward()

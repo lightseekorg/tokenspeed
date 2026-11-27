@@ -305,9 +305,21 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
         const std::int32_t on_disk = node->ClosedEntries(BoundaryTree::kDisk);
         _assert(on_device <= expected && on_host <= expected && on_disk <= expected,
                 "a boundary's history entries lie among its keys");
-        return {.device_publishable = on_device == expected,
-                .host_publishable = on_host == expected,
-                .disk_publishable = on_disk == expected,
+        // On hybrid State+History models with a Disk tier, large State (e.g.
+        // KDA) checkpoints can evict from Host L2 to Disk while History (MLA)
+        // blocks stay in Host/Device RAM. Any prefix hitting such a boundary
+        // MUST read State from Disk (ListWithDisk), so report Disk residency
+        // rather than RAM-only residency to prevent routers from bypassing
+        // Disk cost pricing, outbound Disk-push caps, and Disk kill-switches.
+        const bool state_disk_only =
+            store_.NumStateGroups() > 0 && store_.DiskPool() != nullptr &&
+            (node->IsStateDiskOnly() ||
+             (!node->HasRamCheckpointInProperSubtree() && node->PendingCheckpointStores() == 0 &&
+              node->StateEntries(BoundaryTree::kDisk) > 0 && !HoldsStateCheckpoint(boundary.content_hash)));
+        const bool any_history = on_device == expected || on_host == expected || on_disk == expected;
+        return {.device_publishable = on_device == expected && !state_disk_only,
+                .host_publishable = on_host == expected && !state_disk_only,
+                .disk_publishable = on_disk == expected || (state_disk_only && any_history),
                 .retains_descriptor = retains_descriptor};
     }
     // No continuous history means no ordinary prefix-residency events.

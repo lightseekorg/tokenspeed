@@ -131,6 +131,7 @@ def _qsa_pool(*, device: str, layer_offset: int) -> MHATokenToKVPool:
         num_layers=4,
         num_lcm_blocks=3,
         kv_head_dim=2,
+        enable_memory_saver=False,
     )
 
 
@@ -655,12 +656,12 @@ def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
             assert args[0].tolist() == [8, 12]
             assert args[1].tolist() == [3, 4]
             logical = torch.tensor([5, 6, 7, 8, 9, 10, 11])
-            requests = torch.tensor([0, 0, 0, 1, 1, 1, 1])
+            requests = torch.tensor([0, 0, 0, 1, 1, 1, 1], dtype=torch.int32)
         else:
             assert args[0].tolist() == [8, 10]
             assert args[1] == 1
             logical = torch.tensor([7, 9])
-            requests = torch.tensor([0, 1])
+            requests = torch.tensor([0, 1], dtype=torch.int32)
         slots = torch.ones(logical.shape, dtype=torch.int32)
         return logical, requests, slots, slots, slots
 

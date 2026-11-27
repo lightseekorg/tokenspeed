@@ -39,7 +39,7 @@ class Scale:
 
 @torch.inference_mode()
 def main():
-    saver = TorchMemorySaverAdapter.create(True)
+    saver = TorchMemorySaverAdapter.create(True, device="cuda")
     storage, captures, pool = {}, [], None
     with saver.region(tag="weights", enable_cpu_backup=True):
         weight = torch.ones(16, device="cuda")
@@ -183,6 +183,7 @@ def prefill_config():
         output_length=1,
         enforce_eager=False,
         enable_dp_local_cuda_graph=False,
+        acl_graph_memory_policy="discard",
         prefix_granularity=1,
         max_num_seqs=2,
         chunked_prefill_size=32,
