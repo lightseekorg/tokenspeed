@@ -360,7 +360,7 @@ class TestCacheContractMetadataTest:
             *_mamba_config_pair(torch, heads=16, head_dim=128, spec_tokens=1)
         )
         stub_pool = _ContractPool(
-            {0: ("linear_attention", torch.zeros(8, 3), torch.zeros(8, 5))},
+            {0: ("linear_attention", torch.zeros(2, 3), torch.zeros(2, 5))},
         )
         backend.set_kv_pool(stub_pool)
         assert backend.state_paging_active
@@ -1624,13 +1624,6 @@ class TestPrefillStateGuardPagesGPUTest:
         bs = len(rows)
         lens_cpu = torch.tensor(lens, dtype=torch.int32)
         prefix_cpu = torch.tensor(prefix, dtype=torch.int32)
-        # Pass in-range placeholders through init_forward_metadata, then pin
-        # the resolved tensors to the ids under test so this suite directly
-        # exercises the kernel-side arena guard.
-        safe_rows = [
-            [1 if p else 0, i + 2] + ([1] if checkpoint else [])
-            for i, p in enumerate(prefix)
-        ]
         backend.init_forward_metadata(
             bs=bs,
             num_extends=bs,
@@ -1638,13 +1631,15 @@ class TestPrefillStateGuardPagesGPUTest:
             seq_lens=(prefix_cpu + lens_cpu).cuda(),
             forward_mode=self.ForwardMode.EXTEND,
             block_tables={
-                self.GROUP: torch.tensor(safe_rows, dtype=torch.int32, device="cuda")
+                self.GROUP: torch.tensor(rows, dtype=torch.int32, device="cuda")
             },
             extend_state_checkpoint_lens_cpu=(
                 torch.full((bs,), checkpoint, dtype=torch.int32) if checkpoint else None
             ),
             **_extend_kwargs(torch, lens_cpu, prefix_cpu, "cuda"),
         )
+        # Pin the resolved blocks to the ids under test: the two-slot resolve
+        # falls back to the live block when the input slot is not positive.
         metadata = backend.forward_metadata
         for resolved, column in (
             (metadata.state_in_blocks_by_group, 0),
@@ -1652,10 +1647,6 @@ class TestPrefillStateGuardPagesGPUTest:
         ):
             resolved[self.GROUP].copy_(
                 torch.tensor([row[column] for row in rows], dtype=torch.int32)
-            )
-        if checkpoint:
-            metadata.state_checkpoints.blocks_by_group[self.GROUP].copy_(
-                torch.tensor([row[2] for row in rows], dtype=torch.int32)
             )
         staged = []
         prepare = backend._prepare_prefill_state_inputs
@@ -1916,7 +1907,7 @@ class TestReplayStateTapeGPUTest:
 
 
 class TestHostStateBlockBoundsTest:
-    """Always-on zero-GPU-sync host bounds check in MambaAttnBackend.init_forward_metadata."""
+    """Pool-vs-contract bounds checks, debug validation, and zero-sync CPU decode/verify bounds."""
 
     GROUP = "linear_attention"
 
@@ -1963,100 +1954,38 @@ class TestHostStateBlockBoundsTest:
         )
         return backend
 
-    def _extend_call(self, rows, *, device="cpu", host_table="mirror"):
+    def test_debug_mode_init_forward_metadata_bounds_against_min_pool_capacity(
+        self, monkeypatch
+    ):
         torch = self.torch
-        bs = len(rows)
-        lens_cpu = torch.full((bs,), 64, dtype=torch.int32)
-        prefix_cpu = torch.tensor(
-            [64 if row[0] > 0 else 0 for row in rows], dtype=torch.int32
-        )
-        table_cpu = torch.tensor(rows, dtype=torch.int32)
-        kwargs = dict(
-            bs=bs,
-            num_extends=bs,
-            req_pool_indices=torch.arange(1, bs + 1, dtype=torch.int32, device=device),
-            seq_lens=(prefix_cpu + lens_cpu).to(device=device),
-            forward_mode=self.ForwardMode.EXTEND,
-            block_tables={self.GROUP: table_cpu.to(device=device)},
-            **_extend_kwargs(torch, lens_cpu, prefix_cpu, device),
-        )
-        if host_table == "mirror":
-            kwargs["block_tables_cpu"] = {self.GROUP: table_cpu}
-        elif host_table is not None:
-            kwargs["block_tables_cpu"] = {self.GROUP: host_table}
-        return kwargs
-
-    def test_bounds_and_min_capacity_without_debug_flag(self):
         backend = self._make_backend(num_blocks=12, ssm_blocks=10)
-        backend.init_forward_metadata(**self._extend_call([[-1, -1], [0, 4], [3, 9]]))
-        md = backend.forward_metadata
-        assert md.state_in_blocks_by_group[self.GROUP].tolist() == [0, 0, 3]
-        assert md.state_out_blocks_by_group[self.GROUP].tolist() == [-1, 4, 9]
-        for host_table in ("mirror", None):
-            for bad_rows, expected in (
-                ([[10, 4]], "row 0, slot 0 is 10"),
-                ([[0, 10]], "row 0, slot 1 is 10"),
-                ([[0, 4, 10]], "row 0, slot 2 is 10"),
-                ([[-2, 4]], "row 0, slot 0 is -2"),
-            ):
-                with pytest.raises(ValueError, match=expected):
-                    backend.init_forward_metadata(
-                        **self._extend_call(bad_rows, host_table=host_table)
-                    )
+        assert backend._state_group_num_blocks == {self.GROUP: 10}
 
-    def test_host_table_contract(self):
-        torch = self.torch
-        backend = self._make_backend(num_blocks=10)
-        with pytest.raises(ValueError, match="disagrees with device table shape"):
-            backend.init_forward_metadata(
-                **self._extend_call(
-                    [[0, 4, 5]],
-                    host_table=torch.tensor([[0, 4]], dtype=torch.int32),
-                )
+        def _extend_kwargs_for(rows):
+            bs = len(rows)
+            lens_cpu = torch.full((bs,), 64, dtype=torch.int32)
+            prefix_cpu = torch.tensor(
+                [64 if row[0] > 0 else 0 for row in rows], dtype=torch.int32
             )
-        with pytest.raises(ValueError, match="must use int32"):
-            backend.init_forward_metadata(
-                **self._extend_call(
-                    [[0, 4]],
-                    host_table=torch.tensor([[0, 4]], dtype=torch.int64),
-                )
+            return dict(
+                bs=bs,
+                num_extends=bs,
+                req_pool_indices=torch.arange(1, bs + 1, dtype=torch.int32),
+                seq_lens=prefix_cpu + lens_cpu,
+                forward_mode=self.ForwardMode.EXTEND,
+                block_tables={self.GROUP: torch.tensor(rows, dtype=torch.int32)},
+                **_extend_kwargs(torch, lens_cpu, prefix_cpu, "cpu"),
             )
-        partial_call = self._extend_call([[0, 4]], host_table=None)
-        partial_call["block_tables_cpu"] = {
-            "other_group": torch.tensor([[0, 4]], dtype=torch.int32)
-        }
-        with pytest.raises(ValueError, match="is missing group"):
-            backend.init_forward_metadata(**partial_call)
 
-    def test_cuda_host_table_zero_gpu_sync(self):
-        torch = self.torch
-        if not torch.cuda.is_available():
-            pytest.skip("needs a CUDA device")
-        backend = self._make_backend(device="cuda", num_blocks=10)
-        backend.init_forward_metadata(**self._extend_call([[0, 4]], device="cuda"))
-        valid_call = self._extend_call([[-1, -1], [0, 4], [2, 9]], device="cuda")
-        oob_call = self._extend_call([[0, 4], [2, 10]], device="cuda")
-        torch.cuda.synchronize()
-        previous = torch.cuda.get_sync_debug_mode()
-        try:
-            torch.cuda.set_sync_debug_mode("error")
-            backend.init_forward_metadata(**valid_call)
-            with pytest.raises(ValueError, match="row 1, slot 1 is 10"):
-                backend.init_forward_metadata(**oob_call)
-        finally:
-            torch.cuda.set_sync_debug_mode(previous)
-        with pytest.raises(ValueError, match="must be a CPU tensor"):
-            backend.init_forward_metadata(
-                **self._extend_call(
-                    [[0, 4]],
-                    device="cuda",
-                    host_table=torch.tensor([[0, 4]], dtype=torch.int32, device="cuda"),
-                )
-            )
-        with pytest.raises(ValueError, match="row 0, slot 1 is 10"):
-            backend.init_forward_metadata(
-                **self._extend_call([[0, 10]], device="cuda", host_table=None)
-            )
+        monkeypatch.setenv("TOKENSPEED_CACHE_DEBUG", "1")
+        backend.init_forward_metadata(**_extend_kwargs_for([[0, 9], [3, 8]]))
+        for bad_rows, expected in (
+            ([[10, 4]], "row 0, slot 0 is 10"),
+            ([[0, 10]], "row 0, slot 1 is 10"),
+            ([[-2, 4]], "row 0, slot 0 is -2"),
+        ):
+            with pytest.raises(ValueError, match=expected):
+                backend.init_forward_metadata(**_extend_kwargs_for(bad_rows))
 
     def test_publish_cache_pool_rejects_pool_smaller_than_contract(self):
         torch = self.torch

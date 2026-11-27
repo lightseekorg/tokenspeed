@@ -912,13 +912,15 @@ def packed_block_tables_from_forward_op(
         ValueError: If strict contract validation or a row span fails before
             device transfer.
     """
-    if max_page_id is not None and max_page_ids is not None:
-        raise ValueError("pass max_page_id or max_page_ids, not both")
-    if required_max_page_ids is not None and (
-        max_page_id is not None or max_page_ids is not None
+    if (
+        sum(
+            arg is not None
+            for arg in (max_page_id, max_page_ids, required_max_page_ids)
+        )
+        > 1
     ):
         raise ValueError(
-            "pass required_max_page_ids alone, not with max_page_id or max_page_ids"
+            "pass at most one of max_page_id, max_page_ids, or required_max_page_ids"
         )
     strict_validation = (
         expected_group_ids is not None

@@ -90,7 +90,6 @@ from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
     compute_state_block_indices,
     in_forward_state_checkpoints,
     scan_checkpoint_plan,
-    validate_state_block_table_bounds,
 )
 from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
 from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
@@ -1045,71 +1044,6 @@ class MambaAttnBackend(AttentionBackend):
             state_out_blocks[group_id] = state_out
         return state_in_blocks, state_out_blocks
 
-    def _validate_state_block_bounds(
-        self,
-        bs: int,
-        block_tables: Mapping[str, torch.Tensor],
-        block_tables_cpu: Mapping[str, torch.Tensor] | None,
-    ) -> None:
-        """Always-on pool bounds check on state block tables.
-
-        When ``block_tables_cpu`` supplies pinned host mirrors, checks every
-        state group on CPU before launching any GPU kernel (zero GPU sync) and
-        rejects partial maps that omit a state group. When a caller omits
-        ``block_tables_cpu`` altogether, checks the delivered device tables
-        directly so out-of-range block IDs always fail fast in normal runtime
-        without requiring any debug flag.
-        """
-        group_num_blocks = self._state_group_num_blocks
-        if not group_num_blocks:
-            return
-        if not block_tables_cpu:
-            for group_id in self._state_group_ids:
-                num_blocks = group_num_blocks.get(group_id)
-                if num_blocks is None:
-                    continue
-                device_rows = self._state_rows(block_tables, group_id)
-                validate_state_block_table_bounds(
-                    device_rows[:bs], num_blocks=num_blocks, group_id=group_id
-                )
-            return
-        for group_id in self._state_group_ids:
-            if group_id in group_num_blocks and group_id not in block_tables_cpu:
-                raise ValueError(
-                    f"state paging: block_tables_cpu is missing group {group_id!r}"
-                )
-        for group_id in self._state_group_ids:
-            num_blocks = group_num_blocks.get(group_id)
-            if num_blocks is None:
-                continue
-            rows_cpu = block_tables_cpu[group_id]
-            if rows_cpu.device.type != "cpu":
-                raise ValueError(
-                    f"state paging: block_tables_cpu[{group_id!r}] must be a CPU "
-                    f"tensor (got {rows_cpu.device})"
-                )
-            if rows_cpu.dtype != torch.int32:
-                raise ValueError(
-                    f"state paging: block_tables_cpu[{group_id!r}] must use int32 "
-                    f"(got {rows_cpu.dtype})"
-                )
-            device_rows = self._state_rows(block_tables, group_id)
-            if rows_cpu.ndim != 2 or rows_cpu.shape[0] < bs:
-                raise ValueError(
-                    f"state paging: block_tables_cpu[{group_id!r}] has shape "
-                    f"{tuple(rows_cpu.shape)}, expected a 2D table with at least "
-                    f"{bs} rows"
-                )
-            if tuple(rows_cpu.shape) != tuple(device_rows.shape):
-                raise ValueError(
-                    f"state paging: block_tables_cpu[{group_id!r}] shape "
-                    f"{tuple(rows_cpu.shape)} disagrees with device table shape "
-                    f"{tuple(device_rows.shape)}"
-                )
-            validate_state_block_table_bounds(
-                rows_cpu[:bs], num_blocks=num_blocks, group_id=group_id
-            )
-
     def init_forward_metadata(
         self,
         bs: int,
@@ -1128,7 +1062,6 @@ class MambaAttnBackend(AttentionBackend):
         extend_with_prefix: bool,
         query_shard: QueryShardPlan | None,
         extend_state_checkpoint_lens_cpu: torch.Tensor | None = None,
-        block_tables_cpu: Mapping[str, torch.Tensor] | None = None,
         **kwargs,
     ) -> None:
         reject_query_shard(query_shard, "MambaStateBackend")
@@ -1171,9 +1104,6 @@ class MambaAttnBackend(AttentionBackend):
                 scan_query_start_loc=query_start_loc,
             )
             return
-
-        if bs > 0:
-            self._validate_state_block_bounds(bs, block_tables, block_tables_cpu)
 
         # The extend rows lead with their new-token counts; a MIXED round's
         # decode rows each carry spec_num_tokens verify tokens.

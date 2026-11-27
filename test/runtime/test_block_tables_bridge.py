@@ -261,7 +261,10 @@ class TestBlockTablesBridgeTest:
                 num_reqs=1,
                 max_page_ids={"full": 31},
             )
-        with pytest.raises(ValueError, match="not both"):
+        with pytest.raises(
+            ValueError,
+            match="at most one of max_page_id, max_page_ids, or required_max_page_ids",
+        ):
             self.bridge(
                 scheduler_forward_op,
                 "cpu",
@@ -1016,7 +1019,10 @@ def test_required_max_page_ids_scans_only_named_groups():
             num_reqs=2,
             required_max_page_ids={"missing": 4},
         )
-    with pytest.raises(ValueError, match="required_max_page_ids alone"):
+    with pytest.raises(
+        ValueError,
+        match="at most one of max_page_id, max_page_ids, or required_max_page_ids",
+    ):
         packed_block_tables_from_forward_op(
             valid,
             "cpu",
@@ -1025,7 +1031,10 @@ def test_required_max_page_ids_scans_only_named_groups():
             max_page_id=4,
             required_max_page_ids={"state": 4},
         )
-    with pytest.raises(ValueError, match="required_max_page_ids alone"):
+    with pytest.raises(
+        ValueError,
+        match="at most one of max_page_id, max_page_ids, or required_max_page_ids",
+    ):
         packed_block_tables_from_forward_op(
             valid,
             "cpu",
