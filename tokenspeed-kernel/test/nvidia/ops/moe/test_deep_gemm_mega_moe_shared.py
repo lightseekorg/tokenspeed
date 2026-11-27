@@ -269,3 +269,147 @@ def test_filler_rows_get_no_routed_output(fused):
         assert torch.equal(got[rows:], unrouted[rows:])
         if not fused:
             assert not got[rows:].any()
+
+
+@pytest.mark.usefixtures("process_group")
+def test_fused_zero_padded_shared_expert_matches_unpadded_reference():
+    """Zero-padding a 576-wide MXFP8 shared expert up to a 640-wide padded
+    MegaMoE intermediate matches the unpadded 576-wide reference."""
+    plan = {
+        "persistent_max_num_tokens_per_gpu": 256,
+        "process_group": None,
+        "fast_math": True,
+    }
+    inter, shared_inter = 640, 576
+    extra = inter - shared_inter
+    w = _Experts()
+    # Resize routed weights to the 128-aligned 640 width.
+    g = torch.Generator(device="cuda").manual_seed(11)
+    w.intermediate_size = inter
+    w.w13_weight = nn.Parameter(
+        torch.randint(
+            0,
+            256,
+            (EXPERTS, 2 * inter, HIDDEN // 2),
+            dtype=torch.uint8,
+            device="cuda",
+            generator=g,
+        ),
+        requires_grad=False,
+    )
+    w.w13_weight_scale = nn.Parameter(
+        torch.randint(
+            118,
+            122,
+            (EXPERTS, 2 * inter, HIDDEN // 32),
+            dtype=torch.uint8,
+            device="cuda",
+            generator=g,
+        ),
+        requires_grad=False,
+    )
+    w.w2_weight = nn.Parameter(
+        torch.randint(
+            0,
+            256,
+            (EXPERTS, HIDDEN, inter // 2),
+            dtype=torch.uint8,
+            device="cuda",
+            generator=g,
+        ),
+        requires_grad=False,
+    )
+    w.w2_weight_scale = nn.Parameter(
+        torch.randint(
+            118,
+            122,
+            (EXPERTS, HIDDEN, inter // 32),
+            dtype=torch.uint8,
+            device="cuda",
+            generator=g,
+        ),
+        requires_grad=False,
+    )
+    mega_moe.deep_gemm_mxfp4_mega_moe_process_weights(plan, w)
+
+    raw_gu = (torch.randn(2 * shared_inter, HIDDEN, device="cuda", generator=g) * 2).to(
+        torch.float8_e4m3fn
+    )
+    raw_gu_s = torch.randint(
+        117,
+        121,
+        (2 * shared_inter, HIDDEN // 32),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+    raw_down = (torch.randn(HIDDEN, shared_inter, device="cuda", generator=g) * 2).to(
+        torch.float8_e4m3fn
+    )
+    raw_down_s = torch.randint(
+        117,
+        121,
+        (HIDDEN, shared_inter // 32),
+        dtype=torch.uint8,
+        device="cuda",
+        generator=g,
+    )
+    w1_ref, w2_ref = _dequantize(raw_gu, raw_gu_s), _dequantize(raw_down, raw_down_s)
+
+    w1_half, w3_half = raw_gu.view(torch.uint8).chunk(2, dim=0)
+    padded_gu = torch.cat(
+        [
+            torch.nn.functional.pad(w1_half, (0, 0, 0, extra), value=0),
+            torch.nn.functional.pad(w3_half, (0, 0, 0, extra), value=0),
+        ],
+        dim=0,
+    ).view(torch.float8_e4m3fn)
+    s1_half, s3_half = raw_gu_s.chunk(2, dim=0)
+    padded_gu_s = torch.cat(
+        [
+            torch.nn.functional.pad(s1_half, (0, 0, 0, extra), value=127),
+            torch.nn.functional.pad(s3_half, (0, 0, 0, extra), value=127),
+        ],
+        dim=0,
+    )
+    padded_down = torch.nn.functional.pad(
+        raw_down.view(torch.uint8), (0, extra), value=0
+    ).view(torch.float8_e4m3fn)
+    padded_down_s = torch.nn.functional.pad(raw_down_s, (0, extra // 32), value=127)
+
+    cases = []
+    for tokens in (1, 64, 200):
+        x = torch.randn(
+            tokens, HIDDEN, device="cuda", dtype=torch.bfloat16, generator=g
+        )
+        ids = torch.stack(
+            [
+                torch.randperm(EXPERTS, device="cuda", generator=g)[:TOP_K]
+                for _ in range(tokens)
+            ]
+        ).int()
+        weights = torch.rand(tokens, TOP_K, device="cuda", generator=g)
+        routed = _apply(plan, w, x, weights, ids).clone()
+        gate_up_out = (_fp8_round_trip(x) @ w1_ref.T).bfloat16()
+        activation = torch.empty(
+            tokens, shared_inter, device="cuda", dtype=torch.bfloat16
+        )
+        silu_and_mul(gate_up_out, activation, limit=LIMIT)
+        shared = _fp8_round_trip(activation) @ w2_ref.T
+        cases.append((x, ids, weights, torch.zeros_like(weights), routed, shared))
+
+    assert mega_moe.fuse_deep_gemm_mxfp4_mega_moe_shared_expert(
+        plan, w, padded_gu, padded_gu_s, padded_down, padded_down_s
+    )
+    for x, ids, weights, no_routes, routed, shared in cases:
+        got = _apply(plan, w, x, no_routes, ids).float()
+        assert (got - shared).norm() / shared.norm() < 0.03
+        assert (
+            torch.nn.functional.cosine_similarity(
+                got.flatten(), shared.flatten(), dim=0
+            )
+            > 0.999
+        )
+        both = _apply(plan, w, x, weights, ids).float()
+        expected = routed.float() + shared
+        assert (both - expected).norm() / expected.norm() < 0.01

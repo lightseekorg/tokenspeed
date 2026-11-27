@@ -5069,3 +5069,97 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         shared.down_proj.weight_scale_inv,
     )
     assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))
+
+
+@pytest.mark.parametrize("accept", [True, False])
+def test_mega_moe_pads_unaligned_shared_expert_losslessly(monkeypatch, accept):
+    """When routed experts pad 576 -> 640 for MegaMoE, fuse_shared_expert
+    zero-pads the shared expert to 640 losslessly, updates its parameters on
+    success, clears stale dense scale caches, and leaves parameters untouched
+    when the kernel declines."""
+    metadata = vars(_loader_config())
+    metadata["hidden_size"] = 256
+    metadata["moe_intermediate_size"] = 576
+    config = v41.DeepseekV41Config(text_config=metadata).text_config
+    mapping = _mapping(1, 1, 2)
+    _mock_loader_hardware(monkeypatch, mapping)
+    platform = replace(
+        current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
+    )
+    monkeypatch.setattr(v41, "current_platform", lambda: platform)
+    moe = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    assert moe.experts.intermediate_size == 640
+    shared = moe.shared_experts
+    gate_up, down = shared.gate_up_proj, shared.down_proj
+    assert gate_up.weight.shape == (1152, 256)
+    assert down.weight.shape == (256, 576)
+
+    g = torch.Generator().manual_seed(17)
+    raw_gu_w = (torch.randn(1152, 256, generator=g) * 0.5).to(torch.float8_e4m3fn)
+    raw_gu_s = torch.randint(120, 130, (1152, 8), dtype=torch.uint8, generator=g)
+    raw_d_w = (torch.randn(256, 576, generator=g) * 0.5).to(torch.float8_e4m3fn)
+    raw_d_s = torch.randint(120, 130, (256, 18), dtype=torch.uint8, generator=g)
+    gate_up.weight.data.copy_(raw_gu_w)
+    gate_up.weight_scale_inv.data.copy_(raw_gu_s)
+    down.weight.data.copy_(raw_d_w)
+    down.weight_scale_inv.data.copy_(raw_d_s)
+    gate_up.quant_method.prepared_weight_scales = torch.empty(1)
+    gate_up.quant_method.projection_weight_scales = torch.empty(1)
+    down.quant_method.prepared_weight_scales = torch.empty(1)
+    down.quant_method.projection_weight_scales = torch.empty(1)
+
+    def _dequant(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        s = (scales.int() << 23).view(torch.float32)
+        return (codes.float().view(codes.shape[0], -1, 32) * s[..., None]).view(
+            codes.shape
+        )
+
+    def _run_shared(x: torch.Tensor, gu_w, gu_s, d_w, d_s) -> torch.Tensor:
+        gu = x @ _dequant(gu_w, gu_s).T
+        gate_part, up_part = gu.chunk(2, dim=-1)
+        act = torch.nn.functional.silu(gate_part) * up_part
+        return act @ _dequant(d_w, d_s).T
+
+    x = torch.randn(4, 256, generator=g)
+    ref = _run_shared(x, raw_gu_w, raw_gu_s, raw_d_w, raw_d_s)
+
+    seen = []
+
+    def fuse(plan, layer, *tensors):
+        seen.append(tensors)
+        return accept
+
+    moe.experts.plan["fuse_shared_expert"] = fuse
+    moe.experts._weights_processed = True
+    moe.process_weights_after_loading(moe)
+
+    assert len(seen) == 1
+    gu_w, gu_s, d_w, d_s = seen[0]
+    assert gu_w.shape == (1280, 256) and gu_s.shape == (1280, 8)
+    assert d_w.shape == (256, 640) and d_s.shape == (256, 20)
+    assert not gu_w.view(torch.uint8)[576:640].any()
+    assert not gu_w.view(torch.uint8)[1216:1280].any()
+    assert (gu_s[576:640] == 127).all() and (gu_s[1216:1280] == 127).all()
+    assert not d_w.view(torch.uint8)[:, 576:640].any()
+    assert (d_s[:, 18:20] == 127).all()
+    torch.testing.assert_close(
+        _run_shared(x, gu_w, gu_s, d_w, d_s), ref, rtol=0, atol=0
+    )
+
+    if not accept:
+        assert not moe.shared_expert_fused
+        assert gate_up.weight.shape == (1152, 256)
+        assert down.weight.shape == (256, 576)
+        assert torch.equal(gate_up.weight.view(torch.uint8), raw_gu_w.view(torch.uint8))
+        assert gate_up.quant_method.prepared_weight_scales is not None
+        return
+
+    assert moe.shared_expert_fused
+    assert gate_up.weight.data_ptr() == gu_w.data_ptr()
+    assert gate_up.weight_scale_inv.data_ptr() == gu_s.data_ptr()
+    assert down.weight.data_ptr() == d_w.data_ptr()
+    assert down.weight_scale_inv.data_ptr() == d_s.data_ptr()
+    assert gate_up.quant_method.prepared_weight_scales is None
+    assert gate_up.quant_method.projection_weight_scales is None
+    assert down.quant_method.prepared_weight_scales is None
+    assert down.quant_method.projection_weight_scales is None

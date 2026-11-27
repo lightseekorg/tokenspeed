@@ -24,6 +24,7 @@ import functools
 import logging
 
 import torch
+import torch.nn.functional as F
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
@@ -35,6 +36,7 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
@@ -348,11 +350,69 @@ class DeepseekV4MoE(nn.Module):
         # as the routed experts' processing expects too.
         self.fuse_shared_expert()
 
+    @staticmethod
+    def _pad_shared_expert_weights(
+        gate_up_weight: torch.Tensor,
+        gate_up_scale: torch.Tensor,
+        down_weight: torch.Tensor,
+        down_scale: torch.Tensor,
+        *,
+        hidden_size: int,
+        target_intermediate_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Zero-pad a smaller MXFP8 shared expert to the routed MegaMoE width.
+
+        Routed experts are padded up to MegaMoE's 128-wide intermediate
+        alignment (e.g. 576 -> 640). Padding the shared expert's gate, up, and
+        down lanes with zero FP8 codes and unit E8M0 scales (127) preserves
+        exact mathematical equivalence while letting MegaMoE fuse it.
+        """
+        if down_weight.ndim != 2:
+            return None
+        shared_inter = down_weight.shape[1]
+        if (
+            not (0 < shared_inter < target_intermediate_size)
+            or shared_inter % 32 != 0
+            or target_intermediate_size % 32 != 0
+            or hidden_size % 32 != 0
+            or tuple(gate_up_weight.shape) != (2 * shared_inter, hidden_size)
+            or tuple(gate_up_scale.shape) != (2 * shared_inter, hidden_size // 32)
+            or tuple(down_weight.shape) != (hidden_size, shared_inter)
+            or tuple(down_scale.shape) != (hidden_size, shared_inter // 32)
+            or gate_up_scale.dtype != torch.uint8
+            or down_scale.dtype != torch.uint8
+        ):
+            return None
+        extra = target_intermediate_size - shared_inter
+        w1, w3 = gate_up_weight.view(torch.uint8).chunk(2, dim=0)
+        padded_gate_up_w = torch.cat(
+            [
+                F.pad(w1, (0, 0, 0, extra), mode="constant", value=0),
+                F.pad(w3, (0, 0, 0, extra), mode="constant", value=0),
+            ],
+            dim=0,
+        ).view(torch.float8_e4m3fn)
+        s1, s3 = gate_up_scale.chunk(2, dim=0)
+        padded_gate_up_s = torch.cat(
+            [
+                F.pad(s1, (0, 0, 0, extra), mode="constant", value=127),
+                F.pad(s3, (0, 0, 0, extra), mode="constant", value=127),
+            ],
+            dim=0,
+        )
+        padded_down_w = F.pad(
+            down_weight.view(torch.uint8), (0, extra), mode="constant", value=0
+        ).view(torch.float8_e4m3fn)
+        padded_down_s = F.pad(down_scale, (0, extra // 32), mode="constant", value=127)
+        return padded_gate_up_w, padded_gate_up_s, padded_down_w, padded_down_s
+
     def fuse_shared_expert(self) -> None:
         """Hand the shared expert to MegaMoE when its kernel can run it.
 
         The shared expert's weights are then laid out in place for MegaMoE and
-        its own forward is no longer used.
+        its own forward is no longer used. When the routed experts were padded
+        to MegaMoE's intermediate alignment, the shared expert is zero-padded
+        to match so it fuses into the same launch losslessly.
         """
         shared = self.shared_experts
         if not self.use_mega_moe or shared is None or self.shared_expert_fused:
@@ -374,13 +434,42 @@ class DeepseekV4MoE(nn.Module):
             )
         else:
             self.experts.process_weights_after_loading(self.experts)
-            self.shared_expert_fused = self.experts.fuse_shared_expert(
+            padded_tensors = self._pad_shared_expert_weights(
                 gate_up.weight.data,
                 gate_up.weight_scale_inv.data,
                 down.weight.data,
                 down.weight_scale_inv.data,
+                hidden_size=self.experts.hidden_size,
+                target_intermediate_size=self.experts.intermediate_size,
+            )
+            if padded_tensors is not None:
+                gate_up_w, gate_up_s, down_w, down_s = padded_tensors
+            else:
+                gate_up_w = gate_up.weight.data
+                gate_up_s = gate_up.weight_scale_inv.data
+                down_w = down.weight.data
+                down_s = down.weight_scale_inv.data
+            self.shared_expert_fused = self.experts.fuse_shared_expert(
+                gate_up_w,
+                gate_up_s,
+                down_w,
+                down_s,
             )
             if self.shared_expert_fused:
+                if padded_tensors is not None:
+                    # Keep MegaMoE's fused views owned by the module parameters
+                    # so sharded-state saves and memory-saver release/resume
+                    # track them without retaining the unpadded copies.
+                    gate_up.weight = nn.Parameter(gate_up_w, requires_grad=False)
+                    gate_up.weight_scale_inv = nn.Parameter(
+                        gate_up_s, requires_grad=False
+                    )
+                    down.weight = nn.Parameter(down_w, requires_grad=False)
+                    down.weight_scale_inv = nn.Parameter(down_s, requires_grad=False)
+                for linear in (gate_up, down):
+                    if isinstance(linear.quant_method, Fp8LinearMethod):
+                        linear.quant_method.prepared_weight_scales = None
+                        linear.quant_method.projection_weight_scales = None
                 return
             reason = (
                 "the MegaMoE kernel does not take its weight shapes "

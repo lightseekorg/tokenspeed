@@ -30,7 +30,8 @@ dequantized to BF16 otherwise, after selecting this TP rank's rows.
 Engram tables load local FP8/E8M0 rows in bounded chunks without table conversion.
 The unquantized LM head follows the model loading dtype, including its logits.
 Packed routed experts use the V4 MoE loader, with zero-padded intermediate lanes
-only when required by MegaMoE; shared experts are not padded.
+only when required by MegaMoE; shared experts load at checkpoint width and are
+losslessly zero-padded during MegaMoE fusion when routed experts were padded.
 The generic model loader owns dense and MoELayer postprocessing, including
 MegaMoE weight preparation.
 
@@ -3725,11 +3726,22 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             torch.distributed.barrier()
 
     def post_load_weights(self) -> None:
+        fused_shared_linears: set[nn.Module] = set()
+        for module in self.modules():
+            if (
+                isinstance(module, DeepseekV4MoE)
+                and module.shared_expert_fused
+                and module.shared_experts is not None
+            ):
+                fused_shared_linears.add(module.shared_experts.gate_up_proj)
+                fused_shared_linears.add(module.shared_experts.down_proj)
         for module in self.modules():
             if isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
-            elif isinstance(module, LinearBase) and isinstance(
-                module.quant_method, _ReferenceFp8LinearMethod
+            elif (
+                isinstance(module, LinearBase)
+                and isinstance(module.quant_method, _ReferenceFp8LinearMethod)
+                and module not in fused_shared_linears
             ):
                 # The target and DSpark share this hook. Refresh in place after
                 # a complete weight update; captured graphs retain the buffer.
