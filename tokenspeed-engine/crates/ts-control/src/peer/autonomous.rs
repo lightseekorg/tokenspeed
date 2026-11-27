@@ -113,6 +113,7 @@ impl Peer {
             .unwrap_or_default();
         let worker_scheduler = scheduler.clone();
         let driver = if background {
+            let index = scheduler.lock().peer_lookup_index();
             let wake = protocol.endpoint.as_ref().unwrap().driver.clone();
             let (commands, rx) = mpsc::channel();
             let (tx, rounds) = mpsc::channel();
@@ -120,7 +121,7 @@ impl Peer {
                 .name("ts-peer-host".into())
                 .spawn(move || {
                     wake.run(|| {
-                        if let Err(error) = drive(&mut protocol, worker_scheduler, rx, &tx) {
+                        if let Err(error) = drive(&mut protocol, worker_scheduler, index, rx, &tx) {
                             tracing::error!(%error, "peer worker stopped");
                             let _ = tx.send(Err(error));
                         }
@@ -221,6 +222,7 @@ impl Peer {
             }
             self.fence = fence;
         }
+        control.start_lookups(self.scheduler.lock().peer_lookup_index())?;
         self.versioned = Some(Arc::new(Mutex::new(control)));
         Ok(())
     }
@@ -500,6 +502,7 @@ impl Exports {
         &mut self,
         p: &Protocol,
         scheduler: &Mutex<Scheduler>,
+        index: &ts_scheduler::PeerLookupIndex,
         draining: bool,
     ) -> Result<bool, PeerError> {
         let endpoint = p.endpoint.as_ref().unwrap();
@@ -580,14 +583,51 @@ impl Exports {
             return Err(PeerError::UnreleasedPin(lease.clone()));
         }
         if draining {
+            endpoint.lookups.lock().clear();
             endpoint.requests.lock().clear();
+        }
+
+        // Answer from the live indexes now. Apply the usual soft export (including
+        // its recency refresh) under the scheduler lock before processing any PIN.
+        for _ in 0..16 {
+            let Some((at, Request::Lookup { lease, prompt })) = endpoint.lookups.lock().pop_front()
+            else {
+                break;
+            };
+            if self.finished.contains_key(&lease)
+                || now.saturating_duration_since(at) >= p.settings.record_lifetime
+            {
+                continue;
+            }
+            let (soft, held) = index.lease_state(&lease);
+            let mut holder = endpoint.holder.lock();
+            let reply = if held {
+                let answer = holder.answer(&lease, PeerAnswerKind::Lookup);
+                holder.reply(lease, answer)
+            } else {
+                holder.lookup(
+                    prompt.lookup_event(&lease),
+                    soft,
+                    held,
+                    now,
+                    |q, pending| index.answer(q, pending),
+                )
+            };
+            drop(holder);
+            if let Some(m) = &p.metrics {
+                reply.1.observe_holder(m, false);
+            }
+            send(reply);
         }
 
         // Register a waiter for the scheduler's round-boundary handoff on
         // contention. Bound the wait once per pass so RELEASE can progress.
         let mut handoff_wait = Some(Duration::from_micros(100));
         for _ in 0..16 {
-            if self.cleanup.is_empty() && (draining || endpoint.requests.lock().is_empty()) {
+            if self.cleanup.is_empty()
+                && !endpoint.holder.lock().has_changes()
+                && (draining || endpoint.requests.lock().is_empty())
+            {
                 break;
             }
             let Some(mut cache) = scheduler
@@ -601,6 +641,11 @@ impl Exports {
                     .apply_peer_export(&event, at)
                     .map_err(|e| PeerError::Worker(e.to_string()))?;
                 continue;
+            }
+            for lookup in endpoint.holder.lock().take_changes() {
+                cache
+                    .apply_peer_export(&lookup, micros)
+                    .map_err(|e| PeerError::Worker(e.to_string()))?;
             }
             let Some((at, request)) = endpoint.requests.lock().pop_front() else {
                 break;
@@ -682,7 +727,9 @@ impl Exports {
             }
             send((to, reply));
         }
-        Ok(!self.cleanup.is_empty()
+        Ok(endpoint.holder.lock().has_changes()
+            || !endpoint.lookups.lock().is_empty()
+            || !self.cleanup.is_empty()
             || !endpoint.requests.lock().is_empty()
             || !endpoint.control.lock().is_empty())
     }
@@ -691,6 +738,7 @@ impl Exports {
 fn drive(
     p: &mut Protocol,
     scheduler: Arc<Mutex<Scheduler>>,
+    index: ts_scheduler::PeerLookupIndex,
     commands: mpsc::Receiver<Command>,
     results: &mpsc::Sender<Result<PeerRound, PeerError>>,
 ) -> Result<(), PeerError> {
@@ -769,7 +817,7 @@ fn drive(
             });
             p.start_landings(fetches, p.origin.elapsed().as_micros() as i64, false, times);
         }
-        let holder_work = exports.advance(p, &scheduler, stopping)?;
+        let holder_work = exports.advance(p, &scheduler, &index, stopping)?;
         // Take the clock and queue under the same lock used to stamp arrivals.
         let (now, inbox) = {
             let mut queue = p.endpoint.as_ref().unwrap().replies.lock();

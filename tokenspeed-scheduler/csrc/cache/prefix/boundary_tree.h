@@ -30,6 +30,8 @@
 #include <memory_resource>
 #include <optional>
 #include <span>
+#include <shared_mutex>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -420,13 +422,22 @@ public:
     std::size_t Size() const { return nodes_.size(); }
 
     // The published tail boundaries. A tail's hint leaves with its node.
+    // A peer reader holds both guards from the first prefix probe through the
+    // last copied page ID. Index removal may also unlink a tail (index first).
+    mutable std::shared_mutex peer_index_mutex;
+    mutable std::shared_mutex peer_tail_mutex;
+
     const TailTable& Tails() const noexcept { return tails_; }
     // TailTable::Add: the tail the per-prior cap dropped, if any.
     std::optional<TailTable::Tail> RecordTail(const ContentHash& prior, std::int32_t tail_tokens,
                                               const ContentHash& hash) {
+        std::unique_lock guard(peer_tail_mutex);
         return tails_.Add(prior, tail_tokens, hash);
     }
-    bool TouchTail(const ContentHash& hash) { return tails_.Touch(hash); }
+    bool TouchTail(const ContentHash& hash) {
+        std::unique_lock guard(peer_tail_mutex);
+        return tails_.Touch(hash);
+    }
 
     // Hashes of possibly dead nodes, in the order they were queued, for the
     // coordinator's collection (queue_dead_candidates only). Dropping a holder
@@ -456,6 +467,7 @@ public:
     // and the queued candidates go too.
     void ClearAfterCacheClear() {
         _assert(nodes_.empty(), "a cleared cache leaves no boundary node behind");
+        std::unique_lock guard(peer_tail_mutex);
         tails_.Clear();
         dead_candidates_.clear();
     }
@@ -709,6 +721,7 @@ private:
                    "only a childless node nothing holds leaves the tree");
         // Nothing hangs under a tail, so a tail hash leaves the tail table
         // exactly when nothing holds its node.
+        std::unique_lock guard(peer_tail_mutex);
         tails_.Remove(node.hash);
         // A candidate the last release queued for this node leaves with it
         // (the walk queues what is left above), so taking a chain from below

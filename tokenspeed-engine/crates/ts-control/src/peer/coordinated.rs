@@ -249,6 +249,33 @@ fn cost_class(key: &Key, width: usize, pages: &[ts_scheduler::PeerPageView]) -> 
     )
 }
 
+struct HolderState {
+    offers: Offers,
+    proposals: Vec<(i64, Message, Message)>,
+    accepting: bool,
+}
+impl HolderState {
+    fn lookup(
+        &mut self,
+        key: &Key,
+        gen: &Generation,
+        layout: &Replica,
+        msg: &Message,
+        now: i64,
+        query: impl FnOnce(&PeerEventView) -> ts_scheduler::PeerAnswerView,
+    ) -> Message {
+        if !self.accepting {
+            return Message::Offered(key.clone(), None);
+        }
+        let previous = self.offers.offer_id(key);
+        let reply = self.offers.lookup(key, gen, layout, msg, query, now);
+        if matches!(&reply, Message::Offered(_, Some((o, _, _))) if Some(o.id) != previous) {
+            self.proposals.push((now, msg.clone(), reply.clone()));
+        }
+        reply
+    }
+}
+
 pub(super) struct Control {
     costs: [ReadCost; 16],
     origin: Instant,
@@ -260,11 +287,10 @@ pub(super) struct Control {
     known: HashMap<String, (Generation, Arc<Replica>)>,
     rediscover: HashSet<String>,
     attempts: BTreeMap<u64, Attempt>,
-    offers: Offers,
+    holder: Arc<super::Mutex<HolderState>>,
     pending_releases: PendingReleases,
     cap_warn_after_us: i64,
     votes: Vec<Vote>,
-    proposals: Vec<(i64, Message, Message)>,
     fences: VecDeque<Vec<u64>>,
     signaled: mpsc::Receiver<Instant>,
     missing: Vec<PeerEventView>,
@@ -295,11 +321,14 @@ impl Control {
                 known: HashMap::new(),
                 rediscover: HashSet::new(),
                 attempts: BTreeMap::new(),
-                offers: Offers::new(device_pin_gate),
+                holder: Arc::new(super::Mutex::new(HolderState {
+                    offers: Offers::new(device_pin_gate),
+                    accepting: true,
+                    proposals: Vec::new(),
+                })),
                 pending_releases: PendingReleases::default(),
                 cap_warn_after_us: 0,
                 votes: Vec::new(),
-                proposals: Vec::new(),
                 fences: VecDeque::new(),
                 signaled,
                 missing: Vec::new(),
@@ -310,6 +339,44 @@ impl Control {
             PeerFence(tx),
         )
     }
+    /// Serve advisory lookups without borrowing a scheduler or waiting for a replica round.
+    pub fn start_lookups(&self, index: ts_scheduler::PeerLookupIndex) -> Result<(), PeerError> {
+        let Some(ch) = &self.ch else {
+            return Ok(());
+        };
+        let (tx, rx) = mpsc::sync_channel(128);
+        let (holder, layout, gen, origin) = (
+            self.holder.clone(),
+            self.layout.clone(),
+            self.gen.clone(),
+            self.origin,
+        );
+        let (net, wake) = (Arc::downgrade(&ch.net), ch.versioned_wake.clone());
+        std::thread::Builder::new()
+            .name("ts-peer-lookup".into())
+            .spawn(move || {
+                while let Ok(msg) = rx.recv() {
+                    let Message::Lookup(ref key, ..) = msg else {
+                        continue;
+                    };
+                    let now = i64::try_from(origin.elapsed().as_micros()).unwrap_or(i64::MAX);
+                    let reply = holder
+                        .lock()
+                        .lookup(key, &gen, &layout, &msg, now, |q| index.answer(q, 0));
+                    wake.notify();
+                    let Some(net) = net.upgrade() else {
+                        break;
+                    };
+                    if let Err(error) = net.versioned(&key.reader.name, &reply) {
+                        tracing::warn!(%error, "peer lookup reply not sent");
+                    }
+                }
+            })?;
+        ch.lookups
+            .set(tx)
+            .map_err(|_| PeerError::Configuration("registered lookup worker already started"))
+    }
+
     pub fn reader(&self) -> bool {
         self.layout.members.len() == 8
     }
@@ -320,11 +387,11 @@ impl Control {
         self.len() != 0
             || !self.pending_releases.holders.is_empty()
             || !self.votes.is_empty()
-            || !self.proposals.is_empty()
+            || !self.holder.lock().proposals.is_empty()
             || self.ch.as_ref().is_some_and(|c| !c.inbox.lock().is_empty())
     }
     pub fn len(&self) -> usize {
-        self.attempts.len() + self.offers.active_count()
+        self.attempts.len() + self.holder.lock().offers.active_count()
     }
     pub fn invalidate(&mut self) {
         if self.admission {
@@ -332,6 +399,7 @@ impl Control {
                 "weight generation changed; restart to resume cross-layout peer sharing"
             );
         }
+        self.holder.lock().accepting = false;
         self.admission = false;
         self.known.clear();
         self.rediscover.clear();
@@ -476,7 +544,7 @@ impl Control {
             messages,
             votes: std::mem::take(&mut self.votes),
             deadlines: std::mem::take(&mut self.deadlines),
-            proposals: std::mem::take(&mut self.proposals),
+            proposals: std::mem::take(&mut self.holder.lock().proposals),
         }
         .encode()
     }
@@ -530,16 +598,13 @@ impl Control {
                 }
             }
             Message::Lookup(k, ..) if self.rank == 0 => {
-                let previous = self.offers.offer_id(k);
-                let reply = if self.admission {
-                    self.offers.lookup(k, &self.gen, &self.layout, &m, s, now)
-                } else {
-                    Message::Offered(k.clone(), None)
-                };
-                if matches!(&reply, Message::Offered(_, Some((o, _, _))) if Some(o.id) != previous)
-                {
-                    self.proposals.push((now, m.clone(), reply.clone()));
-                }
+                // Lookup queued before the endpoint finished registration.
+                let reply = self
+                    .holder
+                    .lock()
+                    .lookup(k, &self.gen, &self.layout, &m, now, |q| {
+                        s.answer_peer_lookup_bounded(q, 0)
+                    });
                 self.send(reply);
             }
             Message::Offered(k, offer) => {
@@ -585,7 +650,7 @@ impl Control {
                     self.send(Message::Grant(k.clone(), o.clone(), false));
                     return;
                 }
-                let (reply, v) = self.offers.pin(k, o, s, now);
+                let (reply, v) = self.holder.lock().offers.pin(k, o, s, now);
                 if let Some(v) = v {
                     self.votes.push(v);
                 }
@@ -624,7 +689,7 @@ impl Control {
                     self.send(Message::Ack(k.clone(), *id, *d, Closure::Stale));
                     return;
                 }
-                let (reply, v) = self.offers.close(k, *id, *d, s, now);
+                let (reply, v) = self.holder.lock().offers.close(k, *id, *d, s, now);
                 if let Some(v) = v {
                     self.votes.push(v);
                 }
@@ -667,7 +732,7 @@ impl Control {
             if self.rank == 0 {
                 continue;
             }
-            self.offers.install(
+            self.holder.lock().offers.install(
                 &q,
                 &a,
                 self.layout.contract.plan.prefix_granularity,
@@ -686,7 +751,7 @@ impl Control {
         for (i, r) in reports.iter().enumerate() {
             for v in &r.votes {
                 let reply = match v.stage {
-                    PINNED | CLOSED => self.offers.vote(i, v, now),
+                    PINNED | CLOSED => self.holder.lock().offers.vote(i, v, now),
                     READY | DONE => self
                         .attempts
                         .get_mut(&v.key.lease)
@@ -723,8 +788,13 @@ impl Control {
                         // Consensus refused this offer. No reader could have
                         // obtained GO, so each holder can roll back its own ticket
                         // even if the reader disappeared before sending RELEASE.
-                        let (_, vote) =
-                            self.offers.close(key, offer.id, Disposition::Abort, s, now);
+                        let (_, vote) = self.holder.lock().offers.close(
+                            key,
+                            offer.id,
+                            Disposition::Abort,
+                            s,
+                            now,
+                        );
                         self.votes.extend(vote);
                     }
                     self.send(m);
@@ -763,8 +833,12 @@ impl Control {
         for m in outgoing {
             self.send(m);
         }
-        self.votes
-            .extend(self.offers.expire(now, retirement_bound_ms, s));
+        self.votes.extend(
+            self.holder
+                .lock()
+                .offers
+                .expire(now, retirement_bound_ms, s),
+        );
         round.events.append(&mut self.missing);
         Ok(())
     }

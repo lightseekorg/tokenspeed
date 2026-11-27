@@ -325,6 +325,7 @@ pub struct PeerListener {
     registered: Option<Arc<registered::Replica>>,
     inbox: Arc<Mutex<VecDeque<(Instant, v1::Message)>>>,
     versioned_wake: Arc<DriverWake>,
+    lookups: Arc<std::sync::OnceLock<mpsc::SyncSender<v1::Message>>>,
 }
 
 /// The public listener dispatches both holder requests and reader replies.
@@ -409,6 +410,7 @@ impl PeerListener {
             registered: None,
             inbox: Arc::default(),
             versioned_wake: Arc::default(),
+            lookups: Arc::default(),
         })
     }
 
@@ -466,6 +468,7 @@ impl PeerListener {
             net: self.net.clone(),
             inbox: self.inbox.clone(),
             versioned_wake: self.versioned_wake.clone(),
+            lookups: self.lookups.clone(),
         }
     }
 }
@@ -475,6 +478,7 @@ pub struct VersionedChannel {
     net: Arc<PeerNet>,
     inbox: Arc<Mutex<VecDeque<(Instant, v1::Message)>>>,
     versioned_wake: Arc<DriverWake>,
+    lookups: Arc<std::sync::OnceLock<mpsc::SyncSender<v1::Message>>>,
 }
 
 #[derive(Default)]
@@ -501,6 +505,7 @@ struct Endpoint {
     holder: Arc<Mutex<Holder>>,
     replies: Arc<Mutex<VecDeque<(Instant, Reply)>>>,
     driver: Arc<DriverWake>,
+    lookups: Arc<Mutex<VecDeque<(Instant, Request)>>>,
     requests: Arc<Mutex<VecDeque<(Instant, Request)>>>,
     control: Arc<Mutex<VecDeque<(Instant, Request)>>>,
     _demux: thread::JoinHandle<()>,
@@ -1247,6 +1252,7 @@ fn start_endpoint(
         registered,
         inbox,
         versioned_wake,
+        lookups,
     } = listener;
     let sharded = registered
         .as_ref()
@@ -1269,6 +1275,7 @@ fn start_endpoint(
     let replies = Arc::new(Mutex::new(VecDeque::new()));
     let driver = Arc::new(DriverWake::default());
     let autonomous = progress != PeerProgress::Coordinated;
+    let legacy_lookups = Arc::new(Mutex::new(VecDeque::new()));
     let requests = Arc::new(Mutex::new(VecDeque::new()));
     let control = Arc::new(Mutex::new(VecDeque::new()));
     let (holder_tx, holder_rx) = if autonomous {
@@ -1282,6 +1289,7 @@ fn start_endpoint(
     // `Request::Layout` immediately without ever blocking on `scheduler.lock()`.
     let demux = {
         let discovery = discovery.clone();
+        let legacy_lookups = legacy_lookups.clone();
         let (requests, control) = (requests.clone(), control.clone());
         let (incoming, wake) = (replies.clone(), driver.clone());
         let (net, holder) = (Arc::downgrade(&net), holder.clone());
@@ -1317,6 +1325,13 @@ fn start_endpoint(
                                 if let Some(message) =
                                     v1::Message::decode(payload, kind.as_ref() == b"r")
                                 {
+                                    if matches!(message, v1::Message::Lookup(..)) {
+                                        if let Some(tx) = lookups.get() {
+                                            // Bound ingress just like the replica report inbox.
+                                            let _ = tx.try_send(message);
+                                            continue;
+                                        }
+                                    }
                                     let mut queue = inbox.lock();
                                     if queue.len() < 128 {
                                         queue.push_back((Instant::now(), message));
@@ -1339,6 +1354,8 @@ fn start_endpoint(
                                     | Request::Layout { .. }
                             ) {
                                 control.lock().push_back((Instant::now(), request));
+                            } else if matches!(request, Request::Lookup { .. }) {
+                                legacy_lookups.lock().push_back((Instant::now(), request));
                             } else {
                                 requests.lock().push_back((Instant::now(), request));
                             }
@@ -1410,6 +1427,7 @@ fn start_endpoint(
         holder,
         replies,
         driver,
+        lookups: legacy_lookups,
         requests,
         control,
         _demux: demux,
