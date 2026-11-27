@@ -34,7 +34,10 @@ from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import (
     clean_logits_and_block_max,
     gather_index_pages,
 )
-from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexQueryInput
+from tokenspeed_kernel.ops.attention.dsv41._inputs import (
+    IndexQueryInput,
+    PreparedIndexQuery,
+)
 from tokenspeed_kernel.ops.attention.dsv41._metadata import (
     IndexGeometry,
     index_logit_rows,
@@ -329,7 +332,7 @@ def _dense_scores(
     api = _api(queries)
     starts, packed_ends = dense_ranges(lengths, capacity, offsets)
     logits = api.fp8_fp4_mqa_logits(
-        q=(queries[0].view(torch.int8), queries[1]),
+        q=(queries[0].contiguous().view(torch.int8), queries[1].contiguous()),
         kv=(keys[0].view(torch.int8), keys[1]),
         weights=weights,
         cu_seq_len_k_start=starts,
@@ -348,12 +351,11 @@ def _dense_scores(
     name="deep_gemm_dsv41_index_topk",
     solution="deep_gemm",
     signatures=[format_signature(x=dense_tensor_format(torch.bfloat16))],
-    # Fuses RoPE and query quantization when index_q is an IndexQueryInput,
-    # and resolves the selection's SelectionSlots in its finishing kernel.
     traits={
         "native_indexer": frozenset({True}),
-        "supports_index_query_input": frozenset({True}),
         "supports_selection_slots": frozenset({True}),
+        "supports_index_query_input": frozenset({True}),
+        "supports_prepared_index_query": frozenset({True}),
     },
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
@@ -387,9 +389,8 @@ def index_topk(
         raise ValueError(
             "Native CSA2 selection requires replicated heads and 8-row blocks"
         )
-    query_values = index_q.values if isinstance(index_q, IndexQueryInput) else index_q
     out = _index_topk_outputs(
-        query_values,
+        index_q.values if isinstance(index_q, IndexQueryInput) else index_q,
         weights,
         index_cache,
         page_table,
@@ -403,8 +404,8 @@ def index_topk(
         process_group,
         out,
     )
-    n = query_values.shape[0]
     rows, lengths, blocks, block_lengths = out
+    n = rows.shape[0]
     capacity = page_table.shape[1] * 64
     if capacity == 0:
         rows.fill_(-1)
@@ -437,7 +438,12 @@ def index_topk(
         (index_cache.shape[0], 64 * 68), (index_cache.stride(0), 1)
     )
     weight_dtype = torch.bfloat16 if sparse else torch.float32
-    if isinstance(index_q, IndexQueryInput):
+    if isinstance(index_q, PreparedIndexQuery):
+        queries = (index_q.data, index_q.scales)
+        # A Reindex layer can score a short window densely on a later replay.
+        # The producer already applied BF16 rounding, so widening is exact.
+        weights = weights.to(weight_dtype).contiguous()
+    elif isinstance(index_q, IndexQueryInput):
         queries, weights = triton_dsv41_index_query_rope_quant(
             index_q.values,
             weights,
@@ -1045,15 +1051,21 @@ def hopper_index_topk(
     return out
 
 
+def sparse_candidate_pages_supported(cache):
+    """Whether native sparse MQA can address the index pages directly."""
+    return (
+        cache.stride(0) % 512 == 0
+        and cache.stride(0) < 2**31
+        and cache.data_ptr() % 16 == 0
+    )
+
+
 def _use_sparse_candidate_scores(cache, candidates, candidate_topk):
-    """Native sparse reads require aligned pages and a candidate consumer."""
     return (
         candidates is not None
         and candidates.shape[1] > 0
         and candidate_topk == 0
-        and cache.stride(0) % 512 == 0
-        and cache.stride(0) < 2**31
-        and cache.data_ptr() % 16 == 0
+        and sparse_candidate_pages_supported(cache)
     )
 
 

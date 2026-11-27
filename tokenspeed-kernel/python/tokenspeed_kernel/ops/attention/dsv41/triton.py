@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.ops.attention.dsv41._inputs import PreparedIndexQuery
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
 from tokenspeed_kernel.ops.embedding.triton import (
     MLARopeSetKVBufferLaunch,
@@ -762,15 +763,42 @@ def _score(q, weights, cache, slots, process_group):
 
 
 def _index_inputs(q, weights, cache):
-    if q.ndim != 3 or q.shape[-1] != 128 or q.dtype != torch.bfloat16 or q.shape[1] < 1:
+    """Validate scoring inputs and return the underlying query tensor."""
+    if isinstance(q, PreparedIndexQuery):
+        data = q.data
+        if (
+            data.shape[1:] != (32, 64)
+            or data.dtype != torch.uint8
+            or data.stride()[1:] != (64, 1)
+        ):
+            raise ValueError("Prepared index queries require native 32-head MXFP4 rows")
+        if (
+            q.scales.shape != data.shape[:2]
+            or q.scales.dtype != torch.int32
+            or q.scales.device != data.device
+            or q.scales.stride(1) != 1
+        ):
+            raise ValueError(
+                "Prepared index scales must be int32 [tokens, heads] on the query device"
+            )
+        q = data
+    elif (
+        q.ndim != 3 or q.shape[-1] != 128 or q.dtype != torch.bfloat16 or q.shape[1] < 1
+    ):
         raise ValueError("index_q must be BF16 [tokens, heads, 128]")
-    if weights.shape != q.shape[:2] or weights.dtype not in (
-        torch.bfloat16,
-        torch.float32,
+    if (
+        weights is None
+        or weights.shape != q.shape[:2]
+        or weights.dtype
+        not in (
+            torch.bfloat16,
+            torch.float32,
+        )
     ):
         raise ValueError("weights must be BF16/FP32 [tokens, heads], already scaled")
     _cache(cache, _paged_format(cache, "index"))
     _same_device(q, (weights, cache))
+    return q
 
 
 @register_kernel(
@@ -1124,15 +1152,15 @@ def _index_topk_outputs(
     out,
 ):
     """Validate the shared selection contract and obtain caller-owned outputs."""
-    _index_inputs(index_q, weights, index_cache)
-    tokens = index_q.shape[0]
+    query_data = _index_inputs(index_q, weights, index_cache)
+    tokens = query_data.shape[0]
     if page_table.ndim != 2 or page_table.shape[0] != tokens:
         raise ValueError(
             "page_table must be [tokens, logical pages], one request table per query"
         )
     _integers(page_table, page_table.shape, "page_table")
     _integers(visible_lens, (tokens,), "visible_lens")
-    _same_device(index_q, (page_table, visible_lens, candidate_blocks))
+    _same_device(query_data, (page_table, visible_lens, candidate_blocks))
     if (
         not 1 <= topk <= 512
         or not 0 <= candidate_topk <= 2048
@@ -1161,7 +1189,7 @@ def _index_topk_outputs(
     shapes = ((tokens, topk), (tokens,), (tokens, candidate_topk), (tokens,))
     if out is None:
         out = tuple(
-            torch.empty(shape, dtype=torch.int32, device=index_q.device)
+            torch.empty(shape, dtype=torch.int32, device=query_data.device)
             for shape in shapes
         )
     if len(out) != 4:
@@ -1169,7 +1197,7 @@ def _index_topk_outputs(
             "out must contain row IDs, row lengths, block IDs, block lengths"
         )
     for tensor, shape in zip(out, shapes, strict=True):
-        _output(tensor, shape, torch.int32, index_q.device)
+        _output(tensor, shape, torch.int32, query_data.device)
     return out
 
 
@@ -1473,8 +1501,12 @@ def _swa_rope_insert(
     VALUES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
     HAS_OUT: tl.constexpr,
+    PREFILL_COUNTS=None,
 ):
     token = tl.program_id(0).to(tl.int64)
+    if PREFILL_COUNTS is not None:
+        if token >= tl.load(PREFILL_COUNTS + 1):
+            return
     d = tl.arange(0, 512)
     position = tl.maximum(tl.load(POS + token * POS0).to(tl.int64), 0)
     position_valid = position < MAX_POS
@@ -1518,12 +1550,16 @@ def _swa_rope_insert(
     scale = (exponent << 23).to(tl.float32, bitcast=True)
     quantized = tl.reshape(tl.div_rn(values, scale[:, None]), (512,)).to(tl.float8e4nv)
     if HAS_OUT:
-        restored = quantized.to(tl.float32) * tl.reshape(
-            tl.broadcast_to(scale[:, None], (GROUPS, GROUP)), (512,)
-        )
-        if ROPE_BYTES > 0:
-            restored = tl.where(d < VALUES, restored, rotated.to(tl.float32))
-        tl.store(OUT + token * O0 + d * O1, restored.to(tl.bfloat16))
+        write_out = True
+        if PREFILL_COUNTS is not None:
+            write_out = token < tl.load(PREFILL_COUNTS)
+        if write_out:
+            restored = quantized.to(tl.float32) * tl.reshape(
+                tl.broadcast_to(scale[:, None], (GROUPS, GROUP)), (512,)
+            )
+            if ROPE_BYTES > 0:
+                restored = tl.where(d < VALUES, restored, rotated.to(tl.float32))
+            tl.store(OUT + token * O0 + d * O1, restored.to(tl.bfloat16))
     page = tl.maximum(slot, 0) // P
     row = tl.maximum(slot, 0) % P
     tl.store(
@@ -1564,7 +1600,15 @@ def triton_dsv41_swa_rope_scatter(
     out,
     norm_weight,
     norm_eps,
+    prefill_counts=None,
 ):
+    if prefill_counts is not None and (
+        prefill_counts.shape != (2,)
+        or prefill_counts.dtype != torch.int64
+        or not prefill_counts.is_contiguous()
+        or prefill_counts.device != values.device
+    ):
+        raise ValueError("prefill_counts must hold two contiguous device int64 counts")
     if cache_format not in _PAGED_FORMATS["swa"].values():
         raise ValueError(f"{cache_format!r} is not a SWA row format")
     dim, group, value_bytes, row_bytes, quantized = _layout(cache_format)
@@ -1622,6 +1666,7 @@ def triton_dsv41_swa_rope_scatter(
         value_bytes,
         _scale_bytes(cache_format),
         out is not None,
+        PREFILL_COUNTS=prefill_counts,
         num_warps=4,
         enable_fp_fusion=False,
         debug=True,
@@ -5758,5 +5803,89 @@ def triton_dsv41_verify_layout(
         BLOCK=block,
         USE_LATEST=latest_scores is not None,
         HAS_ACTIVE_COUNT=active_count is not None,
+        num_warps=4,
+    )
+
+
+@triton.jit(do_not_specialize=["page_stride", "pages"])
+def _snapshot_swa_prefix(
+    cache,
+    descriptor,
+    page_stride,
+    pages,
+    GROUP: tl.constexpr,
+    VALUES: tl.constexpr,
+    QUANTIZED: tl.constexpr,
+    SCALE_BYTES: tl.constexpr,
+    FORMAT: tl.constexpr,
+    ROW_BYTES: tl.constexpr,
+):
+    slots = tl.load(descriptor).to(tl.pointer_type(tl.int64))
+    out = tl.load(descriptor + 1).to(tl.pointer_type(tl.bfloat16))
+    count = tl.load(descriptor + 2)
+    tl.device_assert(count <= tl.load(descriptor + 3), "SWA snapshot exceeds workspace")
+    pid = tl.program_id(0).to(tl.int64)
+    row = pid
+    while row < count:
+        # _gather_kernel addresses its row by program_id(0).
+        offset = row - pid
+        _gather_kernel(
+            cache,
+            slots + offset,
+            out + offset * 512,
+            page_stride,
+            ROW_BYTES,
+            1,
+            512,
+            1,
+            64,
+            pages.to(tl.int64) * 64,
+            512,
+            GROUP,
+            VALUES,
+            QUANTIZED,
+            SCALE_BYTES,
+            FORMAT,
+            True,
+        )
+        row += tl.num_programs(0)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_snapshot_swa_prefix",
+    name="triton_dsv41_snapshot_swa_prefix",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=_BYTE_SIGNATURES,
+    traits={},
+    priority=Priority.PORTABLE,
+)
+def triton_dsv41_snapshot_swa_prefix(cache, descriptor, cache_format):
+    _cache(cache, cache_format)
+    if cache_format not in _PAGED_FORMATS["swa"].values() or cache.stride()[1:] != (
+        cache.shape[2],
+        1,
+    ):
+        raise ValueError("SWA snapshot requires contiguous SWA page bytes")
+    if (
+        descriptor.shape != (6,)
+        or descriptor.dtype != torch.int64
+        or not descriptor.is_contiguous()
+    ):
+        raise ValueError("SWA snapshot requires six contiguous int64 descriptor words")
+    _same_device(cache, (descriptor,))
+    _, group, values, row_bytes, quantized = _layout(cache_format)
+    _snapshot_swa_prefix[(256,)](
+        cache,
+        descriptor,
+        cache.stride(0),
+        cache.shape[0],
+        group,
+        values,
+        quantized,
+        _scale_bytes(cache_format),
+        cache_format,
+        row_bytes,
         num_warps=4,
     )

@@ -51,16 +51,12 @@ Attention and MoE TPxEP widths match, or attention/dense/MoE use TP1.
 Fused EP keeps rows local and exchanges actual counts after CED narrowing.
 Ordinary attention DP/EP requires attention/dense/MoE TP1 and eager prefill.
 
-The forward is four stages on one path -- ``encoder_forward`` (embedding and
-the layers below the candidate source, one row per token), ``narrowing_forward``
-(the candidate source layer: all rows in, the decoder view's rows out),
-``decoder_forward`` (the remaining layers and the final norm on the narrowed
-rows) and ``finish_forward`` (the sampled-row gather and the DSpark row
-report). ``forward`` composes them; the prefill graph replays the first and
-third as captured graphs of fixed row counts around the eager narrowing
-(``PrefillGraph``'s ``NarrowingPrefillModel`` contract). Each layer reads its
-row plan from the live context, never as a loose argument a captured break
-would freeze.
+The staged FP8 encoder writes the candidate source KV on all input rows.
+Narrowing selects the decoder rows before that source computes its queries.
+Other paths run the source during narrowing. The prefill graph captures the
+encoder and decoder separately. ``finish_forward`` gathers sampled rows and
+reports DSpark taps.
+Each attention break reads its row plan from the live context.
 """
 
 from __future__ import annotations
@@ -148,6 +144,9 @@ from tokenspeed.runtime.execution.context import (
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+    DeepseekV41AttentionBackend,
+    V41CompressorPlan,
+    V41DecoderView,
     V41RowPlan,
 )
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
@@ -827,6 +826,7 @@ class DeepseekV41Compressor(nn.Module):
         mode,
         *,
         key_rows: QueryShardGather | None,
+        pair_plan: V41CompressorPlan | None = None,
     ):
         """Project local rows, then pool/write in the original request layout.
 
@@ -879,6 +879,7 @@ class DeepseekV41Compressor(nn.Module):
                 mode,
                 self.norm.weight,
                 self.norm.variance_epsilon,
+                pair_plan,
             )
             return content, positions, requests
         return _attention_norm(projected, self.norm), positions, requests
@@ -937,8 +938,11 @@ class DeepseekV41Indexer(nn.Module):
             block_scale=qr_scale,
             output_dtype=x.dtype if qr_scale is not None else None,
         )
-        q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
         weights, _ = self.weights_proj(x, block_scale=None, output_dtype=None)
+        return self.query_from_projections(q, weights, positions, rotary)
+
+    def query_from_projections(self, q, weights, positions, rotary):
+        q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
         if (
             q.is_cuda
             and current_platform().is_blackwell
@@ -1302,6 +1306,7 @@ class DeepseekV41Attention(nn.Module):
         mode,
         *,
         key_rows: QueryShardGather | None,
+        stage=None,
     ):
         if self.compressor is None:
             return
@@ -1313,6 +1318,7 @@ class DeepseekV41Attention(nn.Module):
             backend,
             mode,
             key_rows=key_rows,
+            pair_plan=stage.pairs if stage is not None else None,
         )
         index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
         main_rope_cache = None
@@ -1329,6 +1335,19 @@ class DeepseekV41Attention(nn.Module):
             main_rope_cache = self.rotary_emb.cos_sin_cache
         else:
             main_k = self.rotary_emb.apply_owned(latent, row_positions, False)
+        if stage is not None:
+            slots = (
+                stage.pair_slots if self.compressor.ratio == 2 else stage.source_slots
+            )
+            backend.write_global_slots(
+                self.layer_id,
+                main_k,
+                index_k,
+                row_positions,
+                slots[: hidden_states.shape[0]],
+                main_rope_cache,
+            )
+            return
         backend.write_global(
             self.layer_id,
             main_k,
@@ -1339,7 +1358,9 @@ class DeepseekV41Attention(nn.Module):
             main_rope_cache=main_rope_cache,
         )
 
-    def _q_scale_layout(self, rows: V41RowPlan, fused_decode: bool) -> str:
+    def _q_scale_layout(
+        self, keep_rows: torch.Tensor | None, fused_decode: bool
+    ) -> str:
         """The group-32 scale layout every consumer of Q's latent rows reads.
 
         The indexer's Q up-projection shares these scales when it has one, so
@@ -1348,7 +1369,7 @@ class DeepseekV41Attention(nn.Module):
         separate repack. Narrowing selects rows of the scales, which only the
         canonical layout supports.
         """
-        if rows.keep_rows is not None:
+        if keep_rows is not None:
             return "canonical"
         if fused_decode:
             # The fused path reads fused_q_weight in place of wq_b.
@@ -1388,15 +1409,32 @@ class DeepseekV41Attention(nn.Module):
         reduce_output: bool,
         hidden_codes: torch.Tensor | None = None,
         hidden_scales: torch.Tensor | None = None,
+        decoder_view: V41DecoderView | None = None,
     ) -> torch.Tensor:
         """Return the attention output, reducing its TP partial when requested.
 
         hidden_codes/hidden_scales optionally carry hidden_states already
         quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales).
+        decoder_view is supplied for the replayed CED source whose global KV
+        the encoder has already written.
         """
-        # The CED narrowing layer has request-dependent output rows and runs
-        # eagerly between the encoder and decoder graphs. The other layers
-        # project the same token bucket that their input occupies.
+        backend = ctx.attn_backend
+        if decoder_view is not None or (
+            self.fused_q_weight is not None
+            and isinstance(backend, DeepseekV41AttentionBackend)
+            and backend.prefill_stage is not None
+            and self.mapping.attn.tp_size == 1
+            and hidden_states.is_cuda
+            and hidden_states.shape[0] > 0
+            and self.layer_id != self.ced_decoder_start
+            and (self.compressor is None or self.compressor.ratio == 2)
+        ):
+            return self._forward_with_prefill_stage(
+                positions, hidden_states, ctx, hidden_codes, hidden_scales
+            )
+
+        # An unprepared CED source narrows between the stage graphs. Other
+        # layers can hand their full FP8 output bucket to the next segment.
         handoff_codes = handoff_scales = None
         if (
             is_breakable_capture_active()
@@ -1423,14 +1461,170 @@ class DeepseekV41Attention(nn.Module):
         )
         if out is not None:
             return out
-        # Prepared fused weights serve local heads, so this projection has no
-        # tensor-parallel reduction or collective target.
         return self._project_fp8(
             handoff_codes,
             handoff_scales,
             self.fused_wo_a_weight,
             self.fused_wo_a_scales,
             None,
+        )
+
+    def _project_qkv(
+        self,
+        hidden: torch.Tensor,
+        codes: torch.Tensor | None,
+        scales: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if hidden.shape[0] == 0:
+            return hidden.new_empty((0, self.q_norm.weight.numel() + self.head_dim))
+        qkv, _ = self.wq_a_wkv(
+            hidden if codes is None else codes,
+            block_scale=scales,
+            output_dtype=None if codes is None else hidden.dtype,
+        )
+        return qkv
+
+    def _project_fused_q(
+        self,
+        q_input: torch.Tensor,
+        q_scale: torch.Tensor | None,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if q_scale is not None and q_scale.dtype == torch.int32:
+            return fp8_projection(
+                q_input,
+                q_scale,
+                self.fused_q_weight,
+                self.fused_q_projection_scales,
+                None,
+            )
+        return mm(
+            q_input,
+            self.fused_q_weight,
+            A_scales=q_scale,
+            B_scales=self.fused_q_scales,
+            out_dtype=out_dtype,
+            quant="mxfp8",
+            block_size=[1, 32],
+            prepacked_scales=True,
+        )
+
+    def _prefill_queries(self, qkv, indexer: DeepseekV41Indexer | None):
+        qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
+        qr, codes, scales = rmsnorm_quantize_fp8_group32(
+            qr,
+            self.q_norm.weight,
+            self.q_norm.variance_epsilon,
+            scale_layout=self._q_scale_layout(None, True),
+            override=None,
+            solution="triton",
+        )
+        q = self._project_fused_q(codes, scales, qr.dtype).unflatten(
+            -1, (self.n_local_heads, self.head_dim)
+        )
+        index_q = None
+        if indexer is not None:
+            quantized = isinstance(indexer.wq_b.quant_method, _ReferenceFp8LinearMethod)
+            index_q, _ = indexer.wq_b(
+                codes if quantized else qr,
+                block_scale=scales if quantized else None,
+                output_dtype=qr.dtype if quantized else None,
+            )
+        return q, index_q, swa
+
+    def _forward_with_prefill_stage(self, positions, hidden, ctx, codes, scales):
+        """Run the staged attention. The replayed source already has its global KV."""
+        backend = ctx.attn_backend
+        decoder = self.layer_id >= self.ced_decoder_start
+        capturing = is_breakable_capture_active()
+        indexer = self.indexer
+        # A captured bucket must also serve longer histories than its dummy batch.
+        if (
+            indexer is not None
+            and ctx.forward_mode.is_extend()
+            and not (capturing or ctx.is_prefill_graph_dummy)
+        ):
+            meta = (
+                backend.decoder_view().metadata
+                if decoder
+                else backend.query_metadata(ctx.forward_mode)
+            )
+            if not backend.indexer_needs_scores(
+                self.layer_id, meta.positions, meta.request_indices, ctx.forward_mode
+            ):
+                indexer = None
+        write_kv = self.is_kv_source and self.layer_id != self.ced_decoder_start
+        self.rotary_emb._prepare_cache(hidden.device)
+        aux = self.stream_fork.aux_stream
+        overlap = (
+            (indexer is not None or write_kv)
+            and 0 < hidden.shape[0] <= (384 if self.compressor else 16)
+            and aux is not None
+            and aux.device == hidden.device
+        )
+        if overlap:
+            hidden.record_stream(aux)
+        with self.stream_fork.scope(enable=overlap, overlap=True) as fork:
+            with fork.branch():
+                weights = None
+                if indexer is not None:
+                    weights, _ = indexer.weights_proj(
+                        hidden, block_scale=None, output_dtype=None
+                    )
+                if write_kv:
+                    self.write_prefill_kv(hidden, ctx)
+            q, index_q, swa = self._prefill_queries(
+                self._project_qkv(hidden, codes, scales), indexer
+            )
+
+        rope = self.rotary_emb.cos_sin_cache
+        if indexer is not None:
+            if overlap:
+                weights.record_stream(torch.cuda.current_stream())
+            index_q, weights = indexer.query_from_projections(
+                index_q, weights, positions, self.rotary_emb
+            )
+            index_q, weights = backend.prepare_index_query(
+                self.layer_id, index_q, weights
+            )
+        current = backend.publish_prefill_swa(
+            self.layer_id, swa, rope, self.kv_norm, decoder=decoder
+        )
+        handoff = (None, None)
+        if capturing:
+            handoff = allocate_fp8_output(
+                q.device, self.n_local_groups, q.shape[0], zeroed=False
+            )
+        out = backend.forward_live_queries(
+            ctx,
+            q,
+            index_q,
+            weights,
+            current,
+            rope,
+            self._kernel_attn_sink(),
+            *handoff,
+            layer_id=self.layer_id,
+            decoder=decoder,
+            softmax_scale=self.head_dim**-0.5,
+            groups=self.n_local_groups,
+        )
+        codes, scales = handoff if out is None else out
+        return self._project_fp8(
+            codes, scales, self.fused_wo_a_weight, self.fused_wo_a_scales, None
+        )
+
+    def write_prefill_kv(self, hidden, ctx):
+        """Publish live global and index K using the encoder stage's write slots."""
+        stage = ctx.attn_backend.prefill_stage
+        self._write_global_kv(
+            hidden,
+            stage.positions[: hidden.shape[0]],
+            None,
+            ctx.attn_backend,
+            ctx.forward_mode,
+            key_rows=None,
+            stage=stage,
         )
 
     @break_point
@@ -1502,35 +1696,34 @@ class DeepseekV41Attention(nn.Module):
             or positions.numel() != hidden_states.shape[0]
         ):
             raise ValueError("V4.1 hidden rows and backend query metadata disagree")
+        empty_local = (
+            source_count == 0 and source_gather is None and not self.mapping.attn.has_tp
+        )
         # Backend positions carry -1 for padding; request indices are batch rows.
         positions, requests = source_positions, source_requests
         if rows.source_shard is not None:
             positions = positions[rows.source_shard.local_row_ids]
             requests = requests[rows.source_shard.local_row_ids]
-        if (
+        cache_only = (
             rows.keep_rows is not None
             and rows.keep_rows.numel() == 0
             and (rows.query_shard is None or rows.query_shard.total_rows == 0)
-        ):
-            self._write_global_kv(
-                hidden_states,
-                source_positions,
-                source_requests,
-                backend,
-                mode,
-                key_rows=source_gather,
-            )
+        )
+        if cache_only or empty_local:
+            if cache_only and not empty_local:
+                self._write_global_kv(
+                    hidden_states,
+                    source_positions,
+                    source_requests,
+                    backend,
+                    mode,
+                    key_rows=source_gather,
+                )
+            if handoff_codes is not None:
+                scrub_padding_tail(0, handoff_codes, handoff_scales)
+                return None
             return hidden_states[:0]
-        if hidden_states.shape[0]:
-            qkv, _ = self.wq_a_wkv(
-                hidden_states if hidden_codes is None else hidden_codes,
-                block_scale=hidden_scales,
-                output_dtype=None if hidden_codes is None else hidden_states.dtype,
-            )
-        else:
-            qkv = hidden_states.new_empty(
-                (0, self.q_norm.weight.numel() + self.head_dim)
-            )
+        qkv = self._project_qkv(hidden_states, hidden_codes, hidden_scales)
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
         if (
             qr.shape[0] > 0
@@ -1549,7 +1742,7 @@ class DeepseekV41Attention(nn.Module):
                 qr,
                 self.q_norm.weight,
                 self.q_norm.variance_epsilon,
-                scale_layout=self._q_scale_layout(rows, fused_decode),
+                scale_layout=self._q_scale_layout(rows.keep_rows, fused_decode),
                 override=None,
                 solution="triton",
             )
@@ -1701,29 +1894,8 @@ class DeepseekV41Attention(nn.Module):
                         )
                         index_q = index_weights = None
             if q_input.shape[0]:
-                if (
-                    fused_decode
-                    and q_scale is not None
-                    and q_scale.dtype == torch.int32
-                ):
-                    q = fp8_projection(
-                        q_input,
-                        q_scale,
-                        self.fused_q_weight,
-                        self.fused_q_projection_scales,
-                        None,
-                    )
-                elif fused_decode:
-                    q = mm(
-                        q_input,
-                        self.fused_q_weight,
-                        A_scales=q_scale,
-                        B_scales=self.fused_q_scales,
-                        out_dtype=qr.dtype,
-                        quant="mxfp8",
-                        block_size=[1, 32],
-                        prepacked_scales=True,
-                    )
+                if fused_decode:
+                    q = self._project_fused_q(q_input, q_scale, qr.dtype)
                 else:
                     q, _ = self.wq_b(
                         q_input,
@@ -1828,14 +2000,12 @@ class DeepseekV41Attention(nn.Module):
         )
         if fp8_out is not None:
             return None
+        if q.shape[0] == 0:
+            return hidden_states[:0]
         if fused_decode:
             codes, scales = out
             weight, weight_scales = self.fused_wo_a_weight, self.fused_wo_a_scales
         else:
-            # Zero rows arise from an empty query shard or an idle DP peer's
-            # stage replay; every head-TP rank sees the same row count.
-            if out.shape[0] == 0:
-                return hidden_states.new_empty((0, self.wo_b.output_size))
             out = out[:, : self.n_local_heads]
             weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
             weight_scales = self.wo_a_scales
@@ -2192,6 +2362,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         pending_post: V41HCPost | None,
         allow_ffn_reduce_fusion: bool,
         capture_input: bool,
+        decoder_view: V41DecoderView | None = None,
     ):
         if ctx.forward_mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
@@ -2208,7 +2379,13 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             captured = hidden_states[:, 0, :] if capture_input else None
             return hidden_states, pre_mix, None, captured
-        rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
+        rows = (
+            _row_plan(self.layer_id, self.ced_decoder_start, ctx)
+            if decoder_view is None
+            else V41RowPlan(
+                decoder_view.metadata, decoder_view.metadata, None, None, None
+            )
+        )
         if rows.keep_rows is not None and rows.keep_rows.numel() == 0:
             # Only the global cache producer runs for an open prefill chunk.
             # Finish the preceding HC post without computing unused mixes.
@@ -2311,6 +2488,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 reduce_output=not defer_attn,
                 hidden_codes=codes,
                 hidden_scales=scales,
+                decoder_view=decoder_view,
             )
             attn_pre, post, comb = attn_mixes
             if overlap:
@@ -2553,9 +2731,12 @@ class V41RowState:
             list(captured),
         )
 
+    def select_rows(self, rows: torch.Tensor | slice) -> V41RowState:
+        return self._rebuilt([None if t is None else t[rows] for t in self._tensors()])
+
     def leading(self, rows: int) -> V41RowState:
         """The first ``rows`` rows of every tensor, as views."""
-        return self._rebuilt([t if t is None else t[:rows] for t in self._tensors()])
+        return self.select_rows(slice(rows))
 
     def land_into(self, dst: V41RowState) -> None:
         """Copy this state into the leading rows of ``dst`` and zero its tail.
@@ -2568,9 +2749,12 @@ class V41RowState:
             raise ValueError(
                 f"V4.1 row state of {rows} rows exceeds the {dst.rows}-row target"
             )
-        for src, target in zip(self._tensors(), dst._tensors(), strict=True):
-            if (src is None) != (target is None):
-                raise ValueError("V4.1 row states disagree on their optional tensors")
+        if len(self.captured) != len(dst.captured):
+            raise ValueError("V4.1 row states disagree on tap layout")
+        pairs = tuple(zip(self._tensors(), dst._tensors(), strict=True))
+        if any((src is None) != (target is None) for src, target in pairs):
+            raise ValueError("V4.1 row states disagree on their optional tensors")
+        for src, target in pairs:
             if src is None:
                 continue
             target[:rows].copy_(src)
@@ -2872,6 +3056,32 @@ class DeepseekV41Model(nn.Module):
             captured.append(tap)
         return hidden, pre_mix, pending_post
 
+    def _prepare_prefill_stage(self, ctx, rows, *, decoder):
+        backend = ctx.attn_backend
+        if (
+            isinstance(backend, DeepseekV41AttentionBackend)
+            and self.layers[0].attn.fused_q_weight is not None
+        ):
+            backend.prepare_prefill_stage(ctx, rows, decoder=decoder)
+
+    def _decoder_starts_at_source(self, ctx: ForwardContext) -> bool:
+        """Encoder and decoder must agree on this entry regardless of bucket size."""
+        backend = ctx.attn_backend
+        if (
+            not isinstance(backend, DeepseekV41AttentionBackend)
+            or backend.prefill_stage is None
+            or self.ced_decoder_start == len(self.layers)
+        ):
+            return False
+        source = self.layers[self.ced_decoder_start]
+        return (
+            source.engram is None
+            and source.attn.fused_q_weight is not None
+            and source.attn.compress_ratio == 1
+            and self.mapping.attn.tp_size == 1
+            and self.mapping.dense.tp_size == self.mapping.moe.tp_size == 1
+        )
+
     def encoder_forward(
         self,
         input_ids: torch.Tensor,
@@ -2930,6 +3140,7 @@ class DeepseekV41Model(nn.Module):
         state = V41RowState(
             h, pre_mix, positions, image_mask, hashes, engram_token_mask, []
         )
+        self._prepare_prefill_stage(ctx, state.rows, decoder=False)
         pending_post = None
         for layer in self.layers[: self.ced_decoder_start]:
             h, pre_mix, pending_post = self._run_layer(
@@ -2944,6 +3155,13 @@ class DeepseekV41Model(nn.Module):
             )
         if pending_post is not None:
             h = pending_post.finish(h)
+        if self._decoder_starts_at_source(ctx):
+            source = self.layers[self.ced_decoder_start]
+            if h.shape[0]:
+                x = _v41_hc_input(h, pre_mix, source.attn_norm)
+                source.attn.write_prefill_kv(x, ctx)
+            if self.ced_decoder_start in self.dspark_capture_layers:
+                state.captured.append(h.mean(dim=1))
         state.hidden, state.pre_mix = h, pre_mix
         return state
 
@@ -2968,13 +3186,11 @@ class DeepseekV41Model(nn.Module):
         return _exchange_decoder_counts(num_rows, self.mapping.world_size)
 
     def narrowing_forward(self, state: V41RowState, ctx: ForwardContext) -> V41RowState:
-        """Run the candidate source layer and narrow to the decoder view.
+        """Select live decoder rows and run the source here if its KV is still due.
 
-        The layer projects the decoder's global KV from every row of ``state``
-        and returns the view's rows; the row descriptors and the taps taken so
-        far follow ``keep_rows``. ``state`` may carry a padded tail past the
-        forward's real rows (an encoder graph output): only the real rows are
-        used. A window-only stack has no candidate source and passes through.
+        The encoder may return a padded bucket. Its positions and DSpark taps
+        follow the same row selection as the residual. A window-only stack
+        passes through.
         """
         ctx.attn_backend.begin_indexer_stage()
         start = self.ced_decoder_start
@@ -2992,6 +3208,12 @@ class DeepseekV41Model(nn.Module):
         if state.rows > rows:
             state = state.leading(rows)
         view = backend.decoder_view()
+        if self._decoder_starts_at_source(ctx):
+            if not self.decoder_uses_engram:
+                state = replace(state, hashes=None, engram_token_mask=None)
+            return (
+                state if view.keep_rows is None else state.select_rows(view.keep_rows)
+            )
         counts = self.decoder_collective_counts(ctx, view.metadata.positions.numel())
         captured = list(state.captured)
         # Ordinary EP needs the narrowed rows; fused EP exchanges counts itself.
@@ -3033,12 +3255,13 @@ class DeepseekV41Model(nn.Module):
     def decoder_forward(
         self, state: V41RowState, ctx: ForwardContext
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
-        """Run the layers above the candidate source and the final norm.
+        """Run the replayed source, when present, then the remaining layers and norm.
 
         Every row of ``state`` is computed and sized into the collectives: the
         prefill graph hands a fixed-row state whose tail is padding and slices
         the result. Returns the normalized rows and the DSpark taps.
         """
+        self._prepare_prefill_stage(ctx, state.rows, decoder=True)
         start = self.ced_decoder_start
         captured = list(state.captured)
         h, pre_mix = state.hidden, state.pre_mix
@@ -3057,6 +3280,23 @@ class DeepseekV41Model(nn.Module):
             return hidden, captured
         ctx.attn_backend.begin_indexer_stage()
         pending_post = None
+        if self._decoder_starts_at_source(ctx):
+            # The encoder already wrote global KV and captured the source input tap.
+            counts = self.decoder_collective_counts(ctx, state.rows)
+            with report_collective_sizing(ctx, state.rows, counts):
+                h, pre_mix, post, _ = self.layers[start](
+                    h,
+                    pre_mix,
+                    state.positions,
+                    state.image_mask,
+                    ctx,
+                    pending_post=None,
+                    allow_ffn_reduce_fusion=False,
+                    capture_input=False,
+                    decoder_view=ctx.attn_backend.decoder_view(),
+                )
+                if post is not None:
+                    h = post.finish(h)
         layers = self.layers[start + 1 :]
         if layers:
             counts = self.decoder_collective_counts(ctx, state.rows)

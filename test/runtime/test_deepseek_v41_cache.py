@@ -182,13 +182,13 @@ def _backend(device, max_bs):
     return _verify_backend(device, max_bs, 1)
 
 
-def _pool(recipe, device):
+def _pool(recipe, device, *, enable_memory_saver=False):
     arena = CacheArena(
         _layout(recipe).bind(16),
         device,
         cache_group_specs=tuple(s for s, _ in recipe.groups()),
         token_capacity=1024,
-        enable_memory_saver=False,
+        enable_memory_saver=enable_memory_saver,
     )
     return DeepseekV41CachePool(arena, layer_num=40, rank=0, field_layer_offset=0)
 
@@ -3521,6 +3521,33 @@ def test_one_index_graph_crosses_coverage_limits_with_padding(
             assert (ids[padding:] == -1).all() and (counts[padding:] == 0).all()
     if sparse_scores is not None:
         assert sparse_scores.call_count > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_index_query_preparation_follows_layer_and_scorer():
+    from tokenspeed_kernel.selection import kernel_override
+
+    if (
+        not dsv41.prefill_indexer_batching_supported(68)
+        or current_platform().arch_version.minor > 3
+    ):
+        pytest.skip("requires the native Blackwell indexer")
+    backend = _backend("cuda", 1)
+    q = torch.ones((1, 32, 128), dtype=torch.bfloat16, device="cuda")
+    weights = torch.ones_like(q[..., 0])
+    query = dsv41.IndexQueryInput(
+        q, torch.ones(1, dtype=torch.int64, device="cuda"), _global_rope_table(), 0.25
+    )
+    for layer, dtype in ((20, torch.float32), (24, torch.bfloat16)):
+        packed, scaled = backend.prepare_index_query(layer, query, weights)
+        assert isinstance(packed, dsv41.PreparedIndexQuery)
+        torch.testing.assert_close(scaled, (weights * query.weight_scale).to(dtype))
+    expected = dsv41.index_query_rope_weights(
+        q.clone(), weights, query.positions, query.cos_sin_cache, query.weight_scale
+    )
+    with kernel_override("attention", "dsv41_index_topk", "triton"):
+        actual = backend.prepare_index_query(24, query, weights)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(

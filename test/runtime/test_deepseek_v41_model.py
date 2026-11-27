@@ -34,6 +34,7 @@ import math
 import os
 import re
 import sys
+import time
 import weakref
 from contextlib import contextmanager
 from copy import copy
@@ -290,7 +291,10 @@ class _Backend:
     def decoder_view(self):
         return self.view
 
-    def compress(self, owner, content, scores, mode, norm_weight, norm_eps):
+    def compress(
+        self, owner, content, scores, mode, norm_weight, norm_eps, pair_plan=None
+    ):
+        assert pair_plan is None
         assert content.dtype == scores.dtype == torch.float32
         positions, requests = self.meta.positions, self.meta.request_indices
         self.projections[owner] = (content.clone(), scores.clone())
@@ -1563,7 +1567,9 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
             reduce_output,
             hidden_codes=None,
             hidden_scales=None,
+            decoder_view=None,
         ):
+            assert decoder_view is None
             assert reduce_output and hidden_codes is None and hidden_scales is None
             return x.sin() if keep is None else x[keep].sin()
 
@@ -2449,6 +2455,47 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     assert torch.isfinite(actual).all()
 
 
+def test_published_ced_source_narrows_and_lands_decoder_rows(monkeypatch):
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    model = DeepseekV41Model(
+        _config(), _mapping(0, 1, 1), None, "model", False, "gpu", None
+    )
+    model.dspark_capture_layers = (19, 20)
+    # Exercise the published-source branch on CPU without fused CUDA weights.
+    monkeypatch.setattr(model, "_decoder_starts_at_source", lambda ctx: True)
+    source = model.allocate_decoder_state(9)
+    target = model.allocate_decoder_state(9)
+    for activation in (source.hidden, source.pre_mix, *source.captured):
+        activation.normal_()
+    source.hashes = torch.arange(9).view(9, 1, 1)
+    source.engram_token_mask = torch.ones(9, dtype=torch.bool)
+
+    backend, tables = _backend("cpu", 2), _tables("cpu")
+    ctx = _ctx(backend, 7, ForwardMode.EXTEND)
+    ctx.bs = ctx.num_extends = 2
+    for prompts, outputs, keep in (
+        ([4, 3], 2, list(range(7))),
+        ([5, 3], 1, [3, 4, 5, 6]),
+        ([5, 4], 0, []),
+    ):
+        meta = _extend(backend, tables, [4, 3], [0, 0], [0, 0], prompts)
+        source.positions[:7].copy_(meta.positions)
+        ctx.output_layout = ForwardOutputLayout(2, outputs, 0, 1)
+        narrowed = model.narrowing_forward(source, ctx)
+        assert narrowed.rows == len(keep)
+        assert narrowed.hashes is None and narrowed.engram_token_mask is None
+        narrowed.land_into(target)
+        for original, landed in zip(
+            (source.hidden, source.pre_mix, source.positions, *source.captured),
+            (target.hidden, target.pre_mix, target.positions, *target.captured),
+            strict=True,
+        ):
+            torch.testing.assert_close(
+                landed[: len(keep)], original[keep], rtol=0, atol=0
+            )
+            assert not landed[len(keep) :].any()
+
+
 def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     """The four stages compose to ``forward`` under the prefill graph's padding
     contract: the narrowing stage accepts an encoder state padded past the
@@ -3094,6 +3141,50 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
             torch.testing.assert_close(captured, expected, rtol=0, atol=0)
     finally:
         pdl_enabled(previous_pdl)
+
+
+def _capture_prefill_stage_with_pinned_allocator(_rank):
+    from tokenspeed.runtime.execution.breakable_cuda_graph import (
+        BreakableCapture,
+        active_forward,
+    )
+
+    backend = _backend("cuda", 1)
+    tables = _tables("cuda")
+    capacity = 16
+
+    def batch(rows):
+        _extend(backend, tables, [rows], [0], [0], [rows])
+        return _ctx(backend, rows, ForwardMode.EXTEND)
+
+    ctx = batch(capacity)
+    backend.prepare_prefill_stage(ctx, capacity, decoder=False)
+    counts = torch.empty_like(backend.prefill_stage.counts)
+    torch.cuda.synchronize()
+    graph = BreakableCapture(run_segments_while_capturing=True)
+    with active_forward(ctx), graph:
+        for _ in range(8):
+            # Queue work ahead of the upload, then leave the next capture
+            # segment open while the pinned allocator polls outstanding copies.
+            torch.cuda._sleep(5_000_000)
+            backend.prepare_prefill_stage(ctx, capacity, decoder=False)
+            time.sleep(0.005)
+            counts.copy_(backend.prefill_stage.counts)
+
+    with active_forward(batch(3)):
+        graph.replay()
+    assert counts.tolist() == [3, 3]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.cuda is None, reason="requires CUDA"
+)
+def test_prefill_stage_descriptor_capture_with_pinned_allocator(monkeypatch):
+    # The spawned process reads the service's host allocator setting at startup.
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.delenv("PYTORCH_HIP_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("PYTORCH_ALLOC_CONF", "pinned_use_background_threads:True")
+    torch.multiprocessing.spawn(_capture_prefill_stage_with_pinned_allocator, nprocs=1)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
