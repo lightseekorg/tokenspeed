@@ -60,6 +60,8 @@ pub struct Object {
     pub slot: i32,
     /// Full packed object size, including fields and padding.
     pub bytes: u64,
+    /// Field slices selected by the existing Peer layout planner.
+    pub fragments: Vec<super::prepared::StoredFragment>,
 }
 
 /// Immutable complete dependencies. Construction never reserves L1 or L2.
@@ -155,6 +157,7 @@ impl PrefixPlan {
                     group_id: key.group_id,
                     slot: object.slot,
                     bytes,
+                    fragments: Vec::new(),
                 });
             }
         }
@@ -387,7 +390,18 @@ impl Hit {
     /// Bytes copied to all reader owners, including replicated destinations.
     pub fn transfer_bytes(&self) -> Result<u64, Error> {
         self.plan.objects.iter().try_fold(0u64, |n, object| {
-            n.checked_add(object.bytes)
+            let bytes = if object.fragments.is_empty() {
+                object.bytes
+            } else {
+                object.fragments.iter().try_fold(0u64, |sum, fragment| {
+                    fragment
+                        .bytes
+                        .checked_mul(fragment.rows)
+                        .and_then(|bytes| sum.checked_add(bytes))
+                        .ok_or_else(|| Error("fragment transfer byte count overflow".into()))
+                })?
+            };
+            n.checked_add(bytes)
                 .ok_or_else(|| Error("prefix transfer byte count overflow".into()))
         })
     }
@@ -419,9 +433,12 @@ pub fn query<B: Backend>(
     let mut sizes = HashMap::new();
     let mut previous = i32::MAX;
     let mut members = None;
-    for plan in candidates {
+    for (index, plan) in candidates.iter().enumerate() {
+        if candidates[..index].contains(plan) {
+            return Err(Error("duplicate complete-boundary candidate".into()));
+        }
         if plan.num_tokens <= 0
-            || plan.num_tokens >= previous
+            || plan.num_tokens > previous
             || plan.members == 0
             || members.is_some_and(|n| n != plan.members)
             || plan.objects.is_empty()
@@ -671,6 +688,7 @@ impl<R: ReadingSource> ReadingPrefix<R> {
                     session: (*session).into(),
                     address: *address,
                     bytes: o.bytes,
+                    fragments: o.fragments.clone(),
                 })
             })
             .collect()
@@ -853,6 +871,7 @@ mod tests {
                             group_id: 0,
                             slot: 0,
                             bytes: 16,
+                            fragments: Vec::new(),
                         },
                         Object {
                             key: "state".into(),
@@ -860,6 +879,7 @@ mod tests {
                             group_id: 1,
                             slot: 0,
                             bytes: 16,
+                            fragments: Vec::new(),
                         },
                     ]
                 })
@@ -1081,5 +1101,45 @@ mod tests {
         .is_err());
         assert_eq!(backend.state.lock().unwrap().calls, 0);
         assert_eq!(budget.usage(), (0, 0));
+    }
+    #[test]
+    fn equal_boundary_layouts_require_one_complete_variant() {
+        let mut backend = store();
+        let mut private = plan(1);
+        for object in &mut private.objects {
+            object.key = format!("private-{}", object.key);
+        }
+        let shared = plan(1);
+        let hit = query(&backend, &[private.clone(), shared.clone()], LIMITS)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.num_tokens(), 128);
+        backend.values.remove("state");
+        backend
+            .values
+            .insert("private-state".into(), ("owner-b".into(), vec![22; 16]));
+        // Full in Decode's layout plus State in Prefill's layout is not a checkpoint.
+        assert!(query(&backend, &[private, shared], LIMITS)
+            .unwrap()
+            .is_none());
+    }
+    #[test]
+    fn sliced_network_bytes_do_not_reduce_source_staging_budget() {
+        let backend = store();
+        let mut candidate = plan(2);
+        for object in &mut candidate.objects {
+            object.fragments = vec![super::super::prepared::StoredFragment {
+                field: "state".into(),
+                source_offset: 0,
+                target_offset: 0,
+                source_stride: 8,
+                target_stride: 2,
+                bytes: 2,
+                rows: 2,
+            }];
+        }
+        let hit = query(&backend, &[candidate], LIMITS).unwrap().unwrap();
+        assert_eq!(hit.bytes(), 32);
+        assert_eq!(hit.transfer_bytes().unwrap(), 16);
     }
 }

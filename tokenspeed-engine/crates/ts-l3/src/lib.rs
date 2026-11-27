@@ -37,8 +37,8 @@ pub mod settings;
 pub mod store;
 
 pub use executor::{
-    monotonic_clock, Clock, Executor, ExecutorConfig, ExecutorError, Namespace, Operation,
-    StorageCompletion, StorageKey, StoragePoll, StoragePressure,
+    monotonic_clock, Clock, Executor, ExecutorConfig, ExecutorError, MetadataHandle, Namespace,
+    Operation, StorageCompletion, StorageKey, StoragePoll, StoragePressure,
 };
 pub use layout::{GroupLayout, HostLayout, LayoutError, Range};
 pub use settings::{Settings, StoreSettings};

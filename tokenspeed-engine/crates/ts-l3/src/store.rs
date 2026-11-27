@@ -72,9 +72,24 @@ pub struct IoResult {
 #[error("{0}")]
 pub struct StoreError(pub String);
 
-/// A byte store for packed Host cache blocks. The executor's workers call
-/// it from several threads at once.
+/// Fixed frame bound for small persistent layout descriptions.
+pub const MAX_METADATA_BYTES: usize = 512 << 10;
+
+/// A byte store for packed Host cache blocks, called concurrently by workers.
 pub trait Store: Send + Sync {
+    /// Bounded immutable layout records, not a per-prefix cache inventory.
+    fn metadata_get(&self, _key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        Err(StoreError("layout metadata is unsupported".into()))
+    }
+    /// Create an immutable record; an existing key must never be overwritten.
+    fn metadata_put(&self, _key: &str, _bytes: &[u8]) -> Result<(), StoreError> {
+        Err(StoreError("layout metadata is unsupported".into()))
+    }
+    /// False means the metadata staging allocation must remain registered.
+    fn metadata_retired(&self) -> bool {
+        true
+    }
+
     /// Whether a failed call proves its Host access ended. Valid results
     /// carry their own `retired`.
     fn failures_retire(&self) -> bool;
@@ -108,6 +123,16 @@ pub trait Store: Send + Sync {
 }
 
 impl<S: Store + ?Sized> Store for Arc<S> {
+    fn metadata_get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        (**self).metadata_get(key)
+    }
+    fn metadata_put(&self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        (**self).metadata_put(key, bytes)
+    }
+    fn metadata_retired(&self) -> bool {
+        (**self).metadata_retired()
+    }
+
     fn failures_retire(&self) -> bool {
         (**self).failures_retire()
     }
@@ -185,6 +210,21 @@ impl MemoryStore {
 }
 
 impl Store for MemoryStore {
+    fn metadata_get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(self.objects.lock().unwrap().get(key).cloned())
+    }
+    fn metadata_put(&self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        if bytes.len() > MAX_METADATA_BYTES - 4 {
+            return Err(StoreError("layout record exceeds metadata budget".into()));
+        }
+        self.objects
+            .lock()
+            .unwrap()
+            .entry(key.into())
+            .or_insert_with(|| bytes.to_vec());
+        Ok(())
+    }
+
     fn failures_retire(&self) -> bool {
         true
     }

@@ -43,6 +43,27 @@ pub struct PreparedObject {
     pub address: u64,
     /// Exact length returned by preparation.
     pub bytes: u64,
+    /// Cross-layout slices; empty means the reader's existing packed layout.
+    pub fragments: Vec<StoredFragment>,
+}
+
+/// A validated Peer planner slice from one persisted source object.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StoredFragment {
+    /// Target field identifier.
+    pub field: String,
+    /// Source offset includes the field's offset within its packed object.
+    pub source_offset: u64,
+    /// Offset within the target field's page.
+    pub target_offset: u64,
+    /// Byte distance between consecutive source rows.
+    pub source_stride: u64,
+    /// Byte distance between consecutive destination rows.
+    pub target_stride: u64,
+    /// Bytes copied per row.
+    pub bytes: u64,
+    /// Number of strided rows.
+    pub rows: u64,
 }
 
 /// A source description cannot satisfy the admitted destinations.
@@ -142,6 +163,10 @@ pub fn read_spans(
         let source = sources
             .get(&(group_id, destination.slot))
             .ok_or(PreparedError::Missing(group_id, destination.slot))?;
+        if !source.fragments.is_empty() {
+            append_fragment_reads(source, reader, destination, &mut reads)?;
+            continue;
+        }
         let group = pool
             .groups
             .get(group_id as usize)
@@ -210,6 +235,100 @@ pub fn read_spans(
     Ok(reads)
 }
 
+/// Validate complete, nonoverlapping field coverage before exposing any read.
+fn append_fragment_reads(
+    source: &PreparedObject,
+    reader: &RankGeometry,
+    destination: &PeerPageView,
+    reads: &mut BTreeMap<String, Spans>,
+) -> Result<(), PreparedError> {
+    let invalid = || PreparedError::Layout(destination.group_id);
+    if source.session.is_empty()
+        || source.address == 0
+        || source.bytes == 0
+        || source.address.checked_add(source.bytes).is_none()
+    {
+        return Err(invalid());
+    }
+    let fields: HashMap<_, _> = reader
+        .device
+        .iter()
+        .filter(|f| f.group_id == destination.group_id)
+        .map(|f| (f.field_id.as_str(), f))
+        .collect();
+    let mut covered = HashMap::<&str, Vec<(u64, u64)>>::new();
+    let mut spans = Spans::default();
+    let mut total_rows = 0u64;
+    for f in &source.fragments {
+        total_rows = total_rows
+            .checked_add(f.rows)
+            .filter(|&n| n <= 1 << 20)
+            .ok_or_else(invalid)?;
+        let target = fields.get(f.field.as_str()).ok_or_else(invalid)?;
+        if f.bytes == 0 || f.rows == 0 || f.rows > 1 << 20 || target.page_stride < target.bytes {
+            return Err(invalid());
+        }
+        let base = (destination.block_id as u64)
+            .checked_mul(target.page_stride)
+            .and_then(|n| target.address.checked_add(n))
+            .ok_or_else(invalid)?;
+        for row in 0..f.rows {
+            let src = row
+                .checked_mul(f.source_stride)
+                .and_then(|n| n.checked_add(f.source_offset))
+                .ok_or_else(invalid)?;
+            let dst = row
+                .checked_mul(f.target_stride)
+                .and_then(|n| n.checked_add(f.target_offset))
+                .ok_or_else(invalid)?;
+            let end = dst
+                .checked_add(f.bytes)
+                .filter(|&n| n <= target.bytes)
+                .ok_or_else(invalid)?;
+            if src.checked_add(f.bytes).is_none_or(|n| n > source.bytes) {
+                return Err(invalid());
+            }
+            covered.entry(&f.field).or_default().push((dst, end));
+            spans
+                .sources
+                .push(source.address.checked_add(src).ok_or_else(invalid)?);
+            spans.destinations.push(
+                base.checked_add(dst)
+                    .filter(|n| n.checked_add(f.bytes).is_some())
+                    .ok_or_else(invalid)?,
+            );
+            spans.lengths.push(f.bytes);
+            spans.host_bytes = spans.host_bytes.checked_add(f.bytes).ok_or_else(invalid)?;
+        }
+    }
+    if fields.is_empty() || covered.len() != fields.len() {
+        return Err(invalid());
+    }
+    for (name, field) in fields {
+        let ranges = covered.get_mut(name).ok_or_else(invalid)?;
+        ranges.sort_unstable();
+        let mut end = 0;
+        for &(start, next) in ranges.iter() {
+            if start != end {
+                return Err(invalid());
+            }
+            end = next;
+        }
+        if end != field.bytes {
+            return Err(invalid());
+        }
+    }
+    let out = reads.entry(source.session.clone()).or_default();
+    out.sources.extend(spans.sources);
+    out.destinations.extend(spans.destinations);
+    out.lengths.extend(spans.lengths);
+    out.host_bytes = out
+        .host_bytes
+        .checked_add(spans.host_bytes)
+        .ok_or_else(invalid)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +378,7 @@ mod tests {
             session: format!("ssd-{slot}"),
             address: 256 + slot as u64 * 128,
             bytes: 64,
+            fragments: Vec::new(),
         }
     }
 

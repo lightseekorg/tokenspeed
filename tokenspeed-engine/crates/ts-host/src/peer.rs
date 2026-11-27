@@ -79,6 +79,7 @@ impl Outbox {
 
 /// What the bootstrap resolved for this rank.
 pub struct Settings {
+    l3: Option<ts_l3::Settings>,
     storage: Option<storage::Settings>,
     peer: PeerSettings,
     node_leaders: Vec<(usize, u32)>,
@@ -107,6 +108,7 @@ impl Settings {
     /// The Store and peer register the same Host allocation. Native transports
     /// may share exact registrations but reject partially overlapping ones.
     pub fn use_storage_registrations(&mut self, l3: &ts_l3::Settings) -> Result<(), String> {
+        self.l3 = Some(l3.clone());
         if matches!(l3.store, ts_l3::StoreSettings::Memory) {
             return Ok(());
         }
@@ -161,6 +163,7 @@ impl Settings {
                 .collect::<PyResult<Vec<_>>>()?,
         };
         Ok(Some(Self {
+            l3: None,
             storage: storage::Settings::from_python(&settings.getattr("storage")?)?,
             peer: PeerSettings {
                 name: settings.getattr("name")?.extract()?,
@@ -288,6 +291,7 @@ pub fn start(
     scheduler: Arc<Mutex<Scheduler>>,
     outbox: &Outbox,
     disk: Option<&DiskTier>,
+    l3_executor: Option<&ts_l3::Executor>,
 ) -> Result<Peer, String> {
     let library =
         ts_mooncake::Library::load(&settings.library).map_err(|error| error.to_string())?;
@@ -392,6 +396,41 @@ pub fn start(
                 .into(),
         );
     }
+    let catalog = if replica.index() == 0 {
+        match (registered.as_ref(), settings.l3.as_ref(), l3_executor) {
+            (Some(layout), Some(l3), Some(executor)) => {
+                let source = if settings.source_role == "decode" && layout.members.len() == 1 {
+                    Some(
+                        ts_control::peer::stored_layout::StoredLayout::from_decode(
+                            layout,
+                            &settings.contract,
+                            &l3.namespace,
+                            &l3.weight_version,
+                        )
+                        .map_err(|e| e.to_string())?,
+                    )
+                } else {
+                    None
+                };
+                if source.is_some() || settings.storage.is_some() {
+                    Some(
+                        ts_control::peer::catalog::Catalog::start(
+                            executor.metadata(),
+                            layout.semantic,
+                            l3.weight_version.clone(),
+                            source,
+                        )
+                        .map_err(|e| e.to_string())?,
+                    )
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     if let Some((executor, disk_layout, ring, slot_bytes)) = push_source {
         push.serve(PushSource {
             executor,
@@ -451,7 +490,8 @@ pub fn start(
                     &settings.peer,
                     geometries.len(),
                     scheduler.clone(),
-                    registered.as_deref(),
+                    registered.clone(),
+                    catalog.clone(),
                 )
             })
             .transpose()?
@@ -479,6 +519,9 @@ pub fn start(
     .map_err(|error| error.to_string())?;
     if let Some(storage) = storage {
         peer.attach_storage_source(storage);
+    }
+    if let Some(catalog) = catalog {
+        peer.attach_catalog(catalog);
     }
     if let Some(layout) = registered {
         let retirement_bound_ms = match std::env::var("TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS") {

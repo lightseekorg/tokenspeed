@@ -273,6 +273,7 @@ struct State {
     last_submitted: u64,
     /// Workers still running.
     running_workers: usize,
+    metadata_calls: usize,
 }
 
 impl State {
@@ -411,6 +412,40 @@ struct Shared {
     /// A worker exited.
     exited: Condvar,
     prefix: Mutex<String>,
+}
+
+/// A small metadata client sharing the executor's connection and shutdown guard.
+#[derive(Clone)]
+pub struct MetadataHandle(Arc<Shared>);
+struct MetadataCall(Arc<Shared>);
+impl Drop for MetadataCall {
+    fn drop(&mut self) {
+        let retired = self.0.store.metadata_retired();
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.metadata_calls -= 1;
+        state.unsafe_io |= !retired;
+        self.0.exited.notify_all();
+    }
+}
+impl MetadataHandle {
+    fn enter(&self) -> Result<MetadataCall, crate::StoreError> {
+        let mut state = self.0.lock();
+        if state.stopping {
+            return Err(crate::StoreError("L3 metadata client is stopping".into()));
+        }
+        state.metadata_calls += 1;
+        Ok(MetadataCall(self.0.clone()))
+    }
+    /// Read one immutable layout record; reject calls after shutdown starts.
+    pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, crate::StoreError> {
+        let _guard = self.enter()?;
+        self.0.store.metadata_get(key)
+    }
+    /// Create one layout record without replacing an existing value.
+    pub fn put(&self, key: &str, bytes: &[u8]) -> Result<(), crate::StoreError> {
+        let _guard = self.enter()?;
+        self.0.store.metadata_put(key, bytes)
+    }
 }
 
 impl Shared {
@@ -812,6 +847,11 @@ impl Executor {
     /// The limits and workers it started with.
     pub fn config(&self) -> ExecutorConfig {
         self.shared.config
+    }
+
+    /// Layout discovery uses bounded metadata I/O outside the scheduling thread.
+    pub fn metadata(&self) -> MetadataHandle {
+        MetadataHandle(self.shared.clone())
     }
 
     /// The active weight version, without changing namespace state.
@@ -1233,7 +1273,7 @@ impl Executor {
         for work in &self.shared.work {
             work.notify_all();
         }
-        while state.running_workers > 0 {
+        while state.running_workers > 0 || state.metadata_calls > 0 {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
@@ -1245,7 +1285,7 @@ impl Executor {
                 .expect("L3 executor lock")
                 .0;
         }
-        let retired = state.running_workers == 0 && !state.unsafe_io;
+        let retired = state.running_workers == 0 && state.metadata_calls == 0 && !state.unsafe_io;
         drop(state);
         if !retired {
             // Only process exit releases an unretired native transport: the
@@ -1307,6 +1347,7 @@ mod tests {
         }
     }
 
+    type MetadataFn = dyn Fn(&str) -> Result<Option<Vec<u8>>, StoreError> + Send + Sync;
     type ExistsFn = dyn Fn(&[String]) -> Result<Vec<bool>, StoreError> + Send + Sync;
     type IoFn =
         dyn Fn(&[String], HostBuffer, &[Range]) -> Result<IoResult, StoreError> + Send + Sync;
@@ -1318,6 +1359,8 @@ mod tests {
     #[derive(Default)]
     struct TestStore {
         memory: Arc<MemoryStore>,
+        metadata_get: Option<Box<MetadataFn>>,
+        metadata_unretired: bool,
         exists: Option<Box<ExistsFn>>,
         get: Option<Box<IoFn>>,
         put: Option<Box<IoFn>>,
@@ -1338,6 +1381,18 @@ mod tests {
     }
 
     impl Store for TestStore {
+        fn metadata_get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+            match &self.metadata_get {
+                Some(get) => get(key),
+                None => self.memory.metadata_get(key),
+            }
+        }
+        fn metadata_put(&self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+            self.memory.metadata_put(key, bytes)
+        }
+        fn metadata_retired(&self) -> bool {
+            !self.metadata_unretired
+        }
         fn failures_retire(&self) -> bool {
             self.failures_retire
         }
@@ -3348,5 +3403,84 @@ mod tests {
             ),
             (2.0, 0.0, 0.0)
         );
+    }
+    #[test]
+    fn immutable_metadata_survives_writer_shutdown_and_rejects_closed_handles() {
+        let memory = Arc::new(MemoryStore::new());
+        let mut writer = Harness::new(
+            TestStore {
+                memory: memory.clone(),
+                ..TestStore::new()
+            },
+            CONFIG,
+        );
+        let handle = writer.executor().metadata();
+        handle.put("layout", b"decode-layout").unwrap();
+        handle.put("layout", b"different-layout").unwrap();
+        writer.close(Duration::from_secs(1)).unwrap();
+        assert!(handle.get("layout").is_err());
+        let reader = Harness::new(
+            TestStore {
+                memory,
+                ..TestStore::new()
+            },
+            CONFIG,
+        );
+        assert_eq!(
+            reader.executor().metadata().get("layout").unwrap(),
+            Some(b"decode-layout".to_vec())
+        );
+    }
+    #[test]
+    fn metadata_io_keeps_the_store_alive_until_retirement() {
+        let started = Arc::new(Event::default());
+        let release = Arc::new(Event::default());
+        let _release_on_panic = ReleaseOnDrop(release.clone());
+        let closes = Arc::new(AtomicUsize::new(0));
+        let entered = started.clone();
+        let gate = release.clone();
+        let mut harness = Harness::new(
+            TestStore {
+                closes: closes.clone(),
+                metadata_get: Some(Box::new(move |_| {
+                    entered.set();
+                    assert!(gate.wait(Duration::from_secs(3)));
+                    Ok(None)
+                })),
+                ..TestStore::new()
+            },
+            CONFIG,
+        );
+        let handle = harness.executor().metadata();
+        let call = std::thread::spawn(move || handle.get("layout"));
+        assert!(started.wait(Duration::from_secs(2)));
+        let close_count = closes.clone();
+        let release_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(close_count.load(Ordering::SeqCst), 0);
+            release.set();
+        });
+        harness.close(Duration::from_secs(2)).unwrap();
+        release_thread.join().unwrap();
+        assert!(call.join().unwrap().is_ok());
+        assert_eq!(closes.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn unretired_metadata_quarantines_the_connection() {
+        let closes = Arc::new(AtomicUsize::new(0));
+        let mut harness = Harness::new(
+            TestStore {
+                closes: closes.clone(),
+                metadata_unretired: true,
+                metadata_get: Some(Box::new(|_| {
+                    Err(StoreError("unknown native retirement".into()))
+                })),
+                ..TestStore::new()
+            },
+            CONFIG,
+        );
+        assert!(harness.executor().metadata().get("layout").is_err());
+        assert!(harness.close(Duration::from_secs(1)).is_err());
+        assert_eq!(closes.load(Ordering::SeqCst), 0);
     }
 }

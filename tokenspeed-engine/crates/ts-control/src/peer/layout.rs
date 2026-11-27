@@ -474,6 +474,9 @@ mod tests {
     }
 
     fn with_draft(width: usize) -> Contract {
+        Contract::from_wire(draft_wire(width).to_string().as_bytes()).unwrap()
+    }
+    fn draft_wire(width: usize) -> serde_json::Value {
         let mut wire = contract_wire(width);
         let heads = 8 / width;
         let page_bytes = 4 * heads;
@@ -500,7 +503,7 @@ mod tests {
                     "field_id":id, "partition":{"axis":1,"global_extent":8,"global_parts":[]}
                 }));
         }
-        Contract::from_wire(wire.to_string().as_bytes()).unwrap()
+        wire
     }
 
     #[test]
@@ -720,6 +723,7 @@ mod tests {
                     session: "ssd".into(),
                     address: 1000,
                     bytes: 4,
+                    fragments: Vec::new(),
                 },
                 PreparedObject {
                     group_id: 0,
@@ -727,6 +731,7 @@ mod tests {
                     session: "ssd".into(),
                     address: 1004,
                     bytes: 4,
+                    fragments: Vec::new(),
                 },
                 PreparedObject {
                     group_id: 1,
@@ -734,6 +739,7 @@ mod tests {
                     session: "ssd".into(),
                     address: 2000 + rank as u64,
                     bytes: 1,
+                    fragments: Vec::new(),
                 },
             ];
             let reads = read_spans_registered(&objects, &replica, rank, &destinations).unwrap();
@@ -759,7 +765,411 @@ mod tests {
             session: "ssd".into(),
             address: 1000,
             bytes: 4,
+            fragments: Vec::new(),
         };
         assert!(read_spans_registered(&[object], &replica, 0, &destinations[..1]).is_err());
+    }
+    #[test]
+    fn persisted_decode_state_restores_into_eight_prefill_ranks_without_the_decode() {
+        use crate::peer::{
+            geometry::{HostGroup, HostPool},
+            prepared::{read_spans_registered, PreparedObject},
+            read::{Arena, PageReader},
+            registered::{Member, Replica},
+            stored_layout::StoredLayout,
+            wire::{Reply, Stamp},
+        };
+        use ts_l3::{HostBuffer, MemoryStore, Namespace, Range, Store};
+        use ts_scheduler::{
+            PeerLeaseView, StorageKeyView, StoragePrefixObjectView, StoragePrefixPlanView,
+        };
+        let member = |width: u64, rank: usize| {
+            let mut g = geometry(width);
+            g.session = format!("rank{rank}");
+            g.host = Some(HostPool {
+                address: 1000,
+                groups: vec![
+                    HostGroup {
+                        parent_bytes: 4,
+                        packing: 1,
+                        block_bytes: 4,
+                        field_offsets: vec![("layer.0.kv".into(), 0)],
+                    },
+                    HostGroup {
+                        parent_bytes: 8 / width,
+                        packing: 1,
+                        block_bytes: 8 / width,
+                        field_offsets: vec![("layer.1.recurrent_state".into(), 0)],
+                    },
+                ],
+            });
+            Member {
+                geometry: g,
+                bounds: vec![129, 17],
+                regions: vec![(100, 150)],
+            }
+            .encode(rank)
+        };
+        let decode = Replica::register(
+            [7; 32],
+            contract_wire(1).to_string().as_bytes(),
+            &[member(1, 0)],
+        )
+        .unwrap();
+        let target = Replica::register(
+            [7; 32],
+            contract_wire(8).to_string().as_bytes(),
+            &(0..8).map(|r| member(8, r)).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let namespace = Namespace {
+            deployment_id: "decode-physical-layout".into(),
+            has_draft: false,
+        };
+        let description = StoredLayout::from_decode(
+            &decode,
+            contract_wire(1).to_string().as_bytes(),
+            &namespace,
+            "weights1",
+        )
+        .unwrap();
+        // The catalog uses the ordinary Store connection and survives its writer.
+        use std::sync::Arc;
+        let catalog_store = Arc::new(MemoryStore::new());
+        let start = || {
+            let layout = ts_l3::layout::HostLayout {
+                groups: vec![ts_l3::layout::GroupLayout {
+                    packing: 1,
+                    block_bytes: 1,
+                    shard_count: 1,
+                }],
+                lcm_block_bytes: 1,
+                num_lcm_blocks: 0,
+                owner_rank: 0,
+                tp_rank: 0,
+            };
+            ts_l3::Executor::start(
+                Box::new(catalog_store.clone()),
+                HostBuffer { base: 1, len: 0 },
+                layout,
+                namespace.clone(),
+                "weights1",
+                ts_l3::ExecutorConfig {
+                    max_operations: 4,
+                    max_keys_per_operation: 16,
+                    query_workers: 1,
+                    read_workers: 1,
+                    write_workers: 1,
+                    failure_threshold: 1,
+                    recovery_interval: std::time::Duration::from_secs(1),
+                    clear_cache_drain_timeout: std::time::Duration::from_secs(1),
+                },
+                ts_l3::monotonic_clock(),
+            )
+        };
+        let catalog_keys = super::super::catalog::keys(&description.semantic, "weights1");
+        let mut publisher = start();
+        let io = publisher.metadata();
+        super::super::catalog::publish(&io, &catalog_keys, &description).unwrap();
+        let mut alternative = description.clone();
+        alternative.deployment_id = "decode-layout-v2".into();
+        // Concurrent advertisements must retain both immutable physical namespaces.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                super::super::catalog::publish(&io, &catalog_keys, &description).unwrap()
+            });
+            scope.spawn(|| {
+                super::super::catalog::publish(&io, &catalog_keys, &alternative).unwrap()
+            });
+        });
+        publisher.close(std::time::Duration::from_secs(1)).unwrap();
+        let mut subscriber = start();
+        let reader_io = subscriber.metadata();
+        let found = super::super::catalog::discover(
+            &reader_io,
+            &catalog_keys,
+            &description.semantic,
+            "weights1",
+        )
+        .unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|v| **v == description));
+        assert!(found.iter().any(|v| **v == alternative));
+        assert!(super::super::catalog::discover(
+            &reader_io,
+            &catalog_keys,
+            &description.semantic,
+            "wrong-weights"
+        )
+        .unwrap()
+        .is_empty());
+        reader_io.put(&catalog_keys[2], b"broken record").unwrap();
+        assert_eq!(
+            super::super::catalog::discover(
+                &reader_io,
+                &catalog_keys,
+                &description.semantic,
+                "weights1"
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+        subscriber.close(std::time::Duration::from_secs(1)).unwrap();
+        let prefix = ts_l3::keys::key_prefix(&namespace.deployment_id, "weights1", "");
+        let keys = (0..2)
+            .map(|group| ts_l3::keys::object_key(&prefix, "hash", group, 0, 0))
+            .collect::<Vec<_>>();
+        let metadata = StoragePrefixPlanView {
+            max_tokens: 4,
+            objects: (0..2)
+                .map(|group| StoragePrefixObjectView {
+                    key: StorageKeyView {
+                        group_id: group,
+                        content_hash: "hash".into(),
+                        page_offset: 0,
+                    },
+                    slot: if group == 0 { 0 } else { 1 },
+                })
+                .collect(),
+        };
+        let store = MemoryStore::new();
+        let original: Vec<u8> = vec![10, 11, 12, 13, 100, 101, 102, 103, 104, 105, 106, 107];
+        let host = HostBuffer {
+            base: original.as_ptr() as usize,
+            len: original.len(),
+        };
+        assert!(store
+            .batch_put_from(
+                &keys,
+                host,
+                &[Range { offset: 0, size: 4 }, Range { offset: 4, size: 8 }]
+            )
+            .unwrap()
+            .success
+            .iter()
+            .all(|v| *v));
+        let persisted = serde_json::to_vec(&description).unwrap();
+        store.metadata_put("layout", &persisted).unwrap();
+        drop(decode);
+        drop(original);
+        drop(description);
+        let restored: StoredLayout =
+            serde_json::from_slice(&store.metadata_get("layout").unwrap().unwrap()).unwrap();
+        let plan = restored
+            .plan(&metadata, &target, "weights1", 16)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.objects.len(), 16);
+        assert!(plan
+            .objects
+            .iter()
+            .all(|o| o.key == keys[o.group_id as usize]));
+        let mut staged = vec![0u8; 12];
+        assert!(store
+            .batch_get_into(
+                &keys,
+                HostBuffer {
+                    base: staged.as_mut_ptr() as usize,
+                    len: 12
+                },
+                &[Range { offset: 0, size: 4 }, Range { offset: 4, size: 8 }]
+            )
+            .unwrap()
+            .success
+            .iter()
+            .all(|v| *v));
+        let arena = Arena::new(2048);
+        arena.write(1000, &staged);
+        let ranks: Vec<_> = (0..8)
+            .map(|rank| {
+                plan.objects
+                    .iter()
+                    .filter(|o| o.rank == rank)
+                    .map(|o| PreparedObject {
+                        group_id: o.group_id,
+                        slot: o.slot,
+                        session: "ssd-provider".into(),
+                        address: 1000 + if o.group_id == 0 { 0 } else { 4 },
+                        bytes: o.bytes,
+                        fragments: o.fragments.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let reply = Reply::Prepared {
+            stamp: Stamp {
+                name: "l3@reader".into(),
+                incarnation: 1,
+                identity: "id".into(),
+            },
+            lease: PeerLeaseView {
+                reader: "reader".into(),
+                id: 1,
+            },
+            num_tokens: 4,
+            ranks,
+        };
+        let encoded = reply.encode();
+        let decoded = Reply::decode(&encoded).unwrap();
+        assert_eq!(decoded, reply);
+        let Reply::Prepared { ranks, .. } = decoded else {
+            unreachable!()
+        };
+        for rank in 0..8 {
+            // KV block 6 belongs to rank 5; state is one distinct head per rank.
+            let reads =
+                read_spans_registered(&ranks[rank], &target, rank, &[page(0, 0, 6), page(1, 1, 1)])
+                    .unwrap();
+            for (session, spans) in reads {
+                arena.read(&session, &spans).unwrap();
+            }
+            assert_eq!(arena.read_bytes(201, 1), vec![100 + rank as u8]);
+            if rank == 5 {
+                assert_eq!(arena.read_bytes(104, 4), vec![10, 11, 12, 13]);
+            }
+        }
+        assert!(restored
+            .plan(&metadata, &target, "weights2", 16)
+            .unwrap()
+            .is_none());
+        let mut other = target.clone();
+        other.semantic = [8; 32];
+        assert!(restored
+            .plan(&metadata, &other, "weights1", 16)
+            .unwrap()
+            .is_none());
+        let mut bad = ranks[0].clone();
+        bad[1].fragments[0].source_offset = 8;
+        assert!(read_spans_registered(&bad, &target, 0, &[page(1, 1, 1)]).is_err());
+        let mut overlap = ranks[0].clone();
+        let duplicate = overlap[1].fragments[0].clone();
+        overlap[1].fragments.push(duplicate);
+        assert!(read_spans_registered(&overlap, &target, 0, &[page(1, 1, 1)]).is_err());
+    }
+
+    #[test]
+    fn persisted_draft_restores_each_strided_head_from_one_decode_object() {
+        use crate::peer::{
+            geometry::{HostGroup, HostPool},
+            prepared::{read_spans_registered, PreparedObject},
+            read::{Arena, PageReader},
+            registered::{Member, Replica},
+            stored_layout::StoredLayout,
+        };
+        use ts_scheduler::{StorageKeyView, StoragePrefixObjectView, StoragePrefixPlanView};
+        let member = |width: usize, rank: usize| {
+            let mut g = geometry(width as u64);
+            g.session = format!("rank{rank}");
+            for (id, address) in [("layer.2.k", 1024), ("layer.2.v", 2048)] {
+                g.device.push(DeviceField {
+                    group_id: 2,
+                    field_id: id.into(),
+                    address,
+                    bytes: 32 / width as u64,
+                    page_stride: 32 / width as u64,
+                });
+            }
+            g.host = Some(HostPool {
+                address: 10000,
+                groups: vec![
+                    HostGroup {
+                        parent_bytes: 4,
+                        packing: 1,
+                        block_bytes: 4,
+                        field_offsets: vec![("layer.0.kv".into(), 0)],
+                    },
+                    HostGroup {
+                        parent_bytes: 8 / width as u64,
+                        packing: 1,
+                        block_bytes: 8 / width as u64,
+                        field_offsets: vec![("layer.1.recurrent_state".into(), 0)],
+                    },
+                    HostGroup {
+                        parent_bytes: 64 / width as u64,
+                        packing: 1,
+                        block_bytes: 64 / width as u64,
+                        field_offsets: vec![
+                            ("layer.2.k".into(), 0),
+                            ("layer.2.v".into(), 32 / width as u64),
+                        ],
+                    },
+                ],
+            });
+            Member {
+                geometry: g,
+                bounds: vec![129, 17, 17],
+                regions: vec![(100, 4096)],
+            }
+            .encode(rank)
+        };
+        let decode = Replica::register(
+            [7; 32],
+            draft_wire(1).to_string().as_bytes(),
+            &[member(1, 0)],
+        )
+        .unwrap();
+        let target = Replica::register(
+            [7; 32],
+            draft_wire(8).to_string().as_bytes(),
+            &(0..8).map(|r| member(8, r)).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let source = StoredLayout::from_decode(
+            &decode,
+            draft_wire(1).to_string().as_bytes(),
+            &ts_l3::Namespace {
+                deployment_id: "decode-with-draft".into(),
+                has_draft: true,
+            },
+            "v1",
+        )
+        .unwrap();
+        let plan = source
+            .plan(
+                &StoragePrefixPlanView {
+                    max_tokens: 4,
+                    objects: vec![StoragePrefixObjectView {
+                        key: StorageKeyView {
+                            group_id: 2,
+                            content_hash: "hash".into(),
+                            page_offset: 0,
+                        },
+                        slot: 0,
+                    }],
+                },
+                &target,
+                "v1",
+                16,
+            )
+            .unwrap()
+            .unwrap();
+        let arena = Arena::new(20000);
+        arena.write(10000, &(0..64).collect::<Vec<u8>>());
+        for rank in 0..8 {
+            let planned = &plan.objects[rank];
+            let object = PreparedObject {
+                group_id: 2,
+                slot: 0,
+                session: "ssd".into(),
+                address: 10000,
+                bytes: 64,
+                fragments: planned.fragments.clone(),
+            };
+            let reads = read_spans_registered(&[object], &target, rank, &[page(2, 0, 1)]).unwrap();
+            for (session, spans) in reads {
+                arena.read(&session, &spans).unwrap();
+            }
+            assert_eq!(
+                arena.read_bytes(1028, 4),
+                (0..4).map(|row| (row * 8 + rank) as u8).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                arena.read_bytes(2052, 4),
+                (0..4)
+                    .map(|row| (32 + row * 8 + rank) as u8)
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }

@@ -812,9 +812,39 @@ storage lease owns the joined completion; neither source can independently
 publish or release the whole landing.
 Storage reads translate virtual page IDs to the owning rank's local pages and
 check destination registration bounds. Page-sharded history lands only on its
-owner; replicated groups with TP-partitioned fields use each rank's storage key.
-Storage objects must still belong to the reader's compatible cache namespace;
-this does not add cross-layout conversion of persisted SSD objects.
+owner. Same-layout objects continue to use the reader's physical namespace.
+A TP1/KVP1 Decode writer additionally advertises an address-free source layout
+through its existing Store connection. A TP8/KVP8 Prefill reader can discover
+that layout by semantic model identity and weight generation, query the original
+Decode object keys, and reuse the live Peer partition planner to read its own
+State and Draft field slices. It does not require a live Decode hot-cache
+holder, rewrite existing PUT keys, or gather the full matrix on Prefill before
+splitting it. The SSD provider still stages a complete source object in Host
+memory; only the required fragments cross the network to each target rank.
+Source staging budgets count whole objects, while transfer estimates count
+fragment bytes (conservatively including replicated history dependencies).
+
+The layout catalog has eight create-only slots per semantic identity and weight
+generation, with a 512 KiB maximum frame per slot. These describe physical
+layouts, never requests or prefix inventories. Racing writers read back the
+winner; readers validate descriptors and keep a bounded in-memory snapshot.
+Publication and discovery run every ten seconds on a background worker through
+the existing Store client, outside the scheduler lock. Metadata scratch memory
+is registered separately and participates in executor retirement and shutdown.
+Missing, evicted or incompatible descriptors yield a conservative miss;
+ordinary PUT and same-layout restoration continue. Cross-layout reuse requires
+both the descriptor and the complete source checkpoint to remain available.
+Live weight changes retain the existing Peer invalidation policy; restart with
+the new generation to advertise and discover its layouts.
+
+Within the existing query budgets, each boundary tries the reader namespace
+first and compatible Decode layouts next. A hit must contain all dependencies
+from one physical layout, including the State checkpoint and retained Draft
+window; it cannot combine an MLA object from one namespace with a missing State
+object from another. Prepared replies carry bounded source/destination field
+fragments, validated for source bounds, full destination coverage and overlap
+before submission. Empty fragment lists retain the previous same-layout wire
+format. Other source topologies retain their existing same-layout L3 behavior.
 Single-member background progress and coordinated same-layout peers retain
 the direct path. With it disabled, the usual
 Host restoration policy remains unchanged. With it enabled,

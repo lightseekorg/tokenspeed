@@ -51,7 +51,8 @@ impl Settings {
         peer: &PeerSettings,
         members: usize,
         scheduler: Arc<Mutex<Scheduler>>,
-        registered: Option<&ts_control::peer::registered::Replica>,
+        registered: Option<Arc<ts_control::peer::registered::Replica>>,
+        catalog: Option<ts_control::peer::catalog::Catalog>,
     ) -> Result<storage_servicer::Service, String> {
         let number = |key: &str| {
             self.knobs[key]
@@ -81,7 +82,7 @@ impl Settings {
         if self.l3.layout.groups.iter().any(|g| g.shard_count != 1) && registered.is_none() {
             return Err("sharded direct L3 requires the registered cache layout".into());
         }
-        if let Some(layout) = registered {
+        if let Some(layout) = &registered {
             if layout.members.len() != members
                 || layout.contract.group_specs.len() != self.l3.layout.groups.len()
                 || layout
@@ -140,23 +141,50 @@ impl Settings {
                     ""
                 },
             );
+            let stored = catalog.as_ref().map(|c| c.snapshot()).unwrap_or_default();
             let scheduler = scheduler.lock();
             let mut boundary = prompt.max_tokens.min(max_restore) / grain * grain;
             let mut candidates = Vec::new();
             let mut keys = HashSet::new();
             for _ in 0..limits.max_candidates {
-                if boundary <= 0 {
+                if boundary <= 0 || candidates.len() >= limits.max_candidates {
                     break;
                 }
-                let plan = source::PrefixPlan::from_prompt(
+                let mut variants = Vec::new();
+                if let Some(plan) = source::PrefixPlan::from_prompt(
                     &scheduler,
                     prompt,
                     boundary,
                     &prefix,
                     &layouts,
                     limits.max_query_keys,
-                )?;
-                if let Some(plan) = plan {
+                )? {
+                    variants.push(plan);
+                }
+                if let Some(target) = &registered {
+                    let metadata = scheduler
+                        .storage_prefix_plan_from_hashes(
+                            &prompt.tokens,
+                            &prompt.prefix_hashes,
+                            boundary,
+                            limits.max_query_keys,
+                        )
+                        .map_err(|e| source::Error(e.to_string()))?;
+                    for layout in &stored {
+                        match layout.plan(&metadata, target, weight_version, limits.max_query_keys)
+                        {
+                            Ok(Some(plan)) => variants.push(plan),
+                            Ok(None) => {}
+                            Err(error) => {
+                                tracing::debug!(%error,"incompatible persistent source layout")
+                            }
+                        }
+                    }
+                }
+                for plan in variants {
+                    if candidates.len() >= limits.max_candidates {
+                        break;
+                    }
                     let extra: HashSet<_> = plan
                         .objects
                         .iter()
@@ -168,11 +196,7 @@ impl Settings {
                         candidates.push(plan);
                     }
                 }
-                boundary = if boundary % grain != 0 {
-                    boundary / grain * grain
-                } else {
-                    boundary - grain
-                };
+                boundary -= grain;
             }
             Ok(candidates)
         });

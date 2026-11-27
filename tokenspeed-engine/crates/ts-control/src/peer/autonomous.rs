@@ -66,6 +66,7 @@ enum Driver {
 
 /// The protocol owner and its control-loop handoff.
 pub struct Peer {
+    catalog: Option<super::catalog::Catalog>,
     driver: Driver,
     versioned: Option<super::coordinated::Control>,
     versioned_fence: Option<PeerFence>,
@@ -82,6 +83,11 @@ pub struct Peer {
 }
 
 impl Peer {
+    /// Keep Decode's immutable layout advertisement alive with its Peer runtime.
+    pub fn attach_catalog(&mut self, catalog: super::catalog::Catalog) {
+        self.catalog = Some(catalog);
+    }
+
     /// Start the configured protocol owner.
     pub fn start(
         settings: PeerSettings,
@@ -138,6 +144,7 @@ impl Peer {
             Driver::Rounds(Box::new(protocol))
         };
         Ok(Self {
+            catalog: None,
             versioned: None,
             versioned_fence: None,
             routed_fences: None,

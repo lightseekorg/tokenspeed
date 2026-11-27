@@ -150,6 +150,7 @@ const CHECKPOINT_PIN: u8 = 5;
 const READING: u8 = 6;
 const STORAGE_LAYOUT: u8 = 7;
 const PREPARED: u8 = 8;
+const PREPARED_FRAGMENTS: u8 = 9;
 
 fn write_str(out: &mut Writer, value: &str) {
     out.bytes(value.as_bytes());
@@ -445,7 +446,8 @@ impl Reply {
                 num_tokens,
                 ranks,
             } => {
-                out.u8(PREPARED);
+                let sliced = ranks.iter().flatten().any(|o| !o.fragments.is_empty());
+                out.u8(if sliced { PREPARED_FRAGMENTS } else { PREPARED });
                 write_stamp(&mut out, stamp);
                 write_lease(&mut out, lease);
                 out.i64(i64::from(*num_tokens));
@@ -458,6 +460,11 @@ impl Reply {
                         write_str(&mut out, &object.session);
                         out.u64(object.address);
                         out.u64(object.bytes);
+                        if sliced {
+                            out.bytes(
+                                &serde_json::to_vec(&object.fragments).expect("fragment encoding"),
+                            );
+                        }
                     }
                 }
             }
@@ -490,7 +497,7 @@ impl Reply {
                 stamp: read_stamp(&mut reader).ok_or(Malformed)?,
                 members: reader.u32().ok_or(Malformed)?,
             },
-            PREPARED => {
+            tag @ (PREPARED | PREPARED_FRAGMENTS) => {
                 let stamp = read_stamp(&mut reader).ok_or(Malformed)?;
                 let lease = read_lease(&mut reader).ok_or(Malformed)?;
                 let num_tokens = read_i32(&mut reader).ok_or(Malformed)?;
@@ -514,6 +521,20 @@ impl Reply {
                             session: read_str(&mut reader).ok_or(Malformed)?,
                             address: reader.u64().ok_or(Malformed)?,
                             bytes: reader.u64().ok_or(Malformed)?,
+                            fragments: if tag == PREPARED_FRAGMENTS {
+                                let bytes = reader.bytes().ok_or(Malformed)?;
+                                if bytes.len() > 256 << 10 {
+                                    return Err(Malformed);
+                                }
+                                let fragments: Vec<super::prepared::StoredFragment> =
+                                    serde_json::from_slice(bytes).map_err(|_| Malformed)?;
+                                if fragments.len() > 4096 {
+                                    return Err(Malformed);
+                                }
+                                fragments
+                            } else {
+                                Vec::new()
+                            },
                         });
                     }
                     ranks.push(objects);
@@ -708,6 +729,7 @@ mod tests {
                     session: "storage-owner".into(),
                     address: 1 << 40,
                     bytes: 1024,
+                    fragments: Vec::new(),
                 }]],
             },
             Reply::Layout {

@@ -50,6 +50,7 @@ pub struct MooncakeStore {
     host: HostBuffer,
     in_flight_puts: InFlightPuts,
     registrations: Vec<Range>,
+    metadata: Mutex<Option<MetadataBuffer>>,
 }
 
 /// One Store client is shared by several workers. Keep its concurrent writes
@@ -141,7 +142,41 @@ pub(crate) fn registration_regions(
         .collect())
 }
 
+struct MetadataBuffer {
+    bytes: Box<[u8]>,
+    retired: bool,
+}
+impl MetadataBuffer {
+    fn host(&self) -> HostBuffer {
+        HostBuffer {
+            base: self.bytes.as_ptr() as usize,
+            len: self.bytes.len(),
+        }
+    }
+}
+
 impl MooncakeStore {
+    fn metadata_buffer<'a>(
+        &self,
+        slot: &'a mut Option<MetadataBuffer>,
+    ) -> Result<&'a mut MetadataBuffer, StoreError> {
+        if slot.is_none() {
+            let bytes = vec![0u8; crate::store::MAX_METADATA_BYTES].into_boxed_slice();
+            self.client
+                .register_buffer(bytes.as_ptr() as usize, bytes.len())
+                .map_err(failed)?;
+            *slot = Some(MetadataBuffer {
+                bytes,
+                retired: true,
+            });
+        }
+        let buffer = slot.as_mut().unwrap();
+        if !buffer.retired {
+            return Err(StoreError("layout metadata staging is quarantined".into()));
+        }
+        Ok(buffer)
+    }
+
     /// Load `library`, connect as `setup` says and register the Host pool.
     pub fn connect(
         library: &Path,
@@ -168,6 +203,7 @@ impl MooncakeStore {
             host,
             in_flight_puts: InFlightPuts::default(),
             registrations,
+            metadata: Mutex::new(None),
         })
     }
 
@@ -246,6 +282,67 @@ fn namespace_pattern(prefix: &str) -> String {
 }
 
 impl Store for MooncakeStore {
+    fn metadata_get(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        let mut slot = self.metadata.lock().unwrap_or_else(|p| p.into_inner());
+        let buffer = self.metadata_buffer(&mut slot)?;
+        buffer.retired = false;
+        let outcome = self.batch_get_into(
+            &[key.into()],
+            buffer.host(),
+            &[Range {
+                offset: 0,
+                size: buffer.bytes.len(),
+            }],
+        )?;
+        buffer.retired = outcome.retired;
+        if !outcome.retired {
+            return Err(StoreError("layout metadata read has not retired".into()));
+        }
+        if !outcome.success[0] {
+            if outcome.object_failures[0] {
+                return Ok(None);
+            }
+            return Err(StoreError("layout metadata read failed".into()));
+        }
+        let length = u32::from_le_bytes(buffer.bytes[..4].try_into().unwrap()) as usize;
+        if length > buffer.bytes.len() - 4 {
+            return Err(StoreError("invalid layout metadata frame".into()));
+        }
+        Ok(Some(buffer.bytes[4..4 + length].to_vec()))
+    }
+    fn metadata_put(&self, key: &str, bytes: &[u8]) -> Result<(), StoreError> {
+        if bytes.len() > crate::store::MAX_METADATA_BYTES - 4 {
+            return Err(StoreError("layout record exceeds metadata budget".into()));
+        }
+        let mut slot = self.metadata.lock().unwrap_or_else(|p| p.into_inner());
+        let buffer = self.metadata_buffer(&mut slot)?;
+        buffer.bytes.fill(0);
+        buffer.bytes[..4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buffer.bytes[4..4 + bytes.len()].copy_from_slice(bytes);
+        buffer.retired = false;
+        let outcome = self.batch_put_from(
+            &[key.into()],
+            buffer.host(),
+            &[Range {
+                offset: 0,
+                size: buffer.bytes.len(),
+            }],
+        )?;
+        buffer.retired = outcome.retired;
+        if outcome.retired && outcome.success[0] {
+            Ok(())
+        } else {
+            Err(StoreError("layout metadata publication failed".into()))
+        }
+    }
+    fn metadata_retired(&self) -> bool {
+        self.metadata
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_none_or(|b| b.retired)
+    }
+
     fn failures_retire(&self) -> bool {
         // A top-level SDK error supplies no per-key status vector and does not
         // prove that native access to the Host bytes stopped.
@@ -349,6 +446,12 @@ impl Store for MooncakeStore {
     }
 
     fn close(&self) {
+        let mut slot = self.metadata.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(buffer) = slot.take() {
+            if !buffer.retired || self.client.unregister_buffer(buffer.host().base).is_err() {
+                std::mem::forget(buffer);
+            }
+        }
         for &region in &self.registrations {
             if let Err(error) = self.client.unregister_buffer(self.host.address(region)) {
                 tracing::warn!(%error, "deregistering the Host pool from the store failed");

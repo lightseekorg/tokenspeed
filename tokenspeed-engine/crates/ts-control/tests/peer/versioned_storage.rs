@@ -34,6 +34,8 @@ struct Node {
     scheduler: Arc<Mutex<Scheduler>>,
 }
 struct Group {
+    layout: Arc<RegisteredReplica>,
+    wire: Vec<u8>,
     name: String,
     nodes: Vec<Node>,
     events: Vec<ts_scheduler::PeerEventView>,
@@ -135,6 +137,8 @@ impl Group {
             })
             .collect();
         Self {
+            layout,
+            wire: wire.to_string().into_bytes(),
             name,
             nodes,
             events: Vec::new(),
@@ -237,7 +241,7 @@ impl PageReader for GatedRead {
     }
 }
 
-fn check_landing(hot: bool, missing: bool, fail_storage: bool) {
+fn check_landing(hot: bool, missing: bool, fail_storage: bool, cross_layout: bool) {
     let arena = Arena::new(300_000);
     let started = Arc::new(AtomicUsize::new(0));
     let hot_done = Arc::new(AtomicUsize::new(0));
@@ -291,6 +295,29 @@ fn check_landing(hot: bool, missing: bool, fail_storage: bool) {
     )
     .unwrap()
     .unwrap();
+    let candidate = if cross_layout {
+        let source = ts_control::peer::stored_layout::StoredLayout::from_decode(
+            &holder.layout,
+            &holder.wire,
+            &ts_l3::Namespace {
+                deployment_id: "decode-only-namespace".into(),
+                has_draft: false,
+            },
+            "v1",
+        )
+        .unwrap();
+        let metadata = reader.nodes[0]
+            .scheduler
+            .lock()
+            .storage_prefix_plan(&tokens, 2 * GRAIN, 256)
+            .unwrap();
+        source
+            .plan(&metadata, &reader.layout, "v1", 256)
+            .unwrap()
+            .unwrap()
+    } else {
+        candidate
+    };
     let mut objects = HashMap::new();
     for object in &candidate.objects {
         if missing || (hot && object.slot < 8) {
@@ -456,17 +483,26 @@ fn check_landing(hot: bool, missing: bool, fail_storage: bool) {
 
 #[test]
 fn versioned_reader_restores_l3_without_a_hot_hit() {
-    check_landing(false, false, false);
+    check_landing(false, false, false, false);
 }
 #[test]
 fn versioned_reader_keeps_hot_prefix_after_l3_miss() {
-    check_landing(true, true, false);
+    check_landing(true, true, false, false);
 }
 #[test]
 fn versioned_reader_composes_peer_and_l3_in_parallel() {
-    check_landing(true, false, false);
+    check_landing(true, false, false, false);
 }
 #[test]
 fn versioned_reader_recomputes_after_retired_l3_failure() {
-    check_landing(true, false, true);
+    check_landing(true, false, true, false);
+}
+
+#[test]
+fn versioned_reader_restores_decode_namespace_without_hot_data() {
+    check_landing(false, false, false, true);
+}
+#[test]
+fn versioned_reader_combines_hot_peer_with_decode_storage_namespace() {
+    check_landing(true, false, false, true);
 }

@@ -1039,6 +1039,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 scheduler.clone(),
                 peer_outbox.get(),
                 disk.as_ref(),
+                l3.as_ref(),
             )
         })
         .transpose()

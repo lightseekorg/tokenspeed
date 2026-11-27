@@ -38,6 +38,7 @@ mod composition;
 mod coordinated;
 mod offers;
 pub use autonomous::Peer;
+pub mod catalog;
 pub mod geometry;
 pub mod landing;
 pub mod layout;
@@ -49,6 +50,7 @@ pub mod registered;
 pub mod servicer;
 pub mod storage;
 pub mod storage_servicer;
+pub mod stored_layout;
 pub mod v1;
 pub mod wire;
 

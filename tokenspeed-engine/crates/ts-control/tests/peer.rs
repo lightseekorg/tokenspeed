@@ -910,6 +910,7 @@ fn prepared_storage_objects_land_through_ordinary_admission_without_host_destina
                 session: "prepared-storage".into(),
                 address,
                 bytes: PAGE_BYTES,
+                fragments: Vec::new(),
             }
         })
         .collect();
