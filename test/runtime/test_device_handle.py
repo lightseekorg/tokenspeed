@@ -2201,3 +2201,82 @@ def test_nccl_suspend_and_resume_reach_the_communicators(
     if device_type == "cuda" and hip is None:
         expected += ["stack.trim", ("stack.restore", 2048)]
     assert trace == [*expected, "resume"]
+
+
+def test_cooperative_mega_moe_fences_l2_transfers_before_forward(wire_ops):
+    """MegaMoE rounds order L2 transfer streams onto default_stream ahead of forward."""
+    trace: list = []
+    store, load = _WriteBackOp("store"), _LoadBackOp("load")
+    l2 = SimpleNamespace(
+        submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
+            trace.append(("write_backs", ops))
+        ),
+        submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+            ("load_backs", ops)
+        ),
+        fence_pending_transfers=lambda stream: trace.append(("fence_l2", stream)),
+    )
+
+    unisolated = _handle(
+        trace,
+        host_cache_executor=l2,
+        fence_l2_transfers_before_forward=False,
+    )
+    _execute(unisolated, _plan(cache=[store, load]), _planned(num_extends=0))
+    assert ("fence_l2", unisolated._executor.default_stream) not in trace
+
+    trace.clear()
+    isolated = _handle(
+        trace,
+        host_cache_executor=l2,
+        fence_l2_transfers_before_forward=True,
+    )
+    default = isolated._executor.default_stream
+
+    # Idle/no-forward plans leave async L2 transfers running asynchronously.
+    _execute(isolated, _plan(cache=[store, load]), None)
+    assert ("fence_l2", default) not in trace
+
+    # A round with a forward fences pending transfers right before forward launch.
+    trace.clear()
+    _execute(isolated, _plan(cache=[store, load]), _planned(num_extends=0))
+    assert trace == [
+        ("write_backs", (store, load)),
+        ("default waits", "execution-stream"),
+        ("load_backs", (store, load)),
+        ("fence_l2", default),
+        "forward",
+    ]
+
+    # Even with empty cache_ops, residual transfers from prior rounds are fenced.
+    trace.clear()
+    _execute(isolated, _plan(cache=[]), _planned(num_extends=0))
+    assert trace == [("load_backs", ()), ("fence_l2", default), "forward"]
+
+    # DP-idle rounds participate in MegaMoE collectives and fence as well.
+    trace.clear()
+    isolated._executor.execute_idle_forward = lambda dp_metadata: trace.append(
+        ("idle_forward", dp_metadata)
+    )
+    isolated.run_idle_forward("dp-meta")
+    assert trace == [("fence_l2", default), ("idle_forward", "dp-meta")]
+
+
+@pytest.mark.parametrize(
+    ("moe_backend", "draft_moe_backend", "expected"),
+    [
+        ("mega_moe", None, True),
+        ("deep_gemm_mega_moe", None, True),
+        ("flashinfer_trtllm", "mega_moe", True),
+        ("flashinfer_trtllm", "deep_gemm_mega_moe", True),
+        ("auto", None, False),
+        ("flashinfer_trtllm", "auto", False),
+    ],
+)
+def test_uses_cooperative_mega_moe_detects_target_and_draft_backends(
+    moe_backend: str, draft_moe_backend: str | None, expected: bool
+) -> None:
+    from tokenspeed.runtime.execution.device import _uses_cooperative_mega_moe
+
+    args = SimpleNamespace(moe_backend=moe_backend, draft_moe_backend=draft_moe_backend)
+    assert _uses_cooperative_mega_moe(args) is expected

@@ -2234,6 +2234,139 @@ class TestL3FlatKvExecutorTest:
             [("LoadBackDoneEvent", 9)]
         )
 
+    def test_fence_pending_transfers_orders_unretired_writes_and_loads(self):
+        try:
+            import tokenspeed.runtime.cache.l2.executor as executor_module
+            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+            from tokenspeed.runtime.cache.shared_l2.executor import (
+                SharedL2LoadExecutor,
+            )
+            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
+            from tokenspeed.runtime.cache.transfer.observations import (
+                CompletedObservations,
+            )
+            from tokenspeed.runtime.cache.transfer.ops import RestoreOp
+        except (ImportError, ModuleNotFoundError) as exc:
+            pytest.skip(f"needs runtime dependencies: {exc}")
+
+        ordered_event = Mock(name="ordered_event")
+        pinned_event = Mock(name="pinned_event")
+        restore_event = Mock(name="restore_event")
+        waited: list[object] = []
+        fence_stream = SimpleNamespace(wait_event=lambda event: waited.append(event))
+
+        executor = HostCacheExecutor.__new__(HostCacheExecutor)
+        executor._cache_observations = CompletedObservations(0)
+        executor._ack_lock = threading.Lock()
+        executor._ready_load_acks = []
+        executor._load_poisoned = False
+        executor._completions = CompletionQueue()
+        executor._unretired_write_event = None
+        executor._unretired_load_event = None
+        executor._load_trackers = []
+        executor._slot_state = SimpleNamespace(import_=Mock())
+        executor.attn_tp_rank = 1
+        executor.transfer_backend = "triton"
+        executor.layout = SimpleNamespace(buffers=())
+        executor.host_storage = SimpleNamespace(host_buffer=None)
+        executor.snapshot_storage = SimpleNamespace(host_buffer=None)
+        executor.max_retracted_requests = 4
+        executor.blob_arena = [None] * 5
+        executor._transfer_geometry = None
+        executor._snapshot_geometry = None
+        executor.write_stream = Mock()
+        executor.load_stream = Mock()
+        executor.block_owners = SimpleNamespace(
+            owned_positions=lambda rows: [
+                (index, row) for index, row in enumerate(rows)
+            ]
+        )
+        executor.snapshot_block_owners = executor.block_owners
+        executor._ordered_write_lane = SimpleNamespace(
+            start_d2h=lambda *args, **kwargs: ordered_event
+        )
+        executor._pinned_write_lane = SimpleNamespace(
+            start_d2h=lambda *args, **kwargs: pinned_event
+        )
+        executor._restore_l2_lane = SimpleNamespace(
+            start_h2d=lambda *args, **kwargs: None
+        )
+        executor._restore_pool_lane = SimpleNamespace(
+            start_h2d=lambda *args, **kwargs: None
+        )
+
+        class _WriteBackOp:
+            def __init__(self, op_id: int, *, pinned: bool):
+                self.op_ids = [op_id]
+                self.group_ids = [[0]]
+                self.src_pages = [[1]]
+                self.dst_pages = [[2]]
+                self.source_pinned = [pinned]
+
+        with patch.object(
+            executor_module.Cache, "WriteBackOp", _WriteBackOp, create=True
+        ):
+            # Ordered write-backs already fence inside submit_write_backs.
+            executor.submit_write_backs(
+                [_WriteBackOp(1, pinned=False)],
+                prerequisite_stream=Mock(),
+                fence_stream=fence_stream,
+            )
+            assert waited == [ordered_event]
+            waited.clear()
+            executor.fence_pending_transfers(fence_stream)
+            assert waited == []
+
+            # Pinned write-backs stay unfenced until fence_pending_transfers runs.
+            executor.submit_write_backs(
+                [_WriteBackOp(2, pinned=True)],
+                prerequisite_stream=Mock(),
+                fence_stream=fence_stream,
+            )
+            assert waited == []
+            executor.fence_pending_transfers(fence_stream)
+            assert waited == [pinned_event]
+            waited.clear()
+            # Once fenced, repeated calls do nothing until a new transfer starts.
+            executor.fence_pending_transfers(fence_stream)
+            assert waited == []
+
+            # Mixed ordered + pinned write-back leaves only the pinned event unretired.
+            executor.submit_write_backs(
+                [_WriteBackOp(4, pinned=False), _WriteBackOp(5, pinned=True)],
+                prerequisite_stream=Mock(),
+                fence_stream=fence_stream,
+            )
+            assert waited == [ordered_event]
+            waited.clear()
+            executor.fence_pending_transfers(fence_stream)
+            assert waited == [pinned_event]
+            waited.clear()
+
+        # Restore work on load_stream also fences ahead of the next forward.
+        restore = RestoreOp(
+            op_id=3,
+            request_id="r3",
+            admission_id=7,
+            request_pool_index=1,
+            snapshot_slot=1,
+            transfers=(),
+            source_tier=(),
+        )
+        with patch.object(
+            executor_module.device_module, "Event", return_value=restore_event
+        ):
+            executor.submit_load_backs([restore], prerequisite_stream=Mock())
+        executor.fence_pending_transfers(fence_stream)
+        assert waited == [restore_event]
+        waited.clear()
+        executor.fence_pending_transfers(fence_stream)
+        assert waited == []
+
+        shared_executor = SharedL2LoadExecutor.__new__(SharedL2LoadExecutor)
+        shared_executor.fence_pending_transfers(fence_stream)
+        assert waited == []
+
 
 class TestCompactLayoutRoundTripTest:
     @pytest.fixture(autouse=True)

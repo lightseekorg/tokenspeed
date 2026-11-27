@@ -832,8 +832,8 @@ stream is current. Load-back destinations are never zeroed, and an abort
 frees its request's blocks while that request's forward may still be in
 flight, so the device handle orders the default stream behind the
 execution stream before every plan's loads and restores: the zeroing and
-the block copies, which wait there too, are absent from many plans. Every stream the Host
-cache executor orders against is an argument, never ambient thread state.
+the block copies, which wait there too, are absent from many plans. Every stream the Host cache executor orders against is an argument, never ambient thread state.
+When cooperative all-SM kernels (such as MegaMoE) cannot share SMs with concurrent transfers, `DeviceHandle` fences any unretired L2 write/load events onto the default stream via `HostCacheExecutor.fence_pending_transfers` right before forward launch (including idle DP forwards).
 Each submission kind uses its own staging lane (`cache/transfer/lanes.py`:
 the stream-ordered and pinned write-backs, the snapshot store, and the
 restore's two tiers): a lane uploads block metadata asynchronously and
