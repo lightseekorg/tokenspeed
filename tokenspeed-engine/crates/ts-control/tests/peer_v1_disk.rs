@@ -708,7 +708,8 @@ impl MultiRankReplica {
                 incarnation,
                 channel_opt.take(),
                 retirement_bound_ms,
-            );
+            )
+            .unwrap();
             let kv_dev_base = arena_base + (rank as u64) * stride_per_rank;
             let st_dev_base = kv_dev_base + 0x40_000;
             ranks.push(RankState {

@@ -344,7 +344,8 @@ impl Replica {
         )
         .unwrap();
         if let Some((layout, channel)) = registered {
-            peer.enable_versioned(layout, name.clone(), incarnation, Some(channel), 0);
+            peer.enable_versioned(layout, name.clone(), incarnation, Some(channel), 0)
+                .unwrap();
         }
         Self {
             name,

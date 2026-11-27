@@ -240,7 +240,28 @@ fn remaining(deadline: Instant, timeout: Duration) -> Result<Duration, Error> {
         .ok_or(Error::Timeout(timeout))
 }
 
+/// Wakes a worker waiting in a blocking collective during shutdown.
+pub struct Interrupt(Vec<TcpStream>);
+impl Interrupt {
+    /// Shut down the private mesh, including any pending read.
+    pub fn shutdown(&self) {
+        for stream in &self.0 {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
 impl Mesh {
+    /// Obtain a shutdown handle without sharing the mesh's sequence space.
+    pub fn interrupt_handle(&self) -> io::Result<Interrupt> {
+        self.peers
+            .iter()
+            .flatten()
+            .map(|p| p.stream.try_clone())
+            .collect::<io::Result<Vec<_>>>()
+            .map(Interrupt)
+    }
+
     /// Connect `rank` to every other rank of `addresses` (`host:port`, one
     /// per rank, in rank order). Every rank calls this; it returns once
     /// every connection is up, so it is also a barrier.

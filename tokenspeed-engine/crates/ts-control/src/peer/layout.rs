@@ -918,6 +918,35 @@ mod tests {
     }
 
     #[test]
+    fn a_device_only_holder_registers_without_admitting_any_host_page() {
+        use crate::peer::registered::{Member, Replica};
+
+        let member = Member {
+            geometry: geometry(1),
+            bounds: vec![1, 1],
+            disk_bounds: Vec::new(),
+            regions: vec![(100, 4096)],
+        };
+        let wire = contract_wire(1).to_string();
+        let source = Replica::register([1; 32], wire.as_bytes(), &[member.encode(0)]).unwrap();
+        let received = Replica::decode(source.semantic, source.descriptor).unwrap();
+        let endpoint = received.members[0].endpoint();
+        assert!(endpoint.geometry.host.is_none());
+        for group in 0..2 {
+            let device = page(group, 0, 1);
+            assert_eq!(
+                endpoint.local_page(&received.contract, device, 0).unwrap(),
+                Some(1)
+            );
+            let host = PeerPageView {
+                tier: PeerTier::Host,
+                ..device
+            };
+            assert!(endpoint.local_page(&received.contract, host, 0).is_err());
+        }
+    }
+
+    #[test]
     fn cross_layout_reads_cover_owned_pages_and_the_exact_state_head() {
         let (src, dst) = (contract(1), contract(8));
         let (sg, dg) = (geometry(1), geometry(8));

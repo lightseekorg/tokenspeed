@@ -38,6 +38,12 @@ local read-worker threads while waiting on Disk pushes. Each holder member
 authorizes an offer's id on its push endpoint once pinned—recording the holder's
 local monotonic activation time—and rejects pushes for inactive,
 mismatched-incarnation, or expired-window offers before touching NVMe.
+A queued Disk offer can be restored only with a matching generation and a
+registered Disk-capable holder layout. After any holder member loses Disk
+capability, new lookups can still use its hot prefix. A duplicate lookup for
+an outstanding Disk offer receives a miss. A refreshed offer must bind the
+same prefix and page manifest before the reader can retry its PIN.
+
 Specifically, offer-bound (`P`) Disk pushes are only accepted within 35 seconds
 of offer activation (covering the reader's 30-second submission window plus
 transit slack), and every accepted job's execution deadline is clamped to at

@@ -89,7 +89,7 @@ pub struct Settings {
     ib_device: String,
     regions: Vec<(usize, usize)>,
     device: Vec<DeviceField>,
-    host: HostPool,
+    host: Option<HostPool>,
     contract: Vec<u8>,
     host_bounds: Vec<i64>,
     semantic_id: Vec<u8>,
@@ -127,21 +127,25 @@ impl Settings {
             })
             .collect::<PyResult<Vec<_>>>()?;
         let host = geometry.getattr("host")?;
-        let host = HostPool {
-            address: host.getattr("address")?.extract()?,
-            groups: host
-                .getattr("groups")?
-                .try_iter()?
-                .map(|group| {
-                    let group = group?;
-                    Ok(HostGroup {
-                        parent_bytes: group.getattr("parent_bytes")?.extract()?,
-                        packing: group.getattr("packing")?.extract()?,
-                        block_bytes: group.getattr("block_bytes")?.extract()?,
-                        field_offsets: group.getattr("field_offsets")?.extract()?,
+        let host = if host.is_none() {
+            None
+        } else {
+            Some(HostPool {
+                address: host.getattr("address")?.extract()?,
+                groups: host
+                    .getattr("groups")?
+                    .try_iter()?
+                    .map(|group| {
+                        let group = group?;
+                        Ok(HostGroup {
+                            parent_bytes: group.getattr("parent_bytes")?.extract()?,
+                            packing: group.getattr("packing")?.extract()?,
+                            block_bytes: group.getattr("block_bytes")?.extract()?,
+                            field_offsets: group.getattr("field_offsets")?.extract()?,
+                        })
                     })
-                })
-                .collect::<PyResult<Vec<_>>>()?,
+                    .collect::<PyResult<Vec<_>>>()?,
+            })
         };
         Ok(Some(Self {
             peer: PeerSettings {
@@ -232,7 +236,7 @@ pub fn start(
     let local = RankGeometry {
         session: engine.session_id().to_owned(),
         device: settings.device,
-        host: Some(settings.host),
+        host: settings.host,
         push: Some(push.name().to_owned()),
     };
     let gathered = mesh
@@ -400,7 +404,31 @@ pub fn start(
                 );
             }
         }
-        peer.enable_versioned(layout, name, incarnation, channel, retirement_bound_ms);
+        let progress_mesh = if replica.size() > 1 {
+            let listener =
+                ts_collective::Listener::bind(&settings.bind_host).map_err(|e| e.to_string())?;
+            let port = listener.port().map_err(|e| e.to_string())?;
+            let address = format!("{}:{port}", settings.push_host);
+            let addresses = mesh
+                .all_gather(replica, address.as_bytes())
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(String::from_utf8)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            let rank = replica.index();
+            let group =
+                Group::new(0, (0..addresses.len()).collect(), rank).map_err(|e| e.to_string())?;
+            let transport = Mesh::connect(rank, listener, &addresses, Duration::from_secs(60))
+                .map_err(|e| e.to_string())?;
+            Some((transport, group))
+        } else {
+            None
+        };
+        peer.enable_versioned(layout, name, incarnation, channel, retirement_bound_ms)
+            .map_err(|e| e.to_string())?;
+        peer.start_versioned_progress(progress_mesh)
+            .map_err(|e| e.to_string())?;
     }
     // A second start would be a second peer; there is one per process.
     if outbox.fence.set(peer.fence()).is_err() {

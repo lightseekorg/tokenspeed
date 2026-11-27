@@ -671,7 +671,8 @@ impl DflashReplica {
                 incarnation,
                 channel_opt.take(),
                 0,
-            );
+            )
+            .unwrap();
             let dr_dev_base = arena_base + (rank as u64) * stride_per_rank;
             let kv_dev_base = dr_dev_base + 0x20_000;
             let st_dev_base = dr_dev_base + 0x80_000;

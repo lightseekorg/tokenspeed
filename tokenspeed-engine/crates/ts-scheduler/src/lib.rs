@@ -735,6 +735,8 @@ mod ffi {
         tokens: Vec<i32>,
         /// The bound on the prefix.
         max_tokens: i32,
+        /// Locally reusable tokens at lookup dispatch.
+        local_tokens: i32,
     }
 
     /// What a holder's answer answers.

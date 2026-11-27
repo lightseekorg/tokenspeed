@@ -23,7 +23,7 @@
 use std::{
     sync::{
         atomic::{AtomicBool, AtomicU32, Ordering},
-        Arc, Once,
+        Arc,
     },
     thread,
     time::{Duration, Instant},
@@ -48,16 +48,7 @@ pub(crate) mod owner;
 /// group 0 (full attention) or one of group 1 (State) to an LCM block
 /// (`shared_l2_test_utils.GEOMETRY`).
 pub(crate) fn build_pool(num_lcm_blocks: i32) -> Result<SharedL2Pool, String> {
-    static START: Once = Once::new();
-    START.call_once(|| {
-        // The test binary is not in a Python prefix; point at the one the
-        // crate was built against.
-        std::env::set_var("PYTHONHOME", env!("TS_CONTROL_TEST_PYTHONHOME"));
-        Python::initialize();
-        // The scheduler's module, loaded once: the tests' threads find it
-        // loaded.
-        Python::attach(|py| ts_scheduler::python_module(py).map(drop)).unwrap();
-    });
+    crate::init_test_scheduler();
     Python::attach(|py| {
         let scope = PyDict::new(py);
         scope.set_item("ts", ts_scheduler::python_module(py)?)?;
