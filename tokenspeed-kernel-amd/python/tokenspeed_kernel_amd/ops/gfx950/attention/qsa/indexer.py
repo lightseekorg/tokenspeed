@@ -43,8 +43,11 @@ __all__ = [
     "launch_gluon_qsa_block_topk_stream_gfx950",
 ]
 
-# MFMA M rows (query rows x padded index heads) per large-batch score tile.
-_SCORE_BLOCK_M = 64
+# MFMA M rows (query rows x padded index heads) per score tile: the MFMA's
+# 16 rows for small (decode) batches, so a tile rarely spans requests, and 64
+# for large (prefill) ones, sharing each key tile across 16 query rows.
+_SCORE_BLOCK_M = 16
+_SCORE_LARGE_BLOCK_M = 64
 # Batches from this many rows (prefill) use the large score tile.
 _SCORE_LARGE_ROWS = 512
 # Score programs targeted per launch (about four per CU).
@@ -54,8 +57,20 @@ _SCORE_TARGET_PROGRAMS = 1024
 _NUM_XCDS = 8
 # Compressed blocks per score tile.
 _SCORE_BLOCK_N = 128
-# Warps per selection program.
+# LDS key-tile buffers per score program: one tile copies while the MFMA
+# reads the other. Two 32 KiB stages keep two programs on a CU; three gain
+# no copy depth (see the store ordering in the kernel) and halve that.
+_SCORE_STAGES = 2
+# Block tiles whose cache slots a score program stages in LDS at once.
+# Decode programs own one or two tiles; prefill programs about twenty.
+_SCORE_CHUNK_TILES = 4
+_SCORE_LARGE_CHUNK_TILES = 16
+# Warps per selection program: eight cut one row's latency, four give large
+# batches more rows in flight.
 _SELECT_WARPS = 8
+_SELECT_LARGE_WARPS = 4
+# Batches from this many rows use the large-batch selection programs.
+_SELECT_LARGE_ROWS = 1024
 # Minimum LDS list entries for the selection candidates.
 _SELECT_LIST = 4096
 # The lowest finite FP32 value: ``x >= _FP32_LOWEST`` excludes -inf and NaN.
@@ -86,49 +101,131 @@ def _select_metadata(grid, kernel, args):
 
 
 @gluon.jit
-def _key_tile_slots(
+def _load_tile_slots(
     page_table,
     request,
-    tile,
+    slot_smem,
+    first_tile,
+    tile_step,
     frontier,
     page_size,
     stride_pt_b,
-    k_layout: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    CHUNK_TILES: gl.constexpr,
+    num_warps: gl.constexpr,
 ):
-    # Cache slots of blocks [tile * BLOCK_N, ...); -1 at or past the run's
-    # frontier.
-    k_n = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, k_layout))
+    # Cache slots of a program's next CHUNK_TILES block tiles (first_tile,
+    # first_tile + tile_step, ...) into LDS; -1 at or past the run's frontier.
+    # Key copies read them from LDS, so a slot read never waits on the vector
+    # memory counter behind in-flight key copies.
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, BLOCK_N // 64], [1, 64], [num_warps, 1], [1, 0]
+    )
+    tiles = first_tile + tile_step * gl.arange(
+        0, CHUNK_TILES, layout=gl.SliceLayout(1, layout)
+    )
+    k_n = (
+        tiles[:, None] * BLOCK_N
+        + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, layout))[None, :]
+    )
     live = k_n < frontier
-    # Int64 lengths can widen tile offsets; the host bounds the page table to
-    # 2 GiB, so valid buffer offsets fit in int32. Key addresses stay int64.
+    # The host bounds the page table to 2 GiB, so live buffer offsets fit in
+    # int32; key addresses stay int64.
     pages = cdna4.buffer_load(
         page_table,
         (request * stride_pt_b + k_n // page_size).to(gl.int32),
         mask=live,
         other=0,
     )
-    return gl.where(live, pages.to(gl.int64) * page_size + k_n % page_size, -1)
+    slot_smem.reshape([CHUNK_TILES, BLOCK_N]).store(
+        gl.where(live, pages * page_size + k_n % page_size, -1).to(gl.int32)
+    )
 
 
 @gluon.jit
-def _load_key_tile(
+def _copy_key_tile(
     key_cache,
-    slots,
+    key_smem,
+    slot_smem,
+    tile,
+    chunk_tiles,
     stride_k_n,
-    k_layout: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     HEAD_DIM_PAD: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    CHUNK_TILES: gl.constexpr,
+    num_warps: gl.constexpr,
 ):
-    # Gather the keys of a tile's slots straight into the MFMA B-operand
-    # layout, with 64-bit addressing: the compressed cache may exceed the
-    # 2 GiB reach of buffer loads.
-    k_d = gl.arange(0, HEAD_DIM_PAD, layout=gl.SliceLayout(1, k_layout))
-    return gl.load(
-        key_cache + slots[None, :] * stride_k_n + k_d[:, None],
-        mask=(slots >= 0)[None, :] & (k_d < HEAD_DIM)[:, None],
-        other=0.0,
+    # Copy the keys of chunk tile ``tile`` into stage tile % NUM_STAGES, 16
+    # bytes a lane, with 64-bit addresses: the compressed cache may exceed
+    # the 2 GiB reach of buffer loads. Tiles past the chunk's chunk_tiles
+    # and dead slots load slot 0 into their stage; no score of theirs is
+    # stored. Every call commits one copy group.
+    VEC: gl.constexpr = 8
+    layout: gl.constexpr = gl.BlockedLayout(
+        [VEC, 1],
+        [HEAD_DIM_PAD // VEC, 64 // (HEAD_DIM_PAD // VEC)],
+        [1, num_warps],
+        [0, 1],
     )
+    cols = gl.minimum(tile, CHUNK_TILES - 1) * BLOCK_N + gl.arange(
+        0, BLOCK_N, layout=gl.SliceLayout(0, layout)
+    )
+    slots = slot_smem.gather(cols, axis=0)
+    d = gl.arange(0, HEAD_DIM_PAD, layout=gl.SliceLayout(1, layout))
+    # The launcher checks 16-byte aligned key rows; the multiple of VEC
+    # proves it to the copy's vectorization.
+    stride_vecs = stride_k_n // VEC
+    if HEAD_DIM == HEAD_DIM_PAD:
+        # Unmasked copies keep the vector-memory wait counts static: dead
+        # slots read slot 0, whose scores are never stored.
+        rows = gl.maximum(slots, 0).to(gl.int64) * stride_vecs * VEC
+        cdna4.async_copy.global_load_to_shared(
+            key_smem.index(tile % NUM_STAGES), key_cache + rows[None, :] + d[:, None]
+        )
+    else:
+        # Padded dims must read zeros: stale LDS may hold NaN.
+        live = ((slots >= 0) & (tile < chunk_tiles))[None, :]
+        rows = slots.to(gl.int64) * stride_vecs * VEC
+        cdna4.async_copy.global_load_to_shared(
+            key_smem.index(tile % NUM_STAGES),
+            key_cache + rows[None, :] + d[:, None],
+            mask=live & (d < HEAD_DIM)[:, None],
+            other=0.0,
+        )
+    cdna4.async_copy.commit_group()
+
+
+@gluon.jit
+def _store_scores(scores, out_base, out_offsets, block_ids, limits):
+    # Store a tile's scores below each row's limit. Buffer stores need no
+    # branches for the mask, unlike masked global stores.
+    cdna4.buffer_store(
+        scores,
+        out_base,
+        out_offsets[:, None] + block_ids[None, :],
+        mask=block_ids[None, :] < limits[:, None],
+    )
+
+
+@gluon.jit
+def _head_sum(
+    acc, BLOCK_Q: gl.constexpr, HEADS_PAD: gl.constexpr, BLOCK_N: gl.constexpr
+):
+    # Sum each query row's heads (MFMA rows row * HEADS_PAD + head): pairs
+    # HEADS_PAD / 2 apart first, then down to one, the order of the in-lane
+    # tree reduction, whatever the accumulator layout.
+    if HEADS_PAD == 1:
+        return gl.reshape(acc, [BLOCK_Q, BLOCK_N])
+    else:
+        halves = gl.sum(gl.reshape(acc, [BLOCK_Q, 2, HEADS_PAD // 2, BLOCK_N]), axis=1)
+        return _head_sum(
+            gl.reshape(halves, [BLOCK_Q * (HEADS_PAD // 2), BLOCK_N]),
+            BLOCK_Q,
+            HEADS_PAD // 2,
+            BLOCK_N,
+        )
 
 
 @gluon.jit(
@@ -157,23 +254,26 @@ def gluon_qsa_block_scores_gfx950(
     HEAD_DIM_PAD: gl.constexpr,
     BLOCK_Q: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    CHUNK_TILES: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     num_warps: gl.constexpr,
 ):
     BLOCK_M: gl.constexpr = BLOCK_Q * HEADS_PAD
+    # MFMA row m = query row m // HEADS_PAD, head m % HEADS_PAD. In the
+    # untransposed 16x16 layout a lane holds four consecutive M of one block,
+    # so a row's heads are summed within the lane (with HEADS_PAD of 16, the
+    # one-row tiles, over four lanes' zero-padded heads too).
     mma: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
         instr_shape=[16, 16, 32],
-        transposed=True,
-        # Warps split the blocks: each gathered key is loaded by one warp,
-        # while the small query tile is shared through L1.
+        transposed=False,
+        # Warps split the blocks; each reads its keys of the LDS tile.
         warps_per_cta=[1, num_warps],
     )
     q_layout: gl.constexpr = gl.DotOperandLayout(0, mma, 8)
     k_layout: gl.constexpr = gl.DotOperandLayout(1, mma, 8)
-    out_layout: gl.constexpr = gl.BlockedLayout([1, 4], [2, 32], [num_warps, 1], [1, 0])
-    row_layout: gl.constexpr = gl.SliceLayout(1, out_layout)
-    col_layout: gl.constexpr = gl.SliceLayout(0, out_layout)
+    meta_layout: gl.constexpr = gl.BlockedLayout([1], [64], [num_warps], [0])
 
     # A program owns BLOCK_Q query rows and every col_splits-th block tile.
     # Programs go round-robin to the XCDs; the programs of an XCD take the
@@ -184,16 +284,14 @@ def gluon_qsa_block_scores_gfx950(
     row_tiles = gl.cdiv(rows, BLOCK_Q)
     row0 = (xcd_index % row_tiles) * BLOCK_Q
     split = pid % NUM_XCDS + NUM_XCDS * (xcd_index // row_tiles)
-    q_idx = gl.arange(0, BLOCK_Q, layout=row_layout)
+    q_idx = gl.arange(0, BLOCK_Q, layout=meta_layout)
     q_rows = row0 + q_idx
     row_mask = q_rows < rows
     requests = cdna4.buffer_load(request_indices, q_rows, mask=row_mask, other=-1).to(
         gl.int32
     )
     complete = cdna4.buffer_load(complete_blocks, q_rows, mask=row_mask, other=0)
-    out_rows = logits + q_rows[:, None].to(gl.int64) * stride_l_n
 
-    # M index m = row * HEADS_PAD + head, so each row's heads are adjacent.
     m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, q_layout))
     d = gl.arange(0, HEAD_DIM_PAD, layout=gl.SliceLayout(0, q_layout))
     m_row = row0 + m // HEADS_PAD
@@ -204,6 +302,40 @@ def gluon_qsa_block_scores_gfx950(
         mask=((m_row < rows) & (m_head < NUM_HEADS))[:, None] & (d < HEAD_DIM)[None, :],
         other=0.0,
     )
+
+    # Keys stream through NUM_STAGES LDS buffers; row-major key rows with
+    # their 16-byte chunks XOR-swizzled by the key index, so the MFMA operand
+    # reads of consecutive keys hit distinct banks.
+    key_smem = gl.allocate_shared_memory(
+        key_cache.type.element_ty,
+        [NUM_STAGES, HEAD_DIM_PAD, BLOCK_N],
+        gl.SwizzledSharedLayout(
+            vec=8, per_phase=1, max_phase=HEAD_DIM_PAD // 8, order=[0, 1]
+        ),
+    )
+    slot_smem = gl.allocate_shared_memory(
+        gl.int32,
+        [CHUNK_TILES * BLOCK_N],
+        gl.SwizzledSharedLayout(1, 1, 1, [0]),
+    )
+
+    # Score layout: the accumulator with each row's heads summed (within
+    # the lane). Traced on a dummy tile to name it ahead of the loop.
+    score_layout: gl.constexpr = _head_sum(
+        gl.zeros([BLOCK_M, BLOCK_N], gl.float32, mma), BLOCK_Q, HEADS_PAD, BLOCK_N
+    ).type.layout
+    score_rows: gl.constexpr = gl.SliceLayout(1, score_layout)
+    score_cols: gl.constexpr = gl.SliceLayout(0, score_layout)
+    s_rows = row0 + gl.arange(0, BLOCK_Q, layout=score_rows)
+    s_complete = cdna4.buffer_load(complete_blocks, s_rows, mask=s_rows < rows, other=0)
+    s_requests = cdna4.buffer_load(
+        request_indices, s_rows, mask=s_rows < rows, other=-1
+    ).to(gl.int32)
+    # Scores store through buffer ops from the tile's first row: unlike
+    # masked global stores they need no branches. The launcher bounds a
+    # tile's rows to 2 GiB.
+    out_base = logits + row0.to(gl.int64) * stride_l_n
+    out_offsets = (s_rows - row0) * stride_l_n
 
     # Rows of one request are contiguous: score one request run at a time,
     # sharing each gathered key tile across the run's rows.
@@ -218,66 +350,81 @@ def gluon_qsa_block_scores_gfx950(
             request >= 0,
             gl.minimum(gl.max(gl.where(in_run, complete, 0), axis=0), num_blocks),
             0,
-        )
-        num_tiles = gl.cdiv(frontier, BLOCK_N)
-        # Key gathers run one tile ahead of the MFMA and their page ids one
-        # more, so neither dependent load waits in the loop.
-        keys = _load_key_tile(
-            key_cache,
-            _key_tile_slots(
+        ).to(gl.int32)
+        # This program's tiles of the run: split, split + col_splits, ...
+        my_tiles = gl.maximum(gl.cdiv(frontier, BLOCK_N) - split, 0)
+        my_tiles = gl.cdiv(my_tiles, col_splits)
+        # Store the run's rows below their own complete prefix (selection
+        # reads only that prefix).
+        s_limit = gl.where(
+            (s_rows < rows) & (s_requests == request),
+            gl.minimum(s_complete, num_blocks),
+            0,
+        ).to(gl.int32)
+        for chunk in range(0, my_tiles, CHUNK_TILES):
+            chunk_tiles = gl.minimum(my_tiles - chunk, CHUNK_TILES)
+            first_tile = split + chunk * col_splits
+            _load_tile_slots(
                 page_table,
                 request,
-                split,
+                slot_smem,
+                first_tile,
+                col_splits,
                 frontier,
                 page_size,
                 stride_pt_b,
-                k_layout,
                 BLOCK_N,
-            ),
-            stride_k_n,
-            k_layout,
-            HEAD_DIM,
-            HEAD_DIM_PAD,
-        )
-        next_slots = _key_tile_slots(
-            page_table,
-            request,
-            split + col_splits,
-            frontier,
-            page_size,
-            stride_pt_b,
-            k_layout,
-            BLOCK_N,
-        )
-        for tile in range(split, num_tiles, col_splits):
-            next_keys = _load_key_tile(
-                key_cache, next_slots, stride_k_n, k_layout, HEAD_DIM, HEAD_DIM_PAD
+                CHUNK_TILES,
+                num_warps,
             )
-            next_slots = _key_tile_slots(
-                page_table,
-                request,
-                tile + 2 * col_splits,
-                frontier,
-                page_size,
-                stride_pt_b,
-                k_layout,
-                BLOCK_N,
-            )
-            block_ids = tile * BLOCK_N + gl.arange(0, BLOCK_N, layout=col_layout)
-            acc = gl.zeros([BLOCK_M, BLOCK_N], gl.float32, mma)
-            acc = cdna4.mfma(q_tile, keys, acc)
-            acc = gl.maximum(acc, 0.0)
-            scores = gl.sum(gl.reshape(acc, [BLOCK_Q, HEADS_PAD, BLOCK_N]), axis=1)
-            scores = gl.convert_layout(scores, out_layout)
-            # Selection reads each row's complete prefix; leave its tail unwritten.
-            gl.store(
-                out_rows + block_ids[None, :],
-                scores,
-                mask=in_run[:, None]
-                & (block_ids < num_blocks)[None, :]
-                & (block_ids[None, :] < complete[:, None]),
-            )
-            keys = next_keys
+            for s in gl.static_range(NUM_STAGES - 1):
+                _copy_key_tile(
+                    key_cache,
+                    key_smem,
+                    slot_smem,
+                    s,
+                    chunk_tiles,
+                    stride_k_n,
+                    HEAD_DIM,
+                    HEAD_DIM_PAD,
+                    BLOCK_N,
+                    NUM_STAGES,
+                    CHUNK_TILES,
+                    num_warps,
+                )
+            # Scores are stored one iteration late, after the next tile's copy
+            # wait. That wait's vector-memory count covers only the copies, so
+            # a store issued between a copy and its wait would have to
+            # complete with it, stalling every tile on the store.
+            pending = gl.zeros([BLOCK_Q, BLOCK_N], gl.float32, score_layout)
+            pending_ids = gl.full([BLOCK_N], 2147483647, gl.int32, score_cols)
+            for t in range(0, chunk_tiles):
+                # One copy group per iteration, so NUM_STAGES - 2 stay in flight.
+                cdna4.async_copy.wait_group(NUM_STAGES - 2)
+                _store_scores(pending, out_base, out_offsets, pending_ids, s_limit)
+                keys = key_smem.index(t % NUM_STAGES).load(k_layout)
+                _copy_key_tile(
+                    key_cache,
+                    key_smem,
+                    slot_smem,
+                    t + NUM_STAGES - 1,
+                    chunk_tiles,
+                    stride_k_n,
+                    HEAD_DIM,
+                    HEAD_DIM_PAD,
+                    BLOCK_N,
+                    NUM_STAGES,
+                    CHUNK_TILES,
+                    num_warps,
+                )
+                acc = gl.zeros([BLOCK_M, BLOCK_N], gl.float32, mma)
+                acc = cdna4.mfma(q_tile, keys, acc)
+                pending = _head_sum(gl.maximum(acc, 0.0), BLOCK_Q, HEADS_PAD, BLOCK_N)
+                pending_ids = (first_tile + t * col_splits) * BLOCK_N + gl.arange(
+                    0, BLOCK_N, layout=score_cols
+                )
+            _store_scores(pending, out_base, out_offsets, pending_ids, s_limit)
+            cdna4.async_copy.wait_group(0)
         start = run_end
 
 
@@ -403,12 +550,17 @@ def _spare_slots(values, base):
 @gluon.jit
 def _count_digits(hist, keys, mask, shift):
     # LDS-atomic histogram of the 8-bit digit at ``shift`` of the masked keys
-    # into the first 256 entries of ``hist``.
+    # into the 256 entries of ``hist``. Masked-off keys add zero to per-lane
+    # bins, apart from each other: unmasked LDS ops avoid a branch per
+    # element.
     digits = gl.where(
-        mask, ((keys >> shift) & 0xFF).to(gl.int32), _spare_slots(keys, 256)
+        mask, ((keys >> shift) & 0xFF).to(gl.int32), _spare_slots(keys, 0)
     )
-    digits = gl.reshape(digits, [keys.numel])
-    hist.atomic_scatter_add(gl.full_like(digits, 1), digits, 0)
+    hist.atomic_scatter_add(
+        gl.reshape(mask.to(gl.int32), [keys.numel]),
+        gl.reshape(digits, [keys.numel]),
+        0,
+    )
 
 
 @gluon.jit
@@ -417,7 +569,7 @@ def _radix_digits(hist_smem, keys, live, topk, num_warps: gl.constexpr):
     # time, stopping once the bucket holding the topk-th key is taken whole.
     # Returns the threshold's resolved high bits, their shift, and how many
     # keys equal to them are taken.
-    hist = hist_smem.slice(0, 512)
+    hist = hist_smem.slice(0, 256)
     _count_digits(hist, keys, live, 24)
     digit, before, bucket, total = _pick_digit(hist, topk, 256, num_warps)
     prefix = digit.to(gl.uint32)
@@ -426,13 +578,13 @@ def _radix_digits(hist_smem, keys, live, topk, num_warps: gl.constexpr):
     for p in gl.static_range(1, 4):
         if bucket > remaining:
             _count_digits(
-                hist_smem.slice(512 * p, 512),
+                hist_smem.slice(256 * p, 256),
                 keys,
                 live & ((keys >> shift) == prefix),
                 24 - 8 * p,
             )
             digit, before, bucket, _ = _pick_digit(
-                hist_smem.slice(512 * p, 512), remaining, 256, num_warps
+                hist_smem.slice(256 * p, 256), remaining, 256, num_warps
             )
             prefix = (prefix << 8) | digit.to(gl.uint32)
             remaining -= before
@@ -464,7 +616,7 @@ def _select_full_rows(
     remaining = gl.to_tensor(TOPK)
     selected = gl.to_tensor(0)
     for p in gl.static_range(4):
-        hist = hist_smem.slice(512 * (4 + p), 512)
+        hist = hist_smem.slice(256 * (4 + p), 256)
         for start in range(0, n_cols, CHUNK):
             values = _chunk_scores(row_desc, start, cols, n_cols)
             keys = _select_key(values)
@@ -517,8 +669,10 @@ def gluon_qsa_block_topk_select_gfx950(
     # Top-TOPK selection of a row's finite scores, one program per row:
     #  1. Each lane's GROUP consecutive scores form a group. The TOPK-th
     #     largest group maximum is a lower bound of the TOPK-th largest
-    #     score: an 11-bit histogram of the group maxima bounds it by the
-    #     low edge of its bucket.
+    #     score: a histogram of the group maxima bounds it by the low edge
+    #     of its bucket. Buckets split the positive floats by their top 11
+    #     bits below the sign (1/8 octave); negative maxima share the last
+    #     bucket with zero and denormals.
     #  2. The scores at or above the bound are compacted, in column order,
     #     into an LDS list of at most CAP entries.
     #  3. 8-bit radix passes over the list resolve the threshold, stopping
@@ -530,6 +684,8 @@ def gluon_qsa_block_topk_select_gfx950(
     THREADS: gl.constexpr = 64 * num_warps
     CAP: gl.constexpr = THREADS * LIST_VEC
     BINS: gl.constexpr = 2048
+    # Key bits below the group-histogram digit of a positive score.
+    DIGIT_SHIFT: gl.constexpr = 20
     # Lanes own consecutive columns (16-byte vector loads), so lane order is
     # column order. A group is GROUP columns of a lane; compaction takes
     # COMPACT_VEC columns a lane.
@@ -558,21 +714,23 @@ def gluon_qsa_block_topk_select_gfx950(
     row_desc = cdna4.buffer.make_buffer_descriptor(row_ptr, n_cols * 4)
 
     smem_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [0])
-    # The group histogram's BINS bins, then 512-entry regions for eight 8-bit
-    # histograms; the lists hold LIST_CAP entries. Each also has 64 spare
-    # slots past its end, see _spare_slots.
+    # The group histogram's BINS bins, then eight 256-bin histograms for the
+    # 8-bit radix passes. The lists hold LIST_CAP entries and 64 spare slots
+    # past their end, see _spare_slots.
     LIST_CAP: gl.constexpr = CAP - 64
-    hist_smem = gl.allocate_shared_memory(gl.int32, [4 * BINS], smem_layout)
+    GROUP_REGION: gl.constexpr = BINS
+    HIST_SIZE: gl.constexpr = GROUP_REGION + 8 * 256
+    hist_smem = gl.allocate_shared_memory(gl.int32, [HIST_SIZE], smem_layout)
     list_scores = gl.allocate_shared_memory(gl.int32, [CAP], smem_layout)
     list_cols = gl.allocate_shared_memory(gl.int32, [CAP], smem_layout)
     hist_smem.store(
         gl.zeros(
-            [4 * BINS],
+            [HIST_SIZE],
             gl.int32,
-            gl.BlockedLayout([4 * BINS // THREADS], [64], [num_warps], [0]),
+            gl.BlockedLayout([HIST_SIZE // THREADS], [64], [num_warps], [0]),
         )
     )
-    group_hist = hist_smem.slice(0, 2 * BINS)
+    group_hist = hist_smem.slice(0, BINS)
 
     # 1. Histogram the live group maxima; the next chunk loads ahead.
     GROUP_CHUNK: gl.constexpr = THREADS * GROUP
@@ -586,19 +744,21 @@ def gluon_qsa_block_topk_select_gfx950(
         values = ahead
         ahead = _chunk_scores(row_desc, start + GROUP_CHUNK, cols, n_cols)
         group_max = gl.max(values, axis=1)
+        keys = _select_key(group_max)
+        # Dead groups (past the row or all -inf) add zero to per-lane bins.
+        live = group_max > float("-inf")
         digits = gl.where(
-            group_max > float("-inf"),
-            (_select_key(group_max) >> 21).to(gl.int32),
-            BINS + lane % 64,
+            live, gl.minimum(keys >> DIGIT_SHIFT, BINS - 1).to(gl.int32), lane % 64
         )
-        group_hist.atomic_scatter_add(gl.full_like(digits, 1), digits, 0)
+        group_hist.atomic_scatter_add(live.to(gl.int32), digits, 0)
     digit, _, _, live_groups = _pick_digit(group_hist, TOPK, BINS, num_warps)
     # With more than TOPK live groups, the TOPK-th group maximum's bucket
-    # bounds the selection; otherwise every finite score is a candidate.
-    # Group maxima are never NaN, so the bucket's low edge is not either.
+    # bounds the selection; otherwise, or in the last bucket (which holds
+    # the negative maxima), every finite score is a candidate. Group maxima
+    # are never NaN, so the bucket's low edge is not either.
     bound = gl.where(
-        live_groups > TOPK,
-        _key_score(((digit.to(gl.uint32) + 1) << 21) - 1),
+        (live_groups > TOPK) & (digit < BINS - 1),
+        _key_score(((digit.to(gl.uint32) + 1) << DIGIT_SHIFT) - 1),
         _FP32_LOWEST,
     )
 
@@ -641,7 +801,7 @@ def gluon_qsa_block_topk_select_gfx950(
         )
         live = index < listed
         prefix, shift, remaining = _radix_digits(
-            hist_smem.slice(2 * BINS, 2 * BINS), keys, live, TOPK, num_warps
+            hist_smem.slice(GROUP_REGION, 8 * 256), keys, live, TOPK, num_warps
         )
         # 4. Write the selection in column order.
         _write_selected(
@@ -661,7 +821,7 @@ def gluon_qsa_block_topk_select_gfx950(
             out_row,
             row_desc,
             n_cols,
-            hist_smem.slice(2 * BINS, 2 * BINS),
+            hist_smem.slice(GROUP_REGION, 8 * 256),
             TOPK,
             COMPACT_VEC,
             num_warps,
@@ -684,10 +844,12 @@ def _launch_block_scores(
     *,
     page_size: int,
     out: torch.Tensor | None,
-    block_m: int,
+    block_q: int,
+    heads_pad: int,
+    chunk_tiles: int,
 ) -> torch.Tensor:
-    # launch_gluon_qsa_block_scores_gfx950 with an explicit MFMA M tile:
-    # block_m // heads query rows share each gathered key tile.
+    # launch_gluon_qsa_block_scores_gfx950 with an explicit tile: block_q
+    # query rows of heads_pad (zero-padded) heads share each key tile.
 
     rows, num_heads, head_dim = query.shape
     num_blocks = page_table.shape[1] * page_size
@@ -700,19 +862,24 @@ def _launch_block_scores(
         return logits
     if query.stride(-1) != 1 or key_cache.stride(-1) != 1:
         raise ValueError("QSA indexer query and key head dims must be contiguous")
+    # Key rows are copied to LDS in 16-byte pieces.
+    if head_dim % 8 or key_cache.stride(0) % 8 or key_cache.data_ptr() % 16:
+        raise ValueError("QSA indexer key rows must be 16-byte aligned")
     # Query and page-table buffer loads take 32-bit byte offsets; the key
-    # cache is gathered with 64-bit pointers.
+    # cache is gathered with 64-bit pointers from 32-bit slot ids.
     for tensor in (query, page_table):
         span = sum(
             (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
         )
         if (span + 1) * tensor.element_size() > 1 << 31:
             raise ValueError("Gluon QSA indexer query/page table exceed 2 GiB")
-    heads_pad = triton.next_power_of_2(num_heads)
-    block_q = max(1, block_m // heads_pad)
+    if key_cache.shape[0] >= 1 << 31:
+        raise ValueError("Gluon QSA indexer key cache exceeds 2**31 slots")
+    # A tile's scores are buffer-stored from its first row's base pointer.
+    if ((block_q - 1) * logits.stride(0) + num_blocks) * 4 > 1 << 31:
+        raise ValueError("Gluon QSA score tile rows exceed 2 GiB")
     row_tiles = triton.cdiv(rows, block_q)
-    # Spread the block tiles over programs until the GPU is full; each
-    # program prefetches its next tile while scoring the current one.
+    # Spread the block tiles over programs until the GPU is full.
     # Splits come in multiples of the XCD count (see the kernel); the extra
     # splits past the last tile have no work.
     col_splits = min(
@@ -743,10 +910,22 @@ def _launch_block_scores(
         HEAD_DIM_PAD=max(32, triton.next_power_of_2(head_dim)),
         BLOCK_Q=block_q,
         BLOCK_N=_SCORE_BLOCK_N,
+        NUM_STAGES=_SCORE_STAGES,
+        CHUNK_TILES=chunk_tiles,
         NUM_XCDS=_NUM_XCDS,
         num_warps=4,
     )
     return logits
+
+
+def _large_score_tile(num_heads: int) -> dict[str, int]:
+    # Prefill-sized batches: 16 query rows of 4 heads share each key tile.
+    heads_pad = triton.next_power_of_2(num_heads)
+    return {
+        "block_q": max(1, _SCORE_LARGE_BLOCK_M // heads_pad),
+        "heads_pad": heads_pad,
+        "chunk_tiles": _SCORE_LARGE_CHUNK_TILES,
+    }
 
 
 def launch_gluon_qsa_block_scores_gfx950(
@@ -757,6 +936,7 @@ def launch_gluon_qsa_block_scores_gfx950(
     complete_blocks: torch.Tensor,
     *,
     page_size: int,
+    queries_per_request: int | None,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score every compressed block for each query row.
@@ -764,23 +944,40 @@ def launch_gluon_qsa_block_scores_gfx950(
     Args:
         query: Index queries shaped ``[rows, heads, head_dim]`` with a
             contiguous last dimension; row and head strides are free.
-        key_cache: Compressed keys shaped ``[slots, 1, head_dim]``.
+        key_cache: Compressed keys shaped ``[slots, 1, head_dim]`` with
+            16-byte aligned rows.
         page_table: Compressed-cache page ids shaped ``[requests, pages]``.
         request_indices: Owning request per row; a request's rows are
             contiguous.
         complete_blocks: Fully compressed block count per row.
         page_size: Compressed rows per page.
+        queries_per_request: Uniform consecutive rows per request, or
+            ``None`` for ragged runs. It only picks the tile: small batches
+            of one row per request score one row per tile.
         out: Optional FP32 destination shaped ``[rows, pages * page_size]``
             with a contiguous last dimension.
 
     Returns:
         FP32 scores shaped ``[rows, pages * page_size]``: ``sum_h relu(q_h .
         k)`` below each row's ``complete_blocks``. Values outside that prefix
-        are undefined.
+        are undefined. Scores do not depend on the tile.
     """
 
-    # Large (prefill) batches share each key tile across 16 query rows; small
-    # (decode) batches keep one MFMA M tile so a tile rarely spans requests.
+    num_heads = query.shape[1]
+    if query.shape[0] >= _SCORE_LARGE_ROWS:
+        tile = _large_score_tile(num_heads)
+    else:
+        heads_pad = triton.next_power_of_2(num_heads)
+        if queries_per_request == 1:
+            # One row per tile: a tile spanning requests scores each
+            # request's run after the other. Zero heads fill the MFMA rows.
+            tile = {"block_q": 1, "heads_pad": max(heads_pad, _SCORE_BLOCK_M)}
+        else:
+            tile = {
+                "block_q": max(1, _SCORE_BLOCK_M // heads_pad),
+                "heads_pad": heads_pad,
+            }
+        tile["chunk_tiles"] = _SCORE_CHUNK_TILES
     return _launch_block_scores(
         query,
         key_cache,
@@ -789,7 +986,7 @@ def launch_gluon_qsa_block_scores_gfx950(
         complete_blocks,
         page_size=page_size,
         out=out,
-        block_m=_SCORE_BLOCK_M if query.shape[0] >= _SCORE_LARGE_ROWS else 16,
+        **tile,
     )
 
 
@@ -837,6 +1034,7 @@ def launch_gluon_qsa_block_topk_select_gfx950(
     # Rows of up to GROUP * topk scores list every finite score, so the
     # list must hold them: its 4096 entries keep 64 spare slots.
     cap = max(_SELECT_LIST, 2 * topk)
+    warps = _SELECT_LARGE_WARPS if rows >= _SELECT_LARGE_ROWS else _SELECT_WARPS
     gluon_qsa_block_topk_select_gfx950[(rows,)](
         logits,
         lengths,
@@ -848,8 +1046,8 @@ def launch_gluon_qsa_block_topk_select_gfx950(
         HAS_LENGTHS=lengths is not None,
         TOPK=topk,
         GROUP=cap // (2 * topk),
-        LIST_VEC=cap // (64 * _SELECT_WARPS),
-        num_warps=_SELECT_WARPS,
+        LIST_VEC=cap // (64 * warps),
+        num_warps=warps,
         **extern_compile_options(),
     )
     return selected
@@ -910,7 +1108,7 @@ def launch_gluon_qsa_block_topk_stream_gfx950(
             complete_blocks[start:end],
             page_size=page_size,
             out=scores[: end - start],
-            block_m=_SCORE_BLOCK_M,
+            **_large_score_tile(query.shape[1]),
         )
         launch_gluon_qsa_block_topk_select_gfx950(
             chunk,

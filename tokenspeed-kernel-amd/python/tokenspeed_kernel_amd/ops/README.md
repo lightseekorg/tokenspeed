@@ -1418,46 +1418,75 @@ increasing order rather than by score.
 - `gluon_qsa_block_scores_gfx950` writes `sum_h relu(q_h . k)` for each valid
   compressed block below each row's `complete_blocks`, leaving the tail
   unwritten. Each request run stops at its current maximum frontier.
-  A program owns 16 query rows (prefill) or 4 rows (decode) whose index heads
-  form the 64- or 16-row MFMA M dimension, and loops over its share of
-  128-block tiles, gathering the next tile's keys and the page ids of the one
-  after while scoring the current tile. Programs go round-robin to the eight
-  XCDs, so a split's key tiles are read by the programs of one XCD and stay in
-  its L2. Rows of one request are contiguous; a tile spanning requests scores
-  one request run at a time, so ragged batches need no query grouping. Keys
-  are gathered with 64-bit pointers (the compressed cache may exceed 2 GiB).
-  Page ids, request ids and complete-block counts accept int32 or int64.
-  Query and page-table buffers must fit within 2 GiB; their buffer-load
-  offsets remain 32-bit.
+  A program owns 16 query rows (batches of 512 rows or more), 4 rows
+  (smaller batches) or 1 row (smaller batches of one row per request, with
+  zero heads filling the 16 MFMA rows) whose index heads form the MFMA M
+  dimension, and loops over its share of 128-block tiles. Scores do not
+  depend on the tile: a row's heads are summed within the lane in a fixed
+  order.
+  - Programs go round-robin to the eight XCDs, so a split's key tiles are
+    read by the programs of one XCD and stay in its L2. Rows of one request
+    are contiguous; a tile spanning requests scores one request run at a
+    time, so ragged batches need no query grouping.
+  - A program stages the cache slots of its next 4 (16 for large batches)
+    tiles in LDS, then copies each tile's keys straight to LDS with
+    asynchronous 16-byte copies (XOR-swizzled rows), one tile ahead of the
+    MFMA. Copies are unmasked: dead slots read slot 0 and their scores are
+    never stored, which keeps the vector-memory wait counts static.
+  - A tile's scores are stored one iteration late, right after the next
+    tile's copy wait. The wait counts only the copies, so a store issued
+    between a copy and its wait would have to complete with it; gfx950
+    counts stores and loads on one counter. Stores are masked buffer stores
+    (no branches) from the tile's first row.
+  - Decode batches read each request's keys once and run at 4.3-4.5 TB/s
+    from bs 32 (90K contexts). Prefill batches are bound by the FP32 score
+    stores and the store/copy interplay above: 8192 rows over 16K blocks take
+    ~340 us against ~110 us to write the scores.
+  - Keys are gathered with 64-bit pointers (the compressed cache may exceed
+    2 GiB) from 32-bit slot ids; key rows must be 16-byte aligned. Page ids,
+    request ids and complete-block counts accept int32 or int64. Query and
+    page-table buffers must fit within 2 GiB; their buffer-load offsets
+    remain 32-bit, as do a tile's score-store offsets.
 - `gluon_qsa_block_topk_select_gfx950` selects the `topk` largest finite
-  scores of a row in one 8-warp program. Its cost follows the per-score
+  scores of a row in one program (8 warps; 4 for batches of 1024 rows or
+  more, which keeps more rows in flight). Its cost follows the per-score
   instruction count, so each full-row pass is kept short:
   1. Each lane's `GROUP` consecutive scores form a group (4 for top-512).
      The `topk`-th largest group maximum bounds the `topk`-th largest score
-     from below; an 11-bit LDS histogram of the group maxima finds the low
-     edge of its bucket.
+     from below; an LDS histogram of the group maxima finds the low edge of
+     its bucket. Buckets split the positive floats by the 11 bits below the
+     sign (1/8 octave): QSA scores are ReLU sums, and the sign bit would
+     waste half the buckets. Negative maxima share the last bucket with zero
+     and denormals, which then lists every finite score.
   2. The scores at or above that bound are compacted, in column order, into
-     a 4032-entry LDS list (typically `topk` plus a few hundred).
+     a 4032-entry LDS list (about 1.1-1.3K entries for top-512 of 16-22K real
+     scores; 1/4-octave buckets listed 1.6-2.5K and overflowed on a quarter
+     of the rows from random-token prompts).
   3. 8-bit radix passes over the list find the threshold, stopping once the
      bucket holding the `topk`-th score is taken whole. Digit searches stay
-     within a wave (DPP prefix sums), and masked-off lanes of the LDS
-     histograms and scatters write per-lane spare slots instead of branching.
+     within a wave (DPP prefix sums). Masked-off lanes of the LDS histograms
+     add zero to per-lane bins, and those of the list scatters write per-lane
+     spare slots, instead of branching.
   4. The ids above the threshold and the first ids equal to it are written in
      increasing column order (ties keep the smaller id, like the portable
      selection).
 
-  Rows whose candidates overflow the list (many equal scores) take four
+  The histograms take 16 KiB and the list 32 KiB of LDS, three programs per
+  CU. Rows whose candidates overflow the list (many equal scores) take four
   8-bit radix passes over the whole row instead. Rows of at most
   `GROUP * topk` scores list every finite score. `-inf` and NaN scores are
   never selected. Supplied per-row lengths bound every load (a buffer
   descriptor sized to the live prefix); columns beyond them may be
   uninitialized. Passing `None` scans the full score row. No constexpr
-  depends on the score width or the batch.
+  depends on the score width; the batch picks one of two warp counts.
 - `launch_gluon_qsa_block_topk_stream_gfx950` (the `qsa_block_topk_stream`
   registration) scores and selects row chunks whose FP32 scores fit
   `max_partial_bytes`, reusing one scratch buffer, so it selects exactly what
   the two kernels above select over all rows. Chunks use the 16-row score
-  tile. A budget below one row of scores is an error.
+  tile. A budget below one row of scores is an error. Small chunks leave the
+  GPU partly idle: 8192 rows over 16K blocks take ~840 us in 512-row chunks
+  (the runtime's 32 MiB budget) and ~630 us as one score and one select
+  launch (the `logits` path, ~0.5 GiB of scores).
 
 ### gfx1250 MLA decode
 

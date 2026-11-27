@@ -100,9 +100,8 @@ if current_platform().is_amd:
         queries_per_request: int | None,
         enable_pdl: bool,
     ) -> torch.Tensor:
-        # The kernel finds each tile's request runs itself, and GFX950 has no
-        # programmatic dependent launch.
-        del queries_per_request, enable_pdl
+        # GFX950 has no programmatic dependent launch.
+        del enable_pdl
         return launch_gluon_qsa_block_scores_gfx950(
             query,
             key_cache,
@@ -110,6 +109,7 @@ if current_platform().is_amd:
             request_indices,
             complete_blocks,
             page_size=page_size,
+            queries_per_request=queries_per_request,
         )
 
     @register_kernel(
