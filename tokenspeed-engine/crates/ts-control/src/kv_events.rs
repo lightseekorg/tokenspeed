@@ -174,6 +174,7 @@ enum WireEvent<'a> {
 }
 
 struct StoredChain<'a> {
+    medium: KvEventMedium,
     parent: Option<u64>,
     block_size: i32,
     hashes: Vec<u64>,
@@ -209,13 +210,18 @@ fn is_coalesceable_store(event: &KvEvent<'_>) -> bool {
 ///
 /// Strict invariants preserved:
 /// - Never reorders across contiguous `Removed` / `Stored` phase boundaries.
-/// - Within a contiguous `Removed` phase, groups by medium in `Disk -> Host -> Device`
-///   order while preserving exact per-medium leaf-first order, chunked to `max_blocks`.
-/// - Within a contiguous `Stored` phase, groups by medium in `Device -> Host -> Disk`
-///   order and merges only strictly linear `parent -> child` chains with identical
-///   positive `block_size`, exact `block_hashes.len() * block_size == token_ids.len()`,
-///   and zero duplicate/self-referencing hashes (branching and short tail blocks start
-///   or remain separate events, preserving topological parent-first order).
+/// - Within a contiguous `Removed` phase, merges only contiguous same-medium
+///   runs (chunked to `max_blocks`), strictly preserving the scheduler's
+///   depth-primary leaf-first ordering (`(depth DESC, medium DESC)`) even in
+///   multi-tier batches.
+/// - Within a contiguous `Stored` phase, scans in native order and emits
+///   same-medium linear `parent -> child` chains ordered by each chain's first
+///   event's native index. Because every parent's store natively precedes its
+///   child's (`(depth ASC, medium ASC)`), the parent's chain always starts
+///   strictly earlier and is emitted first even when parent and child reside on
+///   different media (e.g. `Device -> Disk -> Host`). Only events with
+///   identical positive `block_size`, exact `block_hashes.len() * block_size
+///   == token_ids.len()`, and zero duplicate/self-referencing hashes merge.
 fn coalesce_wire_events<'a>(raw: &[KvEvent<'a>], max_blocks: usize) -> Vec<WireEvent<'a>> {
     let mut out = Vec::new();
     let mut idx = 0;
@@ -228,29 +234,26 @@ fn coalesce_wire_events<'a>(raw: &[KvEvent<'a>], max_blocks: usize) -> Vec<WireE
         let segment = &raw[seg_start..idx];
 
         if !is_stored {
-            let mut by_medium: [Vec<u64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-            let mut empty_media: [usize; 3] = [0; 3];
-            for ev in segment {
-                let slot = medium_slot(ev.medium);
-                if ev.block_hashes.is_empty() {
-                    empty_media[slot] += 1;
-                } else {
-                    by_medium[slot].extend_from_slice(ev.block_hashes);
-                }
-            }
-            for medium in [
-                KvEventMedium::Disk,
-                KvEventMedium::Host,
-                KvEventMedium::Device,
-            ] {
-                let slot = medium_slot(medium);
-                for _ in 0..empty_media[slot] {
+            let mut run_idx = 0;
+            while run_idx < segment.len() {
+                let medium = segment[run_idx].medium;
+                if segment[run_idx].block_hashes.is_empty() {
                     out.push(WireEvent::Removed {
                         medium,
                         hashes: Vec::new(),
                     });
+                    run_idx += 1;
+                    continue;
                 }
-                for chunk in by_medium[slot].chunks(max_blocks) {
+                let mut hashes = Vec::new();
+                while run_idx < segment.len()
+                    && segment[run_idx].medium == medium
+                    && !segment[run_idx].block_hashes.is_empty()
+                {
+                    hashes.extend_from_slice(segment[run_idx].block_hashes);
+                    run_idx += 1;
+                }
+                for chunk in hashes.chunks(max_blocks) {
                     out.push(WireEvent::Removed {
                         medium,
                         hashes: chunk.to_vec(),
@@ -260,85 +263,73 @@ fn coalesce_wire_events<'a>(raw: &[KvEvent<'a>], max_blocks: usize) -> Vec<WireE
             continue;
         }
 
-        let mut by_medium: [Vec<&KvEvent<'a>>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut chains: Vec<StoredChain<'a>> = Vec::new();
+        let mut open_tail: HashMap<(usize, u64), usize> = HashMap::new();
+
         for ev in segment {
-            by_medium[medium_slot(ev.medium)].push(ev);
-        }
-        for medium in [
-            KvEventMedium::Device,
-            KvEventMedium::Host,
-            KvEventMedium::Disk,
-        ] {
-            let events_in_medium = &by_medium[medium_slot(medium)];
-            if events_in_medium.is_empty() {
-                continue;
-            }
-            let mut chains: Vec<StoredChain<'a>> = Vec::new();
-            let mut open_tail: HashMap<u64, usize> = HashMap::new();
+            let slot = medium_slot(ev.medium);
+            let parent = ev.has_parent.then_some(ev.parent_block_hash);
+            let coalesceable = is_coalesceable_store(ev);
+            let merged_into = if coalesceable {
+                parent
+                    .and_then(|p| open_tail.get(&(slot, p)).copied())
+                    .filter(|&chain_idx| {
+                        let chain = &chains[chain_idx];
+                        chain.block_size == ev.block_size
+                            && chain.hashes.len() + ev.block_hashes.len() <= max_blocks
+                            && ev.block_hashes.iter().all(|h| !chain.seen.contains(h))
+                    })
+            } else {
+                None
+            };
 
-            for &&ev in events_in_medium {
-                let parent = ev.has_parent.then_some(ev.parent_block_hash);
-                let coalesceable = is_coalesceable_store(&ev);
-                let merged_into = if coalesceable {
-                    parent
-                        .and_then(|p| open_tail.get(&p).copied())
-                        .filter(|&chain_idx| {
-                            let chain = &chains[chain_idx];
-                            chain.block_size == ev.block_size
-                                && chain.hashes.len() + ev.block_hashes.len() <= max_blocks
-                                && ev.block_hashes.iter().all(|h| !chain.seen.contains(h))
-                        })
-                } else {
-                    None
-                };
-
-                if let Some(chain_idx) = merged_into {
-                    let parent_hash = parent.expect("matched parent exists");
-                    open_tail.remove(&parent_hash);
-                    let chain = &mut chains[chain_idx];
-                    chain.hashes.extend_from_slice(ev.block_hashes);
-                    chain.seen.extend(ev.block_hashes.iter().copied());
-                    chain.token_slices.push(ev.token_ids);
-                    chain.total_tokens += ev.token_ids.len();
-                    if chain.hashes.len() < max_blocks {
-                        let new_tail = *chain.hashes.last().expect("non-empty chain");
-                        open_tail.entry(new_tail).or_insert(chain_idx);
+            if let Some(chain_idx) = merged_into {
+                let parent_hash = parent.expect("matched parent exists");
+                open_tail.remove(&(slot, parent_hash));
+                let chain = &mut chains[chain_idx];
+                chain.hashes.extend_from_slice(ev.block_hashes);
+                chain.seen.extend(ev.block_hashes.iter().copied());
+                chain.token_slices.push(ev.token_ids);
+                chain.total_tokens += ev.token_ids.len();
+                if chain.hashes.len() < max_blocks {
+                    let new_tail = *chain.hashes.last().expect("non-empty chain");
+                    open_tail.entry((slot, new_tail)).or_insert(chain_idx);
+                }
+            } else {
+                let mut seen = HashSet::new();
+                if coalesceable {
+                    seen.reserve(ev.block_hashes.len() + usize::from(parent.is_some()));
+                    if let Some(p) = parent {
+                        seen.insert(p);
                     }
-                } else {
-                    let mut seen = HashSet::new();
-                    if coalesceable {
-                        seen.reserve(ev.block_hashes.len() + usize::from(parent.is_some()));
-                        if let Some(p) = parent {
-                            seen.insert(p);
-                        }
-                        seen.extend(ev.block_hashes.iter().copied());
-                    }
-                    let chain_idx = chains.len();
-                    chains.push(StoredChain {
-                        parent,
-                        block_size: ev.block_size,
-                        hashes: ev.block_hashes.to_vec(),
-                        token_slices: vec![ev.token_ids],
-                        total_tokens: ev.token_ids.len(),
-                        seen,
-                    });
-                    if coalesceable && ev.block_hashes.len() < max_blocks {
-                        let tail = *ev.block_hashes.last().expect("non-empty store");
-                        open_tail.entry(tail).or_insert(chain_idx);
-                    }
+                    seen.extend(ev.block_hashes.iter().copied());
+                }
+                let chain_idx = chains.len();
+                chains.push(StoredChain {
+                    medium: ev.medium,
+                    parent,
+                    block_size: ev.block_size,
+                    hashes: ev.block_hashes.to_vec(),
+                    token_slices: vec![ev.token_ids],
+                    total_tokens: ev.token_ids.len(),
+                    seen,
+                });
+                if coalesceable && ev.block_hashes.len() < max_blocks {
+                    let tail = *ev.block_hashes.last().expect("non-empty store");
+                    open_tail.entry((slot, tail)).or_insert(chain_idx);
                 }
             }
+        }
 
-            for chain in chains {
-                out.push(WireEvent::Stored {
-                    medium,
-                    parent: chain.parent,
-                    block_size: chain.block_size,
-                    hashes: chain.hashes,
-                    token_slices: chain.token_slices,
-                    total_tokens: chain.total_tokens,
-                });
-            }
+        for chain in chains {
+            out.push(WireEvent::Stored {
+                medium: chain.medium,
+                parent: chain.parent,
+                block_size: chain.block_size,
+                hashes: chain.hashes,
+                token_slices: chain.token_slices,
+                total_tokens: chain.total_tokens,
+            });
         }
     }
     out
@@ -858,33 +849,36 @@ mod tests {
         let raw: Vec<_> = batch.iter().collect();
         let coalesced = coalesce_wire_events(&raw, 128);
 
-        // Expect 3 Removed (Disk, Host, Device) + 5 Stored:
-        //   Device: [10,11,12] (parent=None), [20,21] (parent=None), [32] (parent=11)
-        //   Host:   [10,11] (parent=None)
-        //   Disk:   [12] (parent=11)
-        assert_eq!(coalesced.len(), 8);
-        match &coalesced[0] {
-            WireEvent::Removed { medium, hashes } => {
-                assert_eq!(*medium, KvEventMedium::Disk);
-                assert_eq!(hashes, &[92, 91]);
-            }
-            _ => panic!("expected Disk removal first"),
-        }
-        match &coalesced[1] {
-            WireEvent::Removed { medium, hashes } => {
-                assert_eq!(*medium, KvEventMedium::Host);
-                assert_eq!(hashes, &[92, 91]);
-            }
-            _ => panic!("expected Host removal second"),
-        }
-        match &coalesced[2] {
-            WireEvent::Removed { medium, hashes } => {
-                assert_eq!(*medium, KvEventMedium::Device);
-                assert_eq!(hashes, &[90]);
-            }
-            _ => panic!("expected Device removal third"),
-        }
-        match &coalesced[3] {
+        // Expect 5 Removed (preserving exact leaf-first depth ordering across alternating media:
+        //   92(Disk), 92(Host), 91(Disk), 91(Host), 90(Device))
+        // + 5 Stored chains in first-event native order:
+        //   Device: [10,11,12] (parent=None),
+        //   Host:   [10,11] (parent=None),
+        //   Device: [20,21] (parent=None),
+        //   Disk:   [12] (parent=11),
+        //   Device: [32] (parent=11).
+        assert_eq!(coalesced.len(), 10);
+        assert!(matches!(
+            &coalesced[0],
+            WireEvent::Removed { medium: KvEventMedium::Disk, hashes } if hashes == &[92]
+        ));
+        assert!(matches!(
+            &coalesced[1],
+            WireEvent::Removed { medium: KvEventMedium::Host, hashes } if hashes == &[92]
+        ));
+        assert!(matches!(
+            &coalesced[2],
+            WireEvent::Removed { medium: KvEventMedium::Disk, hashes } if hashes == &[91]
+        ));
+        assert!(matches!(
+            &coalesced[3],
+            WireEvent::Removed { medium: KvEventMedium::Host, hashes } if hashes == &[91]
+        ));
+        assert!(matches!(
+            &coalesced[4],
+            WireEvent::Removed { medium: KvEventMedium::Device, hashes } if hashes == &[90]
+        ));
+        match &coalesced[5] {
             WireEvent::Stored {
                 medium,
                 parent,
@@ -898,32 +892,6 @@ mod tests {
                 assert_eq!(*total_tokens, 6);
             }
             _ => panic!("expected Device chain 1"),
-        }
-        match &coalesced[4] {
-            WireEvent::Stored {
-                medium,
-                parent,
-                hashes,
-                ..
-            } => {
-                assert_eq!(*medium, KvEventMedium::Device);
-                assert_eq!(*parent, None);
-                assert_eq!(hashes, &[20, 21]);
-            }
-            _ => panic!("expected Device chain 2"),
-        }
-        match &coalesced[5] {
-            WireEvent::Stored {
-                medium,
-                parent,
-                hashes,
-                ..
-            } => {
-                assert_eq!(*medium, KvEventMedium::Device);
-                assert_eq!(*parent, Some(11));
-                assert_eq!(hashes, &[32]);
-            }
-            _ => panic!("expected Device branch after parent chain"),
         }
         match &coalesced[6] {
             WireEvent::Stored {
@@ -945,11 +913,119 @@ mod tests {
                 hashes,
                 ..
             } => {
+                assert_eq!(*medium, KvEventMedium::Device);
+                assert_eq!(*parent, None);
+                assert_eq!(hashes, &[20, 21]);
+            }
+            _ => panic!("expected Device chain 2"),
+        }
+        match &coalesced[8] {
+            WireEvent::Stored {
+                medium,
+                parent,
+                hashes,
+                ..
+            } => {
                 assert_eq!(*medium, KvEventMedium::Disk);
                 assert_eq!(*parent, Some(11));
                 assert_eq!(hashes, &[12]);
             }
             _ => panic!("expected Disk continuation"),
+        }
+        match &coalesced[9] {
+            WireEvent::Stored {
+                medium,
+                parent,
+                hashes,
+                ..
+            } => {
+                assert_eq!(*medium, KvEventMedium::Device);
+                assert_eq!(*parent, Some(11));
+                assert_eq!(hashes, &[32]);
+            }
+            _ => panic!("expected Device branch after parent chain"),
+        }
+    }
+
+    #[test]
+    fn preserves_multi_tier_parent_first_and_leaf_first_ordering() {
+        use ts_scheduler::KvEventView;
+        let store = |h, parent: Option<u64>, medium| KvEventView {
+            stored: true,
+            block_hashes: vec![h],
+            has_parent: parent.is_some(),
+            parent_block_hash: parent.unwrap_or(0),
+            token_ids: vec![h as i32, (h + 1000) as i32],
+            block_size: 2,
+            medium,
+        };
+        let remove = |h, medium| KvEventView {
+            stored: false,
+            block_hashes: vec![h],
+            has_parent: false,
+            parent_block_hash: 0,
+            token_ids: Vec::new(),
+            block_size: 0,
+            medium,
+        };
+
+        // Regression test for cross-medium depth-primary ordering:
+        // 1) Removed (leaf-first): deeper Device children (202, 201) coalesce as a contiguous
+        //    same-medium run and precede shallower Disk parent (200) — never inverted.
+        // 2) Stored (parent-first): Device grandparent G(100) -> Disk-only parent P(101, parent=100)
+        //    -> Host-only children C1(102, parent=101) -> C2(103, parent=102).
+        //    P(Disk) MUST precede [C1, C2](Host) on the wire while C1->C2 still coalesces.
+        let views = vec![
+            remove(202, 0),
+            remove(201, 0),
+            remove(200, 2),
+            store(100, None, 0),
+            store(101, Some(100), 2),
+            store(102, Some(101), 1),
+            store(103, Some(102), 1),
+        ];
+        let batch = KvEventBatch::from_events(&views);
+        let raw: Vec<_> = batch.iter().collect();
+        let coalesced = coalesce_wire_events(&raw, 128);
+
+        assert_eq!(coalesced.len(), 5);
+        assert!(matches!(
+            &coalesced[0],
+            WireEvent::Removed { medium: KvEventMedium::Device, hashes } if hashes == &[202, 201]
+        ));
+        assert!(matches!(
+            &coalesced[1],
+            WireEvent::Removed { medium: KvEventMedium::Disk, hashes } if hashes == &[200]
+        ));
+        assert!(matches!(
+            &coalesced[2],
+            WireEvent::Stored { medium: KvEventMedium::Device, parent: None, hashes, .. }
+                if hashes == &[100]
+        ));
+        assert!(matches!(
+            &coalesced[3],
+            WireEvent::Stored { medium: KvEventMedium::Disk, parent: Some(100), hashes, .. }
+                if hashes == &[101]
+        ));
+        assert!(matches!(
+            &coalesced[4],
+            WireEvent::Stored { medium: KvEventMedium::Host, parent: Some(101), hashes, .. }
+                if hashes == &[102, 103]
+        ));
+
+        // Verify sequential consumer invariant: every stored event's parent is already known.
+        let mut known = HashSet::new();
+        for ev in &coalesced {
+            if let WireEvent::Stored { parent, hashes, .. } = ev {
+                if let Some(p) = parent {
+                    assert!(
+                        known.contains(p),
+                        "parent {p} must be stored before child {:?}",
+                        hashes
+                    );
+                }
+                known.extend(hashes.iter().copied());
+            }
         }
     }
 

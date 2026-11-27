@@ -496,21 +496,25 @@ struct Shared {
     incast: IncastConfig,
 }
 
-const DEFAULT_INCAST_PACE_GBPS: f64 = 6.0;
+/// Default RoCE many-to-one pacing target in gigabytes per second (GB/s = 1e9
+/// bytes/s; 6.0 GB/s ≈ 48 Gb/s on a 100 Gb/s RoCE NIC).
+const DEFAULT_INCAST_PACE_GBYTES_PER_SEC: f64 = 6.0;
 const DEFAULT_INCAST_MIN_STAGGER_US: u64 = 2_000;
 const MAX_INCAST_PER_RANK_US: u64 = 50_000;
 const INCAST_SLEEP_SLICE: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, Copy)]
 struct IncastConfig {
-    pace_gbps_override: Option<f64>,
+    /// Optional pacing rate override in GB/s (gigabytes per second, 1e9 bytes/s).
+    /// `Some(0.0)` disables pacing; `None` uses `DEFAULT_INCAST_PACE_GBYTES_PER_SEC` on RoCE.
+    pace_gbytes_per_sec_override: Option<f64>,
     min_stagger_us: u64,
 }
 
 impl Default for IncastConfig {
     fn default() -> Self {
         Self {
-            pace_gbps_override: None,
+            pace_gbytes_per_sec_override: None,
             min_stagger_us: DEFAULT_INCAST_MIN_STAGGER_US,
         }
     }
@@ -518,20 +522,20 @@ impl Default for IncastConfig {
 
 impl IncastConfig {
     fn parse_values(
-        pace_gbps_raw: Option<&str>,
+        pace_gbytes_per_sec_raw: Option<&str>,
         min_stagger_us_raw: Option<&str>,
     ) -> Result<Self, String> {
-        let pace_gbps_override = match pace_gbps_raw {
+        let pace_gbytes_per_sec_override = match pace_gbytes_per_sec_raw {
             None => None,
             Some(raw) => {
                 let parsed = raw.trim().parse::<f64>().map_err(|_| {
                     format!(
-                        "TOKENSPEED_PD_INCAST_PACE_GBPS must be a non-negative finite number (0 disables), got {raw:?}"
+                        "TOKENSPEED_PD_INCAST_PACE_GBYTES_PER_SEC must be a non-negative finite number in GB/s (gigabytes per second, 1e9 bytes/s; 0 disables), got {raw:?}"
                     )
                 })?;
                 if !parsed.is_finite() || parsed < 0.0 {
                     return Err(format!(
-                        "TOKENSPEED_PD_INCAST_PACE_GBPS must be a non-negative finite number (0 disables), got {raw:?}"
+                        "TOKENSPEED_PD_INCAST_PACE_GBYTES_PER_SEC must be a non-negative finite number in GB/s (gigabytes per second, 1e9 bytes/s; 0 disables), got {raw:?}"
                     ));
                 }
                 Some(parsed)
@@ -554,18 +558,18 @@ impl IncastConfig {
             }
         };
         Ok(Self {
-            pace_gbps_override,
+            pace_gbytes_per_sec_override,
             min_stagger_us,
         })
     }
 
     fn from_env() -> Result<Self, StartError> {
-        let pace_raw = match std::env::var("TOKENSPEED_PD_INCAST_PACE_GBPS") {
+        let pace_raw = match std::env::var("TOKENSPEED_PD_INCAST_PACE_GBYTES_PER_SEC") {
             Ok(v) => Some(v),
             Err(std::env::VarError::NotPresent) => None,
             Err(error) => {
                 return Err(StartError::Config(format!(
-                    "TOKENSPEED_PD_INCAST_PACE_GBPS: {error}"
+                    "TOKENSPEED_PD_INCAST_PACE_GBYTES_PER_SEC: {error}"
                 )))
             }
         };
@@ -589,7 +593,8 @@ impl IncastConfig {
 /// Applied once per room in `transfer_full` (skipped on `transfer_layerwise`,
 /// where producer-step pacing already spreads writes across intervals).
 /// Strictly disabled by default on lossless InfiniBand and non-RoCE transports
-/// unless explicitly enabled via `TOKENSPEED_PD_INCAST_PACE_GBPS`.
+/// unless explicitly enabled via `TOKENSPEED_PD_INCAST_PACE_GBYTES_PER_SEC`
+/// (in GB/s = 1e9 bytes/s).
 fn compute_pd_incast_stagger<'a>(
     room: u64,
     tp_rank: i64,
@@ -599,17 +604,21 @@ fn compute_pd_incast_stagger<'a>(
     is_roce: bool,
     cfg: IncastConfig,
 ) -> Duration {
-    let pace_gbps = match cfg.pace_gbps_override {
+    let pace_gbytes_per_sec = match cfg.pace_gbytes_per_sec_override {
         Some(v) => v,
         None => {
             if is_roce {
-                DEFAULT_INCAST_PACE_GBPS
+                DEFAULT_INCAST_PACE_GBYTES_PER_SEC
             } else {
                 0.0
             }
         }
     };
-    if !pace_gbps.is_finite() || pace_gbps <= 0.0 || dst_tp <= 0 || src_tp <= dst_tp {
+    if !pace_gbytes_per_sec.is_finite()
+        || pace_gbytes_per_sec <= 0.0
+        || dst_tp <= 0
+        || src_tp <= dst_tp
+    {
         return Duration::ZERO;
     }
     let fanin = src_tp / dst_tp;
@@ -631,8 +640,8 @@ fn compute_pd_incast_stagger<'a>(
     if total_bytes < 262_144 && total_spans < 256 {
         return Duration::ZERO;
     }
-    // bytes / (GB/s * 1e3) == microseconds at `pace_gbps` GB/s.
-    let bw_us = ((total_bytes as f64) / (pace_gbps * 1_000.0)) as u64;
+    // bytes / (GB/s * 1e3) == microseconds at `pace_gbytes_per_sec` GB/s (1e9 bytes/s).
+    let bw_us = ((total_bytes as f64) / (pace_gbytes_per_sec * 1_000.0)) as u64;
     let per_rank_us = bw_us
         .max(cfg.min_stagger_us.min(MAX_INCAST_PER_RANK_US))
         .min(MAX_INCAST_PER_RANK_US);
@@ -2838,7 +2847,7 @@ mod tests {
     #[test]
     fn pd_incast_stagger_only_applies_to_roce_many_to_one_transfers() {
         let default_cfg = IncastConfig {
-            pace_gbps_override: None,
+            pace_gbytes_per_sec_override: None,
             min_stagger_us: DEFAULT_INCAST_MIN_STAGGER_US,
         };
         let big_span = Copy::Spans {
@@ -2930,7 +2939,7 @@ mod tests {
         );
         // Explicit override 0 disables even on RoCE; explicit >0 enables even on non-RoCE.
         let disabled = IncastConfig {
-            pace_gbps_override: Some(0.0),
+            pace_gbytes_per_sec_override: Some(0.0),
             min_stagger_us: DEFAULT_INCAST_MIN_STAGGER_US,
         };
         assert_eq!(
@@ -2938,7 +2947,7 @@ mod tests {
             Duration::ZERO
         );
         let forced = IncastConfig {
-            pace_gbps_override: Some(20.0),
+            pace_gbytes_per_sec_override: Some(20.0),
             min_stagger_us: 1_000,
         };
         assert_eq!(
@@ -2950,15 +2959,15 @@ mod tests {
     #[test]
     fn incast_config_rejects_malformed_and_out_of_range_values() {
         let default = IncastConfig::parse_values(None, None).unwrap();
-        assert_eq!(default.pace_gbps_override, None);
+        assert_eq!(default.pace_gbytes_per_sec_override, None);
         assert_eq!(default.min_stagger_us, DEFAULT_INCAST_MIN_STAGGER_US);
 
         let disabled = IncastConfig::parse_values(Some("0"), Some("0")).unwrap();
-        assert_eq!(disabled.pace_gbps_override, Some(0.0));
+        assert_eq!(disabled.pace_gbytes_per_sec_override, Some(0.0));
         assert_eq!(disabled.min_stagger_us, 0);
 
         let custom = IncastConfig::parse_values(Some("8.5"), Some("3000")).unwrap();
-        assert_eq!(custom.pace_gbps_override, Some(8.5));
+        assert_eq!(custom.pace_gbytes_per_sec_override, Some(8.5));
         assert_eq!(custom.min_stagger_us, 3_000);
 
         assert!(IncastConfig::parse_values(Some("6,0"), None).is_err());
