@@ -28,10 +28,14 @@ harness passes for its checkpoint and kernel selection.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tokenspeed.runtime.configs.model_profile import ModelProfile
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -49,6 +53,158 @@ BITWISE_ENVELOPES = {"rl-bitwise"}
 _PLUGIN_ENVELOPES: dict[
     str, tuple[Callable[[ServerArgs], None], Callable[..., None]]
 ] = {}
+
+
+class RLCheckpointValidator(Protocol):
+    """Check checkpoint storage; returning accepts it and raising rejects it."""
+
+    def __call__(
+        self, *, quantization: str | None, vocab_size: int, architecture: str
+    ) -> None:
+        """Validate checkpoint storage; return None to accept or raise to reject."""
+        ...
+
+
+@dataclass(frozen=True, kw_only=True)
+class RLNumericsPolicy:
+    """A model's implementation of the common ``rl-bitwise`` contract.
+
+    Attributes:
+        resolve: Called for the target model before workers and process groups
+            start, with the shared ``ServerArgs``. A draft does not run its
+            own resolver against that shared launch.
+        validate: Called after profile admission for target and draft alike,
+            with keyword arguments ``quantization`` (resolved storage format,
+            or None), ``vocab_size`` (actual vocabulary size), and
+            ``architecture`` (the loader's selected model name). Returning
+            accepts storage; raising rejects it. Validation must stand alone:
+            it cannot assume its paired resolver ran for a draft. A model's
+            ``configure_attention`` hook owns launch/role-dependent limits.
+
+    Registration is not evidence of numerical correctness or alignment;
+    qualification covers each supported target/draft deployment together.
+    """
+
+    resolve: Callable[[ServerArgs], None]
+    validate: RLCheckpointValidator
+
+    def __post_init__(self) -> None:
+        if not callable(self.resolve) or not callable(self.validate):
+            raise TypeError("RLNumericsPolicy callbacks must be callable")
+
+
+_MODEL_RL_POLICIES: dict[str, Callable[[PretrainedConfig], RLNumericsPolicy]] = {}
+
+
+def register_model_rl_numerics(
+    architecture: str,
+    factory: Callable[[PretrainedConfig], RLNumericsPolicy],
+) -> None:
+    """Register checkpoint-aware arithmetic for the shared RL contract.
+
+    Args:
+        architecture: The nonempty, unpadded model registration name used by
+            the loader.
+        factory: A callable receiving that model's checkpoint configuration
+            and returning an RLNumericsPolicy. It can return
+            STANDARD_RL_NUMERICS for variants using the standard arithmetic.
+
+    The model must still declare ``rl-bitwise`` in its verification profile.
+    A failed plugin load rolls this registration back too.
+
+    Raises:
+        TypeError: The architecture is not a string or the factory is not callable.
+        ValueError: The name is empty, padded, or already registered.
+    """
+    if not isinstance(architecture, str):
+        raise TypeError("A numerical policy architecture must be a string")
+    if not architecture or architecture != architecture.strip():
+        raise ValueError("A numerical policy needs a nonempty, unpadded architecture")
+    if not callable(factory):
+        raise TypeError("A numerical policy factory must be callable")
+    if architecture in _MODEL_RL_POLICIES:
+        raise ValueError(f"Numerical policy for {architecture!r} is already registered")
+    _MODEL_RL_POLICIES[architecture] = factory
+
+    def undo() -> None:
+        del _MODEL_RL_POLICIES[architecture]
+
+    from tokenspeed.runtime.plugins.registry import record_external
+
+    record_external("model numerical policy", architecture, undo)
+
+
+def model_rl_numerics(
+    architecture: str, hf_config: PretrainedConfig | None
+) -> RLNumericsPolicy:
+    """Select arithmetic for the architecture actually chosen by the loader.
+
+    Args:
+        architecture: The registered architecture selected for this model.
+        hf_config: Its checkpoint configuration. None is accepted only when
+            the architecture has no registered policy factory.
+
+    Returns:
+        STANDARD_RL_NUMERICS for an unregistered architecture, otherwise the
+        RLNumericsPolicy returned by that architecture's factory.
+
+    Raises:
+        ValueError: A registered factory needs checkpoint context but none was given.
+        TypeError: A factory returned something other than RLNumericsPolicy.
+    """
+    factory = _MODEL_RL_POLICIES.get(architecture)
+    if factory is None:
+        return STANDARD_RL_NUMERICS
+    if hf_config is None:
+        raise ValueError(
+            f"{architecture}'s numerical policy needs its checkpoint config"
+        )
+    policy = factory(hf_config)
+    if not isinstance(policy, RLNumericsPolicy):
+        raise TypeError(f"{architecture}'s policy factory must return RLNumericsPolicy")
+    return policy
+
+
+def launch_rl_numerics(server_args: ServerArgs) -> RLNumericsPolicy:
+    """Select the target policy without applying its resolver.
+
+    Args:
+        server_args: The launch arguments after plugin discovery. Model,
+            revision, download directory, and explicit HF overrides identify
+            the checkpoint metadata used to select its registered profile.
+
+    Returns:
+        The selected model policy after completing any deferred registration.
+        With no registered policy factories this returns STANDARD_RL_NUMERICS
+        without checkpoint IO. Otherwise it loads
+        checkpoint configuration and follows model-loader architecture order;
+        a checkpoint with no registered profile also selects the standard policy.
+    """
+    from tokenspeed.runtime.plugins import finish_headless_plugins
+
+    # Full registration may introduce policies or replace CLI registrations.
+    # Resolve against that final registry, including when CLI registered none.
+    finish_headless_plugins()
+    if not _MODEL_RL_POLICIES:
+        return STANDARD_RL_NUMERICS
+
+    from tokenspeed.runtime.plugins.registry import resolve_model_profile
+    from tokenspeed.runtime.utils.hf_transformers_utils import (
+        get_config,
+        model_loader_architectures,
+    )
+
+    hf_config = get_config(
+        server_args.model,
+        trust_remote_code=server_args.trust_remote_code,
+        revision=server_args.revision,
+        model_override_args=json.loads(server_args.hf_overrides),
+        download_dir=server_args.download_dir,
+    )
+    resolved = resolve_model_profile(model_loader_architectures(hf_config), hf_config)
+    if resolved is None:
+        return STANDARD_RL_NUMERICS
+    return model_rl_numerics(resolved[0], hf_config)
 
 
 def register_numerics_envelope(
@@ -89,9 +245,9 @@ def register_numerics_envelope(
 
 
 def resolve_numerics_envelope(server_args: ServerArgs) -> None:
-    """Resolve the built-in or registered policy after plugin discovery."""
+    """Resolve model-owned RL arithmetic or a registered legacy envelope."""
     if server_args.numerics == "rl-bitwise":
-        server_args._resolve_rl_bitwise()
+        launch_rl_numerics(server_args).resolve(server_args)
     elif server_args.numerics != "auto":
         _PLUGIN_ENVELOPES[server_args.numerics][0](server_args)
 
@@ -168,6 +324,7 @@ def require_verified_numerics(
     architecture: str,
     quantization: str | None,
     vocab_size: int,
+    hf_config: PretrainedConfig | None = None,
 ) -> None:
     """Refuse a model that the requested envelope has not been verified for.
 
@@ -175,15 +332,19 @@ def require_verified_numerics(
         numerics: The launch's ``--numerics`` envelope.
         model_profile: The model's registered profile, or None for an in-tree
             model (none of which is verified under an envelope beyond auto).
-        architecture: The model's architecture name, for the error.
+        architecture: The exact registered architecture selected by the loader,
+            used for policy selection and error context.
+        hf_config: Checkpoint metadata for a registered model policy. It may
+            be omitted when the supplied architecture has no registered policy.
         quantization: The checkpoint's resolved quantization method, or None.
-        vocab_size: The model's vocabulary size; the envelope's blockwise
-            logprobs fold fixed ``BLOCKWISE_VOCAB_BLOCK``-wide blocks of it.
+        vocab_size: The actual vocabulary size checked by the selected policy.
 
     Raises:
         ValueError: The envelope is not verified for this model, or its
-            checkpoint validator rejects the storage or vocabulary. The RL
-            policy requires unquantized weights and whole blockwise vocab blocks.
+            checkpoint validator rejects the storage or vocabulary. The
+            selected model policy owns checkpoint validation. The standard
+            policy requires unquantized
+            weights and whole blockwise vocabulary blocks.
     """
     if numerics == "auto":
         return
@@ -199,19 +360,35 @@ def require_verified_numerics(
     if numerics != "rl-bitwise":
         _PLUGIN_ENVELOPES[numerics][1](quantization=quantization, vocab_size=vocab_size)
         return
+    model_rl_numerics(architecture, hf_config).validate(
+        quantization=quantization, vocab_size=vocab_size, architecture=architecture
+    )
+
+
+def _validate_standard_rl_numerics(*, quantization, vocab_size, architecture):
     if quantization is not None:
         raise ValueError(
-            f"--numerics {numerics} serves unquantized checkpoints only: "
+            "--numerics rl-bitwise serves unquantized checkpoints only: "
             f"{architecture} is {quantization}-quantized, and no "
             "batch-invariant quantized GEMM leaf exists"
         )
     if vocab_size % BLOCKWISE_VOCAB_BLOCK != 0:
         raise ValueError(
-            f"--numerics {numerics} folds --logprob-order blockwise, whose "
+            "--numerics rl-bitwise folds --logprob-order blockwise, whose "
             f"sum(exp) runs over fixed {BLOCKWISE_VOCAB_BLOCK}-wide vocabulary "
             f"blocks; {architecture} has vocab_size {vocab_size}, not a "
             "multiple of it"
         )
+
+
+def _resolve_standard_rl_numerics(server_args: ServerArgs) -> None:
+    server_args._resolve_rl_bitwise()
+
+
+STANDARD_RL_NUMERICS = RLNumericsPolicy(
+    resolve=_resolve_standard_rl_numerics,
+    validate=_validate_standard_rl_numerics,
+)
 
 
 __all__ = [
@@ -231,5 +408,11 @@ __all__ = [
     "YARN_FREQUENCY_DEVICES",
     "require_verified_numerics",
     "register_numerics_envelope",
+    "register_model_rl_numerics",
+    "model_rl_numerics",
+    "launch_rl_numerics",
+    "RLNumericsPolicy",
+    "RLCheckpointValidator",
+    "STANDARD_RL_NUMERICS",
     "resolve_numerics_envelope",
 ]

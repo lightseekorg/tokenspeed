@@ -176,9 +176,13 @@ class ModelRunner:
         require_verified_numerics(
             server_args.numerics,
             model_profile=model_config.model_profile,
-            architecture=resolve_architecture(model_config.hf_config),
+            architecture=(
+                model_config.model_profile_architecture
+                or resolve_architecture(model_config.hf_config)
+            ),
             quantization=model_config.quantization,
             vocab_size=model_config.vocab_size,
+            hf_config=model_config.hf_config,
         )
 
         draft_moe_override = (
