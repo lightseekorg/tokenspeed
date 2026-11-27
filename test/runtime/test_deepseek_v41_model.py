@@ -675,7 +675,7 @@ def test_empty_decoder_rows_complete_hc_and_preserve_ep_participation(
         "supports_all_reduce_mhc_norm",
     ):
         monkeypatch.setattr(v41, name, forbidden)
-    residual, pre_out, pending_out, tap = layer(
+    residual, pre_out, pending_out, tap, prefetched = layer(
         hidden,
         pre,
         positions,
@@ -685,6 +685,7 @@ def test_empty_decoder_rows_complete_hc_and_preserve_ep_participation(
         allow_ffn_reduce_fusion=True,
         capture_input=True,
     )
+    assert prefetched is None
     assert residual.shape == (0, 4, config.hidden_size)
     assert pre_out.shape == (0, 4) and pending_out is None
     torch.testing.assert_close(tap, completed.mean(1) if tokens else hidden[:, 0, :])
@@ -950,13 +951,20 @@ def test_ordinary_dp_gathers_image_mask_with_activations(
     torch.testing.assert_close(actual, x + expected_mask[:3, None] * 8)
 
 
-def test_idle_model_calls_every_ep_layer_with_completed_empty_state(monkeypatch):
+@pytest.mark.parametrize("with_engram", [False, True])
+def test_idle_model_calls_every_ep_layer_with_completed_empty_state(
+    monkeypatch, with_engram
+):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     config = _config()
-    config.engram_layer_ids = []
+    if not with_engram:
+        config.engram_layer_ids = []
     model = DeepseekV41Model(
         config, _mapping(0, 1, 1), None, "model", False, "gpu", None
     )
+    if with_engram:
+        model.initialize_engram(_Tokenizer())
+    assert all(type(layer) is DeepseekV41DecoderLayer for layer in model.layers)
     model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=True))
     calls = []
     for layer in model.layers:
@@ -1865,7 +1873,7 @@ def test_cross_layer_reduction_uses_consumer_norm(monkeypatch, fusion, mode):
     def run():
         residual, pre, pending = initial, initial_pre, None
         for i, layer in enumerate(layers):
-            residual, pre, pending, tap = layer(
+            residual, pre, pending, tap, prefetched = layer(
                 residual,
                 pre,
                 positions,
@@ -1875,6 +1883,7 @@ def test_cross_layer_reduction_uses_consumer_norm(monkeypatch, fusion, mode):
                 allow_ffn_reduce_fusion=i == 0,
                 capture_input=i == 1,
             )
+            assert prefetched is None
         return pending.finish(residual), pre, tap
 
     admitted = mode.is_decode() and fusion != "unavailable"

@@ -486,7 +486,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
                 selection,
                 request_indices,
             )
-            h, pre_mix, pending_post, _ = layer(
+            h, pre_mix, pending_post, _, _ = layer(
                 h,
                 pre_mix,
                 positions,

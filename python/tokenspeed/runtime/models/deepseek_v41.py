@@ -2736,7 +2736,7 @@ class DeepseekV41Model(nn.Module):
                     if index in (self.ced_decoder_start, self.ced_decoder_start + 1):
                         counts = self.decoder_collective_counts(ctx, 0)
                     with report_collective_sizing(ctx, 0, counts):
-                        hidden, pre_mix, _, _ = layer(
+                        hidden, pre_mix, _, _, _ = layer(
                             hidden,
                             pre_mix,
                             positions,
