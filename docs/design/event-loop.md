@@ -930,6 +930,15 @@ registered, before CUDA capture begins. They keep their addresses and values
 across weights sleep/wake; the graph's private temporary buffers remain
 discardable under the separate `cuda_graph` tag.
 
+Models owning peer-sharded CUDA VMM storage outside PyTorch's ordinary caching
+allocator (such as peer-sharded Engram tables) implement `PeerStorageOwner`
+(`execution/peer_storage.py`). `DeviceHandle.release_weights` unmaps and frees
+their physical VMM handles while keeping their virtual addresses reserved (and
+backs up each peer's owned slice to CPU RAM under `cpu_backup`), `resume_weights`
+remaps and restores them at the exact same virtual addresses so captured graphs
+remain valid, `check_weight_update` refuses updates while released, and
+`shutdown_model` permanently closes the mappings after local readers drain.
+
 A resume containing NCCL uses the same-round operation gate: it waits until
 every attention-DP engine holds its resume before entering device collectives.
 For engines with DP projections, the NCCL release drops captured graphs before

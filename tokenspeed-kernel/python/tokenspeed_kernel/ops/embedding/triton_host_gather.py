@@ -67,8 +67,9 @@ _SORT_MIN_ROWS = 32768
 _ROWS_PER_PROGRAM = 4
 
 
-# The entry count varies per batch; keep it out of the specialization key.
-@triton.jit(do_not_specialize=["n_entries"])
+# Entry count and packed scale column stride vary per batch; keep both out of
+# the specialization key.
+@triton.jit(do_not_specialize=["n_entries", "scale_stride"])
 def _host_mxfp8_row_gather_kernel(
     table_ptr,
     ids_ptr,
@@ -82,16 +83,18 @@ def _host_mxfp8_row_gather_kernel(
     index_stride_token,
     index_stride_column,
     table_stride,
+    scale_stride,
     DIM: tl.constexpr,
     ROWS: tl.constexpr,
     SORTED: tl.constexpr,
+    PACKED_SCALES: tl.constexpr,
 ):
     # Each program handles ROWS lookup entries. An entry loads a packed
     # [codes | scales] row, rebuilds its FP32 values and quantizes them again
     # with the group-32 UE8M0 rule (1e-4 amax floor), as quantizing the
     # dequantized BF16 row would. SORTED entries come in table-row order and
     # only the first entry of each run of equal ids (head[e] == e) reads the
-    # host; it writes its output row dst[e], which
+    # table; it writes its output row dst[e], which
     # _copy_duplicate_rows_kernel then copies to the rest of the run.
     entry = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
     live = entry < n_entries
@@ -132,22 +135,35 @@ def _host_mxfp8_row_gather_kernel(
         tl.reshape(quantized.to(tl.uint8, bitcast=True), (ROWS, DIM)),
         mask=live[:, None],
     )
-    tl.store(
-        scales_ptr + dst[:, None] * (DIM // 32) + groups[None, :],
-        exponent.to(tl.uint8),
-        mask=live[:, None],
-    )
+    if PACKED_SCALES:
+        dst_token = dst // n_columns
+        dst_col = dst % n_columns
+        global_g = dst_col[:, None] * (DIM // 32) + groups[None, :]
+        word = global_g // 4
+        lane = global_g % 4
+        byte_offset = (word * scale_stride + dst_token[:, None]) * 4 + lane
+        scales_u8 = scales_ptr.to(tl.pointer_type(tl.uint8))
+        tl.store(scales_u8 + byte_offset, exponent.to(tl.uint8), mask=live[:, None])
+    else:
+        tl.store(
+            scales_ptr + dst[:, None] * (DIM // 32) + groups[None, :],
+            exponent.to(tl.uint8),
+            mask=live[:, None],
+        )
 
 
-@triton.jit(do_not_specialize=["n_entries"])
+@triton.jit(do_not_specialize=["n_entries", "scale_stride"])
 def _copy_duplicate_rows_kernel(
     dst_ptr,
     head_ptr,
     codes_ptr,
     scales_ptr,
     n_entries,
+    n_columns,
+    scale_stride,
     DIM: tl.constexpr,
     ROWS: tl.constexpr,
+    PACKED_SCALES: tl.constexpr,
 ):
     # Copy each sorted run's output row, written by its first entry, to the
     # output rows of the run's other entries.
@@ -165,15 +181,28 @@ def _copy_duplicate_rows_kernel(
     tl.store(
         codes_ptr + dst[:, None] * DIM + cols[None, :], codes, mask=duplicate[:, None]
     )
-    scales = tl.load(
-        scales_ptr + src[:, None] * (DIM // 32) + groups[None, :],
-        mask=duplicate[:, None],
-    )
-    tl.store(
-        scales_ptr + dst[:, None] * (DIM // 32) + groups[None, :],
-        scales,
-        mask=duplicate[:, None],
-    )
+    if PACKED_SCALES:
+        scales_u8 = scales_ptr.to(tl.pointer_type(tl.uint8))
+        src_token = src // n_columns
+        src_col = src % n_columns
+        src_g = src_col[:, None] * (DIM // 32) + groups[None, :]
+        src_off = ((src_g // 4) * scale_stride + src_token[:, None]) * 4 + (src_g % 4)
+        dst_token = dst // n_columns
+        dst_col = dst % n_columns
+        dst_g = dst_col[:, None] * (DIM // 32) + groups[None, :]
+        dst_off = ((dst_g // 4) * scale_stride + dst_token[:, None]) * 4 + (dst_g % 4)
+        scales = tl.load(scales_u8 + src_off, mask=duplicate[:, None])
+        tl.store(scales_u8 + dst_off, scales, mask=duplicate[:, None])
+    else:
+        scales = tl.load(
+            scales_ptr + src[:, None] * (DIM // 32) + groups[None, :],
+            mask=duplicate[:, None],
+        )
+        tl.store(
+            scales_ptr + dst[:, None] * (DIM // 32) + groups[None, :],
+            scales,
+            mask=duplicate[:, None],
+        )
 
 
 @register_kernel(
@@ -190,13 +219,18 @@ def triton_host_mxfp8_row_gather(
     indices: torch.Tensor,
     codes: torch.Tensor,
     scales: torch.Tensor,
+    *,
+    scale_layout: str,
 ) -> None:
     dim = table.shape[1] // 33 * 32
     entries = indices.shape[0] * indices.shape[1]
     if entries == 0:
         return
+    packed_scales = scale_layout == "packed"
+    scale_stride = scales.stride(1) if packed_scales else 0
     table_ptr = current_platform().device_visible_data_ptr(table)
     codes_bytes = codes.view(torch.uint8)
+    n_columns = indices.shape[1]
     if entries < _SORT_MIN_ROWS:
         _host_mxfp8_row_gather_kernel[(entries,)](
             table_ptr=table_ptr,
@@ -207,13 +241,15 @@ def triton_host_mxfp8_row_gather(
             scales_ptr=scales,
             n_entries=entries,
             n_rows=table.shape[0],
-            n_columns=indices.shape[1],
+            n_columns=n_columns,
             index_stride_token=indices.stride(0),
             index_stride_column=indices.stride(1),
             table_stride=table.stride(0),
+            scale_stride=scale_stride,
             DIM=dim,
             ROWS=1,
             SORTED=False,
+            PACKED_SCALES=packed_scales,
         )
         return
     # Everything below stays on the device: no host sync on the number of
@@ -233,13 +269,15 @@ def triton_host_mxfp8_row_gather(
         scales_ptr=scales,
         n_entries=entries,
         n_rows=table.shape[0],
-        n_columns=1,  # Column count and index strides are unused when sorted.
+        n_columns=n_columns,
         index_stride_token=1,
         index_stride_column=0,
         table_stride=table.stride(0),
+        scale_stride=scale_stride,
         DIM=dim,
         ROWS=_ROWS_PER_PROGRAM,
         SORTED=True,
+        PACKED_SCALES=packed_scales,
     )
     _copy_duplicate_rows_kernel[grid](
         dst,
@@ -247,8 +285,11 @@ def triton_host_mxfp8_row_gather(
         codes_bytes,
         scales,
         entries,
+        n_columns,
+        scale_stride,
         DIM=dim,
         ROWS=_ROWS_PER_PROGRAM,
+        PACKED_SCALES=packed_scales,
     )
 
 

@@ -770,8 +770,20 @@ class DummyModelLoader(BaseModelLoader):
             # same values again from the call after it, since its values depend
             # only on the seed, its size and its dtype. A parameter with a
             # dummy initializer takes the initializer's values for
-            # post-processing.
-            initialize_dummy_weights(model)
+            # post-processing. Peer VMM storage parameters (e.g. peer-sharded
+            # Engram tables) initialize only their local peer slice through
+            # dummy_initializer and must not be cast whole-table to FP16.
+            from tokenspeed.runtime.execution.peer_storage import PeerStorageOwner
+
+            peer_storage_ptrs: set[int] = set()
+            if isinstance(model, PeerStorageOwner):
+                peer_storage_ptrs = {
+                    p.data_ptr() for p in model.peer_storage_parameters() if p.numel()
+                }
+            initialize_dummy_weights(
+                model,
+                exclude_data_ptrs=peer_storage_ptrs or None,
+            )
             initialize_dummy_integer_weights(model)
             # An EAGLE3 draft cannot share a vocab-sharded target embedding,
             # and its own dummy embedding is as valid as a loaded one.
@@ -804,13 +816,16 @@ class DummyModelLoader(BaseModelLoader):
                 peer_weights_controller_for,
             )
 
-            exclude_data_ptrs: set[int] | None = None
+            exclude_data_ptrs: set[int] = set(peer_storage_ptrs)
             controller = peer_weights_controller_for(model)
             if controller is not None and controller.finalized:
-                exclude_data_ptrs = {
+                exclude_data_ptrs.update(
                     p.data_ptr() for p in controller.managed_parameters() if p.numel()
-                }
-            initialize_dummy_weights(model, exclude_data_ptrs=exclude_data_ptrs)
+                )
+            initialize_dummy_weights(
+                model,
+                exclude_data_ptrs=exclude_data_ptrs or None,
+            )
         return model.eval()
 
 

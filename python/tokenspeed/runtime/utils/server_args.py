@@ -786,12 +786,18 @@ class ServerArgs:
     deepseek_v41_indexer_query_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
-    # DeepSeek V4.1 Engram host tables. Off by default (GPU-sharded).
+    # DeepSeek V4.1 Engram host / peer-sharded GPU tables. Off by default
+    # (attention-TP GPU-sharded).
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
     engram_host_table_alloc: str = "auto"
     engram_host_table_numa: str = "interleave"
+    engram_gpu_peer_sharded: bool = False
+    engram_gpu_peer_handle_type: str = "auto"
+    engram_peer_rendezvous: str | None = None
+    engram_peer_world_size: int | None = None
+    engram_peer_rank_offset: int | None = None
     # Run each decoder layer's small decode steps as one persistent
     # monokernel launch (DECODE_MONOKERNEL_ARCHITECTURES). Off by default.
     decode_monokernel: bool = False
@@ -1110,7 +1116,68 @@ class ServerArgs:
         self.validate_output_cumulative_probs()
         self.validate_dp_local_cuda_graph()
         self.validate_dsv41_adaptive_dspark()
+        self.validate_engram_table_options()
         self.validate()
+
+    def validate_engram_table_options(self) -> None:
+        if self.engram_gpu_peer_handle_type not in ("auto", "fabric", "posix_fd"):
+            raise ValueError(
+                "--engram-gpu-peer-handle-type must be auto, fabric, or posix_fd; "
+                f"got {self.engram_gpu_peer_handle_type!r}"
+            )
+        if self.engram_host_table and self.engram_gpu_peer_sharded:
+            raise ValueError(
+                "--engram-host-table and --engram-gpu-peer-sharded are mutually "
+                "exclusive"
+            )
+        cross_process_fields = (
+            self.engram_peer_rendezvous,
+            self.engram_peer_world_size,
+            self.engram_peer_rank_offset,
+        )
+        if any(field is not None for field in cross_process_fields):
+            if not self.engram_gpu_peer_sharded:
+                raise ValueError(
+                    "--engram-peer-rendezvous, --engram-peer-world-size, and "
+                    "--engram-peer-rank-offset require --engram-gpu-peer-sharded"
+                )
+            if any(field is None for field in cross_process_fields):
+                raise ValueError(
+                    "--engram-peer-rendezvous, --engram-peer-world-size, and "
+                    "--engram-peer-rank-offset must all be set together"
+                )
+            from tokenspeed_kernel.peer_memory import parse_host_port
+
+            assert self.engram_peer_rendezvous is not None
+            assert self.engram_peer_world_size is not None
+            assert self.engram_peer_rank_offset is not None
+            parse_host_port(self.engram_peer_rendezvous)
+            if (
+                type(self.engram_peer_world_size) is not int
+                or self.engram_peer_world_size < 1
+            ):
+                raise ValueError("--engram-peer-world-size must be a positive integer")
+            if (
+                type(self.engram_peer_rank_offset) is not int
+                or self.engram_peer_rank_offset < 0
+            ):
+                raise ValueError(
+                    "--engram-peer-rank-offset must be a non-negative integer"
+                )
+            local_world = (
+                self.mapping.world_size
+                if self.mapping is not None
+                else max(
+                    1,
+                    self.tp_size * self.dp_size * self.pp_size,
+                )
+            )
+            if self.engram_peer_rank_offset + local_world > self.engram_peer_world_size:
+                raise ValueError(
+                    f"--engram-peer-rank-offset ({self.engram_peer_rank_offset}) + "
+                    f"local world size ({local_world}) exceeds "
+                    f"--engram-peer-world-size ({self.engram_peer_world_size})"
+                )
 
     def validate_dp_local_cuda_graph(self):
         if not self.enable_dp_local_cuda_graph:
@@ -5146,6 +5213,60 @@ class ServerArgs:
                 "use on that host. writer: keep them on the NUMA node of the "
                 "GPU of the rank that loads them. A single rank's table stays "
                 "on its own GPU's node either way."
+            ),
+        )
+        parser.add_argument(
+            "--engram-gpu-peer-sharded",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.engram_gpu_peer_sharded,
+            help=(
+                "DeepSeek V4.1 Engram: shard each FP8 n-gram table in GPU HBM "
+                "across peer GPUs via CUDA VMM (FABRIC handles over MNNVL or "
+                "POSIX FDs intra-node) mapped as one contiguous virtual table, "
+                "so every GPU gathers rows directly without host memory or an "
+                "all-reduce. Mutually exclusive with --engram-host-table."
+            ),
+        )
+        parser.add_argument(
+            "--engram-gpu-peer-handle-type",
+            type=str,
+            choices=["auto", "fabric", "posix_fd"],
+            default=ServerArgs.engram_gpu_peer_handle_type,
+            help=(
+                "CUDA VMM shareable handle type for --engram-gpu-peer-sharded. "
+                "fabric: IMEX/MNNVL handles across hosts or one host. posix_fd: "
+                "single-node Unix socket FD passing. auto: fabric when every "
+                "peer supports it, else posix_fd on a single host."
+            ),
+        )
+        parser.add_argument(
+            "--engram-peer-rendezvous",
+            type=str,
+            default=ServerArgs.engram_peer_rendezvous,
+            help=(
+                "Optional host:port (or [ipv6]:port) TCPStore rendezvous for "
+                "cross-process --engram-gpu-peer-sharded tables shared across "
+                "independent workers in one NVLink domain (e.g. multiple DEP2 "
+                "prefill engines). Requires --engram-peer-world-size and "
+                "--engram-peer-rank-offset."
+            ),
+        )
+        parser.add_argument(
+            "--engram-peer-world-size",
+            type=int,
+            default=ServerArgs.engram_peer_world_size,
+            help=(
+                "Total number of peer GPUs participating in a cross-process "
+                "--engram-peer-rendezvous group."
+            ),
+        )
+        parser.add_argument(
+            "--engram-peer-rank-offset",
+            type=int,
+            default=ServerArgs.engram_peer_rank_offset,
+            help=(
+                "Starting peer rank of this engine within the cross-process "
+                "--engram-peer-rendezvous group (rank r maps to offset + r)."
             ),
         )
         parser.add_argument(

@@ -36,7 +36,10 @@ Integration contract:
 * Hidden states, hashes and masks share the query row layout. Without QCP they
   are replicated within mapping.attn.tp_group; QCP lookup gathers hash IDs and
   reduce-scatters the table contributions back to local query rows.
-  GPU-resident tables are row-sharded across attention TP and all-reduced.
+  GPU-resident tables are either row-sharded across attention TP (``gpu``,
+  all-reduced) or peer-sharded across peer GPUs' HBM over CUDA VMM
+  (``peer_gpu``, ``EngramPeerGpuAlloc``), where each rank maps the full table
+  at one virtual address and gathers MXFP8 rows directly with no collective.
   Host tables keep one packed [codes | scales] row per entry in host memory
   and gather through UVA. ``shared`` tables live in host-NUMA cuMem memory,
   which GPUs map with 2 MiB pages rather than a tmpfs file's 4-64 KiB base
@@ -75,7 +78,7 @@ import numpy as np
 import torch
 from sympy import isprime
 from tokenizers import Regex, normalizers
-from tokenspeed_kernel import host_memory
+from tokenspeed_kernel import host_memory, peer_memory
 from tokenspeed_kernel.ops.communication.fabric import host_identity
 from tokenspeed_kernel.ops.embedding import host_gather
 from tokenspeed_kernel.ops.metadata.ngram import (
@@ -361,8 +364,16 @@ def _is_host_table_writer(mapping: Mapping) -> bool:
     return mapping.rank % max(mapping.nprocs_per_node, 1) == 0
 
 
-def resolve_engram_host_layout(host_table: bool, tp_size: int) -> str:
-    """Return ``gpu``, ``shared``, or ``sharded`` from the CLI opt-in and TP."""
+def resolve_engram_host_layout(
+    host_table: bool, tp_size: int, *, gpu_peer_sharded: bool
+) -> str:
+    """Return ``gpu``, ``peer_gpu``, ``shared``, or ``sharded`` from CLI flags."""
+    if host_table and gpu_peer_sharded:
+        raise ValueError(
+            "Engram tables cannot enable both host_table and gpu_peer_sharded"
+        )
+    if gpu_peer_sharded:
+        return "peer_gpu"
     if not host_table:
         return "gpu"
     if tp_size < 1:
@@ -410,14 +421,106 @@ class EngramHostAlloc:
             )
 
 
-def resolve_engram_host_alloc(host_layout: str) -> EngramHostAlloc | None:
-    """Return the CLI's host-table allocation, or None for GPU tables."""
+@dataclass(frozen=True)
+class EngramPeerGpuAlloc:
+    """Allocation and rendezvous configuration for peer-sharded GPU Engram tables.
+
+    handle_type: ``"fabric"`` (MNNVL/IMEX), ``"posix_fd"`` (single-node Unix
+        socket FD passing), or ``"auto"`` (fabric when every peer supports it,
+        else posix_fd on a single host).
+    rendezvous: Optional ``host:port`` or ``[ipv6]:port`` TCPStore endpoint for
+        cross-process peer sharding across independent workers. When set,
+        ``peer_world_size`` and ``peer_rank_offset`` must both be specified;
+        when None, peers are the ranks of ``torch.distributed.group.WORLD``.
+    """
+
+    handle_type: str
+    rendezvous: str | None
+    peer_world_size: int | None
+    peer_rank_offset: int | None
+
+    def __post_init__(self) -> None:
+        if self.handle_type not in ("auto", "fabric", "posix_fd"):
+            raise ValueError(
+                "Engram peer GPU handle type must be auto, fabric, or posix_fd; "
+                f"got {self.handle_type!r}"
+            )
+        cross = (self.rendezvous, self.peer_world_size, self.peer_rank_offset)
+        if any(field is not None for field in cross):
+            if any(field is None for field in cross):
+                raise ValueError(
+                    "Engram cross-process peer sharding requires rendezvous, "
+                    "peer_world_size, and peer_rank_offset together"
+                )
+            assert self.rendezvous is not None
+            assert self.peer_world_size is not None
+            assert self.peer_rank_offset is not None
+            peer_memory.parse_host_port(self.rendezvous)
+            if self.peer_world_size < 1:
+                raise ValueError("Engram peer_world_size must be positive")
+            if self.peer_rank_offset < 0:
+                raise ValueError("Engram peer_rank_offset must be non-negative")
+
+
+def resolve_engram_host_alloc(
+    host_layout: str,
+) -> EngramHostAlloc | EngramPeerGpuAlloc | None:
+    """Return the CLI's Engram table allocation, or None for TP-sharded GPU tables."""
     if host_layout == "gpu":
         return None
+    if host_layout == "peer_gpu":
+        return EngramPeerGpuAlloc(
+            handle_type=global_server_args_dict["engram_gpu_peer_handle_type"],
+            rendezvous=global_server_args_dict["engram_peer_rendezvous"],
+            peer_world_size=global_server_args_dict["engram_peer_world_size"],
+            peer_rank_offset=global_server_args_dict["engram_peer_rank_offset"],
+        )
     return EngramHostAlloc(
         global_server_args_dict["engram_host_table_alloc"],
         global_server_args_dict["engram_host_table_numa"],
     )
+
+
+def create_engram_peer_exchange(
+    alloc: EngramPeerGpuAlloc,
+    mapping: Mapping,
+    device: torch.device | str,
+) -> tuple[peer_memory.PeerMemoryExchange, str]:
+    """Create the shared peer exchange and resolve the VMM handle type once."""
+    if alloc.rendezvous is not None:
+        assert alloc.peer_world_size is not None
+        assert alloc.peer_rank_offset is not None
+        peer_rank = alloc.peer_rank_offset + mapping.rank
+        if peer_rank >= alloc.peer_world_size:
+            raise ValueError(
+                f"Engram peer rank {peer_rank} (offset {alloc.peer_rank_offset} + "
+                f"rank {mapping.rank}) exceeds peer_world_size {alloc.peer_world_size}"
+            )
+        exchange: peer_memory.PeerMemoryExchange = (
+            peer_memory.TCPStorePeerExchange.connect(
+                alloc.rendezvous,
+                rank=peer_rank,
+                world_size=alloc.peer_world_size,
+                namespace="ts-engram-peer",
+            )
+        )
+    else:
+        exchange = peer_memory.DistributedPeerExchange(
+            torch.distributed.group.WORLD, namespace="ts-engram-peer"
+        )
+    device_index = _host_table_device_index(torch.device(device))
+    fabric_probe = peer_memory.probe_peer_device_memory(device_index, "fabric")
+    posix_probe = peer_memory.probe_peer_device_memory(device_index, "posix_fd")
+    gathered = exchange.all_gather_object(
+        "probe", (host_identity(), fabric_probe, posix_probe)
+    )
+    hosts = [int(entry[0]) for entry in gathered]
+    fabric_probes = [entry[1] for entry in gathered]
+    posix_probes = [entry[2] for entry in gathered]
+    handle_type = peer_memory.resolve_peer_handle_type(
+        alloc.handle_type, hosts, fabric_probes, posix_probes
+    )
+    return exchange, handle_type
 
 
 def _cleanup_host_files() -> None:
@@ -684,7 +787,7 @@ def _dequant_fp8_e8m0(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
 
 
 class RowShardedEngramEmbedding(nn.Module):
-    """FP8 codes and raw E8M0 scale bytes, GPU-sharded or host-resident."""
+    """FP8 codes and raw E8M0 scale bytes, GPU-sharded, peer-sharded, or host-resident."""
 
     def __init__(
         self,
@@ -694,8 +797,11 @@ class RowShardedEngramEmbedding(nn.Module):
         device: torch.device | str,
         host_table: bool,
         host_layout: str,
-        host_alloc: EngramHostAlloc | None,
+        host_alloc: EngramHostAlloc | EngramPeerGpuAlloc | None,
         layer_id: int,
+        *,
+        peer_exchange: peer_memory.PeerMemoryExchange | None = None,
+        peer_handle_type: str | None = None,
     ):
         super().__init__()
         if (
@@ -718,10 +824,25 @@ class RowShardedEngramEmbedding(nn.Module):
                     "cuMem Engram host tables require the shared layout; sharded "
                     "tables use anonymous memory"
                 )
+            if peer_exchange is not None or peer_handle_type is not None:
+                raise ValueError("Host Engram tables take no peer GPU exchange")
+        elif host_layout == "peer_gpu":
+            if not isinstance(host_alloc, EngramPeerGpuAlloc):
+                raise TypeError(
+                    "Peer-sharded GPU Engram tables require an EngramPeerGpuAlloc"
+                )
+            if (peer_exchange is None) != (peer_handle_type is None):
+                raise ValueError(
+                    "peer_exchange and peer_handle_type must be passed together"
+                )
         elif host_layout != "gpu":
-            raise ValueError("GPU Engram tables require host_layout='gpu'")
+            raise ValueError(
+                "GPU Engram tables require host_layout='gpu' or 'peer_gpu'"
+            )
         elif host_alloc is not None:
             raise ValueError("GPU Engram tables take no host allocation")
+        elif peer_exchange is not None or peer_handle_type is not None:
+            raise ValueError("TP-sharded GPU Engram tables take no peer GPU exchange")
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.tp_group = mapping.attn.tp_group
@@ -730,13 +851,13 @@ class RowShardedEngramEmbedding(nn.Module):
         self.layer_id = layer_id
         self._mmap_keep: list[object] = []
         self._host_gpu_registered = False
-        # A host table holding every row its rank looks up (one shared copy, or
-        # a single attention-TP rank) needs no reduction, so its rows can feed
-        # wkv as MXFP8 directly.
-        self.serves_mxfp8_rows = host_table and (
-            host_layout == "shared" or mapping.attn.tp_size == 1
+        # A table holding every row its rank looks up (peer-sharded GPU, shared
+        # host, or single attention-TP host) needs no reduction, so its rows can
+        # feed wkv as MXFP8 directly.
+        self.serves_mxfp8_rows = host_layout == "peer_gpu" or (
+            host_table and (host_layout == "shared" or mapping.attn.tp_size == 1)
         )
-        row_sharded = (not host_table) or host_layout == "sharded"
+        row_sharded = host_layout in ("gpu", "sharded")
         if row_sharded:
             self.part_num_embeddings = (
                 num_embeddings + mapping.attn.tp_size - 1
@@ -749,32 +870,41 @@ class RowShardedEngramEmbedding(nn.Module):
             self.part_num_embeddings = num_embeddings
             self.row_start = 0
             self.row_end = num_embeddings
+        self.load_row_start = self.row_start
+        self.load_row_end = self.row_end
         shared_file = (
             host_layout == "shared"
             and torch.distributed.is_initialized()
             and torch.distributed.get_world_size() > 1
         )
         self._shared_writer = (not shared_file) or _is_host_table_writer(mapping)
-        # Host rows keep each row's codes and scales side by side: a random-row
-        # gather over UVA is bound by address translation, one host page per
-        # row, so a packed row costs one lookup instead of two. weight and
-        # scale are column views of it.
+        # Host and peer-GPU tables keep each row's codes and scales side by
+        # side: random-row gathers read one packed row instead of two separate
+        # addresses. weight and scale are column views of it.
         self.packed: torch.Tensor | None = None
         # The host-NUMA cuMem memory of a shared table, if it got one. The
         # packed rows' storage owns the mapping, so any view of them keeps it
         # alive after this module is gone.
         self.cumem: host_memory.HostMemory | None = None
+        # Peer-sharded GPU HBM VMM mapping when host_layout == "peer_gpu".
+        self.peer_memory: peer_memory.PeerDeviceMemory | None = None
+        self._peer_cross_process = (
+            isinstance(host_alloc, EngramPeerGpuAlloc)
+            and host_alloc.rendezvous is not None
+        )
+        resolved_device = torch.device(device)
         if host_table:
             packed_shape = (
                 self.part_num_embeddings,
                 embedding_dim + embedding_dim // 32,
             )
             packed_bytes = _host_table_nbytes(packed_shape, torch.uint8)
-            if host_layout == "shared" and torch.device(device).type != "meta":
+            if host_layout == "shared" and resolved_device.type != "meta":
+                assert isinstance(host_alloc, EngramHostAlloc)
                 self.cumem = _cumem_host_table(
                     packed_bytes,
                     host_alloc,
-                    torch.device(device),
+                    resolved_device,
                     shared_file,
                     self._shared_writer,
                     layer_id,
@@ -792,6 +922,60 @@ class RowShardedEngramEmbedding(nn.Module):
             self.scale = nn.Parameter(
                 self.packed[:, embedding_dim:], requires_grad=False
             )
+        elif host_layout == "peer_gpu":
+            packed_shape = (
+                self.part_num_embeddings,
+                embedding_dim + embedding_dim // 32,
+            )
+            packed_bytes = _host_table_nbytes(packed_shape, torch.uint8)
+            if resolved_device.type == "meta":
+                self.packed = torch.empty(
+                    packed_shape, dtype=torch.uint8, device="meta"
+                )
+            else:
+                if resolved_device.type != "cuda":
+                    raise ValueError(
+                        "Peer-sharded GPU Engram tables require a CUDA device"
+                    )
+                assert isinstance(host_alloc, EngramPeerGpuAlloc)
+                if peer_exchange is None:
+                    peer_exchange, peer_handle_type = create_engram_peer_exchange(
+                        host_alloc, mapping, resolved_device
+                    )
+                assert peer_handle_type is not None
+                scoped_exchange = peer_exchange.scoped(f"L{layer_id}")
+                device_index = _host_table_device_index(resolved_device)
+                self.peer_memory = peer_memory.create_peer_device_memory(
+                    packed_bytes,
+                    device_index=device_index,
+                    handle_type=peer_handle_type,
+                    exchange=scoped_exchange,
+                )
+                self.packed = self.peer_memory.tensor.view(packed_shape)
+                self.load_row_start, self.load_row_end = (
+                    peer_memory.plan_peer_row_range(
+                        num_embeddings,
+                        packed_shape[1],
+                        self.peer_memory.layout,
+                    )
+                )
+                logger.info(
+                    f"Engram layer {layer_id}: peer-sharded GPU HBM table "
+                    f"({peer_handle_type}), {packed_bytes / 2**30:.2f} GiB total, "
+                    f"{self.peer_memory.layout.local_length / 2**30:.2f} GiB local "
+                    f"on peer {self.peer_memory.layout.peer_rank}/"
+                    f"{self.peer_memory.layout.peer_world_size} "
+                    f"(rows [{self.load_row_start}, {self.load_row_end}))"
+                )
+            self.weight = nn.Parameter(
+                self.packed[:, :embedding_dim].view(torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.scale = nn.Parameter(
+                self.packed[:, embedding_dim:], requires_grad=False
+            )
+            self.weight.dummy_initializer = self._init_dummy_peer_weight
+            self.scale.dummy_initializer = self._init_dummy_peer_scale
         else:
             self.weight = nn.Parameter(
                 torch.empty(
@@ -815,13 +999,59 @@ class RowShardedEngramEmbedding(nn.Module):
             param.weight_loader = self.weight_loader
             param.engram_row_sharded = row_sharded
             param.engram_host_table = host_table
-            param.engram_row_start = self.row_start
-            param.engram_row_end = self.row_end
+            param.engram_row_start = self.load_row_start
+            param.engram_row_end = self.load_row_end
         local_rows = self.row_end - self.row_start
-        if torch.device(device).type != "meta":
+        if resolved_device.type != "meta":
             self.weight.data[local_rows:].zero_()
             self.scale.data[local_rows:].fill_(127)
             self._register_host_for_gpu()
+
+    def _init_dummy_peer_weight(
+        self, param: nn.Parameter, generator: torch.Generator
+    ) -> None:
+        """Initialize only this peer's owned weight rows in bounded GPU chunks."""
+        chunk_rows = 65536
+        for start in range(self.load_row_start, self.load_row_end, chunk_rows):
+            end = min(start + chunk_rows, self.load_row_end)
+            chunk = (
+                torch.empty(
+                    (end - start, self.embedding_dim),
+                    dtype=torch.float16,
+                    device=param.device,
+                )
+                .uniform_(-1e-3, 1e-3, generator=generator)
+                .to(torch.float8_e4m3fn)
+            )
+            param.data[start:end].copy_(chunk)
+
+    def _init_dummy_peer_scale(
+        self, param: nn.Parameter, generator: torch.Generator
+    ) -> None:
+        """Initialize this peer's owned scale rows to unit E8M0 (127) and barrier."""
+        del generator
+        chunk_rows = 65536
+        for start in range(self.load_row_start, self.load_row_end, chunk_rows):
+            end = min(start + chunk_rows, self.load_row_end)
+            param.data[start:end].fill_(127)
+        if self.peer_memory is not None:
+            torch.cuda.synchronize(self.peer_memory.device_index)
+            self.peer_memory.barrier("dummy-init")
+
+    def release_peer_storage(self, *, backup: bool) -> None:
+        """Release physical GPU VMM handles while keeping the VA reserved."""
+        if self.peer_memory is not None:
+            self.peer_memory.release_storage(backup=backup)
+
+    def resume_peer_storage(self, *, backup: bool) -> None:
+        """Reallocate and remap peer VMM handles at the same virtual address."""
+        if self.peer_memory is not None:
+            self.peer_memory.resume_storage(backup=backup)
+
+    def close_peer_storage(self) -> None:
+        """Permanently free peer VMM handles and virtual address at shutdown."""
+        if self.peer_memory is not None:
+            self.peer_memory.close(sync_peers=not self._peer_cross_process)
 
     def _allocate_mmap_rows(
         self,
@@ -882,7 +1112,7 @@ class RowShardedEngramEmbedding(nn.Module):
         self._host_gpu_registered = True
 
     def _apply(self, fn, recurse=True):
-        if self.host_table:
+        if self.host_table or self.host_layout == "peer_gpu":
             return self
         return super()._apply(fn, recurse)
 
@@ -910,26 +1140,31 @@ class RowShardedEngramEmbedding(nn.Module):
         if loaded_weight.ndim != 2 or loaded_weight.shape[1] != param.shape[1]:
             raise ValueError("Engram table weight has the wrong row width")
         rows = loaded_weight.shape[0]
-        local_rows = self.row_end - self.row_start
+        local_rows = self.load_row_end - self.load_row_start
+        dest_start = self.load_row_start - self.row_start
         if rows == self.num_embeddings:
-            if loaded_weight.device.type != "cpu" and len(self.tp_group) > 1:
+            if loaded_weight.device.type != "cpu" and (
+                len(self.tp_group) > 1 or self.host_layout == "peer_gpu"
+            ):
                 raise ValueError(
                     "Do not materialize a full Engram table on GPU; use load_sharded"
                 )
-            loaded_weight = loaded_weight[self.row_start : self.row_end]
+            loaded_weight = loaded_weight[self.load_row_start : self.load_row_end]
         elif rows in (local_rows, self.part_num_embeddings):
             loaded_weight = loaded_weight[:local_rows]
         else:
             raise ValueError(
                 "Engram weight is neither a full table nor this rank's row shard"
             )
-        self._copy_rows(param, loaded_weight, 0)
+        if local_rows > 0:
+            self._copy_rows(param, loaded_weight, dest_start)
 
     def load_sharded(self, parameter_name: str, tensor_slice, chunk_rows: int) -> None:
         """Copy table rows from a CPU safetensors get_slice() in bounded chunks.
 
-        GPU and host-sharded tables copy only this rank's rows. Shared host
-        tables copy every row on the writer rank; followers map the same memory.
+        GPU, host-sharded, and peer-sharded GPU tables copy only this rank's
+        owned rows. Shared host tables copy every row on the writer rank;
+        followers map the same memory.
         Args: parameter_name is 'weight' or 'scale'; tensor_slice is the global
         checkpoint tensor's lazy CPU slice; chunk_rows bounds transient host
         storage. No full tensor, remote shard, or BF16 table is allocated.
@@ -939,27 +1174,33 @@ class RowShardedEngramEmbedding(nn.Module):
             raise ValueError("Expected weight/scale and a positive row chunk size")
         if self.host_table and not self._shared_writer:
             return
-        param = getattr(self, parameter_name)
+        param = self.weight if parameter_name == "weight" else self.scale
         if tuple(tensor_slice.get_shape()) != (self.num_embeddings, param.shape[1]):
             raise ValueError("Checkpoint Engram shape does not match the global table")
-        for start in range(self.row_start, self.row_end, chunk_rows):
-            end = min(start + chunk_rows, self.row_end)
+        for start in range(self.load_row_start, self.load_row_end, chunk_rows):
+            end = min(start + chunk_rows, self.load_row_end)
             rows = tensor_slice[start:end, :]
             if rows.device.type != "cpu":
                 raise ValueError("Open Engram safetensors on CPU before slicing")
             self._copy_rows(param, rows, start - self.row_start)
 
-    def mxfp8_rows(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def mxfp8_rows(
+        self, indices: torch.Tensor, *, scale_layout: str
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather CUDA [T, hash columns] IDs as the MXFP8 input of wkv.
 
-        Returns E4M3 codes [T, columns * head_dim] and canonical UE8M0 scales
-        [T, columns * head_dim / 32]: forward()'s BF16 rows quantized with the
-        reference 1x32 rule, without materializing them. Only tables with
-        ``serves_mxfp8_rows`` hold every row a rank looks up.
+        Returns E4M3 codes [T, columns * head_dim] and UE8M0 scales in
+        ``scale_layout`` (``"canonical"`` uint8 or ``"packed"`` MN-major int32):
+        forward()'s BF16 rows quantized with the reference 1x32 rule, without
+        materializing them. Only tables with ``serves_mxfp8_rows`` hold every
+        row a rank looks up.
         """
         if not self.serves_mxfp8_rows:
             raise RuntimeError("This Engram table needs its rows reduced across TP")
-        return host_gather.mxfp8_row_gather(self.packed, indices, None, None)
+        assert self.packed is not None
+        return host_gather.mxfp8_row_gather(
+            self.packed, indices, None, None, scale_layout=scale_layout
+        )
 
     def forward(
         self, indices: torch.Tensor, *, query_shard: QueryShardPlan | None
@@ -968,10 +1209,12 @@ class RowShardedEngramEmbedding(nn.Module):
 
         Without a query shard, TP peers pass identical indices. A query shard
         gathers IDs and reduce-scatters table contributions to its local rows.
-        Shared host tables gather the full copy and skip the all-reduce. GPU
-        and host-sharded tables expand only local rows and reduce.
-        Dequantization uses the same FP8/E8M0 torch casts in both paths.
+        Shared host and peer-sharded GPU tables gather the full copy and skip
+        the all-reduce. TP-sharded GPU and host-sharded tables expand only
+        local rows and reduce. Dequantization uses the same FP8/E8M0 torch
+        casts in both paths.
         """
+        full_table = self.host_layout in ("shared", "peer_gpu")
         sharded = query_shard is not None and query_shard.size > 1
         if sharded:
             if indices.ndim != 2 or indices.shape[0] != query_shard.local_rows:
@@ -980,11 +1223,11 @@ class RowShardedEngramEmbedding(nn.Module):
                 raise ValueError(
                     "Engram TP and query shard groups must have equal size"
                 )
-            if self.host_layout != "shared":
+            if not full_table:
                 indices = token_all_gather_rows(
                     indices, self.tp_group, list(query_shard.row_counts)
                 )
-        if indices.is_cuda and not self.host_table:
+        if indices.is_cuda and not self.host_table and self.packed is None:
             from tokenspeed_kernel.ops.embedding import mxfp8_embedding
 
             # Each layer's 2D hash slice can be gathered directly; retain the
@@ -1001,9 +1244,9 @@ class RowShardedEngramEmbedding(nn.Module):
         else:
             local = (indices >= self.row_start) & (indices < self.row_end)
             local_ids = (indices - self.row_start).masked_fill(~local, 0)
-            if self.host_table:
+            if self.packed is not None:
                 # Gather whole packed rows and split them: a gather per column
-                # view would pay each random row's host page translation twice.
+                # view would pay each random row's address translation twice.
                 rows = host_gather.uint8_row_gather(self.packed, local_ids, None)
                 values = _dequant_fp8_e8m0(
                     rows[..., : self.embedding_dim], rows[..., self.embedding_dim :]
@@ -1015,7 +1258,7 @@ class RowShardedEngramEmbedding(nn.Module):
                     self.weight.view(torch.uint8)[local_ids], self.scale[local_ids]
                 )
             values = values.masked_fill(~local.unsqueeze(-1), 0)
-        if len(self.tp_group) > 1 and self.host_layout != "shared":
+        if len(self.tp_group) > 1 and not full_table:
             # The workspace all-reduce sizes itself on rows x trailing width.
             # Reduce one row per token, [rows, columns * head_dim]: the lane is
             # widened for that at construction (DeepseekV41Engram), so a
@@ -1035,6 +1278,26 @@ class RowShardedEngramEmbedding(nn.Module):
                 op=torch.distributed.ReduceOp.SUM,
             ).view(values.shape)
         return values
+
+
+@dataclass(frozen=True)
+class EngramPrefetchTask:
+    """Explicit next-layer Engram MXFP8 gather launched on a dedicated stream."""
+
+    engram: DeepseekV41Engram
+    hash_ids: torch.Tensor
+    stream: torch.cuda.Stream
+    fork_event: torch.cuda.Event
+    join_event: torch.cuda.Event
+
+
+@dataclass(frozen=True)
+class EngramPrefetchedRows:
+    """Prefetched MXFP8 codes and scales awaiting a main-stream event join."""
+
+    codes: torch.Tensor
+    scales: torch.Tensor
+    join_event: torch.cuda.Event
 
 
 def engram_reduce_lane_width(layout: EngramLayout) -> int:
@@ -1061,7 +1324,10 @@ class DeepseekV41Engram(nn.Module):
         device: torch.device | str,
         host_table: bool,
         host_layout: str,
-        host_alloc: EngramHostAlloc | None,
+        host_alloc: EngramHostAlloc | EngramPeerGpuAlloc | None,
+        *,
+        peer_exchange: peer_memory.PeerMemoryExchange | None = None,
+        peer_handle_type: str | None = None,
     ):
         """Construct with the V4.1 runtime quant config selected by the caller.
 
@@ -1123,6 +1389,8 @@ class DeepseekV41Engram(nn.Module):
             host_layout,
             host_alloc,
             layer_id,
+            peer_exchange=peer_exchange,
+            peer_handle_type=peer_handle_type,
         )
         self.q_weight.weight_loader = default_weight_loader
         self.k_weight.weight_loader = default_weight_loader
@@ -1132,7 +1400,7 @@ class DeepseekV41Engram(nn.Module):
         self.reduce_lane_armed = False
         if (
             len(mapping.attn.tp_group) > 1
-            and host_layout != "shared"
+            and host_layout not in ("shared", "peer_gpu")
             and torch.distributed.is_initialized()
         ):
             width = engram_reduce_lane_width(layout)
@@ -1144,6 +1412,34 @@ class DeepseekV41Engram(nn.Module):
                     f"{prefix!s}: one-shot all-reduce lane of width {width:d} not "
                     "armed; the Engram embedding reduce falls back to NCCL"
                 )
+
+    def wkv_scale_layout(self) -> str:
+        """Return wkv's MXFP8 activation scale layout from its prepared scales."""
+        method = self.wkv.quant_method
+        if (
+            isinstance(method, Fp8LinearMethod)
+            and method.projection_weight_scales is not None
+            and (self.n_hash_cols * self.embed.embedding_dim) % 128 == 0
+        ):
+            return "packed"
+        return "canonical"
+
+    def can_prefetch_mxfp8(self, hash_ids: torch.Tensor) -> bool:
+        """Whether ``hash_ids`` can be gathered asynchronously as MXFP8 for wkv."""
+        return (
+            hash_ids.is_cuda
+            and hash_ids.ndim == 2
+            and hash_ids.shape[0] > 0
+            and hash_ids.shape[1] == self.n_hash_cols
+            and self.embed.serves_mxfp8_rows
+            and isinstance(self.wkv.quant_method, Fp8LinearMethod)
+        )
+
+    def prefetch_mxfp8_rows(
+        self, hash_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather MXFP8 codes and scales on the caller's current CUDA stream."""
+        return self.embed.mxfp8_rows(hash_ids, scale_layout=self.wkv_scale_layout())
 
     def checkpoint_weight_aliases(self) -> dict[str, str]:
         """Return raw layers.<id>.engram checkpoint names to runtime param paths.
@@ -1172,12 +1468,15 @@ class DeepseekV41Engram(nn.Module):
         token_mask: torch.Tensor,
         *,
         query_shard: QueryShardPlan | None,
+        prefetched: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Inject Engram into [..., 4, hidden_size], returning the same shape/dtype.
 
         hash_ids contains this layer's [..., n_hash_cols] IDs; token_mask is bool
         [...]. False positions pass through unchanged, including image/pad rows.
         Norms and gates accumulate in FP32, independently for each HC copy.
+        When ``prefetched`` is provided, uses the pre-gathered MXFP8
+        ``(codes, scales)`` pair directly instead of gathering again.
         """
         shape = hidden_states.shape[:-2]
         if (
@@ -1200,9 +1499,18 @@ class DeepseekV41Engram(nn.Module):
             # without the BF16 round trip. No collective runs on this path.
             if hidden_states.numel() == 0:
                 return hidden_states
-            codes, scales = self.embed.mxfp8_rows(hash_ids)
+            if prefetched is not None:
+                codes, scales = prefetched
+            else:
+                codes, scales = self.embed.mxfp8_rows(
+                    hash_ids, scale_layout=self.wkv_scale_layout()
+                )
             kv, _ = self.wkv(codes, block_scale=scales, output_dtype=torch.bfloat16)
         else:
+            if prefetched is not None:
+                raise ValueError(
+                    "Prefetched MXFP8 Engram rows require a CUDA 2D MXFP8-serving table"
+                )
             embeddings = self.embed(hash_ids, query_shard=query_shard).flatten(-2)
             if hidden_states.numel() == 0:
                 return hidden_states

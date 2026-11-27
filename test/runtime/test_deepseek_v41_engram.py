@@ -67,6 +67,7 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     EngramHashState,
     EngramHostAlloc,
     EngramLayout,
+    EngramPeerGpuAlloc,
     RowShardedEngramEmbedding,
     build_compressed_token_map,
     compute_hash_multipliers,
@@ -962,7 +963,21 @@ def test_resolve_engram_host_alloc_follows_the_cli(monkeypatch):
 
     monkeypatch.setitem(global_server_args_dict, "engram_host_table_alloc", "cumem")
     monkeypatch.setitem(global_server_args_dict, "engram_host_table_numa", "writer")
+    monkeypatch.setitem(
+        global_server_args_dict, "engram_gpu_peer_handle_type", "fabric"
+    )
+    monkeypatch.setitem(
+        global_server_args_dict, "engram_peer_rendezvous", "127.0.0.1:29500"
+    )
+    monkeypatch.setitem(global_server_args_dict, "engram_peer_world_size", 14)
+    monkeypatch.setitem(global_server_args_dict, "engram_peer_rank_offset", 2)
     assert engram.resolve_engram_host_alloc("gpu") is None
+    assert engram.resolve_engram_host_alloc("peer_gpu") == EngramPeerGpuAlloc(
+        handle_type="fabric",
+        rendezvous="127.0.0.1:29500",
+        peer_world_size=14,
+        peer_rank_offset=2,
+    )
     for layout in ("shared", "sharded"):
         assert engram.resolve_engram_host_alloc(layout) == EngramHostAlloc(
             "cumem", "writer"
@@ -976,15 +991,82 @@ def test_resolve_engram_host_layout_auto_and_explicit():
     previous = global_server_args_dict["engram_host_table_layout"]
     try:
         global_server_args_dict["engram_host_table_layout"] = "auto"
-        assert resolve_engram_host_layout(False, 4) == "gpu"
-        assert resolve_engram_host_layout(True, 1) == "shared"
-        assert resolve_engram_host_layout(True, 4) == "sharded"
+        assert resolve_engram_host_layout(False, 4, gpu_peer_sharded=False) == "gpu"
+        assert resolve_engram_host_layout(False, 4, gpu_peer_sharded=True) == "peer_gpu"
+        assert resolve_engram_host_layout(True, 1, gpu_peer_sharded=False) == "shared"
+        assert resolve_engram_host_layout(True, 4, gpu_peer_sharded=False) == "sharded"
         global_server_args_dict["engram_host_table_layout"] = "shared"
-        assert resolve_engram_host_layout(True, 4) == "shared"
+        assert resolve_engram_host_layout(True, 4, gpu_peer_sharded=False) == "shared"
         global_server_args_dict["engram_host_table_layout"] = "sharded"
-        assert resolve_engram_host_layout(True, 1) == "sharded"
+        assert resolve_engram_host_layout(True, 1, gpu_peer_sharded=False) == "sharded"
+        with pytest.raises(ValueError, match="both host_table and gpu_peer_sharded"):
+            resolve_engram_host_layout(True, 1, gpu_peer_sharded=True)
     finally:
         global_server_args_dict["engram_host_table_layout"] = previous
+
+
+def test_engram_peer_gpu_alloc_and_server_args_validation():
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    assert EngramPeerGpuAlloc("auto", None, None, None).handle_type == "auto"
+    assert EngramPeerGpuAlloc("fabric", "[::1]:47100", 16, 0).peer_world_size == 16
+    with pytest.raises(ValueError, match="handle type"):
+        EngramPeerGpuAlloc("invalid", None, None, None)
+    with pytest.raises(ValueError, match="together"):
+        EngramPeerGpuAlloc("auto", "127.0.0.1:29500", 14, None)
+    with pytest.raises(ValueError, match="positive"):
+        EngramPeerGpuAlloc("auto", "127.0.0.1:29500", 0, 0)
+    with pytest.raises(ValueError, match="non-negative"):
+        EngramPeerGpuAlloc("auto", "127.0.0.1:29500", 4, -1)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ServerArgs(
+            model_path="dummy",
+            engram_host_table=True,
+            engram_gpu_peer_sharded=True,
+        )
+    with pytest.raises(ValueError, match="require --engram-gpu-peer-sharded"):
+        ServerArgs(
+            model_path="dummy",
+            engram_peer_rendezvous="127.0.0.1:29500",
+            engram_peer_world_size=14,
+            engram_peer_rank_offset=0,
+        )
+    with pytest.raises(ValueError, match="must all be specified together"):
+        ServerArgs(
+            model_path="dummy",
+            engram_gpu_peer_sharded=True,
+            engram_peer_rendezvous="127.0.0.1:29500",
+        )
+    args = ServerArgs(
+        model_path="dummy",
+        engram_gpu_peer_sharded=True,
+        engram_gpu_peer_handle_type="fabric",
+        engram_peer_rendezvous="[::1]:29500",
+        engram_peer_world_size=14,
+        engram_peer_rank_offset=4,
+        tp_size=2,
+    )
+    assert args.engram_gpu_peer_sharded is True
+    assert args.engram_peer_rank_offset == 4
+
+
+def test_peer_gpu_embedding_meta_and_validation():
+    mapping = _mapping(0, 1, 1)
+    alloc = EngramPeerGpuAlloc("auto", None, None, None)
+    table = RowShardedEngramEmbedding(
+        72, 64, mapping, "meta", False, "peer_gpu", alloc, 1
+    )
+    assert table.serves_mxfp8_rows
+    assert table.peer_memory is None
+    assert table.packed is not None and table.packed.shape == (72, 66)
+    assert table._apply(lambda t: t.float()) is table
+    assert callable(table.weight.dummy_initializer)
+    assert callable(table.scale.dummy_initializer)
+    with pytest.raises(ValueError, match="CUDA device"):
+        RowShardedEngramEmbedding(72, 64, mapping, "cpu", False, "peer_gpu", alloc, 1)
+    with pytest.raises(TypeError, match="EngramPeerGpuAlloc"):
+        RowShardedEngramEmbedding(72, 64, mapping, "meta", False, "peer_gpu", None, 1)
 
 
 def test_host_sharded_table_matches_gpu_and_allreduces(tmp_path, monkeypatch):
@@ -1995,9 +2077,149 @@ def test_torchrun_ranks_share_a_cumem_host_table(monkeypatch):
             rtol=0,
             atol=0,
         )
-        expected = host_gather.mxfp8_row_gather(packed.to(device), ids, None, None)
-        for actual, reference in zip(table.mxfp8_rows(ids), expected, strict=True):
+        expected = host_gather.mxfp8_row_gather(
+            packed.to(device), ids, None, None, scale_layout="canonical"
+        )
+        for actual, reference in zip(
+            table.mxfp8_rows(ids, scale_layout="canonical"), expected, strict=True
+        ):
             assert torch.equal(actual.view(torch.uint8), reference.view(torch.uint8))
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_peer_gpu_engram_prefetch_packed_and_release_resume(tmp_path):
+    """End-to-end GPU test of peer-sharded Engram, packed scales, prefetch, and release/resume."""
+    pytest.importorskip("cuda.bindings.driver")
+    from tokenspeed_kernel import peer_memory
+
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+    handle_type = None
+    for candidate in ("fabric", "posix_fd"):
+        if peer_memory.probe_peer_device_memory(0, candidate) is None:
+            handle_type = candidate
+            break
+    if handle_type is None:
+        pytest.skip("Neither fabric nor posix_fd CUDA VMM handles available")
+
+    # Use n_heads=2, head_dim=64 -> n_hash_cols=6 -> width=384 (multiple of 128).
+    cfg = SimpleNamespace(
+        engram_layer_ids=[1],
+        engram_num_embeddings=[72],
+        engram_max_ngram_size=4,
+        engram_vocab_size=5,
+        engram_n_heads=2,
+        engram_head_dim=64,
+        engram_pad_token_id=2,
+        engram_compressed_vocab_size=9,
+        hc_mult=4,
+        hidden_size=128,
+        rms_norm_eps=1e-20,
+    )
+    quant = Fp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[32, 32],
+        scale_fmt="ue8m0",
+    )
+    mapping = _mapping(0, 1, 1)
+    alloc = EngramPeerGpuAlloc(handle_type, None, None, None)
+
+    torch.cuda.empty_cache()
+    module = DeepseekV41Engram(
+        cfg,
+        1,
+        mapping,
+        v41_mxfp8_config(quant),
+        "model.layers.1.engram",
+        device,
+        False,
+        "peer_gpu",
+        alloc,
+    )
+    try:
+        assert module.embed.peer_memory is not None
+        assert module.embed.serves_mxfp8_rows
+        assert not module.reduce_lane_armed
+        original_ptr = module.embed.peer_memory.tensor.data_ptr()
+
+        codes, scales = _weights(72, 64)
+        path = tmp_path / "engram_peer.safetensors"
+        save_file(
+            {"weight": codes, "scale": scales.view(torch.float8_e8m0fnu)},
+            str(path),
+            metadata=None,
+        )
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            module.embed.load_sharded("weight", handle.get_slice("weight"), 16)
+            module.embed.load_sharded("scale", handle.get_slice("scale"), 16)
+
+        wkv_codes = torch.randint(-4, 5, module.wkv.weight.shape, dtype=torch.int8).to(
+            torch.float8_e4m3fn
+        )
+        wkv_scales = torch.full(
+            (
+                (module.wkv.weight.shape[0] + 31) // 32,
+                module.wkv.weight.shape[1] // 32,
+            ),
+            127,
+            dtype=torch.uint8,
+        )
+        module.wkv.weight.weight_loader(module.wkv.weight, wkv_codes)
+        module.wkv.weight_scale_inv.weight_loader(
+            module.wkv.weight_scale_inv, wkv_scales
+        )
+        module.wkv.quant_method.process_weights_after_loading(module.wkv)
+
+        hidden = torch.randn(5, 4, 128, dtype=torch.bfloat16, device=device)
+        hash_ids = torch.randint(0, 72, (5, 6), dtype=torch.int64, device=device)
+        hash_ids[0, 0] = -1
+        hash_ids[4, 5] = 72
+        token_mask = torch.tensor([True, True, False, True, True], device=device)
+
+        expected = module(hidden, hash_ids, token_mask, query_shard=None)
+        from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+
+        if isinstance(module.wkv.quant_method, Fp8LinearMethod):
+            assert module.can_prefetch_mxfp8(hash_ids)
+            side_stream = torch.cuda.Stream(device=device)
+            fork_ev = torch.cuda.Event()
+            join_ev = torch.cuda.Event()
+            main_stream = torch.cuda.current_stream()
+            fork_ev.record(main_stream)
+            with torch.cuda.stream(side_stream):
+                side_stream.wait_event(fork_ev)
+                prefetched = module.prefetch_mxfp8_rows(hash_ids)
+                join_ev.record(side_stream)
+            main_stream.wait_event(join_ev)
+            prefetched[0].record_stream(main_stream)
+            prefetched[1].record_stream(main_stream)
+            actual = module(
+                hidden, hash_ids, token_mask, query_shard=None, prefetched=prefetched
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        else:
+            assert not module.can_prefetch_mxfp8(hash_ids)
+            packed_codes, packed_scales = module.embed.mxfp8_rows(
+                hash_ids, scale_layout="packed"
+            )
+            assert packed_codes.shape == (5, 384)
+            assert packed_scales.dtype == torch.int32
+            assert packed_scales.shape == (5, 3)
+
+        # Release/resume cycles must preserve the virtual address and output.
+        for _ in range(2):
+            module.embed.release_peer_storage(backup=True)
+            assert module.embed.peer_memory.released
+            assert module.embed.peer_memory.local_physical_bytes == 0
+            assert module.embed.peer_memory.tensor.data_ptr() == original_ptr
+            module.embed.resume_peer_storage(backup=True)
+            assert not module.embed.peer_memory.released
+            assert module.embed.peer_memory.tensor.data_ptr() == original_ptr
+            resumed = module(hidden, hash_ids, token_mask, query_shard=None)
+            torch.testing.assert_close(resumed, expected, rtol=0, atol=0)
+    finally:
+        module.embed.close_peer_storage()
