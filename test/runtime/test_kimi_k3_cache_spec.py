@@ -190,21 +190,18 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
         ),
     )
 
-    # Four batch rows stage QKV. Twelve resident requests and the two
-    # reserved request slots each hold sixteen (the default capacity) FP32
-    # U/K/decay records per layer, plus one INT32 accepted count every layer
-    # shares.
-    qkv_bytes = 69 * 4 * 8 * 4608 * 2
-    retained_bytes = 14 * (69 * 12 * 16 * 128 * 3 * 4 + 4)
-    descriptor_bytes = 69 * (12 * 8 + 4) + 3 * 4 * 8
+    # Twelve resident requests and the two reserved request slots each hold
+    # sixteen (the default capacity) FP32 U/K/decay records and an eleven-row
+    # (8 draft tokens + 3) BF16 pre-convolution ring per layer, plus one
+    # INT32 accepted count and ring state every layer shares. Four batch rows
+    # keep the prepare's (count, ring head) snapshot.
+    ring_bytes = 69 * (8 + 3) * 4608 * 2
+    retained_bytes = 14 * (69 * 12 * 16 * 128 * 3 * 4 + ring_bytes + 2 * 4)
+    descriptor_bytes = 69 * (13 * 8 + 4) + 3 * 4 * 8
     page_and_step_bytes = (2 * 3 + 1) * 4 * 4
-    record_metadata_bytes = 4 * 4 * 8 + 69 * 4 * 8 * 2 * 8
+    record_metadata_bytes = 4 * 4 * 8 + 4 * 2 * 4 + 69 * 4 * 8 * 2 * 8
     expected_workspace_bytes = (
-        qkv_bytes
-        + retained_bytes
-        + descriptor_bytes
-        + page_and_step_bytes
-        + record_metadata_bytes
+        retained_bytes + descriptor_bytes + page_and_step_bytes + record_metadata_bytes
     )
 
     setup = recipe.setup()
@@ -403,8 +400,9 @@ def test_kda_history_capacity_sizes_each_request_slot(capacity):
         max_resident_requests=6,
         kda_history_capacity=capacity,
     )
+    # The slot's records, its seven-row (4 + 3) ring, its count and ring state.
     assert recipe.workspace_bytes() - smaller.workspace_bytes() == (
-        69 * 3 * 12 * capacity * 128 * 4 + 4
+        69 * 3 * 12 * capacity * 128 * 4 + 69 * 7 * 4608 * 2 + 2 * 4
     )
 
 
@@ -446,15 +444,16 @@ def test_kimi_checkpoint_is_independent_of_request_history(
         "conv_state",
         "recurrent_state",
     }
-    # Increasing residency by one adds the FP32 records of that request's
-    # slot and the count every layer shares.
+    # Increasing residency by one adds the FP32 records and the BF16
+    # width + 3 row pre-convolution ring of that request's slot, and the count
+    # and ring state every layer shares.
     smaller = kimi_recipe(
         speculative_num_draft_tokens=width,
         max_resident_requests=6,
         kda_history_capacity=history_capacity,
     )
     assert recipe.workspace_bytes() - smaller.workspace_bytes() == (
-        69 * 3 * 12 * capacity * 128 * 4 + 4
+        69 * 3 * 12 * capacity * 128 * 4 + 69 * (width + 3) * 4608 * 2 + 2 * 4
     )
     recipe.server_args.disaggregation_mode = "prefill"
     assert recipe.groups() == schema

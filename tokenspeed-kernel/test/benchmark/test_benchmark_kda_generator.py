@@ -303,7 +303,8 @@ def test_retained_benchmark_repetitions_restore_mutable_state(
                 [
                     layer["state"],
                     layer["conv"],
-                    layer["count"],
+                    layer["replay"],
+                    layer["records"].preconv.rows,
                     history.length,
                     history.correction,
                     history.key,
@@ -314,9 +315,12 @@ def test_retained_benchmark_repetitions_restore_mutable_state(
                 window if mode == "kda_retained_commit" else history_length
             )
             slots = history.record_slots.long()
-            # The commit advances the count every layer shares; the verify
+            # The commit advances the count and ring state every layer
+            # shares, past the window that started at ring row 3; the verify
             # reads the round's start.
-            assert layer["count"][slots, 0].tolist() == [expected_length]
+            assert layer["replay"][slots].tolist() == [
+                [expected_length, 1 if mode == "kda_retained_commit" else 0]
+            ]
             assert history.length[slots, 0].tolist() == [
                 0 if mode == "kda_retained_commit" else history_length
             ]
@@ -375,11 +379,24 @@ def test_retained_verify_benchmark_keeps_the_raw_qkv_rows(monkeypatch, batch):
     monkeypatch.setattr(kda_generator, "_retained_benchmark_layer", capture_layer)
     prepared = kda_generator.prepare_kda_fused_paged_verify(request, current_platform())
     (layer,) = layers
-    raw_rows = layer["records"].original_qkv
-    raw_rows.fill_(float("nan"))
+    # Each request's ring holds its page's taps in rows 0..2 and takes its
+    # window's raw rows from row 3.
+    ring = layer["records"].preconv.rows
+    ring[:, 3:].fill_(float("nan"))
     prepared.invocation.reset()
     prepared.invocation.invoke()
-    torch.testing.assert_close(raw_rows, layer["projection"].mixed_qkv, atol=0, rtol=0)
+    torch.testing.assert_close(
+        ring[:, 3:],
+        layer["projection"].mixed_qkv.view(batch, 4, -1),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        ring[:, :3].transpose(1, 2),
+        layer["conv"][layer["reads"].long()],
+        atol=0,
+        rtol=0,
+    )
 
 
 def test_history_capacity_defaults_to_16_and_validates_against_window():

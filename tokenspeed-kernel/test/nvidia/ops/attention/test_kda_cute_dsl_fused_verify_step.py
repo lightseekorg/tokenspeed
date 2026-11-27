@@ -49,12 +49,17 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 if not ArchVersion(10, 0) <= current_platform().arch_version <= ArchVersion(10, 3):
     pytest.skip("requires SM100 or SM103", allow_module_level=True)
-from kda_retained_reference import prepare_history  # noqa: E402
+from kda_retained_reference import (  # noqa: E402
+    prepare_history,
+    replay_length,
+    snapshot,
+)
 from tokenspeed_kernel.ops.activation.triton import (  # noqa: E402
     rmsnorm_gated_sigmoid,
 )
 from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
     KdaOutputNorm,
+    KdaPreconvRing,
     KdaRetainedHistory,
     KdaRetainedRecords,
     kda_fused_paged_verify,
@@ -116,9 +121,9 @@ def _inputs(batch, *, seed, lower_bound=-5.0, metadata=True, f_a_pitch=0):
     )
 
 
-def _records(x, *, original, capacity=1, correction_stride=1):
+def _records(x, *, capacity=1, correction_stride=1):
     """Sentinel-filled request records, with padding around each slot."""
-    slots, rows = x["slots"], x["mixed_qkv"].shape[0]
+    slots = x["slots"]
     correction_rows = torch.full(
         (slots, capacity * WIDTH * correction_stride + CORRECTION_ROW_PAD),
         CORRECTION_FILL,
@@ -138,18 +143,22 @@ def _records(x, *, original, capacity=1, correction_stride=1):
         .transpose(1, 2)[..., ::correction_stride],
         packed[..., :DIM],
         packed[..., DIM:],
-        torch.zeros(slots, 1, dtype=torch.int32, device="cuda"),
+        replay_length(slots),
         x["state_indices"],
         torch.arange(x["state_indices"].numel(), device="cuda", dtype=torch.int32),
     )
     stamps = torch.full(
         (x["slots"], capacity, 2), STAMP_FILL, device="cuda", dtype=torch.int64
     )
+    # Each slot's pre-convolution ring, padded; the prepare seeds rows 0..2.
     retained = torch.full(
-        (rows, 3 * WIDTH + 8), ORIGINAL_FILL, device="cuda"
+        (slots, 4, 3 * WIDTH + 8), ORIGINAL_FILL, device="cuda"
     ).bfloat16()
     records = KdaRetainedRecords(
-        original_qkv=retained[:, : 3 * WIDTH] if original else None,
+        preconv=KdaPreconvRing(
+            retained[..., : 3 * WIDTH],
+            snapshot(history, x["state_indices"].numel())[:, 1],
+        ),
         history=history,
         metadata=x["record_metadata"],
         stamps=stamps if x["record_metadata"] is not None else None,
@@ -158,19 +167,25 @@ def _records(x, *, original, capacity=1, correction_stride=1):
     return records, (correction_rows, key_gate_rows, stamps, retained)
 
 
-def _verify(x, records, output_norm, *, override=None, **producers):
-    # Serving readies the history before every verify round.
+def _prepare(x, records):
+    # Serving readies the history and the ring before every verify round.
     prepare_history(
         x["state_pool"],
         records.history,
         x["state_indices"],
         x["query_start_loc"],
         draft_token_num=1,
+        conv=x["conv_states"],
+        preconv=records.preconv,
     )
+
+
+def _verify(x, records, output_norm, *, override=None, prepare=True, **producers):
+    if prepare:
+        _prepare(x, records)
     return kda_fused_paged_verify(
         x["mixed_qkv"],
         x["conv_weights"],
-        x["conv_states"],
         x["f_a_out"],
         x["f_b_weight"],
         x["beta_logits"],
@@ -193,24 +208,29 @@ def _verify(x, records, output_norm, *, override=None, **producers):
 
 def _split(x, prepared=None):
     """The serving split producers, then the registered record verify."""
-    records, buffers = _records(x, original=False) if prepared is None else prepared
+    records, buffers = _records(x) if prepared is None else prepared
+    _prepare(x, records)
     conv_qkv = fused_kda_verify_conv_update(
         x["mixed_qkv"],
         x["conv_weights"],
-        x["conv_states"],
         x["state_indices"],
+        live_indices=records.history.live_state_indices,
+        preconv=records.preconv,
+        record_slots=records.history.record_slots,
+        page_count=x["state_pool"].shape[0],
         num_heads=HEADS,
         head_dim=DIM,
         draft_token_num=1,
-        original_qkv=buffers[3][:, : 3 * WIDTH],
         query_start_loc=x["query_start_loc"],
     )
     g_raw = F.linear(x["f_a_out"], x["f_b_weight"])
-    return _verify(x, records, None, g_raw=g_raw, conv_qkv=conv_qkv), buffers
+    records = dataclasses.replace(records, preconv=None)
+    out = _verify(x, records, None, prepare=False, g_raw=g_raw, conv_qkv=conv_qkv)
+    return out, buffers
 
 
 def _fused(x, output_norm=None):
-    records, buffers = _records(x, original=True)
+    records, buffers = _records(x)
     return _verify(x, records, output_norm), buffers
 
 
@@ -261,8 +281,8 @@ def test_retained_prefix_append_preserves_base_and_publishes_on_commit(
 
     x = _inputs(2, seed=140)
     x["state_pool"] = x["state_pool"].to(state_dtype)
-    records = _records(x, original=True, capacity=8)[0]
-    expected = _records(x, original=True, capacity=8)[0]
+    records = _records(x, capacity=8)[0]
+    expected = _records(x, capacity=8)[0]
     check_fused_retained_append(
         x, records, expected, _verify, width=1, raw_gate_only=raw_gate_only
     )
@@ -284,8 +304,8 @@ def test_fused_step_matches_split_with_mixed_retained_lengths(
     x["state_indices"].copy_(
         torch.tensor([1, 0, -1, *range(2, 12)], device="cuda", dtype=torch.int32)
     )
-    records, _ = _records(x, original=True, capacity=32)
-    reference, buffers = _records(x, original=False, capacity=32)
+    records, _ = _records(x, capacity=32)
+    reference, buffers = _records(x, capacity=32)
     live = x["state_indices"].clone()
     live[-1] = 12
     records = dataclasses.replace(
@@ -352,7 +372,7 @@ def test_fused_step_matches_split_with_mixed_retained_lengths(
     ):
         torch.testing.assert_close(field, peer, atol=5e-5, rtol=2e-3)
     assert torch.equal(records.stamps, reference.stamps)
-    assert torch.equal(records.original_qkv, buffers[3][:, : 3 * WIDTH])
+    assert torch.equal(records.preconv.rows, buffers[3][..., : 3 * WIDTH])
     # The prepare only reads the counts: row 11's overflowing count folded
     # into its page and the verify read none of it; row 12's copy keeps its 8.
     counts = [0, 5, 7, 1, 2, 3, 8, 9, 15, 16, 17, 32, 8]
@@ -361,6 +381,53 @@ def test_fused_step_matches_split_with_mixed_retained_lengths(
     torch.testing.assert_close(
         x["state_pool"].float(), ref_x["state_pool"].float(), atol=2e-6, rtol=2e-5
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.mem_get_info()[0] < 12 << 30,
+    reason="ring slots past 2**31 elements need 12 GiB free",
+)
+def test_far_ring_slots_past_int32_verify_like_near_ones():
+    """Ring slot offsets past 2**31 elements verify exactly like near slots.
+
+    Rows 0 and 1 own slots 3 and 2, whose rows in the far ring start past
+    2**31 elements; both rings start empty and the prepare seeds them.
+    """
+    x = _inputs(2, seed=71)
+    ring_rows, slots = 4, x["slots"]
+
+    def run(ring):
+        records, buffers = _records(x)
+        history = dataclasses.replace(
+            records.history,
+            record_slots=torch.tensor([3, 2], device="cuda", dtype=torch.int32),
+        )
+        records = dataclasses.replace(
+            records,
+            history=history,
+            preconv=KdaPreconvRing(ring, records.preconv.heads),
+        )
+        return _verify(x, records, None), buffers
+
+    near_ring = torch.zeros(slots, ring_rows, 3 * WIDTH, device="cuda").bfloat16()
+    stride = (1 << 30) + ring_rows * 3 * WIDTH
+    storage = torch.zeros(
+        (slots - 1) * stride + ring_rows * 3 * WIDTH,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    far_ring = storage.as_strided((slots, ring_rows, 3 * WIDTH), (stride, 3 * WIDTH, 1))
+    assert 2 * stride > 2**31
+    near, far = run(near_ring), run(far_ring)
+    assert torch.equal(far[0], near[0])
+    for got, want in zip(far[1][:3], near[1][:3]):
+        assert torch.equal(got, want)
+    assert torch.equal(far_ring[2:], near_ring[2:])
+    # Each row's ring holds its source taps and its candidate at row 3.
+    for row, slot in enumerate((3, 2)):
+        page = int(x["state_indices"][row])
+        assert torch.equal(far_ring[slot, :3].T, x["conv_states"][page, : 3 * WIDTH])
+        assert torch.equal(far_ring[slot, 3], x["mixed_qkv"][row])
 
 
 def test_far_pages_of_a_pool_past_int32_verify_like_near_ones():
@@ -403,7 +470,7 @@ def test_fused_step_without_metadata_records_by_request():
 def test_strided_replay_records_are_rejected(strided):
     """The kernel reads the record metadata and stamps as dense INT64 rows."""
     x = _inputs(3, seed=42)
-    records = _records(x, original=True)[0]
+    records = _records(x)[0]
     dense = records.metadata if strided == "metadata" else records.stamps
     wide = dense.new_zeros(*dense.shape[:-1], 2 * dense.shape[-1])
     view = wide[..., ::2]
@@ -429,10 +496,8 @@ def test_strided_or_unaligned_inputs_match_split_producers(layout):
             interleaved = values.new_zeros(2 * values.numel())
             x[name] = interleaved[::2].copy_(values)
     correction_stride = 2 if layout == "correction channels" else 1
-    expected = _split(
-        x, _records(x, original=False, correction_stride=correction_stride)
-    )
-    records, buffers = _records(x, original=True, correction_stride=correction_stride)
+    expected = _split(x, _records(x, correction_stride=correction_stride))
+    records, buffers = _records(x, correction_stride=correction_stride)
     actual = _verify(x, records, None), buffers
     # The fallback runs the reference producers, so every result is exact.
     assert torch.equal(expected[0], actual[0])
@@ -542,3 +607,117 @@ def test_a_page_past_the_pool_verifies_as_padding():
     assert torch.equal(past_out, out)
     for past, padded in zip(past_buffers, buffers, strict=True):
         assert torch.equal(past, padded)
+
+
+def _share_live_slot_zero(records):
+    """Rows 1 to 3 share live row 0's record slot 0, with ring head 0.
+
+    Rows 1 and 2 have pages 0 and -1; row 3 has a source page but a masked
+    live page. Head 0 points their taps at slot 0's rows 1..3, which row 0
+    reads and writes (head 3). Row 4 keeps its own slot.
+    """
+    live = records.history.live_state_indices.clone()
+    live[3] = 0
+    slots = records.history.record_slots.clone()
+    slots[:4] = 0
+    records = dataclasses.replace(
+        records,
+        history=dataclasses.replace(
+            records.history, live_state_indices=live, record_slots=slots
+        ),
+    )
+    return records
+
+
+def test_padding_rows_beside_live_slot_zero_touch_no_ring_row():
+    """Padding rows sharing live slot 0 read a zero history and write no row.
+
+    The fused kernel and the split producers give the same bits; slot 0 holds
+    exactly row 0's taps and candidate, slots of no taking-part row keep their
+    fill, and the padding rows' outputs are zero.
+    """
+    x = _inputs(5, seed=233)
+    runs = []
+    for fused in (False, True):
+        records, buffers = _records(x)
+        records = _share_live_slot_zero(records)
+        _prepare(x, records)
+        records.preconv.heads[1:4] = 0
+        if fused:
+            out = _verify(
+                x,
+                records,
+                None,
+                override="cute_dsl_kda_fused_paged_verify_step",
+                prepare=False,
+            )
+        else:
+            conv_qkv = fused_kda_verify_conv_update(
+                x["mixed_qkv"],
+                x["conv_weights"],
+                x["state_indices"],
+                live_indices=records.history.live_state_indices,
+                preconv=records.preconv,
+                record_slots=records.history.record_slots,
+                page_count=x["state_pool"].shape[0],
+                num_heads=HEADS,
+                head_dim=DIM,
+                draft_token_num=1,
+                query_start_loc=x["query_start_loc"],
+            )
+            out = _verify(
+                x,
+                dataclasses.replace(records, preconv=None),
+                None,
+                prepare=False,
+                g_raw=F.linear(x["f_a_out"], x["f_b_weight"]),
+                conv_qkv=conv_qkv,
+            )
+        runs.append((out, buffers))
+    _assert_matches(*runs)
+    out, (_, _, _, ring) = runs[1]
+    page = int(x["state_indices"][0])
+    assert torch.equal(ring[0, :3, : 3 * WIDTH].T, x["conv_states"][page, : 3 * WIDTH])
+    assert torch.equal(ring[0, 3, : 3 * WIDTH], x["mixed_qkv"][0])
+    assert (ring[1:4] == ORIGINAL_FILL).all()
+    assert torch.equal(ring[4, 3, : 3 * WIDTH], x["mixed_qkv"][4])
+    assert (out[0, 1:4] == 0).all()
+
+
+def test_an_empty_ring_verifies_padding_without_reading_it():
+    """With no record slot every row is padding: zero outputs, no ring access."""
+    x = dict(_inputs(2, seed=239, metadata=False), slots=0)
+    records, _ = _records(x)
+    assert records.preconv.rows.numel() == 0
+    out = _verify(
+        x, records, None, override="cute_dsl_kda_fused_paged_verify_step", prepare=False
+    )
+    torch.cuda.synchronize()
+    assert (out == 0).all()
+
+
+def test_a_ring_sharing_the_projection_storage_is_rejected():
+    """The fused entry rejects a ring inside the projection's storage before launch."""
+    x = _inputs(3, seed=241)
+    records, _ = _records(x)
+    rows, ring = x["mixed_qkv"].shape[0], records.preconv.rows
+    arena = torch.zeros(
+        rows * 3 * WIDTH + ring.numel(), device="cuda", dtype=torch.bfloat16
+    )
+    mixed = arena[: rows * 3 * WIDTH].view(rows, 3 * WIDTH)
+    mixed.copy_(x["mixed_qkv"])
+    shared = arena[rows * 3 * WIDTH :].view(ring.shape)
+    records = dataclasses.replace(
+        records, preconv=KdaPreconvRing(shared, records.preconv.heads)
+    )
+    before = arena.clone()
+    with pytest.raises(ValueError, match="storage separate"):
+        _verify(
+            dict(x, mixed_qkv=mixed),
+            records,
+            None,
+            override="cute_dsl_kda_fused_paged_verify_step",
+            prepare=False,
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(arena, before)

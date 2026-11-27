@@ -16,6 +16,7 @@ from collections.abc import Callable
 import torch
 from tokenspeed_kernel.ops.attention.kda import (
     KdaOutputNorm,
+    KdaPreconvRing,
     KdaPrefillResult,
     KdaRetainedRecords,
     apply_kda_output_norm,
@@ -46,15 +47,17 @@ _DENSE_HALF_SIGNATURES = format_signatures(
 def triton_kda_verify_conv_update(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
     read_indices: torch.Tensor,
     *,
+    live_indices: torch.Tensor,
+    preconv: KdaPreconvRing,
+    record_slots: torch.Tensor,
+    page_count: int,
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
     query_start_loc: torch.Tensor,
     bias: torch.Tensor | None = None,
-    original_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Materialize the shared split-verify convolution producer."""
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
@@ -64,14 +67,16 @@ def triton_kda_verify_conv_update(
     return fused_kda_verify_conv_update(
         mixed_qkv,
         conv_weights,
-        conv_states,
         read_indices,
+        live_indices=live_indices,
+        preconv=preconv,
+        record_slots=record_slots,
+        page_count=page_count,
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         query_start_loc=query_start_loc,
         bias=bias,
-        original_qkv=original_qkv,
     )
 
 
@@ -94,7 +99,6 @@ def triton_kda_verify_conv_update(
 def triton_nvidia_kda_fused_paged_verify_split(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
     f_a_out: torch.Tensor,
     f_b_weight: torch.Tensor,
     beta_logits: torch.Tensor,
@@ -112,45 +116,38 @@ def triton_nvidia_kda_fused_paged_verify_split(
     g_raw: torch.Tensor | None = None,
     conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run target verify with split convolution and gate producers."""
+    """Run target verify with split convolution and gate producers.
+
+    Without conv_qkv, the convolution producer runs here on
+    retained_records.preconv; with it, the producer that made it already
+    read and wrote the ring, and retained_records.preconv is None.
+    """
     records = retained_records
     from tokenspeed_kernel.ops.attention.kda import _attention_format_signature
     from tokenspeed_kernel.selection import select_kernel
 
+    if (conv_qkv is None) == (records.preconv is None):
+        raise ValueError(
+            "split KDA verify takes the pre-convolution ring exactly when it "
+            "runs the convolution producer"
+        )
     if g_raw is None:
         g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
     if conv_qkv is None:
         conv_qkv = triton_kda_verify_conv_update(
             mixed_qkv,
             conv_weights,
-            conv_states,
             read_indices,
+            live_indices=records.history.live_state_indices,
+            preconv=records.preconv,
+            record_slots=records.history.record_slots,
+            page_count=state_pool.shape[0],
             num_heads=num_heads,
             head_dim=head_dim,
             draft_token_num=draft_token_num,
             query_start_loc=records.query_start_loc,
             bias=None,
-            original_qkv=None,
         )
-    destination = records.original_qkv
-    if destination is not None:
-        if (
-            destination.shape != mixed_qkv.shape
-            or destination.dtype != mixed_qkv.dtype
-            or destination.device != mixed_qkv.device
-            or destination.stride(-1) != 1
-            or destination.stride(0) < destination.shape[-1]
-        ):
-            raise ValueError("Original QKV destination must match the input rows")
-        storage = destination.untyped_storage()
-        begin, end = storage.data_ptr(), storage.data_ptr() + storage.nbytes()
-        for source in (mixed_qkv, g_raw, beta_logits):
-            source_storage = source.untyped_storage()
-            if (
-                begin < source_storage.data_ptr() + source_storage.nbytes()
-                and source_storage.data_ptr() < end
-            ):
-                raise ValueError("Original QKV destination must not overlap producers")
     q, k, v = (
         part.view(1, -1, num_heads, head_dim) for part in conv_qkv.chunk(3, dim=-1)
     )
@@ -184,8 +181,6 @@ def triton_nvidia_kda_fused_paged_verify_split(
         record_metadata=records.metadata,
         record_stamps=records.stamps,
     )
-    if destination is not None:
-        destination.copy_(mixed_qkv)
     return apply_kda_output_norm(out, output_norm)
 
 

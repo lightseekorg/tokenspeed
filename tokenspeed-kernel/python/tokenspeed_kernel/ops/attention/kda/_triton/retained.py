@@ -24,11 +24,11 @@ from tokenspeed_kernel._triton import tl, triton
 
 # The retained commit descriptor ABI (KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS):
 # one UINT64 row per layer, these columns.
-_DESCRIPTOR_COLUMNS = tl.constexpr(12)
-_QKV = tl.constexpr(0)
+_DESCRIPTOR_COLUMNS = tl.constexpr(13)
+_RING = tl.constexpr(0)
 _CONV = tl.constexpr(1)
 _PAGES = tl.constexpr(2)
-_QKV_ROW_STRIDE = tl.constexpr(3)
+_RING_ROW_STRIDE = tl.constexpr(3)
 _CONV_PAGE_STRIDE = tl.constexpr(4)
 _CONV_CHANNEL_STRIDE = tl.constexpr(5)
 _CONV_TAP_STRIDE = tl.constexpr(6)
@@ -37,6 +37,10 @@ _STATE_PAGE_STRIDE = tl.constexpr(8)
 _STATE_HEAD_STRIDE = tl.constexpr(9)
 _STATE_VALUE_STRIDE = tl.constexpr(10)
 _STATE_KEY_STRIDE = tl.constexpr(11)
+_RING_SLOT_STRIDE = tl.constexpr(12)
+# The pre-convolution ring keeps the convolution's 3 past inputs ahead of a
+# verify window's candidates: RING = WINDOW + 3 rows per request slot.
+_RING_HISTORY = tl.constexpr(3)
 # Records a fold applies per unrolled step, so their loads issue together.
 _FOLD_RECORDS = tl.constexpr(8)
 
@@ -151,7 +155,7 @@ def retained_materialize_kernel(
     ]
 )
 def retained_reset_length_kernel(
-    length,
+    replay_state,
     indices,
     record_slots,
     slot_stride,
@@ -172,11 +176,10 @@ def retained_reset_length_kernel(
     valid = (
         (row < rows) & (page > 0) & (page < pages) & (slot >= 0) & (slot < slot_count)
     )
-    tl.store(
-        length + slot * length_stride,
-        0,
-        mask=valid,
-    )
+    # The count and the ring state clear together: an unseeded ring reseeds
+    # from the page that now holds the dense state.
+    tl.store(replay_state + slot * length_stride, 0, mask=valid)
+    tl.store(replay_state + slot * length_stride + 1, 0, mask=valid)
 
 
 @triton.jit
@@ -190,7 +193,7 @@ def retained_batched_accept(
     record_slots,
     metadata,
     stamps,
-    replay_length,
+    snapshot,
     layer,
     row,
     group_count,
@@ -202,11 +205,9 @@ def retained_batched_accept(
     query_stride,
     record_slot_stride,
     record_slot_count,
-    length_stride,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
-    CAPACITY: tl.constexpr,
     WINDOW: tl.constexpr,
 ):
     """One layer's checks of a request row's commit.
@@ -214,7 +215,9 @@ def retained_batched_accept(
     ``live`` says the layer carries the row: its group's source and live
     pages lie in the pool, the record slot is resident and the window is
     non-empty. ``valid`` adds every accepted candidate's stamp. ``old`` is
-    the count of records the round's verify read before its candidates.
+    the count of records the round's verify read before its candidates and
+    ``head`` the ring row of its first candidate, both from the prepare's
+    snapshot of the row.
     """
     group = tl.load(groups + layer).to(tl.int64)
     valid = (group >= 0) & (group < group_count)
@@ -250,9 +253,10 @@ def retained_batched_accept(
     )
     # Every layer of the request shares its slot's count. The verify read it
     # whole when it lies in [0, CAPACITY - WINDOW], else none (the prepare
-    # folded the records into the live page), so old + take <= CAPACITY.
-    old = tl.load(replay_length + record_slot * length_stride, mask=valid, other=0)
-    old = tl.where((old < 0) | (old > CAPACITY - WINDOW), 0, old)
+    # folded the records into the live page), so old + take <= CAPACITY; the
+    # prepare's snapshot holds that applied count and the ring head.
+    old = tl.load(snapshot + row * 2, mask=valid, other=0)
+    head = tl.load(snapshot + row * 2 + 1, mask=valid, other=0).to(tl.int64)
     stamp_slot = tl.load(metadata + row * 3).to(tl.int64)
     generation = tl.load(metadata + row * 3 + 1)
     absolute = tl.load(metadata + row * 3 + 2)
@@ -283,7 +287,7 @@ def retained_batched_accept(
         )
         == 0
     )
-    return source, target, begin, take, old, valid & fresh, live, record_slot
+    return source, target, begin, take, old, head, valid & fresh, live, record_slot
 
 
 @triton.jit
@@ -370,7 +374,6 @@ _BATCHED_RUNTIME_ARGUMENTS = [
     "query_stride",
     "record_slot_stride",
     "record_slot_count",
-    "length_stride",
     "stamp_slots",
     "stamp_capacity",
     "stopped_count",
@@ -394,7 +397,7 @@ def retained_batched_conv_kernel(
     metadata,
     stamps,
     request_stopped,
-    replay_length,
+    snapshot,
     request_ends,
     group_count,
     read_group_stride,
@@ -405,7 +408,6 @@ def retained_batched_conv_kernel(
     query_stride,
     record_slot_stride,
     record_slot_count,
-    length_stride,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
@@ -416,10 +418,8 @@ def retained_batched_conv_kernel(
     correction_strides,
     key_strides,
     decay_strides,
-    CAPACITY: tl.constexpr,
     WINDOW: tl.constexpr,
     CHANNELS: tl.constexpr,
-    ACTIVATION: tl.constexpr,
     CONV: tl.constexpr,
     STATE: tl.constexpr,
     HEADS: tl.constexpr,
@@ -429,7 +429,7 @@ def retained_batched_conv_kernel(
     INCOMPLETE: tl.constexpr,
 ):
     layer, row = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
-    source, target, begin, take, old, valid, live, record_slot = (
+    source, target, begin, take, old, head, valid, live, record_slot = (
         retained_batched_accept(
             descriptors,
             groups,
@@ -440,7 +440,7 @@ def retained_batched_conv_kernel(
             record_slots,
             metadata,
             stamps,
-            replay_length,
+            snapshot,
             layer,
             row,
             group_count,
@@ -452,11 +452,9 @@ def retained_batched_conv_kernel(
             query_stride,
             record_slot_stride,
             record_slot_count,
-            length_stride,
             stamp_strides,
             stamp_slots,
             stamp_capacity,
-            CAPACITY,
             WINDOW,
         )
     )
@@ -469,9 +467,10 @@ def retained_batched_conv_kernel(
             tl.atomic_cas(request_ends + row, ENDED, INCOMPLETE)
         return
     base = descriptors + layer * _DESCRIPTOR_COLUMNS
-    original = tl.load(base + _QKV).to(tl.pointer_type(ACTIVATION))
+    ring = tl.load(base + _RING).to(tl.pointer_type(CONV))
     conv = tl.load(base + _CONV).to(tl.pointer_type(CONV))
-    qkv_stride = tl.load(base + _QKV_ROW_STRIDE).to(tl.int64)
+    ring_row_stride = tl.load(base + _RING_ROW_STRIDE).to(tl.int64)
+    ring_slot_stride = tl.load(base + _RING_SLOT_STRIDE).to(tl.int64)
     conv_stride = tl.load(base + _CONV_PAGE_STRIDE).to(tl.int64)
     channel_stride = tl.load(base + _CONV_CHANNEL_STRIDE).to(tl.int64)
     tap_stride = tl.load(base + _CONV_TAP_STRIDE).to(tl.int64)
@@ -481,12 +480,23 @@ def retained_batched_conv_kernel(
     h0 = tl.load(ptr, mask=mask, other=0)
     h1 = tl.load(ptr + tap_stride, mask=mask, other=0)
     h2 = tl.load(ptr + 2 * tap_stride, mask=mask, other=0)
+    # The verify wrote candidate t to ring row (head + t) mod RING. The row
+    # index stays below RING, so its INT32 math cannot wrap; it is widened
+    # before the row stride multiplies it.
+    slot_rows = ring + record_slot * ring_slot_stride
+    head32 = head.to(tl.int32)
     for token in tl.static_range(WINDOW):
+        ring_row = head32 + token
+        ring_row = tl.where(
+            ring_row >= WINDOW + _RING_HISTORY,
+            ring_row - (WINDOW + _RING_HISTORY),
+            ring_row,
+        )
         x = tl.load(
-            original + (begin + token) * qkv_stride + channel,
+            slot_rows + ring_row.to(tl.int64) * ring_row_stride + channel,
             mask=mask & (token < take),
             other=0,
-        ).to(CONV)
+        )
         h0 = tl.where(token < take, h1, h0)
         h1 = tl.where(token < take, h2, h1)
         h2 = tl.where(token < take, x, h2)
@@ -532,7 +542,7 @@ def retained_batched_conv_kernel(
         "query_stride",
         "record_slot_stride",
         "record_slot_count",
-        "length_stride",
+        "state_stride",
         "stopped_count",
     ]
 )
@@ -545,7 +555,8 @@ def retained_batched_publish_kernel(
     starts,
     record_slots,
     request_stopped,
-    replay_length,
+    snapshot,
+    replay_state,
     batch,
     layers,
     group_count,
@@ -557,22 +568,24 @@ def retained_batched_publish_kernel(
     query_stride,
     record_slot_stride,
     record_slot_count,
-    length_stride,
+    state_stride,
     stopped_count,
-    CAPACITY: tl.constexpr,
     WINDOW: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Write each request row's count once every layer's commit has read it.
+    """Write each request row's count and ring state once every layer's commit has read them.
 
     A row the commit carries -- its source and live pages lie in the pool in
     a state group one of the ``layers`` launched layers lists, its record
     slot is resident and its window is non-empty -- sets its slot's count to
-    the records its verify read plus the round's acceptance, or to 0 when its
-    request ended in this forward (the commit folded its records into its
-    live page). Other rows (graph padding, masked overlap rows, rows paged
-    only in groups no launched layer lists) leave every count alone. Real
-    rows have distinct slots, so no two programs write the same count.
+    the records its verify read plus the round's acceptance and its ring
+    state to the ring row after the last accepted candidate, plus one; or
+    both to 0 when its request ended in this forward (the commit folded its
+    records into its live page). The prepare's snapshot holds the applied
+    count and the ring head of each row. Other rows (graph padding, masked
+    overlap rows, rows paged only in groups no launched layer lists) leave
+    every slot alone. Real rows have distinct slots, so no two programs write
+    the same slot.
     """
     lanes = tl.arange(0, BLOCK)
     row = tl.program_id(0).to(tl.int64) * BLOCK + lanes
@@ -628,18 +641,19 @@ def retained_batched_publish_kernel(
         tl.maximum(tl.load(accepted + row * accepted_stride, mask=carried, other=0), 0),
         tl.minimum(count, WINDOW),
     )
-    old = tl.load(replay_length + record_slot * length_stride, mask=carried, other=0)
-    old = tl.where((old < 0) | (old > CAPACITY - WINDOW), 0, old)
+    old = tl.load(snapshot + row * 2, mask=carried, other=0)
+    head = tl.load(snapshot + row * 2 + 1, mask=carried, other=0) + take
+    head = tl.where(
+        head >= WINDOW + _RING_HISTORY, head - (WINDOW + _RING_HISTORY), head
+    )
     stopped = tl.load(
         request_stopped + record_slot,
         mask=carried & (record_slot < stopped_count),
         other=0,
     )
-    tl.store(
-        replay_length + record_slot * length_stride,
-        tl.where(stopped, 0, old + take).to(tl.int32),
-        mask=carried,
-    )
+    slot_state = replay_state + record_slot * state_stride
+    tl.store(slot_state, tl.where(stopped, 0, old + take).to(tl.int32), mask=carried)
+    tl.store(slot_state + 1, tl.where(stopped, 0, head + 1).to(tl.int32), mask=carried)
 
 
 # Readying retained history for a verify forward, every layer in one launch.
@@ -655,7 +669,7 @@ _PREPARE_RUNTIME_ARGUMENTS = [
     "query_stride",
     "record_slot_stride",
     "record_slot_count",
-    "length_stride",
+    "state_stride",
 ]
 
 
@@ -667,7 +681,8 @@ def retained_batched_prepare_kernel(
     lives,
     starts,
     record_slots,
-    replay_length,
+    replay_state,
+    snapshot,
     correction,
     retained_key,
     retained_decay,
@@ -679,19 +694,22 @@ def retained_batched_prepare_kernel(
     query_stride,
     record_slot_stride,
     record_slot_count,
-    length_stride,
+    state_stride,
     correction_strides,
     key_strides,
     decay_strides,
     CAPACITY: tl.constexpr,
     WINDOW: tl.constexpr,
+    CHANNELS: tl.constexpr,
+    CONV: tl.constexpr,
     STATE: tl.constexpr,
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
     KEYS: tl.constexpr,
     ROWS: tl.constexpr,
+    SEED_BLOCK: tl.constexpr,
 ):
-    """Ready one layer's live page of a request row for the round's verify.
+    """Ready one layer's live page and ring of a request row for the round's verify.
 
     A row takes part in a layer when the layer's group is listed, its source
     and live pages lie inside the pool, its window is non-empty and its
@@ -704,8 +722,16 @@ def retained_batched_prepare_kernel(
     source gets the source state copied, with no record applied: the H
     records stay valid on top of the copy. Program (layer, row, split)
     handles every head h with h % splits == split, in ROWS x KEYS tiles;
-    KEYS is DIM rounded up to a power of two. Counts and records stay
-    untouched; the commit alone writes the count.
+    KEYS is DIM rounded up to a power of two.
+
+    A slot whose ring state is 0 holds no pre-convolution rows yet: the row
+    seeds ring rows 0..2 of the layer from its source page's three
+    convolution taps, and the verify starts its candidates at ring row 3.
+    Program (layer 0, row, split 0) writes the row's snapshot: the count the
+    verify applies (H, or 0 when H overflows) and the ring row of its first
+    candidate, which the verify and the commit read. Counts, ring states and
+    records stay untouched; the commit alone writes the counts and ring
+    states.
     """
     layer, row = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     base = descriptors + layer * _DESCRIPTOR_COLUMNS
@@ -725,6 +751,7 @@ def retained_batched_prepare_kernel(
     begin = tl.load(starts + row * query_stride).to(tl.int64)
     tokens = tl.load(starts + (row + 1) * query_stride).to(tl.int64) - begin
     slot = tl.load(record_slots + row * record_slot_stride).to(tl.int64)
+    resident = (slot >= 0) & (slot < record_slot_count)
     active = (
         listed
         & (source > 0)
@@ -732,12 +759,43 @@ def retained_batched_prepare_kernel(
         & (live > 0)
         & (live < pages)
         & (tokens != 0)
-        & (slot >= 0)
-        & (slot < record_slot_count)
+        & resident
     )
-    # The accepted count belongs to the request slot, not to either page.
-    count = tl.load(replay_length + slot * length_stride, mask=active, other=0)
+    # The accepted count and the ring state belong to the request slot, not
+    # to either page.
+    count = tl.load(replay_state + slot * state_stride, mask=resident, other=0)
+    ring_state = tl.load(replay_state + slot * state_stride + 1, mask=resident, other=0)
     overflow = (count < 0) | (count > CAPACITY - WINDOW)
+    if (layer == 0) & (tl.program_id(2) == 0):
+        tl.store(snapshot + row * 2, tl.where(overflow, 0, count))
+        tl.store(
+            snapshot + row * 2 + 1,
+            tl.where(ring_state > 0, ring_state - 1, _RING_HISTORY),
+        )
+    if active & (ring_state == 0):
+        # Seed ring rows 0..2 with the taps the verify read from the page
+        # before the ring held them, oldest first.
+        ring = tl.load(base + _RING).to(tl.pointer_type(CONV))
+        conv = tl.load(base + _CONV).to(tl.pointer_type(CONV))
+        ring_row_stride = tl.load(base + _RING_ROW_STRIDE).to(tl.int64)
+        ring_slot_stride = tl.load(base + _RING_SLOT_STRIDE).to(tl.int64)
+        conv_stride = tl.load(base + _CONV_PAGE_STRIDE).to(tl.int64)
+        channel_stride = tl.load(base + _CONV_CHANNEL_STRIDE).to(tl.int64)
+        tap_stride = tl.load(base + _CONV_TAP_STRIDE).to(tl.int64)
+        taps = conv + source * conv_stride
+        rows = ring + slot * ring_slot_stride
+        lanes = tl.arange(0, SEED_BLOCK)
+        first = tl.program_id(2) * SEED_BLOCK
+        for start in range(first, CHANNELS, tl.num_programs(2) * SEED_BLOCK):
+            channel = (start + lanes).to(tl.int64)
+            mask = channel < CHANNELS
+            for tap in tl.static_range(_RING_HISTORY):
+                value = tl.load(
+                    taps + channel * channel_stride + tap * tap_stride,
+                    mask=mask,
+                    other=0,
+                )
+                tl.store(rows + tap * ring_row_stride + channel, value, mask=mask)
     if not (active & (overflow | (source != live))):
         return
     # The bound keeps the fold loop's trip count known to the compiler.

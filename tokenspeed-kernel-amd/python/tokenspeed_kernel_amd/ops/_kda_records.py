@@ -22,13 +22,14 @@
 
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
-# Row width of the batched retained commit descriptors: the QKV and
-# convolution fields, then the v-major recurrent state pointer and strides.
-_DESCRIPTOR_COLUMNS = gl.constexpr(12)
-_QKV = gl.constexpr(0)
+# Row width of the batched retained commit descriptors: the pre-convolution
+# ring and convolution fields, the v-major recurrent state pointer and
+# strides, then the ring's record-slot stride.
+_DESCRIPTOR_COLUMNS = gl.constexpr(13)
+_RING = gl.constexpr(0)
 _CONV = gl.constexpr(1)
 _PAGES = gl.constexpr(2)
-_QKV_ROW_STRIDE = gl.constexpr(3)
+_RING_ROW_STRIDE = gl.constexpr(3)
 _CONV_PAGE_STRIDE = gl.constexpr(4)
 _CONV_CHANNEL_STRIDE = gl.constexpr(5)
 _CONV_TAP_STRIDE = gl.constexpr(6)
@@ -37,6 +38,10 @@ _STATE_PAGE_STRIDE = gl.constexpr(8)
 _STATE_HEAD_STRIDE = gl.constexpr(9)
 _STATE_VALUE_STRIDE = gl.constexpr(10)
 _STATE_KEY_STRIDE = gl.constexpr(11)
+_RING_SLOT_STRIDE = gl.constexpr(12)
+# The pre-convolution ring keeps the convolution's 3 past inputs ahead of a
+# verify window's candidates: WINDOW + 3 rows per request slot.
+_RING_HISTORY = gl.constexpr(3)
 
 
 def kda_records_launch_metadata(grid, kernel, args):
@@ -99,11 +104,34 @@ def kda_retained_panel(
     return running
 
 
+def _elements_are_disjoint(tensor) -> bool:
+    """Whether distinct indices of ``tensor`` address distinct elements.
+
+    Dimensions of extent above one, taken by increasing stride, must each
+    step past every element the smaller ones reach: dense tensors and views
+    selecting from a larger one (one layer of a ring) pass, expanded and
+    overlapping views fail.
+    """
+    reach = 0
+    for size, stride in sorted(
+        (
+            (size, stride)
+            for size, stride in zip(tensor.shape, tensor.stride())
+            if size > 1
+        ),
+        key=lambda dim: dim[1],
+    ):
+        if stride <= reach:
+            return False
+        reach += (size - 1) * stride
+    return True
+
+
 def validate_kda_retained_verify(
     mixed,
-    original,
+    ring,
+    ring_heads,
     weights,
-    conv,
     raw_g,
     f_a,
     f_b,
@@ -158,13 +186,28 @@ def validate_kda_retained_verify(
         raise ValueError(
             "retained KDA producers require matching activation dtype and contiguous channels"
         )
-    if (
-        weights.shape != (3 * heads * dim, 4)
-        or conv.shape != (state.shape[0], 3 * heads * dim, 3)
-        or conv.stride()[1:] != (3, 1)
-        or state.stride()[1:] != (dim * dim, dim, 1)
+    if weights.shape != (3 * heads * dim, 4) or state.stride()[1:] != (
+        dim * dim,
+        dim,
+        1,
     ):
         raise ValueError("retained KDA requires four-tap convolution and V-major state")
+    if (
+        ring.ndim != 3
+        or ring.shape != (correction.shape[0], window + 3, 3 * heads * dim)
+        or ring.stride(2) != 1
+        or ring.dtype not in (mixed.dtype, torch.bfloat16)
+        or ring_heads.shape != (batch,)
+        or ring_heads.dtype != torch.int32
+    ):
+        raise ValueError(
+            "retained KDA requires a [record slots, window + 3, channels] "
+            "pre-convolution ring and one INT32 ring head per request"
+        )
+    if not _elements_are_disjoint(ring):
+        # A verify reads some rows of a slot while it writes others, and
+        # requests of different slots write concurrently.
+        raise ValueError("pre-convolution ring rows and slots must not share memory")
     if (
         a_log.shape != (heads,)
         or bias.numel() != heads * dim
@@ -182,7 +225,8 @@ def validate_kda_retained_verify(
         raise ValueError("retained KDA metadata and stamps must be supplied together")
     tensors = (
         weights,
-        conv,
+        ring,
+        ring_heads,
         *gate_inputs,
         beta,
         a_log,
@@ -211,27 +255,12 @@ def validate_kda_retained_verify(
                 "retained KDA stamps must cover request slots and history capacity"
             )
         tensors += (metadata, stamps)
-    if original is not None:
-        if (
-            original.shape != mixed.shape
-            or original.dtype != mixed.dtype
-            or original.stride(-1) != 1
-            or original.stride(0) < original.shape[-1]
-        ):
-            raise ValueError("Original QKV destination must match the input rows")
-        destination = original.untyped_storage()
-        begin, end = (
-            destination.data_ptr(),
-            destination.data_ptr() + destination.nbytes(),
-        )
-        for producer in (mixed, beta, *gate_inputs):
-            storage = producer.untyped_storage()
-            if (
-                begin < storage.data_ptr() + storage.nbytes()
-                and storage.data_ptr() < end
-            ):
-                raise ValueError("Original QKV destination must not overlap producers")
-        tensors += (original,)
+    destination = ring.untyped_storage()
+    begin, end = destination.data_ptr(), destination.data_ptr() + destination.nbytes()
+    for producer in (mixed, beta, *gate_inputs):
+        storage = producer.untyped_storage()
+        if begin < storage.data_ptr() + storage.nbytes() and storage.data_ptr() < end:
+            raise ValueError("the pre-convolution ring must not overlap producers")
     if any(x.device != mixed.device for x in tensors):
         raise ValueError("retained KDA inputs must be on the same device")
 
@@ -351,7 +380,7 @@ def retained_materialize_kernel(
     ],
 )
 def retained_reset_length_kernel(
-    length,
+    replay_state,
     indices,
     record_slots,
     slot_stride,
@@ -375,11 +404,10 @@ def retained_reset_length_kernel(
     valid = (
         (row < rows) & (page > 0) & (page < pages) & (slot >= 0) & (slot < slot_count)
     )
-    gl.store(
-        length + slot * length_stride,
-        0,
-        mask=valid,
-    )
+    # The count and the ring state clear together: an unseeded ring reseeds
+    # from the page that now holds the dense state.
+    gl.store(replay_state + slot * length_stride, 0, mask=valid)
+    gl.store(replay_state + slot * length_stride + 1, 0, mask=valid)
 
 
 @gluon.jit
@@ -393,7 +421,7 @@ def retained_batched_accept(
     record_slots,
     metadata,
     stamps,
-    replay_length,
+    snapshot,
     layer,
     row,
     group_count,
@@ -405,11 +433,9 @@ def retained_batched_accept(
     query_stride,
     record_slot_stride,
     record_slot_count,
-    length_stride,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
-    CAPACITY: gl.constexpr,
     WINDOW: gl.constexpr,
     WAVE: gl.constexpr,
 ):
@@ -418,7 +444,9 @@ def retained_batched_accept(
     ``live`` says the layer carries the row: its group's source and live
     pages lie in the pool, the record slot is resident and the window is
     non-empty. ``valid`` adds every accepted candidate's stamp. ``old`` is
-    the count of records the round's verify read before its candidates.
+    the count of records the round's verify read before its candidates and
+    ``head`` the ring row of its first candidate, both from the prepare's
+    snapshot of the row.
     """
     group = gl.load(groups + layer).to(gl.int64)
     valid = (group >= 0) & (group < group_count)
@@ -454,9 +482,10 @@ def retained_batched_accept(
     )
     # Every layer of the request shares its slot's count. The verify read it
     # whole when it lies in [0, CAPACITY - WINDOW], else none (the prepare
-    # folded the records into the live page), so old + take <= CAPACITY.
-    old = gl.load(replay_length + record_slot * length_stride, mask=valid, other=0)
-    old = gl.where((old < 0) | (old > CAPACITY - WINDOW), 0, old)
+    # folded the records into the live page), so old + take <= CAPACITY; the
+    # prepare's snapshot holds that applied count and the ring head.
+    old = gl.load(snapshot + row * 2, mask=valid, other=0)
+    head = gl.load(snapshot + row * 2 + 1, mask=valid, other=0).to(gl.int64)
     slot = gl.load(metadata + row * 3).to(gl.int64)
     generation = gl.load(metadata + row * 3 + 1)
     absolute = gl.load(metadata + row * 3 + 2)
@@ -487,7 +516,7 @@ def retained_batched_accept(
         )
         == 0
     )
-    return source, target, begin, take, old, valid & fresh, live, record_slot
+    return source, target, begin, take, old, head, valid & fresh, live, record_slot
 
 
 @gluon.jit
@@ -575,7 +604,6 @@ _BATCHED_RUNTIME_ARGUMENTS = [
     "query_stride",
     "record_slot_stride",
     "record_slot_count",
-    "length_stride",
     "stamp_slots",
     "stamp_capacity",
     "stopped_count",
@@ -600,7 +628,7 @@ def retained_batched_conv_kernel(
     metadata,
     stamps,
     request_stopped,
-    replay_length,
+    snapshot,
     request_ends,
     group_count,
     read_group_stride,
@@ -611,7 +639,6 @@ def retained_batched_conv_kernel(
     query_stride,
     record_slot_stride,
     record_slot_count,
-    length_stride,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
@@ -622,10 +649,8 @@ def retained_batched_conv_kernel(
     correction_strides,
     key_strides,
     decay_strides,
-    CAPACITY: gl.constexpr,
     WINDOW: gl.constexpr,
     CHANNELS: gl.constexpr,
-    ACTIVATION: gl.constexpr,
     CONV: gl.constexpr,
     STATE: gl.constexpr,
     HEADS: gl.constexpr,
@@ -636,7 +661,7 @@ def retained_batched_conv_kernel(
     WAVE: gl.constexpr,
 ):
     layer, row = gl.program_id(0).to(gl.int64), gl.program_id(1).to(gl.int64)
-    source, target, begin, take, old, valid, live, record_slot = (
+    source, target, begin, take, old, head, valid, live, record_slot = (
         retained_batched_accept(
             descriptors,
             groups,
@@ -647,7 +672,7 @@ def retained_batched_conv_kernel(
             record_slots,
             metadata,
             stamps,
-            replay_length,
+            snapshot,
             layer,
             row,
             group_count,
@@ -659,19 +684,18 @@ def retained_batched_conv_kernel(
             query_stride,
             record_slot_stride,
             record_slot_count,
-            length_stride,
             stamp_strides,
             stamp_slots,
             stamp_capacity,
-            CAPACITY,
             WINDOW,
             WAVE,
         )
     )
     base = descriptors + layer * _DESCRIPTOR_COLUMNS
-    original = gl.load(base + _QKV).to(gl.pointer_type(ACTIVATION))
+    ring = gl.load(base + _RING).to(gl.pointer_type(CONV))
     conv = gl.load(base + _CONV).to(gl.pointer_type(CONV))
-    qkv_stride = gl.load(base + _QKV_ROW_STRIDE).to(gl.int64)
+    ring_row_stride = gl.load(base + _RING_ROW_STRIDE).to(gl.int64)
+    ring_slot_stride = gl.load(base + _RING_SLOT_STRIDE).to(gl.int64)
     conv_stride = gl.load(base + _CONV_PAGE_STRIDE).to(gl.int64)
     channel_stride = gl.load(base + _CONV_CHANNEL_STRIDE).to(gl.int64)
     tap_stride = gl.load(base + _CONV_TAP_STRIDE).to(gl.int64)
@@ -684,12 +708,20 @@ def retained_batched_conv_kernel(
     h0 = gl.load(ptr, mask=mask, other=0)
     h1 = gl.load(ptr + tap_stride, mask=mask, other=0)
     h2 = gl.load(ptr + 2 * tap_stride, mask=mask, other=0)
+    # The verify wrote candidate t to ring row (head + t) mod RING.
+    rows = ring + record_slot * ring_slot_stride + channel
     for token in gl.static_range(WINDOW):
+        ring_row = head + token
+        ring_row = gl.where(
+            ring_row >= WINDOW + _RING_HISTORY,
+            ring_row - (WINDOW + _RING_HISTORY),
+            ring_row,
+        )
         x = gl.load(
-            original + (begin + token) * qkv_stride + channel,
+            rows + ring_row * ring_row_stride,
             mask=mask & (token < take),
             other=0,
-        ).to(CONV)
+        )
         h0 = gl.where(token < take, h1, h0)
         h1 = gl.where(token < take, h2, h1)
         h2 = gl.where(token < take, x, h2)
@@ -749,7 +781,7 @@ def retained_batched_conv_kernel(
         "query_stride",
         "record_slot_stride",
         "record_slot_count",
-        "length_stride",
+        "state_stride",
         "stopped_count",
     ],
 )
@@ -762,7 +794,8 @@ def retained_batched_publish_kernel(
     starts,
     record_slots,
     request_stopped,
-    replay_length,
+    snapshot,
+    replay_state,
     batch,
     layers,
     group_count,
@@ -774,23 +807,25 @@ def retained_batched_publish_kernel(
     query_stride,
     record_slot_stride,
     record_slot_count,
-    length_stride,
+    state_stride,
     stopped_count,
-    CAPACITY: gl.constexpr,
     WINDOW: gl.constexpr,
     BLOCK: gl.constexpr,
     WAVE: gl.constexpr,
 ):
-    """Write each request row's count once every layer's commit has read it.
+    """Write each request row's count and ring state once every layer's commit has read them.
 
     A row the commit carries -- its source and live pages lie in the pool in
     a state group one of the ``layers`` launched layers lists, its record
     slot is resident and its window is non-empty -- sets its slot's count to
-    the records its verify read plus the round's acceptance, or to 0 when its
-    request ended in this forward (the commit folded its records into its
-    live page). Other rows (graph padding, masked overlap rows, rows paged
-    only in groups no launched layer lists) leave every count alone. Real
-    rows have distinct slots, so no two programs write the same count.
+    the records its verify read plus the round's acceptance and its ring
+    state to the ring row after the last accepted candidate, plus one; or
+    both to 0 when its request ended in this forward (the commit folded its
+    records into its live page). The prepare's snapshot holds the applied
+    count and the ring head of each row. Other rows (graph padding, masked
+    overlap rows, rows paged only in groups no launched layer lists) leave
+    every slot alone. Real rows have distinct slots, so no two programs write
+    the same slot.
     """
     layout: gl.constexpr = gl.BlockedLayout([1], [WAVE], [4], [0])
     lanes = gl.arange(0, BLOCK, layout=layout)
@@ -847,15 +882,16 @@ def retained_batched_publish_kernel(
         gl.maximum(gl.load(accepted + row * accepted_stride, mask=carried, other=0), 0),
         gl.minimum(count, WINDOW),
     )
-    old = gl.load(replay_length + record_slot * length_stride, mask=carried, other=0)
-    old = gl.where((old < 0) | (old > CAPACITY - WINDOW), 0, old)
+    old = gl.load(snapshot + row * 2, mask=carried, other=0)
+    head = gl.load(snapshot + row * 2 + 1, mask=carried, other=0) + take
+    head = gl.where(
+        head >= WINDOW + _RING_HISTORY, head - (WINDOW + _RING_HISTORY), head
+    )
     stopped = gl.load(
         request_stopped + record_slot,
         mask=carried & (record_slot < stopped_count),
         other=0,
     )
-    gl.store(
-        replay_length + record_slot * length_stride,
-        gl.where(stopped, 0, old + take).to(gl.int32),
-        mask=carried,
-    )
+    slot_state = replay_state + record_slot * state_stride
+    gl.store(slot_state, gl.where(stopped, 0, old + take).to(gl.int32), mask=carried)
+    gl.store(slot_state + 1, gl.where(stopped, 0, head + 1).to(gl.int32), mask=carried)

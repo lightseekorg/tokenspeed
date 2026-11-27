@@ -25,6 +25,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.ops.attention.kda import (
     KdaOutputNorm,
+    KdaPreconvRing,
     KdaPrefillResult,
     KdaRetainedHistory,
     KdaRetainedRecords,
@@ -100,7 +101,6 @@ if current_platform().is_amd:
     def _gluon_kda_fused_paged_verify_vmajor_gfx950(
         mixed_qkv: torch.Tensor,
         conv_weights: torch.Tensor,
-        conv_states: torch.Tensor,
         f_a_out: torch.Tensor,
         f_b_weight: torch.Tensor,
         beta_logits: torch.Tensor,
@@ -118,11 +118,12 @@ if current_platform().is_amd:
         g_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Fuse gate, convolution and verify; a supplied raw gate takes precedence."""
+        if retained_records.preconv is None:
+            raise ValueError("fused KDA verify requires a pre-convolution ring")
         result = gluon_kda_retained_verify_gfx950(
             mixed_qkv=mixed_qkv,
-            original_qkv=retained_records.original_qkv,
+            preconv=retained_records.preconv,
             conv_weights=conv_weights,
-            conv_states=conv_states,
             raw_g=g_raw,
             f_a_out=f_a_out if g_raw is None else None,
             f_b_weight=f_b_weight if g_raw is None else None,
@@ -168,7 +169,6 @@ if current_platform().is_amd:
     def _gluon_kda_fused_paged_verify_vmajor_gfx1250(
         mixed_qkv: torch.Tensor,
         conv_weights: torch.Tensor,
-        conv_states: torch.Tensor,
         f_a_out: torch.Tensor,
         f_b_weight: torch.Tensor,
         beta_logits: torch.Tensor,
@@ -186,11 +186,12 @@ if current_platform().is_amd:
         g_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Fuse gate, convolution and verify; a supplied raw gate takes precedence."""
+        if retained_records.preconv is None:
+            raise ValueError("fused KDA verify requires a pre-convolution ring")
         result = gluon_kda_retained_verify_gfx1250(
             mixed_qkv=mixed_qkv,
-            original_qkv=retained_records.original_qkv,
+            preconv=retained_records.preconv,
             conv_weights=conv_weights,
-            conv_states=conv_states,
             raw_g=g_raw,
             f_a_out=f_a_out if g_raw is None else None,
             f_b_weight=f_b_weight if g_raw is None else None,
@@ -235,10 +236,21 @@ if current_platform().is_amd:
 
 
 def _validate_retained_request(
-    history, reads, starts, metadata, stamps, *, heads, dim, window, device
+    history, preconv, reads, starts, metadata, stamps, *, heads, dim, window, device
 ):
     """Check current request geometry; immutable storage was checked at construction."""
     batch = reads.numel()
+    if (
+        preconv.window != window
+        or preconv.rows.shape[0] != history.correction.shape[0]
+        or preconv.rows.shape[2] != 3 * heads * dim
+        or preconv.heads.shape != (batch,)
+        or preconv.rows.device != device
+    ):
+        raise ValueError(
+            "the pre-convolution ring must keep window + 3 rows of every "
+            "channel per record slot and one head per request"
+        )
     if (
         history.correction.shape[1] != heads
         or history.correction.shape[-1] != dim
@@ -275,9 +287,8 @@ def _validate_retained_request(
 def gluon_kda_retained_verify_gfx950(
     *,
     mixed_qkv: torch.Tensor,
-    original_qkv: torch.Tensor | None,
+    preconv: KdaPreconvRing,
     conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
     raw_g: torch.Tensor | None,
     f_a_out: torch.Tensor | None,
     f_b_weight: torch.Tensor | None,
@@ -297,10 +308,12 @@ def gluon_kda_retained_verify_gfx950(
 ) -> torch.Tensor:
     """Verify packed pre-convolution QKV using request-owned accepted records.
 
-    conv_states and state_pool contain source checkpoints. retained_history
-    selects private live pages and FP32 U/normalized-K/decay storage. Verify
-    writes candidates after the accepted prefix, without publishing length.
-    original_qkv optionally retains input rows for commit. raw_g excludes
+    state_pool contains source checkpoints. retained_history selects private
+    live pages and FP32 U/normalized-K/decay storage. Verify writes
+    candidates after the accepted prefix, without publishing length.
+    preconv is the layer's pre-convolution ring and each request's ring
+    head: the convolution reads a request's three previous inputs from it
+    and retains the window's input rows there for commit. raw_g excludes
     f_a_out/f_b_weight; otherwise both projection inputs are required.
     record_metadata and record_stamps are both tensors or both None.
     num_heads/head_dim describe the checkpoint; draft_token_num bounds each
@@ -317,6 +330,7 @@ def gluon_kda_retained_verify_gfx950(
         )
     _validate_retained_request(
         retained_history,
+        preconv,
         read_indices,
         query_start_loc,
         record_metadata,
@@ -328,9 +342,9 @@ def gluon_kda_retained_verify_gfx950(
     )
     return _retained_verify_gfx950(
         mixed_qkv=mixed_qkv,
-        original_qkv=original_qkv,
+        ring=preconv.rows,
+        ring_heads=preconv.heads,
         conv_weights=conv_weights,
-        conv_pool=conv_states,
         raw_g=raw_g,
         f_a_out=f_a_out,
         f_b_weight=f_b_weight,
@@ -358,9 +372,8 @@ def gluon_kda_retained_verify_gfx950(
 def gluon_kda_retained_verify_gfx1250(
     *,
     mixed_qkv: torch.Tensor,
-    original_qkv: torch.Tensor | None,
+    preconv: KdaPreconvRing,
     conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
     raw_g: torch.Tensor | None,
     f_a_out: torch.Tensor | None,
     f_b_weight: torch.Tensor | None,
@@ -380,10 +393,12 @@ def gluon_kda_retained_verify_gfx1250(
 ) -> torch.Tensor:
     """Verify packed pre-convolution QKV using request-owned accepted records.
 
-    conv_states and state_pool contain source checkpoints. retained_history
-    selects private live pages and FP32 U/normalized-K/decay storage. Verify
-    writes candidates after the accepted prefix, without publishing length.
-    original_qkv optionally retains input rows for commit. raw_g excludes
+    state_pool contains source checkpoints. retained_history selects private
+    live pages and FP32 U/normalized-K/decay storage. Verify writes
+    candidates after the accepted prefix, without publishing length.
+    preconv is the layer's pre-convolution ring and each request's ring
+    head: the convolution reads a request's three previous inputs from it
+    and retains the window's input rows there for commit. raw_g excludes
     f_a_out/f_b_weight; otherwise both projection inputs are required.
     record_metadata and record_stamps are both tensors or both None.
     num_heads/head_dim describe the checkpoint; draft_token_num bounds each
@@ -400,6 +415,7 @@ def gluon_kda_retained_verify_gfx1250(
         )
     _validate_retained_request(
         retained_history,
+        preconv,
         read_indices,
         query_start_loc,
         record_metadata,
@@ -411,9 +427,9 @@ def gluon_kda_retained_verify_gfx1250(
     )
     return _retained_verify_gfx1250(
         mixed_qkv=mixed_qkv,
-        original_qkv=original_qkv,
+        ring=preconv.rows,
+        ring_heads=preconv.heads,
         conv_weights=conv_weights,
-        conv_pool=conv_states,
         raw_g=raw_g,
         f_a_out=f_a_out,
         f_b_weight=f_b_weight,

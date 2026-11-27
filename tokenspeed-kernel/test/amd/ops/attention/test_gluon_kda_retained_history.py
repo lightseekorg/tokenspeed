@@ -26,7 +26,13 @@ import importlib
 
 import pytest
 import torch
-from kda_retained_reference import prepare_history
+from kda_retained_reference import (
+    preconv_ring,
+    prepare_history,
+    replay_length,
+    replay_state,
+    snapshot,
+)
 from tokenspeed_kernel.ops.attention.kda import (
     KdaOutputNorm,
     KdaRetainedHistory,
@@ -135,7 +141,6 @@ def _case(
     graph=False,
     null_row=False,
     guard=False,
-    retain_input=True,
     stamp_capacity=None,
     arena_step=2,
     gate_error=None,
@@ -166,19 +171,21 @@ def _case(
     u = torch.randn(slot_count, heads, capacity, dim, device="cuda") * 0.02
     key = torch.nn.functional.normalize(torch.randn_like(u), dim=-1)
     decay = torch.rand_like(key) * 0.2 + 0.7
-    # One accepted count per request slot. Rows that share the dense source
-    # page start with empty histories.
-    length = torch.full(
-        (slot_count, 1), initial_length, device="cuda", dtype=torch.int32
-    )
+    # One accepted count per request slot, beside its ring state (unseeded).
+    # Rows that share the dense source page start with empty histories.
+    length = replay_length(slot_count, pad=arena_step if strided else 0)
+    length.fill_(initial_length)
     if cross_page and batch > 1:
         length.zero_()
     if strided:
-        u, key, decay, length, live, slots = [
-            _arena(x, arena_step) for x in (u, key, decay, length, live, slots)
+        u, key, decay, live, slots = [
+            _arena(x, arena_step) for x in (u, key, decay, live, slots)
         ]
         source = _arena(source, arena_step)
     history = KdaRetainedHistory(u, key, decay, length, live, slots)
+    # Each slot's pre-convolution ring; the prepare seeds it from the source.
+    preconv = preconv_ring(history, batch, 3 * heads * dim, width=width)
+    ring_rows = width + 3
     # Deliberately wrong live convolution must never affect a cross-page verify.
     if cross_page:
         conv[live.long()] = 11
@@ -213,7 +220,6 @@ def _case(
             torch.randint(-8, 9, (tokens, 3 * heads * dim), device="cuda").bfloat16()
             * 0.125
         )
-        original = torch.full_like(mixed, 17) if retain_input else mixed
         beta = torch.randn(tokens, heads, device="cuda").bfloat16()
         f_a = torch.randint(-2, 3, (tokens, dim), device="cuda").bfloat16() * 0.125
         f_b = torch.randint(-2, 3, (heads * dim, dim), device="cuda").bfloat16() * 0.125
@@ -259,9 +265,8 @@ def _case(
                 references.append(None)
         kwargs = dict(
             mixed_qkv=mixed,
-            original_qkv=original if retain_input else None,
+            preconv=preconv,
             conv_weights=weights,
-            conv_states=conv,
             raw_g=None if projected else gate,
             f_a_out=f_a if projected else None,
             f_b_weight=f_b if projected else None,
@@ -289,7 +294,7 @@ def _case(
 
             def verify_with_norm(**inputs):
                 retained = KdaRetainedRecords(
-                    original_qkv=inputs.pop("original_qkv"),
+                    preconv=inputs.pop("preconv"),
                     history=inputs.pop("retained_history"),
                     metadata=inputs.pop("record_metadata"),
                     stamps=inputs.pop("record_stamps"),
@@ -310,13 +315,15 @@ def _case(
             verified = VERIFY
 
         def verify(**inputs):
-            # Serving readies the history before every verify round.
+            # Serving readies the history and the ring before every verify round.
             prepare_history(
                 inputs["state_pool"],
                 inputs["retained_history"],
                 inputs["read_indices"],
                 inputs["query_start_loc"],
                 draft_token_num=width,
+                conv=conv,
+                preconv=inputs["preconv"],
             )
             return verified(**inputs)
 
@@ -402,14 +409,22 @@ def _case(
                     atol=3e-6,
                     rtol=3e-5,
                 )
+        # Each live row's window follows its ring head, wrapping past the last
+        # ring row; the three rows before the head hold its convolution taps.
+        heads_at_verify = snapshot(history, batch)[:, 1].tolist()
         for r, ref in enumerate(references):
+            if ref is None:
+                continue
             begin, end = starts_list[r : r + 2]
-            target = (
-                mixed[begin:end]
-                if ref is not None or not retain_input
-                else torch.full_like(mixed[begin:end], 17)
+            slot, head = int(slots[r]), heads_at_verify[r]
+            kept = [(head + t) % ring_rows for t in range(end - begin)]
+            torch.testing.assert_close(
+                preconv.rows[slot, kept], mixed[begin:end], atol=0, rtol=0
             )
-            torch.testing.assert_close(original[begin:end], target, atol=0, rtol=0)
+            past = [(head - 3 + i) % ring_rows for i in range(3)]
+            torch.testing.assert_close(
+                preconv.rows[slot, past].T, expected_conv[r], atol=0, rtol=0
+            )
         if not stamped:
             # Serving's batched commit always validates accepted stamps; the
             # unstamped diagnostic covers verify alone.
@@ -435,21 +450,23 @@ def _case(
         # test's one layer as kda_retained_reference.commit does, building
         # every argument before a CUDA graph captures the launches.
         commit = resolve_kda_batched_retained_commit(
-            original.dtype, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
+            mixed.dtype, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
         )
+        ring = preconv.rows
         commit_kwargs = dict(
             descriptors=torch.tensor(
                 [
                     [
-                        original.data_ptr(),
+                        ring.data_ptr(),
                         conv.data_ptr(),
                         conv.shape[0],
-                        original.stride(0),
+                        ring.stride(1),
                         conv.stride(0),
                         conv.stride(1),
                         conv.stride(2),
                         state.data_ptr(),
                         *state.stride(),
+                        ring.stride(0),
                     ]
                 ],
                 device="cuda",
@@ -468,7 +485,8 @@ def _case(
             retained_correction=history.correction[:, None],
             retained_key=history.key[:, None],
             retained_decay=history.decay[:, None],
-            replay_length=history.length,
+            replay_state=replay_state(history),
+            replay_snapshot=snapshot(history, batch),
             # No request ends in these rounds.
             request_stopped=torch.zeros(
                 history.length.shape[0], device="cuda", dtype=torch.bool
@@ -479,7 +497,6 @@ def _case(
             num_heads=heads,
             head_dim=dim,
             conv_width=4,
-            activation_dtype=original.dtype,
             conv_state_dtype=conv.dtype,
             recurrent_state_dtype=state.dtype,
         )
@@ -525,6 +542,10 @@ def _case(
             # The prepare folded a row shorter than the window as a full one.
             old = 0 if old_lengths[r] > capacity - width else old_lengths[r]
             assert int(length[int(slots[r]), 0]) == old + take
+            # The ring head moves past the accepted candidates.
+            assert int(replay_state(history)[int(slots[r]), 1]) == (
+                (heads_at_verify[r] + take) % ring_rows + 1
+            )
             if take:
                 expected[r] = references[r][1][take - 1]
             if take:
@@ -712,17 +733,17 @@ def test_retained_empty_and_null_rows():
     )
 
 
-def test_retained_input_owned_by_caller():
+def test_retained_ring_wraps_over_rounds():
+    """Five one-token rounds move the four-row ring's head past its last row."""
     _case(
-        8,
+        16,
         1,
         2,
-        (1,),
+        (1, 1, 1, 1, 1),
         cross_page=False,
         strided=False,
         projected=False,
         lower_bound=None,
-        retain_input=False,
     )
 
 

@@ -70,8 +70,9 @@ def kda_state_fields(
 
     Returns:
         The BF16 convolution state and the dense recurrent state of one
-        scheduler-owned state block. Accepted decode records and their count
-        live in the request-slot workspace (``kda_verify_workspace_bytes``).
+        scheduler-owned state block. Accepted decode records, the
+        pre-convolution ring and their replay state live in the request-slot
+        workspace (``kda_verify_workspace_bytes``).
     """
     return (
         CacheFieldSpec(
@@ -159,32 +160,43 @@ def kda_request_slot_bytes(
     *,
     draft_token_num: int,
 ) -> int:
-    """Return one request slot's retained KDA records over every KDA layer.
+    """Return one request slot's retained KDA records and ring over every KDA layer.
 
-    A request keeps its records in its slot across rounds, scheduled or not,
-    so every resident slot (``max_resident_requests``, including a decode
-    role's extra slots) holds them.
+    A request keeps its records and its pre-convolution ring in its slot
+    across rounds, scheduled or not, so every resident slot
+    (``max_resident_requests``, including a decode role's extra slots) holds
+    them.
 
     Args:
         config: Target attention configuration with model dimensions.
         groups: Cache declarations containing the target's KDA state fields.
         draft_token_num: Effective verify width per request; the history
-            capacity (``kda_history_capacity``) must be at least this.
+            capacity (``kda_history_capacity``) must be at least this, and
+            it sets the ring's draft_token_num + 3 rows.
 
     Returns:
-        Bytes of the slot's FP32 correction, key and decay records for each
-        KDA layer, plus its INT32 accepted count, which every layer shares.
+        Bytes of the slot's FP32 correction, key and decay records and its
+        draft_token_num + 3 BF16 pre-convolution QKV rows (the convolution
+        state's dtype) for each KDA layer, plus its INT32 accepted count and
+        ring state, which every layer shares.
     """
     linear = config.component(LinearAttnConfig)
     heads, value_dim, key_dim = linear.temporal_state_shape
-    return (
-        _kda_layer_count(groups)
+    layers = _kda_layer_count(groups)
+    records = (
+        layers
         * heads
         * kda_history_capacity(config, draft_token_num)
         * (value_dim + 2 * key_dim)
         * torch.float32.itemsize
-        + torch.int32.itemsize
     )
+    ring = (
+        layers
+        * (draft_token_num + 3)
+        * linear.conv_state_shape[0]
+        * torch.bfloat16.itemsize
+    )
+    return records + ring + 2 * torch.int32.itemsize
 
 
 def kda_verify_workspace_bytes(
@@ -204,27 +216,25 @@ def kda_verify_workspace_bytes(
 
     Returns:
         Bytes for each request slot's retained FP32 correction, key and decay
-        records and INT32 accepted count; plus per-batch QKV, commit
-        descriptors, routing arrays and generation/position stamps used by
-        verify and decode.
+        records, pre-convolution ring and INT32 replay state; plus commit
+        descriptors, routing arrays, the prepare's per-row snapshot and
+        generation/position stamps used by verify and decode.
     """
     from tokenspeed_kernel.ops.attention.kda import (
         KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS,
     )
 
-    linear = config.component(LinearAttnConfig)
     num_layers = _kda_layer_count(groups)
     num_slots = RequestSlotLayout(config.max_resident_requests).capacity
     retained_bytes = num_slots * kda_request_slot_bytes(
         config, groups, draft_token_num=draft_token_num
     )
-    qkv_row_bytes = linear.conv_state_shape[0] * config.dtype.itemsize
-    qkv_bytes = num_layers * config.max_bs * draft_token_num * qkv_row_bytes
     group_count = sum(spec.attn_kind == "state" for spec, _ in groups)
     descriptor_columns = KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS
     metadata_bytes = num_layers * (descriptor_columns * 8 + 4)
     metadata_bytes += group_count * 4 * 8
     metadata_bytes += (2 * group_count + 1) * config.max_bs * 4
     metadata_bytes += config.max_bs * 4 * 8
+    metadata_bytes += config.max_bs * 2 * 4
     metadata_bytes += num_layers * config.max_bs * draft_token_num * 2 * 8
-    return retained_bytes + qkv_bytes + metadata_bytes
+    return retained_bytes + metadata_bytes

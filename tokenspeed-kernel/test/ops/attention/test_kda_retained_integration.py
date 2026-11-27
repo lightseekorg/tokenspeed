@@ -21,9 +21,16 @@
 """Retained serving contract: batched prepare, public verify, gathered endpoints,
 batched commit."""
 
+from dataclasses import replace
+
 import pytest
 import torch
-from kda_retained_reference import prepare_history
+from kda_retained_reference import (
+    preconv_ring,
+    prepare_history,
+    replay_state,
+    snapshot,
+)
 from tokenspeed_kernel.ops.attention import kda
 from tokenspeed_kernel.ops.metadata import REQUEST_ENDED, REQUEST_ENDED_INCOMPLETE
 from tokenspeed_kernel.platform import current_platform
@@ -43,7 +50,7 @@ def _history(heads=2, capacity=8, dim=128, values=128):
     decay = (torch.rand(shape, device="cuda", dtype=torch.float32) * 0.2 + 0.7)[
         ..., ::2
     ]
-    # One strided accepted count per request slot.
+    # One strided accepted count per request slot, beside its ring state.
     length = torch.zeros(3, 7, device="cuda", dtype=torch.int32)[:, 2:3]
     live = torch.tensor([3, 4, 5, 0], device="cuda", dtype=torch.int32)
     slots = torch.tensor([2, -1, 0, -1, 1, -1, -1, -1], device="cuda")[::2]
@@ -120,25 +127,26 @@ def test_materialize_shared_source_and_reset_private_lengths(layout):
         (base, history.correction, history.key, history.decay, history.length), before
     ):
         torch.testing.assert_close(value, original, atol=0, rtol=0)
-    history.length[:, 0] = torch.tensor([5, 6, 7], device="cuda")
-    # Rows own slots 2, 0, 1 and -1. A nonpositive page keeps slot 0's count,
-    # and a page past the pool keeps slot 1's, as materialization skips both
-    # rows; the invalid slot is ignored.
+    state = replay_state(history)
+    state.copy_(torch.tensor([[5, 2], [6, 3], [7, 4]], device="cuda"))
+    # Rows own slots 2, 0, 1 and -1. A nonpositive page keeps slot 0's count
+    # and ring state, and a page past the pool keeps slot 1's, as
+    # materialization skips both rows; the invalid slot is ignored.
     pages = torch.tensor([3, 0, 5, 4], device="cuda", dtype=torch.int32)
     kda.kda_reset_retained_length(
-        history.length,
+        state,
         write_indices=pages,
         record_slots=history.record_slots,
         page_count=5,
     )
-    assert history.length[:, 0].tolist() == [5, 6, 0]
+    assert state.tolist() == [[5, 2], [6, 3], [0, 0]]
     kda.kda_reset_retained_length(
-        history.length,
+        state,
         write_indices=pages,
         record_slots=history.record_slots,
         page_count=6,
     )
-    assert history.length[:, 0].tolist() == [5, 0, 0]
+    assert state.tolist() == [[5, 2], [0, 0], [0, 0]]
 
 
 @pytest.mark.parametrize("layout", ["v_major", "k_major"])
@@ -159,15 +167,16 @@ def test_materialize_private_pages_uses_request_slots_and_keeps_counts(layout):
     )
     torch.testing.assert_close(state, expected, atol=2e-6, rtol=2e-6)
     # Every layer folds from the counts its request shares, so a fold keeps
-    # them; one reset after the last layer clears them.
+    # them; one reset after the last layer clears them with the ring states.
     assert history.length[:, 0].tolist() == [1, 0, 3]
+    replay_state(history)[:, 1] = torch.tensor([4, 0, 2], device="cuda")
     kda.kda_reset_retained_length(
-        history.length,
+        replay_state(history),
         write_indices=pages,
         record_slots=history.record_slots,
         page_count=state.shape[0],
     )
-    assert history.length[:, 0].tolist() == [0, 0, 0]
+    assert replay_state(history).tolist() == [[0, 0], [0, 0], [0, 0]]
 
 
 def _fold(base, records, slot, layer, count):
@@ -185,10 +194,14 @@ def _fold(base, records, slot, layer, count):
 def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.float32):
     """Three layers in two State groups commit four rows; row 3 is padding.
 
-    Every layer of a request shares its count: the rows' slots hold 2, the
-    records their verify read, and slot 2, which has no row, holds 7. The
-    commit writes each row's count once, from that and its acceptance. With
-    ``stale``, layer 1 rejects row 1's commit and leaves its window alone.
+    Every layer of a request shares its count and ring state: the rows' slots
+    hold 2, the records their verify read, and slot 2, which has no row,
+    holds 7. The prepare's snapshot gives each row that count and the ring
+    head its verify started the window at, where its candidates' raw rows
+    wait in each layer's ring (wrapping past the last ring row). The commit
+    writes each row's count and ring state once, from the snapshot and its
+    acceptance. With ``stale``, layer 1 rejects row 1's commit and leaves
+    its window alone.
     """
     heads, dim, channels, layers, capacity = 2, 128, 768, 3, 8
     reads = torch.tensor(
@@ -246,13 +259,24 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
         device="cuda",
         dtype=torch.int32,
     )
-    # Strided counts the layers share.
-    length = torch.full((4, 5), 2, device="cuda", dtype=torch.int32)[:, 1:2]
-    length[2] = 7
-    expected_length = length.clone()
+    # Strided counts and ring states the layers share; slot 2 has no row.
+    replay = torch.full((4, 5), 2, device="cuda", dtype=torch.int32)[:, 1:3]
+    replay[:, 1] = 5
+    replay[2] = torch.tensor([7, 6])
+    ring_rows = window + 3
+    # Each row's verify started its window at this ring row; row 3 is padding.
+    ring_heads = [(window + 3 * row) % ring_rows for row in range(4)]
+    snapshot_rows = torch.tensor(
+        [[2, head] for head in ring_heads], device="cuda", dtype=torch.int32
+    )
+    expected_replay = replay.clone()
     for row in range(3):
-        slot = int(record_slots[row])
-        expected_length[slot] = 0 if slot in stopped_slots else 2 + int(accepted[row])
+        slot, take = int(record_slots[row]), int(accepted[row])
+        expected_replay[slot] = (
+            torch.tensor([0, 0])
+            if slot in stopped_slots
+            else torch.tensor([2 + take, (ring_heads[row] + take) % ring_rows + 1])
+        )
     originals, convs, states, descriptors = [], [], [], []
     expected_convs, expected_states = [], []
     for layer in range(layers):
@@ -263,6 +287,19 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
         conv = torch.randn(
             pages, channels + layer * 3, 8, device="cuda", dtype=torch.float32
         )[:, :channels, 1:7:2]
+        # The verify wrote each row's raw candidates to its slot's ring rows
+        # (head + t) mod (window + 3), in the convolution state's dtype; the
+        # ring rows and slots are padded.
+        ring = torch.full(
+            (5, ring_rows + 1, channels + 2 + layer),
+            float("nan"),
+            device="cuda",
+            dtype=torch.float32,
+        )[1:, :ring_rows, :channels]
+        for row in range(3):
+            slot, start = int(record_slots[row]), int(starts[row])
+            for token in range(int(starts[row + 1]) - start):
+                ring[slot, (ring_heads[row] + token) % ring_rows] = qkv[start + token]
         state = (torch.randn(pages, heads + 1, dim, dim, device="cuda") * 0.05).to(
             state_dtype
         )[:, :heads]
@@ -284,18 +321,19 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
                 )
         descriptors.append(
             [
-                qkv.data_ptr(),
+                ring.data_ptr(),
                 conv.data_ptr(),
                 pages,
-                qkv.stride(0),
+                ring.stride(1),
                 conv.stride(0),
                 conv.stride(1),
                 conv.stride(2),
                 state.data_ptr(),
                 *state.stride(),
+                ring.stride(0),
             ]
         )
-        originals.append(qkv)
+        originals.append(ring)
         convs.append(conv)
         states.append(state)
         expected_convs.append(expected_conv)
@@ -314,7 +352,8 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
         retained_correction=records[0],
         retained_key=records[1],
         retained_decay=records[2],
-        replay_length=length,
+        replay_state=replay,
+        replay_snapshot=snapshot_rows,
         request_stopped=request_stopped,
         request_ends=request_ends,
         draft_token_num=window,
@@ -322,12 +361,11 @@ def _commit_case(window, *, stale=False, stopped_slots=(), state_dtype=torch.flo
         num_heads=heads,
         head_dim=dim,
         conv_width=4,
-        activation_dtype=torch.bfloat16,
         conv_state_dtype=torch.float32,
         recurrent_state_dtype=state_dtype,
     )
-    expected = (expected_convs, expected_length, expected_states)
-    return kwargs, originals, (convs, length, states), expected
+    expected = (expected_convs, expected_replay, expected_states)
+    return kwargs, originals, (convs, replay, states), expected
 
 
 def _resolve_commit():
@@ -348,8 +386,9 @@ def test_batched_retained_commit_packed_groups_and_stamps(window, stale):
     assert args["request_ends"].tolist() == [0, 0, 0, 0]
     for value, expected_value in zip(actual[0], expected[0]):
         torch.testing.assert_close(value, expected_value, atol=0, rtol=0)
-    # One count per request: the records its verify read plus its acceptance.
-    # Slot 2 has no row and keeps its count.
+    # One count per request: the records its verify read plus its acceptance,
+    # and the ring state past its accepted candidates. Slot 2 has no row and
+    # keeps both.
     torch.testing.assert_close(actual[1], expected[1], atol=0, rtol=0)
     assert actual[1][:, 0].tolist() == [2 + window, 2, 7, 2 + max(1, window - 1)]
     # Without an ended request the commit writes no dense state.
@@ -401,12 +440,14 @@ def test_a_commit_applies_no_record_of_an_overflowing_count(count):
     only this round's, and a decoding one counts only its acceptance."""
     for stopped in ((), (3,)):
         args, keepalive, actual, expected = _commit_case(4, stopped_slots=stopped)
-        convs, length, states = actual
-        length[3] = count
+        convs, replay, states = actual
+        replay[3, 0] = count
+        # The prepare's snapshot applies none of an overflowing count.
+        args["replay_snapshot"][1, 0] = 0
         before = [state.clone() for state in states]
         _resolve_commit()(**args)
         take = 3
-        assert int(length[3]) == (0 if stopped else take)
+        assert int(replay[3, 0]) == (0 if stopped else take)
         # Row 1's commit still shifts every layer's window.
         for conv, expected_conv in zip(convs, expected[0]):
             torch.testing.assert_close(conv, expected_conv, atol=0, rtol=0)
@@ -437,12 +478,12 @@ def test_rows_no_layer_carries_keep_their_count(stopped):
     whose request ended earlier, or graph padding. No layer carries it, so
     it reports nothing new and its slot keeps its count."""
     args, keepalive, actual, _ = _commit_case(4, stopped_slots=(3,) if stopped else ())
-    length = actual[1]
+    replay = actual[1]
     args["read_indices"][:, 1] = -1
     args["write_indices"][:, 1] = -1
     _resolve_commit()(**args)
     assert args["request_ends"].tolist()[1] == (REQUEST_ENDED if stopped else 0)
-    assert int(length[3]) == 2
+    assert replay[3].tolist() == [2, 5]
 
 
 @pytest.mark.parametrize(
@@ -453,15 +494,26 @@ def test_public_retained_verify_keeps_shared_source_and_materializes_endpoint(
 ):
     torch.manual_seed(42)
     history = _history()
+    preconv = preconv_ring(history, 4, 768, width=window)
     if far_slot:
         # Two request strides fit individually in int32. The last slot's
-        # element offset exceeds 2**31. Only the three short rows are touched.
+        # element offset exceeds 2**31, in the records and in the ring. Only
+        # the three short rows are touched.
         sources = (history.correction, history.key, history.decay)
         slots, heads, capacity, dim = history.correction.shape
         row_size = heads * capacity * dim
         stride = (1 << 30) + 3 * row_size
-        if torch.cuda.mem_get_info()[0] < 10 << 30:
-            pytest.skip("large request-slot offset needs 10 GiB free")
+        ring_size = (window + 3) * 768
+        ring_stride = (1 << 30) + 3 * ring_size
+        if torch.cuda.mem_get_info()[0] < 16 << 30:
+            pytest.skip("large request-slot offsets need 16 GiB free")
+        ring = torch.zeros(
+            2 * ring_stride + ring_size, device="cuda", dtype=torch.bfloat16
+        )
+        preconv = kda.KdaPreconvRing(
+            ring.as_strided((slots, window + 3, 768), (ring_stride, 768, 1)),
+            preconv.heads,
+        )
         storage = torch.empty(2 * stride + 3 * row_size, device="cuda")
         payload = [
             storage.as_strided(
@@ -492,7 +544,6 @@ def test_public_retained_verify_keeps_shared_source_and_materializes_endpoint(
     )
     stamps = torch.full((3, 7, 2), -1, device="cuda", dtype=torch.int64)
     raw = torch.randn(total, 768, device="cuda", dtype=torch.bfloat16) * 0.2
-    original = torch.empty_like(raw)
     conv = torch.randn(8, 768, 3, device="cuda", dtype=torch.bfloat16) * 0.1
     weights = torch.randn(768, 4, device="cuda", dtype=torch.bfloat16) * 0.1
     gate = torch.randn(total, 256, device="cuda", dtype=torch.bfloat16)
@@ -503,27 +554,11 @@ def test_public_retained_verify_keeps_shared_source_and_materializes_endpoint(
     saved = state[1].clone()
     records = kda.KdaRetainedRecords(
         history=history,
-        original_qkv=original,
+        preconv=preconv,
         metadata=metadata,
         stamps=stamps,
         query_start_loc=starts,
     )
-    producer = {}
-    # The split producer consumes the same packed boundaries as verification.
-    if current_platform().is_nvidia:
-        producer["conv_qkv"] = kda.kda_verify_conv_update(
-            raw,
-            weights,
-            conv,
-            reads,
-            num_heads=2,
-            head_dim=128,
-            query_start_loc=starts,
-            draft_token_num=window,
-            original_qkv=None,
-            bias=None,
-            recurrent_layout="v_major",
-        )
     expected_out = torch.empty(total, 2, 128, device="cuda", dtype=torch.float32)
     expected_final = []
     expected_u, expected_key, expected_decay = (
@@ -544,14 +579,42 @@ def test_public_retained_verify_keeps_shared_source_and_materializes_endpoint(
         )
         expected_final.append(running)
     # Every row moves to a private live page, so the prepare copies them all;
-    # row 2's two records stay valid on top of its copied base.
+    # row 2's two records stay valid on top of its copied base. No ring holds
+    # rows yet, so the prepare seeds each from its source page's taps.
     counts = history.length[:, 0].tolist()
     source_2 = state[2].clone()
-    prepare_history(state, history, reads, starts, draft_token_num=window)
+    prepare_history(
+        state,
+        history,
+        reads,
+        starts,
+        draft_token_num=window,
+        conv=conv,
+        preconv=preconv,
+    )
+    assert snapshot(history, 4)[:3].tolist() == [[0, 3], [0, 3], [2, 3]]
+    producer = {}
+    # The split producer consumes the same packed boundaries as verification.
+    if current_platform().is_nvidia:
+        producer["conv_qkv"] = kda.kda_verify_conv_update(
+            raw,
+            weights,
+            reads,
+            live_indices=history.live_state_indices,
+            preconv=preconv,
+            record_slots=history.record_slots,
+            page_count=state.shape[0],
+            num_heads=2,
+            head_dim=128,
+            query_start_loc=starts,
+            draft_token_num=window,
+            bias=None,
+            recurrent_layout="v_major",
+        )
+        records = replace(records, preconv=None)
     out = kda.kda_fused_paged_verify(
         raw,
         weights,
-        conv,
         torch.empty(0, device="cuda"),
         torch.empty(0, device="cuda"),
         beta,
@@ -572,7 +635,18 @@ def test_public_retained_verify_keeps_shared_source_and_materializes_endpoint(
         solution=None,
     )
     assert out is not None
-    torch.testing.assert_close(original, raw, atol=0, rtol=0)
+    # Each request's ring holds its source taps before row 3 and its window's
+    # raw rows from row 3; the padding row's slot keeps its ring.
+    for row in range(3):
+        slot = int(history.record_slots[row])
+        begin, end = int(starts[row]), int(starts[row + 1])
+        torch.testing.assert_close(
+            preconv.rows[slot, :3].T, conv[int(reads[row])], atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            preconv.rows[slot, 3 : 3 + end - begin], raw[begin:end], atol=0, rtol=0
+        )
+    assert replay_state(history)[:, 1].tolist() == [0, 0, 0]
     torch.testing.assert_close(state[1], saved, atol=0, rtol=0)
     torch.testing.assert_close(state[3], saved, atol=2e-6, rtol=2e-6)
     torch.testing.assert_close(state[4], saved, atol=2e-6, rtol=2e-6)
@@ -643,7 +717,7 @@ def test_a_short_window_folds_the_records_verify_cannot_read(window, capacity, c
     )
     stamps = torch.full((3, window, 2), -1, device="cuda", dtype=torch.int64)
     raw = torch.randn(2, 768, device="cuda", dtype=torch.bfloat16) * 0.2
-    original = torch.empty_like(raw)
+    preconv = preconv_ring(history, 4, 768, width=window)
     conv = torch.randn(8, 768, 3, device="cuda", dtype=torch.bfloat16) * 0.1
     weights = torch.randn(768, 4, device="cuda", dtype=torch.bfloat16) * 0.1
     gate = torch.randn(2, 256, device="cuda", dtype=torch.bfloat16)
@@ -654,30 +728,52 @@ def test_a_short_window_folds_the_records_verify_cannot_read(window, capacity, c
         endpoint, conv[3].float(), raw, weights, gate, beta, 0, 2
     )
 
-    prepare_history(state, history, reads, starts, draft_token_num=window)
-    # The count stays; past capacity - window, the verify applies none of it.
+    prepare_history(
+        state,
+        history,
+        reads,
+        starts,
+        draft_token_num=window,
+        conv=conv,
+        preconv=preconv,
+    )
+    # The count stays; past capacity - window, the verify applies none of it,
+    # as the snapshot says.
     assert int(history.length[slot]) == count
+    assert snapshot(history, 4)[0].tolist() == [
+        count if count <= capacity - window else 0,
+        3,
+    ]
     torch.testing.assert_close(state[3], endpoint, atol=2e-6, rtol=2e-5)
 
     producer = {}
+    records = kda.KdaRetainedRecords(
+        history=history,
+        preconv=preconv,
+        metadata=metadata,
+        stamps=stamps,
+        query_start_loc=starts,
+    )
     if current_platform().is_nvidia:
         producer["conv_qkv"] = kda.kda_verify_conv_update(
             raw,
             weights,
-            conv,
             reads,
+            live_indices=history.live_state_indices,
+            preconv=preconv,
+            record_slots=history.record_slots,
+            page_count=state.shape[0],
             num_heads=2,
             head_dim=128,
             query_start_loc=starts,
             draft_token_num=window,
-            original_qkv=None,
             bias=None,
             recurrent_layout="v_major",
         )
+        records = replace(records, preconv=None)
     out = kda.kda_fused_paged_verify(
         raw,
         weights,
-        conv,
         torch.empty(0, device="cuda"),
         torch.empty(0, device="cuda"),
         beta,
@@ -690,13 +786,7 @@ def test_a_short_window_folds_the_records_verify_cannot_read(window, capacity, c
         draft_token_num=window,
         lower_bound=-5.0,
         recurrent_layout="v_major",
-        retained_records=kda.KdaRetainedRecords(
-            history=history,
-            original_qkv=original,
-            metadata=metadata,
-            stamps=stamps,
-            query_start_loc=starts,
-        ),
+        retained_records=records,
         output_norm=None,
         g_raw=gate,
         **producer,
@@ -710,35 +800,210 @@ def test_a_short_window_folds_the_records_verify_cannot_read(window, capacity, c
 
 
 def test_packed_verify_convolution_uses_request_boundaries():
+    """The split producer convolves each request from its ring, wrapping past its end.
+
+    Row r's slot is 3 - r, so slots and rows differ; each ring head puts the
+    three past inputs and the window on different sides of the ring's last
+    row. Row 3 is padding: no page and no window.
+    """
     if not current_platform().is_nvidia:
         pytest.skip("NVIDIA split producer; AMD verifies packed convolution in fusion")
     torch.manual_seed(7)
+    window, rows = 4, 7
     raw = torch.randn(7, 768, device="cuda", dtype=torch.bfloat16)
     weights = torch.randn(768, 4, device="cuda", dtype=torch.bfloat16) * 0.1
-    conv = torch.randn(6, 768, 3, device="cuda", dtype=torch.bfloat16)
+    taps = torch.randn(4, 768, 3, device="cuda", dtype=torch.bfloat16)
     reads = torch.tensor([1, 2, 3, 0], device="cuda", dtype=torch.int32)
     starts = torch.tensor([0, 4, 5, 7, 7], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([3, 2, 1, 0], device="cuda", dtype=torch.int64)
+    heads = torch.tensor([5, 3, 1, 6], device="cuda", dtype=torch.int32)
+    ring = torch.full((4, rows, 768), 9.0, device="cuda", dtype=torch.bfloat16)
+    for row in range(3):
+        for i in range(3):
+            ring[int(slots[row]), (int(heads[row]) - 3 + i) % rows] = taps[row, :, i]
+    before = ring.clone()
     expected = torch.empty_like(raw)
     for row, (begin, end) in enumerate(zip(starts[:-1].tolist(), starts[1:].tolist())):
-        history = conv[int(reads[row])].float()
+        history = taps[row].float()
         for token in range(begin, end):
-            taps = torch.cat([history, raw[token, :, None].float()], dim=-1)
-            expected[token] = torch.nn.functional.silu((taps * weights.float()).sum(-1))
-            history = taps[:, 1:]
+            joined = torch.cat([history, raw[token, :, None].float()], dim=-1)
+            expected[token] = torch.nn.functional.silu(
+                (joined * weights.float()).sum(-1)
+            )
+            history = joined[:, 1:]
     output = kda.kda_verify_conv_update(
         raw,
         weights,
-        conv,
         reads,
+        live_indices=reads,
+        preconv=kda.KdaPreconvRing(ring, heads),
+        record_slots=slots,
+        page_count=6,
         num_heads=2,
         head_dim=128,
-        draft_token_num=4,
+        draft_token_num=window,
         query_start_loc=starts,
         recurrent_layout="v_major",
         bias=None,
-        original_qkv=None,
     )
     torch.testing.assert_close(output, expected, atol=0.003, rtol=0.005)
+    # Each window's raw rows follow the head, wrapping; nothing else changes.
+    for row, (begin, end) in enumerate(zip(starts[:-1].tolist(), starts[1:].tolist())):
+        for token in range(begin, end):
+            before[int(slots[row]), (int(heads[row]) + token - begin) % rows] = raw[
+                token
+            ]
+    torch.testing.assert_close(ring, before, atol=0, rtol=0)
+
+
+def _zero_history_convolution(raw, weights, history):
+    """FP32 convolution and SiLU of each token after ``history`` [channels, 3]."""
+    expected = torch.empty_like(raw)
+    history = history.float()
+    for token in range(raw.shape[0]):
+        joined = torch.cat([history, raw[token, :, None].float()], dim=-1)
+        expected[token] = torch.nn.functional.silu((joined * weights.float()).sum(-1))
+        history = joined[:, 1:]
+    return expected
+
+
+def test_split_producer_takes_part_only_with_a_live_page():
+    """A row with a source page but a masked live page is padding, as in the prepare.
+
+    Row 0 takes part from slot 1 at head 3. Row 1 has source page 3 but live
+    page 0 and shares slot 1 with its ring head at 0, so a ring write would
+    overwrite the taps row 0 reads. Row 2 has source page 4, live page 0 and
+    its own resident slot 2. Both masked rows convolve their inputs over a zero
+    history and leave every ring row as it was.
+    """
+    if not current_platform().is_nvidia:
+        pytest.skip("NVIDIA split producer; AMD verifies packed convolution in fusion")
+    torch.manual_seed(13)
+    window, rows, channels = 4, 7, 768
+    raw = torch.randn(10, channels, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(channels, 4, device="cuda", dtype=torch.bfloat16) * 0.1
+    reads = torch.tensor([1, 3, 4], device="cuda", dtype=torch.int32)
+    lives = torch.tensor([2, 0, 0], device="cuda", dtype=torch.int64)
+    starts = torch.tensor([0, 4, 8, 10], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([1, 1, 2], device="cuda", dtype=torch.int32)
+    heads = torch.tensor([3, 0, 3], device="cuda", dtype=torch.int32)
+    ring = torch.randn(3, rows, channels, device="cuda").to(torch.bfloat16)
+    before = ring.clone()
+    output = kda.kda_verify_conv_update(
+        raw,
+        weights,
+        reads,
+        live_indices=lives,
+        preconv=kda.KdaPreconvRing(ring, heads),
+        record_slots=slots,
+        page_count=6,
+        num_heads=2,
+        head_dim=128,
+        draft_token_num=window,
+        query_start_loc=starts,
+        recurrent_layout="v_major",
+        bias=None,
+    )
+    zero = torch.zeros(channels, 3, device="cuda")
+    expected = torch.cat(
+        [
+            _zero_history_convolution(raw[0:4], weights, before[1, 0:3].T),
+            _zero_history_convolution(raw[4:8], weights, zero),
+            _zero_history_convolution(raw[8:10], weights, zero),
+        ]
+    )
+    torch.testing.assert_close(output, expected, atol=0.003, rtol=0.005)
+    # Only row 0 wrote its window, to rows 3..6 of slot 1.
+    before[1, 3:7] = raw[0:4]
+    torch.testing.assert_close(ring, before, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.mem_get_info()[0] < 10 << 30,
+    reason="ring rows past 2**31 elements need 10 GiB free",
+)
+def test_split_producer_addresses_ring_rows_past_int32():
+    """Ring rows whose offset passes 2**31 elements convolve like near rows.
+
+    The row pitch is 2**29 elements, so rows 4..6 of a four-token window's
+    ring start at or past 2**31 elements. Head 5 reads rows 2..4 and writes
+    rows 5, 6, 0 and 1; only those rows are backed by initialized values.
+    """
+    if not current_platform().is_nvidia:
+        pytest.skip("NVIDIA split producer; AMD verifies packed convolution in fusion")
+    torch.manual_seed(17)
+    window, rows, channels, pitch = 4, 7, 768, 1 << 29
+    assert 4 * pitch >= 2**31
+    storage = torch.empty(
+        (rows - 1) * pitch + channels, device="cuda", dtype=torch.bfloat16
+    )
+    far = storage.as_strided((1, rows, channels), (storage.numel(), pitch, 1))
+    near = torch.randn(1, rows, channels, device="cuda").to(torch.bfloat16)
+    for row in range(rows):
+        far[0, row] = near[0, row]
+    raw = torch.randn(window, channels, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(channels, 4, device="cuda", dtype=torch.bfloat16) * 0.1
+    pages = torch.ones(1, device="cuda", dtype=torch.int32)
+    outputs = []
+    for ring in (near, far):
+        outputs.append(
+            kda.kda_verify_conv_update(
+                raw,
+                weights,
+                pages,
+                live_indices=pages,
+                preconv=kda.KdaPreconvRing(
+                    ring, torch.full((1,), 5, device="cuda", dtype=torch.int32)
+                ),
+                record_slots=torch.zeros(1, device="cuda", dtype=torch.int32),
+                page_count=2,
+                num_heads=2,
+                head_dim=128,
+                draft_token_num=window,
+                query_start_loc=torch.tensor(
+                    [0, window], device="cuda", dtype=torch.int32
+                ),
+                recurrent_layout="v_major",
+                bias=None,
+            )
+        )
+    assert torch.equal(outputs[1], outputs[0])
+    for row in range(rows):
+        assert torch.equal(far[0, row], near[0, row])
+    assert torch.equal(near[0, [5, 6, 0, 1]], raw)
+
+
+def test_preconv_ring_rows_and_slots_need_their_own_memory():
+    """Expanded or overlapping ring layouts fail at construction, aligned or not.
+
+    Every layout keeps the alignment the fused kernels ask of a ring (row and
+    slot strides of eight elements, a 16-byte base), so only the overlap
+    rejects it. One layer of a [slots, layers, rows, channels] ring and a
+    slot-inner layout keep each element distinct and stay valid.
+    """
+    slots, rows, channels = 4, 7, 768
+    storage = torch.zeros(slots * 3 * rows * channels, dtype=torch.bfloat16)
+    heads = torch.full((slots,), 3, dtype=torch.int32)
+    overlapping = [
+        # Rows eight elements apart share 760 channels with their neighbours.
+        storage.as_strided((slots, rows, channels), (rows * channels, 8, 1)),
+        # Slots one row apart share all but one of their rows.
+        storage.as_strided((slots, rows, channels), (channels, channels, 1)),
+        # Expanded rows and expanded slots share every element.
+        storage[:channels].view(1, 1, channels).expand(slots, rows, channels),
+        storage[: rows * channels]
+        .view(1, rows, channels)
+        .expand(slots, rows, channels),
+    ]
+    for ring in overlapping:
+        with pytest.raises(ValueError, match="must not share memory"):
+            kda.KdaPreconvRing(ring, heads)
+    layers = storage.view(slots, 3, rows, channels)
+    kda.KdaPreconvRing(layers[:, 1], heads)
+    kda.KdaPreconvRing(
+        storage[: slots * rows * channels].view(rows, slots, channels).transpose(0, 1),
+        heads,
+    )
 
 
 def test_retained_commit_graph_refresh_and_layer_subset():
@@ -837,6 +1102,7 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
         record_slots=args["record_slots"][:2],
         record_metadata=args["record_metadata"][:2],
         record_stamps=torch.full((3, 5, 11, 2), -1, device="cuda", dtype=torch.int64),
+        replay_snapshot=args["replay_snapshot"][:2],
         request_ends=args["request_ends"][:2],
     )
     with assert_no_triton_compile(
@@ -867,6 +1133,9 @@ def test_retained_commit_does_not_specialize_dynamic_metadata():
                     record_metadata=torch.full(
                         (batch, 3), -1, device="cuda", dtype=torch.int64
                     ),
+                    replay_snapshot=torch.zeros(
+                        batch, 2, device="cuda", dtype=torch.int32
+                    ),
                     request_ends=torch.zeros(batch, device="cuda", dtype=torch.int32),
                 )
             )
@@ -886,8 +1155,14 @@ def _prepare_case(window, *, state_dtype=torch.float32):
     than the window: its own tokens fit, but it folds whenever a full window
     would overflow. Row 8 moves to a private page in group 0 only and fits:
     the group-0 layer copies its source, and the group-1 layers leave it.
+
+    Even slots hold no pre-convolution rows yet (ring state 0): each layer
+    that carries their row seeds ring rows 0..2 from its source page's taps.
+    Odd slots' rings are seeded, and stay as they are. Each row's snapshot
+    gets the count its verify applies and its ring head.
     """
     heads, dim, layers, capacity, slots, pages, rows = 2, 128, 3, 8, 8, 10, 9
+    channels, ring_rows = 3 * heads * dim, window + 3
     groups = torch.tensor([1, 0, 1], device="cuda", dtype=torch.int32)
     # [groups, rows] views of 16-row tables, like serving's padded per-batch
     # tables: every row starts on a 16-byte boundary.
@@ -925,16 +1200,32 @@ def _prepare_case(window, *, state_dtype=torch.float32):
             torch.rand(shape, device="cuda") * 0.2 + 0.7,
         )
     )
-    # Strided counts the layers share.
-    length = torch.zeros(slots, 5, device="cuda", dtype=torch.int32)[:, 1:2]
+    # Strided counts and ring states the layers share.
+    replay = torch.zeros(slots, 5, device="cuda", dtype=torch.int32)[:, 1:3]
     for slot, count in counts.items():
-        length[slot] = count
+        replay[slot] = torch.tensor(
+            [count, 0 if slot % 2 == 0 else slot % ring_rows + 1]
+        )
+    expected_snapshot = torch.zeros(rows, 2, device="cuda", dtype=torch.int32)
+    for row in range(rows):
+        slot = int(record_slots[row])
+        count, ring_state = replay[slot].tolist() if slot < slots else (0, 0)
+        expected_snapshot[row, 0] = count if 0 <= count <= capacity - window else 0
+        expected_snapshot[row, 1] = ring_state - 1 if ring_state else 3
     states, descriptors, expected_states = [], [], []
+    convs, rings, expected_rings = [], [], []
     for layer in range(layers):
         state = (
             torch.randn(pages, heads + 1 + layer, dim, dim, device="cuda") * 0.05
         ).to(state_dtype)[:, :heads]
         expected_state = state.clone()
+        conv = torch.randn(
+            pages, channels + 2 * layer, 3, device="cuda", dtype=torch.bfloat16
+        )[:, :channels]
+        ring = torch.full(
+            (slots, ring_rows + 1, channels + 3), -3.0, device="cuda"
+        ).bfloat16()[:, 1:, :channels]
+        expected_ring = ring.clone()
         group = int(groups[layer])
         for row in range(rows):
             source, live = int(sources[group, row]), int(lives[group, row])
@@ -943,18 +1234,33 @@ def _prepare_case(window, *, state_dtype=torch.float32):
                 0 < source < pages and 0 < live < pages and tokens and slot < slots
             ):
                 continue
+            if slot % 2 == 0:
+                expected_ring[slot, :3] = conv[source].T
             if counts[slot] > capacity - window:
                 expected_state[live] = _fold(
                     state[source], records, slot, layer, counts[slot]
                 ).to(state_dtype)
             elif source != live:
                 expected_state[live] = state[source]
-        row = [0] * kda.KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS
-        row[2] = pages
-        row[7:12] = state.data_ptr(), *state.stride()
-        descriptors.append(row)
+        descriptors.append(
+            [
+                ring.data_ptr(),
+                conv.data_ptr(),
+                pages,
+                ring.stride(1),
+                conv.stride(0),
+                conv.stride(1),
+                conv.stride(2),
+                state.data_ptr(),
+                *state.stride(),
+                ring.stride(0),
+            ]
+        )
         states.append(state)
+        convs.append(conv)
         expected_states.append(expected_state)
+        rings.append(ring)
+        expected_rings.append(expected_ring)
     args = dict(
         descriptors=torch.tensor(descriptors, device="cuda", dtype=torch.uint64),
         group_indices=groups,
@@ -966,14 +1272,18 @@ def _prepare_case(window, *, state_dtype=torch.float32):
         retained_correction=records[0],
         retained_key=records[1],
         retained_decay=records[2],
-        replay_length=length,
+        replay_state=replay,
+        replay_snapshot=torch.full((rows, 2), -9, device="cuda", dtype=torch.int32),
         history_capacity=capacity,
         draft_token_num=window,
         num_heads=heads,
         head_dim=dim,
+        conv_state_dtype=torch.bfloat16,
         recurrent_state_dtype=state_dtype,
     )
-    return args, states, expected_states
+    # The descriptors address the convolution pools and rings: keep them alive.
+    seeding = (rings, expected_rings, expected_snapshot, convs)
+    return args, states, expected_states, seeding
 
 
 def _resolve_prepare():
@@ -990,10 +1300,13 @@ def _resolve_prepare():
 def test_batched_retained_prepare_folds_private_and_overflowing_rows(
     window, state_dtype, captured
 ):
-    args, states, expected_states = _prepare_case(window, state_dtype=state_dtype)
+    args, states, expected_states, seeding = _prepare_case(
+        window, state_dtype=state_dtype
+    )
+    rings, expected_rings, expected_snapshot, _ = seeding
     fields = ("retained_correction", "retained_key", "retained_decay")
     records = [args[name].clone() for name in fields]
-    counts = args["replay_length"].clone()
+    replay = args["replay_state"].clone()
     initial = [x.clone() for x in states]
     prepare = _resolve_prepare()
     prepare(**args)
@@ -1023,10 +1336,16 @@ def test_batched_retained_prepare_folds_private_and_overflowing_rows(
         torch.testing.assert_close(states[layer][9], initial[layer][2], atol=0, rtol=0)
         # Row 8 did not move in group 1, so its layers leave its page.
         torch.testing.assert_close(states[layer][3], initial[layer][3], atol=0, rtol=0)
-    # The commit writes the counts; a prepare only reads them.
-    torch.testing.assert_close(args["replay_length"], counts, atol=0, rtol=0)
+    # The commit writes the counts and ring states; a prepare only reads them.
+    torch.testing.assert_close(args["replay_state"], replay, atol=0, rtol=0)
     for name, before in zip(fields, records):
         torch.testing.assert_close(args[name], before, atol=0, rtol=0)
+    # Unseeded rings of carried rows hold their source taps; others are kept.
+    for ring, expected_ring in zip(rings, expected_rings):
+        torch.testing.assert_close(ring, expected_ring, atol=0, rtol=0)
+    torch.testing.assert_close(
+        args["replay_snapshot"], expected_snapshot, atol=0, rtol=0
+    )
 
 
 def test_batched_retained_prepare_does_not_specialize_dynamic_metadata():
@@ -1034,7 +1353,7 @@ def test_batched_retained_prepare_does_not_specialize_dynamic_metadata():
         retained_batched_prepare_kernel,
     )
 
-    args, _, _ = _prepare_case(4)
+    args, _, _, keepalive = _prepare_case(4)
     prepare = _resolve_prepare()
     prepare(**args)
     with assert_no_triton_compile(retained_batched_prepare_kernel):
@@ -1052,6 +1371,9 @@ def test_batched_retained_prepare_does_not_specialize_dynamic_metadata():
                         batch + 1, device="cuda", dtype=torch.int32
                     ),
                     record_slots=torch.zeros(batch, device="cuda", dtype=torch.int64),
+                    replay_snapshot=torch.zeros(
+                        batch, 2, device="cuda", dtype=torch.int32
+                    ),
                 )
             )
 
@@ -1061,12 +1383,14 @@ def test_a_count_outside_the_history_applies_no_record(count):
     """A count below 0 or past the capacity overflows, so the verify applies
     no record, but the prepare has no records to fold: a row that keeps its
     page leaves it as it is, and a row that moves gets its source copied."""
-    args, states, _ = _prepare_case(4)
+    args, states, _, keepalive = _prepare_case(4)
     # Row 2 (slot 0) keeps its pages; row 0 (slot 2) moves in both groups.
-    args["replay_length"][[0, 2]] = count
+    args["replay_state"][[0, 2], 0] = count
     before = [state.clone() for state in states]
     _resolve_prepare()(**args)
-    assert args["replay_length"][[0, 2], 0].tolist() == [count, count]
+    assert args["replay_state"][[0, 2], 0].tolist() == [count, count]
+    # Their verifies apply none of the count.
+    assert args["replay_snapshot"][[0, 2], 0].tolist() == [0, 0]
     for layer, state in enumerate(states):
         kept = 3 if layer == 1 else 7
         torch.testing.assert_close(state[kept], before[layer][kept], atol=0, rtol=0)
@@ -1144,27 +1468,33 @@ def test_retained_capability_requires_every_explicit_contract():
     )
 
 
-def test_invalid_checkpoint_verify_raises_without_mutation():
-    """A conv/state page-count mismatch fails before touching any page or record."""
+def test_invalid_ring_verify_raises_without_mutation():
+    """A ring that does not keep the window's rows fails before touching any
+    page, ring or record."""
     history = _history(heads=1, dim=128)
     reads = torch.tensor([1, 1, 2, 0], device="cuda", dtype=torch.int32)
-    starts = torch.tensor([0, 1, 2, 3, 3], device="cuda", dtype=torch.int32)
-    raw = torch.randn(3, 384, device="cuda", dtype=torch.bfloat16)
-    conv = torch.randn(8, 384, 3, device="cuda", dtype=torch.bfloat16)
+    starts = torch.tensor([0, 2, 4, 6, 6], device="cuda", dtype=torch.int32)
+    raw = torch.randn(6, 384, device="cuda", dtype=torch.bfloat16)
     state = torch.randn(7, 1, 128, 128, device="cuda")
-    original = torch.full_like(raw, 7)
+    # Four rows a slot: a one-token window's ring, not a two-token one's.
+    ring = torch.full((3, 4, 384), 7.0, device="cuda", dtype=torch.bfloat16)
     metadata = torch.tensor(
         [[0, 1, 0], [1, 1, 0], [2, 1, 0], [-1, -1, -1]],
         device="cuda",
         dtype=torch.int64,
     )
     stamps = torch.full((3, 8, 2), -1, device="cuda", dtype=torch.int64)
-    records = kda.KdaRetainedRecords(original, history, metadata, stamps, starts)
+    records = kda.KdaRetainedRecords(
+        kda.KdaPreconvRing(ring, torch.full((4,), 3, device="cuda", dtype=torch.int32)),
+        history,
+        metadata,
+        stamps,
+        starts,
+    )
     mutable = (
         raw,
-        conv,
         state,
-        original,
+        ring,
         history.correction,
         history.key,
         history.decay,
@@ -1176,22 +1506,20 @@ def test_invalid_checkpoint_verify_raises_without_mutation():
         kda.kda_fused_paged_verify(
             raw,
             torch.ones(384, 4, device="cuda", dtype=torch.bfloat16),
-            conv,
             torch.empty(0, device="cuda"),
             torch.empty(0, device="cuda"),
-            torch.zeros(3, 1, device="cuda", dtype=torch.bfloat16),
+            torch.zeros(6, 1, device="cuda", dtype=torch.bfloat16),
             torch.zeros(1, device="cuda"),
             torch.zeros(128, device="cuda"),
             state_pool=state,
             read_indices=reads,
             num_heads=1,
             head_dim=128,
-            draft_token_num=1,
+            draft_token_num=2,
             recurrent_layout="v_major",
             retained_records=records,
             output_norm=None,
-            g_raw=torch.zeros(3, 128, device="cuda", dtype=torch.bfloat16),
-            conv_qkv=raw if current_platform().is_nvidia else None,
+            g_raw=torch.zeros(6, 128, device="cuda", dtype=torch.bfloat16),
             lower_bound=-5.0,
             override=None,
             solution=None,

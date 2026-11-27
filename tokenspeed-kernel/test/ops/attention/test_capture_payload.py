@@ -18,13 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Retained verification preserves original QKV and projection storage."""
+"""Retained verification keeps pre-convolution rows in the ring and projection storage."""
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
-from kda_retained_reference import make_case, reference, verify
+from kda_retained_reference import make_case, prepare_history, reference, verify
+from tokenspeed_kernel.ops.attention import kda
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -33,31 +36,84 @@ if not torch.cuda.is_available():
 @pytest.mark.parametrize("batch,width", [(1, 1), (4, 4), (8, 1)])
 @pytest.mark.parametrize("strided", [False, True])
 def test_retained_capture_matches_original_rows(batch, width, strided):
+    """Each request's window lands in its slot's ring after the seeded taps."""
     case = make_case(batch, width, strided=strided, ragged=True)
     original = case["raw"].clone()
     expected = reference(case)
     output = verify(case)
-    torch.testing.assert_close(case["records"].original_qkv, original, atol=0, rtol=0)
+    records = case["records"]
+    ring, starts = records.preconv.rows, records.query_start_loc.tolist()
+    for row, page in enumerate(case["reads"].tolist()):
+        slot = int(records.history.record_slots[row])
+        begin, end = starts[row], starts[row + 1]
+        if page <= 0:
+            continue
+        torch.testing.assert_close(ring[slot, :3].T, case["conv"][page], atol=0, rtol=0)
+        torch.testing.assert_close(
+            ring[slot, 3 : 3 + end - begin], original[begin:end], atol=0, rtol=0
+        )
     torch.testing.assert_close(case["raw"], original, atol=0, rtol=0)
     torch.testing.assert_close(output[0].float(), expected[0], atol=2e-4, rtol=1e-2)
 
 
 def test_retained_capture_rejects_overlapping_projection_storage():
-    from dataclasses import replace
-
     case = make_case(2, 4)
-    case["records"] = replace(case["records"], original_qkv=case["raw"])
+    ring = case["records"].preconv.rows
+    # A ring that shares the projection rows' storage.
+    storage = torch.zeros(
+        case["raw"].shape[0] + ring.numel() // ring.shape[-1],
+        ring.shape[-1],
+        device="cuda",
+        dtype=ring.dtype,
+    )
+    case["raw"] = storage[: case["raw"].shape[0]].copy_(case["raw"])
+    overlapping = storage[2 : 2 + ring.numel() // ring.shape[-1]].view_as(ring)
+    case["records"] = replace(
+        case["records"],
+        preconv=kda.KdaPreconvRing(overlapping, case["records"].preconv.heads),
+    )
+    # The round's prepare seeds the (overlapping) ring rows before any verify;
+    # running it again writes the same seeds. The verify itself must refuse
+    # before it writes a row.
+    records = case["records"]
+    prepare_history(
+        case["state"],
+        records.history,
+        case["reads"],
+        records.query_start_loc,
+        draft_token_num=case["width"],
+        conv=case["conv"],
+        preconv=records.preconv,
+    )
     before = case["raw"].clone()
     with pytest.raises(ValueError, match="overlap|separate"):
         verify(case)
     torch.testing.assert_close(case["raw"], before, atol=0, rtol=0)
 
 
-def test_retained_verify_can_leave_original_qkv_with_caller():
-    from dataclasses import replace
-
+def test_retained_verify_requires_the_ring_to_convolve():
+    """A verify that convolves takes its history from the ring: none is an error."""
     case = make_case(2, 4)
-    case["records"] = replace(case["records"], original_qkv=None)
-    expected = reference(case)
-    output = verify(case)
-    torch.testing.assert_close(output[0].float(), expected[0], atol=2e-4, rtol=1e-2)
+    records = replace(case["records"], preconv=None)
+    with pytest.raises(ValueError, match="pre-convolution ring"):
+        kda.kda_fused_paged_verify(
+            case["raw"],
+            case["weights"],
+            None,
+            None,
+            case["beta"],
+            case["a"],
+            case["bias"],
+            state_pool=case["state"],
+            read_indices=case["reads"],
+            num_heads=case["heads"],
+            head_dim=128,
+            draft_token_num=case["width"],
+            lower_bound=case["lower_bound"],
+            recurrent_layout="v_major",
+            retained_records=records,
+            output_norm=None,
+            g_raw=case["gate"],
+            override=None,
+            solution=None,
+        )

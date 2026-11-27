@@ -242,12 +242,12 @@ class KdaRetainedHistory:
         return width
 
 
-# Retained commit descriptor ABI: UINT64 [layers, 12].
-# Each layer's row contains 3 pointers, 1 page count, and 8 strides:
-#   0: original QKV pointer
+# Retained commit descriptor ABI: UINT64 [layers, 13].
+# Each layer's row contains 3 pointers, 1 page count, and 9 strides:
+#   0: pre-convolution ring pointer (the layer's rows of record slot 0)
 #   1: convolution state pointer
 #   2: page count (the convolution and recurrent pools hold the same pages)
-#   3: QKV row stride
+#   3: ring row stride
 #   4: convolution page stride
 #   5: convolution channel stride
 #   6: convolution tap stride
@@ -256,28 +256,135 @@ class KdaRetainedHistory:
 #   9: recurrent head stride
 #  10: recurrent value stride
 #  11: recurrent key stride
+#  12: ring record-slot stride
 # All strides count elements. Per-layer values support different arena layouts.
-# A request's accepted count is not a layer's: every layer shares it, and the
-# prepare and the commit take it as a tensor.
+# The ring holds window + 3 rows per record slot and layer, in the convolution
+# state's dtype with unit channel stride (KdaPreconvRing).
+# A request's accepted count and ring state are not a layer's: every layer
+# shares them, and the prepare and the commit take them as a tensor.
 # Verify already stores U/K/decay records; commit reads them only to fold an
 # ended request's accepted records into its live page. Commit updates the
-# convolution state, then publishes the request's count. The prepare ahead of
-# a verify forward reads the page count and recurrent-state columns.
-KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS = 12
+# convolution state, then publishes the request's count and ring state. The
+# prepare ahead of a verify forward reads the page count, recurrent-state and
+# (to seed a ring) convolution and ring columns.
+KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS = 13
+
+
+def _storage_overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Whether two tensors' storages share any byte."""
+    a, b = left.untyped_storage(), right.untyped_storage()
+    return (
+        a.data_ptr() < b.data_ptr() + b.nbytes()
+        and b.data_ptr() < a.data_ptr() + a.nbytes()
+    )
+
+
+def _elements_are_disjoint(tensor: torch.Tensor) -> bool:
+    """Whether distinct indices of ``tensor`` address distinct elements.
+
+    Dimensions of extent above one, taken by increasing stride, must each
+    step past every element the smaller ones reach. This holds for dense
+    tensors and for views that select from a larger one (such as one layer
+    of a ``[slots, layers, rows, channels]`` ring), and fails for expanded
+    (stride 0) and overlapping views.
+    """
+    reach = 0
+    for size, stride in sorted(
+        (
+            (size, stride)
+            for size, stride in zip(tensor.shape, tensor.stride())
+            if size > 1
+        ),
+        key=lambda dim: dim[1],
+    ):
+        if stride <= reach:
+            return False
+        reach += (size - 1) * stride
+    return True
+
+
+@dataclass(frozen=True)
+class KdaPreconvRing:
+    """One layer's per-request-slot ring of raw pre-convolution QKV rows.
+
+    rows is [record slots, R, channels] in the convolution state's dtype,
+    with unit channel stride and R = window + 3. Every row of every slot is
+    its own memory: no two (slot, row, channel) indices share an element.
+    Ring positions count from the slot's last seed, not from the request's
+    absolute sequence position: the retained prepare seeds an empty slot's
+    rows 0..2 with the three convolution inputs before its window, so its
+    first candidate lands in row 3 whatever the request's length, and each
+    input after that takes the next row mod R. heads is INT32 [requests],
+    the ring row of each request row's first candidate, which the round's
+    prepare wrote (its snapshot). A verify reads the three convolution taps
+    of a request from rows (head - 3 + i) mod R and writes candidate t to
+    row (head + t) mod R; the two sets never overlap. Padding rows (no
+    resident record slot, or no source or live page in the pool) read a
+    zero history and write no row. Construction validates storage
+    metadata, which must stay fixed for the object's lifetime; tensor
+    contents may be refreshed in place.
+    """
+
+    rows: torch.Tensor
+    heads: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if (
+            self.rows.ndim != 3
+            or self.rows.shape[1] <= 3
+            or self.rows.stride(-1) != 1
+            or self.rows.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+        ):
+            raise ValueError(
+                "pre-convolution ring must be [record slots, window + 3, channels] "
+                "with unit channel stride"
+            )
+        if not _elements_are_disjoint(self.rows):
+            # A verify reads some rows of a slot while it writes others, and
+            # requests of different slots write concurrently.
+            raise ValueError(
+                "pre-convolution ring rows and slots must not share memory"
+            )
+        if self.heads.ndim != 1 or self.heads.dtype != torch.int32:
+            raise ValueError("pre-convolution ring heads must be an INT32 vector")
+        if self.heads.device != self.rows.device:
+            raise ValueError("pre-convolution ring fields must share a device")
+
+    def check_separate_storage(self, *tensors: torch.Tensor | None) -> None:
+        """Raise ValueError when the ring's storage overlaps one of ``tensors``.
+
+        A verify writes the ring while it reads its inputs (the raw
+        projection rows, weights and gate inputs) and writes its outputs, so
+        none of them may share the ring's storage. None entries are skipped.
+        """
+        for tensor in tensors:
+            if tensor is not None and _storage_overlaps(self.rows, tensor):
+                raise ValueError(
+                    "the pre-convolution ring must use storage separate from "
+                    "the verify's inputs and outputs"
+                )
+
+    @property
+    def window(self) -> int:
+        """The verify window the ring keeps candidates for."""
+        return self.rows.shape[1] - 3
 
 
 @dataclass(frozen=True)
 class KdaRetainedRecords:
-    """Request-owned records and lengths, packed QKV and validity metadata.
+    """Request-owned records and lengths, pre-convolution ring and validity metadata.
 
-    history owns FP32 U/K/decay and accepted lengths. original_qkv optionally
-    receives pre-convolution inputs. metadata is INT64 [batch, 3] containing
-    slot/generation/absolute start; stamps is INT64 [slots, ring_capacity, 2].
-    Stamp capacity is independent of history capacity. query_start_loc gives
-    packed request boundaries. Tensor contents may be refreshed in place.
+    history owns FP32 U/K/decay and accepted lengths. preconv is the layer's
+    pre-convolution ring a fused verify reads its convolution history from
+    and writes its candidates' raw rows to; None when a split convolution
+    producer (``kda_verify_conv_update``) already did both for this verify.
+    metadata is INT64 [batch, 3] containing slot/generation/absolute start;
+    stamps is INT64 [slots, ring_capacity, 2]. Stamp capacity is independent
+    of history capacity. query_start_loc gives packed request boundaries.
+    Tensor contents may be refreshed in place.
     """
 
-    original_qkv: torch.Tensor | None
+    preconv: KdaPreconvRing | None
     history: KdaRetainedHistory
     metadata: torch.Tensor
     stamps: torch.Tensor
@@ -415,7 +522,6 @@ def kda_paged_prefill(
 def kda_fused_paged_verify(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
     f_a_out: torch.Tensor | None,
     f_b_weight: torch.Tensor | None,
     beta_logits: torch.Tensor,
@@ -439,15 +545,19 @@ def kda_fused_paged_verify(
     """Append candidates to retained history and return packed attention output.
 
     mixed_qkv and convolution inputs describe packed pre-convolution rows.
-    retained_records supplies request-owned history, private live destinations,
-    packed request boundaries and candidate validity stamps. read_indices
-    identifies immutable source pages; convolution reads them. The round's
-    history must already be prepared (resolve_kda_batched_retained_prepare):
+    retained_records supplies request-owned history, the pre-convolution
+    ring, private live destinations, packed request boundaries and candidate
+    validity stamps. read_indices identifies immutable source pages; pages
+    at or below 0 or past state_pool are padding. The round's history and
+    ring must already be prepared (resolve_kda_batched_retained_prepare):
     verify reads each row's live page as its dense base, applies its accepted
-    records, and writes candidates after them. Verify itself never writes a
-    page or a length; commit subsequently publishes accepted candidate length.
-    f_a_out/f_b_weight project the gate when g_raw is omitted. NVIDIA split
-    producers require both g_raw and conv_qkv. lower_bound selects bounded
+    records, and writes candidates after them; it convolves each candidate
+    with the request's three previous inputs from the ring and writes the
+    candidates' raw rows there. Verify itself never writes a page, a length
+    or a ring state; commit subsequently publishes them. f_a_out/f_b_weight
+    project the gate when g_raw is omitted. NVIDIA split producers require
+    both g_raw and conv_qkv, whose producer already used the ring
+    (retained_records.preconv is None then). lower_bound selects bounded
     sigmoid decay, or None selects softplus decay. Unsupported geometry or
     kernel selection raises before any state or record is modified.
     """
@@ -459,14 +569,27 @@ def kda_fused_paged_verify(
         or draft_token_num <= 0
     ):
         raise ValueError("Unsupported retained KDA verify geometry")
-    if conv_states.shape[0] != state_pool.shape[0]:
-        raise ValueError("KDA convolution and recurrent pools must hold the same pages")
     if retained_records is None:
         raise ValueError("Retained KDA verify requires retained records")
     if draft_token_num > retained_records.history.correction.shape[2]:
         raise ValueError("Retained KDA candidate window exceeds history capacity")
     if conv_qkv is not None and g_raw is None:
         raise ValueError("Precomputed convolution requires a projected raw gate")
+    preconv = retained_records.preconv
+    if (conv_qkv is None) != (preconv is not None):
+        raise ValueError(
+            "KDA verify takes the pre-convolution ring exactly when it convolves"
+        )
+    if preconv is not None and (
+        preconv.window != draft_token_num
+        or preconv.heads.shape != (read_indices.shape[0],)
+        or preconv.rows.shape[0] != retained_records.history.correction.shape[0]
+        or preconv.rows.shape[2] != mixed_qkv.shape[-1]
+    ):
+        raise ValueError(
+            "pre-convolution ring must hold window + 3 rows of the input channels "
+            "per record slot and one head per request"
+        )
     if g_raw is None and (f_a_out is None or f_b_weight is None):
         raise ValueError(
             "KDA verify requires a raw gate or both gate projection inputs"
@@ -500,7 +623,6 @@ def kda_fused_paged_verify(
     return kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
-        conv_states=conv_states,
         f_a_out=f_a_out,
         f_b_weight=f_b_weight,
         beta_logits=beta_logits,
@@ -607,15 +729,17 @@ def kda_fused_paged_verify_fuses_producers(
 def kda_verify_conv_update(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
     read_indices: torch.Tensor,
     *,
+    live_indices: torch.Tensor,
+    preconv: KdaPreconvRing,
+    record_slots: torch.Tensor,
+    page_count: int,
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
     query_start_loc: torch.Tensor,
     bias: torch.Tensor | None = None,
-    original_qkv: torch.Tensor | None = None,
     recurrent_layout: str,
 ) -> torch.Tensor:
     """Materialize the convolution producer used by split KDA verification.
@@ -623,12 +747,17 @@ def kda_verify_conv_update(
     Args:
         mixed_qkv: Packed raw QKV projection rows.
         conv_weights: Fused four-tap QKV convolution weights.
-        conv_states: Committed convolution-state pool.
         read_indices: Committed page index for each request.
+        live_indices: Private live page index for each request. A request
+            takes part, as in the retained prepare, when both of its pages
+            lie in (0, page_count) and its record slot is resident; other
+            rows are padding (zero history, no ring write).
+        preconv: The layer's pre-convolution ring and each request's ring
+            head: the convolution reads its history there, and the producer
+            writes each input row there for the accepted-history commit.
+        record_slots: Each request's record slot in the ring.
+        page_count: Pages in the State pool read_indices address.
         bias: Optional per-channel bias before SiLU; None adds zero.
-        original_qkv: Optional separate destination for pre-convolution QKV.
-            The producer retains each input row for accepted-history commit.
-            None leaves retention to the caller.
         num_heads: Per-rank KDA head count.
         head_dim: KDA head width.
         draft_token_num: Maximum verify positions per request.
@@ -656,14 +785,16 @@ def kda_verify_conv_update(
     return kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
-        conv_states=conv_states,
         read_indices=read_indices,
+        live_indices=live_indices,
+        preconv=preconv,
+        record_slots=record_slots,
+        page_count=page_count,
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         query_start_loc=query_start_loc,
         bias=bias,
-        original_qkv=original_qkv,
     )
 
 
@@ -722,25 +853,27 @@ def kda_materialize_retained_pages(
 
 
 def kda_reset_retained_length(
-    length: torch.Tensor,
+    replay_state: torch.Tensor,
     *,
     write_indices: torch.Tensor,
     record_slots: torch.Tensor,
     page_count: int,
 ) -> None:
-    """Clear the slot counts of rows whose page received a dense state.
+    """Clear the slot counts and ring states of rows whose page received a dense state.
 
-    length is INT32 [slot, 1]. write_indices holds each request row's
-    destination page and record_slots its slot; page_count is the State pool's
-    page count. Padding rows -- a page at or below 0, or at or past
-    page_count -- keep their counts, as materialization skips them. Every
-    layer shares a request's count, so the caller clears it once, after every
-    layer's fold, in a launch ordered behind their dense writes.
+    replay_state is INT32 [slot, 2]: each slot's accepted count and its
+    pre-convolution ring state, cleared together so the next verify reseeds
+    the ring from the page. write_indices holds each request row's
+    destination page and record_slots its slot; page_count is the State
+    pool's page count. Padding rows -- a page at or below 0, or at or past
+    page_count -- keep their state, as materialization skips them. Every
+    layer shares a request's replay state, so the caller clears it once,
+    after every layer's fold, in a launch ordered behind their dense writes.
     """
     from tokenspeed_kernel.ops.attention.kda._retained import reset_length
 
     reset_length(
-        length,
+        replay_state,
         write_indices=write_indices,
         record_slots=record_slots,
         page_count=page_count,
@@ -753,20 +886,24 @@ def resolve_kda_batched_retained_commit(
     """Resolve retained cross-layer convolution and count publication.
 
     Returns a callable or None for unsupported geometry/platform. Its uint64
-    [layers, 12] descriptors hold QKV/conv pointers, the page count, QKV row,
-    conv page, conv channel and conv tap strides, then the recurrent state
-    pointer and its page, head, value and key strides, in elements.
-    record_slots selects each request's slot in replay_length, the count
-    every layer shares. The first launch reads it in every layer; a second,
-    one-dimensional launch then writes each carried request's count once: the
-    records its verify read (the count, or 0 when it lies outside
-    [0, history_capacity - draft_token_num]) plus its acceptance. A request
+    [layers, 13] descriptors hold the pre-convolution ring and conv
+    pointers, the page count, ring row, conv page, conv channel and conv tap
+    strides, the recurrent state pointer and its page, head, value and key
+    strides, then the ring's record-slot stride, in elements. record_slots
+    selects each request's slot in replay_state, the count and ring state
+    every layer shares. The first launch writes each layer's convolution
+    state from the source page's taps and the accepted candidates' ring
+    rows, at the ring head of the prepare's snapshot (replay_snapshot); a
+    second,
+    one-dimensional launch then writes each carried request's count once:
+    the records its verify read (the snapshot's applied count) plus its
+    acceptance, and its ring state past the accepted candidates. A request
     whose slot is set in request_stopped ended in this forward: its accepted
-    records are folded into its live page and its count is cleared. One
-    whose commit a layer that carried it rejects instead is reported as
-    ``REQUEST_ENDED_INCOMPLETE`` in request_ends, the forward's per-row
-    ``apply_stop_conditions`` report. Metadata and all pointers remain stable
-    during CUDA graph capture.
+    records are folded into its live page and its count and ring state are
+    cleared. One whose commit a layer that carried it rejects instead is
+    reported as ``REQUEST_ENDED_INCOMPLETE`` in request_ends, the forward's
+    per-row ``apply_stop_conditions`` report. Metadata and all pointers
+    remain stable during CUDA graph capture.
     """
     return _resolve_batched_retained(
         "kda_retained_commit",
@@ -784,7 +921,7 @@ def resolve_kda_batched_retained_prepare(
 
     Returns a callable or None for unsupported geometry/platform. It takes the
     commit's descriptors, layer groups, record slots, FP32 records and shared
-    counts, plus [groups, requests] source and live pages, the packed
+    replay state, plus [groups, requests] source and live pages, the packed
     boundaries and the window (draft_token_num) of the verify that follows.
     A request's count H overflows when it lies outside
     [0, capacity - draft_token_num]; the verify and the commit then apply no
@@ -792,11 +929,14 @@ def resolve_kda_batched_retained_prepare(
     request. In each layer, an overflowing request gets the source state with
     records [0, H) applied in its live page; otherwise a request whose live
     page differs from its source in the layer's group gets the source state
-    copied, with no record applied. One launch decides and copies, and only
-    reads the counts: the commit alone writes them. Run it once per verify
-    round, after the round's pages, boundaries and record slots are
-    refreshed and before any layer's verify: a second run would copy the
-    unchanged source over the fold.
+    copied, with no record applied. A request whose pre-convolution ring is
+    not seeded gets ring rows 0..2 of each layer from its source page's
+    convolution taps. The launch writes each row's applied count and ring
+    head into replay_snapshot for the round's verify and commit. One launch
+    decides and copies, and only reads the replay state: the commit alone
+    writes it. Run it once per verify round, after the round's pages,
+    boundaries and record slots are refreshed and before any layer's verify:
+    a second run would copy the unchanged source over the fold.
     """
     return _resolve_batched_retained(
         "kda_retained_prepare",
@@ -913,6 +1053,7 @@ __all__ = [
     "apply_kda_output_norm",
     "kda_fused_paged_verify_fuses_producers",
     "KdaRetainedHistory",
+    "KdaPreconvRing",
     "KdaRetainedRecords",
     "KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS",
     "kda_materialize_retained_pages",

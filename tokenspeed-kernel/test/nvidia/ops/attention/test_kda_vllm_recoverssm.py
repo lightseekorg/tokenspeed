@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from kda_retained_reference import endpoint, prepare_history, publish
+from kda_retained_reference import endpoint, prepare_history, publish, replay_length
 from utils import is_nvidia
 
 if not is_nvidia():
@@ -164,7 +164,7 @@ def test_vllm_retained_verify_and_publish(batch, width, dim, lower_bound):
         torch.zeros(batch, heads, capacity, dim, device="cuda"),
         torch.zeros(batch, heads, capacity, dim, device="cuda"),
         torch.ones(batch, heads, capacity, dim, device="cuda"),
-        torch.zeros(batch, 1, device="cuda", dtype=torch.int32),
+        replay_length(batch),
         live,
         torch.arange(batch, device="cuda", dtype=torch.int32),
     )

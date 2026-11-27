@@ -34,6 +34,8 @@ output norm is checked against the norm kernel on the plain output.
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -47,12 +49,17 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 if not ArchVersion(10, 0) <= current_platform().arch_version <= ArchVersion(10, 3):
     pytest.skip("requires SM100 or SM103", allow_module_level=True)
-from kda_retained_reference import prepare_history  # noqa: E402
+from kda_retained_reference import (  # noqa: E402
+    prepare_history,
+    replay_length,
+    snapshot,
+)
 from tokenspeed_kernel.ops.activation.triton import (  # noqa: E402
     rmsnorm_gated_sigmoid,
 )
 from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
     KdaOutputNorm,
+    KdaPreconvRing,
     KdaRetainedHistory,
     KdaRetainedRecords,
     kda_fused_paged_verify,
@@ -124,12 +131,12 @@ def _inputs(batch, window, *, seed, lower_bound=-5.0, metadata=True, f_a_pitch=0
     )
 
 
-def _records(x, *, original, capacity, correction_stride=1, history_length=0):
+def _records(x, *, capacity, correction_stride=1, history_length=0):
     """Sentinel-filled request records, with padding around each slot.
 
     With ``history_length``, every slot first holds that many accepted records.
     """
-    slots, rows = x["slots"], x["mixed_qkv"].shape[0]
+    slots = x["slots"]
     correction_rows = torch.full(
         (slots, capacity * WIDTH * correction_stride + CORRECTION_ROW_PAD),
         CORRECTION_FILL,
@@ -149,7 +156,7 @@ def _records(x, *, original, capacity, correction_stride=1, history_length=0):
         .transpose(1, 2)[..., ::correction_stride],
         packed[..., :DIM],
         packed[..., DIM:],
-        torch.zeros(slots, 1, dtype=torch.int32, device="cuda"),
+        replay_length(slots),
         x["state_indices"],
         torch.arange(x["state_indices"].numel(), device="cuda", dtype=torch.int32),
     )
@@ -170,11 +177,15 @@ def _records(x, *, original, capacity, correction_stride=1, history_length=0):
     stamps = torch.full(
         (x["slots"], capacity, 2), STAMP_FILL, device="cuda", dtype=torch.int64
     )
+    # Each slot's pre-convolution ring, padded; the prepare seeds rows 0..2.
     retained = torch.full(
-        (rows, 3 * WIDTH + 8), ORIGINAL_FILL, device="cuda"
+        (slots, x["window"] + 3, 3 * WIDTH + 8), ORIGINAL_FILL, device="cuda"
     ).bfloat16()
     records = KdaRetainedRecords(
-        original_qkv=retained[:, : 3 * WIDTH] if original else None,
+        preconv=KdaPreconvRing(
+            retained[..., : 3 * WIDTH],
+            snapshot(history, x["state_indices"].numel())[:, 1],
+        ),
         history=history,
         metadata=x["record_metadata"],
         stamps=stamps if x["record_metadata"] is not None else None,
@@ -183,19 +194,25 @@ def _records(x, *, original, capacity, correction_stride=1, history_length=0):
     return records, (correction_rows, key_gate_rows, stamps, retained)
 
 
-def _verify(x, records, output_norm, *, override=None, **producers):
-    # Serving readies the history before every verify round.
+def _prepare(x, records):
+    # Serving readies the history and the ring before every verify round.
     prepare_history(
         x["state_pool"],
         records.history,
         x["state_indices"],
         x["query_start_loc"],
         draft_token_num=x["window"],
+        conv=x["conv_states"],
+        preconv=records.preconv,
     )
+
+
+def _verify(x, records, output_norm, *, override=None, prepare=True, **producers):
+    if prepare:
+        _prepare(x, records)
     return kda_fused_paged_verify(
         x["mixed_qkv"],
         x["conv_weights"],
-        x["conv_states"],
         x["f_a_out"],
         x["f_b_weight"],
         x["beta_logits"],
@@ -220,30 +237,32 @@ def _split(x, capacity, *, correction_stride=1, history_length=0):
     """The serving split producers, then the registered record verify."""
     records, buffers = _records(
         x,
-        original=False,
         capacity=capacity,
         correction_stride=correction_stride,
         history_length=history_length,
     )
+    _prepare(x, records)
     conv_qkv = fused_kda_verify_conv_update(
         x["mixed_qkv"],
         x["conv_weights"],
-        x["conv_states"],
         x["state_indices"],
+        live_indices=records.history.live_state_indices,
+        preconv=records.preconv,
+        record_slots=records.history.record_slots,
+        page_count=x["state_pool"].shape[0],
         num_heads=HEADS,
         head_dim=DIM,
         draft_token_num=x["window"],
-        original_qkv=buffers[3][:, : 3 * WIDTH],
         query_start_loc=x["query_start_loc"],
     )
     g_raw = F.linear(x["f_a_out"], x["f_b_weight"])
-    return _verify(x, records, None, g_raw=g_raw, conv_qkv=conv_qkv), buffers
+    records = dataclasses.replace(records, preconv=None)
+    out = _verify(x, records, None, prepare=False, g_raw=g_raw, conv_qkv=conv_qkv)
+    return out, buffers
 
 
 def _fused(x, capacity, output_norm=None, *, history_length=0):
-    records, buffers = _records(
-        x, original=True, capacity=capacity, history_length=history_length
-    )
+    records, buffers = _records(x, capacity=capacity, history_length=history_length)
     return _verify(x, records, output_norm), buffers
 
 
@@ -373,9 +392,7 @@ def test_strided_or_unaligned_inputs_match_split_producers(layout):
         x["conv_weights"] = shifted[1:].view_as(weights).copy_(weights)
     correction_stride = 2 if layout == "correction channels" else 1
     expected = _split(x, 8, correction_stride=correction_stride)
-    records, buffers = _records(
-        x, original=True, capacity=8, correction_stride=correction_stride
-    )
+    records, buffers = _records(x, capacity=8, correction_stride=correction_stride)
     actual = _verify(x, records, None), buffers
     # The fallback runs the reference producers, so every result is exact.
     assert torch.equal(expected[0], actual[0])
@@ -580,8 +597,8 @@ def test_retained_prefix_append_preserves_base_and_publishes_on_commit(
 
     x = _inputs(2, 3, seed=143)
     x["state_pool"] = x["state_pool"].to(state_dtype)
-    records = _records(x, original=True, capacity=8)[0]
-    expected = _records(x, original=True, capacity=8)[0]
+    records = _records(x, capacity=8)[0]
+    expected = _records(x, capacity=8)[0]
     check_fused_retained_append(
         x, records, expected, _verify, width=3, raw_gate_only=raw_gate_only
     )
@@ -618,17 +635,19 @@ def _packed_records(x, capacity, history_length, first_slot=0):
     the same contents whatever ``first_slot`` is. Only those slots are
     initialized: no request addresses the slots before them.
     """
-    slots, rows = x["slots"], x["mixed_qkv"].shape[0]
+    slots = x["slots"]
     storage = torch.empty((first_slot + slots, 3, HEADS, capacity, DIM), device="cuda")
-    lengths = torch.empty((first_slot + slots, 1), dtype=torch.int32, device="cuda")
+    # Each slot's count beside its ring state, which starts unseeded.
+    lengths = torch.empty((first_slot + slots, 2), dtype=torch.int32, device="cuda")
     own = slice(first_slot, None)
     storage[own] = KEY_GATE_FILL
     storage[own, 0] = CORRECTION_FILL
-    lengths[own] = history_length
+    lengths[own, 0] = history_length
+    lengths[own, 1] = 0
     requests = x["state_indices"].numel()
     history = KdaRetainedHistory(
         *storage.unbind(1),
-        lengths,
+        lengths[:, :1],
         x["state_indices"],
         torch.arange(
             first_slot, first_slot + requests, device="cuda", dtype=torch.int32
@@ -652,16 +671,20 @@ def _packed_records(x, capacity, history_length, first_slot=0):
         (slots, capacity, 2), STAMP_FILL, device="cuda", dtype=torch.int64
     )
     retained = torch.full(
-        (rows, 3 * WIDTH + 8), ORIGINAL_FILL, device="cuda"
+        (first_slot + slots, x["window"] + 3, 3 * WIDTH + 8),
+        ORIGINAL_FILL,
+        device="cuda",
     ).bfloat16()
     records = KdaRetainedRecords(
-        original_qkv=retained[:, : 3 * WIDTH],
+        preconv=KdaPreconvRing(
+            retained[..., : 3 * WIDTH], snapshot(history, requests)[:, 1]
+        ),
         history=history,
         metadata=x["record_metadata"],
         stamps=stamps,
         query_start_loc=x["query_start_loc"],
     )
-    return records, (storage[own], history.length[own], stamps, retained)
+    return records, (storage[own], history.length[own], stamps, retained[own])
 
 
 def _fused_packed(x, capacity, history_length, output_norm=None, first_slot=0):
@@ -856,3 +879,119 @@ def test_only_grids_of_one_cta_per_sm_copy_records_on_64_row_tiles():
     assert not copies(ctas=sms + 1)  # more than one CTA per SM
     # The region of 1020 records exceeds what a CTA may claim.
     assert not copies(capacity=1024)
+
+
+@pytest.mark.parametrize("batch", [5, 9])
+def test_padding_rows_beside_live_slot_zero_touch_no_ring_row(batch):
+    """Padding rows sharing live slot 0 read a zero history and write no row.
+
+    Rows 1 to 3 share row 0's record slot 0 with ring head 0, so their taps
+    would read rows 4..6, which row 0 (head 3) writes: rows 1 and 2 have
+    pages 0 and -1, row 3 a source page but a masked live page. The fused
+    kernel and the split producers give the same bits; slot 0 holds exactly
+    row 0's taps and window, slots of no taking-part row keep their fill, and
+    the padding rows' outputs are zero.
+    """
+    window, capacity = 4, 9
+    x = _inputs(batch, window, seed=233 + batch)
+    runs = []
+    for fused in (False, True):
+        records, buffers = _records(x, capacity=capacity)
+        live = records.history.live_state_indices.clone()
+        live[3] = 0
+        slots = records.history.record_slots.clone()
+        slots[:4] = 0
+        records = dataclasses.replace(
+            records,
+            history=dataclasses.replace(
+                records.history, live_state_indices=live, record_slots=slots
+            ),
+        )
+        _prepare(x, records)
+        records.preconv.heads[1:4] = 0
+        if fused:
+            out = _verify(
+                x,
+                records,
+                None,
+                override="cute_dsl_kda_fused_paged_verify_window",
+                prepare=False,
+            )
+        else:
+            conv_qkv = fused_kda_verify_conv_update(
+                x["mixed_qkv"],
+                x["conv_weights"],
+                x["state_indices"],
+                live_indices=live,
+                preconv=records.preconv,
+                record_slots=slots,
+                page_count=x["state_pool"].shape[0],
+                num_heads=HEADS,
+                head_dim=DIM,
+                draft_token_num=window,
+                query_start_loc=x["query_start_loc"],
+            )
+            out = _verify(
+                x,
+                dataclasses.replace(records, preconv=None),
+                None,
+                prepare=False,
+                g_raw=F.linear(x["f_a_out"], x["f_b_weight"]),
+                conv_qkv=conv_qkv,
+            )
+        runs.append((out, buffers))
+    _assert_matches(x, *runs, capacity)
+    out, (_, _, _, ring) = runs[1]
+    page = int(x["state_indices"][0])
+    assert torch.equal(ring[0, :3, : 3 * WIDTH].T, x["conv_states"][page, : 3 * WIDTH])
+    assert torch.equal(ring[0, 3 : 3 + window, : 3 * WIDTH], x["mixed_qkv"][:window])
+    assert (ring[1:4] == ORIGINAL_FILL).all()
+    assert (out[0, window : 4 * window] == 0).all()
+
+
+def test_an_empty_ring_verifies_padding_without_reading_it():
+    """With no record slot every row is padding: zero outputs, no ring access."""
+    x = dict(_inputs(2, 4, seed=239, metadata=False), slots=0)
+    records, _ = _records(x, capacity=9)
+    assert records.preconv.rows.numel() == 0
+    out = _verify(
+        x,
+        records,
+        None,
+        override="cute_dsl_kda_fused_paged_verify_window",
+        prepare=False,
+    )
+    torch.cuda.synchronize()
+    assert (out == 0).all()
+
+
+def test_a_ring_sharing_the_projection_storage_is_rejected():
+    """The fused entry rejects a ring inside the projection's storage before launch.
+
+    The shared ring meets every alignment the window kernel asks of a ring.
+    """
+    window = 4
+    x = _inputs(3, window, seed=241)
+    records, _ = _records(x, capacity=9)
+    rows, ring = x["mixed_qkv"].shape[0], records.preconv.rows
+    arena = torch.zeros(
+        rows * 3 * WIDTH + ring.numel(), device="cuda", dtype=torch.bfloat16
+    )
+    mixed = arena[: rows * 3 * WIDTH].view(rows, 3 * WIDTH)
+    mixed.copy_(x["mixed_qkv"])
+    shared = arena[rows * 3 * WIDTH :].view(ring.shape)
+    assert shared.data_ptr() % 16 == 0
+    records = dataclasses.replace(
+        records, preconv=KdaPreconvRing(shared, records.preconv.heads)
+    )
+    before = arena.clone()
+    with pytest.raises(ValueError, match="storage separate"):
+        _verify(
+            dict(x, mixed_qkv=mixed),
+            records,
+            None,
+            override="cute_dsl_kda_fused_paged_verify_window",
+            prepare=False,
+        )
+    torch.cuda.synchronize()
+    assert torch.equal(arena, before)

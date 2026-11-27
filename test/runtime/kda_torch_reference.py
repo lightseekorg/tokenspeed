@@ -92,11 +92,23 @@ def checked_convolution(raw, conv, *, conv_weights, bias, prefill):
             ),
         ).T.reshape_as(raw)
     else:
+        from tokenspeed_kernel.ops.attention.kda import KdaPreconvRing
+
+        # Each request's ring holds its taps before row 3, as a first round's
+        # prepare seeds it.
+        ring = torch.zeros(
+            batch, width + 3, channels, device=raw.device, dtype=conv.dtype
+        )
+        ring[:, :3] = conv.transpose(1, 2)
+        heads = torch.full((batch,), 3, device=raw.device, dtype=torch.int32)
         actual = kda_verify_conv_update(
             rows,
             conv_weights,
-            pool,
             pages,
+            live_indices=pages,
+            preconv=KdaPreconvRing(ring, heads),
+            record_slots=pages - 1,
+            page_count=pool.shape[0],
             num_heads=channels // (3 * 128),
             head_dim=128,
             draft_token_num=width,
