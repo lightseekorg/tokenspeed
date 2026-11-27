@@ -18,13 +18,25 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Gluon helpers for request-owned KDA records and their accepted lengths."""
+"""Gluon helpers for request-owned KDA records and their accepted counts."""
 
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
-# Row width of the batched retained commit descriptors: the QKV, convolution
-# and length fields, then the v-major recurrent state pointer and strides.
-_DESCRIPTOR_COLUMNS = gl.constexpr(14)
+# Row width of the batched retained commit descriptors: the QKV and
+# convolution fields, then the v-major recurrent state pointer and strides.
+_DESCRIPTOR_COLUMNS = gl.constexpr(12)
+_QKV = gl.constexpr(0)
+_CONV = gl.constexpr(1)
+_PAGES = gl.constexpr(2)
+_QKV_ROW_STRIDE = gl.constexpr(3)
+_CONV_PAGE_STRIDE = gl.constexpr(4)
+_CONV_CHANNEL_STRIDE = gl.constexpr(5)
+_CONV_TAP_STRIDE = gl.constexpr(6)
+_STATE = gl.constexpr(7)
+_STATE_PAGE_STRIDE = gl.constexpr(8)
+_STATE_HEAD_STRIDE = gl.constexpr(9)
+_STATE_VALUE_STRIDE = gl.constexpr(10)
+_STATE_KEY_STRIDE = gl.constexpr(11)
 
 
 def kda_records_launch_metadata(grid, kernel, args):
@@ -381,6 +393,7 @@ def retained_batched_accept(
     record_slots,
     metadata,
     stamps,
+    replay_length,
     layer,
     row,
     group_count,
@@ -392,6 +405,7 @@ def retained_batched_accept(
     query_stride,
     record_slot_stride,
     record_slot_count,
+    length_stride,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
@@ -399,6 +413,13 @@ def retained_batched_accept(
     WINDOW: gl.constexpr,
     WAVE: gl.constexpr,
 ):
+    """One layer's checks of a request row's commit.
+
+    ``live`` says the layer carries the row: its group's source and live
+    pages lie in the pool, the record slot is resident and the window is
+    non-empty. ``valid`` adds every accepted candidate's stamp. ``old`` is
+    the count of records the round's verify read before its candidates.
+    """
     group = gl.load(groups + layer).to(gl.int64)
     valid = (group >= 0) & (group < group_count)
     source = gl.load(
@@ -409,10 +430,7 @@ def retained_batched_accept(
         mask=valid,
         other=0,
     ).to(gl.int64)
-    base = descriptors + layer * _DESCRIPTOR_COLUMNS
-    pages = gl.load(base + 3).to(gl.int64)
-    length = gl.load(base + 2).to(gl.pointer_type(gl.int32))
-    length_stride = gl.load(base + 6).to(gl.int64)
+    pages = gl.load(descriptors + layer * _DESCRIPTOR_COLUMNS + _PAGES).to(gl.int64)
     begin = gl.load(starts + row * query_stride).to(gl.int64)
     count = gl.load(starts + (row + 1) * query_stride).to(gl.int64) - begin
     record_slot = gl.load(record_slots + row * record_slot_stride).to(gl.int64)
@@ -434,10 +452,11 @@ def retained_batched_accept(
         gl.maximum(gl.load(accepted + row * accepted_stride), 0),
         gl.minimum(count, WINDOW),
     )
-    # The request's accepted count lives in its slot, not in the cache page.
-    length = length + record_slot * length_stride
-    old = gl.load(length, mask=valid, other=0)
-    valid = valid & (old >= 0) & (old + take <= CAPACITY)
+    # Every layer of the request shares its slot's count. The verify read it
+    # whole when it lies in [0, CAPACITY - WINDOW], else none (the prepare
+    # folded the records into the live page), so old + take <= CAPACITY.
+    old = gl.load(replay_length + record_slot * length_stride, mask=valid, other=0)
+    old = gl.where((old < 0) | (old > CAPACITY - WINDOW), 0, old)
     slot = gl.load(metadata + row * 3).to(gl.int64)
     generation = gl.load(metadata + row * 3 + 1)
     absolute = gl.load(metadata + row * 3 + 2)
@@ -468,7 +487,7 @@ def retained_batched_accept(
         )
         == 0
     )
-    return source, target, begin, take, old, valid & fresh, live, length, record_slot
+    return source, target, begin, take, old, valid & fresh, live, record_slot
 
 
 @gluon.jit
@@ -496,11 +515,11 @@ def retained_fold_ended_request(
     applies the records to its heads' ``[value, key]`` planes in order.
     """
     base = descriptors + layer * _DESCRIPTOR_COLUMNS
-    state = gl.load(base + 9).to(gl.pointer_type(STATE))
-    page_stride = gl.load(base + 10).to(gl.int64)
-    head_stride = gl.load(base + 11).to(gl.int64)
-    value_stride = gl.load(base + 12).to(gl.int64)
-    key_stride = gl.load(base + 13).to(gl.int64)
+    state = gl.load(base + _STATE).to(gl.pointer_type(STATE))
+    page_stride = gl.load(base + _STATE_PAGE_STRIDE).to(gl.int64)
+    head_stride = gl.load(base + _STATE_HEAD_STRIDE).to(gl.int64)
+    value_stride = gl.load(base + _STATE_VALUE_STRIDE).to(gl.int64)
+    key_stride = gl.load(base + _STATE_KEY_STRIDE).to(gl.int64)
     u = correction + record_slot * correction_strides[0] + layer * correction_strides[1]
     k = retained_key + record_slot * key_strides[0] + layer * key_strides[1]
     d = retained_decay + record_slot * decay_strides[0] + layer * decay_strides[1]
@@ -556,15 +575,19 @@ _BATCHED_RUNTIME_ARGUMENTS = [
     "query_stride",
     "record_slot_stride",
     "record_slot_count",
+    "length_stride",
     "stamp_slots",
     "stamp_capacity",
     "stopped_count",
 ]
 
 
+# A mixed forward's decode rows follow its extend rows in the stop report, so
+# request_ends may start at any INT32 element.
 @gluon.jit(
     launch_metadata=kda_records_launch_metadata,
     do_not_specialize=_BATCHED_RUNTIME_ARGUMENTS,
+    do_not_specialize_on_alignment=["request_ends"],
 )
 def retained_batched_conv_kernel(
     descriptors,
@@ -577,6 +600,8 @@ def retained_batched_conv_kernel(
     metadata,
     stamps,
     request_stopped,
+    replay_length,
+    request_ends,
     group_count,
     read_group_stride,
     read_row_stride,
@@ -586,6 +611,7 @@ def retained_batched_conv_kernel(
     query_stride,
     record_slot_stride,
     record_slot_count,
+    length_stride,
     stamp_strides,
     stamp_slots,
     stamp_capacity,
@@ -605,10 +631,12 @@ def retained_batched_conv_kernel(
     HEADS: gl.constexpr,
     DIM: gl.constexpr,
     BLOCK: gl.constexpr,
+    ENDED: gl.constexpr,
+    INCOMPLETE: gl.constexpr,
     WAVE: gl.constexpr,
 ):
     layer, row = gl.program_id(0).to(gl.int64), gl.program_id(1).to(gl.int64)
-    source, target, begin, take, old, valid, _, length, record_slot = (
+    source, target, begin, take, old, valid, live, record_slot = (
         retained_batched_accept(
             descriptors,
             groups,
@@ -619,6 +647,7 @@ def retained_batched_conv_kernel(
             record_slots,
             metadata,
             stamps,
+            replay_length,
             layer,
             row,
             group_count,
@@ -630,6 +659,7 @@ def retained_batched_conv_kernel(
             query_stride,
             record_slot_stride,
             record_slot_count,
+            length_stride,
             stamp_strides,
             stamp_slots,
             stamp_capacity,
@@ -638,20 +668,18 @@ def retained_batched_conv_kernel(
             WAVE,
         )
     )
-    if not valid:
-        return
     base = descriptors + layer * _DESCRIPTOR_COLUMNS
-    original = gl.load(base).to(gl.pointer_type(ACTIVATION))
-    conv = gl.load(base + 1).to(gl.pointer_type(CONV))
-    qkv_stride = gl.load(base + 4).to(gl.int64)
-    conv_stride = gl.load(base + 5).to(gl.int64)
-    channel_stride = gl.load(base + 7).to(gl.int64)
-    tap_stride = gl.load(base + 8).to(gl.int64)
+    original = gl.load(base + _QKV).to(gl.pointer_type(ACTIVATION))
+    conv = gl.load(base + _CONV).to(gl.pointer_type(CONV))
+    qkv_stride = gl.load(base + _QKV_ROW_STRIDE).to(gl.int64)
+    conv_stride = gl.load(base + _CONV_PAGE_STRIDE).to(gl.int64)
+    channel_stride = gl.load(base + _CONV_CHANNEL_STRIDE).to(gl.int64)
+    tap_stride = gl.load(base + _CONV_TAP_STRIDE).to(gl.int64)
     channel = (
         gl.program_id(2) * BLOCK
         + gl.arange(0, BLOCK, layout=gl.BlockedLayout([1], [WAVE], [4], [0]))
     ).to(gl.int64)
-    mask = channel < CHANNELS
+    mask = (channel < CHANNELS) & valid
     ptr = conv + source * conv_stride + channel * channel_stride
     h0 = gl.load(ptr, mask=mask, other=0)
     h1 = gl.load(ptr + tap_stride, mask=mask, other=0)
@@ -665,6 +693,18 @@ def retained_batched_conv_kernel(
         h0 = gl.where(token < take, h1, h0)
         h1 = gl.where(token < take, h2, h1)
         h2 = gl.where(token < take, x, h2)
+    # Reject only after the window loads, which ``valid`` masks off for a
+    # rejected row: a store ahead of them, even on the rejecting branch, makes
+    # LLVM AMDGPU fetch the uniform descriptor fields with vector instead of
+    # scalar loads, an extra memory round trip in every program.
+    if not valid:
+        # A request that ended in this forward keeps records outside its live
+        # page; its finish must not publish that page. The stop conditions
+        # report ENDED for exactly the rows whose request ended, so the row's
+        # own entry stands in for its stop flag, with no load on this path.
+        if live & (gl.program_id(2) == 0):
+            gl.atomic_cas(request_ends + row, ENDED, INCOMPLETE)
+        return
     ptr = conv + target * conv_stride + channel * channel_stride
     gl.store(ptr, h0, mask=mask)
     gl.store(ptr + tap_stride, h1, mask=mask)
@@ -683,7 +723,6 @@ def retained_batched_conv_kernel(
             layer,
             target,
             record_slot,
-            # Validated against the history capacity above.
             (old + take).to(gl.int32),
             correction_strides,
             key_strides,
@@ -698,7 +737,21 @@ def retained_batched_conv_kernel(
 
 @gluon.jit(
     launch_metadata=kda_records_launch_metadata,
-    do_not_specialize=_BATCHED_RUNTIME_ARGUMENTS,
+    do_not_specialize=[
+        "batch",
+        "layers",
+        "group_count",
+        "read_group_stride",
+        "read_row_stride",
+        "write_group_stride",
+        "write_row_stride",
+        "accepted_stride",
+        "query_stride",
+        "record_slot_stride",
+        "record_slot_count",
+        "length_stride",
+        "stopped_count",
+    ],
 )
 def retained_batched_publish_kernel(
     descriptors,
@@ -708,9 +761,10 @@ def retained_batched_publish_kernel(
     accepted,
     starts,
     record_slots,
-    metadata,
-    stamps,
     request_stopped,
+    replay_length,
+    batch,
+    layers,
     group_count,
     read_group_stride,
     read_row_stride,
@@ -720,56 +774,88 @@ def retained_batched_publish_kernel(
     query_stride,
     record_slot_stride,
     record_slot_count,
-    stamp_strides,
-    stamp_slots,
-    stamp_capacity,
+    length_stride,
     stopped_count,
-    request_ends,
     CAPACITY: gl.constexpr,
     WINDOW: gl.constexpr,
+    BLOCK: gl.constexpr,
     WAVE: gl.constexpr,
-    INCOMPLETE: gl.constexpr,
 ):
-    layer, row = gl.program_id(0).to(gl.int64), gl.program_id(1).to(gl.int64)
-    source, target, begin, take, old, valid, live, length, record_slot = (
-        retained_batched_accept(
-            descriptors,
-            groups,
-            reads,
-            writes,
-            accepted,
-            starts,
-            record_slots,
-            metadata,
-            stamps,
-            layer,
-            row,
-            group_count,
-            read_group_stride,
-            read_row_stride,
-            write_group_stride,
-            write_row_stride,
-            accepted_stride,
-            query_stride,
-            record_slot_stride,
-            record_slot_count,
-            stamp_strides,
-            stamp_slots,
-            stamp_capacity,
-            CAPACITY,
-            WINDOW,
-            WAVE,
-        )
+    """Write each request row's count once every layer's commit has read it.
+
+    A row the commit carries -- its source and live pages lie in the pool in
+    a state group one of the ``layers`` launched layers lists, its record
+    slot is resident and its window is non-empty -- sets its slot's count to
+    the records its verify read plus the round's acceptance, or to 0 when its
+    request ended in this forward (the commit folded its records into its
+    live page). Other rows (graph padding, masked overlap rows, rows paged
+    only in groups no launched layer lists) leave every count alone. Real
+    rows have distinct slots, so no two programs write the same count.
+    """
+    layout: gl.constexpr = gl.BlockedLayout([1], [WAVE], [4], [0])
+    lanes = gl.arange(0, BLOCK, layout=layout)
+    row = gl.program_id(0).to(gl.int64) * BLOCK + lanes
+    in_batch = row < batch
+    # Every layer shares the State pool's page count.
+    pages = gl.load(descriptors + _PAGES).to(gl.int64)
+    # Issued ahead of the group loop: their latency overlaps the page loads'.
+    begin = gl.load(starts + row * query_stride, mask=in_batch, other=0).to(gl.int64)
+    count = (
+        gl.load(starts + (row + 1) * query_stride, mask=in_batch, other=0).to(gl.int64)
+        - begin
     )
+    record_slot = gl.load(
+        record_slots + row * record_slot_stride, mask=in_batch, other=-1
+    ).to(gl.int64)
+    paged = gl.zeros([BLOCK], gl.int32, layout)
+    for group in range(group_count):
+        source = gl.load(
+            reads + group.to(gl.int64) * read_group_stride + row * read_row_stride,
+            mask=in_batch,
+            other=0,
+        ).to(gl.int64)
+        target = gl.load(
+            writes + group.to(gl.int64) * write_group_stride + row * write_row_stride,
+            mask=in_batch,
+            other=0,
+        ).to(gl.int64)
+        # A group carries rows only when a launched layer lists it; the page
+        # loads above do not wait for this check.
+        hits = gl.zeros([BLOCK], gl.int32, layout)
+        for first in range(0, layers, BLOCK):
+            hits += (
+                gl.load(groups + first + lanes, mask=first + lanes < layers, other=-1)
+                == group
+            ).to(gl.int32)
+        paged += (
+            (gl.max(hits, 0) > 0)
+            & (source > 0)
+            & (source < pages)
+            & (target > 0)
+            & (target < pages)
+        ).to(gl.int32)
+    carried = (
+        in_batch
+        & (paged > 0)
+        & (record_slot >= 0)
+        & (record_slot < record_slot_count)
+        & (begin >= 0)
+        & (count > 0)
+        & (count <= WINDOW)
+    )
+    take = gl.minimum(
+        gl.maximum(gl.load(accepted + row * accepted_stride, mask=carried, other=0), 0),
+        gl.minimum(count, WINDOW),
+    )
+    old = gl.load(replay_length + record_slot * length_stride, mask=carried, other=0)
+    old = gl.where((old < 0) | (old > CAPACITY - WINDOW), 0, old)
     stopped = gl.load(
         request_stopped + record_slot,
-        mask=live & (record_slot < stopped_count),
+        mask=carried & (record_slot < stopped_count),
         other=0,
     )
-    if valid:
-        # An ended request's records are folded into its live page.
-        gl.store(length, gl.where(stopped, 0, old + take))
-    # A request that ended in this forward but whose commit this layer
-    # rejected keeps records outside its live page; its finish must not
-    # publish that page.
-    gl.store(request_ends + row, INCOMPLETE, mask=live & (stopped != 0) & (valid == 0))
+    gl.store(
+        replay_length + record_slot * length_stride,
+        gl.where(stopped, 0, old + take).to(gl.int32),
+        mask=carried,
+    )
