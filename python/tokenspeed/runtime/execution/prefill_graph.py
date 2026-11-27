@@ -1096,6 +1096,41 @@ class PrefillGraph:
         if num_tokens < bucket:
             self._input_embeds_buf[num_tokens:bucket].zero_()
 
+    def max_dummy_batch_size(self) -> int | None:
+        """Maximum request count ``bs`` whose disjoint dummy tables fit every group.
+
+        ``_dummy_group_tables`` gives each group disjoint physical parents and
+        writes block IDs up to ``parent_offset * packing + bs``. Returns ``None``
+        when the bound cache pool publishes no cache groups.
+        """
+        specs = self.token_to_kv_pool.arena.cache_group_specs
+        if not specs:
+            return None
+        contract = self.token_to_kv_pool.arena.runtime_contract
+        packing_by_group = contract.virtual_packing
+        counts = contract.virtual_block_counts
+        group_bounds = [
+            (packing_by_group[spec.group_id], counts[spec.group_id]) for spec in specs
+        ]
+
+        def fits(bs: int) -> bool:
+            parent_offset = 0
+            for packing, block_count in group_bounds:
+                if parent_offset * packing + bs >= block_count:
+                    return False
+                parent_offset += -(-bs // packing)
+            return True
+
+        hi = min(block_count - 1 for _, block_count in group_bounds)
+        lo = 0
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
     def _dummy_group_tables(self, bs: int) -> dict[str, "torch.Tensor"]:
         """Build the capture batch's group tables: one row per fabricated
         request, one width per group, and disjoint parents across groups.

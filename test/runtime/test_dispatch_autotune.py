@@ -271,8 +271,19 @@ class _DummyBatch:
 
 
 class _PrefillGraphDouble:
-    def __init__(self, make_dummy_batch):
+    def __init__(
+        self,
+        make_dummy_batch,
+        *,
+        make_dummy_draft_batch=None,
+        max_dummy_bs=None,
+    ):
         self.make_dummy_batch = make_dummy_batch
+        self.make_dummy_draft_batch = make_dummy_draft_batch
+        self._max_dummy_bs = max_dummy_bs
+
+    def max_dummy_batch_size(self) -> int | None:
+        return self._max_dummy_bs
 
 
 class _ForwardStepDouble:
@@ -298,6 +309,7 @@ class _AutotuneExecutor:
         drafter,
         model_input_kwargs,
         events,
+        draft_attn_backend=None,
     ):
         self.config = config
         self.model_runner = _ModelRunnerDouble(forward)
@@ -305,6 +317,7 @@ class _AutotuneExecutor:
         self.prefill_graph = prefill_graph
         self.forward_step = forward_step
         self.drafter = drafter
+        self.draft_attn_backend = draft_attn_backend
         self._model_input_kwargs_hook = model_input_kwargs
         self._events = events
         self.device = "cpu"
@@ -317,6 +330,7 @@ class _AutotuneExecutor:
 
     # autotune() and warm_kernels() both run the real traversal.
     _warm_kernels = ModelExecutor._warm_kernels
+    _prepare_drafter_capture_batch = ModelExecutor._prepare_drafter_capture_batch
 
     def _model_input_kwargs(self, num_tokens, bs, rows):
         return self._model_input_kwargs_hook(num_tokens, bs, rows)
@@ -330,12 +344,19 @@ class _DrafterDouble:
     """Records the startup's extend warmup (``BaseDrafter.warmup_extend``); a
     real drafter needs a draft model and its runner."""
 
-    def __init__(self, events):
+    def __init__(self, events, *, record_extend_draft=False):
         self._events = events
+        self._record_extend_draft = record_extend_draft
 
     def warmup_extend(self, num_tokens):
         assert tuning_module.is_warming_up()
         self._events.append(("draft_extend", num_tokens))
+
+    def warmup_extend_draft(self, *, prepare_batch, max_bs):
+        assert tuning_module.is_warming_up()
+        if self._record_extend_draft:
+            self._events.append(("draft_extend_steps", max_bs))
+            prepare_batch(1, 1)
 
 
 class _ProcessGroupManagerDouble:
@@ -777,6 +798,81 @@ def test_pipeline_parallelism_does_not_run_unsupported_dummy_forward(
         events=[],
     )
     ModelExecutor.autotune(executor, keep_loaded_tactics=False)
+    assert not tuning_module.is_warming_up()
+
+
+@pytest.mark.parametrize("max_dummy_bs", [None, 5])
+def test_large_prefill_warmup_runs_short_extend_and_prefill_only_draft(
+    monkeypatch, tmp_path, max_dummy_bs
+):
+    """Long prefill warmups add a short extend for size-thresholded kernels and
+    drive drafter extend block warmup on prefill_only roles inside kernel_warmup."""
+    events = []
+    draft_backend = object()
+
+    def forward(**kwargs):
+        assert tuning_module.is_warming_up()
+        events.append(("target", kwargs["input_ids"].numel()))
+
+    def make_draft_batch(num_tokens, bs, backend):
+        assert tuning_module.is_warming_up()
+        assert backend is draft_backend
+        events.append(("prepare_draft_batch", num_tokens, bs))
+
+    executor = _AutotuneExecutor(
+        config=_AutotuneConfig(
+            chunked_prefill_size=256,
+            context_len=64,
+            max_num_seqs=16,
+            data_parallel_size=2,
+            prefill_only=True,
+            disable_autotune=True,
+        ),
+        forward=forward,
+        input_buffers=_InputBuffersDouble(
+            input_ids_buf=torch.ones(512, dtype=torch.int32),
+            positions_buf=torch.arange(512),
+            max_bs=8,
+            max_num_tokens=512,
+            on_fill_dummy=lambda **_: events.append("scrub"),
+        ),
+        prefill_graph=_PrefillGraphDouble(
+            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=None),
+            make_dummy_draft_batch=make_draft_batch,
+            max_dummy_bs=max_dummy_bs,
+        ),
+        forward_step=_ForwardStepDouble(),
+        drafter=_DrafterDouble(events, record_extend_draft=True),
+        model_input_kwargs=lambda n, bs, rows: {},
+        events=events,
+        draft_attn_backend=draft_backend,
+    )
+    monkeypatch.setattr(executor_module, "pg_manager", _ProcessGroupManagerDouble(None))
+    monkeypatch.setattr(
+        executor_module, "autotune_cache_path", lambda key: str(tmp_path / "cache.json")
+    )
+    _tap(monkeypatch, executor_module, "load_autotune_cache", lambda *args: None)
+    _tap(monkeypatch, executor_module, "save_autotune_cache", lambda *args: None)
+    _tap(
+        monkeypatch,
+        executor_module,
+        "set_autotune_process_group",
+        lambda group: None,
+    )
+    _tap(monkeypatch, executor_module, "autotune", lambda *args, **kwargs: None)
+
+    ModelExecutor.autotune(executor, keep_loaded_tactics=False)
+
+    expected_draft_max_bs = 8 if max_dummy_bs is None else max_dummy_bs
+    assert events == [
+        "scrub",
+        ("target", 256),
+        ("target", 64),
+        ("draft_extend", 256),
+        ("draft_experts", 256),
+        ("draft_extend_steps", expected_draft_max_bs),
+        ("prepare_draft_batch", 1, 1),
+    ]
     assert not tuning_module.is_warming_up()
 
 

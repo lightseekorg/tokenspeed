@@ -463,6 +463,70 @@ class TestDummyGroupTablesTest:
             assert max(parents) < contract.num_lcm_blocks
             occupied.update(parents)
 
+    @pytest.mark.parametrize("shards", [1, 2])
+    def test_max_dummy_batch_size_bounds_disjoint_group_allocations(self, shards):
+        from dataclasses import replace
+
+        import numpy as np
+
+        from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
+            CacheBatchMetadata,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+            CacheRuntimeContract,
+        )
+
+        assert (
+            self._bare(_backend(), _fake_pool(specs=())).max_dummy_batch_size() is None
+        )
+
+        specs = (
+            replace(_spec("kv", block_granularity=64), shard_count=shards),
+            _spec("side", block_granularity=4),
+            _spec("state", attn_kind="state"),
+        )
+        packing = {"kv": 2, "side": 3, "state": 1}
+        contract = CacheRuntimeContract(
+            prefix_granularity=64,
+            num_lcm_blocks=16,
+            token_capacity=16 * 64,
+            group_specs=specs,
+            group_page_counts={gid: 16 * count + 1 for gid, count in packing.items()},
+            group_packing=packing,
+        )
+        bare = self._bare(
+            _backend(), _fake_pool(specs=specs, runtime_contract=contract)
+        )
+        cap = bare.max_dummy_batch_size()
+        assert cap is not None and cap >= 1
+
+        def build_metadata(bs: int):
+            arrays = {
+                gid: table.cpu().numpy()
+                for gid, table in bare._dummy_group_tables(bs).items()
+            }
+            op = SimpleNamespace(
+                block_table_windows=lambda: {
+                    gid: (arr, arr.shape[1]) for gid, arr in arrays.items()
+                },
+                block_table_spans=lambda: {
+                    gid: np.tile(np.array([0, arr.shape[1]], dtype=np.int32), (bs, 1))
+                    for gid, arr in arrays.items()
+                },
+            )
+            return CacheBatchMetadata.from_forward_op(
+                op,
+                device="cpu",
+                contract=contract,
+                num_requests=bs,
+                validate_page_ids=True,
+                host_tables=True,
+            )
+
+        build_metadata(cap)
+        with pytest.raises(ValueError, match="outside"):
+            build_metadata(cap + 1)
+
     def test_every_group_gets_a_real_block(self):
         backend = _backend()
         pool = _fake_pool(

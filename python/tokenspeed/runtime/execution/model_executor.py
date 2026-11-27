@@ -168,6 +168,11 @@ logger = get_colorful_logger(__name__)
 LOG_MM_TIMING = envs.TOKENSPEED_LOG_MM_TIMING.get()
 LOG_SPEC_ACCEPT_LENGTHS = envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get()
 
+# Long chunked-prefill batches select composite MLA prologues; also warming one
+# short extend inside kernel_warmup reaches the fused Triton prologue so it
+# compiles its registered BLOCK_N variants before serving.
+_SHORT_PREFILL_WARMUP_TOKENS = 64
+
 
 def _last_packed_token_rows(input_lengths: torch.Tensor) -> torch.Tensor:
     """Locate each request's last row within the scheduler's int32 token budget."""
@@ -1360,30 +1365,44 @@ class ModelExecutor:
                         graph_phase=False,
                     )
                 else:
-                    bs = dummy_batch_size(num_tokens, self.config.context_len)
-                    ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
-                    # The model's rows: the span, or this rank's query shard of
-                    # it, as on a real extend (_run_target_forward).
-                    rows = (
-                        slice(0, num_tokens)
-                        if ctx.query_shard is None
-                        else ctx.query_shard.local_row_ids
-                    )
-                    positions = (
-                        ib.mrope_positions_buf[:, rows]
-                        if self.config.model_is_mrope
-                        else ib.positions_buf[rows]
-                    )
-                    with active_forward(ctx):
-                        self.model_runner.forward(
-                            ctx=ctx,
-                            input_ids=ib.input_ids_buf[rows],
-                            positions=positions,
-                            **self._model_input_kwargs(num_tokens, ctx.bs, rows),
+
+                    def warm_target_extend(extend_tokens: int) -> None:
+                        bs = dummy_batch_size(extend_tokens, self.config.context_len)
+                        ctx = self.prefill_graph.make_dummy_batch(extend_tokens, bs)
+                        # The model's rows: the span, or this rank's query shard of
+                        # it, as on a real extend (_run_target_forward).
+                        rows = (
+                            slice(0, extend_tokens)
+                            if ctx.query_shard is None
+                            else ctx.query_shard.local_row_ids
                         )
+                        positions = (
+                            ib.mrope_positions_buf[:, rows]
+                            if self.config.model_is_mrope
+                            else ib.positions_buf[rows]
+                        )
+                        with active_forward(ctx):
+                            self.model_runner.forward(
+                                ctx=ctx,
+                                input_ids=ib.input_ids_buf[rows],
+                                positions=positions,
+                                **self._model_input_kwargs(extend_tokens, ctx.bs, rows),
+                            )
+
+                    warm_target_extend(num_tokens)
+                    if num_tokens > _SHORT_PREFILL_WARMUP_TOKENS:
+                        warm_target_extend(_SHORT_PREFILL_WARMUP_TOKENS)
                     if self.drafter is not None:
                         self.drafter.warmup_extend(num_tokens)
                         self._autotune_draft_experts(num_tokens)
+                        draft_warmup_max_bs = per_rank_max_batch
+                        dummy_bs_cap = self.prefill_graph.max_dummy_batch_size()
+                        if dummy_bs_cap is not None:
+                            draft_warmup_max_bs = min(draft_warmup_max_bs, dummy_bs_cap)
+                        self.drafter.warmup_extend_draft(
+                            prepare_batch=self._prepare_drafter_capture_batch,
+                            max_bs=draft_warmup_max_bs,
+                        )
                     if self.drafter is not None and not self.config.prefill_only:
                         # Prefill-only roles do not allocate decode/verify scratch.
                         # The draft model is reached through the shared speculative
