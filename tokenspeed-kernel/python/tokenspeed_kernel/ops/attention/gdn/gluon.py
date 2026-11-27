@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -31,8 +33,12 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
+
 if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.gdn.decode import (
+        GDN_DECODE_MAX_TOKENS,
         launch_gluon_gdn_decode_gfx950,
     )
 
@@ -95,6 +101,9 @@ if current_platform().is_amd:
             step_indices=None,
             scale=q.shape[-1] ** -0.5 if scale is None else scale,
             use_qk_l2norm=use_qk_l2norm,
+            norm_gate=None,
+            norm_weight=None,
+            norm_eps=None,
         )
 
     @register_kernel(
@@ -111,6 +120,9 @@ if current_platform().is_amd:
             "head_dim": frozenset({128}),
             "padding_safe": frozenset({False, True}),
             "tree": frozenset({False}),
+            # The chunk (WY) form solves all tokens of a request at once.
+            "verify_tokens": frozenset(range(1, GDN_DECODE_MAX_TOKENS + 1)),
+            "output_norm": frozenset({False, True}),
             "separate_output_state": frozenset({False, True}),
             "strided_qkv": frozenset({False, True}),
             "strided_state": frozenset({False, True}),
@@ -135,8 +147,13 @@ if current_platform().is_amd:
         output_state: torch.Tensor | None,
         tree_ancestors: torch.Tensor | None,
         replay_payload: torch.Tensor | None,
+        output_norm: KdaOutputNorm | None = None,
     ) -> torch.Tensor:
-        """gfx950 chain ``gdn_decode_mtp`` (draft trees run the Triton kernel)."""
+        """gfx950 chain ``gdn_decode_mtp`` (draft trees run the Triton kernel).
+
+        ``gdn_decode_mtp`` passes ``output_norm`` only when it is set; the
+        kernel then applies the gated RMSNorm to each head's output.
+        """
         if tree_ancestors is not None or replay_payload is not None:
             raise NotImplementedError("the gfx950 GDN verify kernel follows a chain")
         # Per-token rows (in output_state, default the pool itself) or the
@@ -163,4 +180,7 @@ if current_platform().is_amd:
             step_indices=output_state_indices,
             scale=q.shape[-1] ** -0.5 if scale is None else scale,
             use_qk_l2norm=use_qk_l2norm,
+            norm_gate=None if output_norm is None else output_norm.gate,
+            norm_weight=None if output_norm is None else output_norm.weight,
+            norm_eps=None if output_norm is None else output_norm.eps,
         )

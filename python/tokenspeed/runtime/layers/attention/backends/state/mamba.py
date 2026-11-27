@@ -328,6 +328,9 @@ class MambaAttnBackend(AttentionBackend):
         # Draft-tree verify (bind_tree_verify): per-node parents.
         self.tree_verify: TreeVerifyInputs | None = None
         self._verify_scratch = None
+        # Whether the verify kernel applies the layer's gated output norm
+        # itself (resolved when a pool binds; see GdnAttnBackend).
+        self._verify_fuses_output_norm = False
         self._verify_commit_ctx = None
         self._verify_copy_tables: dict[str, torch.Tensor | int | None] | None = None
 
@@ -2268,7 +2271,8 @@ class MambaAttnBackend(AttentionBackend):
             )
 
         if is_target_verify:
-            core_attn_out = self._verify_scan(
+            # The verify scan returns the normed output.
+            return self._verify_scan(
                 query,
                 key,
                 value,
@@ -2291,6 +2295,7 @@ class MambaAttnBackend(AttentionBackend):
                 seq_len=seq_len,
                 lower_bound=gate_lower_bound,
                 replay_payload=scan_replay,
+                output_norm=output_norm,
             )
         else:
             metadata = self.forward_metadata
@@ -2458,6 +2463,7 @@ class MambaAttnBackend(AttentionBackend):
         seq_len: int,
         lower_bound: float | None,
         replay_payload: torch.Tensor | None,
+        output_norm: KdaOutputNorm | None,
     ) -> torch.Tensor:
         """Per-position recurrent scan of a target-verify round.
 
@@ -2492,9 +2498,11 @@ class MambaAttnBackend(AttentionBackend):
             replay_payload: ``[seq_len, width]`` ReplaySSM payload the scan
                 fills with each token's k, v, a and b, or None when the split
                 filled it.
+            output_norm: The layer's gated output norm, or None. The verify
+                kernel applies it where it can (``_verify_fuses_output_norm``).
 
         Returns:
-            ``[1, seq_len, Hv, V]`` layer output.
+            ``[1, seq_len, Hv, V]`` layer output, normed by ``output_norm``.
         """
         _reject_skip_term(D)
         num_heads = query.shape[2]
@@ -2529,7 +2537,8 @@ class MambaAttnBackend(AttentionBackend):
                 batch_size, draft_token_num
             )
             output_state_indices = output_indices
-        return gdn_decode_mtp(
+        fused_norm = output_norm if self._verify_fuses_output_norm else None
+        out = gdn_decode_mtp(
             query_b,
             key_b,
             value_b,
@@ -2547,7 +2556,11 @@ class MambaAttnBackend(AttentionBackend):
             replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
             pending_replay=self._pending_replay_descriptor(layer_id, batch_size),
+            output_norm=fused_norm,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
+        if fused_norm is not None:
+            return out
+        return apply_kda_output_norm(out, output_norm)
 
     def _prefill_state_dtype(self, cache_dtype: torch.dtype) -> torch.dtype:
         return cache_dtype
