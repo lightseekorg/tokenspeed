@@ -734,7 +734,9 @@ if platform.is_amd:
             topk_weights: Precomputed expert weights ``[tokens, top_k]``.
             topk_ids: Precomputed expert ids ``[tokens, top_k]``.
             num_tokens_global, max_num_tokens_per_gpu, do_finalize, enable_pdl:
-                Unused (no EP / deferred finalize support).
+                Unused: EP reads its expert window from ``w`` (``ep_rank``,
+                ``num_local_experts``, ``ep_size``), and there is no deferred
+                finalize.
 
         Returns:
             MoE output ``[tokens, hidden]`` bf16.
@@ -3281,10 +3283,9 @@ def gluon_petit_largest_max_tokens_per_rank(world_size: int) -> int:
     (Muse Spark's 2368, GLM-5.3 Flash's 2464 and Kimi K3's 1344 at EP8 are
     smaller). A world size at which no profile raises (and any world size
     Petit does not serve, which MoELayer refuses) keeps the default 1024
-    rows. A model whose own limit is lower (Muse Spark above 2368 rows at
-    EP8, or a profile that keeps the default) is refused when its workspace
-    is built (``gluon_petit_max_tokens_per_rank`` with the
-    profile).
+    rows. A model whose own limit is lower (any profile above its own limit,
+    or one that keeps the default) is refused when its workspace is built
+    (``gluon_petit_max_tokens_per_rank`` with the profile).
     """
     world_size = int(world_size)
     served: dict[str, int] = {}

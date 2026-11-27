@@ -406,10 +406,11 @@ class Envs:
     TOKENSPEED_NVFP4_GEMM_SWIGLU_NVFP4_QUANT = EnvBool(True)
 
     # Communication
-    # Under Gluon Petit EP, fork DeepSeek V4/V4.1 and GLM-5.3 Flash MoE shared
-    # experts onto the auxiliary stream during graph capture, as every other
-    # MoE backend does
-    # (off: they stay on the main stream, serial with the Petit collective).
+    # Under Gluon Petit EP, fork the MoE shared experts of DeepSeek V4/V4.1,
+    # GLM-5.3 Flash and Kimi K3 (attention-TP Petit, where it also overlaps
+    # them inside captured graphs) onto the auxiliary stream during graph
+    # capture (off: they stay on the main stream, serial with the Petit
+    # collective).
     TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM = EnvBool(False)
     # InfiniBand traffic class for NVSHMEM (DeepEP all-to-all). Read in every
     # inference process entry so the value reaches NVSHMEM regardless of how

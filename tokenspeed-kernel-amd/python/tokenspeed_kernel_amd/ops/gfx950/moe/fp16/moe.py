@@ -66,12 +66,13 @@ DECODE_S1_NBUF = 1  # single LDS buffer
 # ---- Prefill row slicing ------------------------------------------------------
 # Stage 2 reads the intermediate [tokens * topk, I] through buffer loads, which
 # address at most 2**31 - 1 bytes from the tensor's base: at an intermediate
-# of 2 GiB or more (GLM-5.3 Flash, top-8, I=2048: 65,536 tokens) the last
-# vectors fall out of range and read as zeros. Under expert parallelism the
-# partials [tokens, topk, D] are also zero-filled per call (4 GiB per MoE layer
-# at 65,536 GLM tokens). Prefill is sliced by rows so every launch keeps the
-# intermediate under 2 GiB, and EP launches at most EP_PREFILL_MAX_TOKENS rows;
-# each row's result does not depend on the other rows, so slicing is exact.
+# of 2 GiB or more (tokens * topk * I * 2 bytes; for example top-8, I=2048 at
+# 65,536 tokens) the last vectors fall out of range and read as zeros. Under
+# expert parallelism the partials [tokens, topk, D] are also zero-filled per
+# call (4 GiB per MoE layer in that example). Prefill is sliced by rows so
+# every launch keeps the intermediate under 2 GiB, and EP launches at most
+# EP_PREFILL_MAX_TOKENS rows; each row's result does not depend on the other
+# rows, so slicing is exact.
 _BUFFER_MAX_BYTES = 2**31 - 1
 EP_PREFILL_MAX_TOKENS = 16384
 

@@ -283,8 +283,8 @@ class DeepseekV4MoE(nn.Module):
         self.use_gluon_petit = moe_backend.is_gluon_petit()
         # Attention TP over Petit's EP group: every rank holds the same rows,
         # sends Petit its contiguous share and adds its shared-expert partial;
-        # the caller's all-reduce over the MoE TPxEP group (TP4's) completes
-        # both, so the layer leaves communication to the caller.
+        # the caller's all-reduce over the MoE TPxEP group (the TP=EP group)
+        # completes both, so the layer leaves communication to the caller.
         self.petit_tp_attention = (
             self.use_gluon_petit and gluon_petit_tp_attention_mapping(mapping)
         )
@@ -705,7 +705,7 @@ class DeepseekV4MoE(nn.Module):
         shared expert over all T rows; the routed share lands in its own rows
         of the shared partial (zeros without a shared expert). The caller's
         all-reduce over the MoE TPxEP group then yields routed + shared for
-        every row, exactly as TP4's routed partial + shared partial.
+        every row, exactly as MoE TP's routed partial + shared partial.
         """
         num_rows = hidden_states.shape[0]
         start, end = gluon_petit_tp_attention_rows(

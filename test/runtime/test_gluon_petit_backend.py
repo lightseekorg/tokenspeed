@@ -830,7 +830,7 @@ def test_petit_tp_attention_keeps_other_refusals(
 
 
 def test_petit_dp4_capacity_unchanged(petit_args) -> None:
-    # The DP4 layout keeps sizing from whole chunks (46671ec2).
+    # The DP4 layout keeps sizing its capacity from whole chunks.
     petit_args.mapping = _ep4_mapping()
     petit_args.chunked_prefill_size = 4096
     petit_args.max_prefill_tokens = 4096

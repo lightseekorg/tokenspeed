@@ -257,7 +257,7 @@ def test_triton_mxfp4_moe_defers_local_ep_routes() -> None:
 
 
 # GLM-5.3 Flash's experts: text_config.swiglu_limit, hidden_size and
-# moe_intermediate_size (2048 over TP8) of /models/GLM-5.3-Flash/config.json.
+# moe_intermediate_size (2048 over TP8) of GLM-5.3 Flash's config.json.
 GLM53_FLASH_SWIGLU_LIMIT = 10.0
 GLM53_FLASH_HIDDEN = 4096
 GLM53_FLASH_TP8_INTERMEDIATE = 256

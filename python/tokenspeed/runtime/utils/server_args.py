@@ -3071,8 +3071,9 @@ class ServerArgs:
                     "or attention TP = dense TP = EP size with attention DP1"
                 )
             if tp_attention and getattr(self, "moe_combine_order", "rank") == "slot":
-                # Each rank returns its quarter of the routed rows plus its
-                # shared-expert partial; only a rank-ordered sum completes it.
+                # Each rank returns its ceil(rows / EP) share of the routed
+                # rows plus its shared-expert partial; only a rank-ordered sum
+                # completes it.
                 raise ValueError(
                     "Gluon Petit MegaMoE with attention TP requires "
                     "--moe-combine-order rank"
@@ -3090,8 +3091,8 @@ class ServerArgs:
             # profiles that list this world size in
             # _Profile.raised_capacity_world_sizes. The model is not known
             # here, so this is the largest limit over models (DSv4.1 Flash's);
-            # Petit's workspace enforces each model's own limit (Muse Spark's
-            # 2368 rows at EP8, 1024 for the profiles that keep the default).
+            # Petit's workspace enforces each profile's own limit
+            # (gluon_petit_max_tokens_per_rank with the profile).
             from tokenspeed_kernel.ops.moe.gluon import (
                 gluon_petit_largest_max_tokens_per_rank,
             )

@@ -28,11 +28,15 @@ when selecting a kernel plan.
 ## Runtime contract
 
 Select the backend with both `--moe-backend gluon_petit` and
-`--all2all-backend gluon_petit`. It requires one GFX950 node, EP8/TP1 (EP4/TP1
-is also accepted for the DeepSeek V4.1 Flash and DSpark geometries), BF16 model
-activations, serialized MXFP4 expert weights, trivial expert placement, and no
-more than 1024 tokens per rank. The registered profiles are GPT-OSS 120B, Kimi
-K3, Muse Spark, the DeepSeek V4 expert geometry with unclamped SiLU, and
+`--all2all-backend gluon_petit`. It requires one GFX950 node, EP8 (EP4 is also
+accepted for the DeepSeek V4.1 Flash and DSpark geometries) with attention TP1
+and dense TP1, or attention TP = dense TP = EP size with attention DP1 (the
+model splits the replicated rows across the ranks), BF16 model activations,
+serialized MXFP4 expert weights and trivial expert placement. A rank takes at
+most 1024 tokens, or, for the profiles that raise their capacity at that world
+size, up to the profile's 32-bit heap limit (the server admits at most 7808 rows
+per rank at EP4 and 2624 at EP8). The registered profiles are GPT-OSS 120B,
+Kimi K3, Muse Spark, the DeepSeek V4 expert geometry with unclamped SiLU, and
 DeepSeek V4.1 Flash (with its DSpark draft) and GLM-5.3 Flash (target and MTP
 draft, experts requantized from block FP8 to MXFP4 at load) with SiLU clamped
 at 10. Muse Spark
@@ -41,11 +45,7 @@ because Petit registers only unclamped SiLU for those geometries. Explicit FP8
 activation requests are also rejected; this backend quantizes activations to
 MXFP4.
 
-EP4 reuses the EP8 tiles. Measured on MI350X for DeepSeek V4.1 Flash with DSpark
-at about 50K tokens of context, EP4 decodes faster than TP4 at batch 32 and
-above and slower at batch 16 and below (0.62-0.85x). With prompts of 32K tokens
-or more it prefills slightly faster than TP4 once every GPU has a prompt, and at
-0.3x with a single prompt.
+EP4 reuses the EP8 tiles.
 
 ## Route outputs
 
