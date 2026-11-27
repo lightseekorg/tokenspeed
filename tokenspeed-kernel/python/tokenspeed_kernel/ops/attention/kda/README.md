@@ -136,13 +136,16 @@ prefix sums, value tiles and clustered producer sharing. Bounded windows with
 other windows sum intermediate gates directly so a large early gate cannot
 erase later decay. Runtime counts, arena strides and stamp-ring capacity remain
 runtime values in compiled launch interfaces. The window and split cores load
-the live page's base tile with one bulk copy and prefetch the accepted records
-into L2. The fused window kernel instead bulk-copies each packed record's
-key, decay and its tile's U into shared memory on 64-row value tiles, when the
-grid holds at most one CTA per SM and the CTA's footprint with the copy region
-fits the device's opt-in shared memory per block. Larger grids keep the
-prefetch to preserve occupancy, since the region can cost a 64-row tile a CTA
-per SM; so do other tile sizes and records that are not packed. Like the
+the live page's base tile with one bulk copy. On 128-row value tiles with room
+for retained records, threads start loading the accepted records with the CTA
+and skip the L2 prefetch. On 64-row value tiles with packed records, the fused
+window kernel instead bulk-copies each record's key, decay and its tile's U
+into shared memory when the grid holds at most one CTA per SM and the CTA's
+footprint with the copy region fits the device's opt-in shared memory per
+block. Tiles that use neither early loads nor the bulk copy -- including 32-row
+tiles, unpacked records, 64-row tiles on larger grids where the copy region
+could cost a CTA per SM, and 64-row tiles whose copy region exceeds the
+shared-memory limit -- prefetch the accepted records into L2 instead. Like the
 one-token kernel, both cores project the history instead of replaying it:
 the base rows are scaled by the records' cumulative decay, each
 record's key, weighted by the later decays, becomes a row that a separate pass
