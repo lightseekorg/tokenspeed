@@ -98,7 +98,7 @@ def test_qwen4_exp_qsa_prepare_metadata_matches_torch(
         if isinstance(query_lengths, int)
         else query_lengths
     )
-    request_ids = torch.arange(seq_lens.shape[0], device=device)
+    request_ids = torch.arange(seq_lens.shape[0], dtype=torch.int32, device=device)
     expected_requests = torch.repeat_interleave(
         request_ids, lengths, output_size=total_tokens
     )
@@ -2203,7 +2203,7 @@ def test_qsa_metadata_warmup_covers_page_table_strides(
     lengths = 4 if uniform else torch.full_like(seq_lens, 4)
     recent_table = torch.tensor([[3], [7]], dtype=torch.int32, device=device)
     tags = torch.empty((2, 4), dtype=torch.int64, device=device) if reset_tags else None
-    owners = torch.arange(2, device=device).repeat_interleave(4)
+    owners = torch.arange(2, dtype=torch.int32, device=device).repeat_interleave(4)
     positions = seq_lens[owners].long() - 4 + torch.arange(4, device=device).repeat(2)
 
     def table(width):
