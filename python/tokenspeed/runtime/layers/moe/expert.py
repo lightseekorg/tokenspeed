@@ -733,7 +733,8 @@ class MoELayer(torch.nn.Module):
         """The selected kernel's activation, scale, ID and routing-weight views."""
         if self._input_buffer_factory is None:
             saver = TorchMemorySaverAdapter.create(
-                enable=global_server_args_dict["enable_memory_saver"]
+                enable=global_server_args_dict["enable_memory_saver"],
+                device=global_server_args_dict["device"],
             )
             with saver.named_region("workspace"):
                 self._input_buffer_factory = kernel_moe_prepare_input_buffers(

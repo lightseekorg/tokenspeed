@@ -22,7 +22,13 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.metadata.stop_conditions import REQUEST_ENDED_INCOMPLETE
+from tokenspeed_kernel.ops.attention.kda import (
+    KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS as DESCRIPTOR_COLUMNS,
+)
+from tokenspeed_kernel.ops.metadata.stop_conditions import (
+    REQUEST_ENDED,
+    REQUEST_ENDED_INCOMPLETE,
+)
 from tokenspeed_kernel.platform import current_platform
 
 
@@ -34,6 +40,16 @@ def _kernels():
     from tokenspeed_kernel.ops.attention.kda._triton import retained
 
     return retained, {}
+
+
+def _check_count(name, count, *, device):
+    if (
+        count.ndim != 2
+        or count.shape[1] != 1
+        or count.dtype != torch.int32
+        or count.device != device
+    ):
+        raise ValueError(f"{name} must be INT32 [record slots, 1]")
 
 
 def materialize(recurrent, *, history, source_indices, recurrent_layout, paged):
@@ -89,13 +105,6 @@ def materialize(recurrent, *, history, source_indices, recurrent_layout, paged):
         num_warps=4,
         **options,
     )
-    if paged:
-        reset_length(
-            history.length,
-            write_indices=source_indices,
-            record_slots=history.record_slots,
-            page_count=pages,
-        )
 
 
 def reset_length(length, *, write_indices, record_slots, page_count):
@@ -155,6 +164,7 @@ def batched_commit(
     retained_correction,
     retained_key,
     retained_decay,
+    replay_length,
     request_stopped,
     request_ends,
     draft_token_num,
@@ -166,36 +176,47 @@ def batched_commit(
     conv_state_dtype,
     recurrent_state_dtype,
 ):
-    """Update all layers' convolution, then publish their accepted lengths.
+    """Update all layers' convolution, then publish each request's count.
 
-    descriptors is contiguous UINT64 [layers, 14]: original QKV, convolution,
-    length pointers; page count; QKV row, convolution page, length slot,
-    convolution channel, convolution tap element strides; the v-major
-    recurrent state pointer and its page, head, value and key element
-    strides. QKV channels have unit stride. Every layer's length holds
-    record_slot_count request slots; record_slots selects each request's slot.
-    group_indices maps layers into [groups, requests] page tables.
-    Each live destination is private and cannot overlap another active source.
-    Per-layer descriptor values are validated by the cache owner when binding
-    its arena; the launch validates shared tensor geometry without GPU reads.
+    descriptors is contiguous UINT64 [layers, 12]: original QKV and
+    convolution pointers; page count; QKV row, convolution page, convolution
+    channel and convolution tap element strides; the v-major recurrent state
+    pointer and its page, head, value and key element strides. QKV channels
+    have unit stride. record_slots selects each request's record slot of
+    record_slot_count. group_indices maps layers into [groups, requests] page
+    tables. Each live destination is private and cannot overlap another
+    active source. Per-layer descriptor values are validated by the cache
+    owner when binding its arena; the launch validates shared tensor
+    geometry without GPU reads.
 
     query_start_loc is the packed [requests + 1] boundary vector. Acceptance is
     clamped to the actual interval and draft_token_num. metadata is contiguous
     INT64 [requests, 3]; stamps is INT64 [layers, slots, ring capacity, 2],
-    including strided layer subsets. Every accepted stamp must match before
-    either phase writes. history_capacity and ring capacity are independent.
+    including strided layer subsets. In each layer, every accepted stamp must
+    match before that layer's convolution and fold write; the shared count
+    publish does not inspect stamps and follows the carried rows, those
+    paged in a group a launched layer lists. history_capacity and ring
+    capacity are independent.
 
     retained_correction, retained_key and retained_decay are the FP32 records
-    [record slots, layers, heads, history_capacity, head_dim]. request_stopped
+    [record slots, layers, heads, history_capacity, head_dim]. Every layer of
+    a request follows one count: replay_length is the INT32 [record slots, 1]
+    count of records accepted since each request's dense base. A count H
+    within [0, history_capacity - draft_token_num] is what the round's verify
+    read before its candidates; any other H overflowed, so the prepare folded
+    its records and the verify read none (eff = 0, else eff = H). The first
+    launch reads H in every layer and never writes it; the second writes each
+    carried request's count once, to eff plus its acceptance. request_stopped
     is a bool per request slot, set for a request that ended in this forward.
     Such a request's accepted records, through this round's acceptance, are
-    folded into its live page's dense state, and its length is cleared
-    instead of advanced. No other dense checkpoint or record is copied.
-    request_ends is the contiguous INT32 [requests] ``apply_stop_conditions``
-    report for these rows: a request that ended but whose commit a layer
-    rejected (stale stamps, an interval past the capacity) keeps records
-    outside its live page, and its entry becomes ``REQUEST_ENDED_INCOMPLETE``
-    so its finish publishes nothing.
+    folded into its live page's dense state, and its count is cleared instead
+    of advanced. No other dense checkpoint or record is copied. request_ends
+    is the contiguous INT32 [requests] ``apply_stop_conditions`` report for
+    these rows, ``REQUEST_ENDED`` exactly for the requests set in
+    request_stopped: a request that ended but whose commit a layer that
+    carried it rejected (stale stamps) keeps records outside its live page,
+    and that layer raises its entry to ``REQUEST_ENDED_INCOMPLETE`` so its
+    finish publishes nothing.
     """
     if (
         num_heads <= 0
@@ -222,11 +243,13 @@ def batched_commit(
         )
     if (
         descriptors.ndim != 2
-        or descriptors.shape[1] != 14
+        or descriptors.shape[1] != DESCRIPTOR_COLUMNS
         or descriptors.dtype != torch.uint64
         or not descriptors.is_contiguous()
     ):
-        raise ValueError("retained descriptors must be contiguous UINT64 [layers, 14]")
+        raise ValueError(
+            f"retained descriptors must be contiguous UINT64 [layers, {DESCRIPTOR_COLUMNS}]"
+        )
     layers = descriptors.shape[0]
     batch = accepted_length.numel()
     if (
@@ -281,6 +304,9 @@ def batched_commit(
             "retained records must be FP32 [record slots, layers, heads, "
             "capacity, head_dim]"
         )
+    _check_count("replay_length", replay_length, device=descriptors.device)
+    if replay_length.shape[0] != record_slot_count:
+        raise ValueError("replay_length must hold one count per record slot")
     if request_stopped.ndim != 1 or request_stopped.dtype != torch.bool:
         raise ValueError("request stop flags must be a bool vector")
     if (
@@ -309,7 +335,9 @@ def batched_commit(
     if not layers or not batch:
         return
     kernels, options = _kernels()
-    args = (
+    kernels.retained_batched_conv_kernel[
+        (layers, batch, triton.cdiv(3 * num_heads * head_dim, 256))
+    ](
         descriptors,
         group_indices,
         read_indices,
@@ -320,6 +348,8 @@ def batched_commit(
         record_metadata,
         record_stamps,
         request_stopped,
+        replay_length,
+        request_ends,
         read_indices.shape[0],
         *read_indices.stride(),
         *write_indices.stride(),
@@ -327,15 +357,11 @@ def batched_commit(
         query_start_loc.stride(0),
         record_slots.stride(0),
         record_slot_count,
+        replay_length.stride(0),
         record_stamps.stride(),
         record_stamps.shape[1],
         record_stamps.shape[2],
         request_stopped.numel(),
-    )
-    kernels.retained_batched_conv_kernel[
-        (layers, batch, triton.cdiv(3 * num_heads * head_dim, 256))
-    ](
-        *args,
         *records,
         *(x.stride() for x in records),
         CAPACITY=history_capacity,
@@ -347,15 +373,36 @@ def batched_commit(
         HEADS=num_heads,
         DIM=head_dim,
         BLOCK=256,
+        ENDED=REQUEST_ENDED,
+        INCOMPLETE=REQUEST_ENDED_INCOMPLETE,
         num_warps=4,
         **options,
     )
-    kernels.retained_batched_publish_kernel[(layers, batch)](
-        *args,
-        request_ends,
+    # Every program of the first launch reads the counts this one writes.
+    kernels.retained_batched_publish_kernel[(triton.cdiv(batch, 256),)](
+        descriptors,
+        group_indices,
+        read_indices,
+        write_indices,
+        accepted_length,
+        query_start_loc,
+        record_slots,
+        request_stopped,
+        replay_length,
+        batch,
+        layers,
+        read_indices.shape[0],
+        *read_indices.stride(),
+        *write_indices.stride(),
+        accepted_length.stride(0),
+        query_start_loc.stride(0),
+        record_slots.stride(0),
+        record_slot_count,
+        replay_length.stride(0),
+        request_stopped.numel(),
         CAPACITY=history_capacity,
         WINDOW=draft_token_num,
-        INCOMPLETE=REQUEST_ENDED_INCOMPLETE,
+        BLOCK=256,
         num_warps=4,
         **options,
     )
@@ -373,33 +420,35 @@ def batched_prepare(
     retained_correction,
     retained_key,
     retained_decay,
+    replay_length,
     history_capacity,
     draft_token_num,
     num_heads,
     head_dim,
     recurrent_state_dtype,
 ):
-    """Ready every layer's retained history for a verify forward in two launches.
+    """Ready every layer's retained history for a verify forward in one launch.
 
-    descriptors, group_indices, record_slots and the FP32 records
-    [record slots, layers, heads, history_capacity, head_dim] follow
-    batched_commit; the launch reads only the length and recurrent-state
-    columns of each descriptor. source_indices and live_indices are integer
-    [groups, requests] tables of the pages verify reads from and the private
-    pages it reads its dense base from; query_start_loc is the packed
-    [requests + 1] boundary vector; draft_token_num is the window the verify
-    that follows was built for.
+    descriptors, group_indices, record_slots, replay_length and the FP32
+    records [record slots, layers, heads, history_capacity, head_dim] follow
+    batched_commit; the launch reads only the page count and recurrent-state
+    columns of each descriptor, and every layer must share the page count.
+    source_indices and live_indices are integer [groups, requests] tables of
+    the pages verify reads from and the private pages it reads its dense
+    base from; query_start_loc is the packed [requests + 1] boundary vector;
+    draft_token_num is the window the verify that follows was built for.
 
-    A request folds when its live page differs from its source or when its
-    accepted count L plus the larger of its window T and draft_token_num
-    exceeds history_capacity: the verify kernels apply at most
-    history_capacity - draft_token_num records, so a request with a shorter
-    window folds as soon as a full one would. The first launch writes the
-    source state with records [0, L) applied into the live page, and a
-    second, ordered launch clears L once every tile has read it.
-    Padding rows (a page at or below 0 or at or past the pool, an empty
-    window or a slot outside the record slots) keep their pages and lengths;
-    an L or T out of range on any other row fails a device assertion.
+    Every layer of a request shares its count H (replay_length, INT32
+    [record slots, 1]), which the launch only reads. H overflows when it lies
+    outside [0, history_capacity - draft_token_num]: the verify kernels apply
+    at most that many records, and they and the commit then apply none. Per
+    layer, a request whose H overflows gets its source state with records
+    [0, H) applied in its live page (in place when the two are one page; an H
+    past history_capacity applies none); otherwise a request whose live page
+    differs from its source in the layer's group gets the source state
+    copied without any record, since the H records stay valid on top of it.
+    Padding rows (pages at or below 0 or at or past the pool, an empty window
+    or a slot outside the record slots) keep their pages.
     """
     if num_heads <= 0 or head_dim <= 0 or history_capacity <= 0:
         raise ValueError(
@@ -414,17 +463,20 @@ def batched_prepare(
         raise ValueError("unsupported retained recurrent state dtype")
     if (
         descriptors.ndim != 2
-        or descriptors.shape[1] != 14
+        or descriptors.shape[1] != DESCRIPTOR_COLUMNS
         or descriptors.dtype != torch.uint64
         or not descriptors.is_contiguous()
     ):
-        raise ValueError("retained descriptors must be contiguous UINT64 [layers, 14]")
+        raise ValueError(
+            f"retained descriptors must be contiguous UINT64 [layers, {DESCRIPTOR_COLUMNS}]"
+        )
     layers = descriptors.shape[0]
     batch = record_slots.numel()
     if (
         group_indices.shape != (layers,)
         or not group_indices.is_contiguous()
         or source_indices.ndim != 2
+        or source_indices.shape[0] < 1
         or source_indices.shape[1] != batch
         or live_indices.shape != source_indices.shape
         or query_start_loc.shape != (batch + 1,)
@@ -448,30 +500,16 @@ def batched_prepare(
             "retained records must be FP32 [record slots, layers, heads, "
             "capacity, head_dim]"
         )
+    _check_count("replay_length", replay_length, device=descriptors.device)
+    if replay_length.shape[0] != record_slot_count:
+        raise ValueError("replay_length must hold one count per record slot")
     if any(x.device != descriptors.device for x in (*routing, record_slots, *records)):
         raise ValueError("retained preparation tensors must share a device")
     if not layers or not batch:
         return
-    # Both vendors share these Triton kernels.
+    # Both vendors share this Triton kernel.
     from tokenspeed_kernel.ops.attention.kda._triton import retained
 
-    args = (
-        descriptors,
-        group_indices,
-        source_indices,
-        live_indices,
-        query_start_loc,
-        record_slots,
-    )
-    rows = (
-        batch,
-        source_indices.shape[0],
-        *source_indices.stride(),
-        *live_indices.stride(),
-        query_start_loc.stride(0),
-        record_slots.stride(0),
-        record_slot_count,
-    )
     keys = triton.next_power_of_2(head_dim)
     # Split a request's heads over about 16 programs per SM, so every SM keeps
     # loads in flight when few requests fold (a batch-1 fold of 69 layers takes
@@ -481,10 +519,22 @@ def batched_prepare(
         num_heads,
         max(1, triton.cdiv(16 * current_platform().sm_count, layers * batch)),
     )
-    retained.retained_batched_consolidate_kernel[(layers, batch, splits)](
-        *args,
+    retained.retained_batched_prepare_kernel[(layers, batch, splits)](
+        descriptors,
+        group_indices,
+        source_indices,
+        live_indices,
+        query_start_loc,
+        record_slots,
+        replay_length,
         *records,
-        *rows,
+        source_indices.shape[0],
+        *source_indices.stride(),
+        *live_indices.stride(),
+        query_start_loc.stride(0),
+        record_slots.stride(0),
+        record_slot_count,
+        replay_length.stride(0),
         *(x.stride() for x in records),
         CAPACITY=history_capacity,
         WINDOW=draft_token_num,
@@ -494,14 +544,4 @@ def batched_prepare(
         KEYS=keys,
         ROWS=min(triton.next_power_of_2(head_dim), max(1, 2048 // keys)),
         num_warps=4,
-    )
-    retained.retained_batched_reset_kernel[(layers, triton.cdiv(batch, 128))](
-        *args,
-        *rows,
-        CAPACITY=history_capacity,
-        WINDOW=draft_token_num,
-        BLOCK=128,
-        num_warps=4,
-        # Keeps the interval assertion.
-        debug=True,
     )

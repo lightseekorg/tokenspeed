@@ -260,6 +260,12 @@ class Plane:
     def release(self, rids):
         self.note("release")
 
+    def check_memory_transition(self, tags, release):
+        self.note("check_memory_transition")
+        if release and tags == ["weights"]:
+            return (False, "release KV before weights")
+        return (True, "")
+
     def release_memory(self, tags):
         self.note("release_memory")
         raise RuntimeError("the memory release failed")
@@ -343,6 +349,21 @@ fn this_thread() -> u64 {
             .extract()
             .unwrap()
     })
+}
+
+#[test]
+fn a_memory_preflight_refusal_allows_another_check() {
+    let (plane, _) = plane();
+    let mut data_plane = start(&plane);
+    let tags = ["weights".to_owned()];
+    assert_eq!(
+        data_plane.check_memory_transition(&tags, true).unwrap(),
+        (false, "release KV before weights".to_owned())
+    );
+    assert_eq!(
+        data_plane.check_memory_transition(&tags, false).unwrap(),
+        (true, String::new())
+    );
 }
 
 #[test]

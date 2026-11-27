@@ -1059,6 +1059,7 @@ mod ffi {
         fn clear_cache_retaining_storage(scheduler: Pin<&mut Scheduler>) -> bool;
         fn storage_has_retained_operations(scheduler: &Scheduler) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn can_clear_l1_cache(scheduler: &Scheduler) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
         fn start_shared_l2_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<SharedL2LookupView>;
@@ -1658,6 +1659,11 @@ impl Scheduler {
     /// Drop the Device L1 prefix index only, under the same refusals.
     pub fn clear_l1_cache(&mut self) -> bool {
         ffi::clear_l1_cache(self.pinned())
+    }
+
+    /// Whether [`Scheduler::clear_l1_cache`] would succeed now; changes nothing.
+    pub fn can_clear_l1_cache(&self) -> bool {
+        ffi::can_clear_l1_cache(self.get())
     }
 
     /// Whether current references permit a full clear, without cancelling

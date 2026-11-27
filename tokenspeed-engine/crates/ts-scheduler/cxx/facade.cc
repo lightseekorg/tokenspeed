@@ -755,6 +755,8 @@ bool storage_has_retained_operations(const tokenspeed::Scheduler& scheduler) {
 
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearL1Cache(); }
 
+bool can_clear_l1_cache(const tokenspeed::Scheduler& scheduler) { return scheduler.CanClearL1Cache(); }
+
 bool can_clear_cache(const tokenspeed::Scheduler& scheduler) { return scheduler.CanClearCache(); }
 
 std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler) {

@@ -33,6 +33,10 @@ _CAUSAL_MASKS: dict[torch.device, torch.Tensor] = {}
 def _causal_mask(device: torch.device) -> torch.Tensor:
     mask = _CAUSAL_MASKS.get(device)
     if mask is None:
+        # Warmup must allocate the shared mask outside the graph private pool.
+        # Every layer and batch bucket reads it across graph releases.
+        if torch.npu.is_current_stream_capturing():
+            raise RuntimeError("Initialize the Ascend causal mask before capture")
         mask = torch.triu(
             torch.ones((2048, 2048), dtype=torch.bool, device=device), diagonal=1
         )

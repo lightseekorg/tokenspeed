@@ -779,7 +779,9 @@ def test_kda_recycled_and_restored_slots_start_without_accepted_records():
     )
     backend.set_kv_pool(make_kimi_pool("cpu", usable_pages=24))
     backend.preallocate_verify_workspace(MAX_BS, config.speculative_num_draft_tokens)
-    counts = backend._retained_length_storage
+    # One accepted count per slot, which every KDA layer shares.
+    counts = backend._replay_length
+    assert counts.shape == (backend._record_slot_count, 1)
     counts.fill_(5)
     # Slots 2 and 4 start serving new admissions (RuntimeStates.bind_stop_criteria).
     backend.reset_request_workspace(torch.tensor([2, 4]), stream=None)
@@ -787,9 +789,9 @@ def test_kda_recycled_and_restored_slots_start_without_accepted_records():
     backend.import_slot_state(
         6, torch.empty(0, dtype=torch.uint8), None, admission_id=9
     )
-    for slot in range(counts.shape[1]):
+    for slot in range(counts.shape[0]):
         expected = 0 if slot in (2, 4, 6) else 5
-        assert bool(counts[:, slot].eq(expected).all()), slot
+        assert counts[slot].item() == expected, slot
 
 
 @pytest.mark.parametrize("cls", SAMPLING_BACKENDS, ids=lambda cls: cls.__name__)
