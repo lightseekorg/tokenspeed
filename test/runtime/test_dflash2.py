@@ -166,19 +166,15 @@ def test_dflash2_mla_model_mode_and_yarn_config() -> None:
     }
 
 
-@_CUDA_ONLY
-def test_mla_draft_layers_build_windowed_mla_attention() -> None:
+def _mla_dflash2_config(*, num_attention_heads: int):
     from transformers import PretrainedConfig
 
-    from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
-
-    config = PretrainedConfig(
+    return PretrainedConfig(
         vocab_size=64,
         hidden_size=256,
         intermediate_size=128,
         num_hidden_layers=2,
-        num_attention_heads=2,
+        num_attention_heads=num_attention_heads,
         q_lora_rank=64,
         kv_lora_rank=64,
         qk_nope_head_dim=32,
@@ -200,6 +196,14 @@ def test_mla_draft_layers_build_windowed_mla_attention() -> None:
             "target_layer_ids": [0],
         },
     )
+
+
+@_CUDA_ONLY
+def test_mla_draft_layers_build_windowed_mla_attention() -> None:
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
+
+    config = _mla_dflash2_config(num_attention_heads=2)
     with torch.device("cuda"):
         model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1))
 
@@ -214,37 +218,9 @@ def test_mla_draft_layers_build_windowed_mla_attention() -> None:
 def test_an_mla_draft_load_returns_every_parameter_it_loaded() -> None:
     """The MLA draft's load_weights returns the names it loaded, as the GQA
     draft's does, so the base loader records them."""
-    from transformers import PretrainedConfig
-
     from tokenspeed.runtime.distributed.mapping import Mapping
 
-    config = PretrainedConfig(
-        vocab_size=64,
-        hidden_size=256,
-        intermediate_size=128,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        q_lora_rank=64,
-        kv_lora_rank=64,
-        qk_nope_head_dim=32,
-        qk_rope_head_dim=16,
-        v_head_dim=32,
-        rms_norm_eps=1e-6,
-        max_position_embeddings=4096,
-        rope_theta=10000.0,
-        layer_types=["sliding_attention", "full_attention"],
-        sliding_window=1024,
-        decode_monokernel=False,
-        dflash_config={
-            "attention_mode": "mla",
-            "block_size": 16,
-            "conv_group_size": 16,
-            "conv_kernel_size": 2,
-            "selector_rank": 8,
-            "selector_top_k": 4,
-            "target_layer_ids": [0],
-        },
-    )
+    config = _mla_dflash2_config(num_attention_heads=2)
     with torch.device("cuda"):
         model = DFlash2DraftModel(config, Mapping(rank=0, world_size=1))
     params = dict(model.named_parameters())
@@ -272,6 +248,42 @@ def test_an_mla_draft_load_returns_every_parameter_it_loaded() -> None:
             weights.append((name, value))
 
     assert model.load_weights(weights) == set(params)
+
+
+def test_mla_draft_layers_skip_pre_attn_all_gather_under_dep() -> None:
+    """DFlash2 layers reduce attention over ``attn`` and run replicated MLPs,
+    so every rank holds full rows at every layer boundary even when
+    ``mapping.replicated_for_draft()`` sets ``dense.tp_size == 1``."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.context import ForwardContext
+
+    dep_mapping = Mapping(
+        rank=0,
+        world_size=16,
+        attn_tp_size=8,
+        attn_dp_size=2,
+        moe_ep_size=16,
+        attn_kvp_size=8,
+    )
+    model = DFlash2DraftModel(_mla_dflash2_config(num_attention_heads=8), dep_mapping)
+    assert model.mapping.attn.tp_size == 8
+    assert model.mapping.dense.tp_size == 1
+
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=1,
+        input_num_tokens=4,
+        forward_mode=ForwardMode.EXTEND,
+        output_layout=None,
+        global_num_tokens=[4] * 16,
+    )
+    rows = torch.randn(4, 256)
+    for layer in model.layers:
+        assert layer.comm_manager is not None
+        assert not layer.comm_manager.needs_pre_attn_all_gather()
+        assert layer.comm_manager.pre_attn_comm(rows, ctx) is rows
 
 
 @pytest.mark.parametrize(

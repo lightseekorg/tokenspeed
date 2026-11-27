@@ -312,6 +312,21 @@ def _reduce_norm(
     return norm(all_reduce(hidden_states, tp.tp_group), residual)
 
 
+class _DFlash2CommManager(CommManager):
+    """DFlash2 layers reduce over ``attn`` and never reduce-scatter between layers.
+
+    With ``attn.dp_size > 1``, the draft maps dense weights with
+    ``mapping.replicated_for_draft()`` (``dense.tp_size == 1`` while
+    ``attn.tp_size`` can exceed 1). Unlike an RSAG layer, ``DFlash2DecoderLayer``
+    reduces attention via ``_reduce_norm(..., self.mapping.attn, ...)`` and runs
+    its MLP replicated, leaving full rows on every rank at each layer boundary.
+    """
+
+    def use_all_reduce(self, is_moe: bool) -> bool:
+        del is_moe
+        return True
+
+
 class DFlash2DecoderLayer(DFlashDecoderLayer):
     """DFlash layer with dynamic convolutions around attention and the MLP."""
 
@@ -334,7 +349,7 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         )
         self.comm_manager = None
         if self._uses_mla:
-            self.comm_manager = CommManager(
+            self.comm_manager = _DFlash2CommManager(
                 mapping=mapping,
                 layer_id=layer_id,
                 is_moe=False,
