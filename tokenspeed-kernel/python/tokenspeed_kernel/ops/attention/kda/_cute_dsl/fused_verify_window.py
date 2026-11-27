@@ -534,12 +534,12 @@ class FusedVerifyWindow(RecoverSsmVerify):
         if live:
             # After this warp's own loads. A 32-row tile prefetches every
             # position the records can take, so its last warp does not wait
-            # for the count before its row loads; larger tiles prefetch the
-            # counted records, their wait for the count overlapping the loads.
+            # for the count before its row loads; a 64-row tile prefetches the
+            # counted records, its wait for the count overlapping the loads.
             prefetched = count
             if const_expr(self.value_tile_rows == 32):
                 prefetched = Int32(max(self.capacity - W, 0))
-            if const_expr(not self.copy_records):
+            if const_expr(not self.copy_records and not self.early_history_loads):
                 self._prefetch_records(
                     retained, slot, head, value_start, prefetched, warp, lane
                 )

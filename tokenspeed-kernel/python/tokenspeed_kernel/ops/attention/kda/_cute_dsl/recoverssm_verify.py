@@ -729,7 +729,10 @@ class RecoverSsmVerify:
             self._load_base_tile(
                 shared, retained, live_page, head, value_start, tidx, warp, lane
             )
-            self._prefetch_records(retained, slot, head, value_start, count, warp, lane)
+            if const_expr(not self.early_history_loads):
+                self._prefetch_records(
+                    retained, slot, head, value_start, count, warp, lane
+                )
 
             stamp_slot = Int64(request)
             generation = Int64(0)
@@ -1352,6 +1355,8 @@ class RecoverSsmVerify:
         Lanes 2p and 2p + 1 cover record p, the even one its key row and this
         tile's u, the odd one its decay row, a 128-byte line at a time over
         dense rows (other layouts prefetch lines the replay may not read).
+        Tiles with ``early_history_loads`` skip it: every thread's loads of
+        those lines already start with the CTA (``_start_early_history``).
         """
         K = self.key_dim
         VT = self.value_tile_rows
