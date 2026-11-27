@@ -170,9 +170,20 @@ for info in list_plugins():
   Plugin authors who want to override a built-in should choose
   a value strictly higher than the built-in they replace.
 - `discover_plugins()` walks entry points in alphabetical order by
-  entry-point name. When two registrations land at the same priority for
-  the same `(family, mode)`, discovery emits a warning and selection becomes
-  load-order-dependent — set explicit, distinct priorities to avoid this.
+  entry-point name. Equal-priority registrations for the same `(family, mode)`
+  warn once per pair when their applicability domains may overlap. Disjoint
+  vendors, architecture intervals, operand formats and required shape domains
+  suppress the warning. Predicates are never executed by this diagnostic;
+  unproven intersections still warn. Optional traits and ignorable layouts
+  cannot establish disjointness. Selection and its tie-breaking rules are
+  unchanged.
+- Registration metadata records the declaring module, independently of the
+  implementation's module. Host registrations imported lazily while loading a
+  plugin stay in the registry but are excluded from its `PluginInfo` counts.
+  They still participate as peers in checks of actual plugin registrations.
+  Registrations made outside `tokenspeed_kernel` belong
+  to the loading plugin, including those reusing host implementations. Specs
+  registered directly without module metadata are conservatively counted.
 - A plugin whose `register()` raises does not crash discovery; discovery
   emits a `UserWarning` and other plugins continue loading.
 
