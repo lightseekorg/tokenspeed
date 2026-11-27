@@ -1714,3 +1714,9 @@ def test_host_transfer_mode_accepts_staged_dma_and_rejects_layer_ready(
     assert mode.uses_device_tables is True
     with pytest.raises(ValueError, match="layer_ready=True"):
         host_transfer_contract.HostTransferMode("staged_dma", layer_ready=True)
+
+
+def test_workspace_staging_buffer_requires_explicit_binding(host_transfer_contract):
+    workspace = host_transfer_contract.HostTransferWorkspace()
+    with pytest.raises(RuntimeError, match="bind_staging_buffer"):
+        workspace.staging_buffer()

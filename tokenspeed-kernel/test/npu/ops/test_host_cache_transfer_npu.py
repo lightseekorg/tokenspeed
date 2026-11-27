@@ -400,3 +400,58 @@ def test_npu_staged_transfer_unaligned_byte_fallback_is_byte_exact():
             host_off : host_off + payload
         ]
     assert torch.equal(round_trip_host, expected_host)
+
+
+@requires_npu
+def test_npu_raw_acl_paths_reject_pageable_host_buffer():
+    """Ensure raw ACL SDMA paths reject non-pinned host memory explicitly."""
+    payload = 4096
+    device_buf = torch.zeros(payload * 4, dtype=torch.uint8, device="npu")
+    pageable_host = torch.zeros(payload * 2, dtype=torch.uint8)
+    assert not pageable_host.is_pinned()
+
+    geometry = host_transfer.build_host_transfer_geometry(
+        rows=((0, 0, 0, payload, payload, 0, 1, payload),),
+        layer_slices=((0, 1),),
+        group_packing=(1,),
+        host_group_packing=(1,),
+        host_lcm_block_bytes=payload,
+        num_host_lcm_blocks=2,
+        num_device_lcm_blocks=3,
+        num_device_buffers=1,
+    ).bind(device_buf.device, non_blocking=False)
+
+    workspace = host_transfer.HostTransferWorkspace()
+    workspace.bind_staging_buffer(host_transfer.StagingBuffer(default_bytes=65536))
+    stream = torch.npu.Stream()
+    num_blocks, _ = workspace.load_block_transfers(((0, 1, 1),), geometry=geometry)
+    with torch.npu.stream(stream):
+        workspace.prepare_backend((device_buf,), pageable_host, backend="auto")
+        workspace.commit_block_transfers(
+            num_blocks, device_buf.device, non_blocking=True
+        )
+
+    with pytest.raises(ValueError, match="pinned"):
+        host_transfer.transfer_cache_blocks(
+            "d2h",
+            (device_buf,),
+            pageable_host,
+            geometry,
+            workspace,
+            stream,
+            num_blocks=num_blocks,
+            geometry_offset=0,
+            num_geometry_rows=1,
+            backend="auto",
+            grid_cap=None,
+            layer_ready_flags=None,
+        )
+
+    with pytest.raises(ValueError, match="pinned"):
+        host_transfer._transfer_dma(
+            "d2h",
+            (device_buf,),
+            pageable_host,
+            ((0, payload, 0, payload),),
+            stream=stream,
+        )

@@ -556,9 +556,12 @@ class HostTransferWorkspace:
         self._staging_buffer = staging_buffer
 
     def staging_buffer(self) -> StagingBuffer:
-        """Return the attached staging buffer, creating a private one if absent."""
+        """Return the attached stream-scoped staging buffer."""
         if self._staging_buffer is None:
-            self._staging_buffer = StagingBuffer()
+            raise RuntimeError(
+                "staging_buffer must be bound via bind_staging_buffer() "
+                "before a staged DMA transfer"
+            )
         return self._staging_buffer
 
     def prepare_backend(
@@ -1209,6 +1212,8 @@ def _copy_staging_host(
     if not sizes:
         return
     if staging.device.type == "npu":
+        if not host_buffer.is_pinned():
+            raise ValueError("host_buffer must be pinned CPU memory for NPU ACL memcpy")
         from tokenspeed_kernel.thirdparty.ascend.memcpy import (
             ascend_memcpy_batch_async,
         )
@@ -1267,13 +1272,14 @@ def _transfer_staged_dma(
     transfer per block while keeping HBM usage O(1) with respect to context
     length.
     """
+    device = device_buffers[0].device
     if (
         host_buffer.device.type != "cpu"
         or host_buffer.dtype != torch.uint8
         or not host_buffer.is_contiguous()
+        or (device.type != "cpu" and not host_buffer.is_pinned())
     ):
-        raise ValueError("host_buffer must be contiguous CPU uint8")
-    device = device_buffers[0].device
+        raise ValueError("host_buffer must be contiguous pinned CPU uint8")
     group_slices = geometry.staged_group_slices(geometry_offset, num_geometry_rows)
     if not group_slices:
         return
@@ -1444,6 +1450,8 @@ def _transfer_dma(
     stream=None,
 ) -> None:
     if device_buffers and device_buffers[0].device.type == "npu":
+        if not host_buffer.is_pinned():
+            raise ValueError("host_buffer must be pinned CPU memory for NPU ACL memcpy")
         from tokenspeed_kernel.thirdparty.ascend.memcpy import (
             ascend_memcpy_batch_async,
         )

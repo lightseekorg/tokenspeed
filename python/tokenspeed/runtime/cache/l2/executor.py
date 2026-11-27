@@ -60,6 +60,7 @@ import torch
 from tokenspeed_engine.scheduler import Cache
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferWorkspace,
+    StagingBuffer,
     transfer_cache_blocks,
     wait_layer_ready,
 )
@@ -567,11 +568,10 @@ class HostCacheExecutor:
         # tiers. On Ascend NPU, lanes sharing one transfer stream also share one
         # discardable HBM staging buffer under ``kv_cache`` so colocated RL
         # sleep frees it without CPU backup.
-        self._write_staging = None
-        self._load_staging = None
+        self._write_staging: StagingBuffer | None = None
+        self._load_staging: StagingBuffer | None = None
         device = self.layout.buffers[0].device
         if device.type == "npu" and io_backend == "kernel":
-            from tokenspeed_kernel.ops.kvcache.host_transfer import StagingBuffer
 
             def _allocate_npu_staging(
                 nbytes: int, target_device: torch.device
