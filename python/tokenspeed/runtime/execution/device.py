@@ -978,10 +978,35 @@ class DeviceHandle:
         if self._weight_memory is not None:
             self._weight_memory.before_kv_resume()
 
+    def _peer_weight_controllers(self) -> list:
+        from tokenspeed.runtime.layers.moe.peer_weights import (
+            peer_weights_controller_for,
+        )
+
+        models = [self._executor.model_runner.model]
+        draft_runner = self._executor.draft_model_runner
+        if draft_runner is not None:
+            models.append(draft_runner.model)
+        controllers = []
+        for model in models:
+            controller = peer_weights_controller_for(model)
+            if controller is not None:
+                controllers.append(controller)
+        return controllers
+
     def release_weights(self, adapter) -> None:
         """Discard or back up weights only after device and KV work drained."""
         self.synchronize()
-        operation = lambda: adapter.pause(tag="weights")
+        controllers = self._peer_weight_controllers()
+        backup = (
+            self._weight_memory is None or self._weight_memory.policy == "cpu_backup"
+        )
+
+        def operation() -> None:
+            for controller in controllers:
+                controller.release_storage(backup=backup)
+            adapter.pause(tag="weights")
+
         if self._weight_memory is None:
             operation()
         else:
@@ -989,7 +1014,16 @@ class DeviceHandle:
 
     def resume_weights(self, adapter) -> None:
         """Remap storage and restore constants; discarded parameters stay invalid."""
-        operation = lambda: adapter.resume(tag="weights")
+        controllers = self._peer_weight_controllers()
+        backup = (
+            self._weight_memory is None or self._weight_memory.policy == "cpu_backup"
+        )
+
+        def operation() -> None:
+            adapter.resume(tag="weights")
+            for controller in controllers:
+                controller.resume_storage(backup=backup)
+
         if self._weight_memory is None:
             operation()
         else:
@@ -1227,6 +1261,15 @@ class DeviceHandle:
             UpdateWeightsFromMooncakeReqInput,
         ):
             raise TypeError(f"unsupported weight-load request {type(req).__name__}")
+        controllers = self._peer_weight_controllers()
+        if controllers:
+            if type(req) is UpdateWeightsFromDistributedReqInput:
+                return (
+                    False,
+                    "Peer expert weights do not support distributed broadcast updates",
+                )
+            if any(controller.released for controller in controllers):
+                return False, "Resume weight storage before updating"
         state = self._weight_memory
         if state is None:
             return True, "ready for weight update"
