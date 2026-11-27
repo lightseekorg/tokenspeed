@@ -286,3 +286,155 @@ def test_metrics_relay_kills_child_when_sink_exceeds_shutdown_budget(
     result, events = run_launcher(relay_environment, "kill")
     assert result.returncode == 0, result.stderr
     assert len([event for event in events if event["kind"] == "event"]) == 1
+
+
+@pytest.mark.parametrize("with_pythonpath", [False, True])
+def test_metrics_relay_inherits_runtime_sys_path(tmp_path, with_pythonpath):
+    """Plugins added to ``sys.path`` after startup remain importable in the relay."""
+    plugin_dir = tmp_path / "runtime_plugins"
+    plugin_dir.mkdir()
+    cwd_dir = tmp_path / "cwd"
+    cwd_dir.mkdir()
+    (cwd_dir / "runtime_path_probe.py").write_text(
+        'raise RuntimeError("working directory shadowed runtime sys.path")\n'
+    )
+    (plugin_dir / "runtime_path_probe.py").write_text(textwrap.dedent(r"""
+        import json
+        import os
+        import sys
+        from pathlib import Path
+
+        from tokenspeed.runtime.metrics.registry import register_metric_reporter
+
+        def record(kind, **values):
+            with open(os.environ["RELAY_RECORD"], "a") as stream:
+                stream.write(json.dumps({"kind": kind, "pid": os.getpid(), **values}) + "\n")
+
+        class Sink:
+            def __init__(self, config):
+                self.config = config
+                record("sink", heavy=[
+                    name for name in sys.modules
+                    if name == "tokenspeed_kernel" or name.startswith("tokenspeed_kernel.")
+                    or name.startswith("tokenspeed.runtime.engine")
+                ])
+
+            def emit(self, event):
+                record("event", metric=event.metric, value=event.value)
+                Path(self.config["received"]).touch()
+
+            def close(self, timeout):
+                record("close", timeout=timeout)
+
+        def register():
+            register_metric_reporter(
+                "runtime-path-probe",
+                validate=lambda config: config,
+                create_sink=Sink,
+                start_node=None,
+                override=False,
+            )
+    """))
+    dist = plugin_dir / "runtime_path_probe-1.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: runtime-path-probe\nVersion: 1.0\n"
+    )
+    (dist / "entry_points.txt").write_text(
+        "[tokenspeed.plugins]\nruntime-path-probe = runtime_path_probe:register\n"
+    )
+
+    python_source = Path(__file__).resolve().parents[2] / "python"
+    runtime_paths = (
+        [str(plugin_dir)] if with_pythonpath else [str(plugin_dir), str(python_source)]
+    )
+    launcher = tmp_path / "runtime_path_launcher.py"
+    launcher.write_text(textwrap.dedent(f"""
+        import os
+        import sys
+        import time
+        import types
+        from pathlib import Path
+
+        # Add paths only at runtime via sys.path (not PYTHONPATH).
+        sys.path[:0] = {runtime_paths!r}
+
+        kernel = types.ModuleType("tokenspeed_kernel")
+        kernel.__path__ = []
+        platform = types.ModuleType("tokenspeed_kernel.platform")
+        platform.current_platform = object()
+        kernel_plugins = types.ModuleType("tokenspeed_kernel.plugins")
+        kernel_plugins.discover_plugins = lambda: None
+        sys.modules.update({{"tokenspeed_kernel": kernel,
+                            "tokenspeed_kernel.platform": platform,
+                            "tokenspeed_kernel.plugins": kernel_plugins}})
+
+        import tokenspeed
+        configs = types.ModuleType("tokenspeed.runtime.configs")
+        configs.__path__ = [str(Path(base) / "runtime" / "configs") for base in tokenspeed.__path__]
+        sys.modules[configs.__name__] = configs
+
+        import msgspec
+        import zmq
+        from tokenspeed.runtime import plugins
+        from tokenspeed.runtime.metrics.relay import MetricsRelay
+
+        plugins.ensure_loaded()
+        received = Path(os.environ["RELAY_RECEIVED"])
+        relay = MetricsRelay({{"runtime-path-probe": {{"received": str(received)}}}})
+        try:
+            context = zmq.Context()
+            with context.socket(zmq.PUSH) as push:
+                push.setsockopt(zmq.SNDTIMEO, 5000)
+                push.setsockopt(zmq.LINGER, 0)
+                push.connect(relay.endpoint)
+                push.send(msgspec.msgpack.encode([1, "sys-path-event", "inc", 1.0, {{}}, 1]))
+                deadline = time.monotonic() + 10
+                while not received.exists():
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("relay did not deliver the event")
+                    time.sleep(0.01)
+            context.term()
+        finally:
+            relay.close(timeout=2.0)
+    """))
+
+    env = os.environ.copy()
+    if with_pythonpath:
+        env["PYTHONPATH"] = str(python_source)
+    else:
+        env.pop("PYTHONPATH", None)
+    env.pop("TOKENSPEED_DISABLE_PLUGINS", None)
+    record_file = tmp_path / "record.jsonl"
+    record_file.touch()
+    env["RELAY_RECORD"] = str(record_file)
+    env["RELAY_RECEIVED"] = str(tmp_path / "received")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(launcher)],
+            cwd=cwd_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    finally:
+        events = [json.loads(line) for line in record_file.read_text().splitlines()]
+        child_pids = {event["pid"] for event in events if event["kind"] == "sink"}
+        survivors = []
+        for pid in child_pids:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            survivors.append(pid)
+            os.kill(pid, signal.SIGKILL)
+    assert not survivors, f"relay processes survived launcher shutdown: {survivors}"
+    assert result.returncode == 0, result.stderr
+    (sink,) = [event for event in events if event["kind"] == "sink"]
+    assert sink["heavy"] == []
+    assert [event for event in events if event["kind"] == "event"] == [
+        {"kind": "event", "pid": sink["pid"], "metric": "sys-path-event", "value": 1.0}
+    ]
+    assert len([event for event in events if event["kind"] == "close"]) == 1
