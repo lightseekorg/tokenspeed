@@ -48,6 +48,7 @@ __all__ = [
     "group_host_span",
     "host_identity",
     "multicast_reachable",
+    "symm_mem_reachable",
 ]
 
 logger = logging.getLogger(__name__)
@@ -291,23 +292,21 @@ def group_host_span(ranks: Sequence[int]) -> int | None:
     return len({_host_map[rank] for rank in ranks})
 
 
-def multicast_reachable(group: torch.distributed.ProcessGroup) -> bool:
-    """Whether NVLS multicast can actually map across ``group``'s ranks.
+def symm_mem_reachable(group: torch.distributed.ProcessGroup) -> bool:
+    """Whether symmetric-memory peer handles can map across ``group``'s ranks.
 
-    ``symm_mem`` importing is not enough: a cross-host group without fabric or
-    IMEX still reports multicast support locally and then hangs inside the
-    rendezvous instead of letting the caller fall back. The host-span test is
-    at group granularity: a node-local subgroup of a multi-host job never
-    needs fabric, and probing one would decline a group that works over plain
-    NVLink on a machine with no fabric at all.
+    Unicast peer kernels (such as ``ll_exchange``, ``paged_row_all_gather``,
+    and ``dcp_value_tail``) exchange ``buffer_ptrs`` and only need node-local
+    NVLink or cross-host MNNVL fabric allocation—never NVLS multicast.
 
-    Size alone does not establish node-locality, and neither does alignment to
-    the group's own width: at eight devices a host, ``[6, 7, 8]`` is contiguous
-    and starts on a multiple of three while still living on two hosts. What
-    decides it is which host each rank sits on, which the world map records
-    beside the fabric verdict. Nothing is divided out of the visible device
-    count here: a job running fewer workers than a host has GPUs puts two hosts
-    inside one such window, and the group would skip the fabric test entirely.
+    The host-span test is at group granularity: a node-local subgroup of a
+    multi-host job never needs fabric, and probing one would decline a group
+    that works over plain NVLink on a machine with no fabric at all. Size alone
+    does not establish node-locality, and neither does alignment to the group's
+    own width: at eight devices a host, ``[6, 7, 8]`` is contiguous and starts
+    on a multiple of three while still living on two hosts. What decides it is
+    which host each rank sits on, which the world map records beside the fabric
+    verdict.
 
     Both terms come from the map gathered at distributed initialization, so
     every rank makes the same local decision, and a map never gathered declines
@@ -322,3 +321,15 @@ def multicast_reachable(group: torch.distributed.ProcessGroup) -> bool:
     if span <= 1:
         return True
     return group_has_fabric(ranks)
+
+
+def multicast_reachable(group: torch.distributed.ProcessGroup) -> bool:
+    """Whether NVLS multicast can actually map across ``group``'s ranks.
+
+    ``symm_mem`` importing is not enough: a cross-host group without fabric or
+    IMEX still reports multicast support locally and then hangs inside the
+    rendezvous instead of letting the caller fall back. Callers that only need
+    unicast peer handles should gate on :func:`symm_mem_reachable` so
+    disabling multicast does not disable unicast peer kernels.
+    """
+    return symm_mem_reachable(group)

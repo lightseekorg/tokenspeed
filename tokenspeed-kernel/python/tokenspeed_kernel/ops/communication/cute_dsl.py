@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.fabric import multicast_reachable
+from tokenspeed_kernel.ops.communication.fabric import symm_mem_reachable
 from tokenspeed_kernel.ops.communication.multimem import multimem_available
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -367,7 +367,7 @@ def create_paged_row_all_gather_state(
     )
     if local_ok:
         # A rendezvous over hosts the fabric cannot map would hang.
-        local_ok = multicast_reachable(group)
+        local_ok = symm_mem_reachable(group)
     multicast = False
     if local_ok:
         with torch.cuda.device(device):
@@ -520,7 +520,7 @@ def create_ll_exchange_state(
     )
     if local_ok:
         # A rendezvous over hosts the fabric cannot map would hang.
-        local_ok = multicast_reachable(group)
+        local_ok = symm_mem_reachable(group)
     multicast = False
     if local_ok:
         with torch.cuda.device(device):

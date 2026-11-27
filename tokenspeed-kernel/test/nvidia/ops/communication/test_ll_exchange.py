@@ -299,3 +299,53 @@ def test_epochs_skip_the_zeroed_workspace_past_32_bits(tmp_path):
 
 def test_refusals_and_argument_errors(tmp_path):
     _spawn(_refusals, tmp_path)
+
+
+def test_ll_exchange_state_handles_null_multicast_ptr(monkeypatch):
+    """Unicast fallback precompiles when rendezvous leaves multicast_ptr unset."""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from tokenspeed_kernel.ops.communication._cute_dsl import ll_exchange
+
+    compiled_calls: list[tuple[int, bool, bool, bool, int]] = []
+
+    monkeypatch.setattr(
+        ll_exchange.LLExchangeState,
+        "_workspace",
+        lambda self, group, slot_bytes, fill, device: (
+            torch.zeros(1, dtype=torch.uint8, device=device),
+            SimpleNamespace(multicast_ptr=None),
+            torch.zeros(self.ranks, dtype=torch.int64, device=device),
+        ),
+    )
+    monkeypatch.setattr(
+        ll_exchange,
+        "_compiled",
+        lambda ranks, gather, multicast, floats, device_index: (
+            compiled_calls.append((ranks, gather, multicast, floats, device_index))
+            or (lambda *args: None)
+        ),
+    )
+    monkeypatch.setattr(dist, "barrier", lambda group=None: None)
+    group = mock.Mock()
+    group.size.return_value = 2
+    group.rank.return_value = 0
+
+    state = ll_exchange.LLExchangeState(
+        group,
+        torch.device("cuda", torch.cuda.current_device()),
+        cap_bytes=64,
+        float_cap_bytes=64,
+        multicast=True,
+        timeout_ns=TIMEOUT_NS,
+    )
+    assert state.multicast_ptr == 0
+    assert state.float_multicast_ptr == 0
+    assert all(not mc for _, _, mc, _, _ in compiled_calls)
+    state.launch(
+        torch.zeros(16, dtype=torch.uint8, device="cuda"),
+        torch.empty(32, dtype=torch.uint8, device="cuda"),
+        gather=True,
+        floats=False,
+    )

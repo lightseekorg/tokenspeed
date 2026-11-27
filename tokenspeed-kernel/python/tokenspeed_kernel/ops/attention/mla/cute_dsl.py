@@ -243,7 +243,7 @@ def create_dcp_value_tail(
     Returns:
         The tail, or None on every rank.
     """
-    from tokenspeed_kernel.ops.communication.fabric import multicast_reachable
+    from tokenspeed_kernel.ops.communication.fabric import symm_mem_reachable
 
     degree = group.size()
     local_ok = (
@@ -261,7 +261,7 @@ def create_dcp_value_tail(
     )
     if local_ok:
         # A rendezvous over hosts the fabric cannot map would hang.
-        local_ok = multicast_reachable(group)
+        local_ok = symm_mem_reachable(group)
     if local_ok:
         # Imported before the vote: a rank failing after it would strand its peers.
         try:
