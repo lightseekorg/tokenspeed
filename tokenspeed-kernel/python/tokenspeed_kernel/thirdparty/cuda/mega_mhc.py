@@ -55,13 +55,23 @@ def is_mega_mhc_direct_staging_available() -> bool:
     fn = _api().mega_mhc
     required = ("y_routed_sf", "y_shared_sf", "shared_sf_block_m")
     try:
-        params = inspect.signature(fn).parameters
-        return all(name in params for name in required)
+        params = inspect.signature(fn, follow_wrapped=True).parameters
+        if all(name in params for name in required):
+            return True
+        if not any(
+            param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()
+        ):
+            return False
     except (TypeError, ValueError):
-        # Builtin nanobind/pybind11 C++ extensions lack Python inspect
-        # signatures and expose their keyword parameters in __doc__.
-        doc = getattr(fn, "__doc__", None) or ""
-        return all(re.search(rf"\b{name}\b", doc) is not None for name in required)
+        pass
+    # Python wrappers around nanobind/pybind11 bindings may expose *args/**kwargs
+    # in inspect.signature while listing the real keyword names in __doc__.
+    docs = [getattr(fn, "__doc__", None) or ""]
+    wrapped = getattr(fn, "__wrapped__", None)
+    if wrapped is not None:
+        docs.append(getattr(wrapped, "__doc__", None) or "")
+    combined_doc = "\n".join(docs)
+    return all(re.search(rf"\b{name}\b", combined_doc) is not None for name in required)
 
 
 def _launch(
