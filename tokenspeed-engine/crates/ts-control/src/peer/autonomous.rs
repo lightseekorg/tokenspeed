@@ -66,7 +66,10 @@ enum Driver {
 /// The protocol owner and its control-loop handoff.
 pub struct Peer {
     driver: Driver,
-    versioned: Option<super::coordinated::Control>,
+    versioned: Option<Arc<Mutex<super::coordinated::Control>>>,
+    window: Option<super::progress::Progress>,
+    scheduler: Arc<Mutex<Scheduler>>,
+    epoch: u64,
     device_pin_gate: Arc<servicer::DevicePinGate>,
     port: Option<u16>,
     fence: PeerFence,
@@ -108,6 +111,7 @@ impl Peer {
             .as_ref()
             .map(|e| e.holder.lock().device_pin_gate.clone())
             .unwrap_or_default();
+        let worker_scheduler = scheduler.clone();
         let driver = if background {
             let wake = protocol.endpoint.as_ref().unwrap().driver.clone();
             let (commands, rx) = mpsc::channel();
@@ -116,7 +120,7 @@ impl Peer {
                 .name("ts-peer-host".into())
                 .spawn(move || {
                     wake.run(|| {
-                        if let Err(error) = drive(&mut protocol, scheduler, rx, &tx) {
+                        if let Err(error) = drive(&mut protocol, worker_scheduler, rx, &tx) {
                             tracing::error!(%error, "peer worker stopped");
                             let _ = tx.send(Err(error));
                         }
@@ -135,6 +139,9 @@ impl Peer {
         };
         Ok(Self {
             versioned: None,
+            window: None,
+            scheduler,
+            epoch: 0,
             driver,
             device_pin_gate,
             port,
@@ -148,7 +155,7 @@ impl Peer {
     }
 
     pub(crate) fn autonomous(&self) -> bool {
-        matches!(&self.driver, Driver::Background(_))
+        self.window.is_some() || matches!(&self.driver, Driver::Background(_))
     }
 
     /// Drain queued holder changes on the endpoint owner (empty on other
@@ -177,7 +184,7 @@ impl Peer {
             Driver::Background(_) => Vec::new(),
         };
         match &mut self.versioned {
-            Some(v) => v.report(legacy),
+            Some(v) => v.lock().report(legacy),
             None => legacy,
         }
     }
@@ -190,20 +197,60 @@ impl Peer {
         incarnation: u64,
         channel: Option<super::VersionedChannel>,
         retirement_bound_ms: u32,
-    ) {
+    ) -> Result<(), PeerError> {
         let (control, fence) = super::coordinated::Control::new(
+            self.origin,
             layout,
             self.member,
-            name,
-            incarnation,
+            super::v1::Generation {
+                name,
+                incarnation,
+                epoch: 1,
+            },
             channel,
             self.device_pin_gate.clone(),
             retirement_bound_ms,
         );
         if control.reader() {
+            // The registered driver emits a terminal lookup answer on every path.
+            // Keep shard admission deterministic across scheduler replicas.
+            if !self.scheduler.lock().enable_async_device_peer(false) {
+                return Err(PeerError::Topology);
+            }
             self.fence = fence;
         }
-        self.versioned = Some(control);
+        self.versioned = Some(Arc::new(Mutex::new(control)));
+        Ok(())
+    }
+
+    /// Start progress on a mesh reserved for this replica's peer protocol.
+    pub fn start_versioned_progress(
+        &mut self,
+        mesh: Option<(Mesh, Group)>,
+    ) -> Result<(), PeerError> {
+        let control = self.versioned.as_ref().ok_or(PeerError::Topology)?.clone();
+        let reads = match &self.driver {
+            Driver::Rounds(p) => Some(p.reads.clone()),
+            _ => None,
+        };
+        self.window = Some(super::progress::Progress::start(
+            mesh,
+            control,
+            self.scheduler.clone(),
+            reads,
+            self.origin,
+        )?);
+        Ok(())
+    }
+
+    pub(crate) fn cache_window(
+        &self,
+        phase: super::progress::CacheWait,
+        forward: u64,
+    ) -> Option<super::progress::Window<'_>> {
+        self.window
+            .as_ref()
+            .map(|w| w.open(self.epoch, phase, forward))
     }
 
     /// Apply source votes under the same scheduler lock that protects cache writes.
@@ -212,19 +259,28 @@ impl Peer {
         reports: &[Vec<u8>],
         scheduler: &mut Scheduler,
     ) -> Result<PeerRound, PeerError> {
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .expect("peer round counter exhausted");
         if self.versioned.is_none() {
             return self.agree(reports);
         }
         let (legacy, versioned) = super::coordinated::Control::unpack(reports)?;
         let mut round = self.agree(&legacy)?;
+        if let Some(w) = &self.window {
+            w.drain(&mut round)?;
+        }
         let reads = match &self.driver {
-            Driver::Rounds(p) => Some(&p.reads),
+            Driver::Rounds(p) => Some(p.reads.lock()),
             Driver::Background(_) => None,
         };
-        self.versioned
-            .as_mut()
-            .unwrap()
-            .advance(versioned, scheduler, reads, &mut round)?;
+        self.versioned.as_mut().unwrap().lock().advance(
+            versioned,
+            scheduler,
+            reads.as_deref(),
+            &mut round,
+        )?;
         Ok(round)
     }
     /// Consume results already completed by the protocol owner.
@@ -302,7 +358,12 @@ impl Peer {
         lookups: Vec<PeerLookupView>,
         now_us: i64,
     ) {
-        if let Some(reader) = self.versioned.as_mut().filter(|v| v.reader()) {
+        if let Some(mut reader) = self
+            .versioned
+            .as_ref()
+            .map(|v| v.lock())
+            .filter(|v| v.reader())
+        {
             reader.dispatch(fetches, lookups, now_us);
             return;
         }
@@ -335,7 +396,7 @@ impl Peer {
     }
     /// Attempts which still own progress or await consumption.
     pub fn num_landings(&self) -> usize {
-        self.versioned.as_ref().map_or(0, |v| v.len())
+        self.versioned.as_ref().map_or(0, |v| v.lock().len())
             + match &self.driver {
                 Driver::Rounds(p) => p.num_landings(),
                 Driver::Background(w) => w.pending,
@@ -349,7 +410,7 @@ impl Peer {
     ) {
         self.metrics = logical.clone();
         if let Some(v) = &mut self.versioned {
-            v.meter = physical.clone();
+            v.lock().meter = physical.clone();
         }
         match &mut self.driver {
             Driver::Rounds(p) => p.set_metrics(logical, physical),
@@ -366,7 +427,7 @@ impl Peer {
     /// Switch the namespace after outstanding work drains.
     pub fn set_weight_version(&mut self, version: &str) {
         if let Some(v) = &mut self.versioned {
-            v.invalidate();
+            v.lock().invalidate();
         }
         match &mut self.driver {
             Driver::Rounds(p) => p.set_weight_version(version),
@@ -415,7 +476,7 @@ struct Pending {
     rid: String,
     deadline: i64,
 }
-fn fallback(lease: ts_scheduler::PeerLeaseView) -> PeerEventView {
+pub(super) fn fallback(lease: ts_scheduler::PeerLeaseView) -> PeerEventView {
     PeerEventView {
         kind: PeerEventKind::LookupAnswered,
         lease,
@@ -719,7 +780,7 @@ fn drive(
             outcomes: std::mem::take(&mut p.unplaced),
             ..Report::default()
         };
-        report.outcomes.extend(p.reads.poll());
+        report.outcomes.extend(p.reads.lock().poll());
         for (at, reply) in inbox {
             if let Reply::Answer { stamp, answer } = &reply {
                 if answer.kind == PeerAnswerKind::Lookup {

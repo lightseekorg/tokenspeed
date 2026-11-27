@@ -116,6 +116,11 @@ impl Attempt {
         self.phase = Phase::Finished;
         Some(release)
     }
+    pub fn set_lookup_deadline(&mut self, deadline: i64) {
+        if matches!(self.phase, Phase::Discovery | Phase::Query) {
+            self.deadline = deadline;
+        }
+    }
     pub fn finished(&self) -> bool {
         self.phase == Phase::Finished
     }
@@ -187,7 +192,7 @@ impl Attempt {
                 self.offer = Some(offer.clone());
                 self.pages = pages.clone();
                 self.phase = Phase::Offered;
-                self.deadline = now.saturating_add(2_000_000);
+                self.deadline = round.now_us.saturating_add(2_000_000);
             }
         }
         round.events.push(e);
@@ -478,7 +483,13 @@ impl Attempt {
         } else if now >= self.deadline {
             match self.phase {
                 Phase::Pin | Phase::Planning => self.seal(),
-                Phase::Discovery | Phase::Query | Phase::Offered => {
+                Phase::Discovery | Phase::Query => {
+                    round
+                        .events
+                        .push(super::autonomous::fallback(self.lookup.lease.clone()));
+                    self.phase = Phase::Finished;
+                }
+                Phase::Offered => {
                     self.finish(false, round);
                     self.phase = Phase::Finished;
                 }

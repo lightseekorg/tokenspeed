@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! V1 control traffic and member votes ride the normal replica collective.
+//! V1 control traffic and votes advance from a common replica report on either CPU mesh.
 use super::{
     attempt::Attempt,
     offers::{Offers, Vote, CLOSED, DONE, PINNED, READY},
@@ -40,7 +40,8 @@ pub(super) struct Report {
     legacy: Vec<u8>,
     retirement_bound_ms: u32,
     proposals: Vec<(i64, Message, Message)>,
-    messages: Vec<Message>,
+    messages: Vec<(i64, Message)>,
+    deadlines: Vec<(u64, i64)>,
     votes: Vec<Vote>,
 }
 fn write_msg(w: &mut Writer, m: &Message) {
@@ -63,8 +64,14 @@ impl Report {
             write_msg(&mut w, &a);
         }
         w.count(self.messages.len());
-        for m in self.messages {
+        for (received, m) in self.messages {
+            w.i64(received);
             write_msg(&mut w, &m);
+        }
+        w.count(self.deadlines.len());
+        for (lease, deadline) in self.deadlines {
+            w.u64(lease);
+            w.i64(deadline);
         }
         w.count(self.votes.len());
         for v in self.votes {
@@ -83,7 +90,10 @@ impl Report {
             .map(|_| Some((r.i64()?, msg(&mut r)?, msg(&mut r)?)))
             .collect::<Option<Vec<_>>>()?;
         let messages = (0..r.count()?)
-            .map(|_| msg(&mut r))
+            .map(|_| Some((r.i64()?, msg(&mut r)?)))
+            .collect::<Option<Vec<_>>>()?;
+        let deadlines = (0..r.count()?)
+            .map(|_| Some((r.u64()?, r.i64()?)))
             .collect::<Option<Vec<_>>>()?;
         let votes = (0..r.count()?)
             .map(|_| {
@@ -99,6 +109,7 @@ impl Report {
             legacy,
             retirement_bound_ms,
             proposals,
+            deadlines,
             messages,
             votes,
         })
@@ -169,6 +180,8 @@ impl PendingReleases {
 }
 
 pub(super) struct Control {
+    origin: Instant,
+    deadlines: Vec<(u64, i64)>,
     pub layout: Arc<Replica>,
     rank: usize,
     gen: Generation,
@@ -189,10 +202,10 @@ pub(super) struct Control {
 }
 impl Control {
     pub fn new(
+        origin: Instant,
         layout: Arc<Replica>,
         rank: usize,
-        name: String,
-        incarnation: u64,
+        gen: Generation,
         ch: Option<VersionedChannel>,
         device_pin_gate: Arc<super::servicer::DevicePinGate>,
         retirement_bound_ms: u32,
@@ -200,13 +213,11 @@ impl Control {
         let (tx, signaled) = mpsc::channel();
         (
             Self {
+                origin,
+                deadlines: Vec::new(),
                 layout,
                 rank,
-                gen: Generation {
-                    name,
-                    incarnation,
-                    epoch: 1,
-                },
+                gen,
                 ch,
                 known: HashMap::new(),
                 attempts: BTreeMap::new(),
@@ -227,6 +238,16 @@ impl Control {
     }
     pub fn reader(&self) -> bool {
         self.layout.members.len() == 8
+    }
+    pub fn wake(&self) -> Option<Arc<super::DriverWake>> {
+        self.ch.as_ref().map(|c| c.versioned_wake.clone())
+    }
+    pub fn has_work(&self) -> bool {
+        self.len() != 0
+            || !self.pending_releases.holders.is_empty()
+            || !self.votes.is_empty()
+            || !self.proposals.is_empty()
+            || self.ch.as_ref().is_some_and(|c| !c.inbox.lock().is_empty())
     }
     pub fn len(&self) -> usize {
         self.attempts.len() + self.offers.active_count()
@@ -285,17 +306,28 @@ impl Control {
                 self.missing.push(failed);
             }
         }
-        for q in lookups {
+        for mut q in lookups {
             let id = q.lease.id;
-            if !self.admission || self.pending_releases.holders.contains_key(&q.holder) {
-                continue;
-            }
-            if self.attempts.len() >= 4096 {
-                if self.rank == 0 && now >= self.cap_warn_after_us {
+            let suppressed =
+                !self.admission || self.pending_releases.holders.contains_key(&q.holder);
+            if suppressed || self.attempts.len() >= 4096 {
+                if !suppressed && self.rank == 0 && now >= self.cap_warn_after_us {
                     tracing::warn!("peer attempt limit reached; falling back to local prefill");
                     self.cap_warn_after_us = now.saturating_add(60_000_000);
                 }
+                self.missing.push(super::autonomous::fallback(q.lease));
                 continue;
+            }
+            if self.rank == 0 {
+                let budget = q.deadline_us.saturating_sub(now).max(0);
+                q.deadline_us = (self.origin.elapsed().as_micros() as i64).saturating_add(budget);
+                tracing::debug!(
+                    lease = id,
+                    sent_us = q.deadline_us - budget,
+                    deadline_us = q.deadline_us,
+                    "sharded peer lookup dispatched"
+                );
+                self.deadlines.push((id, q.deadline_us));
             }
             let target = q.holder.clone();
             let mut a = Attempt::new(q);
@@ -315,13 +347,25 @@ impl Control {
         let messages = self
             .ch
             .as_ref()
-            .map(|c| c.inbox.lock().drain(..).collect())
+            .map(|c| {
+                c.inbox
+                    .lock()
+                    .drain(..)
+                    .map(|(t, m)| {
+                        (
+                            t.saturating_duration_since(self.origin).as_micros() as i64,
+                            m,
+                        )
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         Report {
             legacy,
             retirement_bound_ms: self.retirement_bound_ms,
             messages,
             votes: std::mem::take(&mut self.votes),
+            deadlines: std::mem::take(&mut self.deadlines),
             proposals: std::mem::take(&mut self.proposals),
         }
         .encode()
@@ -337,7 +381,7 @@ impl Control {
             .collect();
         Ok((legacy, rs))
     }
-    fn receive(&mut self, m: Message, s: &mut Scheduler, round: &mut PeerRound) {
+    fn receive(&mut self, received: i64, m: Message, s: &mut Scheduler, round: &mut PeerRound) {
         let now = round.now_us;
         match &m {
             Message::LayoutReply(id, g, sid, d, wire) => {
@@ -391,7 +435,16 @@ impl Control {
                     self.known.remove(&k.holder.name);
                 }
                 if let Some(a) = self.attempts.get_mut(&k.lease) {
-                    a.answer(&m, now, round);
+                    let count = round.events.len();
+                    a.answer(&m, received, round);
+                    tracing::debug!(
+                        rank = self.rank,
+                        lease = k.lease,
+                        received_us = received,
+                        advanced_us = now,
+                        tokens = round.events.get(count).map(|event| event.num_tokens),
+                        "sharded peer lookup reply"
+                    );
                 }
             }
             Message::Pin(k, o) if k.holder == self.gen => {
@@ -475,8 +528,13 @@ impl Control {
                 issued_at,
             );
         }
-        for m in first.messages.drain(..) {
-            self.receive(m, s, round);
+        for (lease, deadline) in first.deadlines.drain(..) {
+            if let Some(a) = self.attempts.get_mut(&lease) {
+                a.set_lookup_deadline(deadline);
+            }
+        }
+        for (received, m) in first.messages.drain(..) {
+            self.receive(received, m, s, round);
         }
         for (i, r) in reports.iter().enumerate() {
             for v in &r.votes {
@@ -587,3 +645,7 @@ mod tests {
         assert!(pending.holders.is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "forward_test.rs"]
+mod forward_test;
