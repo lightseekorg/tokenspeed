@@ -136,6 +136,7 @@ def _reference_fp64(args: dict):
         (comb64[..., None] * res64[:, :, None, :]).sum(1)
         + post64[..., None] * x64[:, None, :]
     ).bfloat16()
+    # Match the kernel's BF16 updated-residual input fed to the mix GEMM.
     r = new_residual.double()
     collapsed = (pre64[..., None] * r).sum(1).bfloat16()
     cf = collapsed.double()

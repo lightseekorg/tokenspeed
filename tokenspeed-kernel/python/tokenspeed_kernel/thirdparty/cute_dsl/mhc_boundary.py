@@ -30,7 +30,7 @@ The hidden dimension is split into 16 slices across a 16-CTA DSMEM cluster.
 Each CTA updates its slice of the 4 residual streams, collapses the stream with
 the lagged ``pre`` mix, RMS-normalizes into the sublayer input, and multiplies
 the updated residual with its slice of the mixer projection on BF16 tensor
-cores using TF32-exact BF16 hi/lo weight fragments (``prepare_boundary_weight``).
+cores using BF16 hi+lo weight fragments (``prepare_boundary_weight``).
 CTAs exchange their partial 24 mixes and residual/collapsed sums of squares via
 cluster distributed shared memory (`st.async.shared::cluster` + cluster
 mbarriers) in deterministic fixed rank order, with zero global workspace or
@@ -1100,7 +1100,7 @@ def boundary_weight_shape(hidden: int) -> tuple[int, int, int, int, int]:
 
 
 def prepare_boundary_weight(fn: torch.Tensor) -> torch.Tensor:
-    """Pack ``[24, 4 * hidden]`` FP32 weights into TF32-split BF16 MMA fragments."""
+    """Pack ``[24, 4 * hidden]`` FP32 weights into BF16 hi+lo MMA fragments."""
     if fn.ndim != 2 or fn.shape[0] != MIXES or fn.dtype != torch.float32:
         raise ValueError("prepare_boundary_weight expects FP32 tensor [24, 4 * hidden]")
     if fn.shape[1] % MULT != 0:
@@ -1109,10 +1109,9 @@ def prepare_boundary_weight(fn: torch.Tensor) -> torch.Tensor:
     if not MhcBoundaryKernel.supports(hidden, MULT, TILE):
         raise ValueError(f"Unsupported hidden={hidden} for mhc_boundary weight packing")
     hidden_slice = hidden // CLUSTER
-    bits = fn.contiguous().view(torch.int32)
-    rounded = ((bits + 0x1000) & -0x2000).view(torch.float32)
-    hi = rounded.to(torch.bfloat16)
-    lo = (rounded - hi.float()).to(torch.bfloat16)
+    fn = fn.contiguous()
+    hi = fn.to(torch.bfloat16)
+    lo = (fn - hi.float()).to(torch.bfloat16)
     pairs = torch.cat([hi, lo]).view(torch.int32)
     dev = fn.device
     rank = torch.arange(CLUSTER, device=dev).view(-1, 1, 1, 1)
