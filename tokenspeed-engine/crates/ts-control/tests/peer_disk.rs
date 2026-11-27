@@ -415,7 +415,9 @@ impl Replica {
                 })
                 .collect();
         }
-        self.peer.dispatch(fetches.clone(), lookups, round.now_us);
+        self.peer
+            .dispatch(fetches.clone(), lookups, round.now_us)
+            .unwrap();
         if plan.needs_device() && !fetches.is_empty() {
             self.peer.fence().ready();
         }

@@ -1116,7 +1116,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             } else {
                 None
             };
-            self.dispatch_peer(&plan);
+            self.dispatch_peer(&plan)?;
             // The storage tick disabled forward planning: scheduler aborts arise
             // only in that build, and frozen rounds reset the no-progress streak.
             self.record_scheduler_metrics(None, &cache_ops, 0);
@@ -1295,7 +1295,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // Counted here because `execute` below always runs this plan.
         let cache_ops = plan.cache_ops();
         self.cache_ops.dispatched(&cache_ops);
-        self.dispatch_peer(&plan);
+        self.dispatch_peer(&plan)?;
         let aborts = plan.aborts();
         let retirement_id = if self.replay_retirements.is_some()
             && (!aborts.is_empty()
@@ -3190,7 +3190,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// A plan's peer work goes out: its landings start (each read waits for
     /// this plan's device work on its member), and the lookups it queued are
     /// sent.
-    fn dispatch_peer(&mut self, plan: &ExecutionPlan) {
+    fn dispatch_peer(&mut self, plan: &ExecutionPlan) -> Result<(), LoopError> {
         if let Some(peer) = self.peer.as_mut() {
             let fetches = plan.peer_fetches();
             let lookups = self.scheduler.take_peer_lookups();
@@ -3220,8 +3220,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     }
                 }
             }
-            peer.dispatch(fetches, lookups, self.peer_now_us);
+            peer.dispatch(fetches, lookups, self.peer_now_us)?;
         }
+        Ok(())
     }
 
     /// Drain any holder changes answered on `ts-peer-servicer` while

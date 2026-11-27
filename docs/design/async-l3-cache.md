@@ -802,9 +802,19 @@ its source lifetime. Destination ownership remains with ordinary admission.
 The optional `--enable-kvstore-storage-direct` selects direct restoration for
 Mooncake-backed Prefill workers with peer sharing and explicit
 `--peer-prefix-landing-tier device`. Direct storage restoration does not support
-a Host destination. The TP8/KVP8 versioned cross-layout Peer reader cannot
-currently compose L3 landings; startup rejects enabling direct storage with
-that reader rather than sending storage lookups through the cross-layout protocol.
+a Host destination. The TP8/KVP8 versioned cross-layout Peer reader also
+supports direct storage restoration: hot-cache lookups use the versioned Peer
+protocol, while `l3@` lookups use the local storage coordinator. One plan fence
+is forwarded only to protocols participating in that plan. For a mixed landing,
+the union of their destinations must cover the complete final checkpoint without
+overlap before the hot protocol may accept a partial destination set. The final
+storage lease owns the joined completion; neither source can independently
+publish or release the whole landing.
+Storage reads translate virtual page IDs to the owning rank's local pages and
+check destination registration bounds. Page-sharded history lands only on its
+owner; replicated groups with TP-partitioned fields use each rank's storage key.
+Storage objects must still belong to the reader's compatible cache namespace;
+this does not add cross-layout conversion of persisted SSD objects.
 Single-member background progress and coordinated same-layout peers retain
 the direct path. With it disabled, the usual
 Host restoration policy remains unchanged. With it enabled,
@@ -832,7 +842,10 @@ tracks both leases; the request receives one completion only after all source
 reads retire and their releases are acknowledged. A completed part alone never
 publishes a resumable prefix. A failed part waits for the other part to retire
 before returning the entire landing to ordinary recomputation; an unretired
-part still fails the worker without recycling destinations. A remote-hot-cache
+storage part still fails the worker without recycling destinations. An unknown
+versioned hot read freezes the entire target grant until both paths retire;
+its eventual retirement cannot release pages still being written by storage.
+A remote-hot-cache
 miss may also fall through to L3. Decode and shorter requests do not start
 storage lookups. This composition changes no hot-peer or Mooncake RPC protocol.
 

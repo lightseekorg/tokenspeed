@@ -34,6 +34,7 @@
 
 mod attempt;
 mod autonomous;
+mod composition;
 mod coordinated;
 mod offers;
 pub use autonomous::Peer;
@@ -202,6 +203,9 @@ pub enum PeerError {
     /// The native scheduler rejected an operation on the worker.
     #[error("peer worker: {0}")]
     Worker(String),
+    /// An admitted source plan cannot describe a complete, disjoint landing.
+    #[error("invalid peer plan: {0}")]
+    Plan(String),
     /// Remote DMA retirement could not be established. Do not recycle these pages.
     #[error(
         "peer hard pin {0:?} was not released; replace the holder engine before reusing its cache"
@@ -528,6 +532,7 @@ impl PeerFence {
 struct Protocol {
     progress: PeerProgress,
     storage_source: Option<storage_servicer::Service>,
+    storage_layout: Option<Arc<registered::Replica>>,
     settings: PeerSettings,
     /// The namespace this member reads and serves under; a weight update
     /// moves it.
@@ -594,6 +599,7 @@ impl Protocol {
             .transpose()?;
         Ok(Self {
             storage_source: None,
+            storage_layout: None,
             identity: settings.identity(progress),
             settings,
             progress,
@@ -812,6 +818,7 @@ impl Protocol {
             if self.metrics.is_some() && self.member == 0 && complete {
                 landed.push((request.clone(), begin, end));
             }
+            let lease = self.landings[&keys[0]].lease().clone();
             let device_times = self.landings[&keys[0]].device_times;
             let terminal_us = keys
                 .iter()
@@ -829,6 +836,7 @@ impl Protocol {
             }
             events.push(PeerEventView {
                 kind: PeerEventKind::FetchDone,
+                lease,
                 dispatch_us: device_times.unwrap_or_default().0,
                 writable_us: device_times.unwrap_or_default().1,
                 terminal_us: device_times.map_or(0, |_| terminal_us),
@@ -1300,7 +1308,18 @@ impl Protocol {
                     .get(self.member)
                     .ok_or_else(|| "missing prepared owner".to_owned())
                     .and_then(|objects| {
-                        prepared::read_spans(objects, &self.geometry, &fetch.destinations)
+                        let spans = match &self.storage_layout {
+                            Some(layout) => prepared::read_spans_registered(
+                                objects,
+                                layout,
+                                self.member,
+                                &fetch.destinations,
+                            ),
+                            None => {
+                                prepared::read_spans(objects, &self.geometry, &fetch.destinations)
+                            }
+                        };
+                        spans
                             .map(|spans| (spans.into_iter().collect::<Vec<_>>(), None))
                             .map_err(|error| error.to_string())
                     })

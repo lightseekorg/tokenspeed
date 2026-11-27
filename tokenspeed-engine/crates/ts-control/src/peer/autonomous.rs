@@ -68,6 +68,9 @@ enum Driver {
 pub struct Peer {
     driver: Driver,
     versioned: Option<super::coordinated::Control>,
+    versioned_fence: Option<PeerFence>,
+    routed_fences: Option<super::composition::Fences>,
+    composed: super::composition::Landings,
     device_pin_gate: Arc<servicer::DevicePinGate>,
     port: Option<u16>,
     fence: PeerFence,
@@ -136,6 +139,9 @@ impl Peer {
         };
         Ok(Self {
             versioned: None,
+            versioned_fence: None,
+            routed_fences: None,
+            composed: Default::default(),
             driver,
             device_pin_gate,
             port,
@@ -181,6 +187,9 @@ impl Peer {
 
     /// Report to the normal replica collective (empty for the independent owner).
     pub fn report(&mut self) -> Vec<u8> {
+        if let Some(fences) = &mut self.routed_fences {
+            fences.advance();
+        }
         let legacy = match &mut self.driver {
             Driver::Rounds(p) => p.report(),
             Driver::Background(_) => Vec::new(),
@@ -201,7 +210,7 @@ impl Peer {
         retirement_bound_ms: u32,
     ) {
         let (control, fence) = super::coordinated::Control::new(
-            layout,
+            layout.clone(),
             self.member,
             name,
             incarnation,
@@ -210,7 +219,14 @@ impl Peer {
             retirement_bound_ms,
         );
         if control.reader() {
-            self.fence = fence;
+            let Driver::Rounds(protocol) = &mut self.driver else {
+                unreachable!("versioned reader must be coordinated");
+            };
+            protocol.storage_layout = Some(layout);
+            let (routes, joined) = super::composition::Fences::new();
+            self.routed_fences = Some(routes);
+            self.versioned_fence = Some(fence);
+            self.fence = joined;
         }
         self.versioned = Some(control);
     }
@@ -234,6 +250,7 @@ impl Peer {
             .as_mut()
             .unwrap()
             .advance(versioned, scheduler, reads, &mut round)?;
+        self.composed.advance(&mut round)?;
         Ok(round)
     }
     /// Consume results already completed by the protocol owner.
@@ -310,11 +327,34 @@ impl Peer {
         fetches: Vec<PeerFetchView>,
         lookups: Vec<PeerLookupView>,
         now_us: i64,
-    ) {
-        if let Some(reader) = self.versioned.as_mut().filter(|v| v.reader()) {
-            reader.dispatch(fetches, lookups, now_us);
-            return;
-        }
+    ) -> Result<(), PeerError> {
+        let (fetches, lookups) =
+            if let Some(reader) = self.versioned.as_mut().filter(|v| v.reader()) {
+                let partials = self.composed.register(&fetches, &reader.layout.contract)?;
+                let (storage_fetches, peer_fetches): (Vec<_>, Vec<_>) = fetches
+                    .into_iter()
+                    .partition(|f| f.holder.starts_with("l3@"));
+                let (storage_lookups, peer_lookups): (Vec<_>, Vec<_>) = lookups
+                    .into_iter()
+                    .partition(|q| q.holder.starts_with("l3@"));
+                if !storage_fetches.is_empty() || !peer_fetches.is_empty() {
+                    let mut routes = Vec::new();
+                    if !storage_fetches.is_empty() {
+                        let Driver::Rounds(protocol) = &self.driver else {
+                            unreachable!();
+                        };
+                        routes.push(protocol.fence());
+                    }
+                    if !peer_fetches.is_empty() {
+                        routes.push(self.versioned_fence.as_ref().unwrap().clone());
+                    }
+                    self.routed_fences.as_mut().unwrap().plan(routes);
+                }
+                reader.dispatch(peer_fetches, peer_lookups, now_us, &partials);
+                (storage_fetches, storage_lookups)
+            } else {
+                (fetches, lookups)
+            };
         match &mut self.driver {
             Driver::Rounds(p) => p.dispatch(fetches, lookups, now_us),
             Driver::Background(w) => {
@@ -333,6 +373,7 @@ impl Peer {
                 }
             }
         }
+        Ok(())
     }
     /// The port of this replica member.
     pub fn port(&self) -> Option<u16> {
@@ -348,7 +389,8 @@ impl Peer {
     }
     /// Attempts which still own progress or await consumption.
     pub fn num_landings(&self) -> usize {
-        self.versioned.as_ref().map_or(0, |v| v.len())
+        self.composed.len()
+            + self.versioned.as_ref().map_or(0, |v| v.len())
             + match &self.driver {
                 Driver::Rounds(p) => p.num_landings(),
                 Driver::Background(w) => w.pending,

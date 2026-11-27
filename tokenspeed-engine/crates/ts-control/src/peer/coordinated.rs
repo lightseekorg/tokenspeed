@@ -30,7 +30,7 @@ use super::{
 };
 use crate::codec::{Reader, Writer};
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::{mpsc, Arc},
     time::Instant,
 };
@@ -263,6 +263,7 @@ impl Control {
         fetches: Vec<PeerFetchView>,
         lookups: Vec<PeerLookupView>,
         now: i64,
+        partials: &HashSet<u64>,
     ) {
         if !fetches.is_empty() {
             self.fences
@@ -275,11 +276,15 @@ impl Control {
                 lease: f.lease.clone(),
                 ..empty_event()
             };
-            if let Some(v) = self
-                .attempts
-                .get_mut(&f.lease.id)
-                .and_then(|a| a.reserve(f, &self.layout, self.rank, now))
-            {
+            if let Some(v) = self.attempts.get_mut(&f.lease.id).and_then(|a| {
+                a.reserve(
+                    f,
+                    &self.layout,
+                    self.rank,
+                    now,
+                    partials.contains(&failed.lease.id),
+                )
+            }) {
                 self.votes.push(v);
             } else {
                 self.missing.push(failed);

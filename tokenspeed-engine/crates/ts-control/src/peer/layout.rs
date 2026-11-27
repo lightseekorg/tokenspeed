@@ -60,6 +60,30 @@ pub fn covers_interval(layout: &Contract, begin: i32, end: i32, pages: &[PeerPag
     expected == pages.len()
 }
 
+/// A source in a complete joined admission may supply only some dependencies.
+pub(super) fn covers_subset(
+    layout: &Contract,
+    begin: i32,
+    end: i32,
+    pages: &[PeerPageView],
+) -> bool {
+    if begin < 0 || begin >= end || pages.is_empty() {
+        return false;
+    }
+    let mut seen = BTreeSet::new();
+    pages.iter().all(|page| {
+        seen.insert((page.group_id, page.slot))
+            && layout
+                .group_specs
+                .get(page.group_id as usize)
+                .is_some_and(|spec| {
+                    logical_slot_ranges(spec, begin.into(), end.into(), false).is_ok_and(|ranges| {
+                        ranges.iter().any(|r| r.contains(&i64::from(page.slot)))
+                    })
+                })
+    })
+}
+
 /// Physical layout advertised by one member. Virtual bounds exclude the end.
 /// Addresses for Host and Device come from the respective tier's bindings.
 pub struct ReadEndpoint<'a> {
@@ -72,7 +96,7 @@ pub struct ReadEndpoint<'a> {
 }
 
 impl ReadEndpoint<'_> {
-    fn local_page(
+    pub(super) fn local_page(
         &self,
         layout: &Contract,
         page: PeerPageView,
@@ -605,5 +629,137 @@ mod tests {
         // Shorten a planned fragment, leaving the last byte of the owned KV page uncovered.
         plan.groups[0][0].1.bytes_per_row = 0;
         assert!(plan.reads(&[source], &alias, &pages[..1]).is_err());
+    }
+    #[test]
+    fn composed_admission_requires_complete_disjoint_final_checkpoint() {
+        use crate::peer::composition::Landings;
+        use ts_scheduler::{PeerFetchView, PeerLeaseView};
+        let fetch = |id, holder: &str, end, destinations| PeerFetchView {
+            request_id: "joined".into(),
+            lease: PeerLeaseView {
+                reader: "r".into(),
+                id,
+            },
+            holder: holder.into(),
+            begin_tokens: 0,
+            end_tokens: end,
+            destinations,
+            checkpoint: vec![],
+            prefix_hashes: vec![],
+            tokens: vec![],
+        };
+        let hot = fetch(1, "hot", 4, vec![page(0, 0, 1)]);
+        let storage = fetch(2, "l3@reader", 8, vec![page(0, 1, 2), page(1, 1, 1)]);
+        assert!(!covers_interval(&contract(8), 0, 4, &hot.destinations));
+        assert!(covers_subset(&contract(8), 0, 4, &hot.destinations));
+        let partials = Landings::default()
+            .register(&[hot.clone(), storage.clone()], &contract(8))
+            .unwrap();
+        assert_eq!(partials.into_iter().collect::<Vec<_>>(), vec![1]);
+        let mut missing = storage.clone();
+        missing.destinations.pop();
+        assert!(Landings::default()
+            .register(&[hot.clone(), missing], &contract(8))
+            .is_err());
+        let mut overlap = storage.clone();
+        overlap.destinations.push(page(0, 0, 1));
+        assert!(Landings::default()
+            .register(&[hot.clone(), overlap], &contract(8))
+            .is_err());
+        let mut stale_state = storage.clone();
+        stale_state.destinations[1].slot = 0;
+        assert!(Landings::default()
+            .register(&[hot, stale_state], &contract(8))
+            .is_err());
+    }
+
+    #[test]
+    fn storage_read_maps_owned_history_and_rank_local_state() {
+        use crate::peer::{
+            geometry::{HostGroup, HostPool},
+            prepared::{read_spans_registered, PreparedObject},
+            registered::{Member, Replica},
+        };
+        let members: Vec<_> = (0..8)
+            .map(|rank| {
+                let mut g = geometry(8);
+                g.session = format!("rank{rank}");
+                g.host = Some(HostPool {
+                    address: 1000,
+                    groups: vec![
+                        HostGroup {
+                            parent_bytes: 32,
+                            packing: 8,
+                            block_bytes: 4,
+                            field_offsets: vec![("layer.0.kv".into(), 0)],
+                        },
+                        HostGroup {
+                            parent_bytes: 1,
+                            packing: 1,
+                            block_bytes: 1,
+                            field_offsets: vec![("layer.1.recurrent_state".into(), 0)],
+                        },
+                    ],
+                });
+                Member {
+                    geometry: g,
+                    bounds: vec![129, 17],
+                    regions: vec![(100, 68), (200, 17)],
+                }
+                .encode(rank)
+            })
+            .collect();
+        let mut replica =
+            Replica::register([7; 32], contract_wire(8).to_string().as_bytes(), &members).unwrap();
+        let destinations = vec![page(0, 0, 9), page(0, 1, 10), page(1, 1, 2)];
+        for rank in 0..8 {
+            let objects = vec![
+                PreparedObject {
+                    group_id: 0,
+                    slot: 0,
+                    session: "ssd".into(),
+                    address: 1000,
+                    bytes: 4,
+                },
+                PreparedObject {
+                    group_id: 0,
+                    slot: 1,
+                    session: "ssd".into(),
+                    address: 1004,
+                    bytes: 4,
+                },
+                PreparedObject {
+                    group_id: 1,
+                    slot: 1,
+                    session: "ssd".into(),
+                    address: 2000 + rank as u64,
+                    bytes: 1,
+                },
+            ];
+            let reads = read_spans_registered(&objects, &replica, rank, &destinations).unwrap();
+            let spans = &reads["ssd"];
+            if rank < 2 {
+                assert_eq!(spans.destinations, vec![108, 202]);
+                assert_eq!(
+                    spans.sources,
+                    vec![1000 + rank as u64 * 4, 2000 + rank as u64]
+                );
+                assert_eq!(spans.lengths, vec![4, 1]);
+            } else {
+                assert_eq!(spans.destinations, vec![202]);
+                assert_eq!(spans.sources, vec![2000 + rank as u64]);
+            }
+            // The selected checkpoint must exist even when this rank owns no history page.
+            assert!(read_spans_registered(&objects[..2], &replica, rank, &destinations).is_err());
+        }
+        replica.members[0].regions = vec![(100, 4), (200, 17)];
+        let object = PreparedObject {
+            group_id: 0,
+            slot: 0,
+            session: "ssd".into(),
+            address: 1000,
+            bytes: 4,
+        };
+        assert!(read_spans_registered(&[object], &replica, 0, &destinations[..1]).is_err());
     }
 }

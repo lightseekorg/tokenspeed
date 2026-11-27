@@ -51,6 +51,7 @@ impl Settings {
         peer: &PeerSettings,
         members: usize,
         scheduler: Arc<Mutex<Scheduler>>,
+        registered: Option<&ts_control::peer::registered::Replica>,
     ) -> Result<storage_servicer::Service, String> {
         let number = |key: &str| {
             self.knobs[key]
@@ -74,10 +75,24 @@ impl Settings {
                 );
             }
         }
-        if self.grain <= 0 || self.l3.layout.groups.iter().any(|g| g.shard_count != 1) {
-            return Err(
-                "direct peer landing needs a positive grain and replicated cache groups".into(),
-            );
+        if self.grain <= 0 {
+            return Err("direct peer landing needs a positive grain".into());
+        }
+        if self.l3.layout.groups.iter().any(|g| g.shard_count != 1) && registered.is_none() {
+            return Err("sharded direct L3 requires the registered cache layout".into());
+        }
+        if let Some(layout) = registered {
+            if layout.members.len() != members
+                || layout.contract.group_specs.len() != self.l3.layout.groups.len()
+                || layout
+                    .contract
+                    .group_specs
+                    .iter()
+                    .zip(&self.l3.layout.groups)
+                    .any(|(spec, group)| spec.shard_count != group.shard_count as i64)
+            {
+                return Err("direct L3 and registered Peer cache layouts disagree".into());
+            }
         }
         let limits = source::Limits {
             max_query_keys: number("max_query_keys")? as usize,
@@ -92,7 +107,13 @@ impl Settings {
             .map(|rank| {
                 let mut layout = self.l3.layout.clone();
                 layout.tp_rank = rank;
-                layout.owner_rank = 0;
+                layout.owner_rank = rank
+                    % layout
+                        .groups
+                        .iter()
+                        .map(|g| g.shard_count)
+                        .max()
+                        .unwrap_or(1);
                 layout
             })
             .collect();

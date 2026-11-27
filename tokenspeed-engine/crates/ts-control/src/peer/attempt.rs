@@ -198,6 +198,7 @@ impl Attempt {
         local: &Replica,
         rank: usize,
         now: i64,
+        partial: bool,
     ) -> Option<Vote> {
         let k = self.key.as_ref()?;
         let o = self.offer.as_ref()?;
@@ -210,12 +211,21 @@ impl Attempt {
             && f.begin_tokens < o.end
             && f.holder == k.holder.name
             && f.lease == self.lookup.lease
-            && super::layout::covers_interval(
-                &local.contract,
-                f.begin_tokens,
-                f.end_tokens,
-                &f.destinations,
-            )
+            && if partial {
+                super::layout::covers_subset(
+                    &local.contract,
+                    f.begin_tokens,
+                    f.end_tokens,
+                    &f.destinations,
+                )
+            } else {
+                super::layout::covers_interval(
+                    &local.contract,
+                    f.begin_tokens,
+                    f.end_tokens,
+                    &f.destinations,
+                )
+            }
         {
             let by_slot: HashMap<_, _> = self
                 .pages

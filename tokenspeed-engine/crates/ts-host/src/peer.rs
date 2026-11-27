@@ -392,15 +392,6 @@ pub fn start(
                 .into(),
         );
     }
-    if settings.storage.is_some()
-        && registered
-            .as_ref()
-            .is_some_and(|layout| layout.members.len() == 8)
-    {
-        return Err(
-            "L3 direct restore is not yet supported with the TP8/KVP8 versioned peer reader".into(),
-        );
-    }
     if let Some((executor, disk_layout, ring, slot_bytes)) = push_source {
         push.serve(PushSource {
             executor,
@@ -455,7 +446,14 @@ pub fn start(
     let storage = if replica.index() == 0 {
         settings
             .storage
-            .map(|storage| storage.start(&settings.peer, geometries.len(), scheduler.clone()))
+            .map(|storage| {
+                storage.start(
+                    &settings.peer,
+                    geometries.len(),
+                    scheduler.clone(),
+                    registered.as_deref(),
+                )
+            })
             .transpose()?
     } else {
         None

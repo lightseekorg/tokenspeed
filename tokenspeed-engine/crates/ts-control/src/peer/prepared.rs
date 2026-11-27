@@ -65,6 +65,47 @@ pub enum PreparedError {
     Geometry(#[from] GeometryError),
 }
 
+/// Convert virtual scheduler pages to this rank's owned physical pages before
+/// scattering same-namespace SSD objects. State keys already name the TP shard.
+pub fn read_spans_registered(
+    objects: &[PreparedObject],
+    layout: &super::registered::Replica,
+    rank: usize,
+    destinations: &[PeerPageView],
+) -> Result<BTreeMap<String, Spans>, PreparedError> {
+    let member = layout.members.get(rank).ok_or(PreparedError::Destination)?;
+    let endpoint = member.endpoint();
+    let mut local = Vec::new();
+    for destination in destinations {
+        if destination.tier != ts_scheduler::PeerTier::Device {
+            return Err(PreparedError::Destination);
+        }
+        if let Some(block) = endpoint
+            .local_page(&layout.contract, *destination, rank)
+            .map_err(|_| PreparedError::Destination)?
+        {
+            local.push(PeerPageView {
+                block_id: i32::try_from(block).map_err(|_| PreparedError::Destination)?,
+                ..*destination
+            });
+        }
+    }
+    let reads = read_spans(objects, &member.geometry, &local)?;
+    for spans in reads.values() {
+        for (&address, &bytes) in spans.destinations.iter().zip(&spans.lengths) {
+            let end = address
+                .checked_add(bytes)
+                .ok_or(PreparedError::Destination)?;
+            if !member.regions.iter().any(|&(base, size)| {
+                address >= base && base.checked_add(size).is_some_and(|limit| end <= limit)
+            }) {
+                return Err(PreparedError::Destination);
+            }
+        }
+    }
+    Ok(reads)
+}
+
 /// Every admitted destination's fields, grouped by actual source session.
 ///
 /// A prepared prefix may include objects the reader already has; only the

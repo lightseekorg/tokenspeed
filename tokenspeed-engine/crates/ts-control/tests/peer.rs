@@ -407,7 +407,9 @@ impl Replica {
         let fetches = plan.peer_fetches();
         let lookups = scheduler.take_peer_lookups();
         drop(scheduler);
-        self.peer.dispatch(fetches.clone(), lookups, round.now_us);
+        self.peer
+            .dispatch(fetches.clone(), lookups, round.now_us)
+            .unwrap();
         // The data plane reports the fence of every plan it runs, as the
         // control loop hands it the plans that need the device.
         let needs_device = plan.needs_device();
@@ -766,7 +768,7 @@ fn independent_device_choice(adaptive: bool) {
     let page = &fetches[0].destinations[0];
     let addr = READER_BASE + page.block_id as u64 * PAGE_BYTES;
     drop(sched);
-    reader.peer.dispatch(fetches, vec![], round.now_us);
+    reader.peer.dispatch(fetches, vec![], round.now_us).unwrap();
     // Give a premature write time to surface while the device fence stays closed.
     std::thread::sleep(Duration::from_millis(120));
     assert_eq!(arena.read_bytes(addr, 1), vec![0]);
@@ -1260,6 +1262,9 @@ fn a_holder_that_moved_to_new_weights_is_no_longer_read() {
 // sockets, scheduler admission, fences, scatter reads and completion agreement
 // below are the runtime implementations.
 mod storage_restore {
+    mod versioned {
+        include!("peer/versioned_storage.rs");
+    }
     use super::*;
     use std::collections::HashMap;
     use ts_control::peer::{storage::*, storage_servicer, wire::Stamp};
@@ -2423,7 +2428,7 @@ fn held_host_read(shutdown: bool) {
         let _plan = cache.next_execution_plan(true, false);
         let lookups = cache.take_peer_lookups();
         assert_eq!(lookups.len(), 1);
-        reader.peer.dispatch(vec![], lookups, 0);
+        reader.peer.dispatch(vec![], lookups, 0).unwrap();
         let until = Instant::now() + Duration::from_secs(3);
         loop {
             if reader
