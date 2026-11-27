@@ -812,3 +812,42 @@ def test_explicit_blockwise_order_is_preserved(numerics, order, entrypoint):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+class TestDraftForwardBatchInvariantFlag:
+    """``--enable-draft-forward-batch-invariant`` is an opt-in for DFLASH."""
+
+    def test_off_by_default_also_under_the_bitwise_envelope(self):
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        off = parser.parse_args(["--model", "x"])
+        on = parser.parse_args(
+            ["--model", "x", "--enable-draft-forward-batch-invariant"]
+        )
+        assert not off.enable_draft_forward_batch_invariant
+        assert on.enable_draft_forward_batch_invariant
+        # The envelope does not turn it on: the flag is the opt-in.
+        envelope = ServerArgs(model="x", numerics="rl-bitwise")
+        assert not envelope.enable_draft_forward_batch_invariant
+
+    def test_a_speculative_algorithm_other_than_dflash_is_refused(self):
+        with pytest.raises(
+            ValueError, match="applies to --speculative-algorithm DFLASH"
+        ):
+            ServerArgs(model="x", enable_draft_forward_batch_invariant=True)
+
+    def test_the_flag_reaches_the_runtime_dict(self):
+        from tokenspeed.runtime.utils.env import (
+            global_server_args_dict,
+            global_server_args_dict_update,
+        )
+
+        key = "enable_draft_forward_batch_invariant"
+        previous = global_server_args_dict[key]
+        try:
+            global_server_args_dict_update(ServerArgs(model="x"))
+            assert global_server_args_dict[key] is False
+        finally:
+            global_server_args_dict[key] = previous

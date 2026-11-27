@@ -88,6 +88,7 @@ def test_window_sink_keeps_exactly_the_leading_tokens(sink, window_left):
         softmax_scale=scale,
         solution="triton",
         block_draft=False,
+        batch_invariant=False,
     )
     actual = getattr(result, "result", result).reshape(HEADS, HEAD_DIM).float()
 
@@ -135,6 +136,7 @@ def test_a_sink_request_selects_a_leaf_that_takes_it():
         window_sink=16,
         softmax_scale=HEAD_DIM**-0.5,
         block_draft=False,
+        batch_invariant=False,
     )
     actual = getattr(result, "result", result).reshape(HEADS, HEAD_DIM).float()
     expected = _reference(

@@ -60,6 +60,7 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     GLUON_MHA_DECODE_PAGE_SIZE,
 )
 from tokenspeed.runtime.layers.attention.registry import register_backend
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -169,6 +170,13 @@ class MHAAttnBackend(PagedAttentionBackend):
 
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
+        # --enable-draft-forward-batch-invariant: the draft's decode takes a leaf whose rows
+        # do not move with the batch, and selection fails at startup when none
+        # serves the call. The target's backend keeps the adaptive leaf.
+        self.batch_invariant = (
+            bool(config.is_draft)
+            and global_server_args_dict["enable_draft_forward_batch_invariant"]
+        )
         # Map the selected backend to the corresponding kernel solution string.
         backend_name = spec.backend_name or "mha"
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
@@ -605,6 +613,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             # and length (refresh_decode_metadata): one key read per block.
             uniform_row_groups=self.block_decode_expansion,
             solution=self.kernel_solution,
+            batch_invariant=self.batch_invariant,
             **scale_kwargs,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
@@ -669,6 +678,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                 softmax_scale=layer.scaling,
                 solution="triton",
                 block_draft=False,
+                batch_invariant=self.batch_invariant,
             )
         else:
             prefix_out, prefix_lse = self._lane_prefix_decode(
@@ -727,6 +737,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             softmax_scale=layer.scaling,
             solution="triton",
             block_draft=False,
+            batch_invariant=self.batch_invariant,
         )
         out = out.view(num_reqs, heads, rows, -1).transpose(1, 2)
         lse = lse.view(num_reqs, heads, rows).transpose(1, 2)

@@ -460,6 +460,9 @@ _RMSNORM_OUTPUT_GATE = frozenset({"rmsnorm_output_gate"})
 # uniform_row_groups and run each group of one-row requests as one request.
 _UNIFORM_ROW_GROUPS = frozenset({"uniform_row_groups"})
 
+# Decode kernels whose rows do not depend on the batch they ride in.
+_BATCH_INVARIANT = frozenset({"batch_invariant"})
+
 # Schedule-reading decode kernel -> whether calls of a shape (num_q_heads,
 # num_kv_heads, max_seqlen_q) should take it; the others keep the default.
 _SCHEDULE_PREFERS: dict[str, Callable[..., bool]] = {}
@@ -539,6 +542,7 @@ def mha_decode_with_kvcache(
     solution: str | None = None,
     *,
     block_draft: bool,
+    batch_invariant: bool,
     output_gate: torch.Tensor | None = None,
     output_gate_eps: float | None = None,
     uniform_row_groups: int = 1,
@@ -593,6 +597,9 @@ def mha_decode_with_kvcache(
         solution: Optional kernel solution to force through normal selection.
         block_draft: Select noncausal draft-block attention via its trait.
             Pass False for ordinary decode and True for a noncausal draft block.
+        batch_invariant: Require a leaf declaring ``batch_invariant``. Bitwise
+            envelopes pass True; selection then fails rather than falling back
+            to the adaptive leaf. Such a leaf takes no split ``schedule``.
     """
     signature, scale_kwargs, traits = _decode_selection(
         q,
@@ -624,6 +631,8 @@ def mha_decode_with_kvcache(
             f"uniform_row_groups {uniform_row_groups} needs one row per request"
         )
     features = _SPLIT_SCHEDULE if schedule is not None else frozenset()
+    if batch_invariant:
+        features = features | _BATCH_INVARIANT
     gate_kwargs = {}
     group_kwargs = {}
     kernel = None

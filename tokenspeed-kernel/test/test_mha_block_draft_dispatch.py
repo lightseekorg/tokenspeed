@@ -93,7 +93,9 @@ def test_legacy_gpu_leaf_keeps_expanded_metadata(
     monkeypatch.setattr(
         triton_mha, "_triton_mha_decode_with_kvcache_impl", lambda **kwargs: kwargs["q"]
     )
-    output = mha.mha_decode_with_kvcache(**inputs, block_draft=True, solution="triton")
+    output = mha.mha_decode_with_kvcache(
+        **inputs, block_draft=True, batch_invariant=False, solution="triton"
+    )
     assert output is inputs["q"]
 
 
@@ -136,12 +138,16 @@ def test_plugin_draft_trait_isolation(dispatch_platform, inputs):
     output = mha.mha_decode_with_kvcache(
         **inputs,
         block_draft=True,
+        batch_invariant=False,
         solution="dispatch_test_plugin",
     )
     torch.testing.assert_close(output, inputs["q"] * 2)
     # The higher-priority ordinary leaf must remain isolated by the trait.
     ordinary = mha.mha_decode_with_kvcache(
-        **inputs, block_draft=False, solution="dispatch_test_plugin"
+        **inputs,
+        block_draft=False,
+        batch_invariant=False,
+        solution="dispatch_test_plugin",
     )
     torch.testing.assert_close(ordinary, -inputs["q"])
 
@@ -179,6 +185,7 @@ def test_legacy_positional_arguments_keep_their_meaning(
         None,
         "triton",  # override and solution retain their positional slots
         block_draft=False,
+        batch_invariant=False,
     )
     torch.testing.assert_close(output, inputs["q"] * 0.25 + 2.0)
     assert lse is sinks
@@ -241,6 +248,7 @@ def test_schedule_and_decode_share_draft_selection(
         output = mha.mha_decode_with_kvcache(
             **inputs,
             block_draft=block_draft,
+            batch_invariant=False,
             solution="dispatch_test_schedule",
             schedule=schedule,
         )

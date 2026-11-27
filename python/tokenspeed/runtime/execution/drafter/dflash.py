@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.gemm import plan_dense_gemm
 from tokenspeed_kernel.ops.kvcache.triton import (
     LatentPlanes,
     check_mla_latent_geometry,
@@ -33,6 +34,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import distributed_argmax as _dist_
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
     supports_dist_argmax_shape as _supports_dist_argmax_shape,
 )
+from tokenspeed_kernel.selection import KernelPlan
 from typing_extensions import override
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather, all_gather_single
@@ -74,6 +76,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.spec_block_geometry import (
     read_checkpoint_block_size,
@@ -1063,6 +1066,8 @@ class DFlash(BaseDrafter):
         self._fused_kv_workspace_capacity = 0
         self._fused_kv_workspace_dtype = None
         self._fused_kv_proj_workspace = None
+        # The stacked K|V GEMM's plan under --enable-draft-forward-batch-invariant.
+        self._fused_kv_plan: KernelPlan | None = None
         self._fused_kv_latent_planes: LatentPlanes | None = None
         # The projection writes into a workspace pre-allocated at warmup.
         self._fused_kv_k_buffers = []
@@ -1184,6 +1189,28 @@ class DFlash(BaseDrafter):
             )
             self._fused_kv_enabled = False
             self._fused_kv_is_mla = False
+            return
+        if self._fused_kv_enabled and not self._fused_kv_is_mla:
+            self._fused_kv_plan = self._plan_fused_kv_gemm()
+
+    def _plan_fused_kv_gemm(self) -> KernelPlan | None:
+        """Plan the stacked K|V GEMM under ``--enable-draft-forward-batch-invariant``.
+
+        Runs outside the ``try`` of ``_init_fused_kv_helper``, which falls back to
+        the per-layer write on any error: a flag that cannot be honored must stop
+        the launch.
+        """
+        if not global_server_args_dict["enable_draft_forward_batch_invariant"]:
+            return None
+        weight = self._fused_kv_flat_weight
+        return plan_dense_gemm(
+            mode="mm",
+            input_size=int(weight.shape[1]),
+            output_size=int(weight.shape[0]),
+            dtype=weight.dtype,
+            batch_size=None,
+            batch_invariant=True,
+        )
 
     def _init_fused_kv_helper_mla(self, layers) -> None:
         """Stack the MLA draft's latent KV projection and cache planes.
@@ -1460,7 +1487,12 @@ class DFlash(BaseDrafter):
         self._ensure_fused_workspace(total_ctx, ctx_hidden.dtype)
 
         proj_out_2d = self._fused_kv_proj_workspace[:total_ctx]
-        kernel_mm(ctx_hidden, self._fused_kv_flat_weight, out=proj_out_2d)
+        kernel_mm(
+            ctx_hidden,
+            self._fused_kv_flat_weight,
+            out=proj_out_2d,
+            plan=self._fused_kv_plan,
+        )
 
         proj_out = proj_out_2d.view(
             total_ctx, self._fused_kv_n_layers, self._fused_kv_layer_out_dim

@@ -1671,6 +1671,7 @@ def _attention_decode(
         max_seqlen_q=1,
         solution=solution,
         block_draft=False,
+        batch_invariant=False,
     )
 
 

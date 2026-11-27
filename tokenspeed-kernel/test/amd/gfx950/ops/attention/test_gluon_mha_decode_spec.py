@@ -170,7 +170,9 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
     expected = reference(inputs)
     for solution in ("triton", "gluon"):
         check_output(
-            mha_decode_with_kvcache(**inputs, solution=solution, block_draft=False),
+            mha_decode_with_kvcache(
+                **inputs, solution=solution, block_draft=False, batch_invariant=False
+            ),
             expected,
         )
     # A draft's block positions share their request's table row and length:
@@ -182,7 +184,11 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = mha_decode_with_kvcache(
-            **inputs, solution="gluon", block_draft=False, uniform_row_groups=groups
+            **inputs,
+            solution="gluon",
+            block_draft=False,
+            batch_invariant=False,
+            uniform_row_groups=groups,
         )
     graph.replay()
     check_output(actual, expected)
@@ -197,7 +203,9 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
         # Eager dispatch under the guard verifies dynamic values do not become
         # specialization keys; graph replay alone could not establish that.
         check_output(
-            mha_decode_with_kvcache(**inputs, solution="gluon", block_draft=False),
+            mha_decode_with_kvcache(
+                **inputs, solution="gluon", block_draft=False, batch_invariant=False
+            ),
             expected,
         )
         if groups > 1:
@@ -211,9 +219,15 @@ def assert_uniform_groups_bitwise(inputs, groups):
     """Uniform row groups give the one-row requests' bits: on the kernel that
     reads them (gluon) and on one that serves the rows as they are (triton)."""
     for solution in ("gluon", "triton"):
-        rows = mha_decode_with_kvcache(**inputs, solution=solution, block_draft=False)
+        rows = mha_decode_with_kvcache(
+            **inputs, solution=solution, block_draft=False, batch_invariant=False
+        )
         grouped = mha_decode_with_kvcache(
-            **inputs, solution=solution, block_draft=False, uniform_row_groups=groups
+            **inputs,
+            solution=solution,
+            block_draft=False,
+            batch_invariant=False,
+            uniform_row_groups=groups,
         )
         assert torch.equal(grouped.view(torch.int16), rows.view(torch.int16)), solution
 
@@ -252,9 +266,15 @@ def test_uniform_row_groups_keep_every_bit_at_draft_shapes(running, kv_dtype, wi
         "max_seqlen_q": 1,
         "window_left": window,
     }
-    rows = mha_decode_with_kvcache(**inputs, solution="gluon", block_draft=False)
+    rows = mha_decode_with_kvcache(
+        **inputs, solution="gluon", block_draft=False, batch_invariant=False
+    )
     grouped = mha_decode_with_kvcache(
-        **inputs, solution="gluon", block_draft=False, uniform_row_groups=positions
+        **inputs,
+        solution="gluon",
+        block_draft=False,
+        batch_invariant=False,
+        uniform_row_groups=positions,
     )
     assert torch.equal(grouped.view(torch.int16), rows.view(torch.int16))
 
@@ -292,7 +312,9 @@ def test_uniform_row_groups_with_an_output_gate_keep_every_bit(kv_dtype, window)
         "window_left": window,
     }
     gate = torch.randn(rows, heads * dim, device="cuda").bfloat16()
-    plain = mha_decode_with_kvcache(**inputs, solution="gluon", block_draft=False)
+    plain = mha_decode_with_kvcache(
+        **inputs, solution="gluon", block_draft=False, batch_invariant=False
+    )
     expected = weightless_rmsnorm_gated_sigmoid(
         plain.view(rows, heads * dim), gate, heads, dim, 1e-6, False
     )
@@ -303,6 +325,7 @@ def test_uniform_row_groups_with_an_output_gate_keep_every_bit(kv_dtype, window)
             **inputs,
             solution="gluon",
             block_draft=False,
+            batch_invariant=False,
             uniform_row_groups=positions,
             output_gate=gate,
             output_gate_eps=1e-6,

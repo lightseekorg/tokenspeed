@@ -104,7 +104,7 @@ def test_repeated_and_replayed_decodes_agree(seq_lens: list[int], q_len: int):
 
     def decode() -> torch.Tensor:
         return mha_decode_with_kvcache(
-            solution="flashinfer", **inputs, block_draft=False
+            solution="flashinfer", **inputs, block_draft=False, batch_invariant=False
         )
 
     first = decode()

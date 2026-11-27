@@ -338,6 +338,7 @@ def test_mha_ops_interface_has_no_rel_args(device: str, require) -> None:
         max_seqlen_k=max(kv_lens),
         max_seqlen_q=1,
         block_draft=False,
+        batch_invariant=False,
     )
     assert out.shape == q_decode.shape
     assert not torch.isnan(out).any()

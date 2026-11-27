@@ -26,7 +26,10 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.gemm import plan_dense_gemm
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import KernelPlan
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import (
@@ -140,6 +143,19 @@ class DFlashAttention(nn.Module):
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
         )
+        # The context K|V write slices qkv_proj, which the layer's own plan does
+        # not cover: plan it at construction when the draft is batch-invariant
+        # (no post-load hook, which would make the draft refuse an in-place reload).
+        self.kv_proj_plan: KernelPlan | None = None
+        if global_server_args_dict["enable_draft_forward_batch_invariant"]:
+            self.kv_proj_plan = plan_dense_gemm(
+                mode="mm",
+                input_size=self.hidden_size,
+                output_size=2 * self.kv_size,
+                dtype=self.qkv_proj.weight.dtype,
+                batch_size=None,
+                batch_invariant=True,
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
@@ -208,7 +224,10 @@ class DFlashAttention(nn.Module):
             kv_slice = slice(self.q_size, self.q_size + 2 * self.kv_size)
             weight = qkv_proj.weight[kv_slice]
             bias = qkv_proj.bias[kv_slice] if qkv_proj.bias is not None else None
-            kv = F.linear(hidden_states, weight, bias)
+            if self.kv_proj_plan is not None:
+                kv = kernel_mm(hidden_states, weight, bias=bias, plan=self.kv_proj_plan)
+            else:
+                kv = F.linear(hidden_states, weight, bias)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
             return k, v
         qkv, _ = qkv_proj(hidden_states)
@@ -393,6 +412,30 @@ class DFlashDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _require_batch_invariant_draft(layer_cls, config, quant_config) -> None:
+    """Stop the launch when ``--enable-draft-forward-batch-invariant`` names a
+    draft it was not built and checked for: layers of the plain GQA draft layer
+    class (not DFlash2's or another family's), all with a sliding window, and
+    unquantized weights."""
+    layer_types = get_dflash_layer_types(config)
+    mla = _is_dflash_mla_config(config)
+    windowed = layer_types is not None and all(
+        layer_type == "sliding_attention" for layer_type in layer_types
+    )
+    if (
+        layer_cls is not DFlashDecoderLayer
+        or mla
+        or not windowed
+        or quant_config is not None
+    ):
+        raise ValueError(
+            "--enable-draft-forward-batch-invariant supports only a DFLASH GQA "
+            "draft with sliding-window layers and unquantized weights; got "
+            f"layer class {layer_cls.__name__}, mla={mla}, "
+            f"layer_types={layer_types}, quantized={quant_config is not None}"
+        )
+
+
 def _is_dflash_mla_config(hf_config) -> bool:
     """Whether the checkpoint asks for the MLA parameterization.
 
@@ -513,6 +556,8 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     ) -> None:
         super().__init__()
         self.config = config
+        if global_server_args_dict["enable_draft_forward_batch_invariant"]:
+            _require_batch_invariant_draft(self.decoder_layer_cls, config, quant_config)
         # Under attention DP, a rank whose DP group holds no request skips the
         # draft, so the MLP is replicated (Mapping.replicated_for_draft) to
         # leave its peers no dense collective to wait on. At attention DP 1

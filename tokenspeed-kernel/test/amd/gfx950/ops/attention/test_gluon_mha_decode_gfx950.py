@@ -924,6 +924,7 @@ def test_public_ops_select_the_balanced_path_only_with_a_schedule(tmp_path) -> N
                     schedule=passed,
                     **call,
                     block_draft=False,
+                    batch_invariant=False,
                 ),
                 expected,
             )
@@ -1015,6 +1016,7 @@ def test_output_gate_is_bitwise_to_the_separate_gated_norm(
         max_seqlen_q=max_seqlen_q,
         window_left=window_left,
         block_draft=False,
+        batch_invariant=False,
     )
     if schedule:
         common["schedule"] = mha_decode_schedule(
@@ -1091,6 +1093,7 @@ def test_output_gate_matches_the_separate_gated_norm_at_every_head_count(
         max_seqlen_q=max_seqlen_q,
         window_left=-1,
         block_draft=False,
+        batch_invariant=False,
     )
     if schedule:
         common["schedule"] = mha_decode_schedule(

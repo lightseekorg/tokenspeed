@@ -24,6 +24,9 @@ from tokenspeed_kernel.ops.attention.mha._triton.context import *  # noqa: F403
 from tokenspeed_kernel.ops.attention.mha._triton.decode import (
     _triton_mha_decode_with_kvcache_impl,
 )
+from tokenspeed_kernel.ops.attention.mha._triton.invariant_decode import (
+    triton_invariant_mha_decode_with_kvcache_impl,
+)
 from tokenspeed_kernel.ops.attention.mha._triton.prefill import (
     _triton_mha_extend_with_kvcache_impl,
     _triton_mha_prefill_impl,
@@ -204,6 +207,67 @@ def triton_mha_decode_with_kvcache(
         k_scale=k_scale,
         v_scale=v_scale,
         enable_pdl=enable_pdl,
+    )
+
+
+@register_kernel(
+    "attention",
+    "mha_decode_with_kvcache",
+    name="triton_invariant_mha_decode_with_kvcache",
+    solution="triton",
+    capability=_PORTABLE_CAPABILITY,
+    signatures=format_signatures(
+        ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
+    ),
+    # Selected only by a caller that requires batch_invariant.
+    priority=Priority.REFERENCE,
+    features={"batch_invariant"},
+    traits={
+        "logit_cap": frozenset({False}),
+        "return_lse": frozenset({False, True}),
+        "sinks": frozenset({False, True}),
+        "sliding_window": frozenset({False, True}),
+        "window_sink": frozenset({False, True}),
+    },
+)
+def triton_invariant_mha_decode_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    max_seqlen_k: int,
+    max_seqlen_q: int = 1,
+    window_left: int = -1,
+    window_sink: int = 0,
+    logit_cap: float = 0.0,
+    sinks: torch.Tensor | None = None,
+    return_lse: bool = False,
+    softmax_scale: float | None = None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
+    enable_pdl: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """MHA decode whose rows do not depend on the batch (``_triton/invariant_decode.py``)."""
+    del enable_pdl
+    if logit_cap != 0.0 or any(x is not None for x in (q_scale, k_scale, v_scale)):
+        raise ValueError(
+            "the batch-invariant MHA decode takes no logit cap or q/k/v scales"
+        )
+    return triton_invariant_mha_decode_with_kvcache_impl(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=max_seqlen_k,
+        max_seqlen_q=max_seqlen_q,
+        window_left=window_left,
+        window_sink=window_sink,
+        sinks=sinks,
+        return_lse=return_lse,
+        softmax_scale=softmax_scale,
     )
 
 

@@ -458,6 +458,43 @@ the current callers.
 Plans for different operators or phases still require cross-phase numerical
 acceptance; an individual capability declaration does not establish that.
 
+### Draft forward batch invariance (`--enable-draft-forward-batch-invariant`)
+
+Under `--enable-speculative-sampling` a DFLASH draft's tokens enter the served
+trajectory, so the draft's rows must not move with the batch. Two of its
+operators do, and the flag replaces them. It is off by default, also under
+`rl-bitwise`; with it off the draft keeps the adaptive attention leaf and the
+library GEMM.
+
+**Supported and verified: a DFLASH GQA draft whose layers all use a sliding
+window, with unquantized weights** (32 query and 8 KV heads, head dim 128,
+window 1024 with a 16-token sink, verify width 8, on H200). Anything else stops
+the launch when the draft model is built: another speculative algorithm, a
+DFlash2 or DSpark draft, an MLA draft, a draft with a full-attention layer, a
+quantized draft. None of these is verified, and the MLA draft's stacked K|V
+write still multiplies with an unplanned `torch.mm`.
+
+* **Attention.** `mha_decode_with_kvcache` takes a required `batch_invariant`
+  argument, which the draft's `MHAAttnBackend` sets from the flag (the target's
+  backend does not). It selects the `triton_invariant_mha_decode_with_kvcache`
+  leaf, which folds each row's keys in index order in one program, in place of
+  the adaptive leaf whose key-split count follows the batch and SM count;
+  selection fails rather than falling back, and no split schedule is passed.
+  The leaf has no split dimension, so it costs time where the batch leaves the
+  device underfilled: a windowed block draft takes 1.75x the adaptive leaf's
+  time at batch 1 and matches it from batch 8, and an unwindowed row over 4K to
+  128K keys takes 5x to 12x at batch 1 (`_triton/invariant_decode.py` lists the
+  measurements). It takes no logit cap and no q/k/v scales.
+* **Context K|V write.** The write multiplies the round's context rows, a count
+  the accepted lengths and the co-batch decide, by the draft's `qkv_proj`.
+  `DFlashAttention` plans the per-layer slice and `DFlash` plans the stacked
+  write through `plan_dense_gemm(batch_invariant=True)` at construction. The
+  stacked plan is made outside the fused-write `try`, which degrades to the
+  per-layer write on any error: an unmet flag stops the launch.
+
+The flag changes these two operators only. The draft's other operators get
+their batch invariance from the numerics envelope.
+
 A planned attention leaf that can be recorded into a CUDA graph also declares
 the `cuda_graph` feature. `MLAAttnBackend` and `DSABackend` derive their graph
 support from the leaves they planned (`CudaGraphSupport.from_plans`), so a
