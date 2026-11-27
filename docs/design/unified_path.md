@@ -726,7 +726,11 @@ must fit the selected function's measured resident capacity. Local pipelines
 share a physical CTA; their logical tiles are counted separately from that
 capacity. A rank-ordered FP32 merge completes Down before SiLU and publishes
 activation tiles through per-invocation epochs. Persistent scratch is allocated
-independently of the inference-mode context that first warms a layout.
+independently of the inference-mode context that first warms a layout. With the
+memory saver enabled, the executor registers the CPU-backed workspace region
+before warmup. Activation, partials, and epoch buffers for every layout,
+including layouts first reached in eager execution, survive `weights` release
+and resume.
 
 Down and Up reuse one shared-memory operand arena after Down's MMA completion.
 Up uses separate weight and activation rings when their stage counts differ;
@@ -735,13 +739,12 @@ tiles can retain two Up accumulators, publishing the first only after its final
 K tiles complete while the second continues. Readers acknowledge TMEM before
 reuse or deallocation. PDL, mutable weights and eager/graph calls use these same
 ownership and publication edges. Startup warms the bounded tactic variants
-through the ordinary operator. The validated model dimensions `(4, 2560, 320)`
-and `(4, 8192, 1024)` use the same parameterized implementation, with
-model-specific tile geometry, Up K width and cache policy. Token tiles for the
-existing model preserve resident parallelism and bound per-thread gate state
-for larger batches. Row-derived reduction groups and token pairing belong
-only to the wider model. Other dimensions keep ordinary kernel selection;
-the fused work budget still bounds automatic selection.
+selected by the ordinary operator for each token row count. The parameterized
+kernel accepts hidden sizes divisible by 64 and bottleneck ranks divisible
+by 8 within signed 32-bit layout byte extents. The cooperative grid and the
+per-worker work budget bound automatic selection for each geometry. The
+dimensions `(4, 2560, 320)` and `(4, 8192, 1024)` have tuned tile geometry,
+Up K widths and cache policies within this implementation.
 
 Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
@@ -1634,8 +1637,10 @@ differs from the model's single-page geometry before cache allocation.
 The indexer owns its query/sequence metadata and borrows the full-KV table
 and kernel page size from
 `router.group_view`. Layer-shared layout and top-k still use `SparseTopKShare`
-with the existing forward and MTP reuse boundaries. The router clears this
-share before the root prepares its indexer child; the indexer does not clear it again.
+with the existing forward and MTP reuse boundaries. The layout kernel writes
+batch-local request IDs as `int32` once per forward so every PrimTS layer can
+consume them directly. The router clears the share before the root prepares
+its indexer child; the indexer does not clear it again.
 
 QSA block selection carries an explicit uniform query width into its kernel
 API. Decode derives it from its uniform row contract; extend metadata checks
@@ -1715,7 +1720,12 @@ dense attention. The prologue has written the full KV cache before either
 path runs.
 Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
-the selected top-k rows with the queries.
+the selected physical slots and logical metadata with the same `gather_ids`
+as the queries. The sparse reader sees one row per request and the published
+accepted KV lengths, so kernels using logical blocks can serve step zero.
+The backend memoizes the gathered row layout per forward and the gathered
+blocks per indexer selection. The draft drops these temporary tensors after
+the model forward. Captured gathers are rebuilt on replay in the graph pool.
 
 QSA uses positive `decode_query_lengths` for uniform decode/verification and
 `None` for prefill or mixed/ragged queries, including one-token prefill.
@@ -1737,6 +1747,11 @@ The QSA leaf owns PrimTS plans and per-device scratch for its current KV pool.
 Calls, including graph replays, are ordered across streams. Rebinding drops
 eager plans; capture sessions retain graph plans and allocations until release.
 Scratch may grow without moving graph inputs. Each run regenerates its data.
+Plan offsets and shared scratch use the CPU-backed named workspace region on
+a plan miss. Their addresses survive memory release and resume. The adapter
+clears the initial metadata tensor defaults in FlashInfer's single-query plan
+in place. Each launch passes the current logical candidates and row layout to
+the initialized plan.
 
 QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and the direct-slot
 CuTe kernel read invalid candidates from the zero-initialized slot 1 of the

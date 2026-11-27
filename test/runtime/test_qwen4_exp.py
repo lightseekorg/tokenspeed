@@ -610,6 +610,7 @@ def _qsa_root(
         num_layers=4,
         num_lcm_blocks=7,
         kv_head_dim=8,
+        enable_memory_saver=False,
     )
     backend = Qwen4ExpBackend(config, router, None, QSAIndexerBackend(config, router))
     backend.set_cache_pool(pool)
@@ -1067,7 +1068,7 @@ def test_qwen4_exp_qsa_reuses_per_forward_metadata_across_layers(monkeypatch) ->
     )
     outputs = (
         torch.tensor([4, 5, 6, 7, 8, 9, 10, 11]),
-        torch.tensor([0, 0, 0, 0, 1, 1, 1, 1]),
+        torch.tensor([0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.int32),
         torch.arange(8, dtype=torch.int32),
         torch.arange(8, dtype=torch.int32),
         torch.tensor([1, 1, 1, 2, 2, 2, 2, 3], dtype=torch.int32),

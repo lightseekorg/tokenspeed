@@ -485,3 +485,54 @@ trace_provider = resolve
         modules.del_item("ts_context_test").unwrap();
     });
 }
+
+#[test]
+fn bootstrap_selects_the_memory_protocol_for_the_rank() {
+    use pyo3::{
+        prelude::*,
+        types::{PyModule, PyString},
+    };
+
+    run_in_child(
+        "tests::bootstrap_selects_the_memory_protocol_for_the_rank",
+        || {
+            Python::initialize();
+            Python::attach(|py| {
+                let outbox = PyString::new(py, "outbox");
+                let spans = PyString::new(py, "host spans");
+                let peer = PyString::new(py, "peer");
+                let shared = PyString::new(py, "shared L2");
+                let source = c"def prepare_bootstrap(fd):\n    return capability, lambda outbox, protocol, spans, peer, shared: (fd, outbox, protocol, spans, peer, shared)";
+                let module =
+                    PyModule::from_code(py, source, c"bootstrap_test.py", c"bootstrap_test")
+                        .unwrap();
+                for capability in [false, true] {
+                    module.setattr("capability", capability).unwrap();
+                    let (worker, enabled) = super::bootstrap_worker(
+                        &module,
+                        7,
+                        outbox.as_any(),
+                        spans.as_any(),
+                        peer.as_any(),
+                        shared.as_any(),
+                    )
+                    .unwrap();
+                    assert_eq!(enabled, capability);
+                    assert_eq!(
+                        worker
+                            .extract::<(i32, String, u32, String, String, String)>()
+                            .unwrap(),
+                        (
+                            7,
+                            "outbox".to_owned(),
+                            if capability { 3 } else { 2 },
+                            "host spans".to_owned(),
+                            "peer".to_owned(),
+                            "shared L2".to_owned()
+                        )
+                    );
+                }
+            });
+        },
+    );
+}

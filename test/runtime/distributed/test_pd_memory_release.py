@@ -122,7 +122,7 @@ def _projection_sleep_worker(rank, rendezvous):
     cpu_group = process_group_manager.get_process_group("gloo", ranks)
     initialize_comm_backend(use_pynccl=False)
     global_server_args_dict["enable_memory_saver"] = True
-    saver = TorchMemorySaverAdapter.create(enable=True)
+    saver = TorchMemorySaverAdapter.create(enable=True, device="cuda")
 
     @dataclass(frozen=True)
     class ModelConfig:
@@ -224,6 +224,7 @@ def _projection_sleep_worker(rank, rendezvous):
         attn_tp_cpu_group=cpu_group,
         epd_publisher=None,
         starting=False,
+        replica_memory_transitions=False,
     )
     executor.capture_graphs(entries=None, observer=None)
     torch.testing.assert_close(executor.replay(), expected, rtol=0, atol=0)
@@ -286,7 +287,9 @@ def test_bf16_projection_two_nccl_sleep_wake_cycles(tmp_path):
     ):
         pytest.skip("requires four node-local Blackwell GPUs and NCCL suspend/resume")
     pytest.importorskip("torch_memory_saver")
-    with TorchMemorySaverAdapter.create(enable=True).configure_subprocess():
+    with TorchMemorySaverAdapter.create(
+        enable=True, device="cuda"
+    ).configure_subprocess():
         torch.multiprocessing.spawn(
             _projection_sleep_worker,
             args=((tmp_path / "rendezvous").as_uri(),),
