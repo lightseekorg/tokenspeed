@@ -739,6 +739,7 @@ fn handshake_ready_response() {
             spatial_merge_size: Some(2),
             image_token_id: Some(248056),
             video_token_id: Some(248057),
+            output_vocab_size: Some(248000),
         },
     );
 }

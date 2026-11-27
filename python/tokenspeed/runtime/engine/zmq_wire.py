@@ -197,6 +197,8 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     spatial_merge_size: int | None = None
     image_token_id: int | None = None
     video_token_id: int | None = None
+    # Effective target output vocabulary, after revision/config overrides.
+    output_vocab_size: int | None = None
 
 
 _ENC = msgspec.msgpack.Encoder()
@@ -369,6 +371,7 @@ def engine_ready_response(
     host, port = bootstrap if bootstrap is not None else (None, None)
     return WireEngineCoreReadyResponse(
         max_model_len=model_config.context_len,
+        output_vocab_size=model_config.vocab_size,
         num_gpu_blocks=geometry.num_device_pages,
         prefix_granularity=geometry.prefix_granularity,
         dtype=wire_dtype(model_config.dtype),

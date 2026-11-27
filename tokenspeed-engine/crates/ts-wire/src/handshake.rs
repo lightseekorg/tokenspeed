@@ -173,6 +173,9 @@ wire_struct! {
         pub image_token_id: Option<i64> = None,
         /// The video placeholder token id.
         pub video_token_id: Option<i64> = None,
+        /// Effective target output vocabulary, after revision/config overrides.
+        /// Absent for encoders and older engine registrations.
+        pub output_vocab_size: Option<i64> = None,
     }
 }
 

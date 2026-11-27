@@ -575,6 +575,7 @@ def _handshake_ready_response() -> list[bytes]:
                 spatial_merge_size=2,
                 image_token_id=248056,
                 video_token_id=248057,
+                output_vocab_size=248000,
             )
         )
     ]

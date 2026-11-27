@@ -125,6 +125,12 @@ live rows with this cost in mind.
 
 ## Wire and ownership
 
+The engine's map-encoded startup registration reports `output_vocab_size` from
+the resolved target `ModelConfig`, after revision and configuration overrides.
+Adapters use that effective size for output ID and sampling validation instead
+of reloading default checkpoint metadata. Encoders and older registrations may
+omit it; consumers requiring the value must reject missing metadata explicitly.
+
 Each retained row is little-endian int32 with `2 + 2*K` slots: sampled token ID,
 tail float32 bits, K head IDs, and K head float32 logprob bits. The output wire
 tail `output_full_vocab_topk` contains contiguous bytes per request. It is

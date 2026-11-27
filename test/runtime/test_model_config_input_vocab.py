@@ -35,7 +35,8 @@ from tokenspeed.runtime.configs.model_config import ModelConfig  # noqa: E402
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
 
-def _load(tmp_path, *, input_vocab_size, output_fields):
+def _load(tmp_path, *, input_vocab_size, output_fields, model_override_args="{}"):
+
     config = dict(
         model_type="qwen3",
         architectures=["Qwen3ForCausalLM"],
@@ -68,7 +69,7 @@ def _load(tmp_path, *, input_vocab_size, output_fields):
     return ModelConfig(
         model_path=args.model,
         trust_remote_code=False,
-        model_override_args="{}",
+        model_override_args=model_override_args,
         server_args=args,
         dtype=args.dtype,
         context_length=args.max_model_len,
@@ -173,3 +174,39 @@ def test_output_vocabulary_must_be_embeddable(tmp_path):
         match="Vocabulary sizes must be integers satisfying 0 < output <= input",
     ):
         _load(tmp_path, input_vocab_size=64, output_fields={"output_vocab_size": 128})
+
+
+@pytest.mark.parametrize("default_output,effective_output", [(32, 64), (64, 32)])
+def test_ready_response_uses_the_effective_output_vocabulary(
+    tmp_path, default_output, effective_output
+):
+    import msgspec
+
+    from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
+    from tokenspeed.runtime.engine.zmq_wire import encode, engine_ready_response
+
+    model = _load(
+        tmp_path,
+        input_vocab_size=128,
+        output_fields={"output_vocab_size": default_output},
+        model_override_args=json.dumps({"output_vocab_size": effective_output}),
+    )
+    args = ServerArgs(model=str(tmp_path), device="cpu")
+    ready = engine_ready_response(
+        server_args=args,
+        model_config=model,
+        geometry=SchedulerCacheGeometry(16, 5, 4, 64),
+        multimodal_encoder_dtype=None,
+        world_size=1,
+        dp_size=1,
+        attn_tp_size=1,
+        dp_rank=0,
+        kv_cache_size_tokens=64,
+        bootstrap=None,
+    )
+    raw = msgspec.msgpack.decode(encode(ready))
+    assert raw["output_vocab_size"] == effective_output
+    assert (
+        json.loads((tmp_path / "config.json").read_text())["output_vocab_size"]
+        == default_output
+    )
