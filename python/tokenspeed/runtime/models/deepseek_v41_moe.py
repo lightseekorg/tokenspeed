@@ -360,6 +360,23 @@ class DeepseekV4MoE(nn.Module):
         )
 
     @staticmethod
+    def _shared_expert_mxfp8_decline_reason(
+        gate_up: nn.Module, down: nn.Module
+    ) -> str | None:
+        for linear in (gate_up, down):
+            method = linear.quant_method
+            if not isinstance(method, Fp8LinearMethod) or not method.block_quant:
+                return "shared expert scales are not per-row [1, 32] MXFP8"
+            if list(method.quant_config.weight_block_size) != [1, 32]:
+                return "shared expert scales are block-quantized"
+            if method.quant_config.scale_fmt != "ue8m0":
+                return (
+                    f"shared expert scale format is {method.quant_config.scale_fmt}, "
+                    "not ue8m0"
+                )
+        return None
+
+    @staticmethod
     def _pad_shared_expert_weights(
         gate_up_weight: torch.Tensor,
         gate_up_scale: torch.Tensor,
@@ -476,6 +493,8 @@ class DeepseekV4MoE(nn.Module):
                 f"its SwiGLU limit {shared.act_fn.swiglu_limit} differs from the "
                 f"routed experts' {self.experts.swiglu_arg.limit}"
             )
+        elif layout_reason := self._shared_expert_mxfp8_decline_reason(gate_up, down):
+            reason = layout_reason
         else:
             self.experts.process_weights_after_loading(self.experts)
             padded_tensors = self._pad_shared_expert_weights(

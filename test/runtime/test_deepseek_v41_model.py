@@ -5037,11 +5037,14 @@ def _megamoe_unsharded_dense_mapping(rank: int = 1, world_size: int = 2):
     )
 
 
-@pytest.mark.parametrize("case", ["fused", "limit_differs", "kernel_declines"])
+@pytest.mark.parametrize(
+    "case", ["fused", "limit_differs", "kernel_declines", "block_quant_declines"]
+)
 def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
-    """The MoE hands its FP8 shared expert to a kernel that fuses it, once, and
-    keeps it, saying why, when MegaMoE would clamp it with a different SwiGLU
-    limit or the kernel declines it."""
+    """The MoE hands its [1, 32] MXFP8 shared expert to a kernel that fuses it,
+    once, and keeps it, saying why, when it uses 32x32 block quantization,
+    MegaMoE would clamp it with a different SwiGLU limit, or the kernel declines
+    it."""
     metadata = vars(_loader_config())
     metadata["hidden_size"] = 256
     metadata["moe_intermediate_size"] = 256
@@ -5052,9 +5055,10 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
     )
     monkeypatch.setattr(v41, "current_platform", lambda: platform)
-    moe = v41.DeepseekV41MoE(
-        config, mapping, v41.v41_mxfp8_config(_quant()), 0, "ffn", None
+    quant_config = (
+        _quant() if case == "block_quant_declines" else v41.v41_mxfp8_config(_quant())
     )
+    moe = v41.DeepseekV41MoE(config, mapping, quant_config, 0, "ffn", None)
     shared = moe.shared_experts
     assert shared.gate_up_proj.weight.dtype == torch.float8_e4m3fn
     if case == "limit_differs":
@@ -5079,9 +5083,13 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
     if case != "fused":
         assert len(unfused) == 2
         assert all(message.startswith("Layer 0 ") for message in unfused)
-        expected = "SwiGLU limit" if case == "limit_differs" else "weight shapes"
+        expected = {
+            "limit_differs": "SwiGLU limit",
+            "kernel_declines": "weight shapes",
+            "block_quant_declines": "block-quantized",
+        }[case]
         assert all(expected in message for message in unfused)
-        assert len(calls) == (0 if case == "limit_differs" else 2)
+        assert len(calls) == (2 if case == "kernel_declines" else 0)
         return
     assert unfused == []
     assert len(calls) == 1
