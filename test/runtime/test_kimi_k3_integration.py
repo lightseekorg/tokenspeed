@@ -67,36 +67,60 @@ class _ForwardTables:
         return whole_row_spans(self.arrays)
 
 
-def test_metadata_scans_page_ids_only_when_asked() -> None:
+def test_metadata_scans_kv_only_when_asked_but_always_bounds_state_groups() -> None:
     contract = make_kimi_pool("cpu", usable_pages=2).arena.runtime_contract
-    arrays = {group_id: np.array([[1]], dtype=np.int32) for group_id in KIMI_GROUP_IDS}
-    arrays["linear_attention_0"] = np.array([[3]], dtype=np.int32)
-    forward_op = _ForwardTables(arrays)
+    # KV groups (full_attention, 0..24) stay opt-in under validate_page_ids.
+    kv_oob = {group_id: np.array([[1]], dtype=np.int32) for group_id in KIMI_GROUP_IDS}
+    kv_oob["full_attention"] = np.array([[25]], dtype=np.int32)
+    kv_oob_op = _ForwardTables(kv_oob)
 
     metadata = CacheBatchMetadata.from_forward_op(
-        forward_op,
+        kv_oob_op,
         device="cpu",
         contract=contract,
         num_requests=1,
         validate_page_ids=False,
         host_tables=False,
     )
-    tables = metadata.tables(active_forward_op=forward_op)
-    assert tables["linear_attention_0"].item() == 3
+    tables = metadata.tables(active_forward_op=kv_oob_op)
+    assert tables["full_attention"].item() == 25
 
-    with pytest.raises(ValueError, match="outside -1..2"):
+    with pytest.raises(ValueError, match="outside -1..24"):
         CacheBatchMetadata.from_forward_op(
-            forward_op,
+            kv_oob_op,
             device="cpu",
             contract=contract,
             num_requests=1,
             validate_page_ids=True,
             host_tables=False,
         )
+
+    # State groups (linear_attention_0/1/2, 0..2) are always bounded on CPU
+    # even when validate_page_ids=False.
+    for state_group in (
+        "linear_attention_0",
+        "linear_attention_1",
+        "linear_attention_2",
+    ):
+        for bad_id in (-2, 3):
+            state_oob = {
+                group_id: np.array([[1]], dtype=np.int32) for group_id in KIMI_GROUP_IDS
+            }
+            state_oob[state_group] = np.array([[bad_id]], dtype=np.int32)
+            with pytest.raises(ValueError, match="outside -1..2"):
+                CacheBatchMetadata.from_forward_op(
+                    _ForwardTables(state_oob),
+                    device="cpu",
+                    contract=contract,
+                    num_requests=1,
+                    validate_page_ids=False,
+                    host_tables=False,
+                )
+
     # The structural checks run either way.
     with pytest.raises(ValueError, match="rows"):
         CacheBatchMetadata.from_forward_op(
-            forward_op,
+            kv_oob_op,
             device="cpu",
             contract=contract,
             num_requests=2,

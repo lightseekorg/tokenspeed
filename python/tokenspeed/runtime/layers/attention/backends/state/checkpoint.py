@@ -262,11 +262,11 @@ def compute_state_block_indices(
             pad, ``0`` null). Wider rows are accepted and read at slots 0/1.
         seq_lens_before: Per-request token count before this forward; ``0``
             means the request starts from the zero state and reads no block.
-        validate: Run the host-synchronizing write-side checks.
+        validate: Run the host-synchronizing write-side and bounds checks.
         group_id: State group the table belongs to; only used to attribute
             validation errors (multi-group KDA runs this once per group).
-        num_blocks: Optional state pool block count; when provided, rejects
-            entries outside ``-1..num_blocks-1`` unconditionally.
+        num_blocks: Optional state pool block count; checked when ``validate``
+            is True, rejecting entries outside ``-1..num_blocks-1``.
 
     Returns:
         ``(state_in, state_out)`` int32 block ids per request; ``state_in``
@@ -294,12 +294,11 @@ def compute_state_block_indices(
         live
     )
 
-    if num_blocks is not None:
-        validate_state_block_table_bounds(
-            rows, num_blocks=num_blocks, group_id=group_id
-        )
-
     if validate:
+        if num_blocks is not None:
+            validate_state_block_table_bounds(
+                rows, num_blocks=num_blocks, group_id=group_id
+            )
         real = (checkpoint != -1) | (live != -1)
         if bool((state_in[has_history & real] <= 0).any()):
             raise ValueError(

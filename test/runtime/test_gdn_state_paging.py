@@ -34,8 +34,19 @@ def test_state_helpers_use_shared_implementations():
 
 
 class _ContractPool:
-    def __init__(self, components):
+    def __init__(self, components, *, virtual_block_counts=None):
         # The arena publishes the contract; a view only names its arena.
+        if virtual_block_counts is None:
+            counts: dict[str, int] = {}
+            for group_id, conv_state, recurrent_state in components.values():
+                layer_blocks = min(
+                    int(conv_state.shape[0]), int(recurrent_state.shape[0])
+                )
+                prev = counts.get(group_id)
+                counts[group_id] = (
+                    layer_blocks if prev is None else min(prev, layer_blocks)
+                )
+            virtual_block_counts = counts
         contract = SimpleNamespace(
             prefix_granularity=64,
             group_specs=tuple(
@@ -44,6 +55,7 @@ class _ContractPool:
                     group_id for group_id, _, _ in components.values()
                 )
             ),
+            virtual_block_counts=dict(virtual_block_counts),
         )
         self.arena = SimpleNamespace(runtime_contract=contract)
         self._components = components
@@ -220,12 +232,13 @@ class TestComputeStatePageIndicesTest:
 
     def test_num_blocks_bound_validation(self):
         torch = self.torch
+        # validate=True checks both bounds and write-side invariants.
         state_in, state_out = self.fn(
             torch.tensor(
                 [[-1, -1, -1], [-1, -1, -1], [0, 9, -1], [3, 8, 9]], dtype=torch.int32
             ),
             torch.tensor([0, 4, 0, 64], dtype=torch.int32),
-            validate=False,
+            validate=True,
             group_id="linear_attention",
             num_blocks=10,
         )
@@ -241,10 +254,44 @@ class TestComputeStatePageIndicesTest:
                 self.fn(
                     torch.tensor(bad_rows, dtype=torch.int32),
                     torch.tensor([4], dtype=torch.int32),
+                    validate=True,
+                    group_id="linear_attention",
+                    num_blocks=10,
+                )
+
+        # validate=False stays strictly non-synchronizing even when num_blocks is supplied.
+        state_in, state_out = self.fn(
+            torch.tensor([[10, 11]], dtype=torch.int32),
+            torch.tensor([4], dtype=torch.int32),
+            validate=False,
+            group_id="linear_attention",
+            num_blocks=10,
+        )
+        assert state_in.tolist() == [10]
+        assert state_out.tolist() == [11]
+        if torch.cuda.is_available():
+            rows_cuda = torch.tensor([[10, 11]], dtype=torch.int32, device="cuda")
+            before_cuda = torch.tensor([4], dtype=torch.int32, device="cuda")
+            self.fn(
+                rows_cuda,
+                before_cuda,
+                validate=False,
+                group_id="linear_attention",
+                num_blocks=10,
+            )
+            torch.cuda.synchronize()
+            previous = torch.cuda.get_sync_debug_mode()
+            try:
+                torch.cuda.set_sync_debug_mode("error")
+                self.fn(
+                    rows_cuda,
+                    before_cuda,
                     validate=False,
                     group_id="linear_attention",
                     num_blocks=10,
                 )
+            finally:
+                torch.cuda.set_sync_debug_mode(previous)
 
 
 class TestCacheContractStateBlocksTest:
@@ -2010,6 +2057,233 @@ class TestHostStateBlockBoundsTest:
             backend.init_forward_metadata(
                 **self._extend_call([[0, 10]], device="cuda", host_table=None)
             )
+
+    def test_publish_cache_pool_rejects_pool_smaller_than_contract(self):
+        torch = self.torch
+        fresh = self.MambaAttnBackend(
+            *_mamba_config_pair(torch, heads=2, head_dim=4, max_bs=8, device="cpu")
+        )
+        undersized_ssm = _ContractPool(
+            {
+                0: (
+                    self.GROUP,
+                    torch.zeros(12, 24, 3),
+                    torch.zeros(10, 2, 4, 4),
+                )
+            },
+            virtual_block_counts={self.GROUP: 11},
+        )
+        with pytest.raises(ValueError, match="smaller than runtime contract"):
+            fresh.set_kv_pool(undersized_ssm)
+        assert fresh.kv_pool is None
+
+        undersized_conv = _ContractPool(
+            {
+                0: (
+                    self.GROUP,
+                    torch.zeros(9, 24, 3),
+                    torch.zeros(12, 2, 4, 4),
+                )
+            },
+            virtual_block_counts={self.GROUP: 10},
+        )
+        with pytest.raises(ValueError, match="smaller than runtime contract"):
+            fresh.set_kv_pool(undersized_conv)
+        assert fresh.kv_pool is None
+
+        # Failed rebind must leave the previously bound pool untouched.
+        bound = self._make_backend(num_blocks=10)
+        original_pool = bound.kv_pool
+        with pytest.raises(ValueError, match="smaller than runtime contract"):
+            bound.set_kv_pool(undersized_ssm)
+        assert bound.kv_pool is original_pool
+        assert bound._state_group_num_blocks == {self.GROUP: 10}
+
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    @pytest.mark.parametrize("spec_tokens", [1, 4])
+    def test_decode_and_verify_paths_bound_state_tables_before_refresh(
+        self, device, spec_tokens
+    ):
+        """Eager decode, decode CUDA graph replay (prep tape), and speculative
+        target verify all go through ``CacheBatchMetadata.from_forward_op``
+        with ``validate_page_ids=False, host_tables=False``; state OOB fails
+        fast on CPU with zero GPU sync before ``refresh_decode_metadata``."""
+        from test.runtime.conftest import whole_row_spans, whole_row_windows
+
+        import numpy as np
+
+        from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
+            CacheBatchMetadata,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+            CacheRuntimeContract,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            CacheGroupSpec,
+        )
+
+        torch = self.torch
+        if device == "cuda" and not torch.cuda.is_available():
+            pytest.skip("needs a CUDA device")
+
+        num_blocks = 10
+        kv_spec = CacheGroupSpec(
+            group_id="full",
+            attn_kind="full_history",
+            rows_per_page=64,
+            entry_stride_tokens=4,
+            sliding_window_tokens=None,
+            shard_count=1,
+            replayable=False,
+        )
+        state_spec = CacheGroupSpec(
+            group_id=self.GROUP, attn_kind="state", shard_count=1, replayable=False
+        )
+        contract = CacheRuntimeContract(
+            prefix_granularity=256,
+            num_lcm_blocks=num_blocks - 1,
+            token_capacity=(num_blocks - 1) * 256,
+            group_specs=(kv_spec, state_spec),
+            group_page_counts={"full": num_blocks, self.GROUP: num_blocks},
+            group_packing={"full": 1, self.GROUP: 1},
+        )
+
+        backend = self.MambaAttnBackend(
+            *_mamba_config_pair(
+                torch,
+                heads=2,
+                head_dim=4,
+                spec_tokens=spec_tokens,
+                max_bs=4,
+                device=device,
+            )
+        )
+        pool = _ContractPool(
+            {
+                0: (
+                    self.GROUP,
+                    torch.zeros(num_blocks, 24, 3, device=device),
+                    torch.zeros(num_blocks, 2, 4, 4, device=device),
+                )
+            },
+            virtual_block_counts={self.GROUP: num_blocks},
+        )
+        pool.arena = SimpleNamespace(runtime_contract=contract)
+        backend.set_kv_pool(pool)
+        backend.init_cuda_graph_state(max_bs=4)
+        if spec_tokens > 1:
+            backend.preallocate_verify_workspace(max_bs=4, draft_token_num=spec_tokens)
+
+        def _op(state_rows):
+            arrays = {
+                "full": np.ones((len(state_rows), 2), dtype=np.int32),
+                self.GROUP: np.array(state_rows, dtype=np.int32),
+            }
+            return SimpleNamespace(
+                block_table_windows=lambda: whole_row_windows(arrays),
+                block_table_spans=lambda: whole_row_spans(arrays),
+            )
+
+        req_pool_indices = torch.arange(1, 5, dtype=torch.int32, device=device)
+        seq_lens = torch.full((4,), 65, dtype=torch.int32, device=device)
+        valid_op = _op([[-1, -1], [0, 4], [3, 9]])
+        oob_ops = [
+            (_op([[10, 4], [0, 2]]), r"outside -1\.\.9.*row 0, col 0: 10"),
+            (_op([[0, 10], [0, 2]]), r"outside -1\.\.9.*row 0, col 1: 10"),
+            (_op([[-2, 4], [0, 2]]), r"outside -1\.\.9.*row 0, col 0: -2"),
+        ]
+
+        # Warm up packing and refresh kernels before enabling sync_debug_mode.
+        warm_md = CacheBatchMetadata.from_forward_op(
+            valid_op,
+            device=device,
+            contract=contract,
+            num_requests=3,
+            validate_page_ids=False,
+            host_tables=False,
+        )
+        backend.refresh_decode_metadata(
+            bs=4,
+            actual_bs=3,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            forward_mode=self.ForwardMode.DECODE,
+            block_tables=dict(warm_md.tables(active_forward_op=valid_op)),
+            for_graph_replay=(device == "cuda"),
+        )
+
+        # Idle replay (actual_bs=0) with zero-filled placeholder tables.
+        placeholder = {
+            "full": torch.zeros((4, 2), dtype=torch.int32, device=device),
+            self.GROUP: torch.zeros((4, 2), dtype=torch.int32, device=device),
+        }
+
+        previous = torch.cuda.get_sync_debug_mode() if device == "cuda" else None
+        try:
+            if device == "cuda":
+                torch.cuda.synchronize()
+                torch.cuda.set_sync_debug_mode("error")
+            md = CacheBatchMetadata.from_forward_op(
+                valid_op,
+                device=device,
+                contract=contract,
+                num_requests=3,
+                validate_page_ids=False,
+                host_tables=False,
+            )
+            backend.refresh_decode_metadata(
+                bs=4,
+                actual_bs=3,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=self.ForwardMode.DECODE,
+                block_tables=dict(md.tables(active_forward_op=valid_op)),
+                for_graph_replay=(device == "cuda"),
+            )
+            for bad_op, match in oob_ops:
+                with pytest.raises(ValueError, match=match):
+                    CacheBatchMetadata.from_forward_op(
+                        bad_op,
+                        device=device,
+                        contract=contract,
+                        num_requests=2,
+                        validate_page_ids=False,
+                        host_tables=False,
+                    )
+        finally:
+            if device == "cuda":
+                torch.cuda.set_sync_debug_mode(previous)
+
+        assert backend.forward_metadata.state_in_blocks_by_group[
+            self.GROUP
+        ].cpu().tolist() == [-1, 4, 3, -1]
+        assert backend.forward_metadata.state_out_blocks_by_group[
+            self.GROUP
+        ].cpu().tolist() == [-1, 4, 9, -1]
+
+        try:
+            if device == "cuda":
+                torch.cuda.synchronize()
+                torch.cuda.set_sync_debug_mode("error")
+            backend.refresh_decode_metadata(
+                bs=4,
+                actual_bs=0,
+                req_pool_indices=req_pool_indices,
+                seq_lens=seq_lens,
+                forward_mode=self.ForwardMode.IDLE,
+                block_tables=placeholder,
+                for_graph_replay=(device == "cuda"),
+            )
+        finally:
+            if device == "cuda":
+                torch.cuda.set_sync_debug_mode(previous)
+
+        assert backend.forward_metadata.state_in_blocks_by_group[
+            self.GROUP
+        ].cpu().tolist() == [-1, -1, -1, -1]
+        assert backend.forward_metadata.state_out_blocks_by_group[
+            self.GROUP
+        ].cpu().tolist() == [-1, -1, -1, -1]
 
 
 if __name__ == "__main__":

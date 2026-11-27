@@ -421,24 +421,63 @@ class MambaAttnBackend(AttentionBackend):
             )
         return geometry
 
-    def validate_cache_pool(self, cache_pool: CachePool) -> None:
-        super().validate_cache_pool(cache_pool)
-        self._state_geometry(cache_pool)
+    def _state_group_pool_bounds(
+        self,
+        kv_pool: CachePool,
+        state_group_ids: tuple[str, ...],
+    ) -> dict[str, int]:
+        """Physical block count per state group, checked against the contract.
 
-    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
-        """Latch the state geometry; init and preallocate rebuild the rest."""
-        state_group_ids, layer_geometry = self._state_geometry(cache_pool)
-        super()._publish_cache_pool(cache_pool)
-        self._state_group_ids = state_group_ids
+        ``CacheBatchMetadata.from_forward_op`` checks every state group on CPU
+        against ``contract.virtual_block_counts`` before H2D upload. Requiring
+        each state group's physical buffers to be at least that large ensures
+        every ID passing the host check addresses a valid physical block.
+        """
+        contract = kv_pool.arena.runtime_contract
+        virtual_counts = getattr(contract, "virtual_block_counts", None)
         group_num_blocks: dict[str, int] = {}
-        for layer_id, group_id in cache_pool.state_group_by_layer.items():
-            conv = cache_pool.get_component(layer_id, "conv_state")
-            recurrent = cache_pool.get_component(layer_id, "recurrent_state")
+        for layer_id, group_id in kv_pool.state_group_by_layer.items():
+            conv = kv_pool.get_component(layer_id, "conv_state")
+            recurrent = kv_pool.get_component(layer_id, "recurrent_state")
             layer_blocks = min(int(conv.shape[0]), int(recurrent.shape[0]))
             prev = group_num_blocks.get(group_id)
             group_num_blocks[group_id] = (
                 layer_blocks if prev is None else min(prev, layer_blocks)
             )
+        for group_id in state_group_ids:
+            physical_blocks = group_num_blocks.get(group_id)
+            if physical_blocks is None or physical_blocks <= 0:
+                raise ValueError(
+                    f"state paging: {group_id!r} physical pool block count must "
+                    f"be positive (got {physical_blocks})"
+                )
+            if virtual_counts is not None:
+                contract_blocks = virtual_counts.get(group_id)
+                if contract_blocks is None or contract_blocks <= 0:
+                    raise ValueError(
+                        f"state paging: runtime contract is missing a positive "
+                        f"virtual_block_counts entry for {group_id!r} "
+                        f"(got {contract_blocks!r})"
+                    )
+                if physical_blocks < contract_blocks:
+                    raise ValueError(
+                        f"state paging: physical pool for {group_id!r} has "
+                        f"{physical_blocks} blocks, smaller than runtime contract "
+                        f"virtual_block_counts[{group_id!r}]={contract_blocks}"
+                    )
+        return group_num_blocks
+
+    def validate_cache_pool(self, cache_pool: CachePool) -> None:
+        super().validate_cache_pool(cache_pool)
+        state_group_ids, _ = self._state_geometry(cache_pool)
+        self._state_group_pool_bounds(cache_pool, state_group_ids)
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        """Latch the state geometry; init and preallocate rebuild the rest."""
+        state_group_ids, layer_geometry = self._state_geometry(cache_pool)
+        group_num_blocks = self._state_group_pool_bounds(cache_pool, state_group_ids)
+        super()._publish_cache_pool(cache_pool)
+        self._state_group_ids = state_group_ids
         self._state_group_num_blocks = group_num_blocks
         self.state_paging_active = True
         self._state_layer_geometry = layer_geometry
@@ -972,7 +1011,6 @@ class MambaAttnBackend(AttentionBackend):
         block_tables: Mapping[str, torch.Tensor],
         *,
         validate: bool | None,
-        check_bounds: bool = True,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """Per-state-group (state_in, state_out) block-id mappings for this
         forward from the delivered per-group two-slot tables.
@@ -1001,7 +1039,7 @@ class MambaAttnBackend(AttentionBackend):
                 tokens_before,
                 validate=validate,
                 group_id=group_id,
-                num_blocks=group_num_blocks.get(group_id) if check_bounds else None,
+                num_blocks=group_num_blocks.get(group_id),
             )
             state_in_blocks[group_id] = state_in
             state_out_blocks[group_id] = state_out
@@ -1179,7 +1217,6 @@ class MambaAttnBackend(AttentionBackend):
                     ),
                     block_tables,
                     validate=None,
-                    check_bounds=False,
                 )
             )
             state_checkpoints = in_forward_state_checkpoints(
@@ -1675,7 +1712,6 @@ class MambaAttnBackend(AttentionBackend):
                 self._decode_state_tokens_before(real_bs, seq_lens),
                 block_tables,
                 validate=None,
-                check_bounds=cache_debug_enabled(),
             )
         in_by_group: dict[str, torch.Tensor] = {}
         out_by_group: dict[str, torch.Tensor] = {}
