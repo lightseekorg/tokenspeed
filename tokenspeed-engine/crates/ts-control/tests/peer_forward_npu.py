@@ -45,7 +45,7 @@ def prepare(rank):
 tensors = list(pool.map(prepare, range(8)))
 
 
-def forward(rank):
+def forward(rank, iterations):
     torch.npu.set_device(rank)
     x, w, y = tensors[rank]
     first = torch.npu.Event(enable_timing=True)
@@ -56,7 +56,7 @@ def forward(rank):
     torch.mm(x, w, out=y)
     torch.npu.synchronize()
     started.wait()
-    for _ in range(512):
+    for _ in range(iterations):
         torch.mm(x, w, out=y)
         x, y = y, x
     last.record()
@@ -64,10 +64,10 @@ def forward(rank):
     return first.elapsed_time(last)
 
 
-def arm():
+def arm(iterations=512):
     global futures
     release.clear()
-    futures = [pool.submit(forward, rank) for rank in range(8)]
+    futures = [pool.submit(forward, rank, iterations) for rank in range(8)]
     started.wait()
 
 

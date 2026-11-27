@@ -482,6 +482,96 @@ mod ffi {
         ready_expirations: u64,
     }
 
+    /// Actual pool capacity returned by last-owner release, cumulative since start.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct CacheReleaseView {
+        /// Model cache group.
+        group_id: u32,
+        /// Host L2 if true, Device L1 otherwise.
+        host: bool,
+        /// Child slots physically released.
+        child_slots: u64,
+        /// Parents made empty by their last child's release.
+        parents: u64,
+    }
+
+    /// Dependency-aware Device eviction outcomes, cumulative since start.
+    #[derive(Debug, Clone, Copy, PartialEq, Default)]
+    struct GdsStatsView {
+        /// Normal recovery unit evictions.
+        evicted_units: u64,
+        /// Unused fresh units rejected under pressure.
+        retention_rejections: u64,
+        /// Explicitly demoted units reclaimed.
+        demoted_units: u64,
+        /// Selected units with a Host dependency.
+        mixed_tier_units: u64,
+        /// Device blocks with no recovery consumer.
+        orphan_blocks: u64,
+        /// Blocks reclaimed by the capacity fallback.
+        fallback_blocks: u64,
+        /// Recovery routes lost to the capacity fallback.
+        fallback_units: u64,
+        /// Current normal-eviction watermark.
+        watermark: f64,
+        /// Recovery identities discarded by joint retention.
+        logical_evictions: u64,
+        /// Fresh recovery identities rejected by joint retention.
+        logical_rejections: u64,
+        /// Physical Device copies released by joint plans.
+        device_copies_released: u64,
+        /// Required Host destinations reserved before Device reuse.
+        host_copies_reserved: u64,
+        /// Optional Host replicas skipped without logical loss.
+        host_copy_rejections: u64,
+        /// Host copies released using already-published Disk copies.
+        host_clean_copies_released: u64,
+        /// Current routes that require Disk readback.
+        disk_recoverable_units: u64,
+        /// Recovery routes invalidated by external Disk loss.
+        disk_route_losses: u64,
+        /// In-forward targets considered before allocation.
+        checkpoint_planned: u64,
+        /// Plans that acquired all extra State outputs.
+        checkpoint_allocated: u64,
+        /// Outputs reached by the producer's computed frontier.
+        checkpoint_materialized: u64,
+        /// Extra outputs whose publication committed.
+        checkpoint_published: u64,
+        /// Allocated outputs retired without publication.
+        checkpoint_cancelled: u64,
+        /// Additional State blocks allocated for those outputs.
+        checkpoint_extra_blocks: u64,
+        /// Optional allocation failures handled at the same endpoint.
+        checkpoint_chunk_end_fallbacks: u64,
+        /// Produced identities charged at committed fresh rejection.
+        checkpoint_fresh_rejected: u64,
+        /// Paid extra State blocks of rejected identities.
+        checkpoint_rejected_extra_blocks: u64,
+        /// Rejected receipts without runtime byte/GPU samples.
+        checkpoint_rejected_unmeasured: u64,
+        /// Committed selection plans.
+        committed_plans: u64,
+        /// CPU wall time selecting committed plans, excluding failed attempts.
+        planning_nanoseconds: u64,
+        /// Recovery units with a ready legal route.
+        ready_units: u64,
+        /// Ready units needing no Host load, a subset of ready_units.
+        device_ready_units: u64,
+        /// Units waiting for already-reserved necessary migration.
+        pending_units: u64,
+        /// Registered units without a ready or promised route.
+        broken_units: u64,
+        /// Current registered recovery points.
+        dependency_points: u64,
+        /// Current shared dependency ranges.
+        dependency_ranges: u64,
+        /// Current component leaves of those ranges.
+        dependency_leaves: u64,
+        /// Current Host pressure-domain watermark.
+        host_watermark: f64,
+    }
+
     /// Prefix-cache hits by tier, cumulative since start (`HostCacheStats`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     struct PrefixHitView {
@@ -493,6 +583,10 @@ mod ffi {
         host_hit_tokens: u64,
         /// Remote Device prefix used beyond the local hit.
         peer_hit_tokens: u64,
+        /// Additional resumable tokens over this probe's Device-only route.
+        host_gain_tokens: u64,
+        /// Matched KV beyond the executable recovery boundary.
+        unresumable_kv_tokens: u64,
         /// Token spans of successful storage keys (L3), counted per cache group.
         l3_hit_tokens: u64,
     }
@@ -641,6 +735,8 @@ mod ffi {
         tokens: Vec<i32>,
         /// The bound on the prefix.
         max_tokens: i32,
+        /// Locally reusable tokens at lookup dispatch.
+        local_tokens: i32,
     }
 
     /// What a holder's answer answers.
@@ -1052,6 +1148,8 @@ mod ffi {
         fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
         fn disk_stats(scheduler: &Scheduler) -> DiskStatsView;
         fn prefix_hit_stats(scheduler: &Scheduler) -> PrefixHitView;
+        fn gds_stats(scheduler: &Scheduler) -> GdsStatsView;
+        fn cache_release_stats(scheduler: &Scheduler) -> Vec<CacheReleaseView>;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn cancel_storage_backups(scheduler: Pin<&mut Scheduler>);
         fn cancel_storage_for_clear(scheduler: Pin<&mut Scheduler>);
@@ -1059,6 +1157,7 @@ mod ffi {
         fn clear_cache_retaining_storage(scheduler: Pin<&mut Scheduler>) -> bool;
         fn storage_has_retained_operations(scheduler: &Scheduler) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn can_clear_l1_cache(scheduler: &Scheduler) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
         fn start_shared_l2_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<SharedL2LookupView>;
@@ -1135,15 +1234,15 @@ mod ffi {
 
 pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheObservation,
-    CacheObservationKind, CacheOpKind, CacheOpView, DiskDoneView, DiskOpKind, DiskOpView,
-    DiskStatsView, ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind,
-    PeerAnswerView, PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView,
-    PeerPageView, PeerStatsView, PeerTier, PinSampleView, PrefillGateProbe, PrefixHitView,
-    RequestSpec, SchedulerAbortView, SchedulerSizes, SharedL2AnswerView, SharedL2CheckpointView,
-    SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PoolStatsView,
-    SharedL2ProxyBlockView, SharedL2ReservationView, StorageCancellationView, StorageDoneView,
-    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
-    TransferBatchView,
+    CacheObservationKind, CacheOpKind, CacheOpView, CacheReleaseView, DiskDoneView, DiskOpKind,
+    DiskOpView, DiskStatsView, ForwardBatchView, ForwardEvent, ForwardEventKind, GdsStatsView,
+    KvEventView, PeerAnswerKind, PeerAnswerView, PeerEventKind, PeerEventView, PeerFetchView,
+    PeerLeaseView, PeerLookupView, PeerPageView, PeerStatsView, PeerTier, PinSampleView,
+    PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView, SchedulerSizes,
+    SharedL2AnswerView, SharedL2CheckpointView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView,
+    SharedL2PoolStatsView, SharedL2ProxyBlockView, SharedL2ReservationView,
+    StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind, StorageOpView,
+    StorageStatsView, StorageTickView, TransferBatchView,
 };
 
 fn record_cache_observation(
@@ -1607,6 +1706,16 @@ impl Scheduler {
         ffi::disk_stats(self.get())
     }
 
+    /// Committed Device GDS outcomes.
+    pub fn gds_stats(&self) -> GdsStatsView {
+        ffi::gds_stats(self.get())
+    }
+
+    /// Actual physical releases by group and tier, including request and transfer teardown.
+    pub fn cache_release_stats(&self) -> Vec<CacheReleaseView> {
+        ffi::cache_release_stats(self.get())
+    }
+
     /// Cumulative prefix-cache hits by tier.
     pub fn prefix_hit_stats(&self) -> PrefixHitView {
         ffi::prefix_hit_stats(self.get())
@@ -1658,6 +1767,11 @@ impl Scheduler {
     /// Drop the Device L1 prefix index only, under the same refusals.
     pub fn clear_l1_cache(&mut self) -> bool {
         ffi::clear_l1_cache(self.pinned())
+    }
+
+    /// Whether [`Scheduler::clear_l1_cache`] would succeed now; changes nothing.
+    pub fn can_clear_l1_cache(&self) -> bool {
+        ffi::can_clear_l1_cache(self.get())
     }
 
     /// Whether current references permit a full clear, without cancelling

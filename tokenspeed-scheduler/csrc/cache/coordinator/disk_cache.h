@@ -79,6 +79,7 @@ public:
     // Drops key's Disk entry (and, for a State checkpoint, its State siblings)
     // after a read of it failed. False when it is held or gone.
     bool DropUnreadableEntry(const CacheKey& key);
+    bool DropUnreadableEntry(const CacheKey& key, const CacheBlockRef& source);
     std::int32_t NumDiskCachedBlocks() const;
     std::int32_t NumPinnedDiskCachedBlocks() const;
     std::int32_t NumFreeLcmBlocks() const {

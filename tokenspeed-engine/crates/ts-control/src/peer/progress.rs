@@ -173,6 +173,7 @@ impl Progress {
         loop {
             match self.results.try_recv() {
                 Ok(Ok(result)) => {
+                    round.decisions.extend(result.decisions);
                     round.events.extend(result.events);
                     round.landed.extend(result.landed);
                 }

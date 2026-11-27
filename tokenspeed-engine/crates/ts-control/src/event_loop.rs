@@ -307,6 +307,13 @@ pub trait DataPlane {
     /// success alone must never permit a forward or a KV wake.
     fn commit_weight_update(&mut self, success: bool) -> Result<(), DataPlaneError>;
 
+    /// Check the ordered tags without changing device or allocator state.
+    fn check_memory_transition(
+        &mut self,
+        tags: &[String],
+        release: bool,
+    ) -> Result<(bool, String), DataPlaneError>;
+
     /// Start or stop the profiler (`ProfileReq`). Returns the reply.
     fn profile(
         &mut self,
@@ -409,6 +416,13 @@ pub struct Ranks {
     /// With expert parallelism over several ranks, this rank's EP group in
     /// EP-rank order: the expert rebalance agrees over it.
     pub ep: Option<Group>,
+}
+
+impl Ranks {
+    /// The domain that coordinates forwards, including cross-replica EP.
+    fn memory_domain(&mut self) -> (&mut Mesh, &Group) {
+        (&mut self.mesh, self.dp.as_ref().unwrap_or(&self.replica))
+    }
 }
 
 /// The scheduler's load as reported with each output batch.
@@ -687,6 +701,10 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     cache_ops: CacheOps,
     replay_retirements: Option<ReplayRetirements>,
     controls: Controls,
+    /// Memory calls wait in arrival order so replies of each type stay FIFO.
+    memory_calls: VecDeque<MemoryCall>,
+    /// A scheduler resume cancels memory calls at the next common gate.
+    cancel_memory: bool,
     /// Accepted cache clear waiting for native completions between rounds.
     cache_clear_started: Option<Instant>,
     /// Warm-up drives its clear directly between serving rounds, without a
@@ -726,6 +744,16 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     dp_wants_prefill: Vec<bool>,
     dp_has_decode_work: Vec<bool>,
 }
+
+struct MemoryCall {
+    release: bool,
+    id: Option<String>,
+    tags: Option<Vec<String>>,
+    deadline: Instant,
+}
+
+/// Bound the wait for independently delivered control calls, before any drain.
+const MEMORY_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a round starts from, the same on every replica member.
 struct Relayed {
@@ -797,6 +825,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             forwards_completed: 0,
             copies_confirmed_at: None,
             cache_ops: CacheOps::new(),
+            memory_calls: VecDeque::new(),
+            cancel_memory: false,
             cache_clear_started: None,
             startup_cache_clear: false,
             deferred_flushes: 0,
@@ -1048,6 +1078,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // Every round on every rank, so the attention-DP ranks agree on the
         // flushes and weight operations they run together.
         let (memory_resident, release_pending, nccl_release_pending) = self.gate()?;
+        if release_pending && self.config.controls.replica_memory_transitions {
+            // The gate may have just started a release drain.
+            self.apply_pause_transitions(&mut outputs, &mut released)?;
+        }
         if memory_resident && self.collective_resume_pending {
             self.data_plane.finish_memory_resume()?;
             self.collective_resume_pending = false;
@@ -1449,7 +1483,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         capacity_aborts: i64,
     ) -> Option<SchedulerSizes> {
         let mut planned_sizes: Option<SchedulerSizes> = None;
-        if let Some(metrics) = &self.metrics {
+        if let Some(metrics) = &mut self.metrics {
             let _span = profile::span("EventLoop::record_metrics");
             // A retraction victim's image store is the retraction signal.
             let retracted = cache_ops
@@ -1554,6 +1588,57 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 metrics.observe_request_spec_decode_accept_length(accept_length);
             }
             metrics.record_grammar_queue(self.grammar_queue.len() as i64);
+            metrics.record_cache_releases(
+                self.scheduler
+                    .cache_release_stats()
+                    .into_iter()
+                    .map(|stats| ts_metrics::CacheReleaseStats {
+                        group_id: stats.group_id,
+                        host: stats.host,
+                        child_slots: stats.child_slots,
+                        parents: stats.parents,
+                    })
+                    .collect(),
+            );
+            let gds = self.scheduler.gds_stats();
+            metrics.record_gds_evictions(ts_metrics::GdsStats {
+                evicted_units: gds.evicted_units,
+                retention_rejections: gds.retention_rejections,
+                demoted_units: gds.demoted_units,
+                mixed_tier_units: gds.mixed_tier_units,
+                orphan_blocks: gds.orphan_blocks,
+                fallback_blocks: gds.fallback_blocks,
+                fallback_units: gds.fallback_units,
+                watermark: gds.watermark,
+                logical_evictions: gds.logical_evictions,
+                logical_rejections: gds.logical_rejections,
+                device_copies_released: gds.device_copies_released,
+                host_copies_reserved: gds.host_copies_reserved,
+                host_copy_rejections: gds.host_copy_rejections,
+                host_clean_copies_released: gds.host_clean_copies_released,
+                disk_recoverable_units: gds.disk_recoverable_units,
+                disk_route_losses: gds.disk_route_losses,
+                checkpoint_planned: gds.checkpoint_planned,
+                checkpoint_allocated: gds.checkpoint_allocated,
+                checkpoint_materialized: gds.checkpoint_materialized,
+                checkpoint_published: gds.checkpoint_published,
+                checkpoint_cancelled: gds.checkpoint_cancelled,
+                checkpoint_extra_blocks: gds.checkpoint_extra_blocks,
+                checkpoint_chunk_end_fallbacks: gds.checkpoint_chunk_end_fallbacks,
+                checkpoint_fresh_rejected: gds.checkpoint_fresh_rejected,
+                checkpoint_rejected_extra_blocks: gds.checkpoint_rejected_extra_blocks,
+                checkpoint_rejected_unmeasured: gds.checkpoint_rejected_unmeasured,
+                committed_plans: gds.committed_plans,
+                planning_nanoseconds: gds.planning_nanoseconds,
+                ready_units: gds.ready_units,
+                device_ready_units: gds.device_ready_units,
+                pending_units: gds.pending_units,
+                broken_units: gds.broken_units,
+                dependency_points: gds.dependency_points,
+                dependency_ranges: gds.dependency_ranges,
+                dependency_leaves: gds.dependency_leaves,
+                host_watermark: gds.host_watermark,
+            });
             let hits = self.scheduler.prefix_hit_stats();
             let delta = prefix_hit_delta(&mut self.last_prefix_hits, hits);
             if self.outputs.role() == crate::output::Role::Decode {
@@ -1569,6 +1654,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 delta.l3_hit_tokens,
                 delta.peer_hit_tokens,
             );
+            metrics.record_prefix_recovery(delta.host_gain_tokens, delta.unresumable_kv_tokens);
         }
 
         planned_sizes
@@ -2174,6 +2260,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut all_have_internal = internal.is_some();
         let mut memory_resident = !self.controls.memory_released();
         let mut release_pending = matches!(self.controls.drain(), Some(Drain::Release(_)));
+        let coordinated = self.config.controls.replica_memory_transitions;
+        let mut memory_ready = !self.memory_calls.is_empty();
+        let mut cancel_memory = std::mem::take(&mut self.cancel_memory);
+        let mut memory_timed_out = self
+            .memory_calls
+            .front()
+            .is_some_and(|call| Instant::now() >= call.deadline);
         let mut nccl_release_pending = matches!(
             self.controls.drain(),
             Some(Drain::Release(tags)) if tags.iter().any(|tag| tag == "nccl")
@@ -2200,7 +2293,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 key,
                 -key,
                 if reload_ready { -1 } else { 0 },
+                -i64::from(memory_ready),
+                i64::from(cancel_memory),
+                i64::from(memory_timed_out),
             ];
+            let row = if coordinated { &row[..] } else { &row[..12] };
             let reduced = if self.ranks.replica.size() == 1
                 && self.in_flight.is_empty()
                 && self.copies_confirmed_at.is_none()
@@ -2208,7 +2305,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 let reduced = {
                     let mesh = &mut self.ranks.mesh;
                     ArcMutexGuard::unlocked(&mut self.scheduler, || {
-                        mesh.all_reduce(world, &row, Reduce::Max)
+                        mesh.all_reduce(world, row, Reduce::Max)
                     })?
                 };
                 // Any peer Lookup/Pin/Release answered while waiting on sibling DP
@@ -2221,13 +2318,18 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.sync_peer_holder_changes()?;
                 reduced
             } else {
-                self.ranks.mesh.all_reduce(world, &row, Reduce::Max)?
+                self.ranks.mesh.all_reduce(world, row, Reduce::Max)?
             };
             // A resume reaches DP engines independently. None may forward
             // until every peer can join its device collectives again.
             memory_resident = reduced[7] == 0;
             release_pending = reduced[8] != 0;
             nccl_release_pending = reduced[8] == 2;
+            if coordinated {
+                memory_ready = reduced[12] == -1;
+                cancel_memory = reduced[13] != 0;
+                memory_timed_out = reduced[14] != 0;
+            }
             want_flush = reduced[0] > 0;
             all_have_head = reduced[1] == -1;
             let reload_heads = reduced[2] == RELOAD_GATE_CODE || -reduced[3] == RELOAD_GATE_CODE;
@@ -2283,6 +2385,13 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             // caller, stop withholding forwards for that abandoned clear.
             self.cache_clear_started = None;
         }
+        if coordinated && cancel_memory {
+            // A cache flush may yield to finish_drain below. Withdraw the
+            // active drain and the entire observed queue on every rank first.
+            let reason = "memory operation cancelled before device execution";
+            self.controls.cancel_memory_release(reason);
+            self.refuse_queued_memory(self.memory_calls.len(), reason);
+        }
         let flushed = if want_flush {
             match self.clear_cache()? {
                 Some(flushed) => flushed,
@@ -2321,7 +2430,86 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else if let Some(op) = ready_internal {
             self.complete_internal_op(op)?;
         }
+        if coordinated && !cancel_memory && !release_pending {
+            if memory_ready {
+                release_pending = self.prepare_memory_call()?;
+            } else if memory_timed_out {
+                self.refuse_queued_memory(
+                    self.memory_calls.len(),
+                    "timed out waiting for the same memory call on every rank",
+                );
+            }
+        }
         Ok((memory_resident, release_pending, nccl_release_pending))
+    }
+
+    fn refuse_queued_memory(&mut self, count: usize, reason: &str) {
+        for call in self.memory_calls.drain(..count) {
+            self.controls.refuse_memory_transition(call.release, reason);
+        }
+    }
+
+    fn memory_all(&mut self, local: bool) -> Result<bool, LoopError> {
+        let (mesh, domain) = self.ranks.memory_domain();
+        let result = mesh.all_reduce(domain, &[i64::from(local)], Reduce::Min)?;
+        Ok(result[0] != 0)
+    }
+
+    /// Match at the common gate before any participant pauses or touches its allocator.
+    fn prepare_memory_call(&mut self) -> Result<bool, LoopError> {
+        let call = self
+            .memory_calls
+            .pop_front()
+            .expect("every participant queued a call");
+        let prepared = if call.release {
+            self.controls.release_tags(call.tags.as_deref(), None)
+        } else {
+            self.controls.resume_tags(call.tags.as_deref())
+        };
+        // An invalid request has no descriptor. Share readiness and exact
+        // matching in one exchange, before any rank changes its pause state.
+        let descriptor = match &prepared {
+            Ok(tags) => serde_json::to_vec(&(
+                call.release,
+                &call.id,
+                tags,
+                self.config.controls.backup_device_kv,
+            ))
+            .expect("memory call descriptor contains only strings and a boolean"),
+            Err(_) => Vec::new(),
+        };
+        let (mesh, domain) = self.ranks.memory_domain();
+        let requests = mesh.all_gather(domain, &descriptor)?;
+        if requests.iter().any(Vec::is_empty) {
+            let reason = prepared
+                .err()
+                .unwrap_or_else(|| "memory call refused on another rank".to_owned());
+            self.controls
+                .refuse_memory_transition(call.release, &reason);
+            return Ok(false);
+        }
+        if requests.iter().any(|request| request != &descriptor) {
+            self.controls.refuse_memory_transition(
+                call.release,
+                "memory calls disagree on direction, tags or transition_id",
+            );
+            return Ok(false);
+        }
+        let tags = prepared.expect("every participant validated its memory call");
+        if let Some(reason) = self.memory_transition_refusal(&tags, call.release)? {
+            self.controls
+                .refuse_memory_transition(call.release, &reason);
+            return Ok(false);
+        }
+        if call.release {
+            self.controls.begin_release(tags);
+            return Ok(true);
+        }
+        if !tags.is_empty() {
+            self.apply_memory_transition(&tags, false)?;
+        }
+        self.controls.finish_resume(&tags);
+        Ok(false)
     }
 
     /// Whether any member of this rank's replica says yes.
@@ -2848,14 +3036,20 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             );
         // Every rank joins, even without a local drain. An idle but unpaused
         // peer may admit work next round and still needs our idle forwards.
-        let all_paused = release_pending
-            && self.converge(
-                nccl_ready
-                    && drained
-                    && !self.controls.weights_busy()
-                    && self.transfers_idle()
-                    && self.cache_ops.open() == 0,
-            )?;
+        let all_paused = if release_pending {
+            let ready = nccl_ready
+                && drained
+                && !self.controls.weights_busy()
+                && self.transfers_idle()
+                && self.cache_ops.open() == 0;
+            if self.config.controls.replica_memory_transitions {
+                self.memory_all(ready)?
+            } else {
+                self.converge(ready)?
+            }
+        } else {
+            false
+        };
         // Sync any peer Lookup/Pin/Release answered while `self.scheduler` was
         // unlocked earlier in this round before `storage_non_storage_clearable`
         // or `clear_l1_cache` inspects hard pins. Only runs when a Reload or
@@ -2879,7 +3073,32 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if !all_paused {
                 return Ok(());
             }
-            if tags.iter().any(|tag| tag == "kv_cache") {
+            // Backed-up pages still own their L1 prefix entries. Weight loads
+            // flush those entries before the first parameter write, even if KV sleeps.
+            let clears_kv =
+                !self.config.controls.backup_device_kv && tags.iter().any(|tag| tag == "kv_cache");
+            if self.config.controls.replica_memory_transitions {
+                // Weight and cache prerequisites may have changed while draining.
+                let tags = tags.clone();
+                if let Some(reason) = self.memory_transition_refusal(&tags, true)? {
+                    self.controls.cancel_memory_release(&reason);
+                    return Ok(());
+                }
+                if clears_kv {
+                    self.sync_peer_holder_changes()?;
+                    let ready = self.scheduler.can_clear_l1_cache();
+                    if !self.memory_all(ready)? {
+                        return Ok(());
+                    }
+                    let cleared = self.scheduler.clear_l1_cache();
+                    if !self.memory_all(cleared)? {
+                        return Err(LoopError::Control(
+                            "L1 cache clear failed after the memory domain agreed it was ready"
+                                .to_owned(),
+                        ));
+                    }
+                }
+            } else if clears_kv {
                 self.sync_peer_holder_changes()?;
                 if !self.scheduler.clear_l1_cache() {
                     return Ok(());
@@ -2889,7 +3108,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         match self.controls.take_drain().expect("checked above") {
             Drain::Pause => self.controls.finish_pause_drain(),
             Drain::Release(tags) => {
-                self.data_plane.release_memory(&tags)?;
+                self.apply_memory_transition(&tags, true)?;
                 self.collective_resume_pending |= tags.iter().any(|tag| tag == "nccl");
                 tracing::info!(?tags, "memory released");
                 self.controls.finish_release(tags);
@@ -2900,6 +3119,77 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
         }
         Ok(())
+    }
+
+    fn memory_transition_refusal(
+        &mut self,
+        tags: &[String],
+        release: bool,
+    ) -> Result<Option<String>, LoopError> {
+        // A drain can outlive the control-plane readiness seen at admission.
+        let refusal = if release {
+            self.release_refusal()
+        } else {
+            None
+        };
+        let (ready, reason) = match refusal {
+            Some(reason) => (false, format!("cannot release memory: {reason}")),
+            None => self.data_plane.check_memory_transition(tags, release)?,
+        };
+        if self.memory_all(ready)? {
+            return Ok(None);
+        }
+        Ok(Some(if ready {
+            "memory transition prerequisites were refused on another rank".to_owned()
+        } else {
+            reason
+        }))
+    }
+
+    fn apply_memory_transition(&mut self, tags: &[String], release: bool) -> Result<(), LoopError> {
+        // A device failure reaches the launcher before cleanup. Peers must
+        // never publish success while they wait for the failed rank.
+        let done = if release {
+            self.data_plane.release_memory(tags)
+        } else {
+            self.data_plane.resume_memory(tags)
+        };
+        if self.config.controls.replica_memory_transitions {
+            let agreed = self.memory_all(done.is_ok());
+            done?;
+            if !agreed? {
+                return Err(LoopError::Control(
+                    "memory transition failed on another rank".to_owned(),
+                ));
+            }
+        } else {
+            done?;
+        }
+        Ok(())
+    }
+
+    fn release_refusal(&self) -> Option<String> {
+        // A disaggregated release cannot drain while a pause withholds
+        // requests that would still need their transfers, nor a release run
+        // while a rebalance's steps would land on unmapped weights.
+        (self.transfer.is_some() && !self.withheld.is_empty())
+            .then(|| {
+                "PD requests are buffered by a scheduler pause; resume_scheduler and drain \
+                 them before releasing memory"
+                    .to_owned()
+            })
+            .or_else(|| {
+                self.eplb
+                    .as_ref()
+                    .filter(|controller| controller.phase() != eplb::Phase::Idle)
+                    .map(|controller| {
+                        format!(
+                            "an expert rebalance is in progress ({}); retry the release once \
+                             it has been applied",
+                            controller.phase().name()
+                        )
+                    })
+            })
     }
 
     /// Act on a control operation as it arrives.
@@ -2923,27 +3213,30 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .reply(control::gated_reply(&request, false, refusal));
             return Ok(());
         }
-        // A disaggregated release cannot drain while a pause withholds
-        // requests that would still need their transfers, nor a release run
-        // while a rebalance's steps would land on unmapped weights.
-        let refusal = (self.transfer.is_some() && !self.withheld.is_empty())
-            .then(|| {
-                "PD requests are buffered by a scheduler pause; resume_scheduler and drain \
-                 them before releasing memory"
-                    .to_owned()
-            })
-            .or_else(|| {
-                self.eplb
-                    .as_ref()
-                    .filter(|controller| controller.phase() != eplb::Phase::Idle)
-                    .map(|controller| {
-                        format!(
-                            "an expert rebalance is in progress ({}); retry the release once \
-                             it has been applied",
-                            controller.phase().name()
-                        )
-                    })
-            });
+        if self.config.controls.replica_memory_transitions {
+            let memory = match &request {
+                ControlRequest::ReleaseMemoryOccupation(request) => {
+                    Some((true, request.transition_id.clone(), request.tags.clone()))
+                }
+                ControlRequest::ResumeMemoryOccupation(request) => {
+                    Some((false, request.transition_id.clone(), request.tags.clone()))
+                }
+                _ => None,
+            };
+            if let Some((release, id, tags)) = memory {
+                self.memory_calls.push_back(MemoryCall {
+                    release,
+                    id,
+                    tags,
+                    deadline: Instant::now() + MEMORY_CALL_TIMEOUT,
+                });
+                return Ok(());
+            }
+            if matches!(request, ControlRequest::ResumeScheduler(_)) {
+                self.cancel_memory = true;
+            }
+        }
+        let refusal = self.release_refusal();
         let profile = match &request {
             ControlRequest::Profile(profile) => Some(profile.clone()),
             _ => None,
@@ -3862,6 +4155,10 @@ fn prefix_hit_delta(
             .device_hit_tokens
             .saturating_sub(last.device_hit_tokens),
         host_hit_tokens: hits.host_hit_tokens.saturating_sub(last.host_hit_tokens),
+        host_gain_tokens: hits.host_gain_tokens.saturating_sub(last.host_gain_tokens),
+        unresumable_kv_tokens: hits
+            .unresumable_kv_tokens
+            .saturating_sub(last.unresumable_kv_tokens),
         l3_hit_tokens: hits.l3_hit_tokens.saturating_sub(last.l3_hit_tokens),
     }
 }
@@ -3878,6 +4175,8 @@ mod tests {
             device_hit_tokens: 16,
             host_hit_tokens: 8,
             peer_hit_tokens: 12,
+            host_gain_tokens: 12,
+            unresumable_kv_tokens: 4,
             l3_hit_tokens: 4,
         };
         assert_eq!(prefix_hit_delta(&mut previous, hits), hits);

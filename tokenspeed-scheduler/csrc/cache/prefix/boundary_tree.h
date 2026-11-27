@@ -262,6 +262,10 @@ public:
     // checkpoint's residency; it must outlive every hold.
     BoundaryTree(Config config, CheckpointTree* checkpoints) : config_{config}, checkpoints_{checkpoints} {}
 
+    CheckpointTree* GdsCheckpoints() const {
+        return checkpoints_ && checkpoints_->GdsEnabled() ? checkpoints_ : nullptr;
+    }
+
     // Called with a node's hash whenever its closed Host or Disk entries
     // change, as a block of it is registered on or leaves either tier (the
     // KV event stream reconciles that boundary's residency there). It runs

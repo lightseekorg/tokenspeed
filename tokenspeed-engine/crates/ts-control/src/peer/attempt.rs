@@ -43,6 +43,7 @@ enum Phase {
     Offered,
     Planning,
     Pin,
+    Renewing,
     Reading,
     Closing(Disposition),
     Finished,
@@ -64,6 +65,8 @@ pub(super) struct Attempt {
     deadline: i64,
     retry: i64,
     submit_until: std::time::Instant,
+    renewed: bool,
+    pin_started_us: Option<i64>,
     retire_wait: bool,
     invalid: bool,
     frozen: bool,
@@ -98,6 +101,8 @@ impl Attempt {
             deadline,
             retry: 0,
             submit_until: std::time::Instant::now() + super::v1::SUBMIT_WINDOW,
+            renewed: false,
+            pin_started_us: None,
             retire_wait: false,
             invalid: false,
             frozen: false,
@@ -163,7 +168,10 @@ impl Attempt {
         self.phase = Phase::Query;
         Some(msg)
     }
-    pub fn answer(&mut self, m: &Message, now: i64, round: &mut PeerRound) {
+    pub fn awaiting_answer(&self, k: &Key, received: i64) -> bool {
+        self.phase == Phase::Query && self.key.as_ref() == Some(k) && received < self.deadline
+    }
+    pub fn answer(&mut self, m: &Message, now: i64, economical: bool, round: &mut PeerRound) {
         let Message::Offered(k, offered) = m else {
             return;
         };
@@ -186,6 +194,13 @@ impl Attempt {
                     super::layout::covers_interval(&s.contract, 0, offer.end, pages)
                 })
             {
+                if !economical {
+                    round
+                        .decisions
+                        .push((self.lookup.request_id.clone(), "adaptive_recompute"));
+                    round.events.push(e);
+                    return;
+                }
                 e.num_tokens = offer.end;
                 e.pages = pages.clone();
                 e.checkpoint = m.encode();
@@ -196,6 +211,117 @@ impl Attempt {
             }
         }
         round.events.push(e);
+    }
+    /// The scheduler keeps the exact positive answer with the waiting request.
+    /// Rehydrate it after the short-lived protocol attempt has been collected.
+    pub fn restore(
+        f: &PeerFetchView,
+        local: &Generation,
+        known: &(Generation, Arc<Replica>),
+    ) -> Option<Self> {
+        let Message::Offered(key, Some((offer, digest, pages))) =
+            Message::decode(&f.checkpoint, true)?
+        else {
+            return None;
+        };
+        if &key.reader != local
+            || key.holder != known.0
+            || key.lease != f.lease.id
+            || f.lease.reader != local.name
+            || f.holder != key.holder.name
+            || f.end_tokens != offer.end
+            || f.tokens.len() != offer.end as usize
+            || prefix(&f.tokens) != digest
+            || manifest(&pages) != offer.manifest
+            || !super::layout::covers_interval(&known.1.contract, 0, offer.end, &pages)
+        {
+            return None;
+        }
+        let mut a = Self::new(PeerLookupView {
+            request_id: f.request_id.clone(),
+            deadline_us: 0,
+            lease: f.lease.clone(),
+            holder: f.holder.clone(),
+            max_tokens: offer.end,
+            local_tokens: f.begin_tokens,
+            tokens: Vec::new(),
+            prefix_hashes: Vec::new(),
+        });
+        a.key = Some(key);
+        a.offer = Some(offer);
+        a.source = Some(known.1.clone());
+        a.pages = pages;
+        a.phase = Phase::Offered;
+        Some(a)
+    }
+    pub fn expired(&mut self, k: &Key, o: &Offer, local: &Replica, now: i64) -> Option<Message> {
+        if self.phase != Phase::Pin
+            || self.key.as_ref() != Some(k)
+            || self.offer.as_ref() != Some(o)
+        {
+            return None;
+        }
+        if self.renewed || self.invalid {
+            self.seal();
+            return None;
+        }
+        let f = self.fetch.as_ref()?;
+        let source = self.source.as_ref()?;
+        self.renewed = true;
+        self.phase = Phase::Renewing;
+        self.deadline = now.saturating_add(2_000_000);
+        Some(Message::Lookup(
+            k.clone(),
+            local.semantic,
+            local.digest,
+            source.digest,
+            Prompt {
+                max_tokens: f.end_tokens,
+                prefix_hashes: f.prefix_hashes.clone(),
+                tokens: f.tokens.clone(),
+            },
+        ))
+    }
+    pub fn renewed_offer(&mut self, m: &Message, now: i64) -> Option<Message> {
+        let Message::Offered(k, answer) = m else {
+            return None;
+        };
+        if self.phase != Phase::Renewing || self.key.as_ref() != Some(k) {
+            return None;
+        }
+        let old = self.offer.as_ref()?;
+        if let Some((o, digest, pages)) = answer {
+            if o.id <= old.id {
+                return None;
+            } // delayed original answer
+            if !self.invalid
+                && now < self.deadline
+                && o.end == old.end
+                && o.manifest == old.manifest
+                && manifest(pages) == old.manifest
+                && prefix(&self.fetch.as_ref()?.tokens) == *digest
+            {
+                self.offer = Some(o.clone());
+                self.phase = Phase::Pin;
+                self.deadline = now.saturating_add(2_000_000);
+                return Some(Message::Pin(k.clone(), o.clone()));
+            }
+        }
+        self.seal();
+        None
+    }
+    pub fn read_sample(&self, now: i64) -> Option<(i32, i64)> {
+        let f = self.fetch.as_ref()?;
+        Some((
+            f.end_tokens - f.begin_tokens,
+            now.checked_sub(self.pin_started_us?)?,
+        ))
+    }
+    pub fn source_width(&self) -> usize {
+        self.source.as_ref().map_or(0, |s| s.members.len())
+    }
+    pub fn pages(&self) -> &[PeerPageView] {
+        &self.pages
     }
     pub fn reserve(
         &mut self,
@@ -255,6 +381,7 @@ impl Attempt {
             Some(b) if b.is_empty() => 1,
             Some(_) => 2,
         };
+        self.submit_until = std::time::Instant::now() + super::v1::SUBMIT_WINDOW;
         self.phase = Phase::Planning;
         self.fetch = Some(f);
         self.batches = plan;
@@ -354,6 +481,7 @@ impl Attempt {
                 return None;
             }
             self.phase = Phase::Pin;
+            self.pin_started_us = Some(now);
             self.votes = [None; 8];
             self.deadline = now.saturating_add(2_000_000);
             return Some(Message::Pin(v.key.clone(), self.offer.clone()?));
@@ -420,7 +548,12 @@ impl Attempt {
         now: i64,
         round: &mut PeerRound,
     ) -> (Option<Vote>, Option<Message>) {
-        if self.invalid && matches!(self.phase, Phase::Planning | Phase::Pin | Phase::Reading) {
+        if self.invalid
+            && matches!(
+                self.phase,
+                Phase::Planning | Phase::Pin | Phase::Renewing | Phase::Reading
+            )
+        {
             self.seal();
         }
         if self.phase == Phase::Reading {
@@ -482,7 +615,7 @@ impl Attempt {
             }
         } else if now >= self.deadline {
             match self.phase {
-                Phase::Pin | Phase::Planning => self.seal(),
+                Phase::Pin | Phase::Planning | Phase::Renewing => self.seal(),
                 Phase::Discovery | Phase::Query => {
                     round
                         .events
@@ -528,6 +661,7 @@ mod verification {
             prefix_hashes: vec![],
             tokens: vec![],
             max_tokens: 128,
+            local_tokens: 0,
         };
         let offer = Offer {
             id: 7,

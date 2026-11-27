@@ -1,0 +1,5 @@
+{"owner_address": "tcp://@HEAD@:47100",
+ "device_names": ["mlx5_0,mlx5_1", "mlx5_0,mlx5_1", "mlx5_0,mlx5_1", "mlx5_0,mlx5_1"],
+ "request_timeout_ms": 30000, "join_timeout_s": 1800,
+ "read_workers": 16, "write_workers": 8,
+ "scheduler": {"max_writes_in_flight": 16, "max_keys_per_write": 1024}}

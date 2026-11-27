@@ -26,6 +26,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
+from unittest.mock import sentinel
 
 import numpy as np
 import pytest
@@ -45,6 +46,17 @@ class CpuMemorySaver:
         self.cpu_backup = False
         self.allocations = allocations
         self.snapshots = {}
+        self.nccl_resident = True
+        self.pending_work = False
+
+    def synchronize(self):
+        self.pending_work = False
+
+    def suspend_nccl(self):
+        self.nccl_resident = False
+
+    def resume_nccl(self):
+        self.nccl_resident = True
 
     @contextmanager
     def region(self, *, tag, enable_cpu_backup):
@@ -77,6 +89,7 @@ class CpuMemorySaver:
         return tensor
 
     def pause(self, *, tag):
+        assert not self.pending_work, "unmapped storage before pending work completed"
         for allocation_tag, tensor, cpu_backup in self.allocations:
             if allocation_tag == tag:
                 if cpu_backup:
@@ -89,8 +102,21 @@ class CpuMemorySaver:
                 tensor.copy_(self.snapshots.pop(tensor.data_ptr()))
 
 
-@pytest.fixture
-def memory(monkeypatch):
+def _set_adapter_build(monkeypatch, backend):
+    # The adapter only checks presence. Driver probes must see the real build.
+    version = SimpleNamespace(
+        cuda=sentinel.cuda_build if backend == "cuda" else None,
+        hip=sentinel.hip_build if backend == "hip" else None,
+    )
+    monkeypatch.setattr(
+        adapter, "torch", SimpleNamespace(version=version, cuda=torch.cuda)
+    )
+
+
+@pytest.fixture(params=["cuda", "hip"])
+def memory(monkeypatch, request):
+    _set_adapter_build(monkeypatch, request.param)
+    monkeypatch.setattr(adapter, "_non_expandable_allocation", nullcontext)
     allocations = []
     saver = CpuMemorySaver(allocations)
     monkeypatch.setattr(adapter, "_primary_memory_saver", saver, raising=False)
@@ -109,7 +135,7 @@ def buffers(memory):
 
 
 def test_native_storage_initializes_after_weight_region_and_survives_discard(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     communication = []
     with saver.region(tag="weights", enable_cpu_backup=False):
         weight = memory.allocate(5)
@@ -124,7 +150,7 @@ def test_native_storage_initializes_after_weight_region_and_survives_discard(mem
 
 
 def test_multiple_preparations_finish_before_region_returns(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     outputs = []
     with saver.region(tag="weights", enable_cpu_backup=False):
         for value in (3, 5, 7):
@@ -137,7 +163,7 @@ def test_multiple_preparations_finish_before_region_returns(memory):
 
 
 def test_failed_weight_load_does_not_initialize_communication(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     outputs = []
     with pytest.raises(RuntimeError, match="load failed"):
         with saver.region(tag="weights", enable_cpu_backup=False):
@@ -151,7 +177,7 @@ def test_failed_weight_load_does_not_initialize_communication(memory):
 
 
 def test_preparation_failure_fails_loading_after_managed_scope_exits(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
 
     def fail():
         assert not memory.active
@@ -164,13 +190,41 @@ def test_preparation_failure_fails_loading_after_managed_scope_exits(memory):
 
 
 def test_disabled_adapter_initializes_communication_immediately(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=False)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=False, device="cuda")
     outputs = []
     with saver.region(tag="weights", enable_cpu_backup=False):
         adapter.initialize_communication(lambda: outputs.append(memory.allocate(23)))
         assert outputs[0].item() == 23
     memory.pause(tag="weights")
     assert outputs[0].item() == 23
+
+
+def test_enabled_gpu_saver_refuses_a_cpu_torch_build(monkeypatch):
+    _set_adapter_build(monkeypatch, "cpu")
+    with pytest.raises(RuntimeError, match="requires a CUDA or ROCm PyTorch build"):
+        adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
+
+
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+def test_disabled_adapter_can_run_without_optional_packages(monkeypatch, device):
+    monkeypatch.setitem(sys.modules, "torch_memory_saver", None)
+    monkeypatch.setitem(sys.modules, "torch_npu_memory_saver", None)
+    monkeypatch.setitem(
+        sys.modules, "tokenspeed.runtime.utils.ascend_memory_saver_adapter", None
+    )
+    with adapter.TorchMemorySaverAdapter.create(enable=False, device=device).region():
+        pass
+
+
+def test_enabled_npu_saver_reports_its_missing_optional_package(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch_npu_memory_saver", None)
+    monkeypatch.delitem(
+        sys.modules,
+        "tokenspeed.runtime.utils.ascend_memory_saver_adapter",
+        raising=False,
+    )
+    with pytest.raises(ModuleNotFoundError, match="torch-npu-memory-saver"):
+        adapter.TorchMemorySaverAdapter.create(enable=True, device="npu")
 
 
 def test_graph_rng_storage_survives_sleep_before_graph_replay(
@@ -195,7 +249,7 @@ def test_graph_rng_storage_survives_sleep_before_graph_replay(
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "default_generators", (object(),))
     monkeypatch.setattr(memory, "cuda_graph", capture, raising=False)
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     graph = CudaGraph()
     with saver.cuda_graph(graph, pool=None, stream=None, tag="cuda_graph"):
         temporary = memory.allocate(41)
@@ -211,13 +265,21 @@ def test_graph_rng_storage_survives_sleep_before_graph_replay(
 
 
 @pytest.mark.parametrize(
-    "name", ["executor_inputs", "runtime_states", "attention_state", "workspace"]
+    "name",
+    [
+        "executor_inputs",
+        "runtime_states",
+        "attention_state",
+        "cache_layout",
+        "cache_transfer",
+        "workspace",
+    ],
 )
 def test_named_buffers_preserve_contents_and_addresses_across_discard(
     memory, buffers, name
 ):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
-    nested_saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
+    nested_saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     with saver.region(tag="weights", enable_cpu_backup=False):
         weight = memory.allocate(5)
     with saver.region(tag="kv_cache", enable_cpu_backup=False):
@@ -242,7 +304,7 @@ def test_named_buffers_preserve_contents_and_addresses_across_discard(
 
 
 def test_named_buffer_scope_is_restored_after_failure(memory, buffers):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     with pytest.raises(RuntimeError, match="allocation failed"):
         with saver.named_region("executor_inputs"):
             with saver.named_region("workspace"):
@@ -255,10 +317,18 @@ def test_named_buffer_scope_is_restored_after_failure(memory, buffers):
 
 
 @pytest.mark.parametrize(
-    "name", ["executor_inputs", "runtime_states", "attention_state", "workspace"]
+    "name",
+    [
+        "executor_inputs",
+        "runtime_states",
+        "attention_state",
+        "cache_layout",
+        "cache_transfer",
+        "workspace",
+    ],
 )
 def test_disabled_named_region_leaves_allocations_resident(memory, buffers, name):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=False)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=False, device="cuda")
     with saver.named_region(name):
         constant = buffers.allocate(17)
     memory.pause(tag="weights")
@@ -267,10 +337,40 @@ def test_disabled_named_region_leaves_allocations_resident(memory, buffers, name
 
 @pytest.mark.parametrize("enabled", [True, False])
 def test_unknown_named_region_is_rejected(memory, enabled):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled, device="cuda")
     with pytest.raises(KeyError, match="unknown_owner"):
         with saver.named_region("unknown_owner"):
             pytest.fail("unknown region entered its allocation scope")
+
+
+@pytest.mark.parametrize("nccl_suspendable", [False, True])
+def test_gpu_graph_region_routes_to_its_pool(memory, nccl_suspendable):
+    from tokenspeed.runtime.engine.memory_occupation import memory_regions
+
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
+    with saver.region(tag="weights", enable_cpu_backup=False):
+        weight = memory.allocate(5)
+    with saver.region(tag="cuda_graph", enable_cpu_backup=False):
+        scratch = memory.allocate(7)
+    regions = memory_regions(
+        memory,
+        saver,
+        graph_tag="cuda_graph",
+        nccl_suspendable=nccl_suspendable,
+        synchronize_kv_before_registration=False,
+    )
+    assert list(regions) == ["kv_cache", "weights", "cuda_graph"] + (
+        ["nccl"] if nccl_suspendable else []
+    )
+    memory.pending_work = True
+    regions["cuda_graph"].release()
+    regions["cuda_graph"].resume()
+    assert (weight.item(), scratch.item()) == (5, 0)
+    if nccl_suspendable:
+        regions["nccl"].release()
+        assert not memory.nccl_resident
+        regions["nccl"].resume()
+        assert memory.nccl_resident
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -313,7 +413,7 @@ def test_host_transfer_lane_metadata_survives_sleep_and_later_growth(
         "device_module",
         SimpleNamespace(stream=lambda stream: nullcontext(), Event=Event),
     )
-    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled, device="cuda")
     lane = lanes.HostTransferLane(saver)
     for count in (1, 257):
         assert (
@@ -341,6 +441,15 @@ def test_host_transfer_lane_metadata_survives_sleep_and_later_growth(
         assert [tensor.data_ptr() for tensor in tensors] == pointers
         for tensor, reference in zip(tensors, expected):
             torch.testing.assert_close(tensor, reference, rtol=0, atol=0)
+
+
+def _ordinary_cuda_bytes() -> int:
+    return sum(
+        segment["total_size"]
+        for segment in torch.cuda.memory_snapshot()
+        if segment["device"] == torch.cuda.current_device()
+        and tuple(segment["segment_pool_id"]) == (0, 0)
+    )
 
 
 def _check_managed_metadata_on_cuda():
@@ -547,11 +656,7 @@ def _check_managed_metadata_on_cuda():
                 del result
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None,
-    reason="requires native CUDA VMM memory-saver hooks",
-)
-def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
+def _run_with_cuda_memory_saver(check, *, timeout=90):
     memory_saver = pytest.importorskip("torch_memory_saver")
     # Preload hooks must be installed before CUDA initializes in the child.
     with memory_saver.configure_subprocess():
@@ -559,13 +664,323 @@ def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
             [
                 sys.executable,
                 "-c",
-                "from test.runtime.test_torch_memory_saver_adapter import "
-                "_check_managed_metadata_on_cuda; _check_managed_metadata_on_cuda()",
+                f"from test.runtime.test_torch_memory_saver_adapter import "
+                f"{check.__name__}; {check.__name__}()",
             ],
             cwd=Path(__file__).resolve().parents[2],
             check=True,
-            timeout=90,
+            timeout=timeout,
         )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
+    _run_with_cuda_memory_saver(_check_managed_metadata_on_cuda)
+
+
+@torch.inference_mode()
+def _check_gated_residual_workspace_on_cuda():
+    from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
+    from tokenspeed_kernel.ops.residual import select_gated_residual_mix_kernel
+
+    from tokenspeed.runtime.layers.hyperconnection import (
+        GatedResidualSimple,
+        HyperConnectionConfig,
+        register_workspace_region,
+    )
+
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
+    register_workspace_region(saver)
+    g, h, r = 4, 2048, 256
+    with saver.region(tag="weights", enable_cpu_backup=True), torch.device("cuda"):
+        mixer = GatedResidualSimple(
+            HyperConnectionConfig(hc_count=g, hidden_size=h, hc_lowrank=r)
+        ).to(dtype=torch.bfloat16)
+        mixer.process_weights_after_loading(mixer)
+    with saver.named_region("executor_inputs"):
+        normalized = torch.randn(33, g * h, device="cuda", dtype=torch.bfloat16)
+    down, up = mixer.mix_inject_proj.weight, mixer.input_mix_weight_up.weight
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graphs = []
+
+    for rows in (1, 33):
+        inputs = normalized[:rows]
+        with torch.cuda.stream(stream):
+            selected, _ = select_gated_residual_mix_kernel(
+                inputs,
+                down,
+                up,
+                g,
+                h,
+                r,
+                weights_independent=True,
+                override=None,
+                solution=None,
+            )
+            assert selected.name == "cute_fused_hyperconnection_mix"
+            mixer.mix(inputs, normalized=inputs)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with saver.cuda_graph(graph, pool=None, stream=stream, tag="cuda_graph"):
+            mixed, (_, _, inject) = mixer.mix(inputs, normalized=inputs)
+        graphs.append(graph)
+        tensors = (inputs, down, up, mixed, inject)
+        addresses = tuple(tensor.data_ptr() for tensor in tensors)
+        for _ in range(2):
+            torch.cuda.synchronize()
+            saver.pause(tag="cuda_graph")
+            saver.pause(tag="weights")
+            torch.cuda.empty_cache()
+            ordinary_bytes = _ordinary_cuda_bytes()
+            assert ordinary_bytes == 0, ordinary_bytes
+            saver.resume(tag="weights")
+            saver.resume(tag="cuda_graph")
+            assert tuple(tensor.data_ptr() for tensor in tensors) == addresses
+
+            inputs.mul_(-0.5)
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = torch_hyperconnection_mix(
+                inputs.cpu(), down.cpu(), up.cpu(), g, h, r, r + g, 1.0, True
+            )
+            for actual, reference in zip((mixed, inject), expected, strict=True):
+                torch.testing.assert_close(
+                    actual.cpu().double(), reference, atol=0.004, rtol=0.01
+                )
+
+
+def test_gated_residual_workspace_survives_sleep_and_lazy_allocation():
+    from tokenspeed_kernel.ops.residual.cute_fused import supports_fused_hc
+
+    if not torch.cuda.is_available() or not supports_fused_hc(torch.device("cuda")):
+        pytest.skip("requires supported Blackwell and CuTe DSL")
+    _run_with_cuda_memory_saver(_check_gated_residual_workspace_on_cuda)
+
+
+@torch.inference_mode()
+def _check_bf16_prims_qsa_workspace_on_cuda():
+    from test.runtime.cache_pool_test_utils import make_qsa_pool_for_layers
+
+    from tokenspeed_kernel.numerics.torch.attention.qsa import (
+        torch_qsa_selected_attention,
+    )
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+    from tokenspeed_kernel.workspace import capture_session
+
+    from tokenspeed.runtime.configs.model_config import AttentionArch
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.drafter.eagle import AcceptedPrefixPublisher
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+    from tokenspeed.runtime.layers.attention.qsa.metadata import QSALayout, QSASelection
+    from tokenspeed.runtime.layers.attention.registry import create_paged_router
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+    page_size, head_dim, q_heads = 256, 256, 12
+    pool = make_qsa_pool_for_layers(
+        device="cuda",
+        layer_ids=(0,),
+        field_layer_offset=0,
+        num_layers=1,
+        num_lcm_blocks=3,
+        kv_head_dim=head_dim,
+        enable_memory_saver=True,
+    )
+    saver = pool.arena.memory_saver_adapter
+    component = MHAConfig(
+        backend_name="qsa",
+        num_attention_heads=q_heads,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        attn_tp_size=1,
+    )
+    config = AttnConfig(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        kernel_page_size=page_size,
+        context_len=page_size,
+        max_bs=257,
+        max_resident_requests=257,
+        is_draft=True,
+        components=(component,),
+    )
+    router = create_paged_router(config, AttentionArch.MHA, backend_name="qsa")
+    router.set_cache_pool(pool)
+    backend = router.leaves["full_attention"]
+    layer = PagedAttention(
+        num_heads=q_heads,
+        num_kv_heads=1,
+        head_dim=head_dim,
+        scaling=head_dim**-0.5,
+        layer_id=0,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+    torch.manual_seed(42)
+    k, v = pool.get_kv_buffer(0)
+    k[page_size:].normal_()
+    v[page_size:].normal_()
+    graphs = []
+    retained = []
+    previous_capacity = 0
+    stream = torch.cuda.Stream()
+    for rows in (1, 257):
+        with saver.named_region("executor_inputs"):
+            q = torch.randn(rows, q_heads, head_dim, device="cuda", dtype=k.dtype)
+            requests = torch.arange(rows, device=q.device, dtype=torch.int32)
+            page_table = (1 + requests % 2).view(rows, 1)
+            verify_width, block_size, block_topk = 3, 4, 64
+            first = page_size - verify_width
+            positions = torch.arange(first, page_size, device=q.device).repeat(rows)
+            verify_requests = requests.repeat_interleave(verify_width)
+            complete = ((positions + 1) // block_size).to(torch.int32)
+            block_ids = torch.arange(block_topk, device=q.device, dtype=torch.int32)
+            blocks = torch.where(block_ids < complete[:, None], block_ids, -1)
+            verify_slots = qwen4_exp_qsa_selected_slots(
+                blocks,
+                complete,
+                positions,
+                verify_requests,
+                page_table,
+                page_size,
+                block_size,
+                block_topk * block_size,
+                enable_pdl=False,
+            )
+            accepted = (requests + 1) % verify_width
+            gather_ids = (requests * verify_width + accepted).long()
+            accepted_positions = (first + accepted).long()
+            seq_lens = (accepted_positions + 1).to(torch.int32)
+            slots = verify_slots.index_select(0, gather_ids)
+            write_slots = requests[:1]
+            selection = QSASelection(verify_slots, blocks, block_size)
+            layout = QSALayout(
+                seq_lens=seq_lens,
+                logical_positions=positions,
+                request_indices=verify_requests,
+                qsa_locs=write_slots,
+                recent_locs=write_slots,
+                complete_blocks=complete,
+                queries_per_request=verify_width,
+                qsa_page_table=page_table,
+                full_page_table=page_table,
+                full_kernel_page_size=page_size,
+                reset_draft_tags=None,
+            )
+            ctx = ForwardContext(
+                attn_backend=router,
+                token_to_kv_pool=pool,
+                bs=rows,
+                num_extends=0,
+                input_num_tokens=rows * verify_width,
+                forward_mode=ForwardMode.DECODE,
+                output_layout=ForwardOutputLayout(0, 0, rows, 1),
+                gather_ids=gather_ids,
+                draft_narrowing=AcceptedPrefixPublisher(router, seq_lens),
+            )
+
+        def forward():
+            router.sparse_topk.qsa_selection = selection
+            router.sparse_topk.qsa_metadata = layout
+            return backend.forward_decode(
+                q,
+                None,
+                None,
+                layer,
+                write_slots,
+                pool,
+                rows,
+                topk_indices=slots,
+                ctx=ctx,
+            ).view_as(q)
+
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            before = forward().cpu()
+            # A real plan proves that draft step zero selected PrimTS.
+            runner = backend._qsa_workspace.runners[q.device]
+            # Keep the first gather live so the second eager forward uses
+            # different addresses while hitting the same plan geometry.
+            previous_rows = router.sparse_topk.qsa_draft_rows
+            router.sparse_topk.clear_qsa()
+            gather_ids.copy_(requests * verify_width + (accepted + 1) % verify_width)
+            seq_lens.copy_(positions.index_select(0, gather_ids) + 1)
+            slots.copy_(verify_slots.index_select(0, gather_ids))
+            expected = forward().cpu()
+            reference = torch_qsa_selected_attention(
+                q[:1].cpu(),
+                k.cpu(),
+                v.cpu(),
+                slots[:1].cpu(),
+                layer.scaling,
+                1.0,
+                1.0,
+            )
+            router.sparse_topk.clear_qsa()
+            del previous_rows
+        assert not torch.equal(before, expected)
+        torch.testing.assert_close(expected[:1], reference, atol=4e-3, rtol=1e-2)
+        assert runner._workspace.numel() > previous_capacity
+        previous_capacity = runner._workspace.numel()
+        graph = torch.cuda.CUDAGraph()
+        with capture_session(graph), saver.cuda_graph(
+            graph, pool=None, stream=stream, tag="cuda_graph"
+        ):
+            captured = forward()
+            router.sparse_topk.clear_qsa()
+        graphs.append((graph, captured, expected))
+        plan = next(
+            plan
+            for plan in runner._captured_plans.values()
+            if plan.qo_indptr.numel() == rows + 1
+        )
+        retained.extend(
+            (
+                q,
+                slots,
+                blocks,
+                page_table,
+                gather_ids,
+                verify_requests,
+                positions,
+                plan.qo_indptr,
+                runner._workspace,
+            )
+        )
+        for _ in range(2):
+            torch.cuda.synchronize()
+            snapshots = [(t, t.data_ptr(), t.cpu()) for t in retained]
+            saver.pause(tag="cuda_graph")
+            saver.pause(tag="weights")
+            torch.cuda.empty_cache()
+            assert _ordinary_cuda_bytes() == 0
+            saver.resume(tag="weights")
+            saver.resume(tag="cuda_graph")
+            for tensor, address, contents in snapshots:
+                assert tensor.data_ptr() == address
+                torch.testing.assert_close(tensor.cpu(), contents, atol=0, rtol=0)
+            for recorded, output, reference in graphs:
+                recorded.replay()
+                torch.testing.assert_close(output.cpu(), reference, atol=0, rtol=0)
+
+
+def test_bf16_prims_draft_workspace_survives_sleep_and_growth():
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
+
+    if not torch.cuda.is_available() or current_platform().arch_version not in (
+        ArchVersion(10, 0),
+        ArchVersion(10, 3),
+    ):
+        pytest.skip("requires SM100 or SM103 with CUDA VMM memory-saver hooks")
+    _run_with_cuda_memory_saver(_check_bf16_prims_qsa_workspace_on_cuda, timeout=300)
 
 
 def _check_megamoe_buffers_on_cuda():
@@ -592,7 +1007,7 @@ def _check_megamoe_buffers_on_cuda():
         enable_memory_saver=True,
         mapping=Mapping(rank=0, world_size=1),
     )
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     with tempfile.TemporaryDirectory() as tmp:
         dist.init_process_group(
             "nccl",
@@ -700,7 +1115,7 @@ def _check_checkpoint_metadata_on_cuda():
         in_forward_state_checkpoints,
     )
 
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     retained = []
     consumers = []
     scans = []
@@ -820,7 +1235,7 @@ def test_capture_metadata_survives_sleep_for_target_and_draft(
 
     target = CpuAttentionMetadata()
     draft = CpuAttentionMetadata() if with_draft else None
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     prepare_capture_metadata(
         target,
         draft,
@@ -879,7 +1294,7 @@ def test_forward_cache_tables_use_restorable_pool_when_retained_between_rounds(
         transfer_policy="full_suffix",
         replayable=False,
     )
-    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled, device="cuda")
     contract = CacheRuntimeContract(
         prefix_granularity=1,
         num_lcm_blocks=4,
@@ -940,7 +1355,7 @@ def _check_sampled_drafting_on_cuda(sparse: bool):
     from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 
     vocab, pool, width, max_bs, top_k = 64, 6, 4, 4, 3
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.memory_saver_adapter = saver
 

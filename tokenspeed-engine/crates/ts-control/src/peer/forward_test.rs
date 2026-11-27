@@ -38,8 +38,7 @@ use ts_collective::{Group, Listener, Mesh};
 use ts_scheduler::{PeerPageView, PeerTier, RequestSpec};
 
 fn scheduler(name: &str, budget: Duration) -> Arc<Mutex<Scheduler>> {
-    std::env::set_var("PYTHONHOME", env!("TS_CONTROL_TEST_PYTHONHOME"));
-    Python::initialize();
+    crate::init_test_scheduler();
     Python::attach(|py| {
         let globals = PyDict::new(py);
         globals
@@ -76,6 +75,10 @@ result = ts.Scheduler(cfg)
 }
 
 fn layout() -> Arc<Replica> {
+    layout_at(4096)
+}
+
+fn layout_at(base: u64) -> Arc<Replica> {
     let wire = serde_json::json!({
         "plan":{"prefix_granularity":4,"lcm_block_bytes":64,"num_lcm_blocks":63,
           "groups":[{"group_id":"full","cache_blocks_per_lcm_block":1,"page_count":64}],
@@ -87,12 +90,13 @@ fn layout() -> Arc<Replica> {
         "transfer_schema":{"fields":[]},"field_addresses":null});
     let members = (0..8)
         .map(|rank| {
+            let address = base + rank as u64 * 4096;
             let geometry = RankGeometry {
                 session: format!("rank-{rank}"),
                 device: vec![DeviceField {
                     group_id: 0,
                     field_id: "kv".into(),
-                    address: 4096,
+                    address,
                     page_stride: 64,
                     bytes: 64,
                 }],
@@ -102,7 +106,7 @@ fn layout() -> Arc<Replica> {
             Member {
                 geometry,
                 bounds: vec![64],
-                regions: vec![(4096, 4096)],
+                regions: vec![(address, 4096)],
             }
             .encode(rank)
         })
@@ -112,6 +116,7 @@ fn layout() -> Arc<Replica> {
 
 #[derive(Debug, Clone, Copy)]
 enum Delivery {
+    Recompute,
     DuringForward,
     DelayedAgreement,
     Late,
@@ -191,6 +196,12 @@ fn exercise(delivery: Delivery, budget: Duration, start: impl FnOnce(), finish: 
             Arc::default(),
             0,
         );
+        if i == 0 && matches!(delivery, Delivery::Recompute) {
+            // Only the leader saw an expensive last-shard completion.
+            for cost in &mut c.costs {
+                cost.observe(128, false, 500_000);
+            }
+        }
         c.known
             .insert(source.name.clone(), (source.clone(), layout.clone()));
         let control = Arc::new(Mutex::new(c));
@@ -322,7 +333,13 @@ fn exercise(delivery: Delivery, budget: Duration, start: impl FnOnce(), finish: 
             .advance(Control::unpack(&reports).unwrap().1, s, None, &mut round)
             .unwrap();
         assert_eq!(round.events.len(), 1);
-        let hit = !matches!(delivery, Delivery::Late);
+        if matches!(delivery, Delivery::Recompute) {
+            assert_eq!(
+                round.decisions,
+                vec![("follow".to_string(), "adaptive_recompute")]
+            );
+        }
+        let hit = !matches!(delivery, Delivery::Late | Delivery::Recompute);
         assert_eq!(round.events[0].num_tokens, if hit { 128 } else { 0 });
         eprintln!("case={delivery:?} rank={rank} timeout_ms={} holder_send_ms={:.2} scheduler_delivery_ms={:.2} tokens={}",budget.as_millis(), sent.as_secs_f64()*1000.0,issued.elapsed().as_secs_f64()*1000.0,round.events[0].num_tokens);
         s.advance_peer(now, &round.events).unwrap();
@@ -359,8 +376,7 @@ fn eight_npu_forwards_outlast_the_sharded_lookup_deadline() {
         .with_test_writer()
         .with_max_level(tracing::Level::DEBUG)
         .try_init();
-    std::env::set_var("PYTHONHOME", env!("TS_CONTROL_TEST_PYTHONHOME"));
-    Python::initialize();
+    crate::init_test_scheduler();
     let module = Python::attach(|py| {
         PyModule::from_code(
             py,
@@ -372,6 +388,7 @@ fn eight_npu_forwards_outlast_the_sharded_lookup_deadline() {
         .unbind()
     });
     for delivery in [
+        Delivery::Recompute,
         Delivery::DuringForward,
         Delivery::DelayedAgreement,
         Delivery::Late,
@@ -400,5 +417,290 @@ fn eight_npu_forwards_outlast_the_sharded_lookup_deadline() {
                 })
             },
         );
+    }
+    delayed_checkpoint_reads(|| {
+        let start = Instant::now();
+        Python::attach(|py| {
+            module.call_method1(py, "arm", (24_576,)).unwrap();
+            module.call_method0(py, "begin").unwrap();
+            let times: Vec<f64> = module
+                .call_method0(py, "finish")
+                .unwrap()
+                .extract(py)
+                .unwrap();
+            eprintln!("queued_checkpoint device_ms={times:?}");
+            assert_eq!(times.len(), 8);
+            assert!(times.iter().all(|t| *t > 4_000.0));
+        });
+        start.elapsed().as_micros() as i64
+    });
+}
+
+#[test]
+fn all_readers_follow_the_leader_group_cost_even_when_followers_would_read() {
+    exercise(
+        Delivery::Recompute,
+        Duration::from_millis(300),
+        || {},
+        || thread::sleep(Duration::from_millis(400)),
+    );
+}
+
+#[test]
+fn four_seconds_after_lookup_repin_requires_every_original_shard() {
+    delayed_checkpoint_reads(|| 4_000_001);
+}
+
+fn delayed_checkpoint_reads(wait: impl Fn() -> i64) {
+    use super::super::{offers::Offers, v1::Disposition, wire::Prompt};
+    use ts_scheduler::{ForwardEvent, ForwardEventKind};
+    let layout = layout();
+    let generation = |name: &str| Generation {
+        name: name.into(),
+        incarnation: 1,
+        epoch: 1,
+    };
+    let reader = generation("reader:1");
+    let holder = generation("holder:1");
+    let spec = |id: &str, peer: &str| RequestSpec {
+        admission_id: 0,
+        request_id: id.into(),
+        session_id: String::new(),
+        cache_group_id: String::new(),
+        shared_prefix_tokens: vec![],
+        peer_holder: peer.into(),
+        tokens: (1..=133).collect(),
+        max_new_tokens: 4,
+        max_cached_prefix_tokens: i32::MAX,
+    };
+    let event = |kind, id: &str, tokens| ForwardEvent {
+        kind,
+        request_id: id.into(),
+        tokens,
+        spec_candidate_ids: vec![],
+        reserve_num_tokens: 0,
+        bootstrap_token: -1,
+    };
+    for evict in [None, Some(7)] {
+        let caches: Vec<_> = (0..8)
+            .map(|_| {
+                let s = scheduler(&holder.name, Duration::from_secs(1));
+                let mut c = s.lock();
+                c.submit_requests(&[spec("seed", "")]).unwrap();
+                c.advance(&[event(ForwardEventKind::PdBootstrapped, "seed", vec![])])
+                    .unwrap();
+                assert!(!c
+                    .next_execution_plan(true, false)
+                    .forward_batches()
+                    .is_empty());
+                c.advance(&[event(ForwardEventKind::ExtendResult, "seed", vec![1])])
+                    .unwrap();
+                c.next_execution_plan(true, false);
+                c.advance(&[event(ForwardEventKind::PdSucceeded, "seed", vec![])])
+                    .unwrap();
+                drop(c);
+                s
+            })
+            .collect();
+        let sched = scheduler(&reader.name, Duration::from_millis(50));
+        let mut sched = sched.lock();
+        assert!(sched.enable_async_device_peer(false));
+        sched
+            .submit_requests(&[spec("follow", &holder.name)])
+            .unwrap();
+        sched
+            .advance(&[event(ForwardEventKind::PdBootstrapped, "follow", vec![])])
+            .unwrap();
+        sched.next_execution_plan(true, false);
+        let q = sched.take_peer_lookups().pop().unwrap();
+        let mut a = Attempt::new(q);
+        let query = a.query(&reader, &layout, &holder, layout.clone()).unwrap();
+        let Message::Lookup(ref key, ..) = query else {
+            unreachable!()
+        };
+        let mut offers: Vec<_> = (0..8).map(|_| Offers::new(Arc::default())).collect();
+        let answer = offers[0].lookup(key, &holder, &layout, &query, &mut caches[0].lock(), 1);
+        for h in &mut offers[1..] {
+            h.install(&query, &answer, 4, 8, 1);
+        }
+        let mut round = PeerRound {
+            now_us: 2,
+            ..Default::default()
+        };
+        a.answer(&answer, 2, true, &mut round);
+        assert!(round.events[0].num_tokens > 0);
+        sched.advance_peer(2, &round.events).unwrap();
+        let now = 2 + wait();
+        a.tick(None, None, now, &mut round);
+        assert!(a.finished());
+        for (h, c) in offers.iter_mut().zip(&caches) {
+            h.expire(now, 0, &mut c.lock());
+        }
+        if let Some(rank) = evict {
+            assert!(caches[rank].lock().clear_cache());
+        }
+        let f = sched
+            .next_execution_plan(true, false)
+            .peer_fetches()
+            .pop()
+            .unwrap();
+        let dest = layout_at(65536);
+        let mut readers = (0..8)
+            .map(|_| Attempt::restore(&f, &reader, &(holder.clone(), layout.clone())).unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            Attempt::restore(&f, &reader, &(generation("new-holder"), layout.clone())).is_none()
+        );
+        let ready = readers
+            .iter_mut()
+            .enumerate()
+            .map(|(rank, a)| a.reserve(f.clone(), &dest, rank, now).unwrap())
+            .collect::<Vec<_>>();
+        let mut old_offer = None;
+        for a in &mut readers {
+            for (rank, v) in ready.iter().enumerate() {
+                if let Some(Message::Pin(_, o)) = a.vote(rank, v, now, &mut round) {
+                    old_offer = Some(o);
+                }
+            }
+        }
+        let old = old_offer.unwrap();
+        let (Some(Message::Expired(_, expired)), None) =
+            offers[0].pin(key, &old, &mut caches[0].lock(), now)
+        else {
+            panic!("expected expired")
+        };
+        let renew = readers[0].expired(key, &expired, &dest, now).unwrap();
+        for a in &mut readers[1..] {
+            assert_eq!(a.expired(key, &expired, &dest, now), Some(renew.clone()));
+        }
+        let Message::Lookup(_, _, _, _, Prompt { max_tokens, .. }) = &renew else {
+            unreachable!()
+        };
+        assert_eq!(*max_tokens, f.end_tokens);
+        let fresh = offers[0].lookup(key, &holder, &layout, &renew, &mut caches[0].lock(), now);
+        for h in &mut offers[1..] {
+            h.install(&renew, &fresh, 4, 8, now);
+        }
+        let Message::Offered(_, Some((new, _, pages))) = &fresh else {
+            panic!("missing renewed offer")
+        };
+        assert!(new.id > old.id);
+        for a in &mut readers {
+            assert!(a.renewed_offer(&answer, now).is_none());
+            assert_eq!(
+                a.renewed_offer(&fresh, now),
+                Some(Message::Pin(key.clone(), new.clone()))
+            );
+            a.grant(key, &old, true, now);
+        }
+        let mut votes = Vec::new();
+        for (rank, (h, c)) in offers.iter_mut().zip(&caches).enumerate() {
+            let (_, v) = h.pin(key, new, &mut c.lock(), now);
+            let v = v.unwrap();
+            assert_eq!(v.value != 0, evict != Some(rank));
+            votes.push(v);
+        }
+        let ok = evict.is_none();
+        for h in &mut offers {
+            let mut grant = None;
+            for (rank, v) in votes.iter().enumerate() {
+                grant = h.vote(rank, v, now).or(grant);
+            }
+            assert_eq!(grant, Some(Message::Grant(key.clone(), new.clone(), ok)));
+        }
+        use super::super::{
+            push::{PagePusher, PushItem},
+            read::Arena,
+        };
+        struct NoPush;
+        impl PagePusher for NoPush {
+            fn push(&self, _: &str, _: &str, _: Duration, _: Vec<PushItem>) -> Result<(), String> {
+                panic!("device read issued a push")
+            }
+        }
+        let arena = Arena::new(131072);
+        let addr = |base: u64, block: i32| {
+            base + 4096 * ((block - 1) % 8) as u64 + 64 * (1 + (block - 1) / 8) as u64
+        };
+        for p in pages {
+            arena.write(addr(4096, p.block_id), &[1 + p.slot as u8; 64]);
+        }
+        let pool = Reads::start(
+            Arc::new(arena.clone()),
+            Arc::new(NoPush),
+            std::num::NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let mut done = Vec::new();
+        for a in &mut readers {
+            a.grant(key, new, ok, now);
+            a.fence();
+            let wait = Instant::now();
+            loop {
+                if let (Some(v), _) = a.tick(Some(&pool), None, now, &mut round) {
+                    done.push(v);
+                    break;
+                }
+                assert!(wait.elapsed() < Duration::from_secs(2));
+                thread::yield_now();
+            }
+        }
+        let disposition = if ok {
+            Disposition::Complete
+        } else {
+            Disposition::Abort
+        };
+        for a in &mut readers {
+            let mut release = None;
+            for (rank, v) in done.iter().enumerate() {
+                release = a.vote(rank, v, now + 1, &mut round).or(release);
+            }
+            assert_eq!(
+                release,
+                Some(Message::Release(key.clone(), new.id, disposition))
+            );
+        }
+        let mut closed = Vec::new();
+        for (h, c) in offers.iter_mut().zip(&caches) {
+            let (_, v) = h.close(key, new.id, disposition, &mut c.lock(), now + 1);
+            closed.push(v.unwrap());
+            assert_eq!(c.lock().peer_stats().pinned_blocks, 0);
+            assert_eq!(h.pin(key, &old, &mut c.lock(), now + 1).1.unwrap().value, 0);
+        }
+        for (rank, (a, h)) in readers.iter_mut().zip(&mut offers).enumerate() {
+            let mut ack = None;
+            for (rank, v) in closed.iter().enumerate() {
+                ack = h.vote(rank, v, now + 1).or(ack);
+            }
+            let Some(Message::Ack(k, id, d, c)) = ack else {
+                panic!("no closure")
+            };
+            let mut result = PeerRound::default();
+            a.ack(&k, id, d, c, &mut result);
+            if rank == 0 {
+                sched.advance_peer(now + 1, &result.events).unwrap();
+                assert_eq!(
+                    sched.peer_stats().landed_tokens,
+                    if ok {
+                        (f.end_tokens - f.begin_tokens) as u64
+                    } else {
+                        0
+                    }
+                );
+            }
+            assert_eq!(
+                result.events[0].num_tokens,
+                if ok { f.end_tokens } else { 0 }
+            );
+        }
+        eprintln!("checkpoint wait_us={} evicted_rank={evict:?} extra_tokens={} bytes_per_page=64 copied_pages={} remaining_hard_pins=0", now-2,sched.peer_stats().landed_tokens,if ok {f.destinations.len()}else{0});
+        for page in &f.destinations {
+            let expected = if ok { 1 + page.slot as u8 } else { 0 };
+            assert_eq!(
+                arena.read_bytes(addr(65536, page.block_id), 64),
+                vec![expected; 64]
+            );
+        }
     }
 }

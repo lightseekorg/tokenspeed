@@ -31,7 +31,7 @@ use ts_wire::{EngineRequest, SamplingParams, TokenizedGenerateReqInput};
 use crate::{runtime, FrontendListener};
 
 #[test]
-fn python_cancel_releases_the_consumer_without_an_engine_terminal_output() {
+fn python_abort_and_cancel_end_streams_with_a_silent_engine() {
     Python::initialize();
     Python::attach(|py| {
         let listener = FrontendListener::bind(
@@ -59,7 +59,7 @@ fn python_cancel_releases_the_consumer_without_an_engine_terminal_output() {
         let frontend = pending.wait(py).unwrap();
         let peer = runtime().spawn(async move {
             let mut engine = engine;
-            for _ in 0..2 {
+            for _ in 0..3 {
                 assert!(matches!(
                     engine.next_received().await,
                     EngineRequest::Add(_)
@@ -69,8 +69,10 @@ fn python_cancel_releases_the_consumer_without_an_engine_terminal_output() {
                 engine.next_received().await,
                 EngineRequest::Abort(vec!["cancelled".into()])
             );
-            // The survivor progresses after the abort; the cancelled request
-            // itself has no terminal output.
+            assert_eq!(
+                engine.next_received().await,
+                EngineRequest::Abort(vec!["aborted".into()])
+            );
             engine.output("survivor", 2, Some("length")).await;
             engine
         });
@@ -95,6 +97,9 @@ fn python_cancel_releases_the_consumer_without_an_engine_terminal_output() {
             .set_item("cancelled_frames", frames("cancelled"))
             .unwrap();
         locals
+            .set_item("aborted_frames", frames("aborted"))
+            .unwrap();
+        locals
             .set_item("survivor_frames", frames("survivor"))
             .unwrap();
         let code = CString::new(
@@ -103,15 +108,19 @@ import asyncio
 
 async def exercise():
     await frontend.generate(cancelled_frames)
+    await frontend.generate(aborted_frames)
     await frontend.generate(survivor_frames)
-    outputs = {"cancelled": [], "survivor": []}
+    outputs = {"cancelled": [], "aborted": [], "survivor": []}
     while not all(outputs.values()):
         for rid, chunk in await frontend.next_outputs():
             outputs[rid].append(chunk)
     assert await frontend.cancel("cancelled") is True
     assert await frontend.cancel("cancelled") is False
     assert await frontend.cancel("unknown") is False
+    assert await frontend.abort("aborted") is True
+    assert await frontend.abort("aborted") is False
     while not (isinstance(outputs["cancelled"][-1], native.RequestCancelled)
+               and outputs["aborted"][-1].get("finish_reason") == "abort"
                and outputs["survivor"][-1].get("finish_reason") == "length"):
         for rid, chunk in await frontend.next_outputs():
             outputs[rid].append(chunk)
@@ -120,6 +129,12 @@ async def exercise():
     assert cancelled[0]["output_ids"] == [1]
     assert isinstance(cancelled[1], native.EngineError)
     assert isinstance(cancelled[1], native.RequestCancelled)
+    aborted = outputs["aborted"]
+    assert len(aborted) == 2, aborted
+    assert aborted[0]["output_ids"] == [1]
+    assert aborted[1]["output_ids"] == []
+    assert aborted[1]["prompt_tokens"] == 3
+    assert aborted[1]["completion_tokens"] == 1
     survivor = outputs["survivor"]
     assert [token for chunk in survivor for token in chunk["output_ids"]] == [1, 2]
     assert survivor[-1]["completion_tokens"] == 2

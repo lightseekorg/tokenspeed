@@ -994,12 +994,12 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     executor.drafter = None
     executor._samples_from_vocab_shard = False
     pg = PrefillGraph.__new__(PrefillGraph)
-    pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+    pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False, device="cpu")
     pg.config = executor.config
     pg.input_buffers = ib
     pg.attn_backend = SimpleNamespace(init_forward_metadata=init_metadata)
     pg.token_to_kv_pool = SimpleNamespace(arena=SimpleNamespace(cache_group_specs=()))
-    pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+    pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False, device="cpu")
     pg.dp_size = 1
     pg.drafter = None
     executor.prefill_graph = pg
@@ -1243,6 +1243,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
             trust_remote_code=False,
             revision="revision",
             architectures=["DeepseekV41ForCausalLM"],
+            download_dir=None,
         )
         events.append("tokenizer")
         return tokenizer
@@ -1256,6 +1257,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
     args = SimpleNamespace(
         load_format="dummy",
         download_dir=None,
+        model_loader_extra_config={},
         ext_yaml=None,
         weight_loader_prefetch_checkpoints=False,
         weight_loader_prefetch_num_threads=1,

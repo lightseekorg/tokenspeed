@@ -32,6 +32,7 @@ from typing import Literal
 
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.configs.checkpoints import CheckpointConfig
 from tokenspeed.runtime.configs.numerics import (
     BITWISE_ENVELOPES,
     BLOCKWISE_LOGPROB_ORDERS,
@@ -168,18 +169,35 @@ def expert_placement_requested(server_args) -> bool:
 
 
 def _checkpoint_architectures(
-    model: str, revision: str | None, download: bool = False
+    model: str,
+    revision: str | None,
+    download: bool = False,
+    download_dir: str | None = None,
 ) -> list[str] | None:
     """The ``architectures`` of ``model``'s ``config.json``: from the model
-    directory, else from the local Hugging Face cache, else, with ``download``,
-    by downloading that file alone as ``get_config`` resolves a hub id
-    (HF_HUB_OFFLINE keeps it to the cache; a ModelScope id is not looked up on
-    the Hugging Face Hub). None when it cannot be read.
+    directory (or synced object-store metadata cache), else from the local
+    Hugging Face cache, else, with ``download``, by downloading that file alone
+    as ``get_config`` resolves a hub id (HF_HUB_OFFLINE keeps it to the cache;
+    a ModelScope id is not looked up on the Hugging Face Hub). None when it
+    cannot be read.
     """
     if not model:
         return []
-    path = os.path.join(model, "config.json")
-    if not os.path.isdir(model):
+    from tokenspeed.runtime.model_loader.object_store import (
+        is_object_store_uri,
+        resolve_checkpoint_metadata_dir,
+    )
+
+    local_dir = resolve_checkpoint_metadata_dir(
+        model,
+        download_dir=download_dir,
+        sync=download,
+    )
+    if local_dir is not None:
+        path = os.path.join(local_dir, "config.json")
+    elif is_object_store_uri(model):
+        return None
+    else:
         import huggingface_hub.constants
         from huggingface_hub import hf_hub_download, try_to_load_from_cache
 
@@ -449,6 +467,7 @@ class ServerArgs:
     tokenizer: str | None = None
     tokenizer_mode: str = "auto"
     load_format: str = "auto"
+    model_loader_extra_config: str | dict | None = None
     trust_remote_code: bool = True
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
@@ -536,6 +555,9 @@ class ServerArgs:
     # ranks, under cache pressure, as if last used this many new requests ago. None
     # is the scheduler's default, 16 times the per-rank batch size.
     checkpoint_retention_requests: int | None = None
+    prefix_cache_evict_policy: str = "lru"
+    prefix_cache_gds_prefill_cost: list[float] | None = None
+    prefix_cache_gds_disk_read_cost: list[float] | None = None
     # Checkpoints within this many later requests of the newest on their
     # branch rank as it does. None is the scheduler's default, 0.
     checkpoint_retention_leaf_distance: int | None = None
@@ -719,7 +741,7 @@ class ServerArgs:
     min_kv_split: int | None = None
     kda_backend: str = "auto"
     # Records a request keeps per KDA layer between dense-state folds,
-    # including the verify window; None keeps max(16, draft tokens).
+    # including the verify window; None keeps 16. At least the draft tokens.
     kda_history_capacity: int | None = None
     drafter_attention_backend: str | None = None
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
@@ -944,6 +966,9 @@ class ServerArgs:
     # Dev: permit the reload_forward control call; nothing reloads until it arrives.
     allow_reload_forward: bool = False
     weight_memory_policy: Literal["cpu_backup", "discard"] | None = None
+    acl_graph_memory_policy: Literal["discard", "cpu_backup"] = dataclasses.field(
+        default="discard", kw_only=True
+    )
     disable_cudagraph_memory_reserve: bool = False
     mla_disable_ragged: bool = False
 
@@ -1017,7 +1042,47 @@ class ServerArgs:
             return 0
         return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
 
+    def validate_prefix_cache_eviction(self) -> None:
+        if self.prefix_cache_evict_policy not in ("lru", "gds"):
+            raise ValueError("prefix-cache-evict-policy must be lru or gds")
+        cost = self.prefix_cache_gds_prefill_cost
+        disk_cost = self.prefix_cache_gds_disk_read_cost
+        if disk_cost is not None:
+            if self.prefix_cache_evict_policy != "gds" or self.disk_tier_paths is None:
+                raise ValueError(
+                    "prefix-cache-gds-disk-read-cost requires gds with a Disk tier"
+                )
+            if (
+                len(disk_cost) != 2
+                or not all(math.isfinite(v) for v in disk_cost)
+                or disk_cost[0] < 0
+                or disk_cost[1] <= 0
+            ):
+                raise ValueError("GDS Disk read cost requires finite A >= 0 and B > 0")
+        elif (
+            self.prefix_cache_evict_policy == "gds" and self.disk_tier_paths is not None
+        ):
+            raise ValueError(
+                "GDS with Disk requires explicit --prefix-cache-gds-disk-read-cost A B"
+            )
+        if self.prefix_cache_evict_policy == "lru":
+            if cost is not None:
+                raise ValueError(
+                    "prefix-cache-gds-prefill-cost requires the gds policy"
+                )
+            return
+        if not self.enable_prefix_caching:
+            raise ValueError("gds requires prefix caching")
+        if cost is None or len(cost) != 2:
+            raise ValueError(
+                "gds requires explicit --prefix-cache-gds-prefill-cost D E"
+            )
+        d, e = cost
+        if not math.isfinite(d) or d <= 0 or not math.isfinite(e) or e < 0:
+            raise ValueError("GDS prefill cost requires finite D > 0 and E >= 0")
+
     def __post_init__(self):
+        self.validate_prefix_cache_eviction()
         self.validate_decode_extra_slots()
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
@@ -1029,6 +1094,16 @@ class ServerArgs:
         self.resolve_kernel_backends()
         self.resolve_cache()
         self.resolve_speculative_decoding()
+        if self.enable_memory_saver and self.device == "npu":
+            from tokenspeed.runtime.utils.ascend_memory_saver_state import (
+                validate_memory_saver_scope,
+            )
+
+            validate_memory_saver_scope(
+                has_draft_weights=self.speculative_draft_model_path is not None,
+                weight_policy=self.weight_memory_policy,
+                draft_policy=self.model_update_draft_weights,
+            )
         self.resolve_communication()
         self.resolve_numerics()
         self.resolve_disaggregation()
@@ -1212,7 +1287,12 @@ class ServerArgs:
         network, ``_beam_checkpoint`` is None for a hub id the cache does not
         hold yet; engine setup calls this again with ``download``.
         """
-        architectures = _checkpoint_architectures(self.model, self.revision, download)
+        architectures = _checkpoint_architectures(
+            self.model,
+            self.revision,
+            download,
+            download_dir=self.download_dir,
+        )
         if (
             (
                 self.owned_attention_output != "reduce-scatter"
@@ -1830,6 +1910,15 @@ class ServerArgs:
         return self.enable_kvstore or self.shared_l2_config is not None
 
     @property
+    def checkpoint_config(self) -> CheckpointConfig:
+        """Derive checkpoint rules without depending on startup phase ordering."""
+        return CheckpointConfig.resolve(
+            in_forward=self.enable_state_checkpoint_in_forward,
+            role=self.disaggregation_mode,
+            eviction_policy=self.prefix_cache_evict_policy,
+        )
+
+    @property
     def writes_state_checkpoints_in_forward(self) -> bool:
         """Whether this engine's prefill forwards write in-forward State checkpoints.
 
@@ -1838,10 +1927,7 @@ class ServerArgs:
         checkpoints and demotes superseded in-forward checkpoints; a decode
         server publishes the former as ever.
         """
-        return (
-            self.enable_state_checkpoint_in_forward
-            and self.disaggregation_mode != "decode"
-        )
+        return self.checkpoint_config.production.in_forward
 
     @property
     def drops_short_prompt_end_checkpoints(self) -> bool:
@@ -1850,10 +1936,7 @@ class ServerArgs:
         A prefill server does where it writes in-forward checkpoints; no other
         role does (a fused server keeps its short prompt ends).
         """
-        return (
-            self.writes_state_checkpoints_in_forward
-            and self.disaggregation_mode == "prefill"
-        )
+        return self.checkpoint_config.publication.drop_short_prompt_end
 
     @property
     def scheduler_prefill_chunk_yield_tokens(self) -> int:
@@ -3046,6 +3129,15 @@ class ServerArgs:
                 "one request"
             )
 
+    @property
+    def backup_device_kv(self) -> bool:
+        """An Ascend CPU-backed target can reuse its prefixes across sleep."""
+        return (
+            self.device == "npu"
+            and self.enable_memory_saver
+            and self.weight_memory_policy == "cpu_backup"
+        )
+
     def validate_weight_memory_policy(self):
         """Memory saving chooses its weight semantics explicitly."""
         if self.weight_memory_policy not in (None, "cpu_backup", "discard"):
@@ -3053,14 +3145,18 @@ class ServerArgs:
         if self.enable_memory_saver and self.weight_memory_policy is None:
             raise ValueError("--enable-memory-saver requires --weight-memory-policy")
         if self.weight_memory_policy == "discard":
-            if not self.enable_memory_saver or self.model_update_config is None:
-                raise ValueError(
-                    "Weight discard requires memory saver and Model Updater configuration"
-                )
-            if self.model_update_draft_weights not in ("retain", "refresh"):
-                raise ValueError(
-                    "Weight discard requires an explicit draft update policy"
-                )
+            if self.device == "npu":
+                if not self.enable_memory_saver:
+                    raise ValueError("Weight discard requires memory saver")
+            else:
+                if not self.enable_memory_saver or self.model_update_config is None:
+                    raise ValueError(
+                        "Weight discard requires memory saver and Model Updater configuration"
+                    )
+                if self.model_update_draft_weights not in ("retain", "refresh"):
+                    raise ValueError(
+                        "Weight discard requires an explicit draft update policy"
+                    )
             # Quantization is checked against the resolved model config by
             # WeightMemoryState; CLI names alone cannot prove safe regeneration.
             if self.enable_eplb:
@@ -3091,6 +3187,13 @@ class ServerArgs:
             "--model-update-draft-weights": self.model_update_draft_weights,
         }
         if self.model_update_config is None:
+            if (
+                self.device == "npu"
+                and self.enable_memory_saver
+                and self.weight_memory_policy == "discard"
+                and self.model_update_draft_weights == "retain"
+            ):
+                companions.pop("--model-update-draft-weights")
             given = [flag for flag, value in companions.items() if value is not None]
             if given:
                 raise ValueError(f"{', '.join(given)} require --model-update-config")
@@ -3116,6 +3219,63 @@ class ServerArgs:
                 "--model-update-config: its FP8 weight copies are made once "
                 "after loading, and no weight update rebuilds them"
             )
+
+    def _validate_object_store_options(self) -> None:
+        from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+        for flag, value in (
+            ("--model", self.model),
+            ("--tokenizer", self.tokenizer),
+            ("--speculative-draft-model-path", self.speculative_draft_model_path),
+        ):
+            if not (isinstance(value, str) and is_object_store_uri(value)):
+                continue
+            if self.load_format != "runai_streamer":
+                raise ValueError(
+                    f"{flag}={value!r} is an object-store URI and requires "
+                    f"--load-format runai_streamer, got {self.load_format!r}"
+                )
+            if flag in ("--model", "--tokenizer") and self.revision is not None:
+                raise ValueError(
+                    f"--revision={self.revision!r} is not supported with "
+                    f"object-store URI {flag}={value!r}; object-store "
+                    "checkpoints always stream live bucket state"
+                )
+            if flag == "--speculative-draft-model-path":
+                if self.speculative_draft_model_revision is not None:
+                    raise ValueError(
+                        "--speculative-draft-model-revision="
+                        f"{self.speculative_draft_model_revision!r} is not "
+                        f"supported with object-store URI {flag}={value!r}; "
+                        "object-store checkpoints always stream live bucket state"
+                    )
+                if self.draft_model_path_use_base and self.revision is not None:
+                    raise ValueError(
+                        f"--revision={self.revision!r} is not supported with "
+                        f"object-store URI {flag}={value!r}; object-store "
+                        "checkpoints always stream live bucket state"
+                    )
+
+    def _parse_model_loader_extra_config(self) -> None:
+        raw = self.model_loader_extra_config
+        if raw is None or raw == "":
+            self.model_loader_extra_config = {}
+            return
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "--model-loader-extra-config must be valid JSON"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("--model-loader-extra-config must be a JSON object")
+            self.model_loader_extra_config = parsed
+            return
+        if isinstance(raw, dict):
+            self.model_loader_extra_config = dict(raw)
+            return
+        raise ValueError("--model-loader-extra-config must be a JSON object or dict")
 
     def validate_petit_moe_options(self):
         """Validate shared backend, model, and scheduling options for Petit.
@@ -3332,6 +3492,8 @@ class ServerArgs:
             )
 
     def validate(self):
+        # Disaggregation resolution can disable caching (the encode role).
+        self.validate_prefix_cache_eviction()
         self.validate_decode_extra_slots()
         if (
             type(self.ttft_trace_sampling_percentage) is not int
@@ -3342,6 +3504,15 @@ class ServerArgs:
             )
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
+        if self.acl_graph_memory_policy not in ("discard", "cpu_backup"):
+            raise ValueError("--acl-graph-memory-policy must be discard or cpu_backup")
+        if self.acl_graph_memory_policy == "cpu_backup" and (
+            self.device != "npu" or not self.enable_memory_saver
+        ):
+            raise ValueError(
+                "--acl-graph-memory-policy cpu_backup requires --device npu "
+                "and --enable-memory-saver"
+            )
         if self.low_latency_max_num_tokens_per_gpu <= 0:
             raise ValueError("--low-latency-max-num-tokens-per-gpu must be positive")
         if self.input_logprob_chunk_tokens <= 0:
@@ -3425,6 +3596,8 @@ class ServerArgs:
             )
 
         self.validate_model_update_options()
+        self._validate_object_store_options()
+        self._parse_model_loader_extra_config()
 
         if (
             self.speculative_algorithm is not None
@@ -3620,6 +3793,7 @@ class ServerArgs:
                 "pt",
                 "safetensors",
                 "instanttensor",
+                "runai_streamer",
                 "npcache",
                 "dummy",
                 "extensible",
@@ -3633,9 +3807,19 @@ class ServerArgs:
             '"instanttensor" accelerates safetensors loading on NVIDIA GPUs '
             "via distributed loading, pipelined prefetching, and direct I/O "
             "(with optional GPUDirect Storage support). "
+            '"runai_streamer" streams safetensors weights from local storage '
+            "or cloud object stores (gs://, s3://) via Run:ai Model Streamer. "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values.',
+        )
+        parser.add_argument(
+            "--model-loader-extra-config",
+            type=str,
+            default=ServerArgs.model_loader_extra_config,
+            help="Optional JSON object of extra options for the selected "
+            "model loader (e.g., concurrency, memory_limit, distributed for "
+            "--load-format runai_streamer).",
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -3884,6 +4068,31 @@ class ServerArgs:
             "docs/design/scheduler.md section 1.2.",
         )
         parser.add_argument(
+            "--prefix-cache-evict-policy",
+            choices=("lru", "gds"),
+            default=ServerArgs.prefix_cache_evict_policy,
+            help="Prefix-cache retention policy. GDS jointly manages Device and "
+            "Host retention and requires State cache groups, prefix caching and "
+            "explicit prefill cost D E. Disk keeps its existing replacement policy.",
+        )
+        parser.add_argument(
+            "--prefix-cache-gds-prefill-cost",
+            type=float,
+            nargs=2,
+            metavar=("D", "E"),
+            default=None,
+            help="GDS cost C(a,b)=D*(b-a)+E*(b*b-a*a)/200000; finite D>0, E>=0.",
+        )
+        parser.add_argument(
+            "--prefix-cache-gds-disk-read-cost",
+            type=float,
+            nargs=2,
+            metavar=("A", "B"),
+            default=None,
+            help="Required with GDS and Disk: read cost A per block plus B per aligned byte, "
+            "in prefill-cost units; finite A>=0, B>0.",
+        )
+        parser.add_argument(
             "--checkpoint-retention-requests",
             type=int,
             dest="checkpoint_retention_requests",
@@ -3964,7 +4173,7 @@ class ServerArgs:
             choices=["write_through", "write_back"],
             default=ServerArgs.kvstore_write_policy,
             help="What feeds Host L2 (the KVStore) from the GPU prefix cache. "
-            "'write_through' (the default) copies every page the fused or "
+            "'write_through' (the default) attempts to copy pages the fused or "
             "prefill role caches. "
             "'write_back' copies only the pages the GPU evicts, in the "
             "scheduling step that evicts them (that step's forward waits for "
@@ -4667,10 +4876,11 @@ class ServerArgs:
             default=ServerArgs.kda_history_capacity,
             help="Accepted KDA records each request keeps per layer between "
             "dense-state folds, counting the verify window (the speculative draft "
-            "tokens). Default: max(16, draft tokens); it must be at least the "
-            "draft tokens. A smaller capacity shrinks the per-request verify "
-            "workspace but folds the records into the dense state more often: at "
-            "the draft tokens themselves, every round that accepts any.",
+            "tokens). Default: 16; it must be at least the draft tokens, so a "
+            "window wider than 16 needs this option. A smaller capacity shrinks "
+            "the per-request verify workspace but folds the records into the "
+            "dense state more often: at the draft tokens themselves, every round "
+            "that accepts any.",
         )
         parser.add_argument(
             "--drafter-attention-backend",
@@ -5460,8 +5670,15 @@ class ServerArgs:
             default=None,
             help=(
                 "Required with memory saver: back up weights to CPU, or discard "
-                "them until a complete SDK update. Frozen draft weights retain CPU backup."
+                "them until a complete update. Frozen draft weights retain CPU backup."
             ),
+        )
+        parser.add_argument(
+            "--acl-graph-memory-policy",
+            choices=["discard", "cpu_backup"],
+            default=ServerArgs.acl_graph_memory_policy,
+            help="Ascend memory saver policy for the decode graph private pool. "
+            "Discard temporaries on release (default), or back them up to CPU.",
         )
         parser.add_argument(
             "--disable-cudagraph-memory-reserve",
@@ -6032,7 +6249,8 @@ class ServerArgs:
             default=ServerArgs.model_update_draft_weights,
             help="Whether a Mooncake weight update also streams the "
             "speculative draft model's weights: 'retain' updates the target "
-            "only, 'refresh' updates target and draft.",
+            "only, 'refresh' updates target and draft. For Ascend disk weight "
+            "discard with a draft model, pass 'retain' explicitly.",
         )
 
     @classmethod

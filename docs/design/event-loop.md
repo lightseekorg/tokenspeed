@@ -110,25 +110,24 @@ The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
 
-The native frontend's `abort(rid)` only sends the ordinary wire abort. A
-client abort suppresses terminal output in the engine, so callers must not
-wait for a final chunk as its acknowledgment. `EngineClient::cancel` (Python
-`Frontend.cancel`) sends that same abort and then detaches the local stream.
-The stream yields `StreamError::Cancelled`, exposed by `next_outputs` as a
-`(rid, RequestCancelled)` exception value, after any already queued outputs.
-It creates no finish chunk or token/finish metrics. Only that stream and the
-client's in-flight count change; engine-reported load and slot, cache and
-transfer retirement keep their existing owners and fences.
+The native frontend's `abort(rid)` and `cancel(rid)` send the ordinary wire
+abort. After a successful send, the frontend detaches the original local
+stream if it is still attached and releases its in-flight count. After any
+queued outputs, `abort` delivers an empty token chunk with `finish_reason`
+set to `"abort"` and the latest reported token counts and verify rounds.
+Before the first output, it uses the submitted input ID count for prompt
+usage. `cancel` delivers `StreamError::Cancelled`, exposed by Python's
+`next_outputs` as a `(rid, RequestCancelled)` exception value. The engine owns
+its own load reports and releases slots, cache, and transfer resources at
+retirement.
 
-Cancellation returns `true` only when it closes the local stream. If a finish,
-stream error or another cancellation wins, its result is preserved and
-cancellation returns `false`. A failed send or a dropped cancellation future
-does not detach the stream: the caller can retry, even if the engine already
-received the abort. Stream drop and send cleanup compare the original local
-admission's channel before removing an entry. This protects a later local
-owner, but adds no wire identity: new submissions must use fresh request ids
-to avoid delayed output or abort messages reaching a reused id. Local closure
-is never evidence that engine resources are free.
+`abort` returns `true` when it sends the wire abort. `cancel` returns `true`
+when it detaches the local stream. A finish, stream error or another
+cancellation that wins the race keeps its result. A failed send or a dropped
+cancellation future leaves any still-active stream attached for retry, even
+if the engine already received the abort. Stream drop and send cleanup compare
+the original local admission's channel before removing an entry. Fresh request
+ids keep delayed wire output or abort messages from reaching a later request.
 
 On disaggregated engines, `bootstrap_room` carries the same one-active-request
 rule across distinct request IDs. Peer state is keyed by room, so every new
@@ -884,9 +883,13 @@ address used by EPD. A release is refused while transfers are in
 flight, and refused for a paused PD engine with buffered requests, whose
 transfers cannot drain until those requests are admitted; their transfer
 registration is deferred until resume admits them, and aborted buffered
-requests never register one. An empty memory-resume request is a successful
+requests never register one. An explicit empty release list is refused before
+the scheduler drains. Omitting the list releases all configured regions.
+An empty memory-resume request is a successful
 no-op while a drain is pending; it preserves that drain's admission hold
 until the owning pause or memory-release operation finishes.
+
+The following memory-release and NCCL coordination uses protocol 2.
 
 With attention DP, memory release waits for every rank to stop admissions
 and drain its requests, forwards, cancelled embedding receives, cache copies,
@@ -943,6 +946,29 @@ Until all regions are restored on every rank, it withholds forward permission
 through the scheduler's storage tick and suppresses idle forwards. This covers
 staggered and partial resumes without building a batch that cannot execute;
 control operations and cache acknowledgments continue to progress.
+
+**Coordinated memory transitions (protocol 3)** extend the same control gate
+from 12 columns under protocol 2 to 15. The three added values coordinate
+call readiness, cancellation and timeout over the replica, or the existing
+attention-DP domain when present, including shared MoE TP/EP. All members
+must match direction, canonical tags and any transition ID before pause or
+allocator changes. Normal and idle forwards can progress while a call waits
+for missing participants. Cancellation and timeout refuse the whole observed
+batch at that gate; cancellation preserves the current device mappings.
+
+Release checks device prerequisites before its drain and again after the
+domain drains requests, forwards, cache work and PD transfers. Every stage
+must retire its KV transfers before source KV is released. Readiness is MIN-reduced directly
+over this domain. All members must report L1 clearability before any index
+is cleared; resume checks local prerequisites, including valid weights before
+KV wake. Successful tags and replies are published only after every member
+confirms device completion. A device-apply failure or L1-clear failure after
+readiness agreement is fatal to the entire domain through the host failure
+path, including otherwise healthy ranks; deployment supervision owns recovery.
+
+Protocol selection, startup compatibility, the timeout/retry contract and
+NCCL participation requirements are defined in the
+[memory-transition serving contract](../serving/ascend-memory-saver.md#memory-transition-protocol).
 
 **The same-round gate** (`EventLoop::gate`, every round on every rank).
 Weight-update `flush_cache` and a standalone flush first MAX-reduce
@@ -1862,3 +1888,17 @@ receipt must precede the deadline, even if admission happens several rounds
 later. The protocol delivers an explicit miss for unanswered and suppressed
 lookups. This keeps the scheduler from expiring a request while a timely reply
 awaits replica agreement.
+
+For a timely offer, the reader leader compares the tokens saved beyond its
+local prefix with the observed time from the group's PIN request through the
+last necessary member's READ retirement. Its choice travels with the offer in
+the existing replica report before HBM reservation. Cold paths collect a sample;
+estimates distinguish holder width, source tiers and node locality.
+
+The scheduler retains the original offer with a waiting request. At admission
+the reader can reconstruct an expired attempt from that checkpoint. If the
+holder's unpinned offer has expired, its reply permits one fresh lookup of the
+same prefix in the same generation. Only a newer offer with exactly the original
+boundary, prefix and page manifest can be pinned. All holder members revalidate
+their own pages while acquiring references. A partial PIN aborts the group and
+releases acquired references. A live offer takes the original direct PIN path.

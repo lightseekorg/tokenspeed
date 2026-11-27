@@ -70,7 +70,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
         return std::nullopt;
     }
 
-    HostCache::HostAllocationBatch host_allocation = coordinator_.Host().AcquireHostBlocks(group_ids, buckets);
+    HostCache::HostAllocationBatch host_allocation = coordinator_.Host().AcquireHostCopies(group_ids, buckets);
     _assert(host_allocation.blocks.size() == keys.size(), "Host allocation result must stay aligned");
     stats.no_placement += host_allocation.stats.unallocated;
 
@@ -307,6 +307,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
         const std::size_t first_row = member_of_row.size();
         for (std::size_t m = 0; m < segments[s].members.size(); ++m) {
             CacheEvictor::EvictedBlock& member = segments[s].members[m];
+            if (member.copy_required) continue;  // destination already reserved by the joint plan
             if (member.host_block) {
                 ++stats.host_cached;  // held since the eviction
                 continue;
@@ -330,8 +331,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
         segment_rows.push_back(
             HostCache::HostSegmentRows{.first_row = first_row, .past_end_row = member_of_row.size()});
     }
-    HostCache::HostAllocationBatch host_allocation =
-        coordinator_.Host().AcquireHostSegments(group_ids, buckets, segment_rows);
+    HostCache::HostAllocationBatch host_allocation;
+    if (!group_ids.empty()) host_allocation = coordinator_.Host().AcquireHostSegments(group_ids, buckets, segment_rows);
     _assert(host_allocation.blocks.size() == member_of_row.size(), "Host allocation result must stay aligned");
 
     // A stream-ordered store: the Device sources left the index at the
@@ -343,6 +344,25 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
     std::shared_ptr<const StoreInFlight> in_flight;
     std::vector<CacheTransfer> transfers;
     std::vector<StoreTicket> tickets;
+    const auto copy = [&](CacheEvictor::EvictedBlock& member, CacheBlockRef destination) {
+        const auto& allocator = coordinator_.Allocator(static_cast<std::int32_t>(member.key.group_id));
+        FatalCheck(allocator.BucketOf(member.device_location) == allocator.BucketOf(destination->Location()),
+                   "reserved Host destination has the source owner");
+        if (!op_id) {
+            op_id = nextOpId();
+            in_flight = std::make_shared<StoreInFlight>();
+        }
+        transfers.push_back(CacheTransfer{.group_id = member.key.group_id,
+                                          .source_page = allocator.ResolveDeviceCacheBlockId(member.device_location),
+                                          .destination_page = allocator.ResolveCacheBlockId(*destination),
+                                          .content_hash = member.key.content_hash.ToString(),
+                                          .page_offset = member.key.page_offset});
+        tickets.push_back(StoreTicket{member.key, CacheBlockRef{}, destination});
+        member.host_block = std::move(destination);
+        member.copy_required = false;
+        ++stats.blocks[member.key.group_id];
+        if (member.written_back_before) ++stats.recopied;
+    };
     for (std::size_t s = 0; s < segments.size(); ++s) {
         const HostCache::HostSegmentRows& row_range = segment_rows[s];
         // A segment is placed whole or not at all.
@@ -353,30 +373,17 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
             coordinator_.Host().SettleEvictedSegment(std::move(segments[s]), /*placed_on_host=*/false);
             continue;
         }
+        bool emitted = false;
+        for (auto& member : segments[s].members) {
+            if (!member.copy_required) continue;
+            copy(member, std::move(member.host_block));
+            emitted = true;
+        }
         for (std::size_t row = row_range.first_row; row < row_range.past_end_row; ++row) {
             CacheEvictor::EvictedBlock& member = segments[s].members[member_of_row[row]];
-            CacheBlockRef& host_block = host_allocation.blocks[row];
-            _assert(static_cast<bool>(host_block), "a segment is placed whole or not at all");
-            const GroupAllocator& allocator = coordinator_.Allocator(static_cast<std::int32_t>(member.key.group_id));
-            _assert(allocator.BucketOf(member.device_location) == allocator.BucketOf(host_block->Location()),
-                    "Host store pairs blocks of different owners");
-            if (!op_id) {
-                op_id = nextOpId();
-                in_flight = std::make_shared<StoreInFlight>();
-            }
-            transfers.push_back(CacheTransfer{
-                .group_id = member.key.group_id,
-                .source_page = allocator.ResolveDeviceCacheBlockId(member.device_location),
-                .destination_page = allocator.ResolveCacheBlockId(*host_block),
-                .content_hash = member.key.content_hash.ToString(),
-                .page_offset = member.key.page_offset,
-            });
-            tickets.push_back(StoreTicket{member.key, CacheBlockRef{}, host_block});
-            member.host_block = std::move(host_block);
-            ++stats.blocks[member.key.group_id];
-            if (member.written_back_before) {
-                ++stats.recopied;
-            }
+            FatalCheck(bool(host_allocation.blocks[row]), "a Host segment is placed whole");
+            copy(member, std::move(host_allocation.blocks[row]));
+            emitted = true;
         }
         // A key's later members share the block its row was placed in.
         for (CacheEvictor::EvictedBlock& member : segments[s].members) {
@@ -388,7 +395,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
                 ++stats.in_flight;  // queued twice in this drain
             }
         }
-        if (row_range.first_row < row_range.past_end_row) {
+        if (emitted) {
             stores[s].push_back(StoreWait{.op_id = *op_id, .in_flight = in_flight});
         }
         if (stores[s].empty()) {

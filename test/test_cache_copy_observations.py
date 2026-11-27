@@ -26,6 +26,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 
 import pytest
+import torch
 
 from tokenspeed.runtime.cache.transfer.observations import (
     CompletedObservations,
@@ -150,7 +151,7 @@ class Device:
 @dataclass
 class Buffer:
     groups: list
-    device: str = "cpu"
+    device: torch.device = torch.device("cpu")
 
 
 @dataclass
@@ -167,6 +168,7 @@ class Geometry:
 
 @dataclass(frozen=True)
 class Backend:
+    backend: str = "dma"
     uses_device_tables: bool = False
     layer_ready: bool = False
 
@@ -296,6 +298,7 @@ def executor_factory(monkeypatch):
     class CPUExecutor(module.HostCacheExecutor):
         def __init__(self, *, capacity, rank, copy_failure=False, import_failure=False):
             self._cache_observations = CompletedObservations(capacity)
+            self._next_copy_batch_id = 0
             self._completions = CompletionQueue()
             self._ack_lock = threading.Lock()
             self._ready_load_acks = []
@@ -701,7 +704,7 @@ def test_host_data_plane_drains_completed_cpu_observations(executor_factory):
 
     class ModelBoundary:
         def __init__(self):
-            self.device = "cpu"
+            self.device = torch.device("cpu")
 
     handle = DeviceHandle(ModelBoundary(), host_cache_executor=executor)
     args = ServerArgs(model="fixture")
@@ -723,6 +726,8 @@ def test_host_data_plane_drains_completed_cpu_observations(executor_factory):
         epd_publisher=None,
         starting=False,
         record_cache_observations=True,
+        defer_recurrent_state=False,
+        replica_memory_transitions=False,
     )
     executor.submit_load_backs([restore()], prerequisite_stream=device.current_stream())
     assert plane.poll_cache_events() == []
@@ -736,3 +741,69 @@ def test_host_data_plane_drains_completed_cpu_observations(executor_factory):
     assert plane.poll_cache_observations() == ([], 0)
     empty = DeviceHandle(ModelBoundary())
     assert empty.poll_cache_observations() == ([], 0)
+
+
+def test_copy_batch_timing_is_shared_and_reports_unsupported_device():
+    from tokenspeed.runtime.cache.transfer.layout import CacheField, CacheGroupLayout
+    from tokenspeed.runtime.cache.transfer.observations import (
+        ObservationBatch,
+        PendingCopyTiming,
+    )
+
+    groups = (CacheGroupLayout("state", 1, (CacheField("state", 0, 0, 16, 16),)),)
+    sample = PendingCopyTiming(
+        batch_id=11,
+        backend="dma",
+        groups=groups,
+        rows=((0, 1, 2), (0, 3, 4)),
+        device_kind="cpu",
+        device_module=Device(),
+        stream=Stream(),
+    )
+    batch = sample.complete(
+        ObservationBatch(
+            observation("first").records + observation("second").records, 2
+        )
+    )
+    assert batch.dropped == 2
+    first, second = batch.records
+    assert first.copy_batch_id == second.copy_batch_id == 11
+    assert second.h2d_batch_timing is None
+    timing = first.h2d_batch_timing
+    assert timing.status == "unsupported" and timing.elapsed_ms is None
+    assert timing.bytes == 32 and timing.rows_by_group == (2,)
+    assert timing.group_ids == ("state",) and timing.backend == "dma"
+    assert sample.complete(ObservationBatch((), 1)).dropped == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA copy stream")
+def test_copy_batch_timing_measures_completed_h2d_on_a_real_stream():
+    from tokenspeed.runtime.cache.transfer.layout import CacheField, CacheGroupLayout
+    from tokenspeed.runtime.cache.transfer.observations import PendingCopyTiming
+
+    nbytes = 16 * 1024 * 1024
+    source = torch.full((nbytes,), 7, dtype=torch.uint8, pin_memory=True)
+    destination = torch.empty_like(source, device="cuda")
+    stream = torch.cuda.Stream()
+    groups = (
+        CacheGroupLayout("history", 1, (CacheField("kv", 0, 0, nbytes, nbytes),)),
+    )
+    sample = PendingCopyTiming(
+        batch_id=12,
+        backend="dma",
+        groups=groups,
+        rows=((0, 1, 1),),
+        device_kind="cuda",
+        device_module=torch.cuda,
+        stream=stream,
+    )
+    with torch.cuda.stream(stream):
+        destination.copy_(source, non_blocking=True)
+    sample.finish.record(stream)
+    # The test retires the copy; serving uses CompletionQueue.query instead.
+    sample.finish.synchronize()
+    assert sample.finish.query()
+    timing = sample.complete(observation()).records[0].h2d_batch_timing
+    assert timing.status == "measured" and timing.elapsed_ms > 0
+    assert timing.bytes == nbytes and timing.rows_by_group == (1,)
+    assert torch.equal(destination.cpu(), source)

@@ -105,6 +105,8 @@ pub enum Message {
     Offered(Key, Option<(Offer, Digest, Vec<PeerPageView>)>),
     /// Acquire exactly this offer.
     Pin(Key, Offer),
+    /// The exact unpinned offer expired. Only a fresh offer id may authorize a read.
+    Expired(Key, Offer),
     /// A grant requires every source member to have pinned.
     Grant(Key, Offer, bool),
     /// Terminal reader disposition.
@@ -226,7 +228,11 @@ impl Message {
     pub fn reply(&self) -> bool {
         matches!(
             self,
-            Self::LayoutReply(..) | Self::Offered(..) | Self::Grant(..) | Self::Ack(..)
+            Self::LayoutReply(..)
+                | Self::Offered(..)
+                | Self::Grant(..)
+                | Self::Expired(..)
+                | Self::Ack(..)
         )
     }
     /// Canonical little-endian encoding, beginning with the tag and version.
@@ -240,6 +246,7 @@ impl Message {
             Offered(..) => 0x13,
             Pin(..) => 0x14,
             Grant(..) => 0x15,
+            Expired(..) => 0x16,
             Release(..) => 0x17,
             Ack(..) => 0x18,
         };
@@ -279,7 +286,7 @@ impl Message {
                     put_pages(w, pages);
                 });
             }
-            Pin(k, o) => {
+            Pin(k, o) | Expired(k, o) => {
                 k.put(&mut w);
                 o.put(&mut w);
             }
@@ -374,6 +381,7 @@ impl Message {
             ),
             0x14 => Self::Pin(Key::get(&mut r)?, Offer::get(&mut r)?),
             0x15 => Self::Grant(Key::get(&mut r)?, Offer::get(&mut r)?, r.flag()?),
+            0x16 => Self::Expired(Key::get(&mut r)?, Offer::get(&mut r)?),
             0x17 => Self::Release(Key::get(&mut r)?, nonzero(&mut r)?, disposition(&mut r)?),
             0x18 => Self::Ack(
                 Key::get(&mut r)?,
@@ -443,11 +451,12 @@ mod tests {
             ),
             Message::Offered(key.clone(), Some((offer.clone(), [4; 32], vec![page]))),
             Message::Pin(key.clone(), offer.clone()),
-            Message::Grant(key.clone(), offer, true),
+            Message::Grant(key.clone(), offer.clone(), true),
+            Message::Expired(key.clone(), offer),
             Message::Release(key.clone(), 6, Disposition::Abort),
             Message::Ack(key, 6, Disposition::Abort, Closure::Closed),
         ];
-        for (tag, m) in [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18]
+        for (tag, m) in [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]
             .into_iter()
             .zip(&frames)
         {

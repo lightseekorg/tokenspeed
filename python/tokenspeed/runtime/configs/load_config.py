@@ -34,6 +34,7 @@ class LoadFormat(str, enum.Enum):
     PT = "pt"
     SAFETENSORS = "safetensors"
     INSTANTTENSOR = "instanttensor"
+    RUNAI_STREAMER = "runai_streamer"
     NPCACHE = "npcache"
     DUMMY = "dummy"
     SHARDED_STATE = "sharded_state"
@@ -56,6 +57,9 @@ class LoadConfig:
             using InstantTensor, which accelerates loading via distributed
             loading, pipelined prefetching, and direct I/O (with optional
             GPUDirect Storage support).
+        "runai_streamer" will stream safetensors weights from local storage or
+            cloud object stores (``gs://``, ``s3://``) using Run:ai Model
+            Streamer.
         "npcache" will load the weights in pytorch format and store
             a numpy cache to speed up the loading.
         "dummy" will initialize the weights with random values, which is
@@ -84,9 +88,23 @@ class LoadConfig:
     ext_yaml: str | None = None
 
     def __post_init__(self) -> None:
-        model_loader_extra_config = self.model_loader_extra_config or {}
-        if isinstance(model_loader_extra_config, str):
-            self.model_loader_extra_config = json.loads(model_loader_extra_config)
+        model_loader_extra_config = self.model_loader_extra_config
+        if model_loader_extra_config is None or model_loader_extra_config == "":
+            self.model_loader_extra_config = {}
+        elif isinstance(model_loader_extra_config, str):
+            try:
+                parsed = json.loads(model_loader_extra_config)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "model_loader_extra_config must be valid JSON"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("model_loader_extra_config must be a JSON object")
+            self.model_loader_extra_config = parsed
+        elif isinstance(model_loader_extra_config, dict):
+            self.model_loader_extra_config = dict(model_loader_extra_config)
+        else:
+            raise ValueError("model_loader_extra_config must be a JSON object or dict")
         self._verify_load_format()
 
         if self.ignore_patterns is not None and len(self.ignore_patterns) > 0:
