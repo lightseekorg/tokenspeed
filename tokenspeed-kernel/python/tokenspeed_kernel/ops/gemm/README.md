@@ -371,6 +371,17 @@ DeepGEMM picks a tile configuration from the token count (one per 16 tokens)
 and JIT-compiles each on first use. `warmup_fp8_projections` launches every
 configuration up to a token bound at startup so serving never compiles.
 
+## MXFP8 (1x32 UE8M0) startup warmup
+
+`flashinfer_mm_mxfp8` uses FlashInfer's CuTe DSL runner, which compiles each
+tactic (and its `HardwareInfo` cluster probe) on first execution. When startup
+loads a persisted autotune cache or runs with `--disable-autotune`, only the
+warmup batch's row counts run by default. During `kernel_warmup(enabled=True)`,
+`_warm_mxfp8_buckets` executes each `(device, N, K, dtype, out_dtype)` shape
+across FlashInfer's hybrid token buckets up to `max(M, get_autotune_max_num_tokens())`
+under `autotune(tune_mode=False, ...)` so every servable cached or default
+tactic compiles before serving starts without profiling or retaining GPU memory.
+
 ## Small-N BF16 Split-K policy
 
 `flashinfer_mm_bf16_small_n_splitk` uses FlashInfer's cached CuTe DSL Split-K

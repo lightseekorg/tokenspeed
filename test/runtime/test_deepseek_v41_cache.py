@@ -304,7 +304,8 @@ def test_decode_swa_written_early_is_the_attention_write(monkeypatch, rope):
     )
     attended = []
 
-    def fused_attention(q, cache, *args):
+    def fused_attention(q, cache, *args, positions_nonnegative):
+        assert positions_nonnegative is False
         # Read the SWA field the way attention would: after the write.
         attended.append((cache.clone(), args[0], args[1]))
         return q, q
@@ -4954,3 +4955,417 @@ def test_prefill_indexer_native_architecture(monkeypatch, major, minor, expected
         assert not dsv41.prefill_indexer_batching_supported(132)
     finally:
         deep_gemm.is_native_indexer_available.cache_clear()
+
+
+def test_canonical_swa_plan_skips_empty_prefix_and_batches_prefix_slots(monkeypatch):
+    """Canonical SWA plans skip cache_slots when prefix is empty and batch all
+    non-empty prefixes into a single cache_slots call, matching exact windows."""
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    slot_calls = []
+    real_cache_slots = backend.cache_slots
+
+    def track_slots(group_id, positions, req_indices, mode):
+        slot_calls.append((group_id, positions.numel()))
+        return real_cache_slots(group_id, positions, req_indices, mode)
+
+    monkeypatch.setattr(backend, "cache_slots", track_slots)
+
+    # Zero old SWA prefix (cached replay): zero cache_slots calls.
+    meta_empty = _extend(backend, tables, [74, 76], [64, 128], [64, 64], [138, 204])
+    slot_calls.clear()
+    plan_empty = backend._swa_query_plan(
+        meta_empty.positions,
+        meta_empty.request_indices,
+        ForwardMode.EXTEND,
+        query_shard=None,
+    )
+    assert slot_calls == []
+    for req_plan, count in zip(plan_empty.requests, (74, 76), strict=True):
+        assert req_plan.prefix_slots.numel() == 0
+        expected = torch.arange(count, dtype=torch.int32)[:, None] + torch.arange(
+            -127, 1, dtype=torch.int32
+        )
+        expected = expected.masked_fill(expected < 0, -1)
+        assert torch.equal(req_plan.swa_indices, expected)
+
+    # Mixed prefixes (partial 37 and full 127): exactly one batched cache_slots call.
+    meta_mixed = _extend(backend, tables, [6, 5], [37, 130], [0, 0], [43, 135])
+    slot_calls.clear()
+    plan_mixed = backend._swa_query_plan(
+        meta_mixed.positions,
+        meta_mixed.request_indices,
+        ForwardMode.EXTEND,
+        query_shard=None,
+    )
+    assert slot_calls == [(SWA, 37 + 127)]
+    for req_plan, pcount, count in zip(
+        plan_mixed.requests, (37, 127), (6, 5), strict=True
+    ):
+        assert req_plan.prefix_slots.numel() == pcount
+        expected = torch.arange(pcount, pcount + count, dtype=torch.int32)[
+            :, None
+        ] + torch.arange(-127, 1, dtype=torch.int32)
+        expected = expected.masked_fill(expected < 0, -1)
+        assert torch.equal(req_plan.swa_indices, expected)
+
+
+def _install_cpu_v41_prefill_kernels(monkeypatch):
+    """Deterministic CPU stand-ins for GPU-only V4.1 prefill Triton kernels."""
+
+    def cpu_pack(rows, fmt, out):
+        dst = (
+            torch.empty((rows.shape[0], 1024), dtype=torch.uint8)
+            if out is None
+            else out
+        )
+        dst.copy_(rows.contiguous().view(torch.uint8))
+        return dst
+
+    def cpu_unpack(packed, fmt, out):
+        vals = packed.contiguous().view(torch.bfloat16)
+        if out is None:
+            return vals.clone()
+        out.copy_(vals)
+        return out
+
+    def cpu_scatter(rows, cache, slots, fmt):
+        live = slots >= 0
+        idx = slots[live].long()
+        # Encode first 16 bf16 values into cache bytes (fits 288/528 byte rows).
+        cache[idx // 64, idx % 64, :32] = rows[live, :16].contiguous().view(torch.uint8)
+
+    def cpu_gather(cache, slots, fmt, out):
+        dst = (
+            torch.zeros((*slots.shape, 512), dtype=torch.bfloat16)
+            if out is None
+            else out
+        )
+        dst.zero_()
+        live = slots >= 0
+        if live.any():
+            idx = slots[live].long()
+            raw = cache[idx // 64, idx % 64, :32].contiguous().view(torch.bfloat16)
+            dst[live, :16] = raw
+        return dst
+
+    def cpu_prefill_indices(
+        swa_indices, logical_rows, global_slots, rows, history_base
+    ):
+        sel = logical_rows[rows]
+        valid = global_slots[rows] >= 0
+        shifted = torch.where(valid, sel + history_base[:, None], -1).to(torch.int32)
+        return torch.cat((swa_indices, shifted), dim=1)
+
+    def cpu_selected_attention(
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        out,
+        query_chunk,
+        schedule,
+        prefill_kv,
+        prefill_indices,
+        *,
+        lse,
+    ):
+        kv = prefill_kv[:, 0, :]
+        res = torch.zeros_like(q) if out is None else out
+        for row_i in range(q.shape[0]):
+            idx = prefill_indices[row_i]
+            valid = idx[idx >= 0].long()
+            if valid.numel():
+                # Deterministic reduction of gathered workspace KV rows.
+                res[row_i] = kv[valid].float().mean(dim=0).to(q.dtype)[None, :]
+            else:
+                res[row_i].zero_()
+        return res
+
+    monkeypatch.setattr(dsv41, "cache_pack", cpu_pack)
+    monkeypatch.setattr(dsv41, "cache_unpack", cpu_unpack)
+    monkeypatch.setattr(dsv41, "cache_scatter", cpu_scatter)
+    monkeypatch.setattr(dsv41, "cache_gather", cpu_gather)
+    monkeypatch.setattr(dsv41, "prefill_indices", cpu_prefill_indices)
+    monkeypatch.setattr(dsv41, "selected_attention", cpu_selected_attention)
+    return cpu_gather, cpu_prefill_indices
+
+
+def test_prefill_layout_shares_ratio_isolates_owner_workspace_and_caches_indices(
+    monkeypatch,
+):
+    """Owners with the same compression ratio share one prefill layout, never
+    cross-reuse each other's workspace histories, and reuse prefill_indices on
+    Reuse layers until a new index source runs or the forward ends."""
+    cpu_gather, cpu_prefill_indices = _install_cpu_v41_prefill_kernels(monkeypatch)
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [72, 70], [64, 64], [64, 64], [136, 134])
+    n = meta.positions.numel()
+
+    # Populate distinct global KV contents in owners 2 and 8 (both ratio 2).
+    g2 = torch.full((70, 512), 1.5, dtype=torch.bfloat16)
+    g8 = torch.full((70, 512), -2.5, dtype=torch.bfloat16)
+    for owner, values in ((2, g2), (8, g8)):
+        for req in range(2):
+            pos = torch.arange(0, 140, 2, dtype=torch.int64)
+            req_t = torch.full_like(pos, req)
+            slots = backend.cache_slots(R2, pos, req_t, ForwardMode.EXTEND)
+            dsv41.cache_scatter(
+                values,
+                backend.cache_pool.global_kv(owner),
+                slots,
+                backend.global_format,
+            )
+
+    gather_calls = []
+
+    def track_gather(cache, slots, fmt, out):
+        gather_calls.append((cache.data_ptr(), slots.numel(), fmt))
+        return cpu_gather(cache, slots, fmt, out)
+
+    indices_calls = []
+
+    def track_indices(*args):
+        indices_calls.append(1)
+        return cpu_prefill_indices(*args)
+
+    def fake_topk(
+        q,
+        weights,
+        cache,
+        table,
+        lengths,
+        cb,
+        topk,
+        cand_cap,
+        cand_bs,
+        q_chunk,
+        k_chunk,
+        pg,
+        outputs,
+        *rest,
+    ):
+        rows_out, lens_out, blocks_out, block_lens_out = outputs
+        rows_out.fill_(-1)
+        rows_out[:, 0] = 0
+        rows_out[:, 1] = 1
+        lens_out.fill_(2)
+        if blocks_out is not None:
+            blocks_out.fill_(-1)
+            block_lens_out.zero_()
+
+    monkeypatch.setattr(dsv41, "cache_gather", track_gather)
+    monkeypatch.setattr(dsv41, "prefill_indices", track_indices)
+    monkeypatch.setattr(dsv41, "index_topk", fake_topk)
+
+    q = torch.ones((n, 2, 512), dtype=torch.bfloat16)
+    swa = torch.zeros((n, 512), dtype=torch.bfloat16)
+    iq = torch.ones((n, 2, 128), dtype=torch.bfloat16)
+    iw = torch.ones((n, 2), dtype=torch.bfloat16)
+    sink = torch.full((2,), -100.0, dtype=torch.float32)
+
+    def run_layer(layer_id: int, is_source: bool):
+        return backend.forward_v41(
+            q,
+            swa,
+            layer_id=layer_id,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=iq if is_source else None,
+            index_weights=iw if is_source else None,
+            attn_sink=sink,
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=None,
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            fused_decode_groups=None,
+            key_rows=None,
+        )
+
+    backend.begin_indexer_forward()
+    out_l2 = run_layer(2, True)
+    # Zero old SWA prefix: no SWA prefix gather, only owner 2's global gather.
+    assert len(gather_calls) == 1
+    assert gather_calls[0][0] == backend.cache_pool.global_kv(2).data_ptr()
+    assert len(indices_calls) == 1
+
+    # Layer 3 reuses owner 2's workspace histories AND prefill_indices.
+    out_l3 = run_layer(3, False)
+    assert len(gather_calls) == 1
+    assert len(indices_calls) == 1
+    torch.testing.assert_close(out_l3, out_l2, rtol=0, atol=0)
+
+    # Layer 8 has the same ratio (2) as layer 2, so it shares the layout object,
+    # but MUST gather owner 8's own global KV and compute fresh prefill_indices.
+    plan = backend._swa_query_plan(
+        meta.positions, meta.request_indices, ForwardMode.EXTEND, query_shard=None
+    )
+    layout_r2 = backend._prefill_layouts[(id(plan), 2)]
+    out_l8 = run_layer(8, True)
+    assert backend._prefill_layouts[(id(plan), 2)] is layout_r2
+    assert len(backend._prefill_layouts) == 1
+    assert len(gather_calls) == 2
+    assert gather_calls[1][0] == backend.cache_pool.global_kv(8).data_ptr()
+    assert len(indices_calls) == 2
+    assert (out_l2[..., :16].mean() > 0) and (out_l8[..., :16].mean() < 0)
+
+    # Layer 9 reuses owner 8's workspace histories AND prefill_indices.
+    out_l9 = run_layer(9, False)
+    assert len(gather_calls) == 2
+    assert len(indices_calls) == 2
+    torch.testing.assert_close(out_l9, out_l8, rtol=0, atol=0)
+
+    # Ending the forward releases cached prefill_indices tensors.
+    assert layout_r2.indices_cache
+    backend.end_indexer_forward()
+    assert not layout_r2.indices_cache
+
+
+def test_direct_swa_prefill_matches_copied_workspace(monkeypatch):
+    """Writing single-batch SWA directly into _prefill_kv matches copying it."""
+    _install_cpu_v41_prefill_kernels(monkeypatch)
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [6, 5], [0, 0], [0, 0], [6, 5])
+    n = meta.positions.numel()
+    torch.manual_seed(17)
+    q = torch.randn((n, 2, 512), dtype=torch.bfloat16)
+    swa = torch.randn((n, 512), dtype=torch.bfloat16)
+    sink = torch.zeros(2, dtype=torch.float32)
+
+    def run_layer0():
+        return backend.forward_v41(
+            q,
+            swa,
+            layer_id=0,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=None,
+            index_weights=None,
+            attn_sink=sink,
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=None,
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            fused_decode_groups=None,
+            key_rows=None,
+        )
+
+    direct = run_layer0()
+    # Force multi-batch so direct_swa is disabled and copy_rows executes.
+    backend._prefill_layouts.clear()
+    saved_rows = backend._prefill_kv_rows
+    backend._prefill_kv_rows = 7
+    try:
+        copied = run_layer0()
+    finally:
+        backend._prefill_kv_rows = saved_rows
+        backend._prefill_layouts.clear()
+    torch.testing.assert_close(direct, copied, rtol=0, atol=0)
+
+
+def test_selection_geometry_multi_member_matches_per_member():
+    """Vectorized multi-member _selection_geometry matches per-member expansion."""
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [5, 7], [128, 64], [0, 0], [133, 71])
+    source_table = meta.block_tables[R2]
+    table = source_table[:, :4]
+    spans = backend._prefill_spans
+    merged = ((spans[0], 5), (spans[0], 0), (spans[1], 7))
+    geom = backend._selection_geometry(
+        meta.positions,
+        meta.request_indices,
+        source_table,
+        table,
+        2,
+        0,
+        12,
+        merged,
+        ForwardMode.EXTEND,
+    )
+    assert geom.kernel_metadata.history_rows == (5, 7)
+    width = max(1, max((s.prefix + s.count) // 2 + 63 for s in spans) // 64)
+    r0 = table[0:1, :width].masked_fill(table[0:1, :width] <= 0, -1).expand(5, -1)
+    r1 = table[1:2, :width].masked_fill(table[1:2, :width] <= 0, -1).expand(7, -1)
+    assert torch.equal(geom.table, torch.cat((r0, r1), dim=0))
+
+
+def test_fused_prefill_caches_nonnegative_positions(monkeypatch):
+    """Fused prefill caches contiguous nonnegative int32 positions once per plan."""
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [4, 3], [0, 0], [0, 0], [4, 3])
+    n = meta.positions.numel()
+    seen = []
+
+    def fake_swa_rope_scatter(values, pos, rope, cache, slots, fmt, out, weight, eps):
+        out.copy_(values)
+
+    def fake_fused(
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        positions,
+        cos_sin_cache,
+        num_groups,
+        prefill_kv,
+        prefill_indices,
+        *,
+        positions_nonnegative,
+    ):
+        seen.append((positions, positions_nonnegative))
+        width = q.shape[1] * q.shape[2] // num_groups
+        return (
+            torch.zeros((q.shape[0], num_groups, width), dtype=torch.float8_e4m3fn),
+            torch.zeros((q.shape[0], num_groups, width // 128), dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(dsv41, "swa_rope_scatter", fake_swa_rope_scatter)
+    monkeypatch.setattr(dsv41, "selected_attention_fp8", fake_fused)
+    q = torch.zeros((n, 64, 512), dtype=torch.bfloat16)
+    swa = torch.zeros((n, 512), dtype=torch.bfloat16)
+    rope = torch.zeros((256, 64), dtype=torch.float32)
+    sink = torch.zeros(64, dtype=torch.float32)
+
+    for layer_id in (0, 1):
+        backend.forward_v41(
+            q,
+            swa,
+            layer_id=layer_id,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=None,
+            index_weights=None,
+            attn_sink=sink,
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=rope,
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            fused_decode_groups=8,
+            key_rows=None,
+        )
+
+    assert len(seen) == 2
+    assert seen[0][1] is True and seen[1][1] is True
+    assert seen[0][0] is seen[1][0]
+    assert seen[0][0].dtype == torch.int32 and seen[0][0].is_contiguous()
+    assert torch.equal(seen[0][0], meta.positions.clamp_min(0).to(torch.int32))

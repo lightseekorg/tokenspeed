@@ -103,3 +103,15 @@ def _private_mm_mxfp8():
 
 def mm_mxfp8(*args, **kwargs):
     return _private_mm_mxfp8()(*args, **kwargs)
+
+
+def mxfp8_warmup_buckets(max_tokens: int) -> tuple[int, ...]:
+    """Return the FlashInfer hybrid token buckets covering ``max_tokens``."""
+    from flashinfer.fused_moe.utils import (
+        get_hybrid_num_tokens_buckets,
+        map_to_hybrid_bucket_uncapped,
+    )
+
+    return tuple(
+        get_hybrid_num_tokens_buckets(map_to_hybrid_bucket_uncapped(max_tokens))
+    )

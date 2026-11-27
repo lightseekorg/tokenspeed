@@ -419,12 +419,16 @@ def selected_attention_fp8(
     num_groups: int,
     prefill_kv: torch.Tensor | None,
     prefill_indices: torch.Tensor | None,
+    *,
+    positions_nonnegative: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused Q RoPE, selected attention and inverse RoPE with FP8 output.
 
     Q is unrotated BF16 [T,H,512] from the prepared Q weight; no extra Q norm
     is applied. Cache/selection inputs follow ``selected_attention``. A BF16
     workspace and its indices may replace paged inputs for draft decoding.
+    When ``positions_nonnegative`` is True, ``positions`` must already be
+    contiguous int32 with nonnegative entries, avoiding per-layer clamping.
     Returns E4M3 [T,groups,H/groups*512] and packed UE8M0 int32 scales for
     ``grouped_fp8_projection`` with the prepared output weight. Both prepared
     projections must be used together; this layout is not the ordinary output.
@@ -444,6 +448,7 @@ def selected_attention_fp8(
         num_groups,
         prefill_kv,
         prefill_indices,
+        positions_nonnegative=positions_nonnegative,
     )
 
 

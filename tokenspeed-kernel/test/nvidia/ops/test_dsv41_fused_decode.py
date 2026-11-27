@@ -250,6 +250,7 @@ def test_fused_decode_projection_and_graph(
             groups,
             workspace,
             workspace_slots,
+            positions_nonnegative=False,
         )
         projected = grouped_fp8_projection(
             codes, scales, permuted[2], permuted[3], None
@@ -374,6 +375,7 @@ def test_fused_decode_zero_capacity(device, layout, tokens):
         cos_sin,
         8,
         *workspace_args,
+        positions_nonnegative=False,
     )
     assert codes.shape == (tokens, 8, 4096) and codes.dtype == _FP8
     assert scales.shape == (tokens, 8, 32) and scales.dtype == torch.int32
@@ -400,6 +402,7 @@ def test_fused_decode_rejects_unsupported_output_group_width(device):
             4,
             torch.empty((0, 1, 512), dtype=torch.bfloat16, device=device),
             torch.empty((0, 64), dtype=torch.int32, device=device),
+            positions_nonnegative=False,
         )
     with pytest.raises(ValueError, match="8 heads"):
         dsv41.prepare_fused_decode_weights(
