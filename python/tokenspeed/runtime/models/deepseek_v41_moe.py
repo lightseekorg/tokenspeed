@@ -351,6 +351,13 @@ class DeepseekV4MoE(nn.Module):
         self.fuse_shared_expert()
 
     @staticmethod
+    def _refuse_fused_shared_expert_reload(*_args, **_kwargs) -> None:
+        raise RuntimeError(
+            "Cannot reload fused MegaMoE shared expert weights in place; "
+            "restart the engine to load a new checkpoint"
+        )
+
+    @staticmethod
     def _pad_shared_expert_weights(
         gate_up_weight: torch.Tensor,
         gate_up_scale: torch.Tensor,
@@ -366,22 +373,52 @@ class DeepseekV4MoE(nn.Module):
         alignment (e.g. 576 -> 640). Padding the shared expert's gate, up, and
         down lanes with zero FP8 codes and unit E8M0 scales (127) preserves
         exact mathematical equivalence while letting MegaMoE fuse it.
+
+        Returns ``None`` only when no zero-padding is applicable
+        (``shared_inter >= target_intermediate_size``); raises ``ValueError``
+        on inconsistent MXFP8 weight/scale shapes or dtypes so a malformed
+        checkpoint cannot silently fall back.
         """
         if down_weight.ndim != 2:
-            return None
+            raise ValueError(
+                f"Expected 2D shared expert down_weight, got shape {tuple(down_weight.shape)}"
+            )
         shared_inter = down_weight.shape[1]
         if (
-            not (0 < shared_inter < target_intermediate_size)
+            shared_inter <= 0
             or shared_inter % 32 != 0
+            or target_intermediate_size <= 0
             or target_intermediate_size % 32 != 0
+            or hidden_size <= 0
             or hidden_size % 32 != 0
-            or tuple(gate_up_weight.shape) != (2 * shared_inter, hidden_size)
-            or tuple(gate_up_scale.shape) != (2 * shared_inter, hidden_size // 32)
-            or tuple(down_weight.shape) != (hidden_size, shared_inter)
-            or tuple(down_scale.shape) != (hidden_size, shared_inter // 32)
-            or gate_up_scale.dtype != torch.uint8
-            or down_scale.dtype != torch.uint8
         ):
+            raise ValueError(
+                "Shared expert MXFP8 dimensions must be positive multiples of 32: "
+                f"hidden_size={hidden_size}, shared_intermediate={shared_inter}, "
+                f"target_intermediate={target_intermediate_size}"
+            )
+        expected_shapes = (
+            ("gate_up_weight", gate_up_weight.shape, (2 * shared_inter, hidden_size)),
+            (
+                "gate_up_scale",
+                gate_up_scale.shape,
+                (2 * shared_inter, hidden_size // 32),
+            ),
+            ("down_weight", down_weight.shape, (hidden_size, shared_inter)),
+            ("down_scale", down_scale.shape, (hidden_size, shared_inter // 32)),
+        )
+        for name, actual, expected in expected_shapes:
+            if tuple(actual) != expected:
+                raise ValueError(
+                    f"Shared expert {name} shape mismatch: expected {expected}, "
+                    f"got {tuple(actual)}"
+                )
+        if gate_up_scale.dtype != torch.uint8 or down_scale.dtype != torch.uint8:
+            raise ValueError(
+                "Shared expert MXFP8 scales must be uint8, got "
+                f"{gate_up_scale.dtype} and {down_scale.dtype}"
+            )
+        if shared_inter >= target_intermediate_size:
             return None
         extra = target_intermediate_size - shared_inter
         w1, w3 = gate_up_weight.view(torch.uint8).chunk(2, dim=0)
@@ -466,6 +503,13 @@ class DeepseekV4MoE(nn.Module):
                     )
                     down.weight = nn.Parameter(down_w, requires_grad=False)
                     down.weight_scale_inv = nn.Parameter(down_s, requires_grad=False)
+                for param in (
+                    gate_up.weight,
+                    gate_up.weight_scale_inv,
+                    down.weight,
+                    down.weight_scale_inv,
+                ):
+                    param.weight_loader = self._refuse_fused_shared_expert_reload
                 for linear in (gate_up, down):
                     if isinstance(linear.quant_method, Fp8LinearMethod):
                         linear.quant_method.prepared_weight_scales = None

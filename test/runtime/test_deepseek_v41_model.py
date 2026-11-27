@@ -5146,12 +5146,17 @@ def test_mega_moe_pads_unaligned_shared_expert_losslessly(monkeypatch, accept):
         _run_shared(x, gu_w, gu_s, d_w, d_s), ref, rtol=0, atol=0
     )
 
+    from tokenspeed.runtime.model_loader.loader import post_load_transformed_modules
+
     if not accept:
         assert not moe.shared_expert_fused
         assert gate_up.weight.shape == (1152, 256)
         assert down.weight.shape == (256, 576)
         assert torch.equal(gate_up.weight.view(torch.uint8), raw_gu_w.view(torch.uint8))
         assert gate_up.quant_method.prepared_weight_scales is not None
+        assert not any(
+            "DeepseekV4MoE" in entry for entry in post_load_transformed_modules(moe)
+        )
         return
 
     assert moe.shared_expert_fused
@@ -5163,3 +5168,286 @@ def test_mega_moe_pads_unaligned_shared_expert_losslessly(monkeypatch, accept):
     assert gate_up.quant_method.projection_weight_scales is None
     assert down.quant_method.prepared_weight_scales is None
     assert down.quant_method.projection_weight_scales is None
+    # Disk reloads refuse transformed MegaMoE shared experts before any write,
+    # and direct reload attempts through weight_loader fail explicitly.
+    assert any("DeepseekV4MoE" in entry for entry in post_load_transformed_modules(moe))
+    for param in (
+        gate_up.weight,
+        gate_up.weight_scale_inv,
+        down.weight,
+        down.weight_scale_inv,
+    ):
+        with pytest.raises(RuntimeError, match="Cannot reload fused MegaMoE shared"):
+            param.weight_loader(param, param.data)
+
+
+def test_pad_shared_expert_weights_validates_shapes_and_dtypes():
+    """Malformed shared-expert tensors raise instead of silently declining;
+    matching or wider consistent shapes return None."""
+    from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
+
+    hidden, shared_inter, target_inter = 256, 576, 640
+    gu_w = torch.zeros((2 * shared_inter, hidden), dtype=torch.float8_e4m3fn)
+    gu_s = torch.full((2 * shared_inter, hidden // 32), 127, dtype=torch.uint8)
+    d_w = torch.zeros((hidden, shared_inter), dtype=torch.float8_e4m3fn)
+    d_s = torch.full((hidden, shared_inter // 32), 127, dtype=torch.uint8)
+
+    assert (
+        DeepseekV4MoE._pad_shared_expert_weights(
+            gu_w,
+            gu_s,
+            d_w,
+            d_s,
+            hidden_size=hidden,
+            target_intermediate_size=shared_inter,
+        )
+        is None
+    )
+    assert (
+        DeepseekV4MoE._pad_shared_expert_weights(
+            gu_w,
+            gu_s,
+            d_w,
+            d_s,
+            hidden_size=hidden,
+            target_intermediate_size=512,
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="shape mismatch"):
+        DeepseekV4MoE._pad_shared_expert_weights(
+            gu_w[:-2],
+            gu_s,
+            d_w,
+            d_s,
+            hidden_size=hidden,
+            target_intermediate_size=target_inter,
+        )
+    with pytest.raises(ValueError, match="must be uint8"):
+        DeepseekV4MoE._pad_shared_expert_weights(
+            gu_w,
+            gu_s.to(torch.float32),
+            d_w,
+            d_s,
+            hidden_size=hidden,
+            target_intermediate_size=target_inter,
+        )
+    with pytest.raises(ValueError, match="2D shared expert"):
+        DeepseekV4MoE._pad_shared_expert_weights(
+            gu_w,
+            gu_s,
+            d_w.reshape(-1),
+            d_s,
+            hidden_size=hidden,
+            target_intermediate_size=target_inter,
+        )
+
+
+def _check_fused_padded_shared_expert_survives_release() -> None:
+    """Fuse a 576->640 padded shared expert inside the weights memory-saver
+    region and verify 0 ordinary CUDA bytes after pause plus bit-exact output
+    and preserved parameter addresses across 2 release/resume cycles."""
+    import tempfile
+    from datetime import timedelta
+
+    import torch.distributed as dist
+    from tokenspeed_kernel.ops.moe import deep_gemm as mega_moe
+
+    from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    def _ordinary_bytes() -> int:
+        return sum(
+            segment["total_size"]
+            for segment in torch.cuda.memory_snapshot()
+            if segment["device"] == torch.cuda.current_device()
+            and tuple(segment["segment_pool_id"]) == (0, 0)
+        )
+
+    global_server_args_dict["enable_memory_saver"] = True
+    saver = TorchMemorySaverAdapter.create(enable=True, device="cuda")
+
+    experts, hidden, shared_inter, target_inter, top_k, limit = (
+        16,
+        2048,
+        576,
+        640,
+        4,
+        10.0,
+    )
+
+    class _Experts(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            gen = torch.Generator(device="cuda").manual_seed(11)
+
+            def u8(shape, low, high):
+                return torch.nn.Parameter(
+                    torch.randint(
+                        low,
+                        high,
+                        shape,
+                        dtype=torch.uint8,
+                        device="cuda",
+                        generator=gen,
+                    ),
+                    requires_grad=False,
+                )
+
+            self.w13_weight = u8((experts, 2 * target_inter, hidden // 2), 0, 256)
+            self.w13_weight_scale = u8(
+                (experts, 2 * target_inter, hidden // 32), 118, 122
+            )
+            self.w2_weight = u8((experts, hidden, target_inter // 2), 0, 256)
+            self.w2_weight_scale = u8((experts, hidden, target_inter // 32), 118, 122)
+            self.tp_size = 1
+            self.num_local_experts = self.num_experts = experts
+            self.hidden_size = hidden
+            self.intermediate_size = target_inter
+            self.top_k = top_k
+            self.swiglu_arg = type("SwigluArg", (), {"limit": limit})()
+            self._moe_backend_state = None
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dist.init_process_group(
+            "nccl",
+            init_method=f"file://{tmp}/rendezvous",
+            rank=0,
+            world_size=1,
+            timeout=timedelta(minutes=5),
+            device_id=torch.cuda.current_device(),
+        )
+        try:
+            plan = {
+                "persistent_max_num_tokens_per_gpu": 64,
+                "process_group": None,
+                "fast_math": True,
+            }
+            with saver.region(tag="weights", enable_cpu_backup=True):
+                w = _Experts()
+                mega_moe.deep_gemm_mxfp4_mega_moe_process_weights(plan, w)
+                gen = torch.Generator(device="cuda").manual_seed(19)
+                raw_gu_w = (
+                    torch.randn(2 * shared_inter, hidden, device="cuda", generator=gen)
+                    * 2
+                ).to(torch.float8_e4m3fn)
+                raw_gu_s = torch.randint(
+                    117,
+                    121,
+                    (2 * shared_inter, hidden // 32),
+                    dtype=torch.uint8,
+                    device="cuda",
+                    generator=gen,
+                )
+                raw_d_w = (
+                    torch.randn(hidden, shared_inter, device="cuda", generator=gen) * 2
+                ).to(torch.float8_e4m3fn)
+                raw_d_s = torch.randint(
+                    117,
+                    121,
+                    (hidden, shared_inter // 32),
+                    dtype=torch.uint8,
+                    device="cuda",
+                    generator=gen,
+                )
+                padded = DeepseekV4MoE._pad_shared_expert_weights(
+                    raw_gu_w,
+                    raw_gu_s,
+                    raw_d_w,
+                    raw_d_s,
+                    hidden_size=hidden,
+                    target_intermediate_size=target_inter,
+                )
+                assert padded is not None
+                gu_w, gu_s, d_w, d_s = padded
+                assert mega_moe.fuse_deep_gemm_mxfp4_mega_moe_shared_expert(
+                    plan, w, gu_w, gu_s, d_w, d_s
+                )
+                del raw_gu_w, raw_gu_s, raw_d_w, raw_d_s
+
+            with saver.named_region("executor_inputs"):
+                # Pre-allocate the shared live-request counter in the same
+                # named region ForwardStepRunner uses so it does not pin (0, 0).
+                mega_moe.mega_moe_live_requests("cuda")
+                gen_in = torch.Generator(device="cuda").manual_seed(23)
+                x = torch.randn(
+                    16,
+                    hidden,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    generator=gen_in,
+                )
+                ids = torch.stack(
+                    [
+                        torch.randperm(experts, device="cuda", generator=gen_in)[:top_k]
+                        for _ in range(16)
+                    ]
+                ).int()
+                weights = torch.rand(16, top_k, device="cuda", generator=gen_in)
+
+            tracked = (
+                gu_w,
+                gu_s,
+                d_w,
+                d_s,
+                w.w13_weight,
+                w.w13_weight_scale,
+                w.w2_weight,
+                w.w2_weight_scale,
+            )
+            ptrs = [tensor.data_ptr() for tensor in tracked]
+
+            @torch.inference_mode()
+            def run_cpu() -> torch.Tensor:
+                out = mega_moe.deep_gemm_mxfp4_mega_moe_apply(
+                    plan, x, w, None, weights, ids, None, None, True, False
+                )
+                result = out.cpu()
+                del out
+                return result
+
+            expected = run_cpu()
+            for _ in range(2):
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                saver.pause()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                ordinary = _ordinary_bytes()
+                assert ordinary == 0, ordinary
+                saver.resume()
+                assert [tensor.data_ptr() for tensor in tracked] == ptrs
+                torch.testing.assert_close(run_cpu(), expected, rtol=0, atol=0)
+        finally:
+            dist.destroy_process_group()
+
+
+def test_fused_padded_shared_expert_survives_memory_release():
+    import importlib.util
+    import subprocess
+    from pathlib import Path
+
+    if not (
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability()[0] == 10
+        and importlib.util.find_spec("deep_gemm") is not None
+    ):
+        pytest.skip("requires SM100 CUDA GPU with deep_gemm")
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_deepseek_v41_model import "
+                "_check_fused_padded_shared_expert_survives_release; "
+                "_check_fused_padded_shared_expert_survives_release()",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=600,
+        )
