@@ -737,7 +737,7 @@ class ServerArgs:
     min_kv_split: int | None = None
     kda_backend: str = "auto"
     # Records a request keeps per KDA layer between dense-state folds,
-    # including the verify window; None keeps max(16, draft tokens).
+    # including the verify window; None keeps 16. At least the draft tokens.
     kda_history_capacity: int | None = None
     drafter_attention_backend: str | None = None
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
@@ -4793,10 +4793,11 @@ class ServerArgs:
             default=ServerArgs.kda_history_capacity,
             help="Accepted KDA records each request keeps per layer between "
             "dense-state folds, counting the verify window (the speculative draft "
-            "tokens). Default: max(16, draft tokens); it must be at least the "
-            "draft tokens. A smaller capacity shrinks the per-request verify "
-            "workspace but folds the records into the dense state more often: at "
-            "the draft tokens themselves, every round that accepts any.",
+            "tokens). Default: 16; it must be at least the draft tokens, so a "
+            "window wider than 16 needs this option. A smaller capacity shrinks "
+            "the per-request verify workspace but folds the records into the "
+            "dense state more often: at the draft tokens themselves, every round "
+            "that accepts any.",
         )
         parser.add_argument(
             "--drafter-attention-backend",

@@ -382,10 +382,14 @@ def test_a_forward_stores_the_checkpoints_of_several_rows():
         extend_state_checkpoint_lens_cpu=torch.tensor(offsets, dtype=torch.int32),
         query_shard=None,
     )
+    # Every KDA layer's gather reads the count its row's slot keeps, which
+    # all layers share: it clears once, after the last layer's gather.
+    counts = server.backend._replay_length
+    counts[1:3].fill_(3)
     for layer in LAYERS:
-        server.backend._retained_lengths[layer][1:3].fill_(3)
+        assert counts[1:3].flatten().tolist() == [3, 3], layer
         server.forward(layer, streams[layer], 0, sum(lengths), bs=2)
-        assert not server.backend._retained_lengths[layer][1:3].any()
+    assert not counts[1:3].any()
     torch.cuda.synchronize()
 
     starts = [0, lengths[0]]

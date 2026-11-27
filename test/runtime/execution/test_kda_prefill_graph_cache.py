@@ -419,8 +419,11 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
     correction.copy_((0.01 * torch.arange(1, 11, device="cuda")).view(10, 1, 1, 1))
     key.fill_(0.02)
     decay.fill_(0.9)
+    # The accepted count every layer shares; this forward's only KDA layer
+    # gathers with it and then clears it.
     length = torch.zeros(10, 1, device="cuda", dtype=torch.int32)
-    backend._retained_lengths = {0: length}
+    backend._replay_length = length
+    backend._state_layer_ids = lambda: [0]
     backend.__dict__.update(
         is_draft=False,
         cache_pool=object(),
@@ -757,7 +760,7 @@ def test_plain_metadata_norms_the_zero_padded_bucket():
     )
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
-    backend._retained_lengths = {0: torch.zeros(4, 1, device="cuda", dtype=torch.int32)}
+    backend._replay_length = torch.zeros(4, 1, device="cuda", dtype=torch.int32)
     backend.__dict__.update(
         is_draft=False,
         cache_pool=object(),

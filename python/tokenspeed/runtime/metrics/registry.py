@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -74,8 +75,6 @@ def register_metric_reporter(
         ValueError: The name is invalid, reserved, or already registered.
         TypeError: A supplied callback is not callable.
     """
-    from tokenspeed.runtime.plugins.registry import record_external
-
     if not isinstance(name, str) or not name or name.strip() != name:
         raise ValueError("Metric reporter name must be a nonempty, unpadded string")
     if name == "prometheus":
@@ -103,7 +102,11 @@ def register_metric_reporter(
                 else:
                     _REPORTERS[name] = previous
 
-        record_external("metric reporter", name, undo)
+        # Recording can only be active after the plugin registry is imported.
+        # Standalone metric outputs need not import the inference runtime.
+        plugin_registry = sys.modules.get("tokenspeed.runtime.plugins.registry")
+        if plugin_registry is not None:
+            plugin_registry.record_external("metric reporter", name, undo)
 
 
 def get_metric_reporter(name: str) -> MetricReporter:
