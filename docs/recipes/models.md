@@ -1122,14 +1122,16 @@ tokenspeed serve Qwen/Qwen3-30B-A3B \
 ### LongCat-Flash-Lite on Ascend NPU
 
 The Ascend path supports the LongCat-Flash-Lite checkpoint on one or more
-NPUs. It uses the normal TokenSpeed scheduler and paged KV cache: prefill runs
-eagerly, while the runtime captures fixed-shape decode batches as ACL Graphs.
-All seven decode capture sizes were validated
+NPUs. It uses the normal TokenSpeed scheduler and paged KV cache: the runtime
+captures both the fixed-shape prefill buckets and the fixed-shape decode
+batches as ACL Graphs (prefill graphs are enabled through the N-gram
+`HistoryEmbeddingModel` seam; see below). All seven decode capture sizes were
+validated
 (`--cudagraph-capture-sizes 64 32 16 8 4 2 1`, 7/7 captures succeeded).
 
 The validated environment is the same as the Qwen3-0.6B NPU recipe: CANN
 9.0.0, PyTorch 2.9.0, `torch_npu` 2.9.0.post2, Transformers 5.12.0, Triton
-3.2.0, Triton-Ascend 3.2.1, `apache-tvm-ffi==0.1.13`, and editable
+3.2.0, Triton-Ascend 3.2.1, `apache-tvm-ffi==0.1.13.post3`, and editable
 `tokenspeed-kernel-npu==0.1.0`. From the repository root, install the Ascend
 dependencies, source CANN, and expose the three source packages:
 
@@ -1144,7 +1146,6 @@ python -m tokenspeed.cli serve <longcat-checkpoint> \
   --device npu \
   --dtype bfloat16 \
   --disable-pdl \
-  --disable-prefill-graph \
   --attention-backend mla \
   --sampling-backend greedy \
   --router-topk torch \
@@ -1175,20 +1176,24 @@ substitute the actual weights path; there is no public Hub ID. Pass
 `--trust-remote-code` because the checkpoint ships its own
 `configuration_longcat_ngram` remote code for parsing `config.json`.
 
-LongCat-Flash-Lite keeps prefill eager for a model reason: its N-gram
-embedding reads the request's token-history predecessor windows, which are
-not fixed-shape, so pass `--disable-prefill-graph`. PDL (programmatic
-dependent launch) is not supported on NPU, so `--disable-pdl` is mandatory.
-Do not pass `--enforce-eager`, because that also disables the decode ACL
-Graph. Although the graph flags retain their CUDA-oriented names for CLI
-compatibility, they control ACL Graph capture on an NPU. The `mla` attention
+LongCat-Flash-Lite keeps the prefill graphs enabled: the N-gram model
+implements the official `HistoryEmbeddingModel` protocol, so the prefill graph
+embeds the request token history eagerly through `compute_input_embeddings`
+before the captured forward replays — do not pass `--disable-prefill-graph`.
+PDL (programmatic dependent launch) is not supported on NPU, so `--disable-pdl`
+is mandatory. Do not pass `--enforce-eager`, because that would disable both
+the decode ACL Graphs and the prefill graphs. Although the graph flags retain
+their CUDA-oriented names for CLI compatibility, they control ACL Graph
+capture on an NPU. The `mla` attention
 backend and the `greedy` sampling backend are the validated Ascend choices.
 LongCat's MLA attention and zero-expert MoE additionally require
 `--mla-lora-scale folded`, `--router-topk torch`, and
 `--ep-dispatch-algorithm static_with_zero_expert` with
 `--expert-distribution-recorder-mode stat` and `--all2all-backend none`. The
 command above captures decode batches 64, 32, 16, 8, 4, 2, and 1 as ACL
-Graphs (all seven validated). Scale `--max-model-len`, the KV pool
+Graphs (all seven validated) and the prefill buckets
+(`--prefill-graph-capture-sizes`) as breakable graphs. Scale `--max-model-len`,
+the KV pool
 (`--gpu-memory-utilization`), and the capture sizes together when growing the
 deployment.
 
