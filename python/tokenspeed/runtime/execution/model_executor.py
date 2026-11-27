@@ -1181,13 +1181,23 @@ class ModelExecutor:
                     )
 
         if self.device == "npu" and self.config.enable_memory_saver:
+            from tokenspeed.runtime.layers.moe.peer_weights import (
+                peer_weights_controller_for,
+            )
+
             models = [("target", self.model_runner.model)]
             if self._draft_model_runner is not None:
                 models.append(("draft", self._draft_model_runner.model))
+            peer_storages: set[tuple[int, int]] = set()
+            for _, model in models:
+                controller = peer_weights_controller_for(model)
+                if controller is not None:
+                    peer_storages.update(controller.vmm_managed_storages())
             self.model_runner.memory_saver_adapter.validate_startup(
                 models=models,
                 kv_regions=self.token_to_kv_pool.arena.regions,
                 graphs=self.forward_step.graphs.values(),
+                peer_storages=frozenset(peer_storages),
             )
 
     @property

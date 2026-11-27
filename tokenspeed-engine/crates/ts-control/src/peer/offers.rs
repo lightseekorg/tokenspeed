@@ -124,8 +124,8 @@ impl Offers {
             .filter(|r| !matches!(r.phase, Phase::Soft | Phase::Closed(_)))
             .count()
     }
-    pub fn has(&self, key: &Key) -> bool {
-        self.records.contains_key(key)
+    pub fn offer_id(&self, key: &Key) -> Option<u64> {
+        self.records.get(key).map(|r| r.offer.id)
     }
     pub fn expire(&mut self, now: i64, retirement_bound_ms: u32, s: &mut Scheduler) -> Vec<Vote> {
         let due: Vec<_> = self
@@ -165,6 +165,15 @@ impl Offers {
             return miss();
         }
         let hash: Digest = Sha256::digest(msg.encode()).into();
+        // Expiration may run after this round's messages. Replace only unpinned
+        // metadata; a new lookup always gets a fresh holder-issued capability.
+        if self
+            .records
+            .get(key)
+            .is_some_and(|r| r.phase == Phase::Soft && r.until <= now)
+        {
+            self.records.remove(key);
+        }
         if let Some(r) = self.records.get(key) {
             if r.query != hash || r.phase != Phase::Soft || r.until <= now {
                 return miss();
@@ -250,7 +259,12 @@ impl Offers {
         else {
             return;
         };
-        if k != other || self.records.contains_key(k) {
+        if k != other
+            || self
+                .records
+                .get(k)
+                .is_some_and(|r| r.phase != Phase::Soft || r.offer.id >= o.id)
+        {
             return;
         }
         let lease = PeerLeaseView {
@@ -298,14 +312,18 @@ impl Offers {
                 }),
             )
         };
+        let expired = || (Some(Message::Expired(k.clone(), o.clone())), None);
         let Some(r) = self.records.get_mut(k) else {
-            return no();
+            // A forgotten offer cannot grant a PIN. Let the reader look it up
+            // once more and validate the exact pages under a fresh offer.
+            return expired();
         };
         if *o != r.offer {
             return no();
         }
         match r.phase {
-            Phase::Soft if r.until > now => {
+            Phase::Soft if r.until <= now => expired(),
+            Phase::Soft => {
                 r.phase = Phase::Preparing;
                 r.until = now.saturating_add(2_000_000);
                 r.held = self.device_pin_gate.allows(&r.checkpoint.pages)

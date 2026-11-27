@@ -50,3 +50,19 @@ pub mod shared_l2;
 pub mod startup;
 pub mod trace;
 pub mod transport;
+
+#[cfg(test)]
+fn init_test_scheduler() {
+    use pyo3::Python;
+    use std::sync::Once;
+    static START: Once = Once::new();
+    START.call_once(|| {
+        // The test binary is not in a Python prefix; point at the one the
+        // crate was built against.
+        std::env::set_var("PYTHONHOME", env!("TS_CONTROL_TEST_PYTHONHOME"));
+        Python::initialize();
+        // The scheduler's module, loaded once: the tests' threads find it
+        // loaded.
+        Python::attach(|py| ts_scheduler::python_module(py).map(drop)).unwrap();
+    });
+}
