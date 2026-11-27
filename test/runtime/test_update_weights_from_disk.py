@@ -163,7 +163,6 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
     runner.device = "cpu"
     runner.gpu_id = 0
     runner.checkpoint_load_group = None
-    runner._disk_reload_shapes = None
     # Resident weights (no peer sharing), so disk reloads are allowed.
     runner.mapping = Mapping(rank=0)
     runner.model_config = SimpleNamespace(
@@ -179,13 +178,23 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
         weight_loader_prefetch_checkpoints=False,
         weight_loader_prefetch_num_threads=1,
     )
+    # Some CPU fixtures initialize weights in memory, without a startup checkpoint.
+    runner._disk_reload_shapes = (
+        WeightLoader.checkpoint_shapes(runner.model_config, runner.server_args, model)
+        if any(booted_from.glob("*.safetensors"))
+        else {}
+    )
     return runner
 
 
-def test_disk_reload_keeps_shape_validation_after_initial_source_is_removed(tmp_path):
+@pytest.mark.parametrize("startup_format", ["auto", "runai_streamer"])
+def test_disk_reload_keeps_shape_validation_after_initial_source_is_removed(
+    tmp_path, startup_format
+):
     initial = tmp_path / "initial"
     _write_checkpoint(initial, scale=1)
     runner = _runner(_TinyModel(), initial)
+    runner.server_args.load_format = startup_format
     runner._disk_reload_shapes = WeightLoader.checkpoint_shapes(
         runner.model_config, runner.server_args, runner.model
     )
@@ -208,6 +217,19 @@ def test_disk_reload_keeps_shape_validation_after_initial_source_is_removed(tmp_
     assert ok, message
     assert torch.equal(runner.model.w, expected["w"])
     assert torch.equal(runner.model.b, expected["b"])
+
+
+@pytest.mark.parametrize("source", ["s3://test/model", "gs://test/model"])
+def test_streamer_object_store_startup_has_no_local_shape_snapshot(tmp_path, source):
+    runner = _runner(_TinyModel(), tmp_path)
+    runner.server_args.load_format = "runai_streamer"
+    runner.model_config.model_path = source
+    assert (
+        WeightLoader.checkpoint_shapes(
+            runner.model_config, runner.server_args, runner.model
+        )
+        == {}
+    )
 
 
 def _device_handle(runner, drafter=None) -> DeviceHandle:

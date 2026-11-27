@@ -29,6 +29,7 @@ from tokenspeed.runtime.model_loader.loader import (
     CheckpointFileSelection,
     DefaultModelLoader,
 )
+from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
 from tokenspeed.runtime.model_loader.weight_utils import (
     require_unit_kv_scale_file,
     safetensors_tensor_shapes,
@@ -58,18 +59,24 @@ class WeightLoader:
     ) -> dict[str, tuple[int, ...]]:
         """Snapshot the source shapes used to validate later disk updates.
 
-        Only safetensors headers are read. Formats without safetensors shape
-        validation, including dummy loading, return an empty snapshot. A later
-        update therefore never needs to reopen the initial checkpoint.
+        Only local safetensors headers are read, including Run:ai checkpoints.
+        Object-store sources and formats without local safetensors headers,
+        including dummy loading, return an empty snapshot. A later update
+        therefore never needs to reopen the initial checkpoint.
         """
         load_format = server_args.load_format
         if load_format not in (
             LoadFormat.AUTO,
             LoadFormat.SAFETENSORS,
             LoadFormat.INSTANTTENSOR,
+            LoadFormat.RUNAI_STREAMER,
             LoadFormat.MISTRAL,
             LoadFormat.PT,
             LoadFormat.NPCACHE,
+        ):
+            return {}
+        if load_format == LoadFormat.RUNAI_STREAMER and is_object_store_uri(
+            model_config.model_path
         ):
             return {}
         loader = DefaultModelLoader(

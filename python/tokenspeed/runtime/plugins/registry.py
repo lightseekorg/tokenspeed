@@ -235,7 +235,7 @@ def register_post_model_init_hook(name: str, hook: PostModelInitHook) -> None:
     """
     if not name or name != name.strip():
         raise ValueError(
-            "Post-model-init hook name must be nonempty without whitespace"
+            "Post-model-init hook name must be nonempty without surrounding whitespace"
         )
     if not callable(hook):
         raise TypeError("Post-model-init hook must be callable")

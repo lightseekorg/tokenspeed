@@ -156,7 +156,7 @@ class ModelRunner:
         self.is_draft_worker = is_draft_worker
         self.checkpoint_load_group = checkpoint_load_group
         # Captured before startup hooks; later disk reloads replace the snapshot.
-        self._disk_reload_shapes: dict[str, tuple[int, ...]] | None = None
+        self._disk_reload_shapes: dict[str, tuple[int, ...]] = {}
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
         self.dp_linear_max_tokens: int | None = None
@@ -809,22 +809,6 @@ class ModelRunner:
             return None, str(e)
 
         held = self._disk_reload_shapes
-        if held is None:
-            try:
-                _, held_files, held_safetensors = loader._prepare_weights(
-                    self.model_config.model_path,
-                    getattr(self.model_config, "revision", None),
-                    fall_back_to_pt,
-                    weight_files,
-                )
-                held = safetensors_tensor_shapes(held_files) if held_safetensors else {}
-            except Exception as e:  # noqa: BLE001 - only the shape check is lost
-                logger.warning(
-                    "update_weights_from_disk: cannot read the shapes of "
-                    f"{self.model_config.model_path!s} ({e!s}); "
-                    "checking the new checkpoint's shards only"
-                )
-                held = {}
         # The default loader fills a one-element parameter from any
         # one-element tensor, so those match whatever their shapes.
         mismatched = [

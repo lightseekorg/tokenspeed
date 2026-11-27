@@ -82,9 +82,11 @@ a draft. Hooks own their synchronization, must run in the same order on every
 rank, and propagate failures to startup. Registration joins the plugin loader's
 normal recording and rollback.
 
-The host reads its tokenizer and snapshots initial checkpoint shapes before
-this boundary. Later disk updates validate against the saved shapes rather
-than reopening the initial source directory. Plugins must prepare their own
+The host reads its tokenizer and snapshots local safetensors checkpoint shapes
+before this boundary, including local Run:ai sources. Object-store sources and
+formats without local safetensors headers keep an empty shape snapshot. Later
+disk updates validate against the saved shapes rather than reopening the initial
+source directory. Plugins must prepare their own
 metadata before retiring a source; external frontends and encode services own
 their source lifetimes independently. Explicit reload requests still require
 the new checkpoint they name.
