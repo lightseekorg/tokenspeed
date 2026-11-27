@@ -1243,6 +1243,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
             trust_remote_code=False,
             revision="revision",
             architectures=["DeepseekV41ForCausalLM"],
+            download_dir=None,
         )
         events.append("tokenizer")
         return tokenizer
@@ -1256,6 +1257,7 @@ def test_weight_loader_initializes_engram_once_in_weight_region(
     args = SimpleNamespace(
         load_format="dummy",
         download_dir=None,
+        model_loader_extra_config={},
         ext_yaml=None,
         weight_loader_prefetch_checkpoints=False,
         weight_loader_prefetch_num_threads=1,

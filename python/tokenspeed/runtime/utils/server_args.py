@@ -168,18 +168,35 @@ def expert_placement_requested(server_args) -> bool:
 
 
 def _checkpoint_architectures(
-    model: str, revision: str | None, download: bool = False
+    model: str,
+    revision: str | None,
+    download: bool = False,
+    download_dir: str | None = None,
 ) -> list[str] | None:
     """The ``architectures`` of ``model``'s ``config.json``: from the model
-    directory, else from the local Hugging Face cache, else, with ``download``,
-    by downloading that file alone as ``get_config`` resolves a hub id
-    (HF_HUB_OFFLINE keeps it to the cache; a ModelScope id is not looked up on
-    the Hugging Face Hub). None when it cannot be read.
+    directory (or synced object-store metadata cache), else from the local
+    Hugging Face cache, else, with ``download``, by downloading that file alone
+    as ``get_config`` resolves a hub id (HF_HUB_OFFLINE keeps it to the cache;
+    a ModelScope id is not looked up on the Hugging Face Hub). None when it
+    cannot be read.
     """
     if not model:
         return []
-    path = os.path.join(model, "config.json")
-    if not os.path.isdir(model):
+    from tokenspeed.runtime.model_loader.object_store import (
+        is_object_store_uri,
+        resolve_checkpoint_metadata_dir,
+    )
+
+    local_dir = resolve_checkpoint_metadata_dir(
+        model,
+        download_dir=download_dir,
+        sync=download,
+    )
+    if local_dir is not None:
+        path = os.path.join(local_dir, "config.json")
+    elif is_object_store_uri(model):
+        return None
+    else:
         import huggingface_hub.constants
         from huggingface_hub import hf_hub_download, try_to_load_from_cache
 
@@ -449,6 +466,7 @@ class ServerArgs:
     tokenizer: str | None = None
     tokenizer_mode: str = "auto"
     load_format: str = "auto"
+    model_loader_extra_config: str | dict | None = None
     trust_remote_code: bool = True
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
@@ -1225,7 +1243,12 @@ class ServerArgs:
         network, ``_beam_checkpoint`` is None for a hub id the cache does not
         hold yet; engine setup calls this again with ``download``.
         """
-        architectures = _checkpoint_architectures(self.model, self.revision, download)
+        architectures = _checkpoint_architectures(
+            self.model,
+            self.revision,
+            download,
+            download_dir=self.download_dir,
+        )
         if (
             (
                 self.owned_attention_output != "reduce-scatter"
@@ -3141,6 +3164,63 @@ class ServerArgs:
                 "after loading, and no weight update rebuilds them"
             )
 
+    def _validate_object_store_options(self) -> None:
+        from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+        for flag, value in (
+            ("--model", self.model),
+            ("--tokenizer", self.tokenizer),
+            ("--speculative-draft-model-path", self.speculative_draft_model_path),
+        ):
+            if not (isinstance(value, str) and is_object_store_uri(value)):
+                continue
+            if self.load_format != "runai_streamer":
+                raise ValueError(
+                    f"{flag}={value!r} is an object-store URI and requires "
+                    f"--load-format runai_streamer, got {self.load_format!r}"
+                )
+            if flag in ("--model", "--tokenizer") and self.revision is not None:
+                raise ValueError(
+                    f"--revision={self.revision!r} is not supported with "
+                    f"object-store URI {flag}={value!r}; object-store "
+                    "checkpoints always stream live bucket state"
+                )
+            if flag == "--speculative-draft-model-path":
+                if self.speculative_draft_model_revision is not None:
+                    raise ValueError(
+                        "--speculative-draft-model-revision="
+                        f"{self.speculative_draft_model_revision!r} is not "
+                        f"supported with object-store URI {flag}={value!r}; "
+                        "object-store checkpoints always stream live bucket state"
+                    )
+                if self.draft_model_path_use_base and self.revision is not None:
+                    raise ValueError(
+                        f"--revision={self.revision!r} is not supported with "
+                        f"object-store URI {flag}={value!r}; object-store "
+                        "checkpoints always stream live bucket state"
+                    )
+
+    def _parse_model_loader_extra_config(self) -> None:
+        raw = self.model_loader_extra_config
+        if raw is None or raw == "":
+            self.model_loader_extra_config = {}
+            return
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "--model-loader-extra-config must be valid JSON"
+                ) from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("--model-loader-extra-config must be a JSON object")
+            self.model_loader_extra_config = parsed
+            return
+        if isinstance(raw, dict):
+            self.model_loader_extra_config = dict(raw)
+            return
+        raise ValueError("--model-loader-extra-config must be a JSON object or dict")
+
     def validate_petit_moe_options(self):
         """Validate shared backend, model, and scheduling options for Petit.
 
@@ -3458,6 +3538,8 @@ class ServerArgs:
             )
 
         self.validate_model_update_options()
+        self._validate_object_store_options()
+        self._parse_model_loader_extra_config()
 
         if (
             self.speculative_algorithm is not None
@@ -3653,6 +3735,7 @@ class ServerArgs:
                 "pt",
                 "safetensors",
                 "instanttensor",
+                "runai_streamer",
                 "npcache",
                 "dummy",
                 "extensible",
@@ -3666,9 +3749,19 @@ class ServerArgs:
             '"instanttensor" accelerates safetensors loading on NVIDIA GPUs '
             "via distributed loading, pipelined prefetching, and direct I/O "
             "(with optional GPUDirect Storage support). "
+            '"runai_streamer" streams safetensors weights from local storage '
+            "or cloud object stores (gs://, s3://) via Run:ai Model Streamer. "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values.',
+        )
+        parser.add_argument(
+            "--model-loader-extra-config",
+            type=str,
+            default=ServerArgs.model_loader_extra_config,
+            help="Optional JSON object of extra options for the selected "
+            "model loader (e.g., concurrency, memory_limit, distributed for "
+            "--load-format runai_streamer).",
         )
         parser.add_argument(
             "--trust-remote-code",
