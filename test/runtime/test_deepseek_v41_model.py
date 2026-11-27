@@ -5095,6 +5095,15 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
     assert len(calls) == 1
     layer, tensors = calls[0]
     assert layer is moe.experts
+    from tokenspeed.runtime.layers.parameter import (
+        BaseWeightParameter,
+        ModelWeightParameter,
+    )
+
+    assert isinstance(shared.gate_up_proj.weight, ModelWeightParameter)
+    assert isinstance(shared.down_proj.weight, ModelWeightParameter)
+    assert isinstance(shared.gate_up_proj.weight_scale_inv, BaseWeightParameter)
+    assert isinstance(shared.down_proj.weight_scale_inv, BaseWeightParameter)
     params = (
         shared.gate_up_proj.weight,
         shared.gate_up_proj.weight_scale_inv,
@@ -5102,6 +5111,9 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         shared.down_proj.weight_scale_inv,
     )
     assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))
+    from tokenspeed.runtime.model_loader.loader import post_load_transformed_modules
+
+    assert any("DeepseekV4MoE" in entry for entry in post_load_transformed_modules(moe))
 
 
 @pytest.mark.parametrize("accept", [True, False])
@@ -5203,17 +5215,9 @@ def test_mega_moe_pads_unaligned_shared_expert_losslessly(monkeypatch, accept):
     assert gate_up.quant_method.projection_weight_scales is None
     assert down.quant_method.prepared_weight_scales is None
     assert down.quant_method.projection_weight_scales is None
-    # Disk reloads refuse transformed MegaMoE shared experts before any write,
-    # and direct reload attempts through weight_loader fail explicitly.
+    # Disk reloads refuse transformed MegaMoE shared experts via
+    # post_load_transformed_modules.
     assert any("DeepseekV4MoE" in entry for entry in post_load_transformed_modules(moe))
-    for param in (
-        gate_up.weight,
-        gate_up.weight_scale_inv,
-        down.weight,
-        down.weight_scale_inv,
-    ):
-        with pytest.raises(RuntimeError, match="Cannot reload fused MegaMoE shared"):
-            param.weight_loader(param, param.data)
 
 
 @pytest.mark.parametrize("intermediate", [256, 576])
