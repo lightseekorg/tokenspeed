@@ -817,6 +817,8 @@ A TP1/KVP1 Decode worker may enable Peer and Mooncake storage together without
 the Prefill-only direct restore flag. In this combination storage publishes
 Host history but does not issue Host QUERY/GET restores; incoming request KV
 still follows PD. Decode without Peer retains its ordinary storage policy.
+This Decode configuration still requires `--kvstore-write-policy write_through`;
+L3 publication does not enable the separate Host `write_back` eviction policy.
 This write-back path additionally advertises an address-free source layout
 through its existing Store connection. A TP8/KVP8 Prefill reader can discover
 that layout by semantic model identity and weight generation, query the original

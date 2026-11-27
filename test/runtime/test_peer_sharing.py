@@ -281,7 +281,7 @@ def test_decode_peer_publishes_l3_without_host_restore():
     from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 
     args = _peer_args(disaggregation_mode="decode", kvstore_storage_backend="mooncake")
-    args.validate_peer_prefix_options()
+    args.validate_cache_options()
     config = StorageRuntimeConfig.from_extra_config(
         None,
         host_blocks=16,
@@ -289,6 +289,10 @@ def test_decode_peer_publishes_l3_without_host_restore():
         restore_to_host=args.l3_restore_to_host,
     )
     assert not config.scheduler.restore_to_host
+    # L3 publication does not enable the separate Host eviction-write policy.
+    args.kvstore_write_policy = "write_back"
+    with pytest.raises(ValueError, match="write_back does not support"):
+        args.validate_cache_options()
     # Decode without Peer retains the existing storage restore path.
     args.peer_prefix_port = None
     assert args.l3_restore_to_host
