@@ -763,12 +763,19 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
 def _max_forward_tokens() -> int:
     """The most tokens one forward carries, as execution/device.py sizes it."""
     args = global_server_args_dict
-    chunk = int(args["chunked_prefill_size"])
-    tokens = (
-        chunk
-        if chunk > 0
-        else int(args["max_prefill_tokens"]) + int(args["max_model_len"])
-    )
+    chunk_raw = args["chunked_prefill_size"]
+    chunk = 0 if chunk_raw is None else int(chunk_raw)
+    if chunk > 0:
+        tokens = chunk
+    else:
+        max_prefill = args["max_prefill_tokens"]
+        max_model_len = args["max_model_len"]
+        if max_prefill is None or max_model_len is None:
+            raise ValueError(
+                "V4.1 warmup requires chunked_prefill_size or both "
+                "max_prefill_tokens and max_model_len to be configured"
+            )
+        tokens = int(max_prefill) + int(max_model_len)
     decode_rows = max(
         int(args["max_cudagraph_capture_size"] or 0), int(args["max_num_seqs"] or 0)
     )
@@ -3978,8 +3985,9 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             for module in self.modules()
             if isinstance(module, DeepseekV41Attention)
         ]
-        max_tokens = _max_forward_tokens()
+        max_tokens: int | None = None
         if attentions:
+            max_tokens = _max_forward_tokens()
             _warmup_query_projections(attentions, max_tokens)
         warmed_routers = set()
         for module in self.modules():
@@ -4001,6 +4009,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                         has_placement,
                     )
                     if router_key not in warmed_routers:
+                        if max_tokens is None:
+                            max_tokens = _max_forward_tokens()
                         module.warmup_router(max_tokens)
                         warmed_routers.add(router_key)
 
