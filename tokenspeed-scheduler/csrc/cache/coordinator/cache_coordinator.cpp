@@ -349,8 +349,9 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
                                       node->StateEntries(BoundaryTree::kDisk);
         const bool no_hotter_descendant =
             store_.NumStateGroups() > 0 ? !node->HasRamCheckpointInProperSubtree() : (node->first_child == nullptr);
-        const bool swa_disk_only = store_.DiskPool() != nullptr && swa_disk > 0 && swa_dev == 0 && swa_host == 0 &&
-                                   node->PendingHostStores() == 0 && no_hotter_descendant;
+        const bool swa_disk_only =
+            store_.DiskPool() != nullptr && swa_disk > 0 && node->PendingHostStores() == 0 && no_hotter_descendant &&
+            ((swa_dev == 0 && swa_host == 0) || HasDiskOnlySwaEntry(boundary, tail_tokens));
         const bool lower_tier_only = state_disk_only || swa_disk_only;
         const bool any_history = on_device == expected || on_host == expected || on_disk == expected;
         return {.device_publishable = on_device == expected && !lower_tier_only,
@@ -383,6 +384,34 @@ bool CacheCoordinator::HoldsStateCheckpoint(const ContentHash& content_hash) con
         any_state_group = true;
     }
     return any_state_group;
+}
+
+bool CacheCoordinator::HasDiskOnlySwaEntry(const CacheKey& boundary, std::int32_t tail_tokens) const {
+    const BlockPool* disk_pool = store_.DiskPool();
+    if (disk_pool == nullptr) {
+        return false;
+    }
+    const BlockPool& device_pool = store_.DevicePool();
+    const BlockPool* host_pool = store_.HostPool();
+    for (std::size_t i = 0; i < store_.Groups().size(); ++i) {
+        const CacheGroup& group = store_.Groups()[i];
+        const auto gi = static_cast<std::int32_t>(i);
+        if (store_.GroupIsState(i) || group.Matcher().IsPrefixClosed() || store_.GroupIsReplayable(gi)) {
+            continue;
+        }
+        const std::int32_t first = tail_tokens > 0 ? store_.FirstTailBlockNeeded(gi, tail_tokens) : 0;
+        const std::int32_t past_end =
+            tail_tokens > 0 ? store_.TailBlocksFor(gi, tail_tokens) : store_.BlocksPerBoundary(gi);
+        const PrefixCacheIndex& index = group.Index();
+        for (std::int32_t offset = first; offset < past_end; ++offset) {
+            const CacheKey key{.group_id = group.Id(), .content_hash = boundary.content_hash, .page_offset = offset};
+            if (index.Contains(*disk_pool, key) && !index.Contains(device_pool, key) &&
+                (host_pool == nullptr || !index.Contains(*host_pool, key))) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 template <CacheTier Tier>

@@ -37,7 +37,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Weak,
     },
     thread,
@@ -433,18 +433,22 @@ fn max_inflight_slots_per_job(total_slots: usize) -> usize {
 
 /// The ring's free slots.
 struct Slots {
-    #[cfg(test)]
     total: usize,
     max_per_job: usize,
+    quarantined: AtomicUsize,
     free: Mutex<Vec<usize>>,
     returned: Condvar,
 }
 
 impl Slots {
+    fn has_available_slots(&self) -> bool {
+        self.quarantined.load(Ordering::Acquire) < self.total
+    }
+
     fn take(&self, deadline: Instant, cancelled: &AtomicBool) -> Option<SlotGuard<'_>> {
         let mut free = self.free.lock();
         loop {
-            if cancelled.load(Ordering::Acquire) {
+            if cancelled.load(Ordering::Acquire) || !self.has_available_slots() {
                 return None;
             }
             if let Some(slot) = free.pop() {
@@ -454,7 +458,7 @@ impl Slots {
                 return None;
             }
             if self.returned.wait_until(&mut free, deadline).timed_out() {
-                if cancelled.load(Ordering::Acquire) {
+                if cancelled.load(Ordering::Acquire) || !self.has_available_slots() {
                     return None;
                 }
                 return free.pop().map(|slot| SlotGuard { slots: self, slot });
@@ -476,6 +480,13 @@ impl Slots {
         self.returned.notify_all();
     }
 
+    fn mark_quarantined(&self) {
+        let prev = self.quarantined.fetch_add(1, Ordering::AcqRel);
+        if prev + 1 >= self.total {
+            self.wake_all();
+        }
+    }
+
     fn free_count(&self) -> usize {
         self.free.lock().len()
     }
@@ -486,8 +497,9 @@ impl Slots {
     }
 }
 
-/// RAII guard returning a staging slot on normal scope exit; leaks on panic
-/// so an in-flight NVMe DMA read cannot write into a reused slot.
+/// RAII guard returning a staging slot on normal scope exit; leaks on panic or
+/// explicit [`SlotGuard::quarantine`] so an unretired NVMe DMA read or RDMA
+/// WRITE cannot access a reused slot.
 struct SlotGuard<'a> {
     slots: &'a Slots,
     slot: usize,
@@ -497,11 +509,19 @@ impl SlotGuard<'_> {
     fn index(&self) -> usize {
         self.slot
     }
+
+    /// Permanently retains this slot without returning it to the free pool.
+    fn quarantine(self) {
+        self.slots.mark_quarantined();
+        std::mem::forget(self);
+    }
 }
 
 impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
+        if std::thread::panicking() {
+            self.slots.mark_quarantined();
+        } else {
             self.slots.give_back(self.slot);
         }
     }
@@ -961,9 +981,9 @@ impl Holder {
         let state = Arc::new(HolderState {
             source,
             slots: Slots {
-                #[cfg(test)]
                 total: slots,
                 max_per_job: max_inflight_slots_per_job(slots),
+                quarantined: AtomicUsize::new(0),
                 free: Mutex::new((0..slots).collect()),
                 returned: Condvar::new(),
             },
@@ -1081,11 +1101,13 @@ impl Holder {
                     } else {
                         Some(Reject::Clean)
                     }
-                } else if fenced.is_unknown_overflowed() {
-                    // Holder Disk serving is quarantined after unknown-fence
-                    // overflow, but `key` is provably not an overflowed unknown
-                    // job: record it in `clean` and reject cleanly (`Done`) so
-                    // healthy readers never freeze destination memory.
+                } else if fenced.is_unknown_overflowed() || !self.state.slots.has_available_slots()
+                {
+                    // Holder Disk serving is quarantined (unknown-fence overflow or
+                    // all staging slots quarantined by unretired RDMA writes), and
+                    // `key` is provably not an earlier unknown job: record it in
+                    // `clean` and reject cleanly (`Done`) so healthy readers never
+                    // freeze destination memory.
                     fenced.insert(key.clone(), false);
                     Some(Reject::Quarantined)
                 } else {
@@ -1256,7 +1278,9 @@ impl Holder {
     }
 
     fn can_serve_disk(&self) -> bool {
-        !self.state.source.executor.broken() && !self.state.fenced.lock().is_unknown_overflowed()
+        !self.state.source.executor.broken()
+            && !self.state.fenced.lock().is_unknown_overflowed()
+            && self.state.slots.has_available_slots()
     }
 
     /// Authorizes `(incarnation, offer_id)` to serve Disk pushes once pinned.
@@ -1538,7 +1562,7 @@ impl HolderState {
         let mut next = 0;
         let mut written = 0;
         struct InflightRead<'a> {
-            _slot: SlotGuard<'a>,
+            slot: Option<SlotGuard<'a>>,
             executor: &'a ts_disk::Executor,
             job_id: JobId,
             completed: bool,
@@ -1588,7 +1612,7 @@ impl HolderState {
                         inflight.insert(
                             slot_idx,
                             InflightRead {
-                                _slot: slot_guard,
+                                slot: Some(slot_guard),
                                 executor: &self.source.executor,
                                 job_id,
                                 completed: false,
@@ -1621,10 +1645,12 @@ impl HolderState {
                             "holder Disk executor broke down during peer push; retiring push without reusing unretired staging slots"
                         );
                         // The kernel may still write into these staging slots;
-                        // leak their SlotGuards so no future push reuses them.
+                        // quarantine their SlotGuards so no future push reuses them.
                         for (_, mut entry) in inflight.drain() {
                             entry.completed = true;
-                            std::mem::forget(entry);
+                            if let Some(slot_guard) = entry.slot.take() {
+                                slot_guard.quarantine();
+                            }
                         }
                         ok = false;
                         break;
@@ -1637,7 +1663,7 @@ impl HolderState {
                 continue;
             };
             entry.completed = true;
-            let _slot_guard = entry;
+            let mut slot_guard = entry.slot.take();
             ok &= read;
             if !stopped(ok) {
                 let base = (ring + slot_idx * self.source.slot_bytes) as u64;
@@ -1650,11 +1676,39 @@ impl HolderState {
                         ok = false;
                         break;
                     }
-                    let (spans, _pack_slot) =
+                    let (spans, pack_slot) =
                         self.build_write_spans(ring, base, range_size, allow_in_place, batch_spans);
                     let write_ns = profile::now_ns();
                     if let Err(error) = self.source.writer.write(session, &spans) {
                         tracing::warn!(%error, slot = slot_idx, "peer push write failed");
+                        // An RDMA WRITE error does not guarantee the transport
+                        // stopped reading local source buffers (e.g. Mooncake
+                        // deferred batch cleanup). Quarantine every staging slot
+                        // referenced by `spans` so no subsequent push overwrites
+                        // memory while a WRITE may remain in flight.
+                        let slot_start = base;
+                        let slot_end = base + self.source.slot_bytes as u64;
+                        if spans
+                            .sources
+                            .iter()
+                            .any(|&src| src >= slot_start && src < slot_end)
+                        {
+                            if let Some(guard) = slot_guard.take() {
+                                guard.quarantine();
+                            }
+                        }
+                        if let Some(pack_guard) = pack_slot {
+                            let pack_start =
+                                (ring + pack_guard.index() * self.source.slot_bytes) as u64;
+                            let pack_end = pack_start + self.source.slot_bytes as u64;
+                            if spans
+                                .sources
+                                .iter()
+                                .any(|&src| src >= pack_start && src < pack_end)
+                            {
+                                pack_guard.quarantine();
+                            }
+                        }
                         write_failed = true;
                         block_ok = false;
                         ok = false;
@@ -2679,7 +2733,7 @@ mod tests {
             profile::now_ns()
         )));
         let disk_file = DiskFile::create(&temp.0, (4 * BLOCK) as u64).unwrap();
-        let ring = Arc::new(Memory::map(BLOCK).unwrap());
+        let ring = Arc::new(Memory::map(2 * BLOCK).unwrap());
         let mut seed_mem = Memory::map(2 * BLOCK).unwrap();
         let pattern: Vec<u8> = (0..BLOCK).map(|i| ((i * 7 + 3) & 0xff) as u8).collect();
         seed_mem.write_at(0, &pattern);
@@ -2819,8 +2873,9 @@ mod tests {
         assert_eq!(executor.stats().read_jobs, 1);
         assert_eq!(writer.calls.lock().len(), 3);
 
-        // 2. Write fault to one unreachable reader immediately returns the staging slot
-        //    so healthy readers are never starved.
+        // 2. Write fault to one unreachable reader quarantines the faulted slot
+        //    so unretired writes cannot read overwritten memory, while healthy
+        //    readers continue on the remaining staging slot.
         writer.fail.store(true, Ordering::Release);
         let one = |blk| {
             vec![PushItem {
@@ -2836,21 +2891,21 @@ mod tests {
         assert!(reader
             .push(holder.name(), "s2", Duration::from_secs(2), one(1))
             .is_err());
-        assert_eq!(holder.push_ring_slot_counts(), Some((1, 1)));
+        assert_eq!(holder.push_ring_slot_counts(), Some((1, 2)));
         writer.fail.store(false, Ordering::Release);
         assert_eq!(
             reader.push(holder.name(), "s3", Duration::from_secs(2), one(2)),
             Ok(())
         );
 
-        // 3. Overflowing 1 worker + MAX_QUEUED_PUSHES rejects cleanly without blocking.
+        // 3. Overflowing 2 workers + MAX_QUEUED_PUSHES rejects cleanly without blocking.
         *writer.hold.0.lock().unwrap() = true;
         writer.entered.store(0, Ordering::SeqCst);
         let (qtx, qrx) = mpsc::channel::<Vec<Bytes>>();
         let raw_client = Sockets::start_at("127.0.0.1", 0, qtx).unwrap();
         let reply_ep = format!("127.0.0.1:{}", raw_client.port());
         let (h_host, h_port) = split_endpoint(holder.name()).unwrap();
-        let total = 1 + MAX_QUEUED_PUSHES;
+        let total = 2 + MAX_QUEUED_PUSHES;
         for i in 0..total {
             let msg = Message::Push {
                 job: (900u64 << 32) | (i as u64 + 1),
@@ -2937,6 +2992,7 @@ mod tests {
         let slots = Arc::new(Slots {
             total: 1,
             max_per_job: 1,
+            quarantined: AtomicUsize::new(0),
             free: Mutex::new(Vec::new()),
             returned: Condvar::new(),
         });
@@ -2957,6 +3013,7 @@ mod tests {
         let slots = Slots {
             total: 2,
             max_per_job: 1,
+            quarantined: AtomicUsize::new(0),
             free: Mutex::new(vec![0, 1]),
             returned: Condvar::new(),
         };
@@ -3117,6 +3174,7 @@ mod tests {
         let slots = Arc::new(Slots {
             total: 1,
             max_per_job: 1,
+            quarantined: AtomicUsize::new(0),
             free: Mutex::new(vec![0]),
             returned: Condvar::new(),
         });
@@ -3841,10 +3899,62 @@ mod tests {
         let msg1 = Message::decode(&rrx.recv_timeout(Duration::from_secs(5)).unwrap());
         assert_eq!(msg1, Some(Message::Unknown { job: 1 }));
 
-        // Replaying job 1 after Unknown retirement must answer Unknown (never Done{ok:false}).
+        // Replaying job 1 after Unknown retirement must answer Unknown (never Done{ok:false}),
+        // even after quarantining job 1's sole staging slot degraded `can_serve_disk()`.
+        assert!(!holder.can_serve_disk());
         raw_reader.send(h_host, h_port, p1.frames()).unwrap();
         let replay = Message::decode(&rrx.recv_timeout(Duration::from_secs(2)).unwrap());
         assert_eq!(replay, Some(Message::Unknown { job: 1 }));
+        drop(holder);
+
+        // Fresh 2-slot holder so `legacy_push`'s write fault quarantines 1 slot
+        // while keeping `can_serve_disk() == true` until step 3 forces unknown overflow.
+        let ring2 = Arc::new(Memory::map(2 * BLOCK).unwrap());
+        let temp2 = TempDisk(dir.join(format!(
+            "ts-push-audit2-{}-{}.bin",
+            std::process::id(),
+            profile::now_ns()
+        )));
+        let disk_file2 = DiskFile::create(&temp2.0, (2 * BLOCK) as u64).unwrap();
+        let executor2 = Arc::new(
+            ts_disk::Executor::start(
+                disk_file2,
+                &[
+                    (ring2.address(), ring2.size()),
+                    (seed.address(), seed.size()),
+                ],
+                ExecutorConfig {
+                    backend: Backend::Psync,
+                    queue_depth: 2,
+                    write_queue_depth: 1,
+                    max_io_bytes: 1 << 20,
+                    write_bytes_per_second: 1 << 30,
+                },
+            )
+            .unwrap(),
+        );
+        let holder = PushEndpoint::bind("127.0.0.1", 0, "127.0.0.1", 302).unwrap();
+        holder
+            .serve(PushSource {
+                executor: executor2,
+                disk_layout: HostLayout {
+                    groups: vec![GroupLayout {
+                        packing: 1,
+                        block_bytes: BLOCK,
+                        shard_count: 1,
+                    }],
+                    lcm_block_bytes: BLOCK,
+                    num_lcm_blocks: 2,
+                    owner_rank: 0,
+                    tp_rank: 0,
+                },
+                writer: writer.clone(),
+                ring: ring2,
+                slot_bytes: BLOCK,
+            })
+            .unwrap();
+        let (h_host, h_port) = split_endpoint(holder.name()).unwrap();
+        let _keep_temp2 = temp2;
 
         // Legacy frame `p` (`offer: None`) hitting an RDMA write fault must reply
         // `Done { ok: false }` (and `Cancelled` on Cancel), NEVER unrecognized frame `u`.
@@ -4293,6 +4403,7 @@ mod tests {
                 slots: Slots {
                     total: num_slots,
                     max_per_job: num_slots,
+                    quarantined: AtomicUsize::new(0),
                     free: Mutex::new((0..num_slots).rev().collect()),
                     returned: Condvar::new(),
                 },
@@ -4376,5 +4487,218 @@ mod tests {
         assert!(guard4.is_none());
         assert_eq!(spans4.lengths, vec![256, 256]);
         assert_eq!(spans4.destinations, vec![0x20_000, 0x21_000]);
+    }
+
+    #[test]
+    fn write_error_quarantines_original_and_borrowed_slots_and_degrades_disk_serving() {
+        use std::path::PathBuf;
+        use ts_disk::{Backend, DiskFile, ExecutorConfig};
+
+        struct TempDisk(PathBuf);
+        impl Drop for TempDisk {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        struct FailingWriter;
+        impl PageWriter for FailingWriter {
+            fn write(&self, _: &str, _: &Spans) -> Result<(), String> {
+                Err("transport write fault".into())
+            }
+        }
+
+        let make_holder = |slot_bytes: usize, num_slots: usize| {
+            let dir = std::env::var_os("TS_DISK_TEST_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir);
+            let temp = TempDisk(dir.join(format!(
+                "ts-push-write-err-{}-{}-{}.bin",
+                std::process::id(),
+                num_slots,
+                profile::now_ns()
+            )));
+            let disk_file = DiskFile::create(&temp.0, 8192).unwrap();
+            let ring = Arc::new(Memory::map(slot_bytes * num_slots).unwrap());
+            let executor = Arc::new(
+                ts_disk::Executor::start(
+                    disk_file,
+                    &[(ring.address(), ring.size())],
+                    ExecutorConfig {
+                        backend: Backend::Psync,
+                        queue_depth: 2,
+                        write_queue_depth: 1,
+                        max_io_bytes: 1 << 20,
+                        write_bytes_per_second: 1 << 30,
+                    },
+                )
+                .unwrap(),
+            );
+            let holder = Holder::new(PushSource {
+                executor,
+                disk_layout: HostLayout {
+                    groups: vec![ts_l3::GroupLayout {
+                        packing: 1,
+                        block_bytes: 4096,
+                        shard_count: 1,
+                    }],
+                    lcm_block_bytes: 4096,
+                    num_lcm_blocks: 2,
+                    owner_rank: 0,
+                    tp_rank: 0,
+                },
+                writer: Arc::new(FailingWriter),
+                ring,
+                slot_bytes,
+            })
+            .unwrap();
+            (holder, temp)
+        };
+
+        // Path 1: single batch referencing the original staging slot.
+        // Failing `writer.write()` must quarantine the original slot and
+        // degrade `can_serve_disk()` once all slots are quarantined.
+        let (holder1, _t1) = make_holder(4096, 2);
+        assert!(holder1.can_serve_disk());
+        assert_eq!(holder1.state.slots.free_count(), 2);
+        let item_orig = vec![PushItem {
+            group: 0,
+            block: 1,
+            spans: vec![PushSpan {
+                offset: 0,
+                address: 0x10_000,
+                length: 256,
+            }],
+        }];
+        let running = Running::new(None);
+        assert_eq!(
+            holder1.state.run(
+                "peer",
+                Instant::now() + Duration::from_secs(5),
+                &item_orig,
+                &running,
+            ),
+            RunOutcome::UnknownRetirement
+        );
+        assert_eq!(holder1.state.slots.free_count(), 1);
+        assert!(holder1.can_serve_disk());
+        // Second failing write quarantines the last remaining slot -> degrades Disk serving.
+        assert_eq!(
+            holder1.state.run(
+                "peer",
+                Instant::now() + Duration::from_secs(5),
+                &item_orig,
+                &running,
+            ),
+            RunOutcome::UnknownRetirement
+        );
+        assert_eq!(holder1.state.slots.free_count(), 0);
+        assert!(!holder1.can_serve_disk());
+        holder1.shutdown();
+
+        // Path 2: two batches on the same full-slot block (`range_size == slot_bytes`,
+        // `allow_in_place = false`) force Fast path 3 to borrow a second staging slot.
+        // Batch 0 mixes a contiguous merged run (in the borrowed pack slot) with a
+        // disjoint span (still in the original read slot), so `writer.write()`
+        // references BOTH slots; both must be quarantined on write failure.
+        let (holder2, _t2) = make_holder(4096, 3);
+        assert_eq!(holder2.state.slots.free_count(), 3);
+        let items_borrowed_and_orig = vec![
+            PushItem {
+                group: 0,
+                block: 1,
+                spans: vec![
+                    // Merged into borrowed pack slot:
+                    PushSpan {
+                        offset: 0,
+                        address: 0x20_000,
+                        length: 256,
+                    },
+                    PushSpan {
+                        offset: 512,
+                        address: 0x20_100,
+                        length: 256,
+                    },
+                    // Disjoint single span kept directly in original read slot:
+                    PushSpan {
+                        offset: 1024,
+                        address: 0x30_000,
+                        length: 256,
+                    },
+                ],
+            },
+            // Second item on the same `(group, block)` sets `allow_in_place = false`.
+            PushItem {
+                group: 0,
+                block: 1,
+                spans: vec![PushSpan {
+                    offset: 2048,
+                    address: 0x40_000,
+                    length: 256,
+                }],
+            },
+        ];
+        assert_eq!(
+            holder2.state.run(
+                "peer",
+                Instant::now() + Duration::from_secs(5),
+                &items_borrowed_and_orig,
+                &running,
+            ),
+            RunOutcome::UnknownRetirement
+        );
+        assert_eq!(
+            holder2.state.slots.free_count(),
+            1,
+            "both the original read slot and the borrowed pack slot must be quarantined"
+        );
+        assert!(holder2.can_serve_disk());
+        holder2.shutdown();
+
+        // Path 3: borrowed pack slot holds ALL spans of batch 0 (none left in the
+        // original read slot) -> only the borrowed pack slot is quarantined while
+        // the unreferenced original read slot returns cleanly to the pool.
+        let (holder3, _t3) = make_holder(4096, 3);
+        let items_borrowed_only = vec![
+            PushItem {
+                group: 0,
+                block: 1,
+                spans: vec![
+                    PushSpan {
+                        offset: 0,
+                        address: 0x20_000,
+                        length: 256,
+                    },
+                    PushSpan {
+                        offset: 512,
+                        address: 0x20_100,
+                        length: 256,
+                    },
+                ],
+            },
+            PushItem {
+                group: 0,
+                block: 1,
+                spans: vec![PushSpan {
+                    offset: 2048,
+                    address: 0x40_000,
+                    length: 256,
+                }],
+            },
+        ];
+        assert_eq!(
+            holder3.state.run(
+                "peer",
+                Instant::now() + Duration::from_secs(5),
+                &items_borrowed_only,
+                &running,
+            ),
+            RunOutcome::UnknownRetirement
+        );
+        assert_eq!(
+            holder3.state.slots.free_count(),
+            2,
+            "borrowed pack slot must be quarantined while unreferenced read slot returns"
+        );
+        holder3.shutdown();
     }
 }

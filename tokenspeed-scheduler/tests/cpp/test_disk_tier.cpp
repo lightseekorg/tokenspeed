@@ -1364,6 +1364,58 @@ TEST(DiskTierTest, SwaDiskOnlyBoundaryReportsDiskPublishable) {
     EXPECT_TRUE(status.disk_publishable);
 }
 
+TEST(DiskTierTest, SwaPartialHostEvictionAtMultiBlockBoundaryReportsDiskPublishable) {
+    // Models DFLASH where one prefix boundary spans multiple non-replayable SWA
+    // blocks (`prefix_granularity = kGrain = 4`, `block_granularity = 2` -> 2
+    // SWA blocks per boundary). Evicting just ONE of those SWA blocks from Host
+    // while leaving the sibling SWA block and Full History on Host must still
+    // downgrade the boundary from Host to Disk publishable and notify the
+    // mutation sink.
+    std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kGrain},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .sink_tokens = 2,
+         .cache_blocks_per_lcm_block = 2,
+         .block_granularity = 2},
+    };
+    DiskTierCache cache(specs, 24);
+    const Prompt prompt(3, 107);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(keys).op_id, .success = true});
+
+    const ContentHash tip_hash{prompt.hashes.back()};
+    // Before eviction, all SWA blocks at the tip are in Host RAM -> Host publishable.
+    const auto before = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = tip_hash}, 0);
+    EXPECT_FALSE(before.device_publishable);
+    EXPECT_TRUE(before.host_publishable);
+    EXPECT_TRUE(before.disk_publishable);
+
+    std::vector<CacheKey> tip_swa_keys;
+    for (const CacheKey& key : keys) {
+        if (key.group_id == 1 && key.content_hash == tip_hash) {
+            tip_swa_keys.push_back(key);
+        }
+    }
+    ASSERT_EQ(tip_swa_keys.size(), 2u);
+
+    bool notified_tip = false;
+    cache.coordinator.SetCacheMutationSink([&](const CacheKey& key, CacheMutation mutation) {
+        if (mutation == CacheMutation::kLowerTierResidency && key.content_hash == tip_hash) {
+            notified_tip = true;
+        }
+    });
+
+    // Evict only ONE of the two required SWA blocks at the tip boundary from Host.
+    cache.EvictFromHost(std::vector<CacheKey>{tip_swa_keys.front()});
+
+    EXPECT_TRUE(notified_tip);
+    const auto after = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = tip_hash}, 0);
+    EXPECT_FALSE(after.device_publishable);
+    EXPECT_FALSE(after.host_publishable);
+    EXPECT_TRUE(after.disk_publishable);
+}
+
 TEST(DiskTierTest, SwaDiskOnlyBoundaryWithStateRespectsHotterRamSubtree) {
     // Covers the `NumStateGroups() > 0` branch of `swa_disk_only` in
     // `CacheCoordinator::GetBoundaryEventStatus`: when SWA is Disk-only while
