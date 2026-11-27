@@ -1848,17 +1848,37 @@ def build_device_side(
             torch.device(server_args.device, gpu_id),
         )
         if server_args.mapping.attn.has_kvp:
+            from tokenspeed.runtime.layers.attention.configs.base import resolve_dtype
+
             # A fused decode value tail for the attentions that project as they merge.
             value_heads = set()
-            # The DSA attentions' owned decode top-k gathers float words.
+            # The DSA attentions' owned decode top-k gathers FP32 scores and any
+            # absorbed query rider as float words; size the exchange workspace to
+            # the widest module's per-row payload up to DECODE_FLOAT_EXCHANGE_MAX_BYTES.
             float_words = False
-            for runner in (target, draft):
-                if runner is None:
+            float_row_bytes = 0
+            kv_dtype = resolve_dtype(server_args.kv_cache_dtype)
+            for runner, runner_config in (
+                (target, model_config),
+                (draft, draft_model_config),
+            ):
+                if runner is None or runner_config is None:
                     continue
+                rider_elem_bytes = (
+                    kv_dtype.itemsize
+                    if kv_dtype == torch.float8_e4m3fn
+                    else runner_config.dtype.itemsize
+                )
                 for module in runner.model.modules():
                     if not isinstance(module, GlmDsaSparseAttentionMixin):
                         continue
                     float_words = True
+                    head_dim = module.kv_lora_rank + module.qk_rope_head_dim
+                    float_row_bytes = max(
+                        float_row_bytes,
+                        module.index_topk * 4
+                        + module.num_local_heads * head_dim * rider_elem_bytes,
+                    )
                     if module.owned_decode_value_weight() is not None:
                         value_heads.add(module.num_local_heads)
             prepare_decode_exchange(
@@ -1871,6 +1891,7 @@ def build_device_side(
                 value_heads=value_heads.pop() if len(value_heads) == 1 else None,
                 decode_rows=max_batch_size * decode_input_tokens,
                 float_words=float_words,
+                float_row_bytes=float_row_bytes or None,
             )
         # Large startup batches can select RCCL while a later prefix hit selects
         # Iris. Prepare that small-batch route before the serving sync guard.
