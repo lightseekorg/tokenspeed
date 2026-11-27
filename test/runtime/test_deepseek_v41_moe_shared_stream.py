@@ -22,16 +22,19 @@
 
 Import-level checks (no kernel runs): the switch defaults off, and only with
 it on does a Petit layer fork its shared expert onto the auxiliary stream.
+GLM-5.3 Flash and Kimi K3 log the same choice in the same line format.
 """
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 
+from tokenspeed.runtime.layers.moe.utils import shared_expert_stream_label
+from tokenspeed.runtime.models import glm53_flash, kimi_k3
 from tokenspeed.runtime.models.deepseek_v41_moe import (
     log_shared_expert_stream,
     shared_expert_stream,
-    shared_expert_stream_label,
 )
 from tokenspeed.runtime.utils.env import envs
 
@@ -118,4 +121,100 @@ def test_layer_zero_logs_the_shared_expert_stream(
     assert messages == [
         f"DeepSeek V4 MoE shared expert stream: {label} "
         "prefix=model.layers.0.mlp moe_backend=gluon_petit"
+    ]
+
+
+# (switch, use_gluon_petit, has_aux, label): the switch on and off, with and
+# without an aux stream, and the non-Petit default.
+_STREAM_CASES = [
+    ("1", True, True, "aux (TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM)"),
+    ("0", True, True, "main (Gluon Petit default)"),
+    ("1", True, False, "main (no aux stream)"),
+    ("0", True, False, "main (no aux stream)"),
+    ("0", False, True, "aux (backend default)"),
+]
+_STREAM_IDS = ["on-aux", "off-aux", "on-no-aux", "off-no-aux", "non-petit"]
+
+
+@pytest.mark.parametrize(
+    "value,use_gluon_petit,has_aux,label", _STREAM_CASES, ids=_STREAM_IDS
+)
+def test_glm53_flash_logs_the_shared_expert_stream_once(
+    monkeypatch, caplog, value, use_gluon_petit, has_aux, label
+) -> None:
+    monkeypatch.setenv(_SWITCH, value)
+    caplog.set_level(logging.INFO, logger=glm53_flash.__name__)
+    config = SimpleNamespace(mlp_layer_types=["dense"] * 3 + ["sparse"] * 3)
+    aux = object() if has_aux else None
+    # The target's MoE layers 3..5 log on layer 3 only.
+    for layer_index in range(3, 6):
+        glm53_flash.log_shared_expert_stream(
+            config,
+            layer_index,
+            aux,
+            use_gluon_petit=use_gluon_petit,
+            prefix=f"model.layers.{layer_index}.mlp",
+            moe_backend="gluon_petit",
+        )
+    # The MTP draft's one MoE layer is layer_id 0.
+    glm53_flash.log_shared_expert_stream(
+        config,
+        0,
+        aux,
+        use_gluon_petit=use_gluon_petit,
+        prefix="model.decoder.mlp",
+        moe_backend="gluon_petit",
+    )
+    assert [r.getMessage() for r in caplog.records] == [
+        f"GLM-5.3 Flash MoE shared expert stream: {label} "
+        f"prefix={prefix} moe_backend=gluon_petit"
+        for prefix in ("model.layers.3.mlp", "model.decoder.mlp")
+    ]
+
+
+@pytest.mark.parametrize(
+    "value,use_gluon_petit,has_aux,label", _STREAM_CASES, ids=_STREAM_IDS
+)
+def test_kimi_k3_logs_the_shared_expert_stream_once(
+    monkeypatch, caplog, value, use_gluon_petit, has_aux, label
+) -> None:
+    monkeypatch.setenv(_SWITCH, value)
+    caplog.set_level(logging.INFO, logger=kimi_k3.__name__)
+    config = SimpleNamespace(first_k_dense_replace=1)
+    aux = object() if has_aux else None
+    for layer_index in range(1, 4):
+        kimi_k3.log_shared_expert_stream(
+            config,
+            layer_index,
+            aux,
+            use_gluon_petit=use_gluon_petit,
+            prefix=f"model.layers.{layer_index}.mlp",
+            moe_backend="gluon_petit",
+        )
+    assert [r.getMessage() for r in caplog.records] == [
+        f"Kimi K3 MoE shared expert stream: {label} "
+        "prefix=model.layers.1.mlp moe_backend=gluon_petit"
+    ]
+
+
+@pytest.mark.parametrize(
+    "value,use_gluon_petit,has_aux,label", _STREAM_CASES, ids=_STREAM_IDS
+)
+def test_deepseek_line_with_and_without_aux_stream(
+    monkeypatch, caplog, value, use_gluon_petit, has_aux, label
+) -> None:
+    # DeepSeek's text through the shared helper, byte for byte as before.
+    monkeypatch.setenv(_SWITCH, value)
+    caplog.set_level(logging.INFO, logger="tokenspeed.runtime.models.deepseek_v41_moe")
+    log_shared_expert_stream(
+        0,
+        1,
+        object() if has_aux else None,
+        use_gluon_petit=use_gluon_petit,
+        prefix="model.layers.0.ffn",
+        moe_backend="gluon_petit",
+    )
+    assert [r.getMessage() for r in caplog.records] == [
+        f"DeepSeek V4 MoE shared expert stream: {label} "
+        "prefix=model.layers.0.ffn moe_backend=gluon_petit"
     ]

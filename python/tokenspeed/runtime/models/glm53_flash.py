@@ -30,6 +30,7 @@ indexer projections and consumes the resulting generic DSA metadata.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import Protocol
@@ -74,7 +75,12 @@ from tokenspeed.runtime.layers.moe import (
 )
 from tokenspeed.runtime.layers.moe.block import MoEBlock, MoEBlockFusion
 from tokenspeed.runtime.layers.moe.topk import TopK
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, shared_expert_stream
+from tokenspeed.runtime.layers.moe.utils import (
+    RoutingMethodType,
+    get_moe_backend,
+    log_shared_expert_stream_choice,
+    shared_expert_stream,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -106,6 +112,8 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+logger = logging.getLogger(__name__)
 
 # ===----------------------------------------------------------------------=== #
 # Multimodal vision path
@@ -393,6 +401,29 @@ class Glm53FlashIndexerOutput:
     gate: torch.Tensor
 
 
+def log_shared_expert_stream(
+    config: Glm53FlashTextConfig,
+    layer_index: int,
+    aux_stream: object | None,
+    *,
+    use_gluon_petit: bool,
+    prefix: str,
+    moe_backend: object,
+) -> None:
+    """Log, once per model, which stream the shared expert runs on: on the
+    target's first sparse layer, or the MTP draft's one layer (layer_id 0)."""
+    if layer_index > config.mlp_layer_types.index("sparse"):
+        return
+    log_shared_expert_stream_choice(
+        logger,
+        "GLM-5.3 Flash",
+        aux_stream,
+        use_gluon_petit=use_gluon_petit,
+        prefix=prefix,
+        moe_backend=moe_backend,
+    )
+
+
 class Glm53FlashMoE(MoEBlock):
     """DeepSeek routing with GLM-5.3-Flash's clamped SwiGLU experts."""
 
@@ -482,6 +513,14 @@ class Glm53FlashMoE(MoEBlock):
             fusions=(MoEBlockFusion.FINALIZE_ADD_SHARED,),
         )
         self.owns_ep_communication = owns_ep_communication
+        log_shared_expert_stream(
+            config,
+            layer_index,
+            alt_stream,
+            use_gluon_petit=owns_ep_communication,
+            prefix=prefix,
+            moe_backend=get_moe_backend(),
+        )
 
 
 class _Glm53FlashMergedColumnParallelLinear(MergedColumnParallelLinear):

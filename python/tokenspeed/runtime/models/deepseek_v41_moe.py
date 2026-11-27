@@ -47,8 +47,8 @@ from tokenspeed.runtime.layers.moe.topk import (
 from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
     get_moe_backend,
+    log_shared_expert_stream_choice,
     shared_expert_stream,
-    shared_expert_stream_label,
 )
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -222,11 +222,13 @@ def log_shared_expert_stream(
     """Log, once per model (layer 0), which stream the shared expert runs on."""
     if layer_index != 0 or not n_shared_experts:
         return
-    logger.info(
-        "DeepSeek V4 MoE shared expert stream: %s prefix=%s moe_backend=%s",
-        shared_expert_stream_label(aux_stream, use_gluon_petit=use_gluon_petit),
-        prefix,
-        moe_backend,
+    log_shared_expert_stream_choice(
+        logger,
+        "DeepSeek V4",
+        aux_stream,
+        use_gluon_petit=use_gluon_petit,
+        prefix=prefix,
+        moe_backend=moe_backend,
     )
 
 

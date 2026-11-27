@@ -175,6 +175,7 @@ from tokenspeed.runtime.layers.moe.utils import (
     RoutingMethodType,
     get_all2all_backend,
     get_moe_backend,
+    log_shared_expert_stream_choice,
     shared_expert_stream,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -2546,6 +2547,29 @@ def _check_k3_expert_placement(
         )
 
 
+def log_shared_expert_stream(
+    config: KimiLinearConfig,
+    layer_index: int,
+    aux_stream: object | None,
+    *,
+    use_gluon_petit: bool,
+    prefix: str,
+    moe_backend: object,
+) -> None:
+    """Log, once per model (its first MoE layer), which stream the latent
+    MoE's shared experts run on."""
+    if layer_index != config.first_k_dense_replace:
+        return
+    log_shared_expert_stream_choice(
+        logger,
+        "Kimi K3",
+        aux_stream,
+        use_gluon_petit=use_gluon_petit,
+        prefix=prefix,
+        moe_backend=moe_backend,
+    )
+
+
 class KimiLinearMoE(nn.Module):
     """Kimi-K3 MoE block: sigmoid / noaux_tc router + Latent MoE + shared experts.
 
@@ -2977,6 +3001,22 @@ class KimiLinearMoE(nn.Module):
             and mapping.moe.tp_size == 1
             else None
         )
+        if self.native_latent_moe is not None:
+            # Under Petit the switch picks aux or main (shared_expert_stream);
+            # the native path forks only where its plan overlaps them.
+            log_shared_expert_stream(
+                config,
+                layer_index,
+                (
+                    alt_stream
+                    if self.execution_plan.petit_tp_attention
+                    or self.execution_plan.overlap_shared_experts
+                    else None
+                ),
+                use_gluon_petit=self.execution_plan.petit_tp_attention,
+                prefix=prefix,
+                moe_backend=moe_backend,
+            )
         if self.execution_plan.petit_tp_attention and layer_index == (
             config.first_k_dense_replace
         ):

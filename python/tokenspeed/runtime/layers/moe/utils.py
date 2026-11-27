@@ -270,3 +270,26 @@ def shared_expert_stream_label(
     if use_gluon_petit:
         return "aux (TOKENSPEED_PETIT_SHARED_EXPERT_AUX_STREAM)"
     return "aux (backend default)"
+
+
+def log_shared_expert_stream_choice(
+    model_logger: logging.Logger,
+    model: str,
+    aux_stream: object | None,
+    *,
+    use_gluon_petit: bool,
+    prefix: str,
+    moe_backend: object,
+) -> None:
+    """Log on ``model_logger`` the stream ``model``'s shared expert runs on.
+
+    One line format for every model; each caller logs it once per model, on
+    its first MoE layer.
+    """
+    model_logger.info(
+        "%s MoE shared expert stream: %s prefix=%s moe_backend=%s",
+        model,
+        shared_expert_stream_label(aux_stream, use_gluon_petit=use_gluon_petit),
+        prefix,
+        getattr(moe_backend, "value", moe_backend),
+    )
