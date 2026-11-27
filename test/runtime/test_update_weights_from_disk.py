@@ -1224,5 +1224,25 @@ def test_ascend_disk_refresh_draft_guard_applies_only_to_discard(
         torch.testing.assert_close(parameter, previous)
 
 
+def test_non_npu_dwdp_still_rejects_online_weight_updates(tmp_path):
+    path = _write_checkpoint(tmp_path / "step-1", scale=7.0)
+    model = _TinyModel()
+    runner = _runner(model, path)
+    runner.device = "cuda"
+    runner.mapping.moe_weight_sharing_size = 8
+
+    ok_disk, msg_disk = runner.update_weights_from_disk(
+        UpdateWeightFromDiskReqInput(model_path=str(path))
+    )
+    assert not ok_disk
+    assert "immutable" in msg_disk
+
+    ok_mc, msg_mc = runner.update_weights_from_mooncake(
+        "v1", models=[model], require_complete=False
+    )
+    assert not ok_mc
+    assert "immutable" in msg_mc
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

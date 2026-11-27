@@ -135,10 +135,11 @@ Validation includes cross-node reconstruction, page-boundary handling, complete
 expert metadata, idle owners, odd/even queued forwards, bounded staging,
 full-model mapping counts, and numerical comparison against resident weights.
 
-Prefill workers support checkpoint loading (`auto`, `safetensors`), eager or
-breakable prefill graphs, and `--load-format dummy`; decode and aggregated workers
-additionally require `--enforce-eager`. On NPU, `--enable-memory-saver`
-(`cpu_backup` and `discard`) and Mooncake/disk weight updates are supported.
-All owners must remain available for the instance lifetime; deployment must
-terminate the instance on worker failure. Independent forwarding does not
-provide owner replacement or recovery after an owner fails.
+CUDA prefill workers remain limited to `auto` and `safetensors` checkpoint
+loading, eager or breakable prefill graphs, immutable checkpoints, and no
+memory saver. On Ascend NPU, peer weights additionally support `--load-format
+dummy`, eager `decode` and aggregated (`null`) roles (`--enforce-eager`),
+`--enable-memory-saver` (`cpu_backup` and `discard`), and Mooncake/disk online
+weight updates. All owners must remain available for the instance lifetime;
+deployment must terminate the instance on worker failure. Independent
+forwarding does not provide owner replacement or recovery after an owner fails.

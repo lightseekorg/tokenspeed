@@ -1699,17 +1699,29 @@ class ServerArgs:
         )
 
         if self.moe_weight_sharing_size is not None:
-            if self.load_format not in ("auto", "safetensors", "dummy"):
+            allowed_load_formats = (
+                ("auto", "safetensors", "dummy")
+                if self.device == "npu"
+                else ("auto", "safetensors")
+            )
+            if self.load_format not in allowed_load_formats:
                 raise ValueError(
-                    "Peer expert weights require auto, safetensors, or dummy loading"
+                    "Peer expert weights require auto, safetensors, or dummy loading on NPU"
+                    if self.device == "npu"
+                    else "Peer expert weights require auto or safetensors checkpoint loading"
                 )
             if self.enable_memory_saver and self.device != "npu":
                 raise ValueError(
                     "Peer expert weights memory saver is currently supported on NPU only"
                 )
-            if self.disaggregation_mode not in ("prefill", "decode", "null"):
+            if self.device == "npu":
+                if self.disaggregation_mode not in ("prefill", "decode", "null"):
+                    raise ValueError(
+                        "Peer expert weights require prefill, decode, or aggregated serving"
+                    )
+            elif self.disaggregation_mode != "prefill":
                 raise ValueError(
-                    "Peer expert weights require prefill, decode, or aggregated serving"
+                    "Peer expert weights currently require a prefill instance"
                 )
             if self.mapping.requires_forward_coordination:
                 raise ValueError(

@@ -136,14 +136,17 @@ def test_cli_selects_storage_separately_from_execution():
     "replacement",
     [
         ["--disaggregation-mode", "decode"],
+        ["--disaggregation-mode", "decode", "--enforce-eager"],
         ["--disaggregation-mode", "null"],
+        ["--disaggregation-mode", "null", "--enforce-eager"],
         ["--disaggregation-mode", "encode"],
         ["--pipeline-parallel-size", "2", "--data-parallel-size", "8"],
         ["--moe-weight-sharing-size", "3"],
         ["--moe-tp-size", "16"],
         ["--kvstore-storage-backend", "mooncake"],
         ["--enable-eplb"],
-        ["--enable-memory-saver"],
+        ["--enable-memory-saver", "--weight-memory-policy", "cpu_backup"],
+        ["--load-format", "dummy"],
         ["--load-format", "extensible"],
     ],
 )
@@ -235,7 +238,7 @@ def test_no_attention_dp_means_no_dp_group():
     )
 
 
-@pytest.mark.parametrize("load_format", ["auto", "safetensors", "dummy"])
+@pytest.mark.parametrize("load_format", ["auto", "safetensors"])
 def test_peer_weights_accept_supported_checkpoint_loaders(load_format):
     assert (
         prepare_server_args(BASE + ["--load-format", load_format]).load_format
@@ -243,14 +246,54 @@ def test_peer_weights_accept_supported_checkpoint_loaders(load_format):
     )
 
 
-@pytest.mark.parametrize("role", ["decode", "null"])
-def test_peer_weights_accept_eager_decode_and_aggregated_roles(role):
+def test_peer_weights_accept_npu_dummy_checkpoint_loader():
     args = prepare_server_args(
-        BASE + ["--disaggregation-mode", role, "--enforce-eager"]
+        BASE
+        + [
+            "--device",
+            "npu",
+            "--disable-prefill-graph",
+            "--disable-pdl",
+            "--load-format",
+            "dummy",
+        ]
+    )
+    assert args.load_format == "dummy"
+
+
+@pytest.mark.parametrize("role", ["decode", "null"])
+def test_peer_weights_accept_npu_eager_decode_and_aggregated_roles(role):
+    args = prepare_server_args(
+        BASE
+        + [
+            "--device",
+            "npu",
+            "--disable-prefill-graph",
+            "--disable-pdl",
+            "--disaggregation-mode",
+            role,
+            "--enforce-eager",
+        ]
     )
     assert args.disaggregation_mode == role
     assert args.enforce_eager
     assert not args.mapping.requires_forward_coordination
+
+
+@pytest.mark.parametrize("role", ["decode", "null"])
+def test_peer_weights_reject_npu_non_eager_decode_and_aggregated_roles(role):
+    with pytest.raises(ValueError, match="--enforce-eager"):
+        prepare_server_args(
+            BASE
+            + [
+                "--device",
+                "npu",
+                "--disable-prefill-graph",
+                "--disable-pdl",
+                "--disaggregation-mode",
+                role,
+            ]
+        )
 
 
 @pytest.mark.parametrize("policy", ["cpu_backup", "discard"])

@@ -541,6 +541,11 @@ class ModelRunner:
         Returns:
             ``(ok, message)`` for the control plane.
         """
+        if self.mapping.moe_weight_sharing_size is not None and self.device != "npu":
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         if self.model_update is None:
             return False, (
                 "update_weights_from_mooncake requires the server to start with "
@@ -606,6 +611,11 @@ class ModelRunner:
             post_load_transformed_modules,
         )
 
+        if self.mapping.moe_weight_sharing_size is not None and self.device != "npu":
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         model_path = str(obj.model_path)
         load_format = obj.load_format or self.server_args.load_format
         consumed = 0
