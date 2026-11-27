@@ -80,6 +80,17 @@ def mega_mhc_eligible(
     return is_mega_mhc_available()
 
 
+def mega_mhc_direct_staging_eligible() -> bool:
+    """Return whether direct MegaMoE FP8 staging is supported cleanly."""
+    if not (platform.is_nvidia and platform.arch_version.major == 10):
+        return False
+    from tokenspeed_kernel.thirdparty.cuda.mega_mhc import (
+        is_mega_mhc_direct_staging_available,
+    )
+
+    return is_mega_mhc_direct_staging_available()
+
+
 @register_kernel(
     "residual",
     "mhc_shifted_post_pre_norm",

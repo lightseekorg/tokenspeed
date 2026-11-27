@@ -1938,10 +1938,12 @@ class DeepseekV41MoE(DeepseekV4MoE):
             kwargs["image_bias"] = image_bias
             kwargs["image_token_mask"] = image_token_mask
         if mapped_in_kernel:
-            kwargs["logical_to_physical_map"] = info.partial_logical_to_all_physical_map
-            kwargs["logical_replica_counts"] = (
-                info.partial_logical_to_all_physical_map_num_valid
+            # Match unfused _topk_ids_logical_to_physical_static on all-to-all EP
+            # (one nearest replica per logical expert and EP rank, updated in place).
+            kwargs["logical_to_physical_map"] = (
+                info.partial_logical_to_rank_dispatch_physical_map.unsqueeze(-1)
             )
+            kwargs["logical_replica_counts"] = info.static_replica_counts
             kwargs["ep_rank"] = self.topk.ep_rank
         return kwargs, mapped_in_kernel
 
@@ -2095,12 +2097,11 @@ def _v41_hc_post_pre(
         return residual, x, None, None
     # DeepGEMM mega_mhc split barriers race under CUDA graph replay: a replay can
     # read the previous replay's partials, so keep it out of captured segments.
-    if (
-        not prefer_overlap
-        and not is_breakable_capture_active()
-        and not (residual.is_cuda and torch.cuda.is_current_stream_capturing())
-    ):
-        if quantize_fp8 and fp8_staging is not None:
+    # Direct MegaMoE symm_buffer staging is likewise restricted to uncaptured
+    # forwards where mega_mhc runs (not PrefillGraph or decode graphs).
+    if not prefer_overlap and not is_breakable_capture_active():
+        capturing = residual.is_cuda and torch.cuda.is_current_stream_capturing()
+        if quantize_fp8 and fp8_staging is not None and not capturing:
             x_fp8, x_sf, shared_x_sf = fp8_staging.x_quantized
             shifted = try_mhc_shifted_post_pre_norm_quantize_fp8(
                 pending.x,
@@ -2122,10 +2123,26 @@ def _v41_hc_post_pre(
             if shifted is not None:
                 residual, x, pre, post, comb, *_ = shifted
                 return residual, x, (pre, post, comb), fp8_staging.x_quantized
+            shifted = try_mhc_shifted_post_pre_norm(
+                pending.x,
+                residual,
+                pre_mix,
+                pending.post,
+                pending.comb,
+                *hc_weights,
+                hc_norm_eps,
+                hc_eps,
+                sinkhorn_iters,
+                norm.weight,
+                norm.variance_epsilon,
+            )
+            if shifted is not None:
+                residual, x, pre, post, comb = shifted
+                return residual, x, (pre, post, comb), None
         else:
             join = (
                 try_mhc_shifted_post_pre_norm_quantize_fp8
-                if quantize_fp8
+                if quantize_fp8 and fp8_staging is None
                 else try_mhc_shifted_post_pre_norm
             )
             shifted = join(

@@ -138,7 +138,7 @@ class DeepseekV4TopK(TopK):
         routed_scaling_factor: float,
         hash_routing: bool,
         weights_dtype: torch.dtype,
-        ep_rank: int = 0,
+        ep_rank: int,
     ) -> None:
         super().__init__(
             top_k=top_k,

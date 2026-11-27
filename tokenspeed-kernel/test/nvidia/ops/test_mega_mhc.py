@@ -213,3 +213,112 @@ def test_shifted_mhc_unsupported_returns_none(monkeypatch, case):
             SimpleNamespace(is_nvidia=True, arch_version=SimpleNamespace(major=9)),
         )
     assert try_mhc_shifted_post_pre_norm(**args) is None
+
+
+def test_shifted_mhc_omits_direct_staging_kwargs_and_feature_detects(monkeypatch):
+    from tokenspeed_kernel.ops.residual import (
+        try_mhc_shifted_post_pre_norm_quantize_fp8,
+    )
+    from tokenspeed_kernel.thirdparty.cuda import mega_mhc as native
+
+    real_api = native._api()
+    real_fn = real_api.mega_mhc
+    seen_kwargs: list[set[str]] = []
+
+    def legacy_mega_mhc(
+        *,
+        x,
+        residual,
+        shifted_prev_mix,
+        post_mix,
+        comb_res_mix,
+        fn,
+        mix_scales,
+        mix_bases,
+        hc_mult,
+        hc_norm_eps,
+        hc_pre_eps,
+        hc_post_scale,
+        sinkhorn_eps,
+        num_sinkhorn_iters,
+        rmsnorm_weight,
+        rmsnorm_eps,
+        rmsnorm_scale,
+        new_residual,
+        new_prev_mix,
+        new_post_mix,
+        new_comb_res_mix,
+        y_bf16,
+        y_fp8=None,
+        y_gemm_sf=None,
+    ):
+        seen_kwargs.append(
+            set(
+                (
+                    "y_bf16",
+                    "y_fp8",
+                    "y_gemm_sf",
+                )
+            )
+        )
+        return real_fn(
+            x=x,
+            residual=residual,
+            shifted_prev_mix=shifted_prev_mix,
+            post_mix=post_mix,
+            comb_res_mix=comb_res_mix,
+            fn=fn,
+            mix_scales=mix_scales,
+            mix_bases=mix_bases,
+            hc_mult=hc_mult,
+            hc_norm_eps=hc_norm_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_post_scale=hc_post_scale,
+            sinkhorn_eps=sinkhorn_eps,
+            num_sinkhorn_iters=num_sinkhorn_iters,
+            rmsnorm_weight=rmsnorm_weight,
+            rmsnorm_eps=rmsnorm_eps,
+            rmsnorm_scale=rmsnorm_scale,
+            new_residual=new_residual,
+            new_prev_mix=new_prev_mix,
+            new_post_mix=new_post_mix,
+            new_comb_res_mix=new_comb_res_mix,
+            y_bf16=y_bf16,
+            y_fp8=y_fp8,
+            y_gemm_sf=y_gemm_sf,
+        )
+
+    args = _inputs(8, 1024, 20)
+    tokens, hidden = 8, 1024
+    monkeypatch.setattr(real_api, "mega_mhc", legacy_mega_mhc)
+    native.is_mega_mhc_available.cache_clear()
+    native.is_mega_mhc_direct_staging_available.cache_clear()
+    try:
+        assert not native.is_mega_mhc_direct_staging_available()
+        # Non-staging calls still work against a DeepGEMM signature without
+        # y_routed_sf / y_shared_sf / shared_sf_block_m.
+        assert try_mhc_shifted_post_pre_norm(**args) is not None
+        assert try_mhc_shifted_post_pre_norm_quantize_fp8(**args) is not None
+        assert len(seen_kwargs) == 2
+
+        direct_fp8 = torch.empty(
+            tokens, hidden, device="cuda", dtype=torch.float8_e4m3fn
+        )
+        direct_sf = torch.empty(tokens, hidden // 128, device="cuda", dtype=torch.int32)
+        direct_shared = torch.empty(
+            hidden // 128, 128, device="cuda", dtype=torch.int32
+        ).mT[:tokens]
+        assert (
+            try_mhc_shifted_post_pre_norm_quantize_fp8(
+                **args,
+                y_fp8_out=direct_fp8,
+                y_routed_sf_out=direct_sf,
+                y_shared_sf_out=direct_shared,
+                shared_sf_block_m=64,
+            )
+            is None
+        )
+        assert len(seen_kwargs) == 2
+    finally:
+        native.is_mega_mhc_available.cache_clear()
+        native.is_mega_mhc_direct_staging_available.cache_clear()

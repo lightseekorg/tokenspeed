@@ -22,6 +22,12 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -29,6 +35,7 @@ from tokenspeed_kernel.ops.moe import deep_gemm as deep_gemm_moe
 from tokenspeed_kernel.ops.moe import moe_topk, set_mega_gate_workspace_region
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError
+from tokenspeed_kernel.thirdparty.cuda import mega_gate as mega_gate_mod
 from tokenspeed_kernel.thirdparty.cuda.mega_gate import (
     bf16_mega_gate,
     is_bf16_mega_gate_available,
@@ -290,6 +297,32 @@ def test_bf16_mega_gate_validation_and_registry_guards() -> None:
             gate_weight=weight[:, :128].contiguous(),
             override="deep_gemm_bf16_mega_gate",
         )
+    to_physical = torch.arange(16, device="cuda", dtype=torch.int32).unsqueeze(-1)
+    logical_count = torch.ones(16, device="cuda", dtype=torch.int32)
+    with pytest.raises(ValueError, match="ep_rank is required"):
+        moe_topk(
+            None,
+            4,
+            "sqrt_softplus",
+            "topk",
+            True,
+            1.0,
+            hidden_states=hidden,
+            gate_weight=weight,
+            logical_to_physical_map=to_physical,
+            logical_replica_counts=logical_count,
+        )
+    with pytest.raises(ValueError, match="ep_rank is required"):
+        bf16_mega_gate(
+            hidden,
+            weight,
+            4,
+            renormalize=True,
+            routed_scaling_factor=1.0,
+            ep_rank=None,
+            to_physical_map=to_physical,
+            logical_count=logical_count,
+        )
     # Selection resolves to deep_gemm_bf16_mega_gate by default on SM100.
     w, idx = moe_topk(
         None,
@@ -304,17 +337,20 @@ def test_bf16_mega_gate_validation_and_registry_guards() -> None:
     assert w.shape == (4, 4) and idx.shape == (4, 4)
 
 
+@pytest.mark.filterwarnings("ignore:The CUDA Graph is empty:UserWarning")
 def test_bf16_mega_gate_cuda_graph_replay_and_workspace_region() -> None:
     torch.manual_seed(11)
-    tokens, hidden, experts, top_k = 16, 512, 64, 8
+    tokens_a, tokens_b, hidden, experts, top_k = 16, 8, 512, 64, 8
     weight = (torch.randn(experts, hidden, device="cuda") * 0.1).bfloat16()
-    hidden_states = (torch.randn(tokens, hidden, device="cuda") * 0.1).bfloat16()
+    hidden_a = (torch.randn(tokens_a, hidden, device="cuda") * 0.1).bfloat16()
+    hidden_b = (torch.randn(tokens_b, hidden, device="cuda") * 0.1).bfloat16()
     bias = torch.randn(experts, device="cuda") * 0.05
-    out_w = torch.empty(tokens, top_k, device="cuda", dtype=torch.float32)
-    out_idx = torch.empty(tokens, top_k, device="cuda", dtype=torch.int64)
+    out_w_a = torch.empty(tokens_a, top_k, device="cuda", dtype=torch.float32)
+    out_idx_a = torch.empty(tokens_a, top_k, device="cuda", dtype=torch.int64)
+    out_w_b = torch.empty(tokens_b, top_k, device="cuda", dtype=torch.float32)
+    out_idx_b = torch.empty(tokens_b, top_k, device="cuda", dtype=torch.int64)
 
     entered: list[bool] = []
-    from contextlib import contextmanager
 
     @contextmanager
     def _track_workspace():
@@ -322,8 +358,36 @@ def test_bf16_mega_gate_cuda_graph_replay_and_workspace_region() -> None:
         yield
 
     set_mega_gate_workspace_region(_track_workspace)
+    cold_stream = torch.cuda.Stream()
     stream = torch.cuda.Stream()
     try:
+        # Graph capture on an uninitialized stream must fail closed so DeepGEMM
+        # never allocates its per-stream barrier inside the graph pool.
+        cold_key = (
+            torch.cuda.current_device(),
+            int(cold_stream.cuda_stream),
+        )
+        cold_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cold_graph, stream=cold_stream):
+            with pytest.raises(RuntimeError, match="before graph capture"):
+                moe_topk(
+                    None,
+                    top_k,
+                    "sqrt_softplus",
+                    "topk",
+                    True,
+                    1.0,
+                    correction_bias=bias,
+                    hidden_states=hidden_a,
+                    gate_weight=weight,
+                    out=(out_w_a, out_idx_a),
+                    topk_weights_dtype=torch.float32,
+                    topk_indices_dtype=torch.int64,
+                    override="deep_gemm_bf16_mega_gate",
+                )
+        assert cold_key not in mega_gate_mod._INITIALIZED_STREAMS
+        assert len(entered) == 0
+
         # First uncaptured call on a fresh stream invokes the workspace region;
         # later calls on the same stream do not re-enter it.
         with torch.cuda.stream(stream):
@@ -335,17 +399,13 @@ def test_bf16_mega_gate_cuda_graph_replay_and_workspace_region() -> None:
                 True,
                 1.0,
                 correction_bias=bias,
-                hidden_states=hidden_states,
+                hidden_states=hidden_a,
                 gate_weight=weight,
-                out=(out_w, out_idx),
+                out=(out_w_a, out_idx_a),
                 topk_weights_dtype=torch.float32,
                 topk_indices_dtype=torch.int64,
                 override="deep_gemm_bf16_mega_gate",
             )
-        assert len(entered) == 1
-
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
             moe_topk(
                 None,
                 top_k,
@@ -354,32 +414,179 @@ def test_bf16_mega_gate_cuda_graph_replay_and_workspace_region() -> None:
                 True,
                 1.0,
                 correction_bias=bias,
-                hidden_states=hidden_states,
+                hidden_states=hidden_b,
                 gate_weight=weight,
-                out=(out_w, out_idx),
+                out=(out_w_b, out_idx_b),
                 topk_weights_dtype=torch.float32,
                 topk_indices_dtype=torch.int64,
                 override="deep_gemm_bf16_mega_gate",
             )
         assert len(entered) == 1
 
-        hidden_states.normal_()
-        stream.synchronize()
-        graph.replay()
-        stream.synchronize()
-        eager_w, eager_idx = bf16_mega_gate(
-            hidden_states,
-            weight,
-            top_k,
-            renormalize=True,
-            routed_scaling_factor=1.0,
-            ep_rank=0,
-            correction_bias=bias,
-        )
-        torch.testing.assert_close(out_idx, eager_idx, atol=0, rtol=0)
-        torch.testing.assert_close(out_w, eager_w, atol=0, rtol=0)
+        graph_a = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph_a, stream=stream):
+            moe_topk(
+                None,
+                top_k,
+                "sqrt_softplus",
+                "topk",
+                True,
+                1.0,
+                correction_bias=bias,
+                hidden_states=hidden_a,
+                gate_weight=weight,
+                out=(out_w_a, out_idx_a),
+                topk_weights_dtype=torch.float32,
+                topk_indices_dtype=torch.int64,
+                override="deep_gemm_bf16_mega_gate",
+            )
+        graph_b = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph_b, stream=stream):
+            moe_topk(
+                None,
+                top_k,
+                "sqrt_softplus",
+                "topk",
+                True,
+                1.0,
+                correction_bias=bias,
+                hidden_states=hidden_b,
+                gate_weight=weight,
+                out=(out_w_b, out_idx_b),
+                topk_weights_dtype=torch.float32,
+                topk_indices_dtype=torch.int64,
+                override="deep_gemm_bf16_mega_gate",
+            )
+        assert len(entered) == 1
+
+        # Replay graph_a three times with changing inputs, then interleave A/B replays.
+        for replay_idx in range(3):
+            hidden_a.normal_(mean=0.0, std=0.1 * (replay_idx + 1))
+            stream.synchronize()
+            graph_a.replay()
+            stream.synchronize()
+            eager_w, eager_idx = bf16_mega_gate(
+                hidden_a,
+                weight,
+                top_k,
+                renormalize=True,
+                routed_scaling_factor=1.0,
+                ep_rank=None,
+                correction_bias=bias,
+            )
+            torch.testing.assert_close(out_idx_a, eager_idx, atol=0, rtol=0)
+            torch.testing.assert_close(out_w_a, eager_w, atol=0, rtol=0)
+
+        for step in range(4):
+            if step % 2 == 0:
+                hidden_a.normal_()
+                stream.synchronize()
+                graph_a.replay()
+                stream.synchronize()
+                eager_w, eager_idx = bf16_mega_gate(
+                    hidden_a,
+                    weight,
+                    top_k,
+                    renormalize=True,
+                    routed_scaling_factor=1.0,
+                    ep_rank=None,
+                    correction_bias=bias,
+                )
+                torch.testing.assert_close(out_idx_a, eager_idx, atol=0, rtol=0)
+                torch.testing.assert_close(out_w_a, eager_w, atol=0, rtol=0)
+            else:
+                hidden_b.normal_()
+                stream.synchronize()
+                graph_b.replay()
+                stream.synchronize()
+                eager_w, eager_idx = bf16_mega_gate(
+                    hidden_b,
+                    weight,
+                    top_k,
+                    renormalize=True,
+                    routed_scaling_factor=1.0,
+                    ep_rank=None,
+                    correction_bias=bias,
+                )
+                torch.testing.assert_close(out_idx_b, eager_idx, atol=0, rtol=0)
+                torch.testing.assert_close(out_w_b, eager_w, atol=0, rtol=0)
         assert deep_gemm_moe._HAS_MEGA_GATE
     finally:
-        from contextlib import nullcontext
-
         set_mega_gate_workspace_region(nullcontext)
+
+
+_MEGA_GATE_WARMUP_SCRIPT = """
+import sys
+from pathlib import Path
+import torch
+from tokenspeed_kernel.ops.moe import moe_topk
+
+cache = Path(sys.argv[1])
+hidden, experts, top_k = 5120, 256, 8
+weight = (torch.randn(experts, hidden, device="cuda") * 0.05).bfloat16()
+bias = torch.randn(experts, device="cuda")
+image_bias = torch.randn(experts, device="cuda")
+to_physical = torch.arange(experts, device="cuda", dtype=torch.int32).unsqueeze(-1)
+logical_count = torch.ones(experts, device="cuda", dtype=torch.int32)
+
+def _run(tokens: int) -> None:
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    image_mask = torch.zeros(tokens, device="cuda", dtype=torch.bool)
+    moe_topk(
+        None,
+        top_k,
+        "sqrt_softplus",
+        "topk",
+        True,
+        2.5,
+        correction_bias=bias,
+        hidden_states=x,
+        gate_weight=weight,
+        override="deep_gemm_bf16_mega_gate",
+    )
+    moe_topk(
+        None,
+        top_k,
+        "sqrt_softplus",
+        "topk",
+        True,
+        2.5,
+        correction_bias=bias,
+        hidden_states=x,
+        gate_weight=weight,
+        image_bias=image_bias,
+        image_token_mask=image_mask,
+        logical_to_physical_map=to_physical,
+        logical_replica_counts=logical_count,
+        ep_rank=1,
+        override="deep_gemm_bf16_mega_gate",
+    )
+
+for warm_tokens in (1, 16, 32, 64, 128, 256, 512, 1024):
+    _run(warm_tokens)
+torch.cuda.synchronize()
+compiled = {str(p) for p in cache.rglob("*")}
+
+for serve_tokens in (3, 17, 100, 777):
+    _run(serve_tokens)
+torch.cuda.synchronize()
+new = sorted({str(p) for p in cache.rglob("*")} - compiled)
+assert not new, f"unwarmed mega_gate compiled {new}"
+"""
+
+
+def test_warmup_mega_gate_leaves_nothing_to_compile(tmp_path: Path) -> None:
+    env = {**os.environ, "DG_JIT_CACHE_DIR": str(tmp_path / "jit")}
+    python_path = [str(Path(__file__).resolve().parents[4] / "python")]
+    if env.get("PYTHONPATH"):
+        python_path.append(env["PYTHONPATH"])
+    env["PYTHONPATH"] = os.pathsep.join(python_path)
+    result = subprocess.run(
+        [sys.executable, "-c", _MEGA_GATE_WARMUP_SCRIPT, str(tmp_path / "jit")],
+        env=env,
+        cwd=Path(__file__).resolve().parent,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

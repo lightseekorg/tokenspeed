@@ -880,11 +880,11 @@ if _HAS_MEGA_GATE:
         input_ids: torch.Tensor | None,
         routed_scaling_factor: float,
         *,
+        ep_rank: int | None = None,
         image_bias: torch.Tensor | None = None,
         image_token_mask: torch.Tensor | None = None,
         to_physical_map: torch.Tensor | None = None,
         logical_count: torch.Tensor | None = None,
-        ep_rank: int = 0,
         mask: torch.Tensor | None = None,
         out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:

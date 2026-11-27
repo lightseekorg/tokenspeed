@@ -893,7 +893,10 @@ def try_mhc_shifted_post_pre_norm_quantize_fp8(
     or None for unsupported inputs. H must also be a multiple of 128 (always
     true given the multiple of 1024).
     """
-    from tokenspeed_kernel.ops.residual.deep_gemm import mega_mhc_eligible
+    from tokenspeed_kernel.ops.residual.deep_gemm import (
+        mega_mhc_direct_staging_eligible,
+        mega_mhc_eligible,
+    )
 
     if not mega_mhc_eligible(
         x, residual, pre, post, comb, weight, scale, base, sinkhorn_iters, norm_weight
@@ -903,6 +906,8 @@ def try_mhc_shifted_post_pre_norm_quantize_fp8(
         t is not None for t in (y_fp8_out, y_routed_sf_out, y_shared_sf_out)
     )
     if has_direct_targets:
+        if not mega_mhc_direct_staging_eligible():
+            return None
         tokens, hidden = x.shape
         min_shared_rows = (
             ((tokens + shared_sf_block_m - 1) // shared_sf_block_m)

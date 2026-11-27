@@ -1243,7 +1243,7 @@ def moe_topk(
     image_bias: torch.Tensor | None = None,
     image_token_mask: torch.Tensor | None = None,
     logical_replica_counts: torch.Tensor | None = None,
-    ep_rank: int = 0,
+    ep_rank: int | None = None,
     valid_token_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce expert weights and ids using a registered MoE TopK kernel.
@@ -1391,6 +1391,14 @@ def moe_topk(
         raise ValueError(
             "fused sqrt_softplus expert placement requires both "
             "logical_to_physical_map and logical_replica_counts"
+        )
+    if fused and logical_to_physical_map is not None and ep_rank is None:
+        raise ValueError(
+            "ep_rank is required when logical_to_physical_map is supplied for fused routing"
+        )
+    if ep_rank is not None and (not fused or logical_to_physical_map is None):
+        raise ValueError(
+            "ep_rank requires fused sqrt_softplus routing with logical_to_physical_map"
         )
     if fused:
         router_like = hidden_states

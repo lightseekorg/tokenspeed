@@ -20,6 +20,7 @@
 
 """Optional DeepGEMM shifted mHC adapter, with caller-owned BF16 outputs."""
 
+import inspect
 from functools import lru_cache
 
 import torch
@@ -43,6 +44,20 @@ def is_mega_mhc_available() -> bool:
     except (ImportError, OSError):
         return False
     return True
+
+
+@lru_cache(maxsize=1)
+def is_mega_mhc_direct_staging_available() -> bool:
+    """Return whether installed DeepGEMM accepts direct MegaMoE staging targets."""
+    if not is_mega_mhc_available():
+        return False
+    try:
+        params = inspect.signature(_api().mega_mhc).parameters
+    except (TypeError, ValueError):
+        return False
+    return all(
+        name in params for name in ("y_routed_sf", "y_shared_sf", "shared_sf_block_m")
+    )
 
 
 def _launch(
@@ -73,12 +88,18 @@ def _launch(
         torch.empty_like(tensor) for tensor in (pre, post, comb)
     )
     tokens, hidden = x.shape
-    y_fp8 = y_gemm_sf = y_routed_sf = y_shared_sf = None
-    if (
+    y_fp8 = y_gemm_sf = None
+    has_direct_targets = (
         y_fp8_out is not None
         or y_routed_sf_out is not None
         or y_shared_sf_out is not None
-    ):
+    )
+    extra_kwargs: dict[str, object] = {}
+    if has_direct_targets:
+        if not is_mega_mhc_direct_staging_available():
+            raise RuntimeError(
+                "Installed DeepGEMM mega_mhc does not support direct MegaMoE FP8 staging"
+            )
         if (
             y_fp8_out is None
             or y_routed_sf_out is None
@@ -90,8 +111,11 @@ def _launch(
                 "y_shared_sf_out, and positive shared_sf_block_m"
             )
         y_fp8 = y_fp8_out
-        y_routed_sf = y_routed_sf_out
-        y_shared_sf = y_shared_sf_out
+        extra_kwargs = {
+            "y_routed_sf": y_routed_sf_out,
+            "y_shared_sf": y_shared_sf_out,
+            "shared_sf_block_m": int(shared_sf_block_m),
+        }
     elif quantize_fp8:
         # Packed group-32 scales, MN-major with the token count padded to four
         # so every column starts 16-byte aligned for TMA.
@@ -124,9 +148,7 @@ def _launch(
         y_bf16=y,
         y_fp8=y_fp8,
         y_gemm_sf=y_gemm_sf,
-        y_routed_sf=y_routed_sf,
-        y_shared_sf=y_shared_sf,
-        shared_sf_block_m=int(shared_sf_block_m),
+        **extra_kwargs,
     )
     return new_residual, y, new_pre, new_post, new_comb, y_fp8, y_gemm_sf
 

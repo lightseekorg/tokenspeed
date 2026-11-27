@@ -588,6 +588,18 @@ MegaMoE skips in dispatch and combine; a filler row's MoE output is then
 zero, or the fused shared expert's alone. Eager forwards and prefill-graph
 buckets see (1, 1) and route every row.
 
+Fused `bf16_mega_gate` routing follows the same workspace and stream rules:
+each CUDA stream's first non-empty uncaptured launch runs under the `workspace`
+named region (`set_mega_gate_workspace_region`) so DeepGEMM's persistent
+per-stream barrier stays off the ordinary allocator pool, and capturing on an
+uninitialized stream fails closed. Under static all-to-all EP, it reads
+`partial_logical_to_rank_dispatch_physical_map.unsqueeze(-1)` with `count=1`
+so fused and unfused paths select identical per-rank physical replicas. Direct
+`mega_mhc -> symm_buffer` activation staging only fires on uncaptured forwards
+where `mega_mhc` runs (eager prefill); `PrefillGraph` (`BreakableCapture`) and
+decode CUDA graphs do not invoke `mega_mhc` and continue staging activations
+through `stage_mxfp4_mega_moe_inputs`.
+
 The pair counts requests, not rows, so one pair serves the replay's forwards
 of different rows per request, such as the DeepSeek V4.1 target's rows and
 its DSpark drafter's block rows, where a row mask would need one per row

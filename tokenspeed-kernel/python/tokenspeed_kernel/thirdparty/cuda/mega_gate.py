@@ -79,14 +79,18 @@ def set_mega_gate_workspace_region(
 
 
 def _call_with_workspace_region(device: torch.device, fn: Callable[[], object]):
-    if torch.cuda.is_current_stream_capturing():
-        return fn()
     device_index = (
         device.index if device.index is not None else torch.cuda.current_device()
     )
     stream_key = (device_index, int(torch.cuda.current_stream(device).cuda_stream))
     if stream_key in _INITIALIZED_STREAMS:
         return fn()
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "bf16_mega_gate requires an uncaptured launch on this CUDA stream "
+            "before graph capture so its per-stream barrier allocates inside "
+            "the workspace pool"
+        )
     with _INIT_LOCK:
         if stream_key in _INITIALIZED_STREAMS:
             return fn()
@@ -103,7 +107,7 @@ def bf16_mega_gate(
     *,
     renormalize: bool,
     routed_scaling_factor: float,
-    ep_rank: int,
+    ep_rank: int | None,
     correction_bias: torch.Tensor | None = None,
     image_bias: torch.Tensor | None = None,
     image_token_mask: torch.Tensor | None = None,
@@ -146,7 +150,9 @@ def bf16_mega_gate(
         raise ValueError(
             f"bf16_mega_gate supports at most {_MAX_TOKENS} tokens, got {num_tokens}"
         )
-    if ep_rank < 0:
+    if to_physical_map is not None and ep_rank is None:
+        raise ValueError("ep_rank is required when to_physical_map is provided")
+    if ep_rank is not None and ep_rank < 0:
         raise ValueError(f"ep_rank must be non-negative, got {ep_rank}")
     if not math.isfinite(routed_scaling_factor):
         raise ValueError("routed_scaling_factor must be finite")
@@ -189,6 +195,14 @@ def bf16_mega_gate(
             )
         out_arg = (out_idx, out_weights)
 
+    if num_tokens == 0:
+        if out is not None:
+            return out
+        return (
+            torch.empty((0, top_k), dtype=torch.float32, device=device),
+            torch.empty((0, top_k), dtype=torch.int64, device=device),
+        )
+
     api = _api()
     if api.get_pdl() != pdl_enabled():
         api.set_pdl(pdl_enabled())
@@ -201,7 +215,7 @@ def bf16_mega_gate(
             use_shared_as_routed=False,
             num_shared_experts=0,
             routed_scaling_factor=float(routed_scaling_factor),
-            ep_rank=int(ep_rank),
+            ep_rank=0 if ep_rank is None else int(ep_rank),
             scoring_func="sqrtsoftplus",
             mask=mask,
             bias=correction_bias,
@@ -215,8 +229,5 @@ def bf16_mega_gate(
             out=out_arg,
         )
 
-    if num_tokens == 0:
-        topk_idx, topk_weights = _launch()
-    else:
-        topk_idx, topk_weights = _call_with_workspace_region(device, _launch)
+    topk_idx, topk_weights = _call_with_workspace_region(device, _launch)
     return topk_weights, topk_idx
