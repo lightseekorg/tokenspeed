@@ -6169,15 +6169,20 @@ def gluon_petit_tp_attention_rows(
     ranks may take none. The split depends only on the replicated row count,
     so every rank derives the same graph-stable shapes.
     """
-    share = -(-num_rows // ep_size)
+    share = gluon_petit_tp_attention_share(num_rows, ep_size)
     start = min(num_rows, ep_rank * share)
     return start, min(num_rows, start + share)
+
+
+def gluon_petit_tp_attention_share(num_rows: int, ep_size: int) -> int:
+    """Rows the largest share (rank 0's) holds: ceil(num_rows / ep_size)."""
+    return -(-num_rows // ep_size)
 
 
 def _gluon_petit_rows_per_rank(args, rows: int) -> int:
     """Most of ``rows`` batch rows one rank sends to Petit."""
     if gluon_petit_tp_attention(args):
-        return -(-rows // args.mapping.moe.ep_size)
+        return gluon_petit_tp_attention_share(rows, args.mapping.moe.ep_size)
     return rows
 
 

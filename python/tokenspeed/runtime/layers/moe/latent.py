@@ -672,6 +672,7 @@ class LatentMoELayer(nn.Module):
         """
         from tokenspeed.runtime.utils.server_args import (
             gluon_petit_tp_attention_rows,
+            gluon_petit_tp_attention_share,
         )
 
         num_tokens = hidden_states.shape[0]
@@ -697,7 +698,7 @@ class LatentMoELayer(nn.Module):
             topk_output=topk_output,
             num_global_tokens=num_tokens,
             # Rank 0 holds the largest share.
-            max_num_tokens_per_gpu=-(-num_tokens // ep_size),
+            max_num_tokens_per_gpu=gluon_petit_tp_attention_share(num_tokens, ep_size),
         )
         _check_shape(routed_share, tuple(routed_input.shape), "routed experts")
         latent = (

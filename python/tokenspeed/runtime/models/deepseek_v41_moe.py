@@ -59,6 +59,7 @@ from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import (
     gluon_petit_tp_attention_mapping,
     gluon_petit_tp_attention_rows,
+    gluon_petit_tp_attention_share,
 )
 
 logger = logging.getLogger(__name__)
@@ -699,7 +700,7 @@ class DeepseekV4MoE(nn.Module):
                     topk_output,
                     num_rows,
                     # Rank 0 holds the largest share.
-                    -(-num_rows // self.mapping.moe.ep_size),
+                    gluon_petit_tp_attention_share(num_rows, self.mapping.moe.ep_size),
                     do_finalize=True,
                 )
             with fork.branch():

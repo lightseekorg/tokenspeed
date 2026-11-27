@@ -151,7 +151,10 @@ from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.server_args import (
+    ServerArgs,
+    gluon_petit_tp_attention_share,
+)
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -1457,7 +1460,7 @@ class ModelExecutor:
             # Gluon Petit under attention TP: each rank applies its
             # ceil(rows / EP) share of the replicated prefill rows.
             rows = (
-                -(-num_tokens // layer.ep_size)
+                gluon_petit_tp_attention_share(num_tokens, layer.ep_size)
                 if layer.petit_splits_replicated_rows
                 else num_tokens
             )
