@@ -1585,6 +1585,11 @@ def _check_dflash2_mla_fused_context_write_cuda_and_zero_occupancy() -> None:
             model.clear_latent_planes()
 
         _run_fused_vs_per_layer()
+        # Outside TorchMemorySaver (weights region), get_rope caches cos_sin_cache
+        # in module-level _ROPE_DICT; clear it so only PR-owned leaks could remain.
+        from tokenspeed.runtime.layers import rotary_embedding
+
+        rotary_embedding._ROPE_DICT.clear()
         ordinary_bytes = _ordinary_pool_bytes()
         assert ordinary_bytes <= baseline_bytes, (ordinary_bytes, baseline_bytes)
     finally:
