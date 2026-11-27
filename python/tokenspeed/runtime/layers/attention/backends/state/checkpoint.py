@@ -265,8 +265,8 @@ def compute_state_block_indices(
         validate: Run the host-synchronizing write-side checks.
         group_id: State group the table belongs to; only used to attribute
             validation errors (multi-group KDA runs this once per group).
-        num_blocks: Optional state pool block count; when provided alongside
-            ``validate=True``, also rejects entries outside ``-1..num_blocks-1``.
+        num_blocks: Optional state pool block count; when provided, rejects
+            entries outside ``-1..num_blocks-1`` unconditionally.
 
     Returns:
         ``(state_in, state_out)`` int32 block ids per request; ``state_in``
@@ -294,11 +294,12 @@ def compute_state_block_indices(
         live
     )
 
+    if num_blocks is not None:
+        validate_state_block_table_bounds(
+            rows, num_blocks=num_blocks, group_id=group_id
+        )
+
     if validate:
-        if num_blocks is not None:
-            validate_state_block_table_bounds(
-                rows, num_blocks=num_blocks, group_id=group_id
-            )
         real = (checkpoint != -1) | (live != -1)
         if bool((state_in[has_history & real] <= 0).any()):
             raise ValueError(
