@@ -2499,10 +2499,12 @@ class MambaAttnBackend(AttentionBackend):
                 fills with each token's k, v, a and b, or None when the split
                 filled it.
             output_norm: The layer's gated output norm, or None. The verify
-                kernel applies it where it can (``_verify_fuses_output_norm``).
+                kernel applies it where it can (``_verify_fuses_output_norm``),
+                else the scan applies it after the kernel.
 
         Returns:
-            ``[1, seq_len, Hv, V]`` layer output, normed by ``output_norm``.
+            ``[1, seq_len, Hv, V]`` layer output, normed by ``output_norm``
+            whether the kernel or the scan applied it.
         """
         _reject_skip_term(D)
         num_heads = query.shape[2]
@@ -2558,9 +2560,13 @@ class MambaAttnBackend(AttentionBackend):
             pending_replay=self._pending_replay_descriptor(layer_id, batch_size),
             output_norm=fused_norm,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
-        if fused_norm is not None:
+        if fused_norm is not None or output_norm is None:
             return out
-        return apply_kda_output_norm(out, output_norm)
+        # The separate norm returns [seq_len, Hv * V]; the view keeps one
+        # return shape without a copy.
+        return apply_kda_output_norm(out, output_norm).view(
+            1, seq_len, num_value_heads, head_v_dim
+        )
 
     def _prefill_state_dtype(self, cache_dtype: torch.dtype) -> torch.dtype:
         return cache_dtype

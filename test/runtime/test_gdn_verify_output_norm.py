@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""A GDN verify returns the gated-RMSNormed output, fused where the kernel can."""
+"""A GDN verify returns the gated-RMSNormed output, fused where the kernel can,
+in the raw output's shape either way."""
 
 from __future__ import annotations
 
@@ -125,7 +126,8 @@ def _verify(backend, pool, inputs, output_norm):
     )
 
 
-def test_verify_applies_the_gated_output_norm():
+@pytest.mark.parametrize("fused", [True, False], ids=["fused", "separate"])
+def test_verify_applies_the_gated_output_norm(fused):
     backend, pool = _backend()
     assert backend._verify_fuses_output_norm == gdn_verify_fuses_output_norm(
         torch.bfloat16,
@@ -140,6 +142,10 @@ def test_verify_applies_the_gated_output_norm():
         },
         solution=None,
     )
+    if fused and not backend._verify_fuses_output_norm:
+        pytest.skip("the selected GDN verify kernel applies no output norm")
+    # A platform without a fusing kernel takes the separate norm.
+    backend._verify_fuses_output_norm = fused
     gen = torch.Generator(device=DEVICE).manual_seed(9)
     rows = BATCH * TOKENS
     inputs = {
@@ -164,6 +170,9 @@ def test_verify_applies_the_gated_output_norm():
     raw = _verify(backend, pool, inputs, None)
     normed = _verify(backend, pool, inputs, output_norm)
     expected = apply_kda_output_norm(raw, output_norm)
+    # Both the fused and the separate norm keep the raw output's shape.
+    assert raw.shape == (1, rows, HEADS, HEAD_DIM)
+    assert normed.shape == raw.shape
     # A fused norm reads the FP32 output, the separate one its BF16 rounding.
     torch.testing.assert_close(
         normed.reshape(rows, -1).float(), expected.float(), rtol=2e-2, atol=2e-2
