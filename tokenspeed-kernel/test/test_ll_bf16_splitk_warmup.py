@@ -141,8 +141,14 @@ def test_router_call_sites_warm_splitk_under_kernel_warmup(monkeypatch):
     with kernel_warmup(enabled=True):
         block_scaled.block_scaled_router_mm(x_bs, w_bs, solution=None)
 
-    # 2. dsv4_linear_fp32 (uses real gemm.pdl_enabled import)
+    # 2. dsv4_linear_fp32 (uses real gemm.pdl_enabled import; decline GPU kernel
+    # dispatch so this test stays device-independent on GPU hosts too).
     monkeypatch.setattr(gemm, "warm_ll_bf16_splitk", make_recorder("dsv4"))
+
+    def _no_gpu_kernel(*_args, **_kwargs):
+        raise gemm.NoKernelFoundError("cpu test")
+
+    monkeypatch.setattr(gemm, "select_kernel", _no_gpu_kernel)
     with kernel_warmup(enabled=True):
         gemm.dsv4_linear_fp32(
             torch.zeros((64, 1024), dtype=torch.bfloat16),
