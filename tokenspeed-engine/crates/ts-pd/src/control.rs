@@ -22,7 +22,7 @@
 //! loop sees them: requests register at admission, and every round the
 //! replica agrees on which transfers changed state.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use ts_collective::{Group, Mesh};
 
@@ -83,7 +83,7 @@ pub struct BootstrapInfo {
 }
 
 /// A D-role request whose KV landed.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct RemotePrefill {
     /// The request.
     pub rid: String,
@@ -98,6 +98,22 @@ pub struct RemotePrefill {
     pub spec_candidate_ids: Option<Vec<i32>>,
     /// The request's slot here.
     pub request_pool_index: i32,
+    /// Local observation after KV and bootstrap arrived, before emitting the event.
+    pub kv_ready_at: (SystemTime, Instant),
+}
+
+// Preserve the existing transfer debug record: response-only timings are not logged.
+impl std::fmt::Debug for RemotePrefill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemotePrefill")
+            .field("rid", &self.rid)
+            .field("bootstrap_token", &self.bootstrap_token)
+            .field("cached_tokens", &self.cached_tokens)
+            .field("bootstrap_logprob", &self.bootstrap_logprob)
+            .field("spec_candidate_ids", &self.spec_candidate_ids)
+            .field("request_pool_index", &self.request_pool_index)
+            .finish()
+    }
 }
 
 /// A transfer whose state the replica agreed changed.
@@ -106,9 +122,8 @@ pub enum PdEvent {
     /// The request may be admitted. D role: its peers are connected and,
     /// when the prefill node defers the decode allocation, that node holds every
     /// page of the prompt. P role under early decode allocation: every
-    /// decode rank allocated its destination. P role under deferred
-    /// decode allocation: its decode node announced it; the destination has
-    /// its own event.
+    /// decode rank allocated its destination. Deferred P requests are
+    /// schedulable on submission and do not receive this event.
     Bootstrapped(String),
     /// P role, deferred decode allocation: every decode rank allocated
     /// the request's destination.

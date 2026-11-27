@@ -50,6 +50,9 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa:
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (  # noqa: E402
     Qwen4ExpPLEBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (  # noqa: E402
+    in_forward_state_checkpoints,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (  # noqa: E402
     QWEN4_EXP_PLE_CACHE_GROUP,
     qwen4_exp_ple_context_field,
@@ -253,3 +256,55 @@ def test_the_spanning_forward_stores_what_a_forward_ending_there_leaves():
     ), "the live block holds the chunk end"
     # Row 0 wrote only its live block.
     assert conv[3].abs().sum() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_ple_checkpoint_writer_reuses_uploaded_positions_without_host_sync():
+    config = _config()
+    with torch.device("cuda"):
+        layer = Qwen4ExpPLELayer(
+            config,
+            Mapping(rank=0, world_size=1),
+            layer_id=0,
+            ple_layer_index=0,
+            quant_config=None,
+            prefix="model.layers.0.ple",
+        )
+    lengths = torch.tensor([20, 40], dtype=torch.int32)
+    offsets = torch.tensor([0, 32], dtype=torch.int32)
+    tables = {
+        QWEN4_EXP_PLE_CACHE_GROUP: torch.tensor(
+            [[0, 1, -1], [0, 2, 7]], dtype=torch.int32, device="cuda"
+        )
+    }
+    checkpoints = in_forward_state_checkpoints(
+        offsets, lengths, 2, tables, tuple(tables)
+    )
+    starts = torch.tensor([0, 20], dtype=torch.int64, device="cuda")
+    flat_ids = torch.arange(60, dtype=torch.int64, device="cuda")
+    initial_context = torch.zeros(
+        2, config.ngram_context_len, dtype=torch.int64, device="cuda"
+    )
+    width, window = config.short_conv_state_shape
+    conv_inputs = torch.zeros(60, width, dtype=torch.bfloat16, device="cuda")
+    context_field = torch.zeros(
+        PAGES, config.ngram_context_len, dtype=torch.int64, device="cuda"
+    )
+    conv_field = torch.zeros(PAGES, width, window, dtype=torch.bfloat16, device="cuda")
+    write_args = (
+        checkpoints,
+        flat_ids,
+        initial_context,
+        conv_inputs,
+        starts,
+        context_field,
+        conv_field,
+    )
+    layer._write_checkpoints(*write_args)
+    torch.cuda.synchronize()
+    previous_sync_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        layer._write_checkpoints(*write_args)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_sync_mode)

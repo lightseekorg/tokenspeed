@@ -294,9 +294,11 @@ Select the transport with `--all2all-backend`:
   and its projection/shared-expert weight placement in one module.
   See [Kimi-K3 Hopper PD](../guides/kimi-k3-hopper-pd.md) for deployment layouts.
 
-For NVIDIA NVFP4 checkpoints, `--moe-backend mega_moe` replaces routed
+For NVIDIA NVFP4 and MXFP4 checkpoints, `--moe-backend mega_moe` replaces routed
 dispatch, SiTU expert computation, and combine with MegaMoE. It requires
 `--all2all-backend none`, keeps routing weights after FC2, and returns BF16 outputs.
+MXFP4 experts run FlashInfer's Kimi K3 MegaMoE, which quantizes the BF16 routed
+rows to MXFP8.
 
 The AG/RS and FlashInfer transports quantize NVFP4 activations before dispatch and transfer their
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
@@ -1012,6 +1014,15 @@ TokenSpeed currently supports the flag on AMD GPUs, on one node, without
 pipeline, context or attention data parallelism, an MoE TP x EP size other
 than the attention TP size, `--mm-encoder-tp-mode data`, PD disaggregation,
 fused all-reduce, or an `--all2all-backend` transport.
+
+## Headless plugin registration
+
+A compatible headless launcher can register a plugin's numerical profiles
+before parsing, start the engine ranks, and finish the supervisor's plugin
+registration while the ranks initialize. The full registration must finish
+before the supervisor reports readiness. Compatibility requires the plugin's
+`register_cli_options()` hook and a supported set of enabled plugins. Other
+installations use eager plugin loading.
 
 ## Runtime notes
 

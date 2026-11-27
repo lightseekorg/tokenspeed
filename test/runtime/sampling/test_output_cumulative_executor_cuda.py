@@ -72,6 +72,9 @@ def _executor(*, enabled, drafter):
     executor.tree_spec = None
     executor.drafter = drafter
     executor.runtime_states = RuntimeStates(POOL, VOCAB, VOCAB, 1, device="cuda")
+    # Per row, whether the device ended the request, as ModelExecutor.__init__
+    # sizes it; the stop conditions write it.
+    executor.request_ends = torch.zeros(4, dtype=torch.int32, device="cuda")
     # The input buffers' rows this step reads.
     executor.input_buffers = SimpleNamespace(
         state_write_req_pool_indices_buf=torch.tensor([3, 5], device="cuda"),

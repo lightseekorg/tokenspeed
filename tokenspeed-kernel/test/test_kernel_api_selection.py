@@ -324,6 +324,7 @@ def test_residual_family_exports_and_modes():
         "post_norm_residual_pre_norm_bf16",
         "post_norm_residual_pre_norm_bf16_fp8",
         "residual_gate_coefficients",
+        "set_gated_residual_workspace_region",
         "try_mhc_shifted_post_pre_norm",
         "try_mhc_shifted_post_pre_norm_quantize_fp8",
     }
@@ -1626,14 +1627,17 @@ def _attention_prefill(solution: str | None = None) -> object:
 
 
 def _attention_extend(
-    solution: str | None = None, dtype: torch.dtype = torch.bfloat16
+    solution: str | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 64,
+    page: int = 64,
 ) -> object:
-    q = torch.empty((4, 16, 64), dtype=dtype)
+    q = torch.empty((4, 16, head_dim), dtype=dtype)
     cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
     cu_seqlens_kv = torch.tensor([0, 64, 192], dtype=torch.int32)
-    k_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
-    v_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
-    page_table = torch.empty((2, 4), dtype=torch.int32)
+    k_cache = torch.empty((8 * 64 // page, page, 8, head_dim), dtype=dtype)
+    v_cache = torch.empty((8 * 64 // page, page, 8, head_dim), dtype=dtype)
+    page_table = torch.empty((2, 4 * 64 // page), dtype=torch.int32)
     cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
     return _attention_mha_pkg.mha_extend_with_kvcache(
         q,
@@ -6196,6 +6200,29 @@ _CASES = [
         "gluon_mha_extend_gfx950",
         _attention_extend,
     ),
+    # Head dim 256 (Qwen3.8 full attention) takes the Gluon extend on BF16
+    # and FP8 caches; a 16-token page has no Gluon extend and stays on Triton.
+    *(
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            "mha_extend_with_kvcache",
+            "gluon_mha_extend_gfx950",
+            partial(_attention_extend, dtype=dtype, head_dim=256),
+            id_suffix=f"hd256-{name}",
+        )
+        for name, dtype in (("bf16", torch.bfloat16), ("fp8", torch.float8_e4m3fn))
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mha_extend_with_kvcache",
+        "triton_mha_extend_with_kvcache",
+        partial(_attention_extend, head_dim=256, page=16),
+        id_suffix="hd256-page16",
+    ),
     _case(
         _is_cdna4,
         "cdna4",
@@ -7622,6 +7649,68 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
         assert plan["apply_kernel_name"] == ("flashinfer_trtllm_fp8_routed_moe_apply")
         assert plan["support_routing"] is False
         assert plan["supports_deferred_finalize"] is True
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry._instance = real_registry
+
+
+@pytest.mark.parametrize(
+    ("activation", "routing_mode", "trtllm_kernel"),
+    [
+        ("silu", None, "flashinfer_trtllm_fp8_moe_apply"),
+        ("swiglu", "precomputed_topk", "flashinfer_trtllm_fp8_routed_moe_apply"),
+    ],
+)
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("platform_fixture", ["h100_platform", "b200_platform"])
+def test_fp8_block_moe_selects_a_kernel_that_runs_the_input(
+    request: pytest.FixtureRequest,
+    platform_fixture: str,
+    input_dtype: torch.dtype,
+    activation: str,
+    routing_mode: str | None,
+    trtllm_kernel: str,
+) -> None:
+    if not Platform.get().is_nvidia:
+        pytest.skip("FlashInfer MoE kernels are registered only on NVIDIA")
+
+    # CUTLASS block-scaled FP8 runs on SM90 only; the TRT-LLM quantizer reads BF16 only.
+    if platform_fixture == "h100_platform":
+        expected = "flashinfer_cutlass_fp8_moe_apply"
+    else:
+        expected = trtllm_kernel if input_dtype == torch.bfloat16 else None
+
+    real_platform = Platform.get()
+    real_registry = KernelRegistry.get()
+    try:
+        Platform.override(request.getfixturevalue(platform_fixture))
+        KernelRegistry.reset()
+        importlib.reload(_moe_flashinfer)
+
+        routing = {} if routing_mode is None else {"routing_mode": routing_mode}
+        select = partial(
+            kernel_moe_plan,
+            "fp8",
+            input_dtype=input_dtype,
+            activation=activation,
+            ep_size=4,
+            ispp=2048,
+            fp8_scale_block_shape=(128, 128),
+            internal_activation_dtype="input",
+            hidden=None,
+            swiglu_form="standard" if activation == "swiglu" else None,
+            activation_clamped=False,
+            expert_id_repeats=False,
+            fast_math=True,
+            combine_order="rank",
+            features=frozenset(),
+            **routing,
+        )
+        if expected is None:
+            with pytest.raises(kernel_NoKernelFoundError):
+                select()
+        else:
+            assert select()["apply_kernel_name"] == expected
     finally:
         Platform.override(real_platform)
         KernelRegistry._instance = real_registry

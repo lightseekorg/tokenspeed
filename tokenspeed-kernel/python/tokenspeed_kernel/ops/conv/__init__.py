@@ -68,6 +68,7 @@ from tokenspeed_kernel._triton import tl as _tl
 from tokenspeed_kernel._triton import triton as _triton_lang
 from tokenspeed_kernel.ops.attention.gdn.triton import CausalConv1dPrefillMetadata
 from tokenspeed_kernel.ops.conv import cute_dsl as _cute_dsl_solutions  # noqa: F401
+from tokenspeed_kernel.ops.conv.replay import BankedConvReplayPayload
 from tokenspeed_kernel.ops.conv.triton import (
     PAD_SLOT_ID,
     PREFILL_QKV_CHANNEL_MULTIPLE,
@@ -86,6 +87,7 @@ __all__ = [
     "PAD_SLOT_ID",
     "PREFILL_QKV_CHANNEL_MULTIPLE",
     "InklingCommitTable",
+    "BankedConvReplayPayload",
     "causal_conv1d_fn",
     "causal_conv1d_qkv_fn",
     "causal_conv1d_update",
@@ -778,7 +780,9 @@ def causal_conv1d_update(
     *,
     parent_indices: torch.Tensor | None,
     out: torch.Tensor | None = None,
-    replay_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    replay_payload: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor] | BankedConvReplayPayload | None
+    ) = None,
 ):
     """Select a decode/tree convolution leaf for the supplied state indices."""
     kernel = select_kernel(

@@ -53,6 +53,7 @@ from tokenspeed.runtime.metrics.config import metrics_enabled
 from tokenspeed.runtime.metrics.relay import MetricsRelay
 from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.pd.utils import DisaggregationMode, TransferBackend
+from tokenspeed.runtime.plugins import ensure_loaded, finish_headless_plugins
 from tokenspeed.runtime.utils import (
     configure_logger,
     get_colorful_logger,
@@ -205,7 +206,7 @@ def _start_ranks(
     ``utils.process.set_parent_death_signal``)."""
     binary = host_binary()
     memory_saver_adapter = TorchMemorySaverAdapter.create(
-        enable=server_args.enable_memory_saver
+        enable=server_args.enable_memory_saver, device=server_args.device
     )
     procs, readers = [], []
     for rank in _scheduler_ranks(server_args):
@@ -226,7 +227,10 @@ def _start_ranks(
 
 
 def _start_encode_ranks(
-    server_args: ServerArgs, port_args: PortArgs, parent_death_signal: bool
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    metrics_relay: MetricsRelay | None,
+    parent_death_signal: bool,
 ) -> tuple[list, list]:
     """Start this node's EPD encode ranks, one ``ts-host`` process each in
     encode mode (``epd/encode_host.py``), and return them with their ready
@@ -244,7 +248,7 @@ def _start_encode_ranks(
             rank_server_args,
             port_args,
             contextlib.nullcontext(),
-            None,
+            metrics_relay.endpoint if metrics_relay is not None else None,
             parent_death_signal,
         )
         procs.append(proc)
@@ -398,27 +402,28 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         # Nothing else stops a follower node's ranks, so they must not outlive
         # it, even when it is SIGKILLed; the first node's frontend notices.
         parent_death_signal = server_args.node_rank >= 1
-        if server_args.disaggregation_mode == "encode":
-            # The encode ranks host the node's EPD bootstrap server themselves.
-            procs, readers = _start_encode_ranks(
-                server_args, port_args, parent_death_signal
-            )
-        else:
+        if server_args.disaggregation_mode != "encode":
             # Fail before any rank loads the model.
             refusals = rust_host_refusals(server_args)
             if refusals:
                 raise NotImplementedError(
                     "The engine host does not support " + ", ".join(refusals) + " yet"
                 )
-            # A host's control thread runs no Python: the selected output
-            # plugins run in the node's relay, which the ranks feed.
-            if port_args.metrics_producer_configs:
-                metrics_relay = MetricsRelay(port_args.metrics_producer_configs)
+        # The selected reporter is node-owned for every Rust host mode.
+        if port_args.metrics_producer_configs:
+            metrics_relay = MetricsRelay(port_args.metrics_producer_configs)
+        if server_args.disaggregation_mode == "encode":
+            # The encode ranks host the node's EPD bootstrap server themselves.
+            procs, readers = _start_encode_ranks(
+                server_args, port_args, metrics_relay, parent_death_signal
+            )
+        else:
             procs, readers = _start_ranks(
                 server_args, port_args, metrics_relay, parent_death_signal
             )
         scheduler_procs.extend(procs)
         scheduler_pipe_readers.extend(readers)
+        finish_headless_plugins()
         for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
             if data.get("status") != "ready":
                 raise RuntimeError(
@@ -445,24 +450,35 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             proc.join(timeout=5)
         # The ranks sent their last events: the relay flushes its sinks
         # before the process tree, which it belongs to, goes down.
-        if metrics_relay is not None:
-            metrics_relay.close(timeout=2.0)
-        if scheduler_procs:
-            kill_process_tree(os.getpid(), include_parent=False)
-        for descendant in scheduler_descendants:
-            with contextlib.suppress(psutil.NoSuchProcess):
-                descendant.kill()
-        if kv_bootstrap_server is not None:
-            kv_bootstrap_server.close()
-        metrics_service.close(timeout=2.0)
+        try:
+            if metrics_relay is not None:
+                metrics_relay.close(timeout=2.0)
+        finally:
+            if scheduler_procs:
+                kill_process_tree(os.getpid(), include_parent=False)
+            for descendant in scheduler_descendants:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    descendant.kill()
+            if kv_bootstrap_server is not None:
+                kv_bootstrap_server.close()
+            metrics_service.close(timeout=2.0)
 
 
 def run_scheduler_headless_from_cli(argv: list[str] | None = None) -> None:
     """CLI shim: ``python -m tokenspeed.runtime.entrypoints.engine <ServerArgs>``."""
     from tokenspeed.runtime.utils.server_args import prepare_server_args
 
-    server_args = prepare_server_args(sys.argv[1:] if argv is None else argv)
-    launch_scheduler_headless(server_args)
+    ensure_loaded(headless_config=True)
+    try:
+        server_args = prepare_server_args(sys.argv[1:] if argv is None else argv)
+        launch_scheduler_headless(server_args)
+    except BaseException:
+        # Restore full plugin registration if startup failed before rank launch.
+        try:
+            finish_headless_plugins()
+        except Exception:
+            logger.exception("Failed to finish plugin registration during shutdown")
+        raise
 
 
 if __name__ == "__main__":

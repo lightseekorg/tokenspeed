@@ -23,6 +23,9 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
     if prefix_replay_tokens is not None:
         kwargs["prefix_replay_tokens"] = prefix_replay_tokens
     return make_config(
+        prefix_cache_evict_policy="lru",
+        prefix_cache_gds_prefill_cost=None,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
@@ -39,6 +42,7 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
         storage_config=None,
         **kwargs,
         num_disk_pages=0,
@@ -65,7 +69,7 @@ def _resolve_replay(**overrides) -> int:
     kwargs = {
         "speculative_algorithm": "DSPARK",
         "enable_prefix_caching": True,
-        "enable_kvstore": False,
+        "has_host_tier": False,
         "disaggregation_mode": "null",
         "draft_model_path_use_base": True,
         "draft_model_config": SimpleNamespace(dspark_prefix_replay_tokens=128),
@@ -104,11 +108,15 @@ def test_resolve_dspark_prefix_replay_rejects_invalid_capability(value: int) -> 
 
 @pytest.mark.parametrize(
     "overrides",
-    [{}, {"enable_kvstore": True}, {"disaggregation_mode": "prefill"}],
+    [
+        {},
+        {"has_host_tier": True},
+        {"disaggregation_mode": "prefill"},
+    ],
 )
 def test_resolve_dspark_cache_resident_windows_need_no_replay(overrides) -> None:
     # A draft whose windows live in the KV cache (V4.1) advertises zero and is
-    # free to combine with KVStore and disaggregation.
+    # free to combine with KVStore, a shared L2 pool and disaggregation.
     assert (
         _resolve_replay(
             draft_model_config=SimpleNamespace(dspark_prefix_replay_tokens=0),
@@ -131,7 +139,8 @@ def test_resolve_dspark_prefix_replay_keeps_same_checkpoint_fail_closed() -> Non
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
-        ({"enable_kvstore": True}, "does not support KVStore"),
+        # The local Host L2, or a shared L2 pool in its place.
+        ({"has_host_tier": True}, "does not support KVStore or a shared L2 pool"),
         ({"disaggregation_mode": "prefill"}, "disaggregated serving"),
         ({"disaggregation_mode": "decode"}, "disaggregated serving"),
     ],
@@ -146,6 +155,9 @@ def test_resolve_dspark_prefix_replay_rejects_unsupported_cache_modes(
 @pytest.mark.parametrize("enable_l3_storage", [False, True])
 def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> None:
     config = make_config(
+        prefix_cache_evict_policy="lru",
+        prefix_cache_gds_prefill_cost=None,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
@@ -162,6 +174,7 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
         storage_config=(
             StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=7, prefix_granularity=2
@@ -186,4 +199,4 @@ def test_private_context_rejects_kvstore_even_without_prefix_caching() -> None:
     # The host tier cannot restore a drafter-private context, so KVStore is
     # refused whether or not prefix reuse is on.
     with pytest.raises(ValueError, match="does not support KVStore"):
-        _resolve_replay(enable_prefix_caching=False, enable_kvstore=True)
+        _resolve_replay(enable_prefix_caching=False, has_host_tier=True)

@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <functional>
 
 #include "cache/core/prefetch.h"
@@ -85,14 +86,17 @@ private:
 
     void retain() noexcept;
     void release() noexcept;
-    std::uint32_t useCount() const noexcept { return strong_count_; }
+    // A pending owner callback keeps the control alive without pinning the page.
+    static constexpr std::uint32_t kPending = 1u << 31;
+    std::uint32_t useCount() const noexcept { return strong_count_.load(std::memory_order_acquire) & ~kPending; }
+    void finishRelease(std::uint32_t state) noexcept;
 
     CacheBlock& object() noexcept { return object_; }
     const CacheBlock& object() const noexcept { return object_; }
     bool isOwnedBy(const BlockPool& pool) const noexcept;
 
     CacheBlock object_;
-    std::uint32_t strong_count_{1};
+    std::atomic<std::uint32_t> strong_count_{1};
     CacheBlockUniqueObserver* unique_observers_{nullptr};
 };
 
@@ -127,7 +131,10 @@ public:
 
 private:
     friend class BlockPool;
+    friend class PeerPinRelease;
     friend class CacheBlockUniqueObserver;
+    void releaseFromPeer() noexcept;
+    void finishPeerRelease() noexcept;
 
     explicit CacheBlockRef(internal_cache_block_ref::CacheBlockControl& control) noexcept : control_{&control} {}
 

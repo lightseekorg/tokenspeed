@@ -80,6 +80,9 @@ def wire(monkeypatch):
             StoragePutOp=ts.Cache.StoragePutOp,
             StorageCancelOp=ts.Cache.StorageCancelOp,
             DiskOp=ts.Cache.DiskOp,
+            SharedL2ReleaseOp=ts.Cache.SharedL2ReleaseOp,
+            SharedL2WriteOp=ts.Cache.SharedL2WriteOp,
+            SharedL2TouchOp=ts.Cache.SharedL2TouchOp,
         ),
     )
 
@@ -200,8 +203,50 @@ def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
         )
 
 
+def test_plan_adapter_leaves_a_shared_l2_pools_commands_to_the_host():
+    scheduler = ts.Scheduler(_pool_config())
+    spec = ts.RequestSpec()
+    spec.request_id = "r"
+    spec.tokens = list(range(1, 8))
+    scheduler.submit_requests([spec])
+    [lookup] = scheduler.start_shared_l2_lookups()
+    # The pool holds the prompt's first two pages.
+    slots = [
+        ((0, 0, page_hash, 0), 0, 11 + i) for i, page_hash in enumerate(lookup[1][:2])
+    ]
+    assert (
+        len(scheduler.apply_shared_l2_answers([(lookup[0], 7, 4, 4, None, slots)])) == 2
+    )
+
+    # The load-back from the proxy blocks is the device's.
+    plan = scheduler.next_execution_plan()
+    ops = cache_ops_from_plan(plan, request_admission={}.__getitem__)
+    [load_back] = ops.device
+    assert type(load_back).__name__ == "LoadBackOp"
+    assert ops.storage == ()
+
+    # The release of the answer's ticket and the write of what the prompt
+    # computed are the pool client's: the adapter passes them to no one, and
+    # the host's loop reads them from the plan.
+    event = ts.ExecutionEvent()
+    event.add_event(ts.Cache.LoadBackDoneEvent(load_back.op_ids[0]))
+    scheduler.advance(event)
+    plan = scheduler.next_execution_plan()
+    assert [type(op).__name__ for op in plan.cache] == [
+        "SharedL2ReleaseOp",
+        "SharedL2WriteOp",
+    ]
+    assert cache_ops_from_plan(plan, request_admission={}.__getitem__) == ((), ())
+
+
 @pytest.mark.parametrize(
-    "kind", ["WriteBackDoneEvent", "SnapshotDoneEvent", "RestoreDoneEvent"]
+    "kind",
+    [
+        "WriteBackDoneEvent",
+        "SnapshotDoneEvent",
+        "RestoreDoneEvent",
+        "StateCommitDoneEvent",
+    ],
 )
 def test_cache_acks_become_the_payload_the_host_reads(kind):
     event = getattr(ts.Cache, kind)()
@@ -217,6 +262,9 @@ def test_load_back_acks_become_payloads():
 
 def _config(**overrides):
     fields = dict(
+        prefix_cache_evict_policy="lru",
+        prefix_cache_gds_prefill_cost=None,
+        prefix_cache_gds_disk_block_costs=(),
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
@@ -233,12 +281,31 @@ def _config(**overrides):
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
         storage_config=None,
         num_disk_pages=0,
         disk_config=None,
     )
     fields.update(overrides)
     return make_config(**fields)
+
+
+def _pool_config():
+    return _config(
+        num_host_pages=65,
+        disable_l2_cache=False,
+        host_group_packing=(1,),
+        cache_groups=[ts.CacheGroupConfig("full", 2, 32, ts.AttnKind.Full)],
+        shared_l2_config=ts.SharedL2Config(
+            max_writes_in_flight=2, max_keys_per_write=8
+        ),
+    )
+
+
+def test_make_config_makes_the_host_tier_a_shared_l2_pools_proxy():
+    assert _config().shared_l2_config is None
+    limits = _pool_config().shared_l2_config
+    assert (limits.max_writes_in_flight, limits.max_keys_per_write) == (2, 8)
 
 
 def test_make_config_states_the_snapshot_pool_on_every_role():

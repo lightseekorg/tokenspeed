@@ -265,9 +265,13 @@ def stage_route(
     S: gl.constexpr,
     guard,
 ):
-    route_parts(rlogp, parts, token, tag, S, guard)
     tid = thread_ids()
     lane = tid % 64
+    # The bias loads are in flight across the wait for the logits.
+    biases = ()
+    for i in gl.static_range(14):
+        biases += (gl.load(bias + lane + 64 * i),)
+    route_parts(rlogp, parts, token, tag, S, guard)
     # Wave 0 alone routes the rows, so the LDS accesses here and in
     # rank_candidates and extract use the barrier-free helpers.
     if wave_pending(tid < 64):
@@ -281,11 +285,10 @@ def stage_route(
         keys = ()
         sigmoids = ()
         for i in gl.static_range(14):
-            expert = lane + 64 * i
             sigmoid = gl.extra.libdevice.fast_dividef(
                 1.0, 1.0 + gl.exp2(logits[i] * -1.4426950408889634)
             )
-            score = sigmoid + gl.load(bias + expert)
+            score = sigmoid + biases[i]
             score = gl.where(score == score, score, -3.0e38)
             bits = score.to(gl.int32, bitcast=True)
             keys += (gl.where(bits < 0, ~bits, bits ^ (-2147483648)).to(gl.uint32),)

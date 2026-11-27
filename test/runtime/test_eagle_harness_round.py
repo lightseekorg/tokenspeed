@@ -459,6 +459,9 @@ def _decode_batch(bs: int, width: int):
     each, once their prefill landed."""
     scheduler = ts.Scheduler(
         make_config(
+            prefix_cache_evict_policy="lru",
+            prefix_cache_gds_prefill_cost=None,
+            prefix_cache_gds_disk_block_costs=(),
             num_device_pages=65,
             max_scheduled_tokens=bs * width,
             max_batch_size=bs,
@@ -475,6 +478,7 @@ def _decode_batch(bs: int, width: int):
             prefill_decode_interval=0,
             prefill_decode_min_interval=0,
             max_consecutive_prefill_rounds=0,
+            prefill_interval_min_decoding=0,
             storage_config=None,
             decode_input_tokens=width,
             cache_groups=[

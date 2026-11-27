@@ -138,6 +138,7 @@ class CpuConfig:
     startup_requests: bool = False
     memory_saver: bool = False
     memory_regions: tuple = ()
+    backup_device_kv: bool = False
     allow_reload_forward: bool = False
     l3: object = None
     disk: object = None
@@ -185,9 +186,10 @@ class CpuDevice:
             time.sleep(0.02)
         return rows
     def complete(self, rows):
-        return ([3] * rows, [1] * rows, None, None, None, None, None, None, None)
+        return ([3] * rows, [1] * rows, None, None, None, None, None, None, None, None)
     def note_committed(self, result): pass
     def release(self, rids): pass
+    def replay_retirement_enabled(self): return False
     def poll_cache_events(self): return []
     def poll_cache_observations(self): return ([], 0)
 
@@ -219,7 +221,10 @@ class CpuBootstrap:
 
 retained_schedulers = []
 
-def bootstrap(*args):
+def prepare_bootstrap(fd):
+    return False, start
+
+def start(outbox, protocol, spans, peer, shared):
     result = CpuBootstrap()
     if retain_owner:
         # Keep an explicit native owner as well as the frozen Python cycle:

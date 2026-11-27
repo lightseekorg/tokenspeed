@@ -26,6 +26,7 @@ import importlib
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 # Executed as a script by run_ci_suite: the test dir must be importable.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -78,7 +79,9 @@ class _Holder:
 def _executor(monkeypatch, log, *, with_draft: bool):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
-    executor.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+    executor.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     executor.config = SimpleNamespace(
         spec_algo=None,
         enforce_eager=False,
@@ -239,6 +242,28 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
         ("prefill", 3, observer, executor.forward_step),
         ("drafter", "stream", "window:prefill:drafter"),
     ]
+
+
+def test_graphless_ascend_startup_checks_model_and_kv_ownership(monkeypatch):
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.device = "npu"
+    executor.config = SimpleNamespace(enable_memory_saver=True)
+    executor.forward_step = SimpleNamespace(disable=True, graphs={})
+    executor.prefill_graph = SimpleNamespace(disable=True)
+    saver = Mock()
+    executor.model_runner = SimpleNamespace(model="target", memory_saver_adapter=saver)
+    executor._draft_model_runner = SimpleNamespace(model="draft")
+    regions = {"arena": object()}
+    executor.token_to_kv_pool = SimpleNamespace(arena=SimpleNamespace(regions=regions))
+    monkeypatch.setattr(module, "workspace_pool", lambda _: Mock())
+
+    executor.capture_graphs(entries=None, observer=None)
+
+    saver.validate_startup.assert_called_once()
+    inventory = saver.validate_startup.call_args.kwargs
+    assert inventory["models"] == [("target", "target"), ("draft", "draft")]
+    assert inventory["kv_regions"] is regions
+    assert list(inventory["graphs"]) == []
 
 
 def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):

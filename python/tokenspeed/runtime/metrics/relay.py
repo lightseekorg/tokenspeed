@@ -30,14 +30,18 @@ neither a rank nor its interpreter.
 
 The relay owns the sinks only; the launcher keeps the node sessions
 (``metrics_service.start``) and the Prometheus endpoint, which reads the
-hosts' multiprocess files directly.
+hosts' multiprocess files directly. A standalone interpreter loads only the
+runtime entry points that registered the selected outputs in the launcher.
 """
 
 from __future__ import annotations
 
+import atexit
 import multiprocessing as mp
 import os
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import uuid
@@ -56,6 +60,21 @@ from tokenspeed.runtime.metrics.service import metrics_service
 
 # How long the relay waits for a message before checking for a stop.
 _POLL_MS = 100
+
+
+def _reporter_entry_points(names: dict[str, MetricConfig]) -> list[str]:
+    """Select successful launcher registrations, preserving override order."""
+    from tokenspeed.runtime.plugins import list_plugins
+
+    return [
+        plugin.entry_point
+        for plugin in list_plugins()
+        if plugin.entry_point is not None
+        and any(
+            kind == "metric reporter" and names.keys() & registered
+            for kind, registered in plugin.registrations
+        )
+    ]
 
 
 def decode_event(frame: bytes) -> MetricEvent:
@@ -92,12 +111,16 @@ def relay_events(
 
 
 def _relay_main(
-    endpoint: str, producer_configs: dict[str, MetricConfig], ready: Connection
+    endpoint: str,
+    producer_configs: dict[str, MetricConfig],
+    ready: Connection,
+    entry_points: list[str],
 ) -> None:
+    """Create selected sinks, acknowledge the bound socket, then relay events."""
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda _signum, _frame: stop.set())
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    metrics_service.connect(producer_configs)
+    metrics_service.connect(producer_configs, reporter_entry_points=entry_points)
     sink = metrics_service.get_event_sink()
     context = zmq.Context()
     socket = context.socket(zmq.PULL)
@@ -126,31 +149,58 @@ class MetricsRelay:
             f"ipc://{tempfile.gettempdir()}/ts-metrics-relay-"
             f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
         )
-        context = mp.get_context("spawn")
-        reader, writer = context.Pipe(duplex=False)
-        self._process = context.Process(
-            target=_relay_main,
-            args=(self.endpoint, producer_configs, writer),
-            name="ts-metrics-relay",
-            daemon=True,
-        )
-        self._process.start()
-        writer.close()
+        entry_points = _reporter_entry_points(producer_configs)
+        reader, writer = mp.Pipe()
         try:
+            # A fresh module entry avoids multiprocessing.spawn re-importing
+            # the launcher's engine/model stack before entering the relay.
+            self._process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "from tokenspeed.runtime.metrics.relay import main; main()",
+                    str(writer.fileno()),
+                ],
+                pass_fds=(writer.fileno(),),
+            )
+        except BaseException:
+            reader.close()
+            raise
+        finally:
+            writer.close()
+        try:
+            reader.send((self.endpoint, producer_configs, entry_points))
             reader.recv()
-        except EOFError:
-            self._process.join(timeout=1.0)
+        except (EOFError, BrokenPipeError, ConnectionResetError):
+            self.close(timeout=1.0)
             raise RuntimeError(
                 "the metrics relay failed to start; see its error above"
             ) from None
+        except BaseException:
+            self.close(timeout=1.0)
+            raise
         finally:
             reader.close()
+        atexit.register(self.close, timeout=2.0)
 
     def close(self, timeout: float) -> None:
         """Stop the relay; it closes its sinks within ``timeout``."""
-        if self._process.is_alive():
+        atexit.unregister(self.close)
+        if self._process.poll() is None:
             self._process.terminate()
-        self._process.join(timeout=timeout)
-        if self._process.is_alive():
+        try:
+            self._process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
             self._process.kill()
-            self._process.join(timeout=1.0)
+            self._process.wait(timeout=1.0)
+
+
+def main() -> None:
+    """Start only the launcher's selected metric plugins in a fresh interpreter."""
+    with Connection(int(sys.argv[1])) as ready:
+        endpoint, configs, entry_points = ready.recv()
+        _relay_main(endpoint, configs, ready, entry_points)
+
+
+if __name__ == "__main__":
+    main()

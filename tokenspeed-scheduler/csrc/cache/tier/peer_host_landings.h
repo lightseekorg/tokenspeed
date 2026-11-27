@@ -60,8 +60,9 @@ public:
     // Nothing when the reservation cannot resume the prompt at exactly that
     // boundary within the credits: a partial landing is never kept.
     std::optional<Started> Start(const PromptPrefix& prompt, const std::string& request_id, const PeerLeaseId& lease,
-                                 const std::string& holder, std::int32_t local_tokens);
+                                 const std::string& holder, std::int32_t local_tokens, bool* retry = nullptr);
     // Whether the landing finished; an unknown one counts as finished.
+    bool ContainsRequest(const std::string& rid) const { return by_request_.contains(rid); }
     bool Completed(std::uint64_t id) const;
     // The runtime ended `request_id`'s landing at `num_tokens`: at its end,
     // every member read every page under a pin the holder vouched for, and
@@ -75,6 +76,10 @@ public:
     // Whether a landing is still in flight.
     bool HasProgressPending() const;
     std::size_t NumHeldHostBlocks() const;
+    // The Host blocks landings hold (in-flight unpublished destinations and
+    // published Ready holds). A cache clear drains or detaches them
+    // (CacheCoordinator::CacheIsClearableAfterStorageDrain).
+    std::vector<const CacheBlockRef*> HeldHostBlockRefs() const;
 
 private:
     struct Landing {
@@ -87,6 +92,7 @@ private:
         std::optional<TailPublication> tail;
         bool detached{false};
         bool completed{false};
+        CacheCoordinator::RecoveryMetadata recovery_metadata;
     };
 
     std::uint64_t nextId();

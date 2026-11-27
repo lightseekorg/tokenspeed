@@ -73,7 +73,7 @@ def _copy_u128_masked(
 class QueryGroups:
     """Resolve request-owned groups without a metadata allocation or host read.
 
-    Uniform runs use arithmetic. Ragged runs start a group at each eight-row
+    Uniform runs use arithmetic. Ragged runs start a group at each query-tile
     boundary and at each ownership change, splitting at the next boundary.
     Inactive ragged CTAs stop before initializing the scoring pipelines.
     """
@@ -81,9 +81,9 @@ class QueryGroups:
     @cute.jit
     def _group_count(self, rows: cutlass.Int32, width: cutlass.Int32):
         if cutlass.const_expr(self.group_layout == "aligned"):
-            count = rows // 8
+            count = rows // self.query_group
         elif cutlass.const_expr(self.group_layout == "uniform"):
-            count = (rows // width) * cute.ceil_div(width, 8)
+            count = (rows // width) * cute.ceil_div(width, self.query_group)
         elif cutlass.const_expr(self.group_layout == "ragged"):
             count = rows
         return count
@@ -97,24 +97,26 @@ class QueryGroups:
         group: cutlass.Int32,
     ):
         if cutlass.const_expr(self.group_layout == "aligned"):
-            start = group * 8
-            valid = cutlass.Int32(8)
+            start = group * self.query_group
+            valid = cutlass.Int32(self.query_group)
         elif cutlass.const_expr(self.group_layout == "uniform"):
-            groups_per_request = cute.ceil_div(width, 8)
-            offset = (group % groups_per_request) * 8
+            groups_per_request = cute.ceil_div(width, self.query_group)
+            offset = (group % groups_per_request) * self.query_group
             start = (group // groups_per_request) * width + offset
-            valid = cutlass.min(cutlass.Int32(8), width - offset)
+            valid = cutlass.min(cutlass.Int32(self.query_group), width - offset)
         elif cutlass.const_expr(self.group_layout == "ragged"):
             start = group
             valid = cutlass.Int32(0)
-            active = start % 8 == 0
+            active = start % self.query_group == 0
             if not active:
                 active = requests[start - 1] != requests[start]
             if active:
                 valid = cutlass.Int32(1)
-                end = cutlass.min(rows, (start // 8 + 1) * 8)
+                end = cutlass.min(
+                    rows, (start // self.query_group + 1) * self.query_group
+                )
                 owner = requests[start]
-                for offset in cutlass.range_constexpr(1, 8):
+                for offset in cutlass.range_constexpr(1, self.query_group):
                     if valid == offset and start + offset < end:
                         if requests[start + offset] == owner:
                             valid += 1

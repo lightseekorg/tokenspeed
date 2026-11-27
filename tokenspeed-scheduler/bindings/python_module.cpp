@@ -20,6 +20,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/array.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/map.h>
@@ -30,9 +31,12 @@
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
+#include "cache/tier/shared_l2_pool.h"
+#include "scheduler/operations/cache.h"
 #include "scheduler/outside_events/inc.h"
 #include "scheduler/operations/inc.h"
 #include "scheduler/capacity_model.h"
@@ -49,7 +53,7 @@ Writable types:
 2. RequestSpec
 3. ForwardEvent (ExtendResult, Finish, Abort, UpdateReserveNumTokens)
 4. PD::*Event
-5. cache::* ACKs (WriteBackDone, LoadBackDone, SnapshotDone, RestoreDone)
+5. cache::* ACKs (WriteBackDone, LoadBackDone, SnapshotDone, RestoreDone, StateCommitDone)
 
 All other types are produced by the scheduler and consumed by Python, so they do
 not need writable properties.
@@ -83,6 +87,59 @@ void BindForwardCommonFields(Cls& cls) {
         .def_prop_ro(
             "input_lengths", [](const Op& op) -> const std::vector<std::int32_t>& { return op.input_lengths; },
             nb::rv_policy::reference_internal);
+}
+
+// Shared L2 values cross the binding as plain Python values, in the shapes
+// of the owner's wire: a key is (namespace_id, group_id, content_hash,
+// page_offset), a tail (tail_tokens, hash), and a prompt's tokens are int32
+// bytes.
+using SharedL2KeyTuple = std::tuple<std::uint32_t, std::uint32_t, std::string, std::int32_t>;
+using SharedL2TailTuple = std::tuple<std::int32_t, std::string>;
+
+SharedL2KeyTuple SharedL2Key(const tokenspeed::CacheKey& key) {
+    return {key.namespace_id, key.group_id, key.content_hash.ToString(), key.page_offset};
+}
+
+std::vector<tokenspeed::CacheKey> SharedL2Keys(const std::vector<SharedL2KeyTuple>& keys) {
+    std::vector<tokenspeed::CacheKey> out;
+    out.reserve(keys.size());
+    for (const auto& [namespace_id, group_id, content_hash, page_offset] : keys) {
+        out.push_back(tokenspeed::CacheKey{.namespace_id = namespace_id,
+                                           .group_id = group_id,
+                                           .content_hash = tokenspeed::ContentHash{content_hash},
+                                           .page_offset = page_offset});
+    }
+    return out;
+}
+
+std::optional<SharedL2TailTuple> SharedL2Tail(const std::optional<tokenspeed::TailPublication>& tail) {
+    if (!tail) {
+        return std::nullopt;
+    }
+    return SharedL2TailTuple{tail->tail_tokens, tail->hash.ToString()};
+}
+
+std::optional<tokenspeed::TailPublication> SharedL2Tail(const std::optional<SharedL2TailTuple>& tail) {
+    if (!tail) {
+        return std::nullopt;
+    }
+    return tokenspeed::TailPublication{.tail_tokens = std::get<0>(*tail),
+                                       .hash = tokenspeed::ContentHash{std::get<1>(*tail)}};
+}
+
+nb::bytes SharedL2TokenBytes(const std::vector<std::int32_t>& tokens) {
+    return nb::bytes(reinterpret_cast<const char*>(tokens.data()), tokens.size() * sizeof(std::int32_t));
+}
+
+std::vector<std::int32_t> SharedL2Tokens(const nb::bytes& tokens) {
+    if (tokens.size() % sizeof(std::int32_t) != 0) {
+        throw std::invalid_argument("shared L2 tokens must be int32 bytes");
+    }
+    std::vector<std::int32_t> out(tokens.size() / sizeof(std::int32_t));
+    if (!out.empty()) {
+        std::memcpy(out.data(), tokens.c_str(), tokens.size());
+    }
+    return out;
 }
 
 }  // namespace
@@ -183,6 +240,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("sink_tokens", &tokenspeed::CacheGroupConfig::sink_tokens)
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
         .def_rw("checkpoint_granularity", &tokenspeed::CacheGroupConfig::checkpoint_granularity)
+        .def_rw("deferred_decode_state", &tokenspeed::CacheGroupConfig::deferred_decode_state)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 
@@ -231,12 +289,16 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("prefill_decode_interval", &tokenspeed::SchedulerConfig::prefill_decode_interval)
         .def_rw("prefill_decode_min_interval", &tokenspeed::SchedulerConfig::prefill_decode_min_interval)
         .def_rw("max_consecutive_prefill_rounds", &tokenspeed::SchedulerConfig::max_consecutive_prefill_rounds)
+        .def_rw("prefill_interval_min_decoding", &tokenspeed::SchedulerConfig::prefill_interval_min_decoding)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
         .def_rw("drop_short_prompt_end_checkpoints", &tokenspeed::SchedulerConfig::drop_short_prompt_end_checkpoints)
         .def_rw("demote_superseded_state_checkpoints",
                 &tokenspeed::SchedulerConfig::demote_superseded_state_checkpoints)
+        .def_rw("prefix_cache_evict_policy", &tokenspeed::SchedulerConfig::prefix_cache_evict_policy)
+        .def_rw("prefix_cache_gds_prefill_cost", &tokenspeed::SchedulerConfig::prefix_cache_gds_prefill_cost)
+        .def_rw("prefix_cache_gds_disk_block_costs", &tokenspeed::SchedulerConfig::prefix_cache_gds_disk_block_costs)
         .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
         .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance)
         // P role: the most tokens a prefill chunk that cannot finish gives up
@@ -321,12 +383,18 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pressure_high", &tokenspeed::StorageConfig::pressure_high)
         .def_ro("pressure_low", &tokenspeed::StorageConfig::pressure_low);
     scheduler_config.def_rw("storage_config", &tokenspeed::SchedulerConfig::storage_config);
+    nb::class_<tokenspeed::SharedL2Config>(m, "SharedL2Config")
+        .def(nb::init<std::int32_t, std::int32_t>(), nb::arg("max_writes_in_flight"), nb::arg("max_keys_per_write"))
+        .def_ro("max_writes_in_flight", &tokenspeed::SharedL2Config::max_writes_in_flight)
+        .def_ro("max_keys_per_write", &tokenspeed::SharedL2Config::max_keys_per_write);
+    scheduler_config.def_rw("shared_l2_config", &tokenspeed::SchedulerConfig::shared_l2_config);
     nb::class_<tokenspeed::DiskConfig>(m, "DiskConfig")
         .def(nb::init<std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int32_t, std::int64_t,
-                      std::int64_t>(),
+                      std::int64_t, std::int32_t, bool>(),
              nb::arg("max_operations"), nb::arg("max_blocks_per_operation"), nb::arg("max_host_blocks"),
              nb::arg("max_write_host_blocks"), nb::arg("max_queued_cleanings"), nb::arg("min_prefetch_tokens"),
-             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"))
+             nb::arg("wait_timeout_us"), nb::arg("ready_timeout_us"), nb::arg("min_clean_tokens"),
+             nb::arg("require_reuse_for_cleaning"))
         .def_ro("max_operations", &tokenspeed::DiskConfig::max_operations)
         .def_ro("max_blocks_per_operation", &tokenspeed::DiskConfig::max_blocks_per_operation)
         .def_ro("max_host_blocks", &tokenspeed::DiskConfig::max_host_blocks)
@@ -334,7 +402,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("max_queued_cleanings", &tokenspeed::DiskConfig::max_queued_cleanings)
         .def_ro("min_prefetch_tokens", &tokenspeed::DiskConfig::min_prefetch_tokens)
         .def_ro("wait_timeout_us", &tokenspeed::DiskConfig::wait_timeout_us)
-        .def_ro("ready_timeout_us", &tokenspeed::DiskConfig::ready_timeout_us);
+        .def_ro("ready_timeout_us", &tokenspeed::DiskConfig::ready_timeout_us)
+        .def_ro("min_clean_tokens", &tokenspeed::DiskConfig::min_clean_tokens)
+        .def_ro("require_reuse_for_cleaning", &tokenspeed::DiskConfig::require_reuse_for_cleaning);
     scheduler_config.def_rw("disk_config", &tokenspeed::SchedulerConfig::disk_config);
     nb::class_<tokenspeed::DiskStats>(m, "DiskStats")
         .def_ro("operations", &tokenspeed::DiskStats::operations)
@@ -356,10 +426,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("Host", tokenspeed::PeerLandingTier::kHost);
     nb::class_<tokenspeed::PeerConfig>(m, "PeerConfig")
         .def(nb::init<std::string, std::uint64_t, std::int32_t, std::int64_t, std::int64_t, std::int64_t, std::int32_t,
-                      tokenspeed::PeerLandingTier, std::int32_t, std::int64_t>(),
+                      tokenspeed::PeerLandingTier, std::int32_t, std::int64_t, bool>(),
              nb::arg("name"), nb::arg("incarnation"), nb::arg("max_leases"), nb::arg("soft_pin_us"),
              nb::arg("hard_pin_us"), nb::arg("lookup_timeout_us"), nb::arg("min_fetch_tokens"), nb::arg("landing_tier"),
-             nb::arg("max_host_landing_blocks"), nb::arg("host_ready_timeout_us"))
+             nb::arg("max_host_landing_blocks"), nb::arg("host_ready_timeout_us"), nb::arg("versioned_shards"))
         .def_ro("name", &tokenspeed::PeerConfig::name)
         .def_ro("incarnation", &tokenspeed::PeerConfig::incarnation)
         .def_ro("max_leases", &tokenspeed::PeerConfig::max_leases)
@@ -406,7 +476,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dead_entry", &tokenspeed::CacheEvictor::HostEvictionStats::dead_entry)
         .def_ro("tail_cap", &tokenspeed::CacheEvictor::HostEvictionStats::tail_cap)
         .def_ro("flush", &tokenspeed::CacheEvictor::HostEvictionStats::flush)
-        .def_ro("duplicate_kv", &tokenspeed::CacheEvictor::HostEvictionStats::duplicate_kv);
+        .def_ro("duplicate_kv", &tokenspeed::CacheEvictor::HostEvictionStats::duplicate_kv)
+        .def_ro("clean", &tokenspeed::CacheEvictor::HostEvictionStats::clean)
+        .def_ro("released", &tokenspeed::CacheEvictor::HostEvictionStats::released);
     nb::class_<tokenspeed::CacheEvictor::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
         .def_ro("blocks", &tokenspeed::CacheEvictor::DeviceEvictionCounts::blocks)
         .def_ro("host_resident", &tokenspeed::CacheEvictor::DeviceEvictionCounts::host_resident);
@@ -438,9 +510,54 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::PrefixHitStats>(m, "PrefixHitStats")
         .def_ro("prompt_tokens", &tokenspeed::PrefixHitStats::prompt_tokens)
         .def_ro("device_hit_tokens", &tokenspeed::PrefixHitStats::device_hit_tokens)
+        .def_ro("peer_hit_tokens", &tokenspeed::PrefixHitStats::peer_hit_tokens)
         .def_ro("host_hit_tokens", &tokenspeed::PrefixHitStats::host_hit_tokens)
         .def_ro("host_gain_tokens", &tokenspeed::PrefixHitStats::host_gain_tokens)
         .def_ro("unresumable_kv_tokens", &tokenspeed::PrefixHitStats::unresumable_kv_tokens);
+    nb::class_<tokenspeed::CacheReleaseStats>(m, "CacheReleaseStats")
+        .def_ro("group_id", &tokenspeed::CacheReleaseStats::group_id)
+        .def_ro("tier", &tokenspeed::CacheReleaseStats::tier)
+        .def_ro("child_slots", &tokenspeed::CacheReleaseStats::child_slots)
+        .def_ro("parents", &tokenspeed::CacheReleaseStats::parents);
+
+    nb::class_<tokenspeed::GdsEvictionStats>(m, "GdsEvictionStats")
+        .def_ro("evicted_units", &tokenspeed::GdsEvictionStats::evicted_units)
+        .def_ro("retention_rejections", &tokenspeed::GdsEvictionStats::retention_rejections)
+        .def_ro("demoted_units", &tokenspeed::GdsEvictionStats::demoted_units)
+        .def_ro("mixed_tier_units", &tokenspeed::GdsEvictionStats::mixed_tier_units)
+        .def_ro("orphan_blocks", &tokenspeed::GdsEvictionStats::orphan_blocks)
+        .def_ro("fallback_blocks", &tokenspeed::GdsEvictionStats::fallback_blocks)
+        .def_ro("fallback_units", &tokenspeed::GdsEvictionStats::fallback_units)
+        .def_ro("logical_evictions", &tokenspeed::GdsEvictionStats::logical_evictions)
+        .def_ro("logical_rejections", &tokenspeed::GdsEvictionStats::logical_rejections)
+        .def_ro("device_copies_released", &tokenspeed::GdsEvictionStats::device_copies_released)
+        .def_ro("host_copies_reserved", &tokenspeed::GdsEvictionStats::host_copies_reserved)
+        .def_ro("host_copy_rejections", &tokenspeed::GdsEvictionStats::host_copy_rejections)
+        .def_ro("host_clean_copies_released", &tokenspeed::GdsEvictionStats::host_clean_copies_released)
+        .def_ro("disk_recoverable_units", &tokenspeed::GdsEvictionStats::disk_recoverable_units)
+        .def_ro("disk_route_losses", &tokenspeed::GdsEvictionStats::disk_route_losses)
+        .def_ro("checkpoint_planned", &tokenspeed::GdsEvictionStats::checkpoint_planned)
+        .def_ro("checkpoint_allocated", &tokenspeed::GdsEvictionStats::checkpoint_allocated)
+        .def_ro("checkpoint_materialized", &tokenspeed::GdsEvictionStats::checkpoint_materialized)
+        .def_ro("checkpoint_published", &tokenspeed::GdsEvictionStats::checkpoint_published)
+        .def_ro("checkpoint_cancelled", &tokenspeed::GdsEvictionStats::checkpoint_cancelled)
+        .def_ro("checkpoint_extra_blocks", &tokenspeed::GdsEvictionStats::checkpoint_extra_blocks)
+        .def_ro("checkpoint_chunk_end_fallbacks", &tokenspeed::GdsEvictionStats::checkpoint_chunk_end_fallbacks)
+        .def_ro("checkpoint_fresh_rejected", &tokenspeed::GdsEvictionStats::checkpoint_fresh_rejected)
+        .def_ro("checkpoint_rejected_extra_blocks", &tokenspeed::GdsEvictionStats::checkpoint_rejected_extra_blocks)
+        .def_ro("checkpoint_rejected_unmeasured", &tokenspeed::GdsEvictionStats::checkpoint_rejected_unmeasured)
+        .def_ro("committed_plans", &tokenspeed::GdsEvictionStats::committed_plans)
+        .def_ro("planning_nanoseconds", &tokenspeed::GdsEvictionStats::planning_nanoseconds)
+        .def_ro("ready_units", &tokenspeed::GdsEvictionStats::ready_units)
+        .def_ro("device_ready_units", &tokenspeed::GdsEvictionStats::device_ready_units)
+        .def_ro("pending_units", &tokenspeed::GdsEvictionStats::pending_units)
+        .def_ro("broken_units", &tokenspeed::GdsEvictionStats::broken_units)
+        .def_ro("dependency_points", &tokenspeed::GdsEvictionStats::dependency_points)
+        .def_ro("dependency_ranges", &tokenspeed::GdsEvictionStats::dependency_ranges)
+        .def_ro("dependency_leaves", &tokenspeed::GdsEvictionStats::dependency_leaves)
+        .def_ro("host_watermark", &tokenspeed::GdsEvictionStats::host_watermark)
+        .def_ro("watermark", &tokenspeed::GdsEvictionStats::watermark);
+
     nb::class_<tokenspeed::HostCacheStats>(m, "HostCacheStats")
         .def_ro("prefix_hits", &tokenspeed::HostCacheStats::prefix_hits)
         .def_ro("publication_stores", &tokenspeed::HostCacheStats::publication_stores)
@@ -454,6 +571,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
         .def_ro("demoted_entries_not_written_back", &tokenspeed::HostCacheStats::demoted_entries_not_written_back)
         .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions)
+        .def_ro("gds_evictions", &tokenspeed::HostCacheStats::gds_evictions)
         .def_ro("lone_compactions", &tokenspeed::HostCacheStats::lone_compactions)
         .def_ro("lone_compaction_moves", &tokenspeed::HostCacheStats::lone_compaction_moves)
         .def_ro("checkpoint_resume_gaps", &tokenspeed::HostCacheStats::checkpoint_resume_gaps);
@@ -520,6 +638,38 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("op_id", &tokenspeed::cache::DiskDone::op_id)
         .def_ro("success", &tokenspeed::cache::DiskDone::success);
 
+    // A shared L2 rank's commands to its pool, relayed by the runtime; keys,
+    // tails and tokens have the shapes SharedL2Pool takes.
+    const auto shared_l2_keys = [](const std::vector<tokenspeed::CacheKey>& keys) {
+        std::vector<SharedL2KeyTuple> out;
+        out.reserve(keys.size());
+        for (const tokenspeed::CacheKey& key : keys) out.push_back(SharedL2Key(key));
+        return out;
+    };
+    nb::class_<tokenspeed::SharedL2WriteOperation>(cache, "SharedL2WriteOp")
+        .def_ro("op_id", &tokenspeed::SharedL2WriteOperation::op_id)
+        .def_prop_ro("keys",
+                     [shared_l2_keys](const tokenspeed::SharedL2WriteOperation& op) { return shared_l2_keys(op.keys); })
+        .def_ro("buckets", &tokenspeed::SharedL2WriteOperation::buckets)
+        .def_ro("device_blocks", &tokenspeed::SharedL2WriteOperation::device_blocks)
+        // [(tokens, prefix_hashes, tail, access_epoch)], as SharedL2Pool.commit takes them.
+        .def_prop_ro("checkpoints", [](const tokenspeed::SharedL2WriteOperation& op) {
+            nb::list checkpoints;
+            for (const tokenspeed::CheckpointTree::Checkpoint& checkpoint : op.checkpoints) {
+                checkpoints.append(nb::make_tuple(SharedL2TokenBytes(checkpoint.tokens), checkpoint.prefix_hashes,
+                                                  SharedL2Tail(checkpoint.tail), checkpoint.access_epoch));
+            }
+            return checkpoints;
+        });
+    nb::class_<tokenspeed::SharedL2ReleaseOperation>(cache, "SharedL2ReleaseOp")
+        .def_ro("ticket", &tokenspeed::SharedL2ReleaseOperation::ticket);
+    nb::class_<tokenspeed::SharedL2TouchOperation>(cache, "SharedL2TouchOp")
+        .def_prop_ro(
+            "keys", [shared_l2_keys](const tokenspeed::SharedL2TouchOperation& op) { return shared_l2_keys(op.keys); });
+    nb::class_<tokenspeed::cache::SharedL2WriteDone>(cache, "SharedL2WriteDone")
+        .def(nb::init<std::uint32_t>(), nb::arg("op_id"))
+        .def_ro("op_id", &tokenspeed::cache::SharedL2WriteDone::op_id);
+
     nb::class_<tokenspeed::cache::WriteBackDone>(cache, "WriteBackDoneEvent")
         .def(nb::init<>())
         .def_rw("op_id", &tokenspeed::cache::WriteBackDone::op_id);
@@ -540,6 +690,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::cache::RestoreDone>(cache, "RestoreDoneEvent")
         .def(nb::init<>())
         .def_rw("op_id", &tokenspeed::cache::RestoreDone::op_id);
+
+    // The runtime committed the deferred decode state a plan's retractions
+    // published (ExecutionPlan.state_commit_fence).
+    nb::class_<tokenspeed::cache::StateCommitDone>(cache, "StateCommitDoneEvent")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::cache::StateCommitDone::op_id);
 
     // RestoreOp.source_tiers carries these as plain integers per row.
     nb::enum_<tokenspeed::HostTier>(cache, "HostTier", nb::is_arithmetic())
@@ -796,6 +952,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_prop_ro("has_peer_fetches",
                      [](const tokenspeed::ExecutionPlan& plan) { return !plan.peer_fetches.empty(); })
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero)
+        .def_ro("state_commit_fence", &tokenspeed::ExecutionPlan::state_commit_fence)
         .def("pages_to_zero_arrays",
              [](nb::handle self) {
                  // Zero-copy 1-D int32 views of pages_to_zero, one per cache group
@@ -817,16 +974,35 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         // forwards and before this plan's zeroing; destinations are never in
         // pages_to_zero. No ACK.
         .def_ro("pages_to_copy", &tokenspeed::ExecutionPlan::pages_to_copy)
-        .def("pages_to_copy_arrays", [](nb::handle self) {
-            // Zero-copy (n, 2) int32 views of pages_to_copy, one per cache
-            // group (empty groups included): column 0 the source, column 1
-            // the destination. std::pair<int32, int32> is two contiguous
-            // int32s, which the static_assert below holds the layout to.
-            static_assert(sizeof(std::pair<std::int32_t, std::int32_t>) == 2 * sizeof(std::int32_t),
-                          "a copy pair must be two contiguous int32 values");
+        .def("pages_to_copy_arrays",
+             [](nb::handle self) {
+                 // Zero-copy (n, 2) int32 views of pages_to_copy, one per cache
+                 // group (empty groups included): column 0 the source, column 1
+                 // the destination. std::pair<int32, int32> is two contiguous
+                 // int32s, which the static_assert below holds the layout to.
+                 static_assert(sizeof(std::pair<std::int32_t, std::int32_t>) == 2 * sizeof(std::int32_t),
+                               "a copy pair must be two contiguous int32 values");
+                 auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
+                 nb::dict out;
+                 for (auto& [gid, pairs] : plan.pages_to_copy) {
+                     const auto* data = pairs.empty() ? nullptr : reinterpret_cast<const std::int32_t*>(pairs.data());
+                     out[nb::str(gid.c_str())] =
+                         nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(data, {pairs.size(), 2}, self);
+                 }
+                 return out;
+             })
+        // The live State blocks of this plan's retraction victims, per
+        // deferred-decode-state group, as (request pool index, page id): the
+        // runtime folds each slot's accepted decode records into its block on
+        // the execution stream before the plan's stores, copies, zeroing and
+        // forward. No ACK.
+        .def_ro("state_folds", &tokenspeed::ExecutionPlan::state_folds)
+        .def("state_folds_arrays", [](nb::handle self) {
+            // Zero-copy (n, 2) int32 views of state_folds, one per listed
+            // group: column 0 the request pool index, column 1 the page id.
             auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
             nb::dict out;
-            for (auto& [gid, pairs] : plan.pages_to_copy) {
+            for (auto& [gid, pairs] : plan.state_folds) {
                 const auto* data = pairs.empty() ? nullptr : reinterpret_cast<const std::int32_t*>(pairs.data());
                 out[nb::str(gid.c_str())] =
                     nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(data, {pairs.size(), 2}, self);
@@ -850,6 +1026,52 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
+        .def("start_shared_l2_lookups",
+             // [(request_id, prefix_hashes, tokens, max_tokens)].
+             [](tokenspeed::Scheduler& s) {
+                 nb::list lookups;
+                 for (const tokenspeed::SharedL2Lookup& lookup : s.StartSharedL2Lookups()) {
+                     lookups.append(nb::make_tuple(lookup.request_id, lookup.prefix_hashes,
+                                                   SharedL2TokenBytes(lookup.tokens), lookup.max_tokens));
+                 }
+                 return lookups;
+             })
+        .def(
+            "apply_shared_l2_answers",
+            // answers: [(request_id, ticket, num_tokens, kv_tokens, tail, [(key, bucket, pool_page)])], the
+            // tuple SharedL2Pool.lookup returns behind the id of the request it answers. Returns the proxy
+            // blocks created: [(group_id, host_block, bucket, pool_page)].
+            [](tokenspeed::Scheduler& s,
+               const std::vector<
+                   std::tuple<std::string, std::uint64_t, std::int32_t, std::int32_t, std::optional<SharedL2TailTuple>,
+                              std::vector<std::tuple<SharedL2KeyTuple, std::int32_t, std::int32_t>>>>& answers) {
+                std::vector<tokenspeed::SharedL2Answer> converted;
+                converted.reserve(answers.size());
+                for (const auto& [request_id, ticket, num_tokens, kv_tokens, tail, pages] : answers) {
+                    tokenspeed::SharedL2Answer& answer =
+                        converted.emplace_back(tokenspeed::SharedL2Answer{.request_id = request_id,
+                                                                          .ticket = ticket,
+                                                                          .num_tokens = num_tokens,
+                                                                          .kv_tokens = kv_tokens,
+                                                                          .tail = SharedL2Tail(tail)});
+                    std::vector<SharedL2KeyTuple> keys;
+                    keys.reserve(pages.size());
+                    for (const auto& [key, bucket, pool_page] : pages) {
+                        keys.push_back(key);
+                        answer.buckets.push_back(bucket);
+                        answer.pool_pages.push_back(pool_page);
+                    }
+                    answer.keys = SharedL2Keys(keys);
+                }
+                std::vector<std::tuple<std::uint32_t, std::int32_t, std::int32_t, std::int32_t>> created;
+                for (const tokenspeed::SharedL2ProxyBlock& block : s.ApplySharedL2Answers(converted)) {
+                    created.emplace_back(block.group_id, block.host_block, block.bucket, block.pool_page);
+                }
+                return created;
+            },
+            nb::arg("answers"),
+            "Apply the pool's answers in order and return the proxy blocks they created. An answer the scheduler "
+            "cannot take raises: the runtime stops serving on it.")
         .def("drain_kv_events",
              [](tokenspeed::Scheduler& s) {
                  nb::list result;
@@ -912,7 +1134,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("host_cache_stats", &tokenspeed::Scheduler::GetHostCacheStats,
              "Host L2 counters and the Device evictions they are read against, cumulative since start. "
              "Accounting only, for tests and inspection: no scheduling decision reads them, the runtime "
-             "exports none, and reading them changes nothing.")
+             "exports selected counters, and reading them changes nothing.")
+        .def("cache_release_stats", &tokenspeed::Scheduler::GetCacheReleaseStats,
+             "Actual last-owner child-slot and parent releases by group and tier, cumulative since start.")
         .def("storage_pending", &tokenspeed::Scheduler::StoragePending)
         .def("storage_stats", &tokenspeed::Scheduler::GetStorageStats)
         .def("disk_stats", &tokenspeed::Scheduler::GetDiskStats)
@@ -940,4 +1164,92 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 return std::tuple{std::move(group_ids), std::move(hashes), std::move(page_offsets)};
             },
             nb::arg("content_hashes"));
+
+    // The owner's side of a shared L2 pool. `config` gives the cache groups,
+    // the prefix granularity, the pool's page layout (host_group_packing) and
+    // the checkpoint retention settings; no scheduler is built from it. The
+    // owner's launcher builds the pool here and its service calls it from the
+    // engine host; the methods are for Python that runs schedulers against a
+    // pool, as this package's tests do.
+    using SharedL2Pool = tokenspeed::SharedL2Pool;
+    // (tokens, prefix_hashes, tail, access_epoch).
+    using SharedL2CheckpointTuple =
+        std::tuple<nb::bytes, std::vector<std::string>, std::optional<SharedL2TailTuple>, std::uint64_t>;
+    nb::class_<SharedL2Pool>(m, "SharedL2Pool")
+        .def(
+            "__init__",
+            [](SharedL2Pool* self, const tokenspeed::SchedulerConfig& config, std::int32_t num_lcm_blocks,
+               std::int32_t headroom_lcm_blocks) {
+                // A rank's default window counts its own requests; the pool
+                // counts every rank's, so it takes no default.
+                if (!config.checkpoint_retention_requests) {
+                    throw std::invalid_argument(
+                        "SharedL2Pool: checkpoint_retention_requests must be set (0 ranks every entry by its own use)");
+                }
+                new (self)
+                    SharedL2Pool(tokenspeed::MakeSpecsFromConfig(config), config.prefix_granularity,
+                                 config.host_group_packing, num_lcm_blocks, headroom_lcm_blocks,
+                                 *config.checkpoint_retention_requests, config.checkpoint_retention_leaf_distance);
+            },
+            nb::arg("config"), nb::arg("num_lcm_blocks"), nb::arg("headroom_lcm_blocks"))
+        .def(
+            "lookup",
+            // Returns (ticket, num_tokens, kv_tokens, tail, [(key, bucket, page)]).
+            [](SharedL2Pool& pool, std::uint64_t client, const std::vector<std::string>& prefix_hashes,
+               const nb::bytes& tokens, std::int32_t max_tokens) {
+                const std::vector<std::int32_t> prompt = SharedL2Tokens(tokens);
+                const SharedL2Pool::Hit hit =
+                    pool.Lookup(client, {.prefix_hashes = prefix_hashes, .tokens = prompt, .max_tokens = max_tokens});
+                std::vector<std::tuple<SharedL2KeyTuple, std::int32_t, std::int32_t>> pages;
+                pages.reserve(hit.pages.size());
+                for (const SharedL2Pool::Page& page : hit.pages) {
+                    pages.emplace_back(SharedL2Key(page.key), page.bucket, page.pool_page);
+                }
+                return std::tuple{hit.ticket, hit.num_tokens, hit.kv_tokens, SharedL2Tail(hit.tail), std::move(pages)};
+            },
+            nb::arg("client"), nb::arg("prefix_hashes"), nb::arg("tokens"), nb::arg("max_tokens"))
+        .def("release", &SharedL2Pool::Release, nb::arg("client"), nb::arg("ticket"))
+        .def(
+            "reserve",
+            // Returns (ticket, pages aligned with keys).
+            [](SharedL2Pool& pool, std::uint64_t client, const std::vector<SharedL2KeyTuple>& keys,
+               const std::vector<std::int32_t>& buckets) {
+                SharedL2Pool::Reservation reservation = pool.Reserve(client, SharedL2Keys(keys), buckets);
+                return std::tuple{reservation.ticket, std::move(reservation.pages)};
+            },
+            nb::arg("client"), nb::arg("keys"), nb::arg("buckets"))
+        .def(
+            "commit",
+            [](SharedL2Pool& pool, std::uint64_t client, std::uint64_t ticket,
+               const std::vector<SharedL2CheckpointTuple>& checkpoints) {
+                std::vector<tokenspeed::CheckpointTree::Checkpoint> converted;
+                converted.reserve(checkpoints.size());
+                for (const auto& [tokens, prefix_hashes, tail, access_epoch] : checkpoints) {
+                    converted.push_back({.tokens = SharedL2Tokens(tokens),
+                                         .prefix_hashes = prefix_hashes,
+                                         .tail = SharedL2Tail(tail),
+                                         .access_epoch = access_epoch});
+                }
+                pool.Commit(client, ticket, converted);
+            },
+            nb::arg("client"), nb::arg("ticket"), nb::arg("checkpoints"))
+        .def(
+            "touch",
+            [](SharedL2Pool& pool, const std::vector<SharedL2KeyTuple>& keys) { pool.Touch(SharedL2Keys(keys)); },
+            nb::arg("keys"))
+        .def("disconnect", &SharedL2Pool::Disconnect, nb::arg("client"))
+        .def("clear_cache", &SharedL2Pool::ClearCache)
+        .def("stats", [](const SharedL2Pool& pool) {
+            const SharedL2Pool::Stats stats = pool.GetStats();
+            return std::map<std::string, std::uint64_t>{
+                {"num_lcm_blocks", static_cast<std::uint64_t>(stats.num_lcm_blocks)},
+                {"empty_lcm_blocks", static_cast<std::uint64_t>(stats.empty_lcm_blocks)},
+                {"cached_blocks", static_cast<std::uint64_t>(stats.cached_blocks)},
+                {"pinned_blocks", static_cast<std::uint64_t>(stats.pinned_blocks)},
+                {"reserved_blocks", stats.reserved_blocks},
+                {"open_lookups", stats.open_lookups},
+                {"evicted_blocks", stats.evicted_blocks},
+                {"checkpoints", stats.checkpoints},
+            };
+        });
 }

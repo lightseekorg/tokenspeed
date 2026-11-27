@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 
+import numpy as np
 import pytest
 import torch
 
@@ -24,9 +25,15 @@ from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
     HybridKDATokenToKVPool,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import kda_state_fields
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    CacheFieldSpec,
+    pack,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
+    CacheGroupSpec,
 )
 
 
@@ -226,6 +233,92 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
     # Both views name the one arena, so a clear through either zeros it.
     draft_pool.clear_kv_buffers()
     assert not torch.count_nonzero(draft_pool.kv_buffer[0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("recurrent_state_dtype", [torch.float32, torch.bfloat16])
+def test_kimi_k3_checkpoint_survives_copy_and_reuse(
+    recurrent_state_dtype: torch.dtype,
+) -> None:
+    """Copy and zero a dense checkpoint without touching an adjacent MLA block."""
+    device = "cuda"
+    heads, dim = 2, 8
+    groups = (
+        (
+            CacheGroupSpec(
+                group_id=FULL_ATTENTION,
+                attn_kind="full_history",
+                rows_per_page=128,
+                entry_stride_tokens=1,
+                replayable=False,
+            ),
+            (CacheFieldSpec("layer.0.latent_kv", "slot.0", (128, 1, 576), "bfloat16"),),
+        ),
+        (
+            CacheGroupSpec(
+                group_id=LINEAR_ATTENTION, attn_kind="state", replayable=False
+            ),
+            kda_state_fields(
+                1,
+                "slot.0",
+                conv_shape=(3 * heads * dim, 3),
+                recurrent_shape=(heads, dim, dim),
+                recurrent_state_dtype=recurrent_state_dtype,
+            ),
+        ),
+    )
+    plan = pack(
+        groups,
+        prefix_granularity=128,
+        cache_blocks_per_lcm_block={FULL_ATTENTION: 1, LINEAR_ATTENTION: 1},
+        max_padding_fraction=float("inf"),
+    ).bind(4)
+    arena = make_arena(
+        plan, device=device, cache_group_specs=tuple(spec for spec, _ in groups)
+    )
+    pool = HybridKDATokenToKVPool(
+        arena=arena,
+        model_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
+        quant_method=None,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        layer_num=2,
+        rank=0,
+        layer_types=(FULL_ATTENTION, LINEAR_ATTENTION),
+    )
+    fields = {
+        name: pool.get_component(1, name) for name in ("conv_state", "recurrent_state")
+    }
+    for index, tensor in enumerate(fields.values(), 1):
+        tensor[1].fill_(index)
+        tensor[2].fill_(index + 3)
+
+    # State blocks 1..3 occupy parents 0..2. MLA block 4 owns parent 3.
+    latent = pool.get_key_buffer(0)[4]
+    latent.fill_(0.25)
+    before = {name: tensor.clone() for name, tensor in fields.items()}
+    arena.copy_blocks({LINEAR_ATTENTION: np.asarray([[1, 2], [2, 3]], dtype=np.int64)})
+    for name, tensor in fields.items():
+        for destination, source in ((1, 1), (2, 1), (3, 2)):
+            torch.testing.assert_close(
+                tensor[destination],
+                before[name][source],
+                atol=0,
+                rtol=0,
+                equal_nan=True,
+            )
+
+    pool.zero_new_blocks({LINEAR_ATTENTION: np.asarray([2], dtype=np.int64)})
+    for name, tensor in fields.items():
+        torch.testing.assert_close(
+            tensor[2], torch.zeros_like(tensor[2]), atol=0, rtol=0
+        )
+        torch.testing.assert_close(tensor[1], before[name][1], atol=0, rtol=0)
+        torch.testing.assert_close(
+            tensor[3], before[name][2], atol=0, rtol=0, equal_nan=True
+        )
+    torch.testing.assert_close(latent, torch.full_like(latent, 0.25), atol=0, rtol=0)
 
 
 def test_kimi_k3_gqa_block_draft_kv_pages_join_the_full_attention_group() -> None:

@@ -23,14 +23,22 @@
 from __future__ import annotations
 
 import functools
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops._triton_l2 import prefetch_l2
 from tokenspeed_kernel.ops._triton_ptx import mul_rn_f32
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 _RELU2_FP8_MAX = tl.constexpr(448.0)
+
+# Fewest 1024-column programs per row before a finalize row takes one program.
+_FINALIZE_ROW_PROGRAM_MIN_COLUMNS = 3
+# Fewest column-grid programs per SM before a finalize row takes one program.
+_FINALIZE_ROW_PROGRAM_MIN_PROGRAMS_PER_SM = 6
 
 __all__ = [
     "add3",
@@ -214,6 +222,11 @@ def _moe_finalize_gate_add_kernel(
     tl.store(out_ptr + row_offset + ccols, result.to(tl.bfloat16), mask=cmask)
 
 
+@functools.cache
+def _sm_count(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
 def moe_finalize_gate_add(
     gemm2_out: torch.Tensor,
     expanded_idx_to_permuted_idx: torch.Tensor,
@@ -273,9 +286,18 @@ def moe_finalize_gate_add(
     expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.reshape(-1).contiguous()
     BLOCK = triton.next_power_of_2(hidden_dim)
     num_warps = 4 if BLOCK <= 2048 else (8 if BLOCK <= 4096 else 16)
-    chunk = min(BLOCK, 1024)
+    columns = triton.cdiv(hidden_dim, 1024)
+    floor = _FINALIZE_ROW_PROGRAM_MIN_PROGRAMS_PER_SM * _sm_count(
+        hidden_states.device.index
+    )
+    if columns >= _FINALIZE_ROW_PROGRAM_MIN_COLUMNS and num_tokens * columns >= floor:
+        chunk = BLOCK
+    else:
+        chunk = min(BLOCK, 1024)
     enable_pdl = pdl_enabled()
-    _moe_finalize_gate_add_kernel[(num_tokens, triton.cdiv(hidden_dim, chunk))](
+    kernel_launcher(
+        _moe_finalize_gate_add_kernel, (num_tokens, triton.cdiv(hidden_dim, chunk))
+    )(
         gemm2_out,
         expanded_idx_to_permuted_idx,
         expert_weights,
@@ -293,6 +315,18 @@ def moe_finalize_gate_add(
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return out
+
+
+def _finalize_warmup_variants(
+    args: Mapping[str, Any],
+) -> tuple[dict[str, tuple[int, ...]], ...]:
+    # Either layout's launch prepares both the column and the row programs.
+    return ({"CHUNK": tuple(sorted({min(args["BLOCK"], 1024), args["BLOCK"]}))},)
+
+
+register_triton_warmup(
+    _moe_finalize_gate_add_kernel, variants=_finalize_warmup_variants
+)
 
 
 @triton.jit

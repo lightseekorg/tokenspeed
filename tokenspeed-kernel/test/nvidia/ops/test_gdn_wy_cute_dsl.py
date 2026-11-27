@@ -484,7 +484,7 @@ def test_wy_registry_selection(tmp_path, tree, solution):
     path = tmp_path / "selection.json"
     ShapeCapture.get().clear()
     with shape_capture(path):
-        output = gdn.gdn_decode_mtp(**case, solution=solution)
+        output = gdn.gdn_decode_mtp(**case, solution=solution, pending_replay=None)
     selected = json.loads(path.read_text())
     assert selected[-1]["kernel_name"] == "cute_dsl_gdn_decode_mtp"
     torch.testing.assert_close(output.double(), reference(case), atol=1e-4, rtol=2**-7)
@@ -508,7 +508,7 @@ def test_wy_selection_refuses_unsupported_execution(tokens, state_update):
     )
     case["disable_state_update"] = not state_update
     with pytest.raises(NoKernelFoundError):
-        gdn_decode_mtp(**case, solution="cute_dsl")
+        gdn_decode_mtp(**case, solution="cute_dsl", pending_replay=None)
 
 
 @pytest.mark.parametrize("tokens,scale", [(1, None), (4, 0.25)])
@@ -651,10 +651,10 @@ def test_wy_explicit_solution_is_preserved():
     )
     # The portable kernel's state pool is packed rather than row-padded.
     case["initial_state"] = case["initial_state"].contiguous()
-    actual = gdn_decode_mtp(**case, solution="triton")
+    actual = gdn_decode_mtp(**case, solution="triton", pending_replay=None)
     torch.testing.assert_close(actual.double(), reference(case), atol=1e-4, rtol=2**-7)
     with pytest.raises(NoKernelFoundError):
-        gdn_decode_mtp(**case, solution="flashinfer")
+        gdn_decode_mtp(**case, solution="flashinfer", pending_replay=None)
 
 
 @pytest.mark.parametrize(
@@ -694,7 +694,7 @@ def test_mtp_selects_chain_kernel(tmp_path, state_dtype, strided, solution, expe
     path = tmp_path / "selection.json"
     ShapeCapture.get().clear()
     with shape_capture(path):
-        actual = gdn.gdn_decode_mtp(**case, solution=solution)
+        actual = gdn.gdn_decode_mtp(**case, solution=solution, pending_replay=None)
     selected = json.loads(path.read_text())
     assert selected[-1]["mode"] == "gdn_decode_mtp"
     assert selected[-1]["kernel_name"] == expected
@@ -722,7 +722,7 @@ def test_verify_kernel_warmup_preserves_inputs(tokens, solution):
     tensors = [value for value in case.values() if isinstance(value, torch.Tensor)]
     before = [value.clone() for value in tensors]
     with kernel_warmup(enabled=True):
-        actual = gdn_decode_mtp(**case, solution=solution)
+        actual = gdn_decode_mtp(**case, solution=solution, pending_replay=None)
     torch.testing.assert_close(actual.double(), expected, atol=1e-4, rtol=2**-7)
     assert all(torch.equal(value, saved) for value, saved in zip(tensors, before))
 
@@ -762,7 +762,7 @@ def test_general_verify_warmup_covers_batch_changes(warmup_batch, tokens):
         )
 
     with kernel_warmup(enabled=True):
-        actual = gdn_decode_mtp(**inputs(warmup_batch))
+        actual = gdn_decode_mtp(**inputs(warmup_batch), pending_replay=None)
     assert actual.isfinite().all()
     # Cross the step/tree threshold in both directions and the value-tile boundary.
     boundary = current_platform().sm_count // 4
@@ -771,7 +771,7 @@ def test_general_verify_warmup_covers_batch_changes(warmup_batch, tokens):
     ):
         for batch in (1, 2, 6, max(6, boundary), max(6, boundary + 1), 64):
             case = inputs(batch)
-            actual = gdn_decode_mtp(**case)
+            actual = gdn_decode_mtp(**case, pending_replay=None)
             assert actual.isfinite().all()
             if batch == 1:
                 torch.testing.assert_close(
@@ -809,7 +809,7 @@ def test_bf16_write_dispatch_preserves_padding_contract(
     with shape_capture(path):
         if mode == "gdn_decode_mtp":
             case["disable_state_update"] = False
-            actual = gdn.gdn_decode_mtp(**case, solution=solution)
+            actual = gdn.gdn_decode_mtp(**case, solution=solution, pending_replay=None)
         else:
             arguments = {
                 name: case[name]

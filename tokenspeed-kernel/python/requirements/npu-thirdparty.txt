@@ -1,1 +1,2 @@
 # Ascend native operators are supplied by tokenspeed-kernel-npu and flash_ops.
+torch-npu-memory-saver==0.1.6

@@ -82,6 +82,8 @@ pub struct PeerMetrics {
     remaining: Metric,
     snapshot: Metric,
     totals: Metric,
+    decisions: Metric,
+    holder_events: Metric,
     physical: Metric,
     bytes: Metric,
     source_bytes: Metric,
@@ -132,6 +134,18 @@ impl PeerMetrics {
                 "tokenspeed:peer_scheduler_state",
                 "Current holder or reader scheduler state.",
                 balance,
+            ),
+            decisions: Metric::counter(
+                exporter,
+                "tokenspeed:peer_decisions",
+                "Reader decision details by reason.",
+                &["model_name", "app_key", "dp_rank", "reason"],
+            ),
+            holder_events: Metric::counter(
+                exporter,
+                "tokenspeed:peer_holder_events",
+                "Lookup, PIN and RELEASE outcomes observed by this source replica.",
+                &["model_name", "app_key", "dp_rank", "outcome"],
             ),
             totals: Metric::counter(
                 exporter,
@@ -199,6 +213,18 @@ impl PeerMetrics {
             &[&self.model, &self.app, &self.dp, outcome],
             remaining_us as f64 / 1e6,
         );
+    }
+
+    /// Detail for a reader decision; reason names come from the protocol or scheduler.
+    pub fn decision(&self, reason: &str) {
+        self.decisions
+            .inc(&[&self.model, &self.app, &self.dp, reason], 1.0);
+    }
+
+    /// Count holder replies on the replica owner under the source service's own role.
+    pub fn holder_event(&self, outcome: &str) {
+        self.holder_events
+            .inc(&[&self.model, &self.app, &self.dp, outcome], 1.0);
     }
 
     /// Current scheduler state and changes to native cumulative counters.

@@ -130,18 +130,30 @@ def torch_prepare_prefill_state_inputs(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Seed each prefill's conv window and recurrent state from its source.
 
-    A request with history (``src > 0``) copies conv row ``src`` to ``dst``
-    and reads state ``src``; one without keeps conv row ``dst`` and starts
-    from a zero state. ``conv`` is updated in place.
+    Only block ids in the open interval ``(0, num_blocks)`` of a pool are read
+    or written there; block 0 is the null block. A request whose ``src`` lies
+    in ``(0, conv.shape[0])`` and whose different ``dst`` lies in the same
+    interval copies conv row ``src`` to ``dst``; any other request keeps conv
+    unchanged. A request whose ``src`` lies in ``(0, state.shape[0])`` has
+    history and reads state ``src``; one without starts from a zero state.
+    ``conv`` is updated in place.
 
     Returns:
         ``(initial states [requests, ...], has_history [requests])``.
     """
-    history = src > 0
-    safe = torch.where(history, src, dst).long()
-    conv[dst.long()] = conv[safe]
-    recurrent = state[safe]
-    recurrent.masked_fill_(~history[:, None, None, None], 0)
+    src = src.long()
+    dst = dst.long()
+    history = (src > 0) & (src < state.shape[0])
+    copy = (
+        (src > 0)
+        & (src < conv.shape[0])
+        & (dst > 0)
+        & (dst < conv.shape[0])
+        & (src != dst)
+    )
+    conv[dst[copy]] = conv[src[copy]]
+    recurrent = state.new_zeros((src.numel(), *state.shape[1:]))
+    recurrent[history] = state[src[history]]
     return recurrent, history
 
 

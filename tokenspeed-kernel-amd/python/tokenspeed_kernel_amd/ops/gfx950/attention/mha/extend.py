@@ -197,22 +197,22 @@ def _use_warp_pipeline(
 
 
 def _launch_options(
-    num_warps: int, *, element_size: int, window_left: int, single_request: bool
+    num_warps: int, *, element_size: int, window_left: int, share_cus: bool
 ) -> dict:
     """Compile options of an extend launch.
 
     The launch has num_warps waves a work-group, K/V elements of
-    element_size bytes and window_left (-1: full attention). The 8-wave tile
-    of a one-request batch (single_request) under full attention with FP8
-    K/V also takes four waves a SIMD. The warm-up compiles both values of
-    single_request, so no launch compiles.
+    element_size bytes and window_left (-1: full attention). With share_cus
+    (_shares_cus), the 8-wave tile under full attention with FP8 K/V also
+    takes four waves a SIMD. The warm-up compiles both values of share_cus,
+    so no launch compiles.
     """
     options = dict(num_warps=num_warps, **extern_compile_options())
     if (
         num_warps == _WARP_PIPELINE_NUM_WARPS
         and element_size == 1
         and window_left < 0
-        and single_request
+        and share_cus
     ):
         # Left to the compiler, the tile's registers fit one work-group (two
         # waves a SIMD) on a CU, and little hides its LDS reads and pipeline
@@ -221,14 +221,27 @@ def _launch_options(
         # order are unchanged, so outputs stay bit-identical. The
         # sliding-window and 16-bit K/V variants keep the compiler's
         # occupancy: at 128 VGPRs they spill hundreds of bytes a wave.
-        # Only a batch of one request takes it. Work-groups of requests with
-        # different cached lengths finish at different times and do not move
-        # between CUs, so pairs keep sharing a CU beside idle ones, which
-        # costs more than the shared CU gains. The cached lengths live on the
-        # device, so the launcher cannot tell batches of near-equal requests,
-        # which would gain, from unequal ones.
+        # Which launches take it: see _shares_cus.
         options["waves_per_eu"] = 4
     return options
+
+
+def _shares_cus(batch: int, num_workgroups: int) -> bool:
+    """Whether an extend launch takes four waves a SIMD (two work-groups a CU).
+
+    batch is the request count and num_workgroups the grid size (query blocks
+    x KV heads x KV splits); _launch_options applies the result. A batch of
+    one request always does. With several, work-groups of requests with
+    different cached lengths finish at different times and do not move between
+    CUs: within one round of pairs, a pair of long ones keeps sharing a CU
+    beside idle ones, which can cost more than sharing gains. From two rounds
+    on, the dispatcher refills each CU as its work-groups finish, so the
+    unequal ones balance out. The cached lengths live on the device, so the
+    launcher sizes this by the grid alone.
+    """
+    # Two rounds of work-group pairs on every CU.
+    min_workgroups_per_cu = 4
+    return batch == 1 or num_workgroups >= min_workgroups_per_cu * _GFX950_SM_COUNT
 
 
 def _extend_tile(
@@ -312,7 +325,7 @@ class ExtendConfig:
         KV_DTYPE,
         q_strides,
     ):
-        assert HEAD_DIM in (64, 128)
+        assert HEAD_DIM in (64, 128, 256)
         assert BLOCK_N == PAGE_SIZE
         assert N_HEADS % N_KV_HEADS == 0
         padded_group_size = triton.next_power_of_2(N_HEADS // N_KV_HEADS)
@@ -547,7 +560,7 @@ class ExtendProgram:
         # the arena's size), so its _CACHE_ALIGN_BYTES alignment, which the direct-to-LDS
         # copy needs (buffer_load_to_local has no lowering without it), is
         # stated here: the launcher checks the arena's base, and a page is a
-        # whole number of 16-byte rows (HEAD_DIM is 64 or 128, see
+        # whole number of 16-byte rows (HEAD_DIM is 64, 128 or 256, see
         # ExtendConfig).
         page = buffer.make_buffer_descriptor(
             gl.multiple_of(
@@ -1642,6 +1655,14 @@ _EXTEND_PIPELINE_MAX_LDS_BYTES = 64 * 1024
 # single-buffered, 512 and 1024 7% faster pipelined.
 _EXTEND_PIPELINED_WORKGROUPS_PER_CU = 2
 _EXTEND_SINGLE_WORKGROUPS_PER_CU = 3
+# Head dim 256 needs 260-280 VGPRs a wave, so registers alone hold one 4-wave
+# or two 2-wave work-groups on a CU. A 2-deep K/V ring within the 64 KB above
+# keeps that residency, so those launches always pipeline 2 deep: FP8 K/V
+# (64 KB). 16-bit K/V would need 128 KB and stays single-buffered. MI355X, 24
+# query / 4 KV heads, FP8, 8192-row chunks of a 32k prompt: 8% faster than
+# single-buffered; the 4-deep ring (128 KB) gained 7% there but leaves one
+# 2-wave work-group a CU, and short extends ran up to 40% slower.
+_EXTEND_HEAD_DIM_256_STAGES = 2
 
 
 def _extend_stage_choices(
@@ -1651,6 +1672,10 @@ def _extend_stage_choices(
     if num_warps == _WARP_PIPELINE_NUM_WARPS:
         # The warp-pipelined loop always streams through 4-slot rings.
         return (_EXTEND_STAGES,)
+    if head_dim == 256:
+        stages = _EXTEND_HEAD_DIM_256_STAGES
+        pipeline_bytes = 2 * stages * page_size * head_dim * element_size
+        return (1,) if pipeline_bytes > _EXTEND_PIPELINE_MAX_LDS_BYTES else (stages,)
     pipeline_bytes = 2 * _EXTEND_STAGES * page_size * head_dim * element_size
     if pipeline_bytes > _EXTEND_PIPELINE_MAX_LDS_BYTES:
         return (1,)
@@ -1921,9 +1946,9 @@ def _extend(
             # soonest: rounds of the CUs per split of the KV stream, fewer
             # splits on a tie. Where it does, the 4-wave count stands.
             # These rounds count one 8-wave work-group a CU, as at the
-            # compiler's occupancy. A one-request launch compiled at four
-            # waves a SIMD fits two, and takes the same split
-            # count so that its bits do not depend on the request count.
+            # compiler's occupancy. A launch compiled at four waves a SIMD
+            # (_shares_cus) fits two, and takes the same split count so that
+            # its bits do not depend on the request count.
             eight_wave_groups = grid_num_q_blocks * n_kv_heads
             if eight_wave_groups * num_kv_splits % _GFX950_SM_COUNT != 0:
                 limit = min(
@@ -2065,17 +2090,17 @@ def _extend(
         # Compiling needs only their dtype and alignment, not their size.
         mid_o, mid_lse = split_buffers(1, MAX_KV_SPLITS)
         for tile in sorted(tiles):
-            # The options of a batch of several requests, and those of a
-            # one-request batch where they differ.
+            # Both occupancies a launch can take (_shares_cus): the
+            # compiler's and four waves a SIMD, skipping a duplicate set.
             option_sets = []
-            for single_request in (False, True):
+            for share_cus in (False, True):
                 options = dict(
                     grid=(1,),
                     **_launch_options(
                         tile[3],
                         element_size=k_cache.element_size(),
                         window_left=window_left,
-                        single_request=single_request,
+                        share_cus=share_cus,
                     ),
                 )
                 if options not in option_sets:
@@ -2108,7 +2133,7 @@ def _extend(
         num_warps,
         element_size=k_cache.element_size(),
         window_left=window_left,
-        single_request=batch == 1,
+        share_cus=_shares_cus(batch, grid_num_q_blocks * n_kv_heads * num_kv_splits),
     )
     if num_kv_splits > 1:
         mid_o, mid_lse = split_buffers(total_q, num_kv_splits)

@@ -84,6 +84,30 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
             "the Host tier is fed by publication or by eviction, not both");
 }
 
+CacheCoordinator::RecoveryMetadata CacheCoordinator::TrackRecoveryMetadata(const PromptPrefix& prompt,
+                                                                           std::int32_t boundary_tokens) {
+    if (!store_.UsesGds() || store_.NumStateGroups() == 0 || boundary_tokens == 0 ||
+        prompt.tokens.size() < static_cast<std::size_t>(boundary_tokens))
+        return {};
+    const auto pages = static_cast<std::size_t>(boundary_tokens / store_.PrefixGranularity());
+    const auto hashes = prompt.prefix_hashes.first(pages);
+    const auto tokens = prompt.tokens.first(static_cast<std::size_t>(boundary_tokens));
+    std::optional<TailPublication> tail;
+    const auto tail_tokens = boundary_tokens % store_.PrefixGranularity();
+    if (tail_tokens > 0) {
+        tail = TailPublication{.tail_tokens = tail_tokens,
+                               .hash = HashPrefixPage(tokens.last(static_cast<std::size_t>(tail_tokens)),
+                                                      hashes.empty() ? ContentHash{} : ContentHash{hashes.back()})};
+    }
+    const ContentHash hash = tail ? tail->hash : ContentHash{hashes.back()};
+    store_.Checkpoints().Observe(tokens, hashes, tail, /*access_epoch=*/0);
+    CheckpointTree::MetadataHold hold{store_.Checkpoints(), hash};
+    auto boundary = store_.Boundaries().LinkPublication(
+        CompletedPages{.tokens = tokens, .prefix_hashes = hashes, .tail = tail, .publish_state = true});
+    syncCheckpoint(hash);
+    return RecoveryMetadata{std::move(boundary), std::move(hold)};
+}
+
 CacheCoordinator::~CacheCoordinator() {
     // Dropping the groups releases their Host entries, which the boundary
     // tree reports to the mutation sink. Its owner (the scheduler) is already
@@ -305,9 +329,21 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
         const std::int32_t on_disk = node->ClosedEntries(BoundaryTree::kDisk);
         _assert(on_device <= expected && on_host <= expected && on_disk <= expected,
                 "a boundary's history entries lie among its keys");
-        return {.device_publishable = on_device == expected,
-                .host_publishable = on_host == expected,
-                .disk_publishable = on_disk == expected,
+        // On hybrid State+History models with a Disk tier, large State (e.g.
+        // KDA) checkpoints can evict from Host L2 to Disk while History (MLA)
+        // blocks stay in Host/Device RAM. Any prefix hitting such a boundary
+        // MUST read State from Disk (ListWithDisk), so report Disk residency
+        // rather than RAM-only residency to prevent routers from bypassing
+        // Disk cost pricing, outbound Disk-push caps, and Disk kill-switches.
+        const bool state_disk_only =
+            store_.NumStateGroups() > 0 && store_.DiskPool() != nullptr &&
+            (node->IsStateDiskOnly() ||
+             (!node->HasRamCheckpointInProperSubtree() && node->PendingCheckpointStores() == 0 &&
+              node->StateEntries(BoundaryTree::kDisk) > 0 && !HoldsStateCheckpoint(boundary.content_hash)));
+        const bool any_history = on_device == expected || on_host == expected || on_disk == expected;
+        return {.device_publishable = on_device == expected && !state_disk_only,
+                .host_publishable = on_host == expected && !state_disk_only,
+                .disk_publishable = on_disk == expected || (state_disk_only && any_history),
                 .retains_descriptor = retains_descriptor};
     }
     // No continuous history means no ordinary prefix-residency events.
@@ -364,6 +400,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
                     *store_.HostPool(), std::span{group_keys[i]}.subspan(begin_block), out.per_group[i].blocks,
                     access_epoch, SessionForAccess(access_epoch));
             }
+            recordDeviceHits(std::span{group_keys[i]}.subspan(begin_block), out.per_group[i].blocks);
         }
         if (probe.tail && !probe.tail->group_keys[i].empty()) {
             // The tail's blocks follow the full pages in the same table.
@@ -376,6 +413,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
                                                              tail_match.blocks, access_epoch,
                                                              SessionForAccess(access_epoch));
                 }
+                recordDeviceHits(probe.tail->group_keys[i], tail_match.blocks);
             }
             out.per_group[i].blocks.insert(out.per_group[i].blocks.end(),
                                            std::make_move_iterator(tail_match.blocks.begin()),
@@ -397,6 +435,17 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
         }
     }
     return out;
+}
+
+void CacheCoordinator::recordDeviceHits(std::span<const CacheKey> keys, std::span<const CacheBlockRef> blocks) {
+    if (!collects_device_hits_) {
+        return;
+    }
+    for (std::size_t j = 0; j < blocks.size(); ++j) {
+        if (blocks[j]) {
+            device_hits_.push_back(keys[j]);
+        }
+    }
 }
 
 CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
@@ -447,6 +496,15 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
         }
     }
     return out;
+}
+
+CoordinatorMatch CacheCoordinator::PinHostPrefix(PrefixProbe&& probe) {
+    _assert(host_.HasPool(), "PinHostPrefix requires a host pool");
+    _assert(probe.device.num_common_tokens == 0, "a Host-only coordinator's probe hits no Device entry");
+    const std::uint64_t access_epoch = history_.IssueAccessEpoch();
+    AcquiredPrefix acquired = acquirePrefix(std::move(probe), access_epoch);
+    history_.RecordAdmission(access_epoch);
+    return std::move(acquired.host);
 }
 
 CacheCoordinator::PrefixExport CacheCoordinator::ExportPrefix(PrefixProbe&& probe) {
@@ -514,6 +572,7 @@ CacheCoordinator::PrefixExport CacheCoordinator::ExportListing(const PrefixProbe
         PrefixCacheIndex& index = store_.Groups()[page.key.group_id].Index();
         CacheBlockRef block = index.Find(*pool, page.key);
         FatalCheck(static_cast<bool>(block), "a listed page is still indexed when it is exported");
+        index.RecordUseExisting(*pool, page.key);
         index.TouchExisting(*pool, std::span{&page.key, 1}, std::span{&block, 1}, out.access_epoch,
                             SessionForAccess(out.access_epoch));
         out.blocks.push_back(
@@ -557,7 +616,7 @@ std::int32_t CacheCoordinator::DemoteExportedChain(std::span<const CacheKey> key
         }
         chain.insert(chain.end(), exported->second.begin(), exported->second.end());
     }
-    return DemoteEntries(chain);
+    return DemoteEntries(chain, DemotionCause::kPeerHandoff);
 }
 
 // A full-pool census, and deliberately so: whether a parent is reclaimable
@@ -719,6 +778,34 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, const 
     publication.reset();
     recordCheckpoints(completed, access_epoch);
     recordPublishedTail(completed);
+}
+
+void CacheCoordinator::CacheWrittenHostBlocks(std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
+                                              std::span<const CompletedPages> checkpoints,
+                                              std::span<const std::uint64_t> access_epochs) {
+    _assert(blocks.size() == keys.size(), "a Host publication names a key for every block");
+    _assert(checkpoints.size() == access_epochs.size(),
+            "a Host publication names an access epoch for every checkpoint");
+    // Held while the blocks register under the checkpoints' nodes.
+    std::vector<BoundaryTree::Hold> publications;
+    publications.reserve(checkpoints.size());
+    for (const CompletedPages& completed : checkpoints) {
+        publications.push_back(store_.Boundaries().LinkPublication(completed));
+    }
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        host_.CacheHostBlock(blocks[i], keys[i], /*inherited_metadata=*/std::nullopt);
+    }
+    // A boundary nothing registered under leaves again.
+    publications.clear();
+    for (std::size_t i = 0; i < checkpoints.size(); ++i) {
+        const CompletedPages& completed = checkpoints[i];
+        recordCheckpoints(completed, access_epochs[i]);
+        if (completed.tail) {
+            host_.CacheHostTail(
+                completed.prefix_hashes.empty() ? ContentHash{} : ContentHash{completed.prefix_hashes.back()},
+                *completed.tail);
+        }
+    }
 }
 
 template <CacheTier Tier>
@@ -977,15 +1064,23 @@ std::vector<CacheKey> CacheCoordinator::BoundaryCheckpointKeys(std::span<const s
     return keys;
 }
 
-std::int32_t CacheCoordinator::DemoteEntries(std::span<const CacheKey> keys) {
-    std::int32_t demoted = 0;
+std::int32_t CacheCoordinator::DemoteEntries(std::span<const CacheKey> keys, DemotionCause cause) {
+    return CheckedInt32(DemoteEntriesWithEvents(keys, cause).size());
+}
+
+std::vector<CacheCoordinator::DemotionEvent> CacheCoordinator::DemoteEntriesWithEvents(std::span<const CacheKey> keys,
+                                                                                       DemotionCause cause) {
+    if (store_.UsesGds() && cause == DemotionCause::kSupersededCheckpoint) return {};
+    std::vector<DemotionEvent> demoted;
     for (const CacheKey& key : keys) {
         PrefixCacheIndex& index = store_.Groups()[key.group_id].Index();
-        demoted +=
-            index.Demote(store_.DevicePool(), key, CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/0) ? 1 : 0;
+        if (index.Demote(store_.DevicePool(), key, CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/0))
+            demoted.push_back(
+                {key, CacheTier::kDevice, *store_.LocationOf(store_.DevicePool(), key.group_id, key), cause});
         if (store_.HostPool() != nullptr) {
-            demoted +=
-                index.Demote(*store_.HostPool(), key, CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/0) ? 1 : 0;
+            if (index.Demote(*store_.HostPool(), key, CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/0))
+                demoted.push_back(
+                    {key, CacheTier::kHost, *store_.LocationOf(*store_.HostPool(), key.group_id, key), cause});
         }
     }
     return demoted;
@@ -997,6 +1092,7 @@ std::uint64_t CacheCoordinator::LatestStateAccessEpoch(const ContentHash& hash) 
 }
 
 void CacheCoordinator::recordCheckpoints(const CompletedPages& completed, std::uint64_t access_epoch) {
+    if (completed.checkpoint_lifecycle) completed.checkpoint_lifecycle->Publish();
     if (store_.NumStateGroups() == 0 || completed.tokens.empty()) {
         return;
     }
@@ -1006,7 +1102,9 @@ void CacheCoordinator::recordCheckpoints(const CompletedPages& completed, std::u
         if (store_.Checkpoints().Observe(
                 completed.tokens.first(pages * static_cast<std::size_t>(store_.PrefixGranularity())),
                 completed.prefix_hashes.first(pages), std::nullopt, access_epoch)) {
-            syncCheckpoint(ContentHash{completed.prefix_hashes[pages - 1]});
+            const ContentHash hash{completed.prefix_hashes[pages - 1]};
+            store_.Checkpoints().AttachProduction(hash, completed.checkpoint_lifecycle);
+            syncCheckpoint(hash);
         }
     }
     if (completed.publish_state &&

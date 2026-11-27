@@ -109,7 +109,17 @@ def test_bootstrap_preserves_gpu_spacing(monkeypatch):
     )
     host = HostBootstrap.__new__(HostBootstrap)
     with pytest.raises(FileNotFoundError, match="model weights unavailable"):
-        host.__init__(args, None, None, None, None, None, peer_outbox=None)
+        host.__init__(
+            args,
+            None,
+            None,
+            None,
+            None,
+            None,
+            peer_outbox=None,
+            shared_l2_handle=None,
+            replica_memory_transitions=False,
+        )
     assert host._gpu_id == 3
 
 
@@ -192,21 +202,33 @@ def _rank_args(rank: int) -> tuple[ServerArgs, PortArgs]:
     return server_args, PortArgs.init_new(server_args)
 
 
+@pytest.mark.parametrize("device", ["cuda", "npu"])
 @pytest.mark.parametrize("enable_async_logging", [False, True])
 def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
-    tmp_path, enable_async_logging
+    tmp_path, enable_async_logging, device
 ):
     binary = _fake_host(
         tmp_path,
         """
+        import os
+        assert set(args) == {"--python", "--control-fd", "--enable-async-logging"}
         server_args, port_args, relay = connection.recv()
         connection.send({"status": "ready", "rank": server_args.mapping.rank,
                          "python": python, "relay": relay,
-                         "async_logging": args["--enable-async-logging"]})
+                         "async_logging": args["--enable-async-logging"],
+                         "device": os.environ["TS_HOST_DEVICE"]})
         time.sleep(600)
         """,
     )
-    server_args, port_args = _rank_args(3)
+    server_args = ServerArgs(
+        model="x",
+        device=device,
+        disable_prefill_graph=device == "npu",
+        disable_pdl=device == "npu",
+        enable_memory_saver=False,
+    )
+    server_args.mapping.rank = 3
+    port_args = PortArgs.init_new(server_args)
     server_args.enable_async_logging = enable_async_logging
     proc, reader = start_rust_host(
         binary, server_args, port_args, nullcontext(), "ipc:///tmp/relay", False
@@ -219,6 +241,7 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
             "python": sys.executable,
             "relay": "ipc:///tmp/relay",
             "async_logging": str(enable_async_logging).lower(),
+            "device": device,
         }
         assert proc.is_alive() and proc.exitcode is None
     finally:
@@ -568,7 +591,7 @@ def _resolved(rid: str, **fields) -> SamplingParams:
     return params
 
 
-def _data_plane(handle: DeviceHandle) -> HostDataPlane:
+def _data_plane(handle: DeviceHandle, *, defer_recurrent_state=False) -> HostDataPlane:
     """A text-only, aggregated rank's data plane over ``handle``."""
     server_args = ServerArgs(model="x")
     server_args.mapping.rank = 0
@@ -587,7 +610,9 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
         max_encoder_tokens=None,
         attn_tp_cpu_group=None,
         epd_publisher=None,
+        replica_memory_transitions=False,
         starting=False,
+        defer_recurrent_state=defer_recurrent_state,
     )
 
 
@@ -624,9 +649,11 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(
     assert pending is not None
     completed = plane.complete(pending)
     assert completed[2].tolist() == [-0.5]
+    # The stand-in executor reports no request ends.
     assert completed[:2] + completed[3:] == (
         [100],
         [1],
+        None,
         None,
         None,
         None,
@@ -661,7 +688,8 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
         _plan_with_one_request("r1"), None, None, None, (([0], [2], [0], 2), 1), None
     )
 
-    *_, logprobs, returned_cumulative_probs = plane.complete(pending)
+    *_, logprobs, returned_cumulative_probs, request_ends = plane.complete(pending)
+    assert request_ends is None
     if cumulative_probs is None:
         assert returned_cumulative_probs is None
     else:
