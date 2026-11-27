@@ -70,15 +70,17 @@ fn kind_name(kind: CacheEventKind) -> &'static str {
         CacheEventKind::LoadBackDone => "LoadBackDoneEvent",
         CacheEventKind::SnapshotDone => "SnapshotDoneEvent",
         CacheEventKind::RestoreDone => "RestoreDoneEvent",
+        CacheEventKind::StateCommitDone => "StateCommitDoneEvent",
         _ => unreachable!("a cache event kind the bridge does not define"),
     }
 }
 
-const KINDS: [CacheEventKind; 4] = [
+const KINDS: [CacheEventKind; 5] = [
     CacheEventKind::WriteBackDone,
     CacheEventKind::LoadBackDone,
     CacheEventKind::SnapshotDone,
     CacheEventKind::RestoreDone,
+    CacheEventKind::StateCommitDone,
 ];
 
 type Key = (u32, &'static str);

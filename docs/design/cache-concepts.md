@@ -6,6 +6,48 @@ concepts are *logical* (token-based, storage-agnostic) and which are *physical*
 reference for naming, code placement, and layering decisions in both the C++
 scheduler (`tokenspeed-scheduler`) and the Python runtime.
 
+## Cross-layout peer prefix reads
+
+A coordinated peer reader matches a digest of the serving model namespace,
+immutable weight generation, and the active recipe's state encoding. An explicit
+shared serving name lets replicas mount the same weights at different paths.
+Compute precision, fusion and parallelism are local choices. The transfer planner
+checks both descriptors before constructing member reads. Persistent storage has
+its own identity.
+
+All source members must pin the proposed checkpoint before the holder grants a
+read. All reader members must report retirement before sending RELEASE.
+Only the original holder's matching CLOSED/COMPLETE reply can publish a hit.
+Unknown retirement freezes the landing. A restarted holder or a conflicting
+close ends the business attempt with zero reused tokens.
+
+Wire revision 2 bounds the start of each member's last native read. Its local
+30-second monotonic submission window starts before the member votes READY.
+Workers check the same deadline at each batch, including after queue and
+destination-fence waits. The holder starts its own 30-second interval at
+GRANT, after all READY votes. A delayed GRANT cannot restart the reader clock.
+Mixed wire revisions fall back to local prefill.
+
+A deployment with a guaranteed upper bound on the time from the reader's
+final submission check through the last possible source-memory access can
+set `TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS` on the holder. Include host
+scheduling pauses after the check, native queues, reconnects, retries, DMA
+drain after process failure, and timer drift/margin. All ranks follow their
+holder leader's configured value. After the submission interval plus this
+bound, the holder initiates an ABORT and releases its own source references
+even if the reader disappeared. This never releases a reader's frozen target.
+If the backend has no verified bound, leave the setting unset: a granted
+source remains pinned pending explicit closure. A timeout for polling one
+Mooncake batch alone does not establish the bound. No heartbeats extend it.
+
+After all reader members have retired their reads, a missing RELEASE reply
+can still force the request to recompute. Once its closing deadline passes,
+the reader drops the finished request and keeps the exact release message.
+New lookups to that holder pause until its pending closes receive terminal
+replies. Cleanup retries rotate among those leases and do not occupy active
+attempt slots. Healthy holders can continue serving requests. An unknown DMA
+retirement keeps the original landing frozen and cannot enter this retry path.
+
 ## Two worlds: logical tokens vs. physical storage
 
 ### Logical world (token units, storage-agnostic)
@@ -126,6 +168,19 @@ pool; no capacity is reserved for State or history.
 Mirrored ranks must agree on Host packing as well as parent counts. Startup
 compares both before allocating pinned memory and refuses incompatible local
 payload geometry rather than giving the same block ID different meanings.
+
+A shared L2 pool (`--shared-l2-config`) uses the compact Host geometry too. A
+pool page holds one block exactly as a Host block does, and a rank reports the
+pool's `host_group_packing` for its Host tier, which is then a proxy: its
+blocks hold no bytes and stand for pinned pool pages. Only the parents are
+spread over the provider processes' memory, in the order the providers
+joined: a page lies in its parent as a Host block does, on the provider that
+holds the parent (`shared_l2/geometry.rs` of `ts-control`, from the sizes
+`runtime/cache/shared_l2/layout.py` reads off the Host layout); the bytes
+move between a rank's Device blocks and pool pages by RDMA and never pass
+through the rank's host memory. The pool's capacity follows from the same
+geometry: a State checkpoint costs one parent for each State group, and KV
+pages share parents by their group's packing.
 
 Host allocations follow PyTorch's existing allocator configuration, including
 `PYTORCH_ALLOC_CONF` and its legacy `PYTORCH_CUDA_ALLOC_CONF` name. TokenSpeed
@@ -453,6 +508,48 @@ prompt end from slot 0: slot 1 is the fresh block the padding row never wrote
 prompt-end state onto another request's canonical checkpoint before the
 rotation; slot 0 then pins that equivalent checkpoint through the finish.
 
+KDA keeps its FP32 decode records and their accepted count in the active
+request slot, outside the LCM arena. The live State block holds only the
+dense base and the convolution state, exactly as without retained history;
+the scheduler and the cache see nothing else. Prefill writes complete
+checkpoints. The decode commit of the forward that ends a request (the
+sampling epilogue has set `RuntimeStates.stopped` for its slot) folds the
+slot's accepted records into the live block and clears the count. The block
+a finish publishes is thus a self-contained dense checkpoint before the host
+learns that the request ended. BF16 dense storage rounds at this boundary.
+A finish the device's stop criteria do not explain -- a grammar that ends
+while the request ignores EOS, a client abort -- leaves the records
+unfolded. With a group deferring its decode state
+(`Scheduler::DefersDecodeState`), the control plane publishes on the device's
+word alone: every forward reports per row whether the device ended the
+request (`request_ends`, written by the sampling epilogue's stop conditions
+and raised by the commit when a layer rejected the row's commit). A request
+the device did not end gets `forward::Abort` rather than `forward::Finish`, so
+it publishes nothing, as for a numerically corrupted forward, and the slot's
+next admission clears the count (`reset_request_workspace`). A request the
+device ended but could not complete -- records left outside the live block --
+is an engine error (`CommitError::IncompleteDecodeState`): the engine stops
+rather than publish an incomplete state.
+
+A retraction publishes and images the victim's computed frontier. The
+backend declares its State groups as deferring their decode state
+(`deferred_decode_state_groups`, set on the scheduler's `CacheGroupConfig`),
+and the scheduler lists a decoded victim's live block in each of them, the
+one its decode steps write in place, in the plan's `state_folds`, by request
+slot. Before the plan's stores, copies, zeroing and forward, the data plane
+folds each listed slot's records into its block (`DeviceHandle.execute`,
+`fold_deferred_state`). The list does not depend on the image: a retraction
+whose image the split refuses after the publication aborts the victim, but
+its publication stands, and the fold completes it before any reader. A
+block the publication swapped for another request's equal entry is not
+listed; that entry already holds the complete state. The FP32 records stay in
+the GPU workspace. Restore copies the complete dense and convolution states
+and starts the restored slot with an accepted count of zero. A remote peer
+does not observe stream order: with peers, a plan whose retractions publish
+such an endpoint carries a `state_commit_fence`; the data plane acknowledges
+it on the execution stream right behind the folds, and the scheduler refuses
+peer pins of those blocks until the ACK (RFC 0004, "Pin").
+
 State groups may additionally restrict reusable checkpoints with
 `checkpoint_granularity`: intermediate prefill forwards end on its multiples,
 and only prefill-produced states at these positions are published or matched.
@@ -529,6 +626,16 @@ capacity layout without these slots keeps such a forward on its live metadata
 break of the ordinary prefill graph. Qwen4-Exp's PLE layer writes its own
 checkpoint windows at its eager break, over live metadata.
 
+Checkpoint positions and scan indices are planned on the host. Each metadata
+preparation packs its related tensors into one pinned upload without
+synchronizing the model stream. Checkpoint writers reuse the uploaded row
+and offset views. These mirrors stay live-sized; only the token and block
+slots consumed by captured
+state writers keep the fixed capacity shape. Retained device views belong to
+the existing `attention_state` region and follow its `weights` release/resume
+lifecycle. Each upload has fresh host staging storage so overlapping forwards
+cannot overwrite metadata whose transfer is still in flight.
+
 For PD landing into a partial history block, follow the
 [block-table export contract](#block-tables-and-exported-page-ids) above.
 
@@ -545,32 +652,55 @@ the request without another forward. KDA convolution history may use either
 channel-major or channels-last storage; the PD schema partitions the channel
 axis in each layout, preserving its separate Q/K/V channel segments.
 
-KDA targets with a batched commit kernel use the same deferred-state lifecycle
-for ordinary decode (`T=1`) and speculative verification. Verify leaves the
-committed recurrent and convolution state unchanged; acceptance selects the
-prefix to commit into the live block.
+KDA uses retained history for ordinary decode and speculative verification.
+Each KDA State page holds the convolution window and a dense recurrent base,
+and nothing else. Each resident request has a stable slot outside the LCM
+arena. For each KDA layer, the slot holds FP32 corrections (U), normalized
+keys (K) and per-token decays, plus an INT32 count of the updates accepted
+since the dense base of the request's input page. Batch reordering changes
+the mapping from batch rows to request slots.
 
-On NVIDIA and AMD, verify saves FP32 corrections plus unnormalized keys and raw gates
-in the activation dtype (BF16 or FP16). Recovery recomputes key normalization
-and gate decay, then applies the saved corrections to the input checkpoint.
-It does not recompute the state-dependent correction or the gate projection.
-Original QKV rows are retained only for convolution-history commit. The
-persistent convolution pool keeps its cache dtype, independently of activation
-dtype. Records and position/generation stamps cover the current verify round;
-they are transient workspace, not prefix-cache entries.
+Verify replays the accepted updates in order to reconstruct the current
+state. It appends candidates after that accepted prefix. Commit advances the
+slot's count by the accepted count and updates the convolution window. For
+example, after four candidates and two acceptances, the next verify starts
+writing at index two. Generation stamps identify candidates from the current
+round. Eager execution and CUDA graphs use the same page and request-slot
+routing.
 
-Both vendors consume the same post-convolution activation values in verify
-and save those unnormalized keys for recovery. NVIDIA uses Triton recovery;
-AMD uses Gluon recovery. Neither recomputes the state-dependent correction.
-Convolution history is committed separately so in-place pages are safe.
-Platforms without a matching batched commit and no-store verify keep the dense
-`max_bs * (draft_tokens + 1)` per-position state workspace.
+Each layer has room for `max(16, effective_verify_width)` records per slot, or
+for `--kda-history-capacity` records when set (at least the verify width): a
+smaller capacity shrinks the request-slot workspace but folds more often. Every
+resident slot holds them, a decode role's extra slots included. When a whole
+candidate window will no longer fit, the accepted updates are folded into the
+dense base before the slot is reused, even for a request whose own window is
+shorter. A change of live page likewise starts from a materialized base. Both
+folds run before the verify forward, in one launch pair for every layer, once
+the metadata refresh has resolved the round's pages
+(`KdaAttnBackend._prepare_retained_history`): verify itself reads only live
+blocks and writes neither a block nor a count. The base uses `--mamba-ssm-dtype`
+(FP32 or BF16). Replay accumulates in FP32 and rounds when it writes the dense
+base.
 
-The Kimi-K3 and GLM-5.3-Flash recipes share the backend's payload specification
-and reserve transient convolution rows, payloads, descriptors and record
-metadata before sizing the arena. Prefill-only engines reserve no decode
-records. GLM also reserves its target/draft-shared KPool tails once, so state
-memory does not disappear from the GPU budget.
+Prefill starts from the logical state of its input page, then writes dense
+live and interior checkpoints and clears the rows' counts. A decode commit
+only advances the count, except in the forward that ends the request, which
+folds the records into the live block; a retraction folds them before its
+image is stored (above). A published or imaged block is therefore a
+self-contained dense checkpoint, and prefill to decode transfer carries it
+unchanged. A recycled slot may still count records of an owner whose end the
+device did not see, so the runtime clears the count whenever a slot gets a
+new owner (`reset_request_workspace`): at its first forward
+(`RuntimeStates.bind_stop_criteria`) and, on a PD decode node, already at the
+landing of a prompt computed elsewhere, which a retraction may fold before
+any forward (`ModelExecutor.reset_remote_prefill_cache_lengths`). A restore
+starts the slot at zero itself (`import_slot_state`).
+
+The cache recipes reserve the record and count storage by resident request
+capacity, including the reserved slots in `RequestSlotLayout`. They budget
+original QKV, routing and generation stamps separately by verify batch size.
+Adding LCM pages increases the space for dense checkpoints while the record
+budget stays fixed. Prefill-only engines allocate no decode records.
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 
@@ -3463,3 +3593,17 @@ unusable State checkpoint eligible for an optimistic storage query.
 Query/GET still requires all Full, State and window
 objects; diverging prompts therefore cannot reuse a checkpoint solely because
 they share a group or boundary length.
+
+## Deferred recurrent state workspace
+
+Deferred GDN payloads are execution workspace, rather than a cache group:
+they never enter prefix matching, tier storage, retraction images or PD
+transfers. Two batch-sized banks retain replay inputs until the next forward
+consumes them or materializes dropouts. Only the small slot/generation records
+are slot state, owned by `GdnPendingState` through `SlotStateExporter`.
+Export and import reject records that still name a pending payload.
+
+The runtime retires replay before reading or reusing its old State block or
+request slot. It materializes the state at a request exit to cover published
+checkpoints and snapshots. Until then the bank and live block together
+describe the logical frontier. This adds no State slot or cache span.

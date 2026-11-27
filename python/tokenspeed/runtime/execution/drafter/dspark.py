@@ -81,10 +81,6 @@ class DSpark(DFlash):
         # Set by keep_draft_logits_vocab_sharded: sampled steps stay on this rank's shard.
         self._samples_vocab_shard = False
 
-    def require_full_draft_logits(self) -> None:
-        """DSpark samples the target's shared head, not a draft-owned processor."""
-        self.logits_processor.require_full_vocab_logits()
-
     @override
     def keep_draft_logits_vocab_sharded(
         self,

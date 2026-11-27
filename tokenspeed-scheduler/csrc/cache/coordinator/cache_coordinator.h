@@ -210,6 +210,32 @@ public:
     // under another branch. Returns the entries demoted.
     std::int32_t DemoteExportedChain(std::span<const CacheKey> keys, std::uint64_t access_epoch);
 
+    // A coordinator that is a Host tier alone -- the owner of a shared L2
+    // pool (SharedL2Pool) -- has no admission and no Device publication to
+    // drive it, and enters the same code here and through Host().
+    //
+    // Pins a probe's Host hit as an admission's first step does: the tail kept
+    // young, every hit dated with a new access epoch, the resume gap counted,
+    // and one new request counted toward the checkpoint retention window,
+    // also for a probe that hit nothing. Per group the Host hits (holes
+    // empty), then the tail's blocks.
+    CoordinatorMatch PinHostPrefix(PrefixProbe&& probe);
+    // Publishes `blocks` under `keys` on the Host with no Device publication,
+    // and with them the State checkpoints whose block is among them, in a
+    // Device publication's order (CacheCompletedBlocks): every checkpoint's
+    // boundary is linked, the blocks register, then each checkpoint and its
+    // tail are recorded. access_epochs[i] stands for the request that published
+    // checkpoints[i], as an access epoch does on the Device: the retention
+    // ranking only compares it.
+    void CacheWrittenHostBlocks(std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
+                                std::span<const CompletedPages> checkpoints,
+                                std::span<const std::uint64_t> access_epochs);
+    // On, the keys of the Device entries prefix hits acquire are collected,
+    // for the caller to take once per plan: a shared L2 pool refreshes
+    // its copies of them, as a rank's own Host tier refreshes its entries.
+    void SetDeviceHitCollection(bool enabled) { collects_device_hits_ = enabled; }
+    std::vector<CacheKey> TakeDeviceHits() { return std::exchange(device_hits_, {}); }
+
     // Admit consumes the probe (PrefixProber) whether or not it admits; a
     // caller that retries after a failure keeps a copy. A missing epoch
     // starts a new request; a supplied epoch continues that request. Once
@@ -584,6 +610,9 @@ private:
     template <CacheTier Tier>
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);
+    // SetDeviceHitCollection: the keys of the blocks a Device hit acquired
+    // (blocks[j] under keys[j], holes empty).
+    void recordDeviceHits(std::span<const CacheKey> keys, std::span<const CacheBlockRef> blocks);
     AcquiredPrefix acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch);
     template <CacheTier Tier>
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
@@ -648,6 +677,9 @@ private:
     StorageQueries storage_;
     // The cache owners of the admitted requests.
     SessionRegistry sessions_;
+    // SetDeviceHitCollection.
+    bool collects_device_hits_{false};
+    std::vector<CacheKey> device_hits_;
 };
 
 // The prefix-match policy of one spec: full attention is prefix-closed with

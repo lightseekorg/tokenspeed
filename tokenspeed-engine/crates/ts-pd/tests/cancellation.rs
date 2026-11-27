@@ -380,11 +380,16 @@ fn a_revocation_whose_deregistration_fails_keeps_waiting_for_acknowledgments() {
 }
 
 fn transfer_counter(directory: &std::path::Path, name: &str) -> f64 {
+    transfer_samples(directory, name, "")
+}
+
+fn transfer_samples(directory: &std::path::Path, name: &str, outcome: &str) -> f64 {
     let result = std::process::Command::new("python3")
         .env("PROMETHEUS_MULTIPROC_DIR", directory)
         .arg("-c")
-        .arg("import sys; from prometheus_client import CollectorRegistry, multiprocess; r=CollectorRegistry(); multiprocess.MultiProcessCollector(r); print(sum(s.value for m in r.collect() for s in m.samples if s.name == sys.argv[1]))")
+        .arg("import sys; from prometheus_client import CollectorRegistry, multiprocess; r=CollectorRegistry(); multiprocess.MultiProcessCollector(r); print(sum(s.value for m in r.collect() for s in m.samples if s.name == sys.argv[1] and (not sys.argv[2] or s.labels.get('outcome') == sys.argv[2])))")
         .arg(name)
+        .arg(outcome)
         .output().unwrap();
     assert!(
         result.status.success(),
@@ -423,6 +428,15 @@ fn room_end_metrics(name: &str, cancel_decode: Option<bool>) {
     );
     let (mut mesh, group) = single_rank();
     prepare(&mut pair, "r", &mut mesh, &group);
+    transfer_one(&mut pair, "success", 777, &mut mesh, &group);
+    assert_eq!(
+        transfer_counter(&directory, "tokenspeed:prefill_kv_handoff_seconds_count"),
+        1.
+    );
+    assert_eq!(
+        transfer_counter(&directory, "tokenspeed:decode_kv_wait_seconds_count"),
+        1.
+    );
     match cancel_decode {
         Some(true) => pair.decode.cancel("r"),
         Some(false) => pair.prefill.cancel("r"),
@@ -433,6 +447,10 @@ fn room_end_metrics(name: &str, cancel_decode: Option<bool>) {
     }
     expect_cancelled(&mut pair.prefill, "r", &mut mesh, &group);
     expect_cancelled(&mut pair.decode, "r", &mut mesh, &group);
+    assert_eq!(
+        transfer_counter(&directory, "tokenspeed:kv_handoffs_total"),
+        2.
+    );
     assert_eq!(
         transfer_counter(&directory, "tokenspeed:kv_transfer_failures_total"),
         if cancel_decode.is_some() { 0.0 } else { 1.0 }
@@ -454,63 +472,25 @@ fn a_failed_room_increments_transfer_failures_once() {
     room_end_metrics("failure", None);
 }
 
-fn replica_end_metrics(cause: &str) {
-    let library = native::NativeLibrary::new();
-    let listeners: Vec<_> = (0..2)
+fn run_replica<T: Send>(
+    members: usize,
+    run: impl Fn(usize, &mut ts_collective::Mesh, &ts_collective::Group) -> T + Sync,
+) -> Vec<T> {
+    let listeners: Vec<_> = (0..members)
         .map(|_| ts_collective::Listener::bind("127.0.0.1").unwrap())
         .collect();
     let addresses: Vec<_> = listeners
         .iter()
         .map(|l| format!("127.0.0.1:{}", l.port().unwrap()))
         .collect();
-    let results = thread::scope(|scope| {
+    thread::scope(|scope| {
         let workers: Vec<_> = listeners
             .into_iter()
             .enumerate()
             .map(|(rank, listener)| {
                 let addresses = &addresses;
-                let library = library.path().to_path_buf();
+                let run = &run;
                 scope.spawn(move || {
-                    let directory = std::env::temp_dir().join(format!(
-                        "ts-pd-replica-{cause}-{rank}-{}",
-                        std::process::id()
-                    ));
-                    std::fs::create_dir_all(&directory).unwrap();
-                    let exporter = ts_metrics::Exporter::new(&ts_metrics::MetricsConfig {
-                        prometheus_dir: Some(directory.clone()),
-                        relay_endpoint: None,
-                    })
-                    .unwrap();
-                    let metrics =
-                        std::sync::Arc::new(ts_metrics::KvTransferMetrics::new(&exporter, "m", ""));
-                    let source = pattern();
-                    let destination = vec![0u8; BYTES];
-                    let timeout = if rank == 0 && cause == "timeout" {
-                        Duration::ZERO
-                    } else {
-                        Duration::from_secs(120)
-                    };
-                    let mut pair = pair_on_port_with_metrics(
-                        library,
-                        &source,
-                        &destination,
-                        timeout,
-                        None,
-                        0,
-                        "early",
-                        Some(metrics),
-                    );
-                    pair.prefill.register("r", &pair.bootstrap).unwrap();
-                    // Only one rank has observed a terminal event when the real
-                    // collective runs; the other still waits for its manifest.
-                    if rank == 0 {
-                        match cause {
-                            "cancel" => pair.prefill.cancel("r"),
-                            "failure" => pair.prefill.abort_room("r", pair.bootstrap.room),
-                            "timeout" => {}
-                            _ => unreachable!(),
-                        }
-                    }
                     let mut mesh = ts_collective::Mesh::connect(
                         rank,
                         listener,
@@ -518,17 +498,9 @@ fn replica_end_metrics(cause: &str) {
                         Duration::from_secs(5),
                     )
                     .unwrap();
-                    let replica = ts_collective::Group::new(0, vec![0, 1], rank).unwrap();
-                    let events = pair.prefill.poll(&mut mesh, &replica).unwrap();
-                    assert_eq!(
-                        events,
-                        [PdEvent::Failed("r".into()), PdEvent::Stopped("r".into())]
-                    );
-                    assert!(pair.prefill.poll(&mut mesh, &replica).unwrap().is_empty());
-                    (
-                        transfer_counter(&directory, "tokenspeed:kv_transfer_failures_total"),
-                        transfer_counter(&directory, "tokenspeed:kv_transfer_timeouts_total"),
-                    )
+                    let replica =
+                        ts_collective::Group::new(0, (0..members).collect(), rank).unwrap();
+                    run(rank, &mut mesh, &replica)
                 })
             })
             .collect();
@@ -536,27 +508,165 @@ fn replica_end_metrics(cause: &str) {
             .into_iter()
             .map(|worker| worker.join().unwrap())
             .collect::<Vec<_>>()
+    })
+}
+
+fn rank_metrics(
+    name: &str,
+    rank: usize,
+) -> (
+    std::path::PathBuf,
+    std::sync::Arc<ts_metrics::KvTransferMetrics>,
+) {
+    let directory = std::env::temp_dir().join(format!(
+        "ts-pd-replica-{name}-{rank}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let exporter = ts_metrics::Exporter::new(&ts_metrics::MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let metrics = std::sync::Arc::new(ts_metrics::KvTransferMetrics::new(&exporter, "m", ""));
+    (directory, metrics)
+}
+
+fn replica_end_metrics(cause: &str, members: usize, instrument_follower: bool) {
+    let last = members - 1;
+    let results = run_replica(members, |rank, mesh, replica| {
+        let library = native::NativeLibrary::new();
+        let (directory, metrics) = rank_metrics(&format!("{cause}-{members}"), rank);
+        let source = pattern();
+        let destination = vec![0u8; BYTES];
+        let timeout = if rank == last && cause == "timeout" {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(120)
+        };
+        let mut pair = pair_on_port_with_metrics(
+            library.path().to_path_buf(),
+            &source,
+            &destination,
+            timeout,
+            None,
+            0,
+            "early",
+            (rank == 0 || instrument_follower).then_some(metrics),
+        );
+        pair.prefill.register("r", &pair.bootstrap).unwrap();
+        // Only one rank has observed a terminal event when the real
+        // collective runs; the other still waits for its manifest.
+        if rank == 0 {
+            match cause {
+                "cancel" => pair.prefill.cancel("r"),
+                "failure" => pair.prefill.abort_room("r", pair.bootstrap.room),
+                "timeout" => {}
+                _ => unreachable!(),
+            }
+        }
+        // Fail two rooms in the same agreement, with different causes.
+        let second = BootstrapInfo {
+            room: pair.bootstrap.room + 1,
+            ..pair.bootstrap.clone()
+        };
+        pair.prefill.register("second", &second).unwrap();
+        pair.prefill.cancel("second");
+        let events = pair.prefill.poll(mesh, replica).unwrap();
+        assert_eq!(
+            events,
+            [
+                PdEvent::Failed("r".into()),
+                PdEvent::Stopped("r".into()),
+                PdEvent::Failed("second".into()),
+                PdEvent::Stopped("second".into())
+            ]
+        );
+        assert!(pair.prefill.poll(mesh, replica).unwrap().is_empty());
+        assert_eq!(
+            transfer_counter(&directory, "tokenspeed:kv_handoffs_total"),
+            if rank == 0 { 2. } else { 0. }
+        );
+        assert_eq!(
+            transfer_samples(
+                &directory,
+                "tokenspeed:kv_handoffs_total",
+                "handshake_failed"
+            ),
+            if rank == 0 && cause == "timeout" {
+                1.
+            } else {
+                0.
+            }
+        );
+        (
+            transfer_counter(&directory, "tokenspeed:kv_transfer_failures_total"),
+            transfer_counter(&directory, "tokenspeed:kv_transfer_timeouts_total"),
+        )
     });
-    let expected = match cause {
-        "cancel" => vec![(0.0, 0.0), (0.0, 0.0)],
-        "timeout" => vec![(0.0, 1.0), (0.0, 0.0)],
-        "failure" => vec![(1.0, 0.0), (0.0, 0.0)],
+    let mut expected = vec![(0., 0.); members];
+    match cause {
+        "failure" => expected[0].0 = 1.,
+        "timeout" if instrument_follower => expected[last].1 = 1.,
+        "timeout" | "cancel" => {}
         _ => unreachable!(),
-    };
+    }
     assert_eq!(results, expected);
 }
 
 #[test]
 fn replica_cancel_propagation_does_not_invent_a_transfer_failure() {
-    replica_end_metrics("cancel");
+    replica_end_metrics("cancel", 2, true);
 }
 
 #[test]
 fn replica_timeout_propagation_keeps_timeout_separate_from_failure() {
-    replica_end_metrics("timeout");
+    replica_end_metrics("timeout", 2, true);
 }
 
 #[test]
 fn replica_failure_propagation_counts_only_the_rank_that_detected_it() {
-    replica_end_metrics("failure");
+    replica_end_metrics("failure", 2, true);
+}
+
+#[test]
+fn an_uninstrumented_follower_reports_its_handshake_failure_through_the_replica_owner() {
+    replica_end_metrics("timeout", 4, false);
+}
+
+#[test]
+fn a_followers_native_write_failure_ends_the_request_on_every_rank_and_counts_once() {
+    run_replica(4, |rank, mesh, replica| {
+        let library = native::NativeLibrary::new();
+        let (directory, metrics) = rank_metrics("write", rank);
+        let source = pattern();
+        let destination = vec![0u8; BYTES];
+        // Only rank 2 lacks a registered destination for the second KV layer.
+        // All four manifests are valid; the native transport rejects the write.
+        let registered = if rank == 2 { PAGES[0].end } else { BYTES };
+        let mut pair = pair_on_port_with_metrics(
+            library.path().to_path_buf(),
+            &source,
+            &destination[..registered],
+            Duration::from_secs(120),
+            None,
+            0,
+            "early",
+            Some(metrics),
+        );
+        let (mut local_mesh, local_group) = single_rank();
+        prepare(&mut pair, "r", &mut local_mesh, &local_group);
+        pair.send("r", 7, Vec::new()).unwrap();
+
+        expect_cancelled(&mut pair.prefill, "r", mesh, replica);
+        assert!(pair.prefill.poll(mesh, replica).unwrap().is_empty());
+        let outcomes = "tokenspeed:kv_handoffs_total";
+        let expected = if rank == 0 { 1.0 } else { 0.0 };
+        assert_eq!(transfer_counter(&directory, outcomes), expected);
+        assert_eq!(transfer_samples(&directory, outcomes, "failed"), expected);
+        assert_eq!(
+            transfer_counter(&directory, "tokenspeed:kv_transfer_failures_total"),
+            if rank == 2 { 1.0 } else { 0.0 }
+        );
+    });
 }

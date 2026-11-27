@@ -802,7 +802,11 @@ its source lifetime. Destination ownership remains with ordinary admission.
 The optional `--enable-kvstore-storage-direct` selects direct restoration for
 Mooncake-backed Prefill workers with peer sharing and explicit
 `--peer-prefix-landing-tier device`. Direct storage restoration does not support
-a Host destination. With it disabled, the usual
+a Host destination. The TP8/KVP8 versioned cross-layout Peer reader cannot
+currently compose L3 landings; startup rejects enabling direct storage with
+that reader rather than sending storage lookups through the cross-layout protocol.
+Single-member background progress and coordinated same-layout peers retain
+the direct path. With it disabled, the usual
 Host restoration policy remains unchanged. With it enabled,
 `restore_to_host=false` keeps PUT/write-back but suppresses Host QUERY/GET jobs.
 Dynamo uses its ordinary hot-cache/load/capacity placement and sends no L3 probe.

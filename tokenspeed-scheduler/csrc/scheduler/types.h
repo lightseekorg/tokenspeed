@@ -27,6 +27,7 @@
 
 #include "cache/tier/disk.h"
 #include "cache/tier/peer.h"
+#include "cache/tier/shared_l2.h"
 #include "cache/tier/storage.h"
 #include <vector>
 
@@ -134,6 +135,11 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // A shared L2 pool as the rank's Host L2: the Host allocator then sizes
+    // the proxy tier (no bytes; at least the pool's blocks), and published
+    // entries are written to the pool as a write-through Host store would be.
+    // P and fused roles, replicated groups, never with L3 or a snapshot pool.
+    std::optional<SharedL2Config> shared_l2_config;
     // Sharing cached prefixes with other replicas
     // (docs/rfcs/0004-peer-prefix-sharing.md); absent turns it off.
     std::optional<PeerConfig> peer_config;
@@ -153,6 +159,14 @@ struct SchedulerConfig {
     // chunks runs (docs/design/scheduler.md §3.3). 0 keeps the unbounded
     // suspension.
     std::int32_t max_consecutive_prefill_rounds{0};
+    // With max_consecutive_prefill_rounds: a round owes the decode rounds of
+    // prefill_decode_interval and prefill_decode_min_interval only while at
+    // least this many requests are ready to decode (PrefillDone or Decoding)
+    // before it. With fewer, the intervals are waived, but a run of
+    // back-to-back prefill rounds that hold a decode back still ends at the
+    // cap and the next round decodes (docs/design/scheduler.md §3.3). 0
+    // always owes them.
+    std::int32_t prefill_interval_min_decoding{0};
     // P and fused roles: rank new local prefills by work after Device/Host
     // prefix reuse, keeping stable ties and resident chunks first. Only the
     // oldest waiting prompt counts successful later first admissions; after

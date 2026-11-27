@@ -113,6 +113,56 @@ The D role probes Device and Host history and receives missing data from
 its peer.
 See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
+**A shared L2 pool is asked before admission, never by it.** With
+`shared_l2_config` the rank's Host tier is the proxy of one Host L2 pool that
+every rank of the prefill and fused instances shares (the decode role does
+not use one): an owner process keeps the pool's index
+(`SharedL2Pool`, the Host L2 code over pages it holds no bytes of) and
+provider processes its bytes. The main rule is three sentences:
+
+1. At the head of each scheduling round a rank sends the prefixes of
+   its newly arrived prompts to the pool's owner in one blocking call, and
+   applies the answers before it plans.
+2. A hit is admitted like a local Host L2 hit: Device pages are allocated,
+   the pages are read from the pool by RDMA behind the forward, and the
+   prompt computes only the tokens after the hit.
+3. Pages a forward completes are written to the pool once that forward has
+   landed; the owner registers them under the Host L2's retention rules, and
+   every rank's later lookups can hit them.
+
+The scheduler's part of each sentence follows. The loop's part, and the one
+list of the special cases with where each is handled, is the *Shared L2
+pool* entry of `event-loop.md`.
+
+- *Lookups.* `StartSharedL2Lookups()` hands the runtime each waiting prompt's
+  lookup once, and none for a prompt whose Device prefix already covers what
+  it may reuse. Before a plan the runtime asks the owner about all of them
+  in one request, waits for the reply and applies the answers
+  (`ApplySharedL2Answers`), each of which names its prompt by its request
+  id; a `Submitted` prompt is absent from forward candidates until its
+  lookup is settled, that is answered or turned out not to be needed
+  (`AdmissionResources::shared_l2_lookup_state`). A miss is an answer that
+  names no page, and its prompt computes.
+- *Hits.* An answer becomes proxy Host entries, each standing for a pool
+  page the owner pinned under the answer's ticket; from there admission,
+  junction cuts and load-back are the Host L2 code. The prompt's
+  pre-admission state holds the entries
+  (`AdmissionResources::shared_l2_hit_blocks`): dropping it lets them go,
+  while a load-back the admission started holds its sources until its ACK.
+  Each plan drops a ticket's proxy entries from its answer's last one back,
+  up to the first one a waiting prompt or a load-back still holds, and
+  releases the tickets left without an entry: an entry nothing
+  holds stays while a later one of its ticket is held, and the owner keeps
+  the ticket's pages pinned meanwhile.
+- *Writes.* Publications are written to the pool from the write-through
+  store queue (`TierTransferManager::StartSharedL2Writes`): at most
+  `max_writes_in_flight` writes of `max_keys_per_write` blocks are in
+  flight, and only those pin their Device sources, until the runtime reports
+  each one done; the rest wait as keys. A write carries each State
+  checkpoint among its blocks (its tokens, page hashes and tail), which the
+  owner's checkpoint retention ranks by. The runtime relays the plan's shared L2 ops (write, release,
+  touch) to its pool client and none blocks it.
+
 A first admission with no free request-pool row skips prefix matching; with
 prefix caching, the prompt was hashed when it was submitted. This is a slot
 constraint, not a KV capacity failure: it does not trigger retraction.
@@ -943,7 +993,9 @@ parents they leave return to the empty FIFO, and the admission is retried once
 in the same plan build. It runs only when all of these hold: the admission
 failed in its last variant, no other request holds pages, no forward result or
 PD transfer of the request is out, no load-back or pinned store is in flight
-(a retraction's two global gates, §2), and a dense layout of the blocks plus
+(a retraction's two global gates, §2), with a shared L2 pool no publication
+waits in the store queue for its write (the special cases of the *Shared L2
+pool* entry in `event-loop.md` say why), and a dense layout of the blocks plus
 the demand fits the pool bucket by bucket (`DenseLayoutParents`:
 `ParentsNeededForBucketsAndPairs`, the demand's copy-in pairs counted) —
 otherwise the shortfall is the bound's own and compacting would only churn.
@@ -1254,6 +1306,19 @@ the image as the split planned:
   (sampling state, speculative readiness — exported by the runtime into
   `snapshot_slot`), ride one `SnapshotStoreOperation`; the op may carry zero
   page rows, the blob always.
+
+A State group may defer its decode state
+(`CacheGroupConfig::deferred_decode_state`: the runtime commits a decoding
+request's state to slot 1 only at its end or at this retraction, first thing
+in the plan). The retraction lists a decoded victim's slot-1 block in each
+such group in the plan's `state_folds`, as (request pool index, page id),
+once its publication is done and before the split: a victim whose image the
+split then refuses is aborted, but the publication stands and still needs
+the fold. A block the publication swapped for another request's equal entry
+is left out. Local readers order behind the fold on the device, but a peer
+does not: with peers, the slot-1 blocks this publication put into the index
+for a decoded victim join the plan's `state_commit_fence`, and
+`PeerPagesMatch` refuses them until `cache::StateCommitDone`.
 
 The split plans the L2 leg before anything is acquired or evicted for it. The
 slots to copy are grouped by boundary (a content hash, with every group's slot
@@ -1838,6 +1903,31 @@ rank, like the interval's. With both `K` and the minimum interval `M`, a
 round owes decodes when `M` has rounds left or when the interval does and no
 overdue prompt may suspend it.
 
+**Decode threshold** (`prefill_interval_min_decoding` `T`, requires `K`; fused
+role only; `0` is off): `N` and `M` are owed only while at least `T` requests
+are ready to decode (`PrefillDone` or `Decoding`) before the round. With
+fewer, the interval and `M` are waived, but not `K`'s bound on the run: once
+`K` prefill rounds in a row have held a decode back, the next round owes one
+decode round, not the whole interval, and no overdue prompt suspends it.
+That round ends the run, so the few decodes stall at most `K` prefill rounds
+at a time instead of for a whole queue of prompts. Below `T` the decode-side
+guarantees therefore weaken: `M`'s "no prefill round directly follows
+another" becomes `K` prefill rounds, then one decode round. Below `T` a
+waiting prompt is held back at most one decode round per `K` prefill rounds;
+its held-back count may pass `N`. A held interval survives the waiver and is
+owed in full once `T` is met. The threshold adds no state: it is a function
+of the candidates, so the counters, held-back counts and run count follow
+the plans, identical on every rank, like the interval's; under attention DP
+each replica compares its own ready decodes with `T`. A retracted or
+restoring request is not ready to decode, so a retraction can drop the count
+below `T` and waive the rest of the interval: from the round it is planned
+for a forced retraction, which runs before the count, and from the next
+round for a capacity retraction, which runs after it. In mixed mode a round
+below `T` runs its prefill beside the decodes, which ends the run, so `K`
+never forces a round there. While few
+requests decode, this trades their token latency for first-token latency; at
+or above `T`, and with `T` unset, every plan is unchanged.
+
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. The Host cache decides the image's split, not whether there is
 one: with L2 the published prefix — tail and state checkpoint included —
@@ -2360,3 +2450,25 @@ retirement, then for any outstanding local forward. Repeated cancellation
 cannot restart a transfer wait after its retirement event has arrived. Destroying
 the request destroys this state, so reusing a client request ID cannot inherit
 an old abort.
+
+## Deferred recurrent state
+
+With deferred recurrent replay enabled, ordinary decode completion advances
+the token frontier as usual. The GPU owns the replay record. The runtime
+uses the request slots already carried by snapshot operations and tracks the
+last decode slot for request releases and scheduler aborts. It materializes
+replay for an ending request because its State may already be in the prefix
+index, including when retraction published a checkpoint before finding that
+its image could not fit.
+
+The scheduler releases slots and blocks by the ordinary request state
+transitions. The runtime orders replay writeback before the plan's snapshot,
+store, copy, zero, load and forward operations consume or reuse them. Host
+retirement fences also cover releases queued by the preceding round's
+results, even when no subsequent forward runs.
+
+The peer holder declines new Device page PINs until retirement fences have
+completed on the replica, since the source execution stream cannot order an
+incoming RDMA read. The reader can use local compute. PINs for prefixes held
+entirely in Host or Disk and existing leases continue independently. The same
+completion tracking protects cache clear and drain.

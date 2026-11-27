@@ -218,6 +218,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ),
             output_dtype=torch.get_default_dtype(),
             offload=offload_embedding,
+            table_layout=config.ple_table_layout,
             enable_hot_cache=config.enable_ple_hot_cache,
             prefix=table_prefix,
         )
@@ -1198,8 +1199,8 @@ class Qwen4ExpPLELayer(nn.Module):
         before it. Offsets are whole prefix pages, longer than either.
         """
         device = flat_ids.device
-        rows = checkpoints.rows.to(device)
-        offsets = checkpoints.offsets.to(device)
+        rows = checkpoints.device_rows
+        offsets = checkpoints.device_offsets
         row_starts = starts[rows]
         blocks = checkpoints.blocks_by_group[QWEN4_EXP_PLE_CACHE_GROUP]
         context = self._final_context(

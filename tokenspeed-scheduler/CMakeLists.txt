@@ -78,10 +78,13 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/operations/cache.cpp
     csrc/cache/tier/transfer_manager.cpp
     csrc/cache/tier/storage_manager.cpp
+    csrc/cache/tier/shared_l2_pool.cpp
+    csrc/cache/tier/shared_l2_proxy.cpp
     csrc/cache/tier/disk_manager.cpp
     csrc/cache/tier/peer_exports.cpp
     csrc/cache/tier/peer_host_landings.cpp
     csrc/scheduler/operations/storage.cpp
+    csrc/scheduler/operations/shared_l2.cpp
     csrc/scheduler/operations/disk.cpp
     csrc/scheduler/operations/peer.cpp
 )
@@ -195,6 +198,8 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_cache_event_ownership.cpp
         tests/cpp/test_forced_retraction_limit.cpp
         tests/cpp/test_capacity_model.cpp
+        tests/cpp/test_shared_l2_pool.cpp
+        tests/cpp/test_shared_l2_proxy.cpp
         tests/cpp/test_shadow_occupancy.cpp
         tests/cpp/test_cache_data_flow.cpp
         tests/cpp/test_flat_hash_map.cpp

@@ -102,6 +102,13 @@ public:
     // (warm Host hits counted). Empty when no boundary fits.
     StorageReservation ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                             std::size_t max_blocks);
+    // Longest boundary that `hits` (with Device and Host) can resume under the
+    // Host-suffix rule, without allocating blocks or spending Host credits.
+    std::int32_t ResumableStorageTokens(const PromptPrefix& prompt, std::span<const CacheKey> hits) const;
+    // Reserve only a complete peer landing. A transient shortage sets retry;
+    // an illegal boundary or a suffix exceeding the absolute limit does not.
+    StorageReservation ReserveExactStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
+                                                 std::size_t available, std::size_t limit, bool& retry);
     // Peer sharing with a Disk tier (docs/rfcs/0006-disk-tier.md): what a
     // holder lists when `disk_hits`, keys its Disk holds, extend its local
     // hit -- the longest boundary the Device, the Host and the Disk resume
@@ -111,6 +118,8 @@ public:
     PrefixProber::PrefixListing ListWithDisk(const PromptPrefix& prompt, std::span<const CacheKey> disk_hits) const;
 
 private:
+    StorageReservation reserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
+                                            std::size_t available, std::size_t limit, bool* exact_retry);
     // The complete dependency set selected by a matcher, with each key's
     // absolute logical block index (including holes before an SWA window);
     // floor_tokens is the tier's floor, where a token-spanned group's hits

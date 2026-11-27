@@ -55,7 +55,8 @@ StorageStats Scheduler::GetStorageStats() const {
     for (const auto& request : requests_) {
         stats.waiting_requests += request->Is<fsm::Prefetching>();
         const auto* admission = request->AdmissionResourcesPtr();
-        stats.ready_requests += admission != nullptr && admission->storage_hold.has_value();
+        stats.ready_requests +=
+            admission != nullptr && (admission->storage_hold.has_value() || admission->storage_base_hold.has_value());
     }
     return stats;
 }
@@ -164,12 +165,12 @@ Scheduler::SharedPrefixPublication Scheduler::GetSharedPrefixPublication(std::sp
 }
 
 void Scheduler::expireStorage(Request& request) {
-    if (request.Is<fsm::Prefetching>()) {
-        spdlog::debug("[L3] rid={} op_id={} prefetch timed out", request.Id(),
-                      request.GetIf<fsm::Prefetching>()->lease.OperationId());
+    if (const auto* prefetch = request.GetIf<fsm::Prefetching>();
+        prefetch != nullptr && ownsStorageLease(prefetch->lease)) {
+        spdlog::debug("[L3] rid={} op_id={} prefetch timed out", request.Id(), prefetch->lease.OperationId());
         ++storage_wait_timeouts_;
     } else if (const auto* admission = request.AdmissionResourcesPtr();
-               admission != nullptr && admission->storage_hold) {
+               admission != nullptr && admission->storage_hold && ownsStorageLease(admission->storage_hold->lease)) {
         spdlog::debug("[L3] rid={} ready hold expired before admission", request.Id());
         ++storage_ready_expirations_;
     }
@@ -214,14 +215,21 @@ bool Scheduler::ownsStorageLease(const StorageLease& lease) const {
 }
 
 void Scheduler::releaseStorage(Request& request) {
-    if (!storage_transfers_ && !disk_transfers_ && !peer_host_landings_) return;
-    // The request gives L3 up and keeps its place: the lease on the operation
-    // it waits for, or on its Ready data, dies with the wait.
-    if (request.Is<fsm::Prefetching>()) {
+    if (!storage_transfers_ && !disk_transfers_) return;
+    // The request gives L3/Disk up and keeps its place: the lease on the
+    // operation it waits for, or on its Ready data, dies with the wait. A peer
+    // Host landing (`peer_host_landings_`) owns its own lifecycle and peer
+    // clock, so leave it untouched here.
+    if (const auto* prefetch = request.GetIf<fsm::Prefetching>();
+        prefetch != nullptr && (!prefetch->lease || ownsStorageLease(prefetch->lease))) {
         request.Apply(fsm::FinishPrefetchEvent{std::nullopt});
     }
     if (auto* admission = request.AdmissionResourcesPtr()) {
-        admission->storage_hold.reset();
+        if (admission->storage_hold && ownsStorageLease(admission->storage_hold->lease)) {
+            admission->storage_hold.reset();
+        }
+        // The base of a landed peer prefix is an L3/Disk hold as well.
+        admission->storage_base_hold.reset();
         admission->storage_prepared = true;
     }
 }
@@ -284,6 +292,7 @@ void Scheduler::prepareStorage(Request& request) {
         return;
     }
 
+    if (request.Is<fsm::PeerLooking>()) return;
     auto* admission = request.AdmissionResourcesPtr();
     if (admission == nullptr || admission->storage_prepared || !storage_allowed_) return;
     admission->storage_prepared = true;

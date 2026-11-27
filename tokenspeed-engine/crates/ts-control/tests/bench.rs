@@ -75,6 +75,7 @@ fn result(tokens: &[i32], lengths: &[i32]) -> ForwardResult {
         output_logprobs: None,
         output_token_cumulative_probs: None,
         nan_flags: None,
+        request_ends: None,
         next_input_ids: None,
         serving_compiles: None,
         grammar_terminated_at: None,
@@ -98,6 +99,7 @@ fn bench_commit_decode() {
         1,
         Some(1 << 24),
         Role::Plain,
+        false,
         NO_FINISH_LOG,
         false,
         None,
@@ -268,7 +270,15 @@ impl DataPlane for InstantDevice {
         Ok(Vec::new())
     }
 
-    fn release(&mut self, _: &[String]) -> Result<(), DataPlaneError> {
+    fn replay_retirement_enabled(&self) -> bool {
+        false
+    }
+
+    fn poll_replay_retirement(&mut self) -> Result<u64, DataPlaneError> {
+        unreachable!("no recurrent State in the benchmark")
+    }
+
+    fn release(&mut self, _: &[String], _: Option<u64>) -> Result<(), DataPlaneError> {
         Ok(())
     }
 
@@ -500,6 +510,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             1,
             Some(1 << 24),
             Role::Plain,
+            false,
             NO_FINISH_LOG,
             false,
             None,

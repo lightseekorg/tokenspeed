@@ -28,7 +28,9 @@
 //!
 //! The scheduler itself is constructed in Python (its configuration is
 //! derived there from the device build) and driven from Rust through
-//! [`Scheduler::from_python`], without the GIL.
+//! [`Scheduler::from_python`], without the GIL. The cache index of a shared
+//! L2 pool's owner is built and driven the same way
+//! ([`SharedL2Pool::from_python`]).
 
 // The crate is the FFI boundary to C++ and the interpreter.
 #![allow(unsafe_code)]
@@ -244,6 +246,9 @@ mod ffi {
         SnapshotStore,
         /// A retracted request's restore (`SnapshotRestoreBatch`).
         SnapshotRestore,
+        /// The commit of the deferred decode state a plan's retractions
+        /// published (`ExecutionPlan::state_commit_fence`).
+        StateCommit,
     }
 
     /// The kind of a plan's storage operation.
@@ -259,7 +264,8 @@ mod ffi {
         Cancel,
     }
 
-    /// A content-addressed cache key a storage operation names (`CacheKey`).
+    /// A content-addressed cache key that a storage operation, a shared L2
+    /// answer or a shared L2 op names (`CacheKey`).
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct StorageKeyView {
         /// The cache group, by index.
@@ -304,6 +310,11 @@ mod ffi {
         SnapshotDone,
         /// A restore finished (`cache::RestoreDone`).
         RestoreDone,
+        /// The runtime committed a plan's retracted decode state
+        /// (`cache::StateCommitDone`).
+        StateCommitDone,
+        /// A shared L2 pool write finished (`cache::SharedL2WriteDone`).
+        SharedL2WriteDone,
     }
 
     /// A cache op's acknowledgment, fed back to the scheduler.
@@ -480,6 +491,8 @@ mod ffi {
         device_hit_tokens: u64,
         /// Tokens the Host loads (L2 including anything L3 supplied).
         host_hit_tokens: u64,
+        /// Remote Device prefix used beyond the local hit.
+        peer_hit_tokens: u64,
         /// Token spans of successful storage keys (L3), counted per cache group.
         l3_hit_tokens: u64,
     }
@@ -685,7 +698,16 @@ mod ffi {
         held: bool,
     }
 
-    /// A reader's landing in a plan (`tokenspeed::PeerFetchOperation`).
+    /// Why a hinted request entered local prefill.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PeerLocalChoice {
+        /// Scheduler request ID.
+        request_id: String,
+        /// Bounded scheduler decision code.
+        reason: String,
+    }
+
+    /// A peer fetch admitted by the scheduler.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct PeerFetchView {
         /// The landing request.
@@ -700,6 +722,12 @@ mod ffi {
         end_tokens: i32,
         /// The blocks it fills.
         destinations: Vec<PeerPageView>,
+        /// Original holder answer for an exact re-PIN after admission.
+        checkpoint: Vec<u8>,
+        /// Prefix hashes at the original lookup boundary.
+        prefix_hashes: Vec<String>,
+        /// Prompt tokens through that boundary for exact checkpoint revalidation.
+        tokens: Vec<i32>,
     }
 
     /// The kind of a [`PeerEventView`].
@@ -715,6 +743,10 @@ mod ffi {
         LookupAnswered,
         /// Reader: a landing's outcome (`cache::PeerFetchDone`).
         FetchDone,
+        /// Business fallback while the independently retained target may still be written.
+        FetchFrozen,
+        /// All members certified retirement of a previously frozen target.
+        TargetRetired,
     }
 
     /// A peer event the replica agreed on. Fields other kinds do not use
@@ -738,6 +770,14 @@ mod ffi {
         /// Pin: the boundary the holder's answer named; LookupAnswered: the
         /// holder's boundary; FetchDone: the boundary confirmed.
         num_tokens: i32,
+        /// Reader-local monotonic times for adaptive Device feedback (zero when absent).
+        dispatch_us: i64,
+        /// First instant when the device fence and the fetch plan are both ready.
+        writable_us: i64,
+        /// RELEASE arrival on success, or protocol retirement on failure.
+        terminal_us: i64,
+        /// Reader-local original lookup answer.
+        checkpoint: Vec<u8>,
         /// FetchDone: the landing request.
         request_id: String,
     }
@@ -766,8 +806,10 @@ mod ffi {
         landing_requests: usize,
         /// Reader: tokens landed so far.
         landed_tokens: u64,
-        /// Reader: landings given up so far.
+        /// Reader: landings whose transfer failed to complete the prefix.
         failed_landings: u64,
+        /// Reader: successful Host landings whose request gave up the reservation.
+        unused_host_landings: u64,
     }
 
     /// One cache group's page counts.
@@ -777,6 +819,135 @@ mod ffi {
         total: i32,
         /// Pages it can still hand out.
         available: i32,
+    }
+
+    /// A waiting prompt's question to the shared L2 pool (`SharedL2Lookup`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedL2LookupView {
+        /// The prompt's request, which its answer names.
+        request_id: String,
+        /// The chain hashes of the prompt's full pages below `max_tokens`.
+        prefix_hashes: Vec<String>,
+        /// The prompt's first `max_tokens` tokens.
+        tokens: Vec<i32>,
+        /// The most tokens a hit may cover.
+        max_tokens: i32,
+    }
+
+    /// The pool's answer to a lookup (`SharedL2Answer`): its longest
+    /// reusable prefix of the prompt, pinned under `ticket`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedL2AnswerView {
+        /// The request whose lookup it answers.
+        request_id: String,
+        /// What the owner pinned the hit under; 0 pins nothing (a miss).
+        ticket: u64,
+        /// The tokens the hit resumes from.
+        num_tokens: i32,
+        /// How far the pool's KV reaches.
+        kv_tokens: i32,
+        /// Tokens of the hit's partial last page; 0 when it ends on a page.
+        tail_tokens: i32,
+        /// The partial last page's hash, with `tail_tokens`.
+        tail_hash: String,
+        /// The hit's keys.
+        keys: Vec<StorageKeyView>,
+        /// Each key's shard.
+        buckets: Vec<i32>,
+        /// Each key's pool page.
+        pool_pages: Vec<i32>,
+    }
+
+    /// A proxy Host block an answer created, and the pool page a load-back
+    /// from it reads (`SharedL2ProxyBlock`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SharedL2ProxyBlockView {
+        /// The cache group, by index.
+        group_id: u32,
+        /// The proxy Host block.
+        host_block: i32,
+        /// The page's shard.
+        bucket: i32,
+        /// The pool page, within the group.
+        pool_page: i32,
+    }
+
+    /// A State checkpoint, which a pool write commits with the
+    /// checkpoint's block (`CheckpointTree::Checkpoint`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedL2CheckpointView {
+        /// The checkpoint's tokens.
+        tokens: Vec<i32>,
+        /// The chain hashes of its full pages.
+        prefix_hashes: Vec<String>,
+        /// Tokens of its partial last page; 0 when it ends on a page.
+        tail_tokens: i32,
+        /// The partial last page's hash, with `tail_tokens`.
+        tail_hash: String,
+        /// The access epoch of the request that published it on this rank.
+        access_epoch: u64,
+    }
+
+    /// The kind of a plan's shared L2 op.
+    #[derive(Debug)]
+    enum SharedL2OpKind {
+        /// Copy Device blocks into the pool (`SharedL2WriteOperation`).
+        Write,
+        /// Unpin what a lookup hit (`SharedL2ReleaseOperation`).
+        Release,
+        /// Refresh the pool's copies of keys (`SharedL2TouchOperation`).
+        Touch,
+    }
+
+    /// A shared L2 op a plan carries, for the rank's pool client.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedL2OpView {
+        /// What it does.
+        kind: SharedL2OpKind,
+        /// A write's id; unused by the other kinds.
+        op_id: u32,
+        /// A release's ticket; unused by the other kinds.
+        ticket: u64,
+        /// A write's or a touch's keys.
+        keys: Vec<StorageKeyView>,
+        /// A write's shard per key.
+        buckets: Vec<i32>,
+        /// A write's source Device block per key.
+        device_blocks: Vec<i32>,
+        /// The checkpoints among a write's blocks.
+        checkpoints: Vec<SharedL2CheckpointView>,
+    }
+
+    /// What a pool reservation granted (`SharedL2Pool::Reservation`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SharedL2ReservationView {
+        /// What the pool reserves the pages under; 0 reserves nothing.
+        ticket: u64,
+        /// One per key, in order: the page to write, or why there is none
+        /// (-1 the pool holds the key, -2 no page is free, -3 another
+        /// reservation writes it).
+        pages: Vec<i32>,
+    }
+
+    /// A pool's counters (`SharedL2Pool::Stats`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SharedL2PoolStatsView {
+        /// LCM blocks the pool has.
+        num_lcm_blocks: i32,
+        /// LCM blocks no page is taken from.
+        empty_lcm_blocks: i32,
+        /// Blocks the pool caches.
+        cached_blocks: i32,
+        /// Cached blocks a lookup pins.
+        pinned_blocks: i32,
+        /// Blocks reserved for a write not committed yet.
+        reserved_blocks: usize,
+        /// Lookup tickets not released yet.
+        open_lookups: usize,
+        /// Blocks evicted so far.
+        evicted_blocks: u64,
+        /// State checkpoints the pool holds.
+        checkpoints: usize,
     }
 
     unsafe extern "C++" {
@@ -814,14 +985,49 @@ mod ffi {
             now_us: i64,
             events: &[PeerEventView],
         ) -> Result<()>;
+        #[namespace = "tokenspeed"]
+        type PeerPinRelease;
+        fn peer_release_handle(
+            scheduler: Pin<&mut Scheduler>,
+            lease: &PeerLeaseView,
+        ) -> SharedPtr<PeerPinRelease>;
+        fn release_peer_pin(handle: &SharedPtr<PeerPinRelease>) -> bool;
+        fn enable_async_host_peer(scheduler: Pin<&mut Scheduler>) -> bool;
+        fn enable_async_device_peer(scheduler: Pin<&mut Scheduler>, adaptive: bool) -> bool;
+        fn reserve_peer_host(
+            scheduler: Pin<&mut Scheduler>,
+            lease: &PeerLeaseView,
+            tokens: i32,
+            retry: &mut bool,
+        ) -> Result<Vec<PeerFetchView>>;
+        fn apply_peer_export(
+            scheduler: Pin<&mut Scheduler>,
+            event: &PeerEventView,
+            now_us: i64,
+        ) -> Result<bool>;
+        fn pin_peer_offer(
+            scheduler: Pin<&mut Scheduler>,
+            event: &PeerEventView,
+            now_us: i64,
+        ) -> Result<bool>;
+        fn close_peer_offer(
+            scheduler: Pin<&mut Scheduler>,
+            lease: &PeerLeaseView,
+            now_us: i64,
+        ) -> Result<bool>;
         fn take_peer_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<PeerLookupView>;
-        fn answer_peer_lookup(scheduler: &Scheduler, lookup: &PeerEventView) -> PeerAnswerView;
+        fn answer_peer_lookup(
+            scheduler: &Scheduler,
+            lookup: &PeerEventView,
+            pending_new_leases: usize,
+        ) -> PeerAnswerView;
         fn peer_pages_match(
             scheduler: &Scheduler,
             lookup: &PeerEventView,
             num_tokens: i32,
             pages: &[PeerPageView],
         ) -> bool;
+        fn peer_lease_can_pin(scheduler: &Scheduler, lease: &PeerLeaseView) -> bool;
         fn peer_lease_held(scheduler: &Scheduler, lease: &PeerLeaseView) -> bool;
         fn plan_calls(scheduler: &Scheduler) -> i64;
         fn take_peer_pin_samples(scheduler: Pin<&mut Scheduler>) -> Vec<PinSampleView>;
@@ -889,6 +1095,7 @@ mod ffi {
         fn kv_event_media(batch: &KvEventBatch) -> &[u8];
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
+        fn defers_decode_state(scheduler: &Scheduler) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
         fn storage_current_pending(scheduler: &Scheduler) -> bool;
         fn storage_progress_pending(scheduler: &Scheduler) -> bool;
@@ -907,10 +1114,16 @@ mod ffi {
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
+        fn start_shared_l2_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<SharedL2LookupView>;
+        fn apply_shared_l2_answers(
+            scheduler: Pin<&mut Scheduler>,
+            answers: &[SharedL2AnswerView],
+        ) -> Result<Vec<SharedL2ProxyBlockView>>;
 
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_completed_prompts(plan: &ExecutionPlan) -> Vec<String>;
         fn plan_needs_device(plan: &ExecutionPlan) -> bool;
+        fn plan_has_pages_to_copy(plan: &ExecutionPlan) -> bool;
         fn plan_remote_decode(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_remote_prefill(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_forward_transfer(plan: &ExecutionPlan) -> Vec<TransferBatchView>;
@@ -920,7 +1133,41 @@ mod ffi {
         fn plan_cache_ops(plan: &ExecutionPlan) -> Vec<CacheOpView>;
         fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
         fn plan_disk_ops(plan: &ExecutionPlan) -> Vec<DiskOpView>;
+        fn plan_shared_l2_ops(plan: &ExecutionPlan) -> Vec<SharedL2OpView>;
+        fn plan_peer_local_choices(plan: &ExecutionPlan) -> Vec<PeerLocalChoice>;
         fn plan_peer_fetches(plan: &ExecutionPlan) -> Vec<PeerFetchView>;
+
+        #[namespace = "tokenspeed"]
+        type SharedL2Pool;
+        fn shared_l2_pool_lookup(
+            pool: Pin<&mut SharedL2Pool>,
+            client: u64,
+            lookup: &SharedL2LookupView,
+        ) -> Result<SharedL2AnswerView>;
+        fn shared_l2_pool_release(
+            pool: Pin<&mut SharedL2Pool>,
+            client: u64,
+            ticket: u64,
+        ) -> Result<()>;
+        fn shared_l2_pool_reserve(
+            pool: Pin<&mut SharedL2Pool>,
+            client: u64,
+            keys: &[StorageKeyView],
+            buckets: &[i32],
+        ) -> Result<SharedL2ReservationView>;
+        fn shared_l2_pool_commit(
+            pool: Pin<&mut SharedL2Pool>,
+            client: u64,
+            ticket: u64,
+            checkpoints: &[SharedL2CheckpointView],
+        ) -> Result<()>;
+        fn shared_l2_pool_touch(
+            pool: Pin<&mut SharedL2Pool>,
+            keys: &[StorageKeyView],
+        ) -> Result<()>;
+        fn shared_l2_pool_disconnect(pool: Pin<&mut SharedL2Pool>, client: u64);
+        fn shared_l2_pool_clear_cache(pool: Pin<&mut SharedL2Pool>) -> bool;
+        fn shared_l2_pool_stats(pool: &SharedL2Pool) -> SharedL2PoolStatsView;
 
         /// Install the scheduler's profile span sink, which forwards to
         /// [`record_scheduler_span`], or remove it.
@@ -945,9 +1192,12 @@ pub use ffi::{
     DiskStatsView, ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind,
     PeerAnswerView, PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView,
     PeerPageSlotView, PeerPageView, PeerStatsView, PeerTier, PinSampleView, PrefillGateProbe,
-    PrefixHitView, RequestSpec, SchedulerAbortView, SchedulerSizes, StorageCancellationView,
-    StorageDoneView, StorageKeyView, StorageOpKind, StorageOpView, StoragePrefixObjectView,
-    StoragePrefixPlanView, StorageStatsView, StorageTickView, TransferBatchView,
+    PrefixHitView, RequestSpec, SchedulerAbortView, SchedulerSizes, SharedL2AnswerView,
+    SharedL2CheckpointView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView,
+    SharedL2PoolStatsView, SharedL2ProxyBlockView, SharedL2ReservationView,
+    StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind, StorageOpView,
+    StoragePrefixObjectView, StoragePrefixPlanView, StorageStatsView, StorageTickView,
+    TransferBatchView,
 };
 
 fn record_cache_observation(
@@ -981,6 +1231,7 @@ pub struct StorageRound {
 extern "C" {
     fn PyInit_tokenspeed_scheduler_ext() -> *mut pyffi::PyObject;
     fn ts_scheduler_from_python(object: *mut pyffi::PyObject) -> *mut ffi::Scheduler;
+    fn ts_shared_l2_pool_from_python(object: *mut pyffi::PyObject) -> *mut ffi::SharedL2Pool;
     fn ts_scheduler_plan_into_python(plan: *mut ffi::ExecutionPlan) -> *mut pyffi::PyObject;
 }
 
@@ -1057,7 +1308,25 @@ pub struct Scheduler {
 // `&mut self`.
 unsafe impl Send for Scheduler {}
 
+// Unpin and owner-side revocation synchronize inside the ticket.
+/// A revocable handle to one native lease's existing strong references.
+pub struct PeerReleaseHandle(cxx::SharedPtr<ffi::PeerPinRelease>);
+impl PeerReleaseHandle {
+    /// Returns after all of this lease's strong references were dropped.
+    pub fn release(&self) -> bool {
+        ffi::release_peer_pin(&self.0)
+    }
+}
+use ffi::PeerPinRelease;
+unsafe impl Send for PeerPinRelease {}
+unsafe impl Sync for PeerPinRelease {}
+
 impl Scheduler {
+    /// A revocable, thread-safe release handle for an existing hard pin.
+    pub fn peer_release_handle(&mut self, lease: &PeerLeaseView) -> PeerReleaseHandle {
+        PeerReleaseHandle(ffi::peer_release_handle(self.pinned(), lease))
+    }
+
     /// Drive the scheduler a Python `tokenspeed_scheduler.Scheduler` owns.
     pub fn from_python(object: &Bound<'_, PyAny>) -> PyResult<Self> {
         // SAFETY: the GIL is held (`Bound`), and the returned pointer lives as
@@ -1139,6 +1408,27 @@ impl Scheduler {
         )
     }
 
+    /// With a shared L2 pool: the lookups of the waiting prompts not handed
+    /// out yet, each once. A prompt is admitted only once its lookup is
+    /// answered; one whose Device prefix covers what it may reuse asks
+    /// nothing.
+    pub fn start_shared_l2_lookups(&mut self) -> Vec<SharedL2LookupView> {
+        let _span = profile::span("Scheduler::start_shared_l2_lookups");
+        ffi::start_shared_l2_lookups(self.pinned())
+    }
+
+    /// Settle the lookups with the pool's answers, in order. Returns the
+    /// proxy Host blocks created, for the pool's loader. Fails on an answer
+    /// the scheduler cannot take: one no lookup waits for, or that does not
+    /// fit its prompt; the answers after it are not applied.
+    pub fn apply_shared_l2_answers(
+        &mut self,
+        answers: &[SharedL2AnswerView],
+    ) -> Result<Vec<SharedL2ProxyBlockView>, cxx::Exception> {
+        let _span = profile::span("Scheduler::apply_shared_l2_answers");
+        ffi::apply_shared_l2_answers(self.pinned(), answers)
+    }
+
     /// Feed the round head's peer events back: the agreed peer clock, then
     /// the events in the order the replica agreed on (peer prefix sharing,
     /// `docs/rfcs/0004-peer-prefix-sharing.md`).
@@ -1151,15 +1441,67 @@ impl Scheduler {
         ffi::advance_peer(self.pinned(), now_us, events)
     }
 
+    /// Enable independent Device reads with the supplied admission behavior.
+    pub fn enable_async_device_peer(&mut self, adaptive: bool) -> bool {
+        ffi::enable_async_device_peer(self.pinned(), adaptive)
+    }
+    /// Enable independent reservations into the Host landing tier.
+    pub fn enable_async_host_peer(&mut self) -> bool {
+        ffi::enable_async_host_peer(self.pinned())
+    }
+
+    /// Reserve unpublished Host pages for a live reader lease.
+    pub fn reserve_peer_host(
+        &mut self,
+        lease: &PeerLeaseView,
+        tokens: i32,
+        retry: &mut bool,
+    ) -> Result<Vec<PeerFetchView>, cxx::Exception> {
+        ffi::reserve_peer_host(self.pinned(), lease, tokens, retry)
+    }
+
+    /// Change only the holder's export ledger while holding the cache mutex.
+    pub fn apply_peer_export(
+        &mut self,
+        event: &PeerEventView,
+        now_us: i64,
+    ) -> Result<bool, cxx::Exception> {
+        ffi::apply_peer_export(self.pinned(), event, now_us)
+    }
+
+    /// Acquire one exact v1 member ticket, isolated from legacy timers.
+    pub fn pin_peer_offer(
+        &mut self,
+        event: &PeerEventView,
+        now_us: i64,
+    ) -> Result<bool, cxx::Exception> {
+        ffi::pin_peer_offer(self.pinned(), event, now_us)
+    }
+
+    /// Release this member's exact v1 ticket without demoting the source.
+    pub fn close_peer_offer(
+        &mut self,
+        lease: &PeerLeaseView,
+        now_us: i64,
+    ) -> Result<bool, cxx::Exception> {
+        ffi::close_peer_offer(self.pinned(), lease, now_us)
+    }
+
     /// A reader's lookups since the last take, to send to their holders.
     pub fn take_peer_lookups(&mut self) -> Vec<PeerLookupView> {
         ffi::take_peer_lookups(self.pinned())
     }
 
     /// A holder's answer to `lookup` (a [`PeerEventKind::Lookup`] event),
-    /// read from the cache as it stands; it changes nothing.
-    pub fn answer_peer_lookup(&self, lookup: &PeerEventView) -> PeerAnswerView {
-        ffi::answer_peer_lookup(self.get(), lookup)
+    /// read from the cache as it stands; it changes nothing. Bounded by the
+    /// `pending_new_leases` unsynced lookup hits already queued in the holder
+    /// servicer.
+    pub fn answer_peer_lookup_bounded(
+        &self,
+        lookup: &PeerEventView,
+        pending_new_leases: usize,
+    ) -> PeerAnswerView {
+        ffi::answer_peer_lookup(self.get(), lookup, pending_new_leases)
     }
 
     /// Whether `lookup`'s prompt, up to `num_tokens`, still resolves to
@@ -1171,6 +1513,11 @@ impl Scheduler {
         pages: &[PeerPageView],
     ) -> bool {
         ffi::peer_pages_match(self.get(), lookup, num_tokens, pages)
+    }
+
+    /// Whether `lease` still holds an active soft pin eligible to become hard.
+    pub fn peer_lease_can_pin(&self, lease: &PeerLeaseView) -> bool {
+        ffi::peer_lease_can_pin(self.get(), lease)
     }
 
     /// Whether `lease`'s pin holds its pages now.
@@ -1312,6 +1659,14 @@ impl Scheduler {
         ffi::can_abort_before_admission(self.get(), request_id)
     }
 
+    /// Whether a cache group defers its decode state to a request's end
+    /// (`CacheGroupConfig::deferred_decode_state`): a finish only the host
+    /// saw must then end with `ForwardEventKind::Abort`, which publishes
+    /// nothing.
+    pub fn defers_decode_state(&self) -> bool {
+        ffi::defers_decode_state(self.get())
+    }
+
     /// Whether storage operations are in flight.
     pub fn storage_pending(&self) -> bool {
         ffi::storage_pending(self.get())
@@ -1416,6 +1771,108 @@ impl Scheduler {
     /// The most tokens one request can hold in the cache.
     pub fn max_single_request_tokens(&self) -> i32 {
         ffi::max_single_request_tokens(self.get())
+    }
+}
+
+/// A shared L2 pool owned by a Python `tokenspeed_scheduler.SharedL2Pool`
+/// object and driven from Rust: the cache index the pool's owner keeps over
+/// the providers' pages.
+///
+/// Python must not call into the pool while this exists; the owner's serving
+/// thread is its only user.
+pub struct SharedL2Pool {
+    raw: NonNull<ffi::SharedL2Pool>,
+    /// Keeps the C++ pool alive.
+    _owner: Py<PyAny>,
+}
+
+// SAFETY: the pool has no thread affinity; exclusive access goes through
+// `&mut self`.
+unsafe impl Send for SharedL2Pool {}
+
+impl SharedL2Pool {
+    /// Drive the pool a Python `tokenspeed_scheduler.SharedL2Pool` owns.
+    pub fn from_python(object: &Bound<'_, PyAny>) -> PyResult<Self> {
+        // SAFETY: the GIL is held (`Bound`), and the returned pointer lives as
+        // long as `object`, which `_owner` keeps alive.
+        let raw = unsafe { ts_shared_l2_pool_from_python(object.as_ptr()) };
+        let raw = NonNull::new(raw).ok_or_else(|| PyErr::fetch(object.py()))?;
+        Ok(Self {
+            raw,
+            _owner: object.clone().unbind(),
+        })
+    }
+
+    fn pinned(&mut self) -> std::pin::Pin<&mut ffi::SharedL2Pool> {
+        // SAFETY: `raw` is valid (see `from_python`) and `&mut self` makes this
+        // the only reference. The C++ object never moves.
+        unsafe { std::pin::Pin::new_unchecked(self.raw.as_mut()) }
+    }
+
+    /// The pool's longest reusable prefix of `lookup`'s prompt, pinned for
+    /// `client` under the answer's ticket until the client releases it; a
+    /// miss pins nothing (ticket 0). Fails on tokens short of the lookup's
+    /// bound.
+    pub fn lookup(
+        &mut self,
+        client: u64,
+        lookup: &SharedL2LookupView,
+    ) -> Result<SharedL2AnswerView, cxx::Exception> {
+        ffi::shared_l2_pool_lookup(self.pinned(), client, lookup)
+    }
+
+    /// Unpin what a lookup hit under `ticket`. Fails for a ticket no lookup
+    /// of `client` holds.
+    pub fn release(&mut self, client: u64, ticket: u64) -> Result<(), cxx::Exception> {
+        ffi::shared_l2_pool_release(self.pinned(), client, ticket)
+    }
+
+    /// Reserve a page for each of `keys` that the pool neither holds nor
+    /// has reserved, in the key's bucket, for `client` to write and commit.
+    /// Fails on a key or a bucket that is not of the pool.
+    pub fn reserve(
+        &mut self,
+        client: u64,
+        keys: &[StorageKeyView],
+        buckets: &[i32],
+    ) -> Result<SharedL2ReservationView, cxx::Exception> {
+        ffi::shared_l2_pool_reserve(self.pinned(), client, keys, buckets)
+    }
+
+    /// Publish the blocks reserved under `ticket`, with the checkpoints
+    /// whose State block is among them. Fails, with no change, for a ticket
+    /// under which `client` reserves nothing or a checkpoint whose tokens do
+    /// not cover its pages and tail.
+    pub fn commit(
+        &mut self,
+        client: u64,
+        ticket: u64,
+        checkpoints: &[SharedL2CheckpointView],
+    ) -> Result<(), cxx::Exception> {
+        ffi::shared_l2_pool_commit(self.pinned(), client, ticket, checkpoints)
+    }
+
+    /// Refresh the pool's copies of `keys`: a rank used its own.
+    pub fn touch(&mut self, keys: &[StorageKeyView]) -> Result<(), cxx::Exception> {
+        ffi::shared_l2_pool_touch(self.pinned(), keys)
+    }
+
+    /// End everything `client` holds: its lookups' pins and its
+    /// reservations.
+    pub fn disconnect(&mut self, client: u64) {
+        ffi::shared_l2_pool_disconnect(self.pinned(), client);
+    }
+
+    /// Empty the pool. Refused (`false`) while a client holds pins or
+    /// reservations.
+    pub fn clear_cache(&mut self) -> bool {
+        ffi::shared_l2_pool_clear_cache(self.pinned())
+    }
+
+    /// The pool's counters.
+    pub fn stats(&self) -> SharedL2PoolStatsView {
+        // SAFETY: as in `pinned`.
+        ffi::shared_l2_pool_stats(unsafe { self.raw.as_ref() })
     }
 }
 
@@ -1550,9 +2007,17 @@ impl ExecutionPlan {
 
     /// Whether the data plane has anything to do for this plan: a batch,
     /// a Host copy (cache op), pages to zero or copy, or a remote stream.
-    /// Storage operations are the L3 executor's, not the data plane's.
+    /// Storage operations are the L3 executor's and shared L2 ops
+    /// the pool client's, not the data plane's.
     pub fn needs_device(&self) -> bool {
         ffi::plan_needs_device(&self.0)
+    }
+
+    /// Whether the plan relocates or copies any Device cache blocks
+    /// (`pages_to_copy`), whose destinations enter `PrefixCacheIndex` during
+    /// `next_execution_plan` before `copy_cache_pages` runs on the device.
+    pub fn has_pages_to_copy(&self) -> bool {
+        ffi::plan_has_pages_to_copy(&self.0)
     }
 
     /// P role: the prompts whose KV goes to their decode node now.
@@ -1609,7 +2074,18 @@ impl ExecutionPlan {
         ffi::plan_disk_ops(&self.0)
     }
 
-    /// The peer prefix landings the plan admitted, in plan order.
+    /// The shared L2 ops the plan carries, in plan order; the
+    /// rank's pool client runs them.
+    pub fn shared_l2_ops(&self) -> Vec<SharedL2OpView> {
+        ffi::plan_shared_l2_ops(&self.0)
+    }
+
+    /// Hinted requests this plan admitted locally, with their last decision.
+    pub fn peer_local_choices(&self) -> Vec<ffi::PeerLocalChoice> {
+        ffi::plan_peer_local_choices(&self.0)
+    }
+
+    /// Reads granted by the scheduler.
     pub fn peer_fetches(&self) -> Vec<PeerFetchView> {
         ffi::plan_peer_fetches(&self.0)
     }

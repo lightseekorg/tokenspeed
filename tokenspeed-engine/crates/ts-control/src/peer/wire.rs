@@ -67,6 +67,18 @@ pub enum Request {
         /// The lease.
         lease: PeerLeaseView,
     },
+    /// An exact PIN carrying the original holder identity and checkpoint.
+    CheckpointPin {
+        /// Holder identity and incarnation from the original answer.
+        stamp: Stamp,
+        /// Exact prefix and complete original source mapping.
+        checkpoint: PeerEventView,
+    },
+    /// An autonomous reader is still retiring a submitted read on this lease.
+    Reading {
+        /// The original lease including the reader incarnation.
+        lease: PeerLeaseView,
+    },
     /// The release of a lease, asking to demote after a complete read.
     Release {
         /// The lease.
@@ -134,8 +146,10 @@ const LOOKUP: u8 = 1;
 const PIN: u8 = 2;
 const RELEASE: u8 = 3;
 const ANSWER: u8 = 4;
-const STORAGE_LAYOUT: u8 = 5;
-const PREPARED: u8 = 6;
+const CHECKPOINT_PIN: u8 = 5;
+const READING: u8 = 6;
+const STORAGE_LAYOUT: u8 = 7;
+const PREPARED: u8 = 8;
 
 fn write_str(out: &mut Writer, value: &str) {
     out.bytes(value.as_bytes());
@@ -325,8 +339,17 @@ impl Request {
                 out.i32s(&prompt.tokens);
                 out.i64(i64::from(prompt.max_tokens));
             }
+            Request::CheckpointPin { stamp, checkpoint } => {
+                out.u8(CHECKPOINT_PIN);
+                write_stamp(&mut out, stamp);
+                write_change(&mut out, checkpoint);
+            }
             Request::Pin { lease } => {
                 out.u8(PIN);
+                write_lease(&mut out, lease);
+            }
+            Request::Reading { lease } => {
+                out.u8(READING);
                 write_lease(&mut out, lease);
             }
             Request::Release { lease, demote } => {
@@ -361,7 +384,22 @@ impl Request {
                     },
                 }
             }
+            CHECKPOINT_PIN => {
+                let stamp = read_stamp(&mut reader).ok_or(Malformed)?;
+                let checkpoint = read_change(&mut reader).ok_or(Malformed)?;
+                if checkpoint.kind != PeerEventKind::Pin
+                    || checkpoint.num_tokens <= 0
+                    || checkpoint.max_tokens != checkpoint.num_tokens
+                    || checkpoint.tokens.len() != checkpoint.num_tokens as usize
+                {
+                    return Err(Malformed);
+                }
+                Request::CheckpointPin { stamp, checkpoint }
+            }
             PIN => Request::Pin {
+                lease: read_lease(&mut reader).ok_or(Malformed)?,
+            },
+            READING => Request::Reading {
                 lease: read_lease(&mut reader).ok_or(Malformed)?,
             },
             RELEASE => Request::Release {
@@ -563,6 +601,10 @@ pub(crate) fn read_change(reader: &mut Reader<'_>) -> Option<PeerEventView> {
         pages: read_pages(reader)?,
         demote: reader.flag()?,
         num_tokens: read_i32(reader)?,
+        dispatch_us: 0,
+        writable_us: 0,
+        terminal_us: 0,
+        checkpoint: Vec::new(),
         request_id: String::new(),
     })
 }
@@ -579,6 +621,10 @@ impl Prompt {
             pages: Vec::new(),
             demote: false,
             num_tokens: 0,
+            dispatch_us: 0,
+            writable_us: 0,
+            terminal_us: 0,
+            checkpoint: Vec::new(),
             request_id: String::new(),
         }
     }
@@ -610,6 +656,7 @@ mod tests {
                 },
             },
             Request::Pin { lease: lease() },
+            Request::Reading { lease: lease() },
             Request::Release {
                 lease: lease(),
                 demote: true,

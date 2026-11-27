@@ -485,7 +485,7 @@ class RuntimeStates:
         admission_ids: Sequence[int],
         request_pool_indices: Sequence[int],
         stop_criteria: Sequence[StopCriteria],
-    ) -> None:
+    ) -> torch.Tensor | None:
         """Write the stop criteria of every slot whose admission changed.
 
         Runs on the stream the forward runs on, ahead of it; a slot keeps its
@@ -493,6 +493,10 @@ class RuntimeStates:
         binding so even an image taken before first use gets canonical criteria.
         Criteria are fixed at admission; reusing a public request ID creates
         a new admission even when its criteria happen to be equal.
+
+        Returns:
+            The device indices (int64) of the slots whose admission changed,
+            or None when every slot keeps its admission.
         """
         if len(stop_criteria) != len(admission_ids):
             raise ValueError(
@@ -506,7 +510,7 @@ class RuntimeStates:
             if self._stop_criteria_owners[slot] != admission_id
         ]
         if not changed:
-            return
+            return None
         pin = torch.device(self.device).type == "cuda"
         slots = torch.tensor(
             [request_pool_indices[i] for i in changed],
@@ -530,6 +534,7 @@ class RuntimeStates:
         self.token_limits.index_copy_(
             0, slots, limits.to(self.device, non_blocking=True)
         )
+        return slots
 
     def apply_stop_conditions(
         self,
@@ -538,6 +543,7 @@ class RuntimeStates:
         accept_lengths: torch.Tensor,
         input_lengths: torch.Tensor,
         prompt_lengths: torch.Tensor,
+        request_ends: torch.Tensor,
         *,
         num_extends: int,
         num_prefill_outputs: int,
@@ -545,7 +551,8 @@ class RuntimeStates:
         padding_index: int,
     ) -> None:
         """Cut this forward's accepted widths at each request's stop
-        conditions and record which requests ended (``stopped``).
+        conditions and record which requests ended (``stopped``, per slot,
+        and ``request_ends``, the per-row report the control plane reads).
 
         Must run before anything reads ``accept_lengths``; see
         ``tokenspeed_kernel.ops.metadata.apply_stop_conditions``.
@@ -560,6 +567,7 @@ class RuntimeStates:
             self.stop_token_ids,
             self.token_limits,
             self.stopped,
+            request_ends,
             num_extends=num_extends,
             num_prefill_outputs=num_prefill_outputs,
             decode_width=decode_width,

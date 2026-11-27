@@ -88,6 +88,11 @@ class CacheRecipe(ABC):
     # state set this; their ``workspace_bytes`` is that backend's staging.
     uses_paged_state_verify: ClassVar[bool] = False
 
+    @property
+    def peer_state_abi(self) -> dict | None:
+        """State encoding for cross-layout reads, when this recipe supports them."""
+        return None
+
     def __init__(
         self,
         *,

@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <utility>
 
 #include "cache/tier/peer.h"
@@ -34,6 +35,12 @@ namespace tokenspeed::fsm {
 
 // A lookup is out to the holder the request's hint names. Nothing is held
 // here; the answer, or the deadline, returns the request to Submitted.
+struct PeerHostGrant {
+    PeerLookupRequest lookup;
+    std::vector<std::int32_t> shared_prefix;
+    StorageLease landing;
+    bool lookup_answered{false};
+};
 struct PeerLooking {
     PeerLooking(AdmissionResources admission, PeerLeaseId lease, std::int64_t deadline_us, std::string holder,
                 std::int32_t minimum_tokens)
@@ -45,6 +52,7 @@ struct PeerLooking {
 
     AdmissionResources admission;
     PeerLeaseId lease;
+    std::shared_ptr<PeerHostGrant> host_grant;
     std::int64_t deadline_us;
     std::string holder;
     // A storage lookup must improve on the retained hot hit by its minimum

@@ -20,9 +20,11 @@
 
 """The Python half of the Rust engine host (RFC 0002).
 
-``ts-host`` (``tokenspeed-engine/crates/ts-host``) runs one rank: its control
-thread schedules, admits requests and emits outputs in Rust, and the
-interpreter it embeds runs the data plane. This module is everything that
+``ts-host`` (``tokenspeed-engine/crates/ts-host``) starts one rank by
+exec'ing the launcher's interpreter into ``tokenspeed_engine.host``. That
+process's main thread enters the host extension and becomes the control
+thread, which schedules, admits requests and emits outputs in Rust; its
+forward thread runs the data plane. This module is everything that
 interpreter runs, plus the launcher's side:
 
 * ``start_rust_host`` starts the binary for one rank; every launch path
@@ -62,7 +64,7 @@ from multiprocessing.connection import Connection
 import msgspec
 import torch
 import torch.distributed as dist
-from tokenspeed_engine.scheduler import Scheduler
+from tokenspeed_engine.scheduler import Scheduler, SharedL2Config
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 
@@ -85,6 +87,7 @@ from tokenspeed.runtime.cache.peer import (
     peer_incarnation,
     peer_scheduler_config,
 )
+from tokenspeed.runtime.cache.transfer.ops import SnapshotOp
 from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
@@ -678,6 +681,9 @@ class _AdmittedRequest:
     multimodal_inputs: MultimodalInputs | None
     # Its grammar's matcher in the host, once compiled; None without one.
     grammar: HostGrammar | None = None
+    # The slot whose last decode could have left replay. Retraction ends
+    # that ownership even though the request's admission stays alive.
+    replay_slot: int | None = None
 
 
 @dataclass(frozen=True)
@@ -711,8 +717,11 @@ class HostDataPlane:
         epd_publisher,
         starting: bool,
         record_cache_observations: bool = False,
+        *,
+        defer_recurrent_state: bool,
     ) -> None:
         self._device = handle
+        self._defer_recurrent_state = defer_recurrent_state
         self._record_cache_observations = record_cache_observations
         # The engine serves its own startup requests (``HostConfig``'s
         # ``startup_requests``) until ``finish_startup``.
@@ -809,6 +818,22 @@ class HostDataPlane:
     def _admission_id(self, rid: str) -> int:
         return self._requests[rid].admission_id
 
+    def _retiring_replay_slots(self, plan, cache_ops) -> list[int]:
+        slots = []
+        for operation in cache_ops:
+            if isinstance(operation, SnapshotOp):
+                request = self._requests[operation.request_id]
+                if request.replay_slot is not None:
+                    slots.append(operation.request_pool_index)
+                    request.replay_slot = None
+        for abort in plan.aborts:
+            request = self._requests.get(abort.request_id)
+            if request is not None and request.replay_slot is not None:
+                # A retraction can publish a checkpoint before it fails.
+                slots.append(request.replay_slot)
+                request.replay_slot = None
+        return slots
+
     def execute(
         self,
         plan,
@@ -817,6 +842,7 @@ class HostDataPlane:
         grammar_advance: list[bool] | None,
         logprobs: tuple[tuple[list[int], list[int], list[int], int] | None, int] | None,
         history: tuple[list[int], list[int], list[list[int]]] | None,
+        retirement_id: int | None = None,
     ) -> _Dispatched | None:
         """Run one round's plan; the forward to complete later, if one ran.
 
@@ -837,6 +863,7 @@ class HostDataPlane:
                 committed prefixes the batch seeds (``RequestHistorySeeds``'
                 slots, prefix lengths and tokens); None when no row needs
                 one.
+            retirement_id: The host's fence for snapshots and scheduler aborts.
         """
         dp_metadata = None
         idle_forward = False
@@ -920,10 +947,31 @@ class HostDataPlane:
             request_admission=self._admission_id,
             record_observations=self._record_cache_observations,
         )
+        retirement_slots = (
+            self._retiring_replay_slots(plan, cache_ops.device)
+            if retirement_id is not None
+            else ()
+        )
+        if (
+            self._defer_recurrent_state
+            and planned is not None
+            and planned.forward_op.num_extends() == 0
+            and any(request.replay_slot is None for request in requests)
+        ):
+            for request, slot in zip(
+                requests, planned.forward_op.request_pool_indices, strict=True
+            ):
+                request.replay_slot = slot
         # The engine's own startup requests let the kernels they reach
         # prepare their compile variants, as model-only warmup does.
         with kernel_warmup(enabled=self._starting):
-            results = self._device.execute(plan, planned, cache_ops=cache_ops.device)
+            results = self._device.execute(
+                plan,
+                planned,
+                cache_ops=cache_ops.device,
+                retirement_slots=retirement_slots,
+                retirement_id=retirement_id,
+            )
             if idle_forward:
                 self._device.run_idle_forward(dp_metadata)
         self._gc_hooks.note_round(forwarded=results is not None or idle_forward)
@@ -988,12 +1036,27 @@ class HostDataPlane:
         """
         return self._device.poll_cache_observations()
 
-    def release(self, rids: list[str]) -> None:
+    def poll_replay_retirement(self) -> int:
+        """Report the last completed replay fence to the host."""
+        return self._device.poll_replay_retirement()
+
+    def replay_retirement_enabled(self) -> bool:
+        """Whether the host needs to order replay retirement work."""
+        return self._defer_recurrent_state
+
+    def release(self, rids: list[str], retirement_id: int | None = None) -> None:
         """Forget requests that ended. Their grammar matchers and
         shared-memory features go behind every forward launched before this,
         the ones that may read them."""
         requests = [(rid, self._requests.pop(rid)) for rid in rids]
-        if any(
+        retirement_slots = []
+        if retirement_id is not None:
+            retirement_slots = [
+                request.replay_slot
+                for _, request in requests
+                if request.replay_slot is not None
+            ]
+        if retirement_slots or any(
             request.grammar is not None
             or (
                 request.multimodal_inputs is not None
@@ -1004,6 +1067,8 @@ class HostDataPlane:
             # A release is a data-plane task: it runs behind a drafter's
             # pending round.
             self._device.settle()
+        if retirement_id is not None:
+            self._device.retire_replay(retirement_id, retirement_slots)
         for rid, request in requests:
             if request.grammar is not None:
                 request.grammar.release()
@@ -1242,7 +1307,7 @@ def _peer_sharing_settings(
     geometry,
     l3,
 ) -> PeerSharingSettings:
-    """Build the live cache namespace and agree on the TP replica's incarnation."""
+    """Build the live cache namespace and agree on the TP replica's settings."""
     mapping = server_args.mapping
     deployment_id = cache_deployment_id(
         server_args,
@@ -1252,6 +1317,7 @@ def _peer_sharing_settings(
         world_cpu_group=None,
         for_peer=True,
     )
+    protocol = mooncake_protocol()
     incarnation = [peer_incarnation()]
     if mapping.attn.tp_size > 1:
         dist.broadcast_object_list(
@@ -1288,7 +1354,7 @@ def _peer_sharing_settings(
         library=mooncake_library(),
         local_ip=local_ip,
         push_host=host,
-        protocol=mooncake_protocol(),
+        protocol=protocol,
         ib_device=server_args.disaggregation_ib_device or "",
         geometry=geometry,
         storage=(
@@ -1301,6 +1367,8 @@ def _peer_sharing_settings(
             if server_args.enable_kvstore_storage_direct
             else None
         ),
+        semantic_id=geometry.semantic_id,
+        source_role=server_args.disaggregation_mode,
     )
 
 
@@ -1321,6 +1389,7 @@ class HostBootstrap:
         host_spans,
         metrics_relay_endpoint: str | None,
         peer_outbox,
+        shared_l2_handle,
     ) -> None:
         self._server_args = server_args
         self._connection = connection
@@ -1427,6 +1496,7 @@ class HostBootstrap:
                 peer_outbox=(
                     peer_outbox if server_args.peer_prefix_port is not None else None
                 ),
+                shared_l2_handle=shared_l2_handle,
             )
             # The L3 tier the host runs over the shared Host pool; None
             # without a storage backend.
@@ -1487,6 +1557,8 @@ class HostBootstrap:
                     answer_timeout_ms=server_args.peer_prefix_answer_timeout_ms,
                     min_fetch_tokens=server_args.peer_prefix_min_fetch_tokens,
                     landing_tier=server_args.peer_prefix_landing_tier,
+                    versioned_shards=bool(self.peer_sharing.semantic_id)
+                    and mapping.attn.kvp_size == 8,
                     num_host_blocks=host_block_capacity(
                         device.host_cache.storage,
                         device.host_cache.ownership.shard_counts,
@@ -1495,10 +1567,21 @@ class HostBootstrap:
                 )
             specs = device.specs
             geometry = specs.cache_geometry
+            # With --shared-l2-config, the config of the pool the device
+            # build joined; else None.
+            shared_l2_client_config = device.shared_l2_client_config
             scheduler_config = scheduler_config_from_args(
                 server_args,
                 specs,
                 storage_config=storage_config,
+                shared_l2_config=(
+                    SharedL2Config(
+                        max_writes_in_flight=shared_l2_client_config.max_writes_in_flight,
+                        max_keys_per_write=shared_l2_client_config.max_keys_per_write,
+                    )
+                    if shared_l2_client_config is not None
+                    else None
+                ),
                 num_disk_pages=disk.num_disk_lcm_blocks + 1 if disk is not None else 0,
                 disk_config=disk_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
@@ -1511,7 +1594,7 @@ class HostBootstrap:
                 prefix_replay_tokens=resolve_dspark_prefix_replay_tokens(
                     speculative_algorithm=spec_algorithm,
                     enable_prefix_caching=server_args.enable_prefix_caching,
-                    enable_kvstore=server_args.enable_kvstore,
+                    has_host_tier=server_args.has_host_tier,
                     disaggregation_mode=server_args.disaggregation_mode,
                     draft_model_path_use_base=server_args.draft_model_path_use_base,
                     draft_model_config=draft_model_config,
@@ -1795,6 +1878,7 @@ class HostBootstrap:
                 ),
                 starting=server_args.enable_startup_requests,
                 record_cache_observations=device.specs.cache_observation_capacity > 0,
+                defer_recurrent_state=server_args.enable_deferred_gdn_state,
             )
             self._device = device.handle
 
@@ -1886,6 +1970,7 @@ def bootstrap(
     weight_update_commit_protocol: int = 0,
     host_spans=None,
     peer_outbox=None,
+    shared_l2_handle=None,
 ) -> HostBootstrap | EncodeBootstrap:
     """Build this host's rank from the arguments the launcher sends on
     ``control_fd``; with PD, its transfer peer reaches the host through
@@ -1895,6 +1980,9 @@ def bootstrap(
     (``engine/profiler.py``); an older host binary passes none. With peer
     prefix sharing, ``peer_outbox`` is where the data plane tells the host a
     plan's landings may be read (``cache/peer.py``); an older host binary
+    passes none. With a shared L2 pool, ``shared_l2_handle`` is the host's
+    shared L2 handle, where the rank starts its client of the pool's owner and
+    hands over its loads (``cache/shared_l2/rank.py``); an older host binary
     passes none."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
@@ -1913,6 +2001,11 @@ def bootstrap(
             "--peer-prefix-port requires a ts-host binary with peer prefix "
             "sharing; rebuild tokenspeed-engine together with this runtime"
         )
+    if server_args.shared_l2_config is not None and shared_l2_handle is None:
+        raise RuntimeError(
+            "--shared-l2-config requires a ts-host binary with the shared L2 "
+            "pool client; rebuild tokenspeed-engine together with this runtime"
+        )
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(
             server_args, port_args, connection, metrics_relay_endpoint
@@ -1925,6 +2018,7 @@ def bootstrap(
         host_spans,
         metrics_relay_endpoint,
         peer_outbox,
+        shared_l2_handle,
     )
 
 

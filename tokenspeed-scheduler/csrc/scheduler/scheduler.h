@@ -20,11 +20,14 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -38,6 +41,7 @@
 #include "cache/tier/disk_manager.h"
 #include "cache/tier/peer_exports.h"
 #include "cache/tier/peer_host_landings.h"
+#include "cache/tier/shared_l2_proxy.h"
 #include "cache/tier/storage_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
@@ -66,6 +70,7 @@ class StagedCacheProgress;
 struct PrefixHitStats {
     std::uint64_t prompt_tokens{0};
     std::uint64_t device_hit_tokens{0};
+    std::uint64_t peer_hit_tokens{0};
     std::uint64_t host_hit_tokens{0};
     std::uint64_t host_gain_tokens{0};
     std::uint64_t unresumable_kv_tokens{0};
@@ -156,6 +161,24 @@ public:
     // Above this pressure hold new prompts back when delay is enabled.
     // Resident chunks must be able to consume their own reservations.
     static constexpr float kPrefillWatermark = 0.9F;
+
+    // With a shared L2 pool (SchedulerConfig::shared_l2_config) a waiting
+    // prompt is admitted only once its lookup is answered. Before a plan the
+    // runtime starts the lookups, asks the pool's owner about all of them in
+    // one request, waits for its reply and applies the answers.
+    //
+    // The waiting prompts' lookups not handed out yet, each once. A prompt
+    // whose Device prefix already covers what it may reuse asks nothing.
+    std::vector<SharedL2Lookup> StartSharedL2Lookups();
+    // Mirrors the pool's answers into the proxy Host tier, each for the
+    // request it names; returns the proxy blocks created, each with the pool
+    // page a load-back from it reads. An answer the scheduler cannot take --
+    // one whose request has no lookup that waits for it, that lies outside
+    // its prompt, or that does not name, under a ticket, a bucket and a page
+    // for each key of the rank's cache groups and a tail inside a page --
+    // throws std::invalid_argument, and the runtime stops serving: nothing of
+    // that answer is kept, and the answers after it are not applied.
+    std::vector<SharedL2ProxyBlock> ApplySharedL2Answers(const std::vector<SharedL2Answer>& answers);
 
     void Advance(const ExecutionEvent& event);
     KvEventBatch DrainKvEventBatch();
@@ -250,11 +273,18 @@ public:
     // A holder's answers: reads of the cache as it stands, which the runtime
     // gives between rounds (PeerExports). What a message changes reaches
     // every member as its event at the next round's head.
-    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup) const {
+    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup, std::size_t pending_new_leases) const {
+        if (peer_exports_ && !peer_exports_->CanAcceptLookup(lookup.lease, pending_new_leases)) {
+            return PeerAnswer{.lease = lookup.lease, .kind = PeerAnswerKind::kLookup};
+        }
         return PeerExports::AnswerLookup(coordinator_, lookup);
     }
     bool PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num_tokens,
                         std::span<const PeerPage> pages) const;
+    bool PeerLeaseCanPin(const PeerLeaseId& lease) const { return peer_exports_ && peer_exports_->CanPin(lease); }
+    std::shared_ptr<PeerPinRelease> PeerReleaseHandle(const PeerLeaseId& id) {
+        return peer_exports_ ? peer_exports_->ReleaseHandle(id) : nullptr;
+    }
     bool PeerLeaseHeld(const PeerLeaseId& lease) const { return peer_exports_ && peer_exports_->Held(lease); }
     // Plans built so far: no cache entry leaves between two plans.
     std::int64_t PlanCalls() const { return plan_calls_; }
@@ -265,8 +295,19 @@ public:
         std::size_t landing_requests{0};
         std::uint64_t landed_tokens{0};
         std::uint64_t failed_landings{0};
+        std::uint64_t unused_host_landings{0};
     };
     PeerStats GetPeerStats() const;
+    bool EnableAsyncHostPeer();
+    bool EnableAsyncDevicePeer(bool adaptive);
+    std::optional<PeerFetchOperation> ReservePeerHost(const PeerLeaseId& lease, std::int32_t num_tokens, bool& retry);
+    bool ApplyPeerExport(const cache::PeerLookup& event, std::int64_t now_us);
+    void ApplyPeerExport(const cache::PeerPin& event, std::int64_t now_us, const cache::PeerLookup* checkpoint);
+    void ApplyPeerExport(const cache::PeerRelease& event, std::int64_t now_us);
+    // v1 member tickets are independent of legacy messages and timers.
+    bool PinPeerOffer(const cache::PeerLookup& checkpoint, const cache::PeerPin& pin, std::int64_t now_us);
+    bool ClosePeerOffer(const PeerLeaseId& lease, std::int64_t now_us);
+    void RetirePeerTarget(const PeerLeaseId& lease) { peer_target_holds_.erase(lease); }
     std::vector<PeerExports::PinSample> TakePeerPinSamples() {
         return peer_exports_ ? peer_exports_->TakePinSamples() : std::vector<PeerExports::PinSample>{};
     }
@@ -329,6 +370,14 @@ public:
     // otherwise reclaimable device pool. The runtime must enforce this limit
     // before submitting requests.
     std::int32_t MaxSingleRequestTokens() const { return max_single_request_tokens_; }
+    // Whether a cache group defers its decode state to a request's end
+    // (CacheGroupConfig::deferred_decode_state). A finish only the host saw
+    // leaves that state incomplete, so the runtime ends such a request with
+    // forward::Abort, which publishes nothing.
+    bool DefersDecodeState() const {
+        return std::ranges::any_of(config_.cache_groups,
+                                   [](const CacheGroupConfig& group) { return group.deferred_decode_state; });
+    }
 
     std::int32_t CacheGroupTotalPages(const std::string& group_id) const;
     std::int32_t CacheGroupAvailablePages(const std::string& group_id) const;
@@ -533,6 +582,28 @@ private:
     // decode's result -- paused or not, plan or no plan.
     void settleFinishedRequests();
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
+    // (group, kernel page id) of State blocks whose deferred decode state
+    // (CacheGroupConfig::deferred_decode_state) the runtime has not committed.
+    using StateCommitPages = std::set<std::pair<std::uint32_t, std::int32_t>>;
+    // The live block (slot 1, which a decode step writes in place) of each of
+    // `request`'s deferred-decode-state groups once it has decoded: its
+    // accepted decode records stay in its request slot until the runtime
+    // folds them into that block. None before its first decode.
+    StateCommitPages liveDeferredStatePages(const Request& request) const;
+    // Lists each of `live_state` that `victim` still holds after its
+    // retraction's publication in `plan`'s state_folds. A block the
+    // publication swapped for another request's equal entry is left out: that
+    // entry already holds the complete state.
+    void planStateFolds(const Request& victim, const StateCommitPages& live_state, ExecutionPlan& plan) const;
+    // Withholds from peers each of `candidates` that a publication put into
+    // the Device index as `request`'s own block, until the commit of the plan
+    // being built is acknowledged. A duplicate the index kept from another
+    // request holds committed state and stays readable.
+    void withholdUncommittedState(const Request& request, std::int32_t state_slot, const StateCommitPages& candidates);
+    // Whether `page` of `group` is a published endpoint whose deferred decode
+    // state the runtime has not acknowledged committing yet.
+    bool peerPagesReady(std::span<const PeerPage> pages) const;
+    bool awaitsStateCommit(std::uint32_t group, std::int32_t page) const;
     // The dead checkpoints SchedulerConfig::state_checkpoint_in_forward skips
     // (outside_event_handler.cpp): the pre-tail State checkpoint that makes a
     // request's prompt end dead, from the prompt and where the request
@@ -598,6 +669,38 @@ private:
     // The answered prompt's landing into Host blocks before its admission:
     // it waits in Prefetching, or is admitted from its local hit when the
     // Host cannot take the whole answered prefix.
+    bool async_host_peer_{false};
+    bool async_device_peer_{false};
+    bool adaptive_device_peer_{false};
+    // Feedback by source tier/locality. Arrays have fixed cardinality even as holders churn.
+    struct LandingCost {
+        int samples{0};
+        double scale{1.0};
+        double success_rate{1.0};
+        std::int64_t last_attempt_us{0};
+        double failure_us{0.0};  // unconditional expected wasted wait per attempt
+    };
+    std::array<LandingCost, 16> device_landing_cost_{};
+    // Median of five complete admissions in the same local batch condition.
+    // A single unusually long forward must not set the next reader's local price.
+    struct DispatchWait {
+        std::array<std::int64_t, 5> recent{};
+        std::size_t next{};
+        bool ready{};
+        void Observe(std::int64_t us);
+        double Estimate() const;
+    };
+    std::array<DispatchWait, 3> device_dispatch_wait_{};
+    void recordPeerDispatch(Request& request);
+    struct DeviceAttempt {
+        std::size_t path;
+        double nominal_us;
+        std::size_t batch_class;
+        std::int32_t end_tokens;
+    };
+    std::unordered_map<std::string, DeviceAttempt> device_attempts_;
+    std::optional<PeerHostLandings::Started> reservePeerHost(Request& request, const fsm::PeerHit& hit,
+                                                             std::optional<TailPublication>& tail);
     void startPeerHostLanding(Request& request);
     std::vector<PeerPageSlot> peerReusablePages(Request& request, std::int32_t hot_tokens) const;
     // The blocks a landing of [hit_tokens, end_tokens) fills whole in the
@@ -630,10 +733,12 @@ private:
     bool ownsStorageLease(const StorageLease& lease) const;
     bool peerHostLandingsPending() const { return peer_host_landings_ && peer_host_landings_->NumLandings() > 0; }
     std::int32_t cacheablePrefixTokens(const Request& request) const;
+    void handleEvent(const cache::SharedL2WriteDone& event);
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
     void handleEvent(const cache::SnapshotDone& event);
     void handleEvent(const cache::RestoreDone& event);
+    void handleEvent(const cache::StateCommitDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
     void handleEvent(const pd::DestinationReadyEvent& event);
     void handleEvent(const pd::FailedEvent& event);
@@ -696,12 +801,22 @@ private:
     // Work handed to the transfer peer takes neither budget nor a batch
     // slot, so it bypasses this (but still marks the request scheduled).
     template <typename Operation>
-    void pushOperation(PlanBuild& build, const Request& request, Operation operation) {
+    void pushOperation(PlanBuild& build, Request& request, Operation operation) {
         build.scheduled.insert(&request);
         // The D role budgets prompt tokens only: its prefills are the peer's
         // work (they ride plan.remote_prefill and never reach here), so its
         // decode steps run against no chunk budget.
         if constexpr (std::is_same_v<Operation, PrefillOperation>) {
+            if (const auto hit = std::exchange(request.pending_peer_hit, std::nullopt)) {
+                const auto used = std::min(operation.extend_prefix_len, hit->end);
+                const auto local = std::min(used, hit->local);
+                const auto device = std::min(local, hit->local - hit->host);
+                prefix_hit_stats_.prompt_tokens += request.PrefillSize();
+                prefix_hit_stats_.device_hit_tokens += device;
+                prefix_hit_stats_.host_hit_tokens += local - device;
+                prefix_hit_stats_.peer_hit_tokens += used - local;
+            }
+            if (request.peer_dispatch_sample) recordPeerDispatch(request);
             build.token_budget -= operation.input_length;
             if (config_.max_kv_page_num > 0) {
                 const std::int64_t end =
@@ -825,8 +940,9 @@ private:
     // `ignore_exemption`: the empty-round retraction (docs/design/scheduler.md §2).
     VictimChoice chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const;
     // The first half of a retraction: publishes the pages the victim completed
-    // since its last admission (see forward.cpp).
-    void publishCompletedPrefix(Request& victim);
+    // since its last admission (see forward.cpp). `live_state` is the
+    // victim's liveDeferredStatePages, taken before the publication.
+    void publishCompletedPrefix(Request& victim, const StateCommitPages& live_state);
     // Why the host budgets cannot hold the request's image right now
     // (projected, nothing mutated), unset when they can (see forward.cpp).
     std::optional<ImageShortfall> imageShortfall(const Request& request) const;
@@ -876,6 +992,14 @@ private:
     // always without max_consecutive_prefill_rounds; with it, only until a
     // run of back-to-back prefill rounds reaches the cap.
     bool prefillSuspensionAllowed() const;
+    // Whether enough candidates are ready to decode (PrefillDone or
+    // Decoding) for the interval to be owed this round: always without
+    // prefill_interval_min_decoding; with it, at least that many.
+    bool intervalDecodingThresholdMet(std::span<Request* const> candidates) const;
+    // Below the threshold, whether the round owes a decode round anyway:
+    // once the run of back-to-back prefill rounds holding a decode back has
+    // reached max_consecutive_prefill_rounds.
+    bool prefillRunCappedBelowThreshold() const;
     bool belowPrefillWatermark() const;
     bool prefillAllowed(const Request& request, const PlanBuild& build) const;
     // Admits the waiting prompts whose holder answered with more than their
@@ -885,6 +1009,8 @@ private:
     // admission takes it this round.
     void schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                               bool new_prompts_sealed);
+    void schedulePrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                             bool new_prompts_sealed);
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
@@ -911,18 +1037,25 @@ private:
     std::unique_ptr<StorageTransferManager> storage_transfers_;
     // The Disk tier's prefetches and cleaning writes; null without one.
     std::unique_ptr<DiskTransferManager> disk_transfers_;
+    // The rank's proxy of its shared L2 pool; null without one.
+    std::unique_ptr<SharedL2Proxy> shared_l2_proxy_;
     // Peer prefix sharing, when configured: the holder's leases, the peer
     // clock, the reader's lease counter and what goes out to other replicas.
     std::unique_ptr<PeerExports> peer_exports_;
+    std::unique_ptr<PeerExports> peer_offer_tickets_;
+    std::unordered_map<std::string, PeerLeaseId> peer_target_attempts_;
+    std::unordered_map<PeerLeaseId, std::vector<CacheBlockRef>, PeerLeaseIdHash> peer_target_holds_;
     // A reader's landings into Host, with PeerLandingTier::kHost; null
     // otherwise. The fetches started since the last plan go out with it.
     std::unique_ptr<PeerHostLandings> peer_host_landings_;
     std::vector<PeerFetchOperation> peer_host_fetches_;
+    std::unordered_map<PeerLeaseId, std::weak_ptr<fsm::PeerHostGrant>, PeerLeaseIdHash> peer_host_grants_;
     std::int64_t peer_now_us_{0};
     std::uint64_t next_peer_lease_{0};
     std::vector<PeerLookupRequest> peer_lookups_;
     std::uint64_t peer_landed_tokens_{0};
     std::uint64_t peer_failed_landings_{0};
+    std::uint64_t peer_unused_host_landings_{0};
     std::int64_t storage_now_us_{0};
     std::uint64_t storage_wait_timeouts_{0};
     std::uint64_t storage_ready_expirations_{0};
@@ -930,6 +1063,14 @@ private:
     std::uint64_t storage_pressure_bypasses_{0};
     bool forward_allowed_{true};
     std::vector<WriteBackOperation> pending_write_back_operations_;
+    // Decoded endpoints of deferred-decode-state groups that a retraction
+    // published while peers can pin: gathered while a plan is built, then
+    // held under that plan's state_commit_fence until the runtime
+    // acknowledges the commit (cache::StateCommitDone). No PIN exports any of
+    // them (PeerPagesMatch).
+    StateCommitPages uncommitted_state_pages_;
+    std::map<std::uint32_t, StateCommitPages> state_commit_fences_;
+    std::uint32_t next_state_commit_fence_{0};
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
     // Accounting only (schedulePrefillFirstChunk); no decision reads it.

@@ -103,6 +103,7 @@ def _config(args: ServerArgs, specs):
         enable_kv_cache_events=False,
         prefix_replay_tokens=0,
         peer_config=None,
+        shared_l2_config=None,
         num_disk_pages=0,
         disk_config=None,
     )
@@ -119,6 +120,49 @@ def test_an_engine_without_l3_passes_no_prefetch_threshold():
     assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
     assert cfg.host_write_policy == ts.SchedulerConfig.HostWritePolicy.WriteThrough
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == (5, 8)
+
+
+def test_a_shared_l2_pools_write_limits_reach_the_scheduler_config():
+    args = ServerArgs(model="x", max_num_seqs=8)
+    # A pool requires --disable-kvstore.
+    args.enable_kvstore = False
+    specs = _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    without = _config(args, specs)
+    assert without.shared_l2_config is None and without.disable_l2_cache is True
+    # The rank joined a pool (--shared-l2-config).
+    args.shared_l2_config = json.dumps(
+        {
+            "owner_address": "tcp://127.0.0.1:1",
+            "device_names": [""],
+            "request_timeout_ms": 1000,
+            "join_timeout_s": 5,
+            "read_workers": 1,
+            "write_workers": 1,
+            "scheduler": {"max_writes_in_flight": 3, "max_keys_per_write": 16},
+        }
+    )
+    cfg = scheduler_config_from_args(
+        args,
+        specs,
+        storage_config=None,
+        num_disk_pages=0,
+        disk_config=None,
+        max_scheduled_tokens=args.chunked_prefill_size,
+        max_batch_size=8,
+        max_resident_requests=8,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+        enable_kv_cache_events=False,
+        prefix_replay_tokens=0,
+        peer_config=None,
+        shared_l2_config=ts.SharedL2Config(
+            max_writes_in_flight=3, max_keys_per_write=16
+        ),
+    )
+    limits = cfg.shared_l2_config
+    assert (limits.max_writes_in_flight, limits.max_keys_per_write) == (3, 16)
+    # The pool is the Host L2: the local one is off, the proxy tier stays.
+    assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -189,6 +233,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -251,6 +296,38 @@ def test_the_prefill_round_cap_reaches_the_scheduler():
     assert cfg.max_consecutive_prefill_rounds == 2
 
 
+def test_the_prefill_interval_min_decoding_defaults_to_always_owed():
+    args = prepare_server_args(
+        ["--model", "x", "--max-num-seqs", "8", "--prefill-decode-interval", "4"]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_interval_min_decoding == 0
+
+
+def test_the_prefill_interval_min_decoding_reaches_the_scheduler():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--prefill-decode-interval",
+            "128",
+            "--max-consecutive-prefill-rounds",
+            "1",
+            "--prefill-interval-min-decoding",
+            "6",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_interval_min_decoding == 6
+    assert cfg.max_consecutive_prefill_rounds == 1
+
+
 @pytest.mark.parametrize(
     "flags,error",
     [
@@ -288,6 +365,30 @@ def test_the_prefill_round_cap_reaches_the_scheduler():
                 "64",
             ],
             "--prefill-decode-min-interval cannot be combined",
+        ),
+        (
+            [
+                "--prefill-decode-interval",
+                "64",
+                "--max-consecutive-prefill-rounds",
+                "1",
+                "--prefill-interval-min-decoding",
+                "-1",
+            ],
+            "--prefill-interval-min-decoding must be non-negative",
+        ),
+        (
+            ["--prefill-decode-interval", "64", "--prefill-interval-min-decoding", "8"],
+            "--prefill-interval-min-decoding needs --max-consecutive-prefill-rounds",
+        ),
+        (
+            [
+                "--prefill-decode-min-interval",
+                "2",
+                "--prefill-interval-min-decoding",
+                "8",
+            ],
+            "--prefill-interval-min-decoding needs --max-consecutive-prefill-rounds",
         ),
     ],
 )
@@ -1121,6 +1222,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         prefill_decode_interval=0,
         prefill_decode_min_interval=0,
         max_consecutive_prefill_rounds=0,
+        prefill_interval_min_decoding=0,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (

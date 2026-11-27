@@ -133,6 +133,7 @@ class AttentionBuild:
     cache_fields_by_stage: tuple[tuple[str, ...], ...]
     producer_fields_by_step: tuple[tuple[str, ...], ...]
     logical_plan: CacheMemoryPlan | None
+    peer_state_abi: dict | None = None
 
 
 def _ordinary_cache_family(config: AttnConfig | None) -> CacheModelFamily | None:
@@ -928,6 +929,11 @@ def _gdn_linear_attn_backend(
         config.component(SoftmaxAttnConfig),
         writes_state_checkpoints_in_forward=(
             server_args.writes_state_checkpoints_in_forward
+        ),
+        defer_recurrent_state=(
+            server_args.enable_deferred_gdn_state
+            and not server_args.decode_monokernel
+            and server_args.pipeline_parallel_size == 1
         ),
     )
 
@@ -1727,4 +1733,7 @@ def create_attn_components(
         cache_fields_by_stage=cache_fields_by_stage,
         producer_fields_by_step=stage_schedules[server_args.mapping.pp_rank],
         logical_plan=logical_plan,
+        peer_state_abi=(
+            recipe.peer_state_abi if server_args.peer_prefix_port else None
+        ),
     )

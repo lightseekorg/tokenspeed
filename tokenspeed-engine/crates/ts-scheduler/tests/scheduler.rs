@@ -27,8 +27,10 @@ use std::{ffi::CString, sync::Once};
 use pyo3::{prelude::*, types::PyDict};
 use ts_scheduler::{
     profile, BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent,
-    ForwardEventKind, RequestSpec, Scheduler, StorageCancellationView, StorageDoneView,
-    StorageOpKind, StorageRound, StorageTickView, TransferBatchView,
+    ForwardEventKind, RequestSpec, Scheduler, SharedL2AnswerView, SharedL2CheckpointView,
+    SharedL2LookupView, SharedL2OpKind, SharedL2Pool, SharedL2PoolStatsView,
+    StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind, StorageRound,
+    StorageTickView, TransferBatchView,
 };
 
 /// Start the interpreter once per test process, with the scheduler module
@@ -1853,4 +1855,545 @@ fn frozen_rounds_do_not_forward_or_abort_waiting_requests() {
     let plan = scheduler.next_execution_plan(true, false);
     assert!(plan.aborts().is_empty());
     assert_eq!(plan.forward_batches()[0].request_ids, ["paused"]);
+}
+
+#[test]
+fn a_scheduler_reports_whether_a_cache_group_defers_its_decode_state() {
+    interpreter();
+    for deferred in [false, true] {
+        let code = format!(
+            "{NEW_SCHEDULER}
+state = ts.CacheGroupConfig(
+    group_id='state', block_granularity=0, total_pages=64, attn_kind=ts.AttnKind.State
+)
+state.deferred_decode_state = {}
+cfg.cache_groups = [*cfg.cache_groups, state]
+result = ts.Scheduler(cfg)
+",
+            if deferred { "True" } else { "False" }
+        );
+        let scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+        assert_eq!(scheduler.defers_decode_state(), deferred);
+    }
+}
+
+/// A small scheduler whose Host tier is the proxy of a shared L2 pool.
+const POOL_SCHEDULER: &str = r#"
+import tokenspeed_scheduler as ts
+cfg = ts.SchedulerConfig()
+cfg.role = ts.SchedulerConfig.Role.Fused
+cfg.prefix_granularity = 2
+cfg.num_device_pages = 32
+cfg.num_host_pages = 65
+cfg.host_group_packing = [1]
+cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
+cfg.num_snapshot_pages = 1
+cfg.max_scheduled_tokens = 16
+cfg.max_batch_size = 4
+cfg.max_resident_requests = 4
+cfg.disable_l2_cache = False
+cfg.shared_l2_config = ts.SharedL2Config(max_writes_in_flight=2, max_keys_per_write=8)
+cfg.cache_groups = [ts.CacheGroupConfig("full", 2, 32, ts.AttnKind.Full)]
+result = ts.Scheduler(cfg)
+"#;
+
+/// The pool's answer to `lookup`: its prompt's first `pages` pages, pinned
+/// under `ticket`, at pool pages 11, 12, ...
+fn pool_answer(lookup: &SharedL2LookupView, ticket: u64, pages: usize) -> SharedL2AnswerView {
+    SharedL2AnswerView {
+        request_id: lookup.request_id.clone(),
+        ticket,
+        num_tokens: 2 * pages as i32,
+        kv_tokens: 2 * pages as i32,
+        tail_tokens: 0,
+        tail_hash: String::new(),
+        keys: lookup.prefix_hashes[..pages]
+            .iter()
+            .map(|hash| StorageKeyView {
+                group_id: 0,
+                content_hash: hash.clone(),
+                page_offset: 0,
+            })
+            .collect(),
+        buckets: vec![0; pages],
+        pool_pages: (11..11 + pages as i32).collect(),
+    }
+}
+
+#[test]
+fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, POOL_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("waiting", (1..=7).collect())])
+        .unwrap();
+    let lookups = scheduler.start_shared_l2_lookups();
+    let [lookup] = &lookups[..] else {
+        panic!("one lookup, got {lookups:?}");
+    };
+    // The prompt's last token is recomputed: three full pages may hit.
+    assert_eq!(lookup.request_id, "waiting");
+    assert_eq!((lookup.max_tokens, lookup.prefix_hashes.len()), (6, 3));
+    assert_eq!(lookup.tokens, [1, 2, 3, 4, 5, 6]);
+    assert!(
+        scheduler.start_shared_l2_lookups().is_empty(),
+        "handed out once"
+    );
+
+    // No plan runs the prompt before its answer.
+    let plan = scheduler.next_execution_plan(true, false);
+    assert!(!plan.needs_device());
+    assert!(plan.shared_l2_ops().is_empty());
+
+    let proxy_blocks = scheduler
+        .apply_shared_l2_answers(&[pool_answer(lookup, 7, 2)])
+        .unwrap();
+    assert_eq!(
+        proxy_blocks
+            .iter()
+            .map(|block| (block.group_id, block.bucket, block.pool_page))
+            .collect::<Vec<_>>(),
+        [(0, 0, 11), (0, 0, 12)]
+    );
+
+    // The prompt resumes behind the hit, which a load-back reads from the
+    // proxy blocks.
+    let plan = scheduler.next_execution_plan(true, false);
+    let batch = &plan.forward_batches()[0];
+    assert_eq!(batch.request_ids, ["waiting"]);
+    assert_eq!(batch.extend_prefix_lens, [4]);
+    let ops = plan.cache_ops();
+    assert_eq!(
+        ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
+        [CacheOpKind::LoadBack]
+    );
+    assert!(plan.shared_l2_ops().is_empty());
+
+    // Once the load landed nothing holds the proxy blocks: the next plan
+    // releases the ticket.
+    scheduler
+        .advance_head(
+            &StorageRound::default(),
+            &[CacheEvent {
+                kind: CacheEventKind::LoadBackDone,
+                op_id: ops[0].op_id,
+            }],
+        )
+        .unwrap();
+    let ops = scheduler.next_execution_plan(true, false).shared_l2_ops();
+    let [release, write] = &ops[..] else {
+        panic!("a release and a write, got {ops:?}");
+    };
+    assert_eq!((release.kind, release.ticket), (SharedL2OpKind::Release, 7));
+    // What the prompt computed goes to the pool: its third page and its
+    // tail, not the two pages it loaded from there.
+    assert_eq!(write.kind, SharedL2OpKind::Write);
+    assert_eq!(write.keys.len(), 2);
+    assert_eq!(write.keys[0].content_hash, lookup.prefix_hashes[2]);
+}
+
+#[test]
+fn a_pool_write_ends_with_its_completion() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, POOL_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("writer", (1..=7).collect())])
+        .unwrap();
+    let lookup = scheduler.start_shared_l2_lookups().remove(0);
+    assert!(scheduler
+        .apply_shared_l2_answers(&[pool_answer(&lookup, 0, 0)])
+        .unwrap()
+        .is_empty());
+    scheduler.next_execution_plan(true, false);
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "writer", vec![9])])
+        .unwrap();
+
+    // What the prompt published goes to the pool: its three full pages and
+    // its tail, each from the Device block that holds it.
+    let ops = scheduler.next_execution_plan(true, false).shared_l2_ops();
+    let [write] = &ops[..] else {
+        panic!("one write, got {ops:?}");
+    };
+    assert_eq!(write.kind, SharedL2OpKind::Write);
+    assert_eq!(
+        write.keys[..3]
+            .iter()
+            .map(|key| key.content_hash.as_str())
+            .collect::<Vec<_>>(),
+        lookup.prefix_hashes
+    );
+    assert_eq!(write.buckets, [0, 0, 0, 0]);
+    assert_eq!(write.device_blocks.len(), 4);
+    assert!(write.checkpoints.is_empty(), "no State checkpoint");
+    assert!(!scheduler.can_clear_cache());
+
+    // Its completion joins the head batch as an acknowledgment and lets its
+    // blocks go; a completion of a write that is not in flight is an error.
+    let done = CacheEvent {
+        kind: CacheEventKind::SharedL2WriteDone,
+        op_id: write.op_id,
+    };
+    scheduler
+        .advance_head(&StorageRound::default(), std::slice::from_ref(&done))
+        .unwrap();
+    let error = scheduler
+        .advance_head(&StorageRound::default(), &[done])
+        .unwrap_err();
+    assert!(error.what().contains("unknown shared L2 write"), "{error}");
+}
+
+#[test]
+fn an_answer_the_scheduler_cannot_take_is_an_error() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, POOL_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[
+            spec("missed", (1..=7).collect()),
+            spec("hit", (11..=17).collect()),
+        ])
+        .unwrap();
+    let lookups = scheduler.start_shared_l2_lookups();
+    let [missed, hit] = &lookups[..] else {
+        panic!("two lookups, got {lookups:?}");
+    };
+
+    // An answer that does not fit its prompt is an error, and so is one the
+    // proxy cannot mirror: nothing of either is kept.
+    let mut misfit = pool_answer(hit, 3, 1);
+    misfit.num_tokens = 3;
+    let error = scheduler.apply_shared_l2_answers(&[misfit]).unwrap_err();
+    assert!(error.what().contains("outside the prompt"), "{error}");
+    let mut unhashed = pool_answer(hit, 3, 1);
+    unhashed.keys[0].content_hash.clear();
+    let error = scheduler.apply_shared_l2_answers(&[unhashed]).unwrap_err();
+    assert!(error.what().contains("names keys"), "{error}");
+    // A tail is its tokens and its hash: a hash without tokens is refused.
+    let mut tokenless_tail = pool_answer(hit, 3, 1);
+    tokenless_tail.tail_hash = hit.prefix_hashes[0].clone();
+    let error = scheduler
+        .apply_shared_l2_answers(&[tokenless_tail])
+        .unwrap_err();
+    assert!(
+        error.what().contains("tail lies strictly inside"),
+        "{error}"
+    );
+    // No plan runs a prompt whose lookup has no answer, and none has a
+    // ticket of a refused answer to release.
+    let plan = scheduler.next_execution_plan(true, false);
+    assert!(!plan.needs_device() && plan.shared_l2_ops().is_empty());
+
+    // A miss and a hit settle their lookups in one call, which returns the
+    // hit's proxy blocks alone; a second answer for a request names no
+    // lookup that waits.
+    let proxy_blocks = scheduler
+        .apply_shared_l2_answers(&[pool_answer(missed, 0, 0), pool_answer(hit, 5, 2)])
+        .unwrap();
+    assert_eq!(
+        proxy_blocks
+            .iter()
+            .map(|block| block.pool_page)
+            .collect::<Vec<_>>(),
+        [11, 12]
+    );
+    let error = scheduler
+        .apply_shared_l2_answers(&[pool_answer(hit, 6, 2)])
+        .unwrap_err();
+    assert!(error.what().contains("no lookup that waits"), "{error}");
+    // Neither does an answer for a request whose lookup was not handed out,
+    // or for one the scheduler does not know.
+    scheduler
+        .submit_requests(&[spec("unasked", (21..=27).collect())])
+        .unwrap();
+    for request_id in ["unasked", "unknown"] {
+        let answer = SharedL2AnswerView {
+            request_id: request_id.to_owned(),
+            ..pool_answer(missed, 0, 0)
+        };
+        let error = scheduler.apply_shared_l2_answers(&[answer]).unwrap_err();
+        assert!(error.what().contains("no lookup that waits"), "{error}");
+    }
+    let plan = scheduler.next_execution_plan(true, false);
+    let batch = &plan.forward_batches()[0];
+    assert_eq!(batch.request_ids, ["missed", "hit"]);
+    assert_eq!(batch.extend_prefix_lens, [0, 4]);
+}
+
+#[test]
+fn a_plan_of_pool_commands_alone_needs_no_device() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, POOL_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("gone", (1..=7).collect())])
+        .unwrap();
+    let lookup = scheduler.start_shared_l2_lookups().remove(0);
+    scheduler
+        .apply_shared_l2_answers(&[pool_answer(&lookup, 7, 2)])
+        .unwrap();
+    // The request leaves before a plan admitted it: nothing holds the proxy
+    // blocks of its hit, and the next plan releases the ticket.
+    scheduler
+        .advance(&[event(ForwardEventKind::Abort, "gone", vec![])])
+        .unwrap();
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(
+        plan.shared_l2_ops()
+            .iter()
+            .map(|op| (op.kind, op.ticket))
+            .collect::<Vec<_>>(),
+        [(SharedL2OpKind::Release, 7)]
+    );
+    // The pool's client runs them: the data plane gets nothing.
+    assert!(!plan.needs_device());
+    assert!(plan.cache_ops().is_empty());
+}
+
+#[test]
+fn without_a_pool_the_pool_calls_ask_nothing_and_fail_as_errors() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("plain", (1..=40).collect())])
+        .unwrap();
+    assert!(scheduler.start_shared_l2_lookups().is_empty());
+    let answer = SharedL2AnswerView {
+        request_id: "plain".to_owned(),
+        ticket: 0,
+        num_tokens: 0,
+        kv_tokens: 0,
+        tail_tokens: 0,
+        tail_hash: String::new(),
+        keys: Vec::new(),
+        buckets: Vec::new(),
+        pool_pages: Vec::new(),
+    };
+    let error = scheduler.apply_shared_l2_answers(&[answer]).unwrap_err();
+    assert!(
+        error.what().contains("without a configured pool"),
+        "{error}"
+    );
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(plan.forward_batches()[0].request_ids, ["plain"]);
+    assert!(plan.shared_l2_ops().is_empty());
+}
+
+/// A pool of 8 LCM blocks as its owner builds it: pages of two tokens, a
+/// full-attention group with two blocks to an LCM block and a State group
+/// with one.
+const NEW_POOL: &str = r#"
+import tokenspeed_scheduler as ts
+full = ts.CacheGroupConfig()
+full.group_id, full.block_granularity, full.attn_kind = "full", 2, ts.AttnKind.Full
+full.cache_blocks_per_lcm_block = 2
+state = ts.CacheGroupConfig()
+state.group_id, state.block_granularity, state.attn_kind = "state", 0, ts.AttnKind.State
+state.cache_blocks_per_lcm_block = 1
+cfg = ts.SchedulerConfig()
+cfg.prefix_granularity = 2
+cfg.cache_groups = [full, state]
+cfg.host_group_packing = [2, 1]
+cfg.checkpoint_retention_requests = 0
+result = ts.SharedL2Pool(cfg, 8, 0)
+"#;
+
+/// The chain hashes of the prompt 1..=5 as a rank's scheduler computes
+/// them: its two full pages and its tail of one token. The pool hashes a
+/// looked-up prompt's own tail to find a published one.
+const POOL_PROMPT_HASHES: &str = r#"
+import hashlib, struct
+def page_hash(tokens, prior):
+    prior = bytes.fromhex(prior)
+    return hashlib.sha256(
+        struct.pack("<I", len(prior)) + prior + struct.pack(f"<I{len(tokens)}i", len(tokens), *tokens)
+    ).hexdigest()
+first = page_hash([1, 2], "")
+second = page_hash([3, 4], first)
+result = [first, second, page_hash([5], second)]
+"#;
+
+fn pool_prompt_hashes() -> [String; 3] {
+    Python::attach(|py| run(py, POOL_PROMPT_HASHES).extract().unwrap())
+}
+
+fn pool_key(group_id: u32, content_hash: &str) -> StorageKeyView {
+    StorageKeyView {
+        group_id,
+        content_hash: content_hash.to_owned(),
+        page_offset: 0,
+    }
+}
+
+/// The blocks of the prompt 1..=5: its two full pages, its tail's block,
+/// and the State checkpoint at its end.
+fn pool_prompt_keys() -> Vec<StorageKeyView> {
+    let [first, second, tail] = pool_prompt_hashes();
+    vec![
+        pool_key(0, &first),
+        pool_key(0, &second),
+        pool_key(0, &tail),
+        pool_key(1, &tail),
+    ]
+}
+
+/// The checkpoint at the end of the prompt 1..=5.
+fn pool_prompt_checkpoint() -> SharedL2CheckpointView {
+    let [first, second, tail] = pool_prompt_hashes();
+    SharedL2CheckpointView {
+        tokens: (1..=5).collect(),
+        prefix_hashes: vec![first, second],
+        tail_tokens: 1,
+        tail_hash: tail,
+        access_epoch: 7,
+    }
+}
+
+/// The lookup of the prompt 1..=7, which starts with the prompt 1..=5. A
+/// page past the checkpoint is in no pool: its hash is never matched.
+fn pool_lookup() -> SharedL2LookupView {
+    let [first, second, _] = pool_prompt_hashes();
+    SharedL2LookupView {
+        request_id: "longer".to_owned(),
+        prefix_hashes: vec![first, second, "1-2-3-4-5-6".to_owned()],
+        tokens: (1..=7).collect(),
+        max_tokens: 7,
+    }
+}
+
+#[test]
+fn only_a_pool_object_is_accepted() {
+    interpreter();
+    Python::attach(|py| {
+        let not_a_pool = run(py, "result = object()");
+        let error = SharedL2Pool::from_python(&not_a_pool).err().unwrap();
+        assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+    });
+}
+
+#[test]
+fn a_pool_python_built_is_written_and_read_from_rust() {
+    interpreter();
+    let mut pool = Python::attach(|py| SharedL2Pool::from_python(&run(py, NEW_POOL)).unwrap());
+    let empty = pool.stats();
+    assert_eq!(
+        empty,
+        SharedL2PoolStatsView {
+            num_lcm_blocks: 8,
+            empty_lcm_blocks: 8,
+            cached_blocks: 0,
+            pinned_blocks: 0,
+            reserved_blocks: 0,
+            open_lookups: 0,
+            evicted_blocks: 0,
+            checkpoints: 0,
+        }
+    );
+    // An empty pool answers a miss, for the request that asked.
+    let miss = pool.lookup(2, &pool_lookup()).unwrap();
+    assert_eq!((miss.request_id.as_str(), miss.ticket), ("longer", 0));
+    assert!(miss.keys.is_empty() && miss.pool_pages.is_empty());
+
+    // Client 1 reserves a page for every block and commits them with the
+    // checkpoint.
+    let keys = pool_prompt_keys();
+    let reservation = pool.reserve(1, &keys, &[0; 4]).unwrap();
+    assert!(reservation.ticket != 0);
+    assert!(
+        reservation.pages.iter().all(|page| *page >= 1),
+        "{reservation:?}"
+    );
+    assert_eq!(pool.stats().reserved_blocks, 4);
+    // Another client gets no page for a block that is being written.
+    let second = pool.reserve(2, &keys, &[0; 4]).unwrap();
+    assert_eq!((second.ticket, second.pages), (0, vec![-3; 4]));
+    pool.commit(1, reservation.ticket, &[pool_prompt_checkpoint()])
+        .unwrap();
+    let stats = pool.stats();
+    assert_eq!(
+        (
+            stats.reserved_blocks,
+            stats.cached_blocks,
+            stats.checkpoints
+        ),
+        (0, 4, 1)
+    );
+
+    // Client 2's longer prompt hits the checkpoint: its blocks at the pages
+    // the write got, pinned under the answer's ticket.
+    let hit = pool.lookup(2, &pool_lookup()).unwrap();
+    assert!(hit.ticket != 0);
+    assert_eq!((hit.num_tokens, hit.kv_tokens), (5, 5));
+    assert_eq!(
+        (hit.tail_tokens, &hit.tail_hash),
+        (1, &pool_prompt_hashes()[2])
+    );
+    assert_eq!(hit.keys, keys);
+    assert_eq!(hit.buckets, [0; 4]);
+    assert_eq!(hit.pool_pages, reservation.pages);
+    let stats = pool.stats();
+    assert_eq!((stats.pinned_blocks, stats.open_lookups), (4, 1));
+    assert!(!pool.clear_cache(), "a pinned pool is not emptied");
+
+    // A ticket is its client's.
+    let error = pool.release(1, hit.ticket).unwrap_err();
+    assert!(
+        error.what().contains("no lookup of its client holds"),
+        "{error}"
+    );
+    pool.release(2, hit.ticket).unwrap();
+    assert_eq!(pool.stats().pinned_blocks, 0);
+    pool.touch(&keys[..2]).unwrap();
+    assert!(pool.clear_cache());
+    assert_eq!(pool.stats(), empty);
+}
+
+#[test]
+fn a_pool_refuses_what_is_not_its_own_as_an_error() {
+    interpreter();
+    let mut pool = Python::attach(|py| SharedL2Pool::from_python(&run(py, NEW_POOL)).unwrap());
+    // A group the pool does not have, a bucket outside the group's shards,
+    // tokens short of the lookup's bound.
+    let error = pool.reserve(1, &[pool_key(2, "1-2")], &[0]).unwrap_err();
+    assert!(error.what().contains("a shared L2 key names"), "{error}");
+    let error = pool.touch(&[pool_key(0, "")]).unwrap_err();
+    assert!(error.what().contains("a shared L2 key names"), "{error}");
+    let error = pool.reserve(1, &[pool_key(0, "1-2")], &[1]).unwrap_err();
+    assert!(
+        error.what().contains("outside its group's shard"),
+        "{error}"
+    );
+    let short = SharedL2LookupView {
+        max_tokens: 8,
+        ..pool_lookup()
+    };
+    let error = pool.lookup(1, &short).unwrap_err();
+    assert!(error.what().contains("must reach its bound"), "{error}");
+
+    // A commit names a reservation of its client, and a checkpoint covers
+    // its pages and tail exactly: one that ends on a page has no tail.
+    let reservation = pool.reserve(1, &pool_prompt_keys(), &[0; 4]).unwrap();
+    let error = pool
+        .commit(2, reservation.ticket, &[pool_prompt_checkpoint()])
+        .unwrap_err();
+    assert!(error.what().contains("reserves nothing"), "{error}");
+    let tailless = SharedL2CheckpointView {
+        tail_tokens: 0,
+        tail_hash: String::new(),
+        ..pool_prompt_checkpoint()
+    };
+    let error = pool.commit(1, reservation.ticket, &[tailless]).unwrap_err();
+    assert!(error.what().contains("cover its pages and tail"), "{error}");
+    assert_eq!(pool.stats().reserved_blocks, 4);
+
+    // A client that leaves loses what it reserved.
+    pool.disconnect(1);
+    assert_eq!(pool.stats().reserved_blocks, 0);
+    let error = pool
+        .commit(1, reservation.ticket, &[pool_prompt_checkpoint()])
+        .unwrap_err();
+    assert!(error.what().contains("reserves nothing"), "{error}");
 }

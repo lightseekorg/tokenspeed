@@ -64,6 +64,8 @@ class Inkling2DSpark(DFlash):
     spec_algorithm = "DSPARK"
     sample_from_anchor = False
     uses_shared_context_projection = False
+    # Its recurrent proposal is greedy: it does not sample from or record a q.
+    supports_speculative_sampling = False
 
     def _init_native_buffers(self) -> None:
         context_length = self.draft_model_runner.model_config.context_len

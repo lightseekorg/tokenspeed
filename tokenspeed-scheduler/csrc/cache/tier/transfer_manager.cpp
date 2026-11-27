@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 #include <numeric>
 #include <unordered_set>
 #include <utility>
@@ -48,10 +49,6 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
     _assert(cause == HostStoreCause::kPublication || cause == HostStoreCause::kFinish,
             "only publication and finish drain the pending-store queue");
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(cause)];
-    std::vector<CacheKey> keys;
-    std::vector<CacheBlockRef> device_block_refs;
-    std::vector<std::uint32_t> group_ids;
-    std::vector<std::int32_t> buckets;
     // Keys already travelling: every ticket of every in-flight write-back
     // whose ACK publishes it -- an eviction write-back's key may never be
     // published (its segment can be cancelled), so it is stored again.
@@ -67,30 +64,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
             storing_keys.insert(ticket.key);
         }
     }
-    for (auto& candidate : coordinator_.Host().TakePendingStores()) {
-        if (coordinator_.Host().ContainsHostCachedBlock(candidate.key)) {
-            ++stats.host_cached;
-            continue;
-        }
-        if (!storing_keys.insert(candidate.key).second) {
-            ++stats.in_flight;
-            continue;
-        }
-
-        CacheBlockRef device_block_ref = coordinator_.AcquireDeviceCachedBlock(candidate.key);
-        if (!device_block_ref) {
-            ++stats.evicted_before_drain;
-            continue;
-        }
-
-        group_ids.push_back(candidate.key.group_id);
-        // The Host copy lives in its Device source's bucket (same owner).
-        buckets.push_back(coordinator_.Allocator(static_cast<std::int32_t>(candidate.key.group_id))
-                              .BucketOf(device_block_ref->Location()));
-        keys.push_back(std::move(candidate.key));
-        device_block_refs.push_back(std::move(device_block_ref));
-    }
-
+    auto [keys, device_block_refs, group_ids, buckets] =
+        acquireStoreSources(stats, storing_keys, std::numeric_limits<std::size_t>::max());
     if (keys.empty()) {
         return std::nullopt;
     }
@@ -147,9 +122,93 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
     };
 }
 
+TierTransferManager::StoreSources TierTransferManager::acquireStoreSources(
+    WriteBackStats& stats, std::unordered_set<CacheKey, CacheKeyHash>& storing_keys, std::size_t max_sources) {
+    StoreSources sources;
+    while (sources.keys.size() < max_sources && coordinator_.Host().HasPendingStores()) {
+        for (auto& candidate : coordinator_.Host().TakePendingStores(max_sources - sources.keys.size())) {
+            if (coordinator_.Host().ContainsHostCachedBlock(candidate.key)) {
+                ++stats.host_cached;
+                continue;
+            }
+            if (!storing_keys.insert(candidate.key).second) {
+                ++stats.in_flight;
+                continue;
+            }
+
+            CacheBlockRef device_block_ref = coordinator_.AcquireDeviceCachedBlock(candidate.key);
+            if (!device_block_ref) {
+                ++stats.evicted_before_drain;
+                continue;
+            }
+
+            sources.group_ids.push_back(candidate.key.group_id);
+            // The Host copy lives in its Device source's bucket (same owner).
+            sources.buckets.push_back(coordinator_.Allocator(static_cast<std::int32_t>(candidate.key.group_id))
+                                          .BucketOf(device_block_ref->Location()));
+            sources.keys.push_back(std::move(candidate.key));
+            sources.device_block_refs.push_back(std::move(device_block_ref));
+        }
+    }
+    return sources;
+}
+
+std::vector<SharedL2WriteOperation> TierTransferManager::StartSharedL2Writes(const SharedL2Config& limits) {
+    ProfileSpan profile_span{"TierTransferManager::StartSharedL2Writes"};
+    WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(HostStoreCause::kPublication)];
+    std::unordered_set<CacheKey, CacheKeyHash> storing_keys;
+    for (const auto& [op_id, write] : shared_l2_writes_) {
+        storing_keys.insert(write.keys.begin(), write.keys.end());
+    }
+    std::vector<SharedL2WriteOperation> writes;
+    while (shared_l2_writes_.size() < static_cast<std::size_t>(limits.max_writes_in_flight)) {
+        StoreSources sources =
+            acquireStoreSources(stats, storing_keys, static_cast<std::size_t>(limits.max_keys_per_write));
+        if (sources.keys.empty()) {
+            break;
+        }
+        SharedL2WriteOperation write{.op_id = nextOpId(), .keys = sources.keys, .buckets = std::move(sources.buckets)};
+        write.device_blocks.reserve(sources.keys.size());
+        const auto write_carries_checkpoint = [&write](const ContentHash& hash) {
+            return std::ranges::any_of(write.checkpoints, [&](const CheckpointTree::Checkpoint& checkpoint) {
+                return (checkpoint.tail ? checkpoint.tail->hash : ContentHash{checkpoint.prefix_hashes.back()}) == hash;
+            });
+        };
+        for (std::size_t i = 0; i < sources.keys.size(); ++i) {
+            const CacheKey& key = sources.keys[i];
+            write.device_blocks.push_back(coordinator_.Allocator(static_cast<std::int32_t>(key.group_id))
+                                              .ResolveCacheBlockId(*sources.device_block_refs[i]));
+            ++stats.blocks[key.group_id];
+            // A checkpoint rides with its State block, once per
+            // write: the owner records it when the block is registered.
+            if (!coordinator_.GroupIsState(key.group_id) || write_carries_checkpoint(key.content_hash)) {
+                continue;
+            }
+            if (std::optional<CheckpointTree::Checkpoint> checkpoint =
+                    coordinator_.Checkpoints().CheckpointOf(key.content_hash)) {
+                write.checkpoints.push_back(std::move(*checkpoint));
+            }
+        }
+        shared_l2_writes_.emplace(write.op_id,
+                                  InFlightSharedL2Write{.keys = std::move(sources.keys),
+                                                        .device_block_refs = std::move(sources.device_block_refs)});
+        ++stats.ops;
+        writes.push_back(std::move(write));
+    }
+    return writes;
+}
+
+void TierTransferManager::CompleteSharedL2Write(const cache::SharedL2WriteDone& event) {
+    // The record goes with its pins: the sources are evictable again.
+    if (shared_l2_writes_.erase(event.op_id) != 1) {
+        throw std::invalid_argument("completion of an unknown shared L2 write");
+    }
+}
+
 bool TierTransferManager::HasPinnedStoresInFlight() const {
-    return std::ranges::any_of(
-        write_backs_, [](const auto& entry) { return entry.second.guard == StoreSourceGuard::kPinnedUntilAck; });
+    return !shared_l2_writes_.empty() || std::ranges::any_of(write_backs_, [](const auto& entry) {
+        return entry.second.guard == StoreSourceGuard::kPinnedUntilAck;
+    });
 }
 
 LoadBackOperation TierTransferManager::StartPrefixLoad(std::vector<BlockTransfer> block_transfers) {

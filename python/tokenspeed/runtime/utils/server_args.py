@@ -86,7 +86,9 @@ logger = get_colorful_logger(__name__)
 # either.
 SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full", "sonic"})
 # The one backend whose verify reads the DFlash2 candidate selector's sparse
-# draft q (RuntimeStates.future_draft_q): DFLASH under the flag needs it.
+# draft q (RuntimeStates.future_draft_q): a DFlash2 draft needs it. A base DFLASH
+# draft records the dense q and takes SPECULATIVE_SAMPLING_BACKENDS; DFlash.
+# bind_sampling_backend checks the pairing once the draft is loaded.
 DFLASH_SPECULATIVE_SAMPLING_BACKEND = "triton"
 
 # Usable range of --spec-reject-draft-prob-threshold. The sentinel rows are
@@ -499,6 +501,10 @@ class ServerArgs:
     # The most back-to-back prefill rounds an overdue prompt may suspend the
     # interval for; 0 keeps the unbounded suspension.
     max_consecutive_prefill_rounds: int = 0
+    # The interval is owed only while at least this many requests are ready
+    # to decode; below it --max-consecutive-prefill-rounds still ends a run of
+    # prefill rounds that hold a decode back. 0 always owes the interval.
+    prefill_interval_min_decoding: int = 0
     enable_short_prefill_first: bool = False
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
@@ -656,6 +662,9 @@ class ServerArgs:
     kvstore_storage_backend_extra_config: str | None = None
     enable_kvstore_storage_direct: bool = False
     kvstore_storage_direct_config: str | None = None
+    # A paged L2 pool shared by every prefill rank, in place of their Host L2
+    # (--shared-l2-config, a JSON object).
+    shared_l2_config: str | None = None
     # Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md): the port
     # the node's replica leaders share for external control messages;
     # None turns it off.
@@ -711,6 +720,9 @@ class ServerArgs:
     attention_backend: str | None = None
     min_kv_split: int | None = None
     kda_backend: str = "auto"
+    # Records a request keeps per KDA layer between dense-state folds,
+    # including the verify window; None keeps max(16, draft tokens).
+    kda_history_capacity: int | None = None
     drafter_attention_backend: str | None = None
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
     # (default) is exact dense attention; see --skip-softmax-threshold help.
@@ -820,6 +832,7 @@ class ServerArgs:
     # [SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN, SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX].
     spec_reject_draft_prob_threshold: float = 2.0
     enable_replay_ssm: bool = True
+    enable_deferred_gdn_state: bool = False
     eagle3_layers_to_capture: str | None = None
     # EAGLE-Harness dynamic draft trees for EAGLE4 (see the flags' help).
     speculative_exec_mode: int = -1
@@ -949,6 +962,7 @@ class ServerArgs:
     # scratch is allocated before graph capture, so larger forwards fall
     # back to the generic all-to-all instead of growing it at runtime.
     head_tp_exchange_max_rows: int = 256
+    ple_table_layout: str = "global_sharded"
     lm_head_tp_size: int | None = None
     tp_batch_invariant: Literal["none", "attn", "attn+dense"] = "none"
     dense_tp_size: int | None = None
@@ -1812,6 +1826,12 @@ class ServerArgs:
         return self.disaggregation_mode not in ("prefill", "encode")
 
     @property
+    def has_host_tier(self) -> bool:
+        """Whether this engine's scheduler has a Host tier: the local Host L2,
+        or a shared L2 pool in its place."""
+        return self.enable_kvstore or self.shared_l2_config is not None
+
+    @property
     def writes_state_checkpoints_in_forward(self) -> bool:
         """Whether this engine's prefill forwards write in-forward State checkpoints.
 
@@ -1914,6 +1934,22 @@ class ServerArgs:
                 )
             # Reuse the scheduler's no-pool capacity abort path. Host history
             # and fixed hot partitions follow the ordinary request ownership.
+            self.retraction_snapshot_host_gb = 0.0
+            self.retraction_snapshot_ratio = 0.0
+            self.retraction_snapshot_max_requests = 0
+            return
+        if self.shared_l2_config is not None and self.retracting_role:
+            # A retraction image's Host part would go to the pool's proxy
+            # tier, which holds no bytes.
+            forced = self.debug_force_retraction_interval != 0
+            if host_gb > 0 or ratio not in (None, 0) or max_requests > 0 or forced:
+                raise ValueError(
+                    "a rank with --shared-l2-config does not retract; remove the "
+                    "--retraction-snapshot-host-gb, --retraction-snapshot-ratio, "
+                    "--retraction-snapshot-max-requests and "
+                    "--debug-force-retraction-interval overrides (a ratio of 0 is "
+                    "allowed)."
+                )
             self.retraction_snapshot_host_gb = 0.0
             self.retraction_snapshot_ratio = 0.0
             self.retraction_snapshot_max_requests = 0
@@ -2295,12 +2331,10 @@ class ServerArgs:
         the draft-prob chain kernel:
         ``greedy`` verifies by exact match, so a dense q never enters it, and
         ``triton`` by a target-sampled exact match unless it runs block
-        verification, which reads the dense q. The one block drafter
-        served is DFLASH with the DFlash2 candidate selector: its walk samples
-        each step from the selector's q over its top-K candidates, which only
-        the ``triton`` backend verifies (sparse q); base DFLASH without the
-        selector is refused when the drafter binds the verifier, since only
-        the loaded checkpoint tells the two apart. The prefill role of a
+        verification, which reads the dense q. DFLASH is admitted with either
+        ``triton`` (a DFlash2 draft's sparse q) or a draft-prob backend (a base
+        draft's dense q); only the loaded checkpoint says which, so the drafter
+        refuses the wrong pairing when it binds the verifier. The prefill role of a
         disaggregated deployment never verifies a chain of its own and its
         drafted candidates ship to the decode node without q, so there the
         flag would only allocate the per-slot distribution buffer; it is
@@ -2320,8 +2354,7 @@ class ServerArgs:
         if self.speculative_algorithm is None:
             raise ValueError(
                 "--enable-speculative-sampling needs speculative decoding: pass "
-                "--speculative-algorithm EAGLE3, MTP, or DSPARK (or DFLASH with a "
-                "DFlash2 draft and --sampling-backend triton)"
+                "--speculative-algorithm EAGLE3, MTP, DSPARK, or DFLASH"
             )
         # EAGLE-Harness samples its trees (validate_eagle_harness_args).
         if self.speculative_eagle_topk != 1 and not self.eagle_harness:
@@ -2330,12 +2363,15 @@ class ServerArgs:
                 f"{self.speculative_eagle_topk=}"
             )
         if self.speculative_algorithm == "DFLASH":
-            if self.sampling_backend != DFLASH_SPECULATIVE_SAMPLING_BACKEND:
+            if (
+                self.sampling_backend != DFLASH_SPECULATIVE_SAMPLING_BACKEND
+                and self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS
+            ):
                 raise ValueError(
-                    "--enable-speculative-sampling with DFLASH needs --sampling-backend "
-                    f"{DFLASH_SPECULATIVE_SAMPLING_BACKEND}, the one verifier that reads "
-                    "the DFlash2 selector's sparse draft distribution; got "
-                    f"--sampling-backend {self.sampling_backend}"
+                    "--enable-speculative-sampling with DFLASH needs "
+                    f"--sampling-backend {DFLASH_SPECULATIVE_SAMPLING_BACKEND} "
+                    f"(DFlash2) or one of {sorted(SPECULATIVE_SAMPLING_BACKENDS)} "
+                    f"(base draft); got --sampling-backend {self.sampling_backend}"
                 )
         elif (
             self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS
@@ -2744,8 +2780,9 @@ class ServerArgs:
     def validate_startup_requests(self):
         if not self.enable_startup_requests:
             return
-        # A disaggregated node's requests need a peer node, and dropping the
-        # startup prefixes would delete an L3 store's shared namespace.
+        # A disaggregated node's requests need a peer node, dropping the
+        # startup prefixes would delete an L3 store's shared namespace, and it
+        # would leave them in a shared L2 pool.
         if self.disaggregation_mode != "null":
             raise ValueError(
                 "--enable-startup-requests is not supported with --disaggregation-mode"
@@ -2754,6 +2791,10 @@ class ServerArgs:
             raise ValueError(
                 "--enable-startup-requests is not supported with "
                 "--kvstore-storage-backend"
+            )
+        if self.shared_l2_config is not None:
+            raise ValueError(
+                "--enable-startup-requests is not supported with --shared-l2-config"
             )
 
     def validate_peer_prefix_options(self):
@@ -2787,6 +2828,10 @@ class ServerArgs:
                 (
                     "--query-context-parallel-size > 1",
                     self.query_context_parallel_size > 1,
+                ),
+                (
+                    "--enable-memory-saver (Peer Mooncake MRs do not yet re-register across TorchMemorySaver HBM unmap/remap)",
+                    self.enable_memory_saver,
                 ),
             )
             if refused
@@ -2901,6 +2946,45 @@ class ServerArgs:
                     "--enable-state-checkpoint-in-forward writes a checkpoint only "
                     "the prefix cache can reuse; it requires prefix caching"
                 )
+        if self.shared_l2_config is not None:
+            from tokenspeed.runtime.cache.shared_l2.client import SharedL2ClientConfig
+
+            SharedL2ClientConfig.from_json(self.shared_l2_config)
+            # The pool takes the Host L2's place on prefill and fused ranks
+            # of attention TP 1 (docs/configuration/server.md, "Shared L2
+            # pool"). Any other sharded cache group is refused when the cache
+            # is built.
+            unsupported = [
+                setting
+                for setting, refused in (
+                    ("the local Host L2 (pass --disable-kvstore)", self.enable_kvstore),
+                    (
+                        "--kvstore-storage-backend",
+                        self.kvstore_storage_backend is not None,
+                    ),
+                    ("--kv-offload-config", self.kv_offload_config is not None),
+                    (
+                        "--disaggregation-mode decode or encode",
+                        self.disaggregation_mode in ("decode", "encode"),
+                    ),
+                    ("attention TP > 1", self.mapping.attn.tp_size != 1),
+                    (
+                        "--kv-parallel-size > 1 (the first version of the pool "
+                        "holds replicated KV only)",
+                        self.kv_parallel_size > 1,
+                    ),
+                    ("--pipeline-parallel-size > 1", self.mapping.has_pp),
+                    ("disabled prefix caching", not self.enable_prefix_caching),
+                    # A sleep unmaps the Device cache, which the pool's client
+                    # registered for RDMA once, and a wake maps other memory.
+                    ("--enable-memory-saver", self.enable_memory_saver),
+                )
+                if refused
+            ]
+            if unsupported:
+                raise ValueError(
+                    f"--shared-l2-config does not support {', '.join(unsupported)}"
+                )
         _require_choice(
             "--kvstore-write-policy",
             self.kvstore_write_policy,
@@ -2917,6 +3001,8 @@ class ServerArgs:
             unsupported = [
                 setting
                 for setting, refused in (
+                    # A pool is written when a page is published.
+                    ("--shared-l2-config", self.shared_l2_config is not None),
                     ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
                     (
                         "--kvstore-storage-backend",
@@ -3301,6 +3387,17 @@ class ServerArgs:
                 "--max-consecutive-prefill-rounds needs --prefill-decode-interval: "
                 "it bounds how long an overdue prompt suspends the interval"
             )
+        if self.prefill_interval_min_decoding < 0:
+            raise ValueError("--prefill-interval-min-decoding must be non-negative")
+        if (
+            self.prefill_interval_min_decoding
+            and not self.max_consecutive_prefill_rounds
+        ):
+            raise ValueError(
+                "--prefill-interval-min-decoding needs "
+                "--max-consecutive-prefill-rounds: below the threshold the round "
+                "cap is what still bounds how long running decodes stall"
+            )
         if self.monokernel_stuck_record_dir is not None:
             fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
             if fs_type != "tmpfs":
@@ -3604,6 +3701,7 @@ class ServerArgs:
                 "mxfp4",
                 "nvfp4",
                 "w8a8_fp8",
+                "w8a16_fp8_block",
                 "compressed-tensors",
             ],
             help="The quantization method.",
@@ -3755,6 +3853,19 @@ class ServerArgs:
             "suspension.",
         )
         parser.add_argument(
+            "--prefill-interval-min-decoding",
+            type=int,
+            default=ServerArgs.prefill_interval_min_decoding,
+            help="With --max-consecutive-prefill-rounds (which needs "
+            "--prefill-decode-interval): owe the "
+            "--prefill-decode-interval and --prefill-decode-min-interval decode "
+            "rounds only while at least this many requests are ready to decode. "
+            "With fewer, waiting prompts are prefilled at once, but once "
+            "--max-consecutive-prefill-rounds prefill rounds in a row have held "
+            "a decode back, the next round decodes. Aggregated serving only. "
+            "0 (the default) always owes them.",
+        )
+        parser.add_argument(
             "--enable-state-checkpoint-in-forward",
             action="store_true",
             dest="enable_state_checkpoint_in_forward",
@@ -3880,6 +3991,19 @@ class ServerArgs:
             "--disable-kvstore, --kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
             "and at startup for a model with more than 64 cache groups; see "
+            "docs/configuration/server.md.",
+        )
+        parser.add_argument(
+            "--shared-l2-config",
+            type=str,
+            default=ServerArgs.shared_l2_config,
+            help="JSON object joining a shared L2 pool, which takes the place of "
+            "this rank's Host L2 (requires --disable-kvstore; prefill and fused "
+            "instances of attention TP 1; not with L3 storage, KV offloading, "
+            "retraction, --enable-memory-saver or --kvstore-write-policy "
+            "write_back). Fields: owner_address, device_names, "
+            "request_timeout_ms, join_timeout_s, read_workers, write_workers, "
+            "scheduler {max_writes_in_flight, max_keys_per_write}; see "
             "docs/configuration/server.md.",
         )
         parser.add_argument(
@@ -4565,6 +4689,17 @@ class ServerArgs:
             "cuDNN KDA prefill engine on SM100/SM103. Decode is unaffected.",
         )
         parser.add_argument(
+            "--kda-history-capacity",
+            type=int,
+            default=ServerArgs.kda_history_capacity,
+            help="Accepted KDA records each request keeps per layer between "
+            "dense-state folds, counting the verify window (the speculative draft "
+            "tokens). Default: max(16, draft tokens); it must be at least the "
+            "draft tokens. A smaller capacity shrinks the per-request verify "
+            "workspace but folds the records into the dense state more often: at "
+            "the draft tokens themselves, every round that accepts any.",
+        )
+        parser.add_argument(
             "--drafter-attention-backend",
             type=str,
             help="Attention backend for drafter model in speculative decoding "
@@ -5065,15 +5200,14 @@ class ServerArgs:
             "drafter samples each step from its own distribution q (per-request "
             "temperature; greedy rows stay argmax) and verify accepts with "
             "coin * q(x) < p(x) instead of the target-only rule (vLLM's "
-            "draft_sample_method=probabilistic). Needs EAGLE3 or MTP, or DSPARK "
-            "with the block or synthetic rejection method, with "
-            "--speculative-eagle-topk 1 and the flashinfer or "
-            "flashinfer_full sampling backend, EAGLE4 on EAGLE-Harness "
-            "(--speculative-exec-mode 0 or 1, trees or chains) and the "
-            "flashinfer backend, or DFLASH with a DFlash2 (candidate selector) "
-            "draft and the triton backend; refused on the prefill role of "
-            "a disaggregated deployment. Every drafter but DFLASH costs a "
-            "per-request fp32 draft distribution buffer; see "
+            "draft_sample_method=probabilistic). Needs EAGLE3, MTP, DSPARK or "
+            "DFLASH with a base draft, with --speculative-eagle-topk 1 and the "
+            "flashinfer or flashinfer_full sampling backend, EAGLE4 on "
+            "EAGLE-Harness (--speculative-exec-mode 0 or 1, trees or chains) "
+            "and the flashinfer backend, or DFLASH with a DFlash2 (candidate "
+            "selector) draft and the triton backend; refused on the prefill "
+            "role of a disaggregated deployment. Every drafter but a DFlash2 "
+            "draft costs a per-request fp32 draft distribution buffer; see "
             "docs/configuration/server.md.",
         )
         parser.add_argument(
@@ -5097,6 +5231,12 @@ class ServerArgs:
             "above this value mark a request with no proposal yet (fresh "
             "admission, PD landing) and always reject. Must lie within "
             "[1.0, 2**20].",
+        )
+        parser.add_argument(
+            "--enable-deferred-gdn-state",
+            action="store_true",
+            default=ServerArgs.enable_deferred_gdn_state,
+            help="Defer accepted GDN recurrent replay to the next layer's WY (BF16 T4 chains).",
         )
         parser.add_argument(
             "--disable-replay-ssm",
@@ -5189,7 +5329,8 @@ class ServerArgs:
             "the engine's own (one short, one of a full prefill chunk, then a "
             "full batch) through the ordinary serving path, so the first client "
             "requests do not compile what that path reaches. Not supported with "
-            "--disaggregation-mode or --kvstore-storage-backend.",
+            "--disaggregation-mode, --kvstore-storage-backend or "
+            "--shared-l2-config.",
         )
         parser.add_argument(
             "--enable-cudagraph-gc",
@@ -5425,6 +5566,14 @@ class ServerArgs:
             "o_proj rows). The symmetric-memory scratch is allocated before "
             "graph capture; larger forwards fall back to the generic all-to-all. "
             "Only used with --attn-head-tp-size > 1.",
+        )
+        parser.add_argument(
+            "--ple-table-layout",
+            choices=["global_sharded", "attn_tp_sharded", "shared", "peer_sharded"],
+            default=ServerArgs.ple_table_layout,
+            help="PLE vocabulary layout: global_sharded splits across stage ranks; "
+            "attn_tp_sharded splits within attention TP; shared maps one full host table "
+            "per node; peer_sharded directly reads mapped host shards on one node.",
         )
         parser.add_argument(
             "--lm-head-tp-size",
@@ -5876,7 +6025,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.weight_version,
             help="Initial model-weight version: the L3 cache's namespace, which a "
-            "flushed weight update naming a new version replaces.",
+            "flushed weight update naming a new version replaces. For sharded peer "
+            "sharing with a draft, explicitly version the target and draft as one pair; "
+            "change the version whenever either checkpoint changes.",
         )
         parser.add_argument(
             "--model-update-config",

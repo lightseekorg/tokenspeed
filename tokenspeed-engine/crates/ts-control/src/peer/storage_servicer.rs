@@ -141,13 +141,6 @@ impl Service {
             .spawn(move || {
                 let mut records: HashMap<PeerLeaseView, Record<B::Prepared>> = HashMap::new();
                 while !stopped.load(Ordering::Acquire) {
-                    if let Some((identity, version)) =
-                        updates.lock().unwrap_or_else(|e| e.into_inner()).take()
-                    {
-                        records.clear();
-                        settings.stamp.identity = identity;
-                        settings.weight_version = version;
-                    }
                     let now = Instant::now();
                     records.retain(|_, record| now < record.expires);
                     let request = match incoming.recv_timeout(Duration::from_millis(20)) {
@@ -155,6 +148,13 @@ impl Service {
                         Err(mpsc::RecvTimeoutError::Timeout) => continue,
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     };
+                    if let Some((identity, version)) =
+                        updates.lock().unwrap_or_else(|e| e.into_inner()).take()
+                    {
+                        records.clear();
+                        settings.stamp.identity = identity;
+                        settings.weight_version = version;
+                    }
                     let (_, reply) = handle(
                         request,
                         &settings,
@@ -426,6 +426,16 @@ fn handle<B: Backend>(
                     ranks,
                 },
             )
+        }
+        Request::CheckpointPin { checkpoint, .. } => {
+            // Storage preparation uses admitted destinations, not a hot-cache checkpoint.
+            answer(settings, checkpoint.lease, PeerAnswerKind::Pin, 0, false)
+        }
+        Request::Reading { lease } => {
+            if let Some(record) = records.get_mut(&lease) {
+                record.expires = Instant::now() + settings.record_lifetime;
+            }
+            answer(settings, lease, PeerAnswerKind::Pin, 0, false)
         }
         Request::Release { lease, demote } => {
             let complete = match records.remove(&lease).map(|r| r.state) {

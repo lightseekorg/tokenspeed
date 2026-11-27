@@ -36,6 +36,8 @@ the same parallel layout, member by member.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -59,8 +61,7 @@ SOFT_PIN_S = 2.0
 # their deadline, long before.
 HARD_PIN_S = 30.0
 # A reader whose read failed holds the landing's blocks this long before
-# reusing them, so a READ still in flight cannot land in another request's
-# block.
+# reusing them, so an in-flight READ cannot land in another request's block.
 QUARANTINE_S = 5.0
 # A holder forgets a lease's record this long after its last request.
 RECORD_LIFETIME_S = HARD_PIN_S + 30.0
@@ -99,6 +100,7 @@ def peer_scheduler_config(
     min_fetch_tokens: int,
     landing_tier: str,
     num_host_blocks: int,
+    versioned_shards: bool,
     storage: DirectSourceSettings | None = None,
 ) -> PeerConfig:
     """The scheduler's peer sharing limits.
@@ -126,11 +128,21 @@ def peer_scheduler_config(
     host = landing_tier == "host"
     if not host and landing_tier != "device":
         raise ValueError(f"unknown peer landing tier {landing_tier!r}")
+    if answer_timeout_ms <= 0:
+        raise ValueError(
+            f"peer answer_timeout_ms must be positive, got {answer_timeout_ms}"
+        )
+    answer_timeout_s = answer_timeout_ms / 1000.0
+    soft_pin_s = min(
+        HARD_PIN_S,
+        max(SOFT_PIN_S, (2.0 if host else 4.0) * answer_timeout_s + 2.0),
+    )
+    host_ready_s = max(HOST_READY_S, answer_timeout_s + 5.0)
     return PeerConfig(
         name=name,
         incarnation=incarnation,
         max_leases=MAX_LEASES,
-        soft_pin_us=int(SOFT_PIN_S * 1e6),
+        soft_pin_us=int(soft_pin_s * 1e6),
         hard_pin_us=int(HARD_PIN_S * 1e6),
         lookup_timeout_us=answer_timeout_ms * 1000,
         min_fetch_tokens=min_fetch_tokens,
@@ -138,7 +150,8 @@ def peer_scheduler_config(
         max_host_landing_blocks=(
             max(1, int(num_host_blocks * HOST_LANDING_BLOCKS_FRACTION)) if host else 0
         ),
-        host_ready_timeout_us=int(HOST_READY_S * 1e6) if host else 0,
+        host_ready_timeout_us=int(host_ready_s * 1e6) if host else 0,
+        versioned_shards=versioned_shards,
         **(storage.scheduler_limits if storage else {}),
     )
 
@@ -185,6 +198,9 @@ class PeerGeometry:
     device: tuple[PeerDeviceField, ...]
     host: PeerHostPool
     regions: tuple[tuple[int, int], ...]
+    transfer_contract: bytes = b""
+    semantic_id: bytes = b""
+    host_virtual_bounds: tuple[int, ...] = ()
 
 
 def peer_host_regions(
@@ -218,6 +234,9 @@ def build_peer_geometry(
     device_regions: Sequence[tuple[int, int]],
     host_storage: HostCacheStorage,
     host_region_planner: PeerHostRegionPlanner | None = None,
+    transfer_contract: bytes = b"",
+    semantic_id: bytes = b"",
+    host_virtual_bounds: tuple[int, ...] = (),
 ) -> PeerGeometry:
     """This rank's geometry: the fields the Host tier stores (the target's
     and the draft's), at their Device addresses and their offsets in the
@@ -281,6 +300,9 @@ def build_peer_geometry(
     return PeerGeometry(
         device=tuple(device),
         host=PeerHostPool(address=host_address, groups=tuple(host_groups)),
+        transfer_contract=transfer_contract,
+        semantic_id=semantic_id,
+        host_virtual_bounds=host_virtual_bounds,
         regions=(
             *((int(address), int(length)) for address, length in device_regions),
             *host_regions,
@@ -334,4 +356,40 @@ class PeerSharingSettings:
     protocol: str
     ib_device: str
     geometry: PeerGeometry
-    storage: DirectSourceSettings | None
+    storage: DirectSourceSettings | None = None
+    semantic_id: bytes = b""
+    source_role: str = ""
+
+
+def peer_semantic_id(
+    model_namespace: str,
+    revision: str | None,
+    weight_version: str | None,
+    state_abi: dict | None,
+    *,
+    paired_weights: bool = False,
+) -> bytes:
+    """Identify the model generation and the recipe's cross-layout state encoding."""
+    revision = (revision or "").lower()
+    pinned = len(revision) == 40 and all(c in "0123456789abcdef" for c in revision)
+    version = (weight_version or "").strip()
+    if version == "default":
+        version = ""
+    if not model_namespace or not state_abi or not (pinned or version):
+        return b""
+    identity = {
+        "format": 2,
+        "model": model_namespace,
+        "revision": revision if pinned else "",
+        "weight_version": version,
+        "state_abi": state_abi,
+    }
+    if paired_weights:
+        # A pinned target revision alone says nothing about the draft weights.
+        if not version:
+            return b""
+        identity["paired_weights"] = True
+    payload = json.dumps(
+        identity, sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    return hashlib.sha256(payload.encode()).digest()

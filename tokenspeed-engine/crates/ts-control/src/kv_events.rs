@@ -156,7 +156,7 @@ fn hashes(encoder: &mut ts_wire::msgpack::Encoder, hashes: &[u64]) {
 }
 
 /// Bind addresses as libzmq reads them: `*` is every interface.
-fn bind_address(endpoint: &str) -> String {
+pub(crate) fn bind_address(endpoint: &str) -> String {
     endpoint.replace("://*:", "://0.0.0.0:")
 }
 
