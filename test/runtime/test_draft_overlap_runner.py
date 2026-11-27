@@ -99,6 +99,7 @@ def _config(**changes) -> ModelExecutorConfig:
         spec_num_steps=3,
         spec_num_tokens=4,
         grammar_backend="none",
+        acl_graph_memory_policy="discard",
     )
     fields.update(changes)
     return ModelExecutorConfig(**fields)
