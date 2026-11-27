@@ -127,6 +127,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
             return import_module("tokenspeed.runtime.cache.l2.executor")
     host_transfer = ModuleType("tokenspeed_kernel.ops.kvcache.host_transfer")
     host_transfer.HostTransferWorkspace = Mock
+    host_transfer.StagingBuffer = Mock
     host_transfer.build_host_transfer_geometry = Mock()
     host_transfer.transfer_cache_blocks = Mock()
     host_transfer.wait_layer_ready = Mock()
@@ -1063,7 +1064,10 @@ class TestGroupAwareWireTest:
         assert (executor._transfer_geometry) is (bound_geometry)
         assert ([count for count, _ in trackers]) == ([3, 1])
 
-    def test_direct_and_npu_init_keep_geometry_on_the_host(self, subtests):
+    def test_direct_init_keeps_geometry_on_the_host(self, subtests):
+        # The direct backend copies with DMA range calls on every vendor, so it
+        # never binds the geometry or allocates the NPU HBM staging buffers;
+        # those belong to the kernel backend, on NPU as on CUDA.
         executor_module = self._executor_module()
         lanes_module = _lanes_module()
         HostCacheExecutor = executor_module.HostCacheExecutor
@@ -1127,8 +1131,8 @@ class TestGroupAwareWireTest:
                 ),
             ) as build_geometry,
         ):
-            for io_backend, device_type in (("direct", "cuda"), ("kernel", "npu")):
-                with subtests.test(io_backend=io_backend, device_type=device_type):
+            for device_type in ("cuda", "npu"):
+                with subtests.test(device_type=device_type):
                     field = SimpleNamespace(
                         field_id="field",
                         device_buffer_index=0,
@@ -1158,7 +1162,7 @@ class TestGroupAwareWireTest:
                         host_size_gb=0,
                         snapshot_pool=NO_POOL,
                         slot_state_exporters=None,
-                        io_backend=io_backend,
+                        io_backend="direct",
                         attn_tp_rank=0,
                         kvp_rank=0,
                         nprocs_per_node=1,
@@ -1167,6 +1171,8 @@ class TestGroupAwareWireTest:
                     )
                     assert (executor._transfer_geometry.device_rows) is None
                     executor._transfer_geometry.bind.assert_not_called()
+                    assert (executor._write_staging) is None
+                    assert (executor._load_staging) is None
 
         assert (build_geometry.call_count) == (2)
 
