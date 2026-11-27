@@ -263,6 +263,113 @@ def test_wy_graph_refreshes_inputs_and_runtime_geometry(tree, tokens, warm_token
     torch.testing.assert_close(output, run_wy(**case), rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("tokens", [5, 8, 9, 16])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_wy_pipeline_chunk_boundaries_and_graph_refresh(tokens, state_dtype):
+    from utils import assert_no_cute_compile
+
+    heads, vheads = 8, 32
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    batch = max(256, 2 * sm_count) // vheads + 1
+    case = make_case(
+        batch=batch,
+        tokens=tokens,
+        dtype=torch.bfloat16,
+        state_dtype=state_dtype,
+        tree=False,
+        strided=False,
+        heads=heads,
+        vheads=vheads,
+    )
+    chunk = 4 if tokens <= 8 else 8
+    case["initial_state_indices"][0] = -1
+    case["k"][:, chunk:].mul_(-0.5)
+    case["v"][:, chunk:].mul_(2.0)
+    case["a"][:, chunk - 1] = -4.0
+    case["b"][:, chunk - 1] = 4.0
+    payload_width = (heads + vheads) * 128 + 2 * vheads
+    replay = case["q"].new_full((batch * tokens, payload_width), float("nan"))
+    case["replay_payload"] = replay
+    warm = dict(case)
+    for name in ("q", "k", "v", "a", "b", "initial_state_indices"):
+        warm[name] = case[name][:1]
+    warm["replay_payload"] = replay[:tokens]
+    with kernel_warmup(enabled=True):
+        run_wy(**warm)
+    state_before = case["initial_state"].clone()
+
+    with assert_no_cute_compile():
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run_wy(**case)
+        for _ in range(2):
+            for name in ("q", "k", "v", "a", "b"):
+                case[name].mul_(-0.75)
+            case["initial_state_indices"].copy_(case["initial_state_indices"].roll(1))
+            replay.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(
+                output.double(), reference(case), atol=1e-4, rtol=2**-7
+            )
+            expected = torch.cat(
+                [case[name].flatten(2) for name in ("k", "v", "a", "b")], dim=-1
+            )
+            torch.testing.assert_close(replay, expected.flatten(0, 1), atol=0, rtol=0)
+    assert torch.equal(case["initial_state"], state_before)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_wy_t16_warmup_covers_wide_state_tiles(state_dtype):
+    from utils import assert_no_cute_compile
+
+    heads, vheads = 4, 12
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+
+    def inputs(batch, tokens, *, strided):
+        return make_case(
+            batch=batch,
+            tokens=tokens,
+            dtype=torch.bfloat16,
+            state_dtype=state_dtype,
+            tree=True,
+            strided=strided,
+            heads=heads,
+            vheads=vheads,
+        )
+
+    wy._COMPILED.clear()
+    with kernel_warmup(enabled=True):
+        run_wy(**inputs(1, 16, strided=True))
+
+    wide_batch = 2 * sm_count // vheads + 1
+    with assert_no_cute_compile():
+        for batch, tokens, unaligned_state in (
+            (1, 9, False),
+            ((sm_count + vheads - 1) // vheads, 13, False),
+            (wide_batch, 16, False),
+            (wide_batch, 9, True),
+        ):
+            case = inputs(batch, tokens, strided=False)
+            names = ("q", "k", "v")
+            widths = (heads * 128, heads * 128, vheads * 128)
+            projection = torch.cat([case[name].flatten(2) for name in names], dim=-1)
+            for name, part in zip(names, projection.split(widths, dim=-1), strict=True):
+                case[name] = part.view(batch, tokens, -1, 128)
+            if unaligned_state:
+                pool = case["initial_state"]
+                shifted = pool.new_empty((pool.numel() + 1,))[1:].view_as(pool)
+                shifted.copy_(pool)
+                case["initial_state"] = shifted
+            case["initial_state_indices"][0] = -1
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                output = run_wy(**case)
+            graph.replay()
+            torch.testing.assert_close(
+                output.double(), reference(case), atol=1e-4, rtol=2**-7
+            )
+
+
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("batch,heads,vheads,offset", [(9, 2, 6, 1), (12, 8, 24, 0)])
 def test_wy_graph_with_unaligned_state_rows(state_dtype, batch, heads, vheads, offset):
