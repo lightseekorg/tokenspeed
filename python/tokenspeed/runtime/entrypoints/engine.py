@@ -53,6 +53,7 @@ from tokenspeed.runtime.metrics.config import metrics_enabled
 from tokenspeed.runtime.metrics.relay import MetricsRelay
 from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.pd.utils import DisaggregationMode, TransferBackend
+from tokenspeed.runtime.plugins import ensure_loaded, finish_headless_plugins
 from tokenspeed.runtime.utils import (
     configure_logger,
     get_colorful_logger,
@@ -422,6 +423,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             )
         scheduler_procs.extend(procs)
         scheduler_pipe_readers.extend(readers)
+        finish_headless_plugins()
         for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
             if data.get("status") != "ready":
                 raise RuntimeError(
@@ -448,24 +450,35 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             proc.join(timeout=5)
         # The ranks sent their last events: the relay flushes its sinks
         # before the process tree, which it belongs to, goes down.
-        if metrics_relay is not None:
-            metrics_relay.close(timeout=2.0)
-        if scheduler_procs:
-            kill_process_tree(os.getpid(), include_parent=False)
-        for descendant in scheduler_descendants:
-            with contextlib.suppress(psutil.NoSuchProcess):
-                descendant.kill()
-        if kv_bootstrap_server is not None:
-            kv_bootstrap_server.close()
-        metrics_service.close(timeout=2.0)
+        try:
+            if metrics_relay is not None:
+                metrics_relay.close(timeout=2.0)
+        finally:
+            if scheduler_procs:
+                kill_process_tree(os.getpid(), include_parent=False)
+            for descendant in scheduler_descendants:
+                with contextlib.suppress(psutil.NoSuchProcess):
+                    descendant.kill()
+            if kv_bootstrap_server is not None:
+                kv_bootstrap_server.close()
+            metrics_service.close(timeout=2.0)
 
 
 def run_scheduler_headless_from_cli(argv: list[str] | None = None) -> None:
     """CLI shim: ``python -m tokenspeed.runtime.entrypoints.engine <ServerArgs>``."""
     from tokenspeed.runtime.utils.server_args import prepare_server_args
 
-    server_args = prepare_server_args(sys.argv[1:] if argv is None else argv)
-    launch_scheduler_headless(server_args)
+    ensure_loaded(headless_config=True)
+    try:
+        server_args = prepare_server_args(sys.argv[1:] if argv is None else argv)
+        launch_scheduler_headless(server_args)
+    except BaseException:
+        # Restore full plugin registration if startup failed before rank launch.
+        try:
+            finish_headless_plugins()
+        except Exception:
+            logger.exception("Failed to finish plugin registration during shutdown")
+        raise
 
 
 if __name__ == "__main__":
