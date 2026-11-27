@@ -2214,7 +2214,11 @@ def build_device_side(
             mapping.attn.tp_size,
             mapping.attn.kvp_size,
         )
-        if draft_model_config is None and topology in (
+        state_abi = attention.peer_state_abi
+        draft_supported = (
+            server_args.speculative_algorithm == "DFLASH" and state_abi is not None
+        )
+        if (draft_model_config is None or draft_supported) and topology in (
             ("prefill", 8, 8),
             ("decode", 1, 1),
         ):
@@ -2226,7 +2230,11 @@ def build_device_side(
             transfer_contract = CacheTransferContract(
                 arena.plan,
                 tuple(arena.cache_group_specs),
-                build_cache_transfer_schema(arena.plan, model_config=model_config),
+                build_cache_transfer_schema(
+                    arena.plan,
+                    model_config=model_config,
+                    draft_model_config=draft_model_config,
+                ),
             ).to_wire_bytes()
         peer_geometry = build_peer_geometry(
             scheduler_group_ids=tuple(
@@ -2246,7 +2254,8 @@ def build_device_side(
                     server_args.served_model_name,
                     model_config.revision,
                     server_args.weight_version,
-                    attention.peer_state_abi,
+                    state_abi,
+                    paired_weights=draft_model_config is not None,
                 )
                 if transfer_contract
                 else b""

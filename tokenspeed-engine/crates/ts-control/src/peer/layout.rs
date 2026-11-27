@@ -23,6 +23,7 @@ use super::geometry::{RankGeometry, Spans};
 use std::collections::{BTreeMap, BTreeSet};
 use ts_pd::layout::{
     contract::Contract,
+    manifest::logical_slot_ranges,
     route::{Fragment, Planner},
     LayoutError,
 };
@@ -43,25 +44,18 @@ pub fn covers_interval(layout: &Contract, begin: i32, end: i32, pages: &[PeerPag
     }
     let mut expected = 0usize;
     for (group, spec) in layout.group_specs.iter().enumerate() {
-        let (lo, hi) = if spec.attn_kind == "state" {
-            (1, 2)
-        } else {
-            let Ok(grain) = spec.block_granularity() else {
-                return false;
-            };
-            if grain <= 0 {
+        let Ok(ranges) = logical_slot_ranges(spec, begin.into(), end.into(), false) else {
+            return false;
+        };
+        for mut range in ranges {
+            let n = (range.end - range.start).max(0) as usize;
+            if n > pages.len() - expected
+                || !range.all(|slot| slots.contains(&(group, slot as i32)))
+            {
                 return false;
             }
-            (i64::from(begin) / grain, 1 + (i64::from(end) - 1) / grain)
-        };
-        let n = (hi - lo) as usize;
-        if n > pages.len() - expected {
-            return false;
+            expected += n;
         }
-        if !(lo..hi).all(|slot| slots.contains(&(group, slot as i32))) {
-            return false;
-        }
-        expected += n;
     }
     expected == pages.len()
 }
@@ -207,22 +201,20 @@ impl<'a> PeerReadPlan<'a> {
             return Err(LayoutError::new("unsupported peer read topology"));
         }
         for (layout, width) in [(source, holders), (dest, readers)] {
-            if !layout
-                .group_specs
-                .iter()
-                .any(|g| g.full_suffix() && g.shard_count == width as i64)
-                || layout.group_specs.iter().any(|g| {
-                    g.replayable
-                        || match g.attn_kind.as_str() {
-                            "state" => {
-                                g.shard_count != 1
-                                    || g.transfer_policy.as_deref() != Some("latest_snapshot")
-                            }
-                            "full_history" => !g.full_suffix() || g.shard_count != width as i64,
-                            _ => true,
+            if !layout.group_specs.iter().any(|g| {
+                g.attn_kind == "full_history" && g.full_suffix() && g.shard_count == width as i64
+            }) || layout.group_specs.iter().any(|g| {
+                g.replayable
+                    || match g.attn_kind.as_str() {
+                        "state" => {
+                            g.shard_count != 1
+                                || g.transfer_policy.as_deref() != Some("latest_snapshot")
                         }
-                })
-            {
+                        "sliding_window" => !g.full_suffix() || g.shard_count != 1,
+                        "full_history" => !g.full_suffix() || g.shard_count != width as i64,
+                        _ => true,
+                    }
+            }) {
                 return Err(LayoutError::new("unsupported peer group topology"));
             }
         }
@@ -351,8 +343,12 @@ mod tests {
     use serde_json::json;
 
     fn contract(width: usize) -> Contract {
+        Contract::from_wire(contract_wire(width).to_string().as_bytes()).unwrap()
+    }
+
+    fn contract_wire(width: usize) -> serde_json::Value {
         let heads = 8 / width;
-        let wire = json!({
+        json!({
             "plan": {"prefix_granularity": 4, "num_lcm_blocks": 16, "lcm_block_bytes": 4 + heads,
                 "groups": [
                     {"group_id":"kv","cache_blocks_per_lcm_block":1,"page_count":17},
@@ -373,8 +369,7 @@ mod tests {
                  "sliding_window_tokens":null,"replayable":false,"transfer_policy":"latest_snapshot","shard_count":1}],
             "transfer_schema":{"fields":[{"field_id":"layer.1.recurrent_state",
                 "partition":{"axis":0,"global_extent":8,"global_parts":[]}}]},"field_addresses":null
-        });
-        Contract::from_wire(wire.to_string().as_bytes()).unwrap()
+        })
     }
 
     fn page(group_id: u32, slot: i32, block_id: i32) -> PeerPageView {
@@ -451,6 +446,113 @@ mod tests {
                 expected.insert(0, ((112, 104), 4));
             }
             assert_eq!(actual, expected);
+        }
+    }
+
+    fn with_draft(width: usize) -> Contract {
+        let mut wire = contract_wire(width);
+        let heads = 8 / width;
+        let page_bytes = 4 * heads;
+        wire["plan"]["lcm_block_bytes"] = json!(4 + heads + 2 * page_bytes);
+        wire["plan"]["groups"].as_array_mut().unwrap().push(json!({
+            "group_id":"draft","cache_blocks_per_lcm_block":1,"page_count":17
+        }));
+        wire["group_specs"].as_array_mut().unwrap().push(json!({
+            "group_id":"draft","attn_kind":"sliding_window","rows_per_page":4,"entry_stride_tokens":1,
+            "sliding_window_tokens":5,"sink_tokens":2,"replayable":false,"transfer_policy":"full_suffix","shard_count":1
+        }));
+        for (index, id) in ["layer.2.k", "layer.2.v"].into_iter().enumerate() {
+            wire["plan"]["planes"].as_array_mut().unwrap().push(json!({
+                "plane_id":id, "bytes_per_lcm_block":page_bytes,"arena_offset_bytes":2048 + index * 1024
+            }));
+            wire["plan"]["fields"].as_array_mut().unwrap().push(json!({
+                "group_id":"draft","field_id":id,"plane_id":id,"shape":[4,heads,1],
+                "dtype":"uint8","field_offset_bytes":0,"page_stride_bytes":page_bytes
+            }));
+            wire["transfer_schema"]["fields"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "field_id":id, "partition":{"axis":1,"global_extent":8,"global_parts":[]}
+                }));
+        }
+        Contract::from_wire(wire.to_string().as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn sliding_draft_needs_the_sink_and_retained_tail_at_the_offer_end() {
+        let layout = with_draft(8);
+        let mut pages: Vec<_> = (0..5).map(|slot| page(0, slot, slot + 1)).collect();
+        pages.extend([page(1, 1, 1), page(2, 0, 1), page(2, 4, 5)]);
+        assert!(covers_interval(&layout, 0, 20, &pages));
+        for missing in [6, 7] {
+            let mut incomplete = pages.clone();
+            incomplete.remove(missing);
+            assert!(!covers_interval(&layout, 0, 20, &incomplete));
+        }
+        let suffix = [page(0, 4, 5), page(1, 1, 1), page(2, 4, 5)];
+        assert!(covers_interval(&layout, 16, 20, &suffix));
+        assert!(!covers_interval(&layout, 0, i32::MAX, &suffix));
+    }
+
+    #[test]
+    fn sliding_draft_copies_each_rows_key_and_value_for_the_readers_head() {
+        let dst = with_draft(8);
+        let geometry = |width: usize| {
+            let mut result = geometry(width as u64);
+            for (id, base) in [("layer.2.k", 1024), ("layer.2.v", 2048)] {
+                let size = 4 * 8 / width as u64;
+                result.device.push(DeviceField {
+                    group_id: 2,
+                    field_id: id.into(),
+                    address: base,
+                    bytes: size,
+                    page_stride: size,
+                });
+            }
+            result
+        };
+        fn endpoint(geometry: &RankGeometry) -> ReadEndpoint<'_> {
+            ReadEndpoint {
+                geometry,
+                host_virtual_bounds: &[],
+                regions: &[(100, 4096)],
+            }
+        }
+        for holders in [1, 8] {
+            let src = with_draft(holders);
+            let sg = geometry(holders);
+            let dg = geometry(8);
+            let sources: Vec<_> = (0..holders).map(|_| endpoint(&sg)).collect();
+            for reader in 0..8 {
+                let plan = PeerReadPlan::new(&src, &dst, holders, 8, reader).unwrap();
+                let reads = plan
+                    .reads(&sources, &endpoint(&dg), &[(page(2, 4, 3), page(2, 4, 6))])
+                    .unwrap();
+                assert_eq!(reads.len(), 1);
+                let spans = &reads[&(reader % holders)];
+                let mut actual = Vec::new();
+                for ((src, dst), len) in spans
+                    .sources
+                    .iter()
+                    .zip(&spans.destinations)
+                    .zip(&spans.lengths)
+                {
+                    actual.extend((0..*len).map(|i| (src + i, dst + i)));
+                }
+                let mut expected = Vec::new();
+                let heads = 8 / holders as u64;
+                for base in [1024, 2048] {
+                    for row in 0..4 {
+                        expected.push((
+                            base + (3 * 4 + row) * heads + reader as u64 % heads,
+                            base + 6 * 4 + row,
+                        ));
+                    }
+                }
+                actual.sort_unstable();
+                assert_eq!(actual, expected);
+            }
         }
     }
 

@@ -360,6 +360,8 @@ def peer_semantic_id(
     revision: str | None,
     weight_version: str | None,
     state_abi: dict | None,
+    *,
+    paired_weights: bool = False,
 ) -> bytes:
     """Identify the model generation and the recipe's cross-layout state encoding."""
     revision = (revision or "").lower()
@@ -376,6 +378,11 @@ def peer_semantic_id(
         "weight_version": version,
         "state_abi": state_abi,
     }
+    if paired_weights:
+        # A pinned target revision alone says nothing about the draft weights.
+        if not version:
+            return b""
+        identity["paired_weights"] = True
     payload = json.dumps(
         identity, sort_keys=True, separators=(",", ":"), allow_nan=False
     )

@@ -6206,7 +6206,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.weight_version,
             help="Initial model-weight version: the L3 cache's namespace, which a "
-            "flushed weight update naming a new version replaces.",
+            "flushed weight update naming a new version replaces. For sharded peer "
+            "sharing with a draft, explicitly version the target and draft as one pair; "
+            "change the version whenever either checkpoint changes.",
         )
         parser.add_argument(
             "--model-update-config",
