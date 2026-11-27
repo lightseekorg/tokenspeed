@@ -741,19 +741,64 @@ def _graph_kernel_nodes(capture) -> int:
     return int(count.value)
 
 
+# C1, C5 (+ its selector) and C5b live in the profile-generic Petit apply and
+# kernels, so they are checked for every model that serves Petit with them:
+# both DSv4.1 Flash profiles (EP4 and EP8), and at EP8 Muse Spark (SiLU, 256
+# experts, top-8, deferred routes), GLM-5.3 Flash (clamped SiLU, 288 experts;
+# its MTP draft shares the profile) and Kimi K3 (SiTU, 896 experts, top-16).
 _FUSION_PROFILES = pytest.mark.parametrize(
-    "profile_name", ("dsv41_flash", "dsv41_flash_dspark")
+    "profile_name",
+    ("dsv41_flash", "dsv41_flash_dspark", "muse_spark", "glm53_flash", "kimi_k3"),
 )
+# The capacity each model serves the fusions at (its tuned EP8 prefill chunk:
+# _PROFILE_RAISED_CAPACITY); the DSv4.1 profiles keep the default 1024 rows.
+_FUSION_CAPACITY = _PROFILE_RAISED_CAPACITY
+# C3 needs a model that adds a full-width BF16 addend to Petit's reduced rows;
+# only DeepSeek V4.1's MoE opens petit_combine_post. Why it is not served:
+_FUSE_POST_NOT_APPLICABLE = {
+    "muse_spark": (
+        "C3 does not apply to Muse Spark: no shared expert, and Petit returns "
+        "its routes unsummed (do_finalize=False) for the per-route norm; the "
+        "residual combine needs reduced routes"
+    ),
+    "glm53_flash": (
+        "C3 needs a GLM-5.3 Flash model port: Glm53FlashMoE never opens "
+        "petit_combine_post"
+    ),
+    "kimi_k3": (
+        "C3 does not apply to Kimi K3: Petit combines latent rows, and the "
+        "shared output and residual are added in hidden space after "
+        "routed_norm and routed_up_proj"
+    ),
+}
+# Models whose Petit call defers the combine (do_finalize=False): C1 still
+# fills unit weights, so it saves one graph node per call there, not two.
+_FUSION_DEFERRED = frozenset({"muse_spark"})
+# Each model's own decode calls for the C5 selector (EP8 per-rank rows):
+# Muse DP8 batch 1/8/16 (1, 8, 16 rows), GLM DP8 MTP-4 verify at batch 1/8/16
+# (4, 32, 64 rows), Kimi attention-TP8 EAGLE-3 verify at batch 1/4/16
+# (ceil(T / 8) rows of T = 4, 16, 64).
+_FUSION_SERVING_COUNTS = {
+    "muse_spark": ([1] + [0] * 7, [1] * 8, [2] * 8),
+    "glm53_flash": ([4] + [0] * 7, [4] * 8, [8] * 8),
+    "kimi_k3": ([1] * 4 + [0] * 4, [2] * 8, [8] * 8),
+}
 
 
 def _fusion_case(profile_name: str) -> SimpleNamespace:
     """One rank's Petit layer for the fusion tests (C1, C5, C5b, C3).
 
     Joins the process group, builds ``profile_name``'s layer with this rank's
-    weights and returns it with ``call(x, ids, weights, counts,
-    do_finalize=True)``, the Petit apply at the per-rank row ``counts``.
+    weights at its serving capacity (``_FUSION_CAPACITY``) and returns it
+    with ``call(x, ids, weights, counts, do_finalize=True)``, the Petit apply
+    at the per-rank row ``counts``. Skips a world size the profile does not
+    serve.
     """
     profile = _PROFILES[profile_name]
+    if _WORLD_SIZE not in profile.world_sizes:
+        sizes = "/".join(map(str, profile.world_sizes))
+        pytest.skip(f"{profile_name} is registered for EP{sizes} only")
+    capacity = _FUSION_CAPACITY.get(profile_name)
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
@@ -764,7 +809,12 @@ def _fusion_case(profile_name: str) -> SimpleNamespace:
     layer = _TestMoeLayer(profile, ws, device)
     _weights(layer, profile, rank, ws)
     plan = _make_plan(profile, ws)
+    if capacity is not None:
+        # The runtime passes ServerArgs.gluon_petit_max_tokens_per_rank here.
+        plan["gluon_petit_max_tokens_per_rank"] = capacity
     kernel_moe_process_weights(plan, layer)
+    if capacity is not None:
+        assert layer._moe_backend_state.max_tokens_per_rank == capacity
 
     def call(x, ids, weights, counts, do_finalize=True):
         return kernel_moe_apply(
@@ -792,7 +842,10 @@ def _fusion_case(profile_name: str) -> SimpleNamespace:
 def _fusion_inputs(case, count: int):
     """This rank's ``count`` input rows and their synthetic top-k routes."""
     profile = case.profile
-    input_scale = 4.0 if profile.clamp is not None else 1.0 / 32
+    # Clamped SiLU and SiTU need inputs that reach the clamp and saturation.
+    input_scale = (
+        4.0 if profile.clamp is not None or profile.activation == "situ" else 1.0 / 32
+    )
     values = torch.arange(count * profile.hidden, device=case.device)
     x = (
         ((((values * 13 + case.rank * 7) % 127) - 63).float() * input_scale)
@@ -860,7 +913,7 @@ def test_distributed_petit_fuse_prep_bit_exact(profile_name):
     int64 ids and BF16 weights (one cast each), the deferred-routes mode and
     CUDA graph replay with refreshed router buffers; and its captured graph
     has two fewer nodes per call than the copying path's for int32 ids and
-    FP32 weights.
+    FP32 weights (one fewer for a model that defers the combine, Muse Spark).
     """
     from tokenspeed_kernel.ops.moe import gluon as petit
 
@@ -923,6 +976,28 @@ def test_distributed_petit_fuse_prep_bit_exact(profile_name):
             assert nodes[True] == nodes[False] - 2, nodes
 
         _collective_check(device, check_nodes)
+        if profile_name in _FUSION_DEFERRED:
+            # The model's own deferred call: the id copy goes, the unit-weight
+            # fill stays.
+            deferred = {}
+            for fused in (False, True):
+                petit._PETIT_FUSE_PREP = fused
+                torch.cuda.synchronize()
+                dist.barrier()
+                deferred[fused] = _graph_kernel_nodes(
+                    lambda: case.call(x, ids, weights, counts, do_finalize=False)
+                )
+                torch.cuda.synchronize()
+                dist.barrier()
+            print(
+                f"[fuse_prep] rank {rank} {profile_name} deferred graph nodes "
+                f"per call off={deferred[False]} on={deferred[True]}"
+            )
+
+            def check_deferred_nodes():
+                assert deferred[True] == deferred[False] - 1, deferred
+
+            _collective_check(device, check_deferred_nodes)
     finally:
         petit._PETIT_FUSE_PREP = initial
 
@@ -992,7 +1067,10 @@ def test_distributed_petit_fuse_post_combine(profile_name):
     event all agree bit for bit with each other and stay within the
     rounding bound of the old bf16(bf16(sum r) + s) (test_gluon_petit.py
     _fuse_post_bound: 2^-8 |sum r| + 2^-7 max(|old|, |new|)).
+    Only the DSv4.1 profiles serve C3 (``_FUSE_POST_NOT_APPLICABLE``).
     """
+    if profile_name in _FUSE_POST_NOT_APPLICABLE:
+        pytest.skip(_FUSE_POST_NOT_APPLICABLE[profile_name])
     from tokenspeed_kernel.ops.moe import gluon as petit
 
     case = _fusion_case(profile_name)
@@ -1117,7 +1195,8 @@ def test_distributed_petit_stage1_n128_selector_bit_exact(profile_name):
     Every rank takes the same tile, chosen from the call's total row count,
     including zero-row ranks; the output equals the 256-column tile's bit for
     bit (eager, deferred routes, graph replay) for DP4 batch 1/2/4 with one
-    busy rank, the tp4ep4 2/2/2/0 and 3/3/3/3 splits and 6 rows on every rank.
+    busy rank, the tp4ep4 2/2/2/0 and 3/3/3/3 splits and 6 rows on every rank,
+    and each EP8 model's own decode calls (``_FUSION_SERVING_COUNTS``).
     """
     module = _petit_launch_module()
     case = _fusion_case(profile_name)
@@ -1139,7 +1218,7 @@ def test_distributed_petit_stage1_n128_selector_bit_exact(profile_name):
             [2] * (ws - 1) + [0],
             [3] * ws,
             [6] * ws,
-        ):
+        ) + _FUSION_SERVING_COUNTS.get(profile_name, ()):
             x, ids, weights = _fusion_inputs(case, counts[rank])
             outputs = {}
             for by_experts in (False, True):
