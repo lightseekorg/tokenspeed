@@ -419,6 +419,7 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     adapter.vision = None
     adapter.model = nn.Module()
     adapter.model.config = config
+    adapter.model.engram_host_layout = "gpu"
     with set_default_torch_dtype(dtype), torch.device(device):
         adapter.lm_head = adapter.resolve_lm_head(
             SimpleNamespace(text_config=config), _quant(), ""
