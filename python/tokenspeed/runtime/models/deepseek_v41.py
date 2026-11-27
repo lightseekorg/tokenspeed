@@ -196,7 +196,6 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     EngramPeerWeightsController,
     EngramPrefetchedRows,
     EngramPrefetchTask,
-    RowShardedEngramEmbedding,
     bind_engram_peer_gpu,
     is_engram_embed_checkpoint_name,
     resolve_engram_host_alloc,
