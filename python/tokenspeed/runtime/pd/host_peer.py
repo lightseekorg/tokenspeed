@@ -47,12 +47,15 @@ from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.ipv6 import (  # noqa: F401
+    enable_mooncake_ipv6_for_host,
+    is_valid_ipv6_address,
+)
 from tokenspeed.runtime.pd.topology import PDParallelTopology
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import (
     get_ip,
     get_local_ip_by_remote,
-    is_valid_ipv6_address,
     join_host_port,
     resolve_host,
     split_host_port,
@@ -152,18 +155,6 @@ class DecodeSettings:
     waiting_timeout_s: float
     heartbeat_interval_s: float
     heartbeat_max_failures: int
-
-
-def enable_mooncake_ipv6_for_host(hostname: str) -> None:
-    """Make Mooncake's handshake use IPv6 when ``hostname``, the address the
-    host's transfer engine starts on, is an IPv6 literal.
-
-    Mooncake opens its P2P handshake sockets as IPv4 unless ``MC_USE_IPV6``
-    is set, and reads it when its first engine starts, so the bootstrap sets
-    it before the host starts one; an explicit setting is kept.
-    """
-    if is_valid_ipv6_address(hostname):
-        os.environ.setdefault("MC_USE_IPV6", "1")
 
 
 def mooncake_protocol() -> str:

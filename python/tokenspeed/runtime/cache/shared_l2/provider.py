@@ -32,10 +32,8 @@ import time
 
 import tokenspeed_engine
 
-from tokenspeed.runtime.cache.shared_l2.wire import (
-    OwnerConnection,
-    enable_mooncake_ipv6_for_host,
-)
+from tokenspeed.runtime.cache.shared_l2.wire import OwnerConnection
+from tokenspeed.runtime.ipv6 import enable_mooncake_ipv6_for_host
 
 logger = logging.getLogger(__name__)
 
