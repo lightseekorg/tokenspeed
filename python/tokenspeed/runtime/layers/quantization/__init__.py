@@ -35,9 +35,11 @@ from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.mxfp8_nvfp4 import Mxfp8Nvfp4Config
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+from tokenspeed.runtime.layers.quantization.w8a16_fp8_block import W8A16Fp8BlockConfig
 
 BASE_QUANTIZATION_METHODS: dict[str, type[QuantizationConfig]] = {
     "fp8": Fp8Config,
+    "w8a16_fp8_block": W8A16Fp8BlockConfig,
     "fp8_weight_only": Fp8WeightOnlyConfig,
     "mxfp8": Mxfp8Config,
     "mxfp8_nvfp4": Mxfp8Nvfp4Config,

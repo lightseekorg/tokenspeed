@@ -52,6 +52,7 @@ def _cpu_pinned_allocation(monkeypatch):
         return allocate(*args, **kwargs)
 
     monkeypatch.setattr(torch, "empty", empty)
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
 
 
 def _kv(group_id, *, rows_per_page=1, entry_stride_tokens=1):
@@ -120,6 +121,8 @@ def test_invalid_pinned_allocation_is_rejected(monkeypatch, null_address):
     if null_address:
         monkeypatch.setattr(tensor, "data_ptr", lambda: 0)
         monkeypatch.setattr(tensor, "is_pinned", lambda: True)
+    else:
+        monkeypatch.setattr(tensor, "is_pinned", lambda: False)
 
     def allocate(size, *, dtype, pin_memory):
         assert size == tensor.numel() and dtype == tensor.dtype and pin_memory
@@ -128,14 +131,22 @@ def test_invalid_pinned_allocation_is_rejected(monkeypatch, null_address):
     monkeypatch.setattr(torch, "empty", allocate)
     with pytest.raises(RuntimeError, match="Failed to allocate 192 pinned CPU bytes"):
         HostCacheStorage(
-            _layout(), group_specs=_SPECS, num_host_lcm_blocks=2, block_alignment=1
+            _layout(),
+            group_specs=_SPECS,
+            num_host_lcm_blocks=2,
+            block_alignment=1,
+            align_host_buffer=False,
         )
 
 
 def test_block_offsets_follow_group_packing_without_overlap():
     layout = _layout()
     storage = HostCacheStorage(
-        layout, group_specs=_SPECS, num_host_lcm_blocks=2, block_alignment=1
+        layout,
+        group_specs=_SPECS,
+        num_host_lcm_blocks=2,
+        block_alignment=1,
+        align_host_buffer=False,
     )
 
     # The 80-byte State rounds the parent up to three whole KV pages.
@@ -159,7 +170,11 @@ def test_direct_io_alignment_pads_every_block_after_its_fields():
         consumers=(("k", "v"), ("state",)),
     )
     storage = HostCacheStorage(
-        layout, group_specs=_SPECS, num_host_lcm_blocks=3, block_alignment=4096
+        layout,
+        group_specs=_SPECS,
+        num_host_lcm_blocks=3,
+        block_alignment=4096,
+        align_host_buffer=True,
     )
 
     assert storage.host_cache_block_bytes == (8192, 12288)
@@ -169,17 +184,40 @@ def test_direct_io_alignment_pads_every_block_after_its_fields():
     # Every block starts on the alignment, so each moves in one direct I/O.
     for group_index, packing in enumerate(storage.group_packing):
         for block_id in range(1, 3 * packing + 1):
-            assert storage.host_block_offset(group_index, block_id) % 4096 == 0
+            assert (
+                storage.host_buffer.data_ptr()
+                + storage.host_block_offset(group_index, block_id)
+            ) % 4096 == 0
     with pytest.raises(ValueError, match="block_alignment"):
         HostCacheStorage(
-            layout, group_specs=_SPECS, num_host_lcm_blocks=1, block_alignment=0
+            layout,
+            group_specs=_SPECS,
+            num_host_lcm_blocks=1,
+            block_alignment=0,
+            align_host_buffer=False,
+        )
+
+
+@pytest.mark.parametrize("block_alignment", [3, 8192])
+def test_aligned_buffer_rejects_incompatible_block_alignment(block_alignment):
+    with pytest.raises(ValueError, match="block_alignment .* must divide"):
+        HostCacheStorage(
+            _layout(),
+            group_specs=_SPECS,
+            num_host_lcm_blocks=2,
+            block_alignment=block_alignment,
+            align_host_buffer=True,
         )
 
 
 def test_the_host_block_capacity_is_the_densest_groups_blocks():
     # Three 32-byte KV pages per 96-byte parent beside one 80-byte State.
     storage = HostCacheStorage(
-        _layout(), group_specs=_SPECS, num_host_lcm_blocks=5, block_alignment=1
+        _layout(),
+        group_specs=_SPECS,
+        num_host_lcm_blocks=5,
+        block_alignment=1,
+        align_host_buffer=False,
     )
     assert storage.group_packing == (3, 1)
     assert host_block_capacity(storage, (1, 1)) == 15
@@ -191,7 +229,11 @@ def test_the_host_block_capacity_is_the_densest_groups_blocks():
 def test_null_and_out_of_range_blocks_are_rejected(group_index, block_id):
     layout = _layout()
     storage = HostCacheStorage(
-        layout, group_specs=_SPECS, num_host_lcm_blocks=2, block_alignment=1
+        layout,
+        group_specs=_SPECS,
+        num_host_lcm_blocks=2,
+        block_alignment=1,
+        align_host_buffer=False,
     )
 
     with pytest.raises(IndexError):
@@ -225,7 +267,11 @@ def test_host_fields_are_packed_without_padding():
     )
 
     storage = HostCacheStorage(
-        layout, group_specs=_SPECS, num_host_lcm_blocks=1, block_alignment=1
+        layout,
+        group_specs=_SPECS,
+        num_host_lcm_blocks=1,
+        block_alignment=1,
+        align_host_buffer=False,
     )
 
     assert storage.host_cache_block_bytes == (80, 1200)
@@ -246,7 +292,11 @@ def test_host_storage_does_not_retain_device_buffers():
     reference = weakref.ref(buffer)
     layout = dataclasses.replace(_layout(), buffers=(buffer,))
     storage = HostCacheStorage(
-        layout, group_specs=_SPECS, num_host_lcm_blocks=2, block_alignment=1
+        layout,
+        group_specs=_SPECS,
+        num_host_lcm_blocks=2,
+        block_alignment=1,
+        align_host_buffer=False,
     )
     del layout, buffer
     gc.collect()
@@ -271,6 +321,7 @@ def test_shared_host_storage_packs_payloads_independently_of_device_strides():
         group_specs=(*_SPECS, _kv("aux")),
         num_host_lcm_blocks=2,
         block_alignment=1,
+        align_host_buffer=False,
     )
 
     # Three 32-byte KV pages make the 96-byte parent: 19 aux payloads fit it.
@@ -305,7 +356,11 @@ _QWEN38_GROUPS = (
 def test_parent_packs_whole_kv_pages_beside_a_larger_state_checkpoint():
     layout, specs = _payload_layout(_QWEN38_GROUPS)
     storage = HostCacheStorage(
-        layout, group_specs=specs, num_host_lcm_blocks=2, block_alignment=1
+        layout,
+        group_specs=specs,
+        num_host_lcm_blocks=2,
+        block_alignment=1,
+        align_host_buffer=False,
     )
 
     # The State checkpoint is 8.63 full-attention pages: 8 pages leave a 7.3%

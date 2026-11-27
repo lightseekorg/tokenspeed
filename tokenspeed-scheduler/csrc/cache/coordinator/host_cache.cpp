@@ -24,6 +24,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <memory_resource>
 #include <optional>
@@ -38,11 +39,17 @@
 #include "cache/coordinator/tier_eviction_planner.h"
 #include "cache/core/block_placement_demand.h"
 #include "utils.h"
+#include "cache/coordinator/gds_tiered.h"
+#include <numeric>
 
 namespace tokenspeed {
 
-std::vector<HostCache::StoreCandidate> HostCache::TakePendingStores() {
-    auto pending = std::exchange(pending_stores_, {});
+std::vector<HostCache::StoreCandidate> HostCache::TakePendingStores(std::size_t max_candidates) {
+    const auto past_end =
+        pending_stores_.begin() + static_cast<std::ptrdiff_t>(std::min(max_candidates, pending_stores_.size()));
+    std::vector<StoreCandidate> pending(std::make_move_iterator(pending_stores_.begin()),
+                                        std::make_move_iterator(past_end));
+    pending_stores_.erase(pending_stores_.begin(), past_end);
     std::erase_if(pending, [this](const StoreCandidate& candidate) {
         const auto& index = store_.Groups()[candidate.key.group_id].Index();
         auto location = store_.LocationOf(store_.DevicePool(), candidate.key.group_id, candidate.key);
@@ -76,6 +83,7 @@ void HostCache::QueueCachedBlocksForStore(std::span<const std::string> content_h
 
 HostCache::HostAllocationBatch HostCache::AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                                             std::span<const std::int32_t> buckets) {
+    if (store_.UsesGds()) return acquireGdsBlocks(group_ids, buckets, true, false);
     _assert(store_.HostPool() != nullptr, "AcquireHostBlocks requires a host pool");
     _assert(group_ids.size() == buckets.size(), "Host allocation needs one bucket per requested block");
     HostAllocationBatch batch;
@@ -136,6 +144,87 @@ HostCache::HostAllocationBatch HostCache::AcquireHostBlocks(std::span<const std:
     return batch;
 }
 
+HostCache::HostAllocationBatch HostCache::AcquireHostCopies(std::span<const std::uint32_t> groups,
+                                                            std::span<const std::int32_t> buckets) {
+    return store_.UsesGds() ? acquireGdsBlocks(groups, buckets, false, false) : AcquireHostBlocks(groups, buckets);
+}
+
+HostCache::HostAllocationBatch HostCache::AcquireHostLanding(std::span<const std::uint32_t> groups,
+                                                             std::span<const std::int32_t> buckets) {
+    if (store_.UsesGds()) return acquireGdsBlocks(groups, buckets, true, true);
+    _assert(groups.size() == buckets.size(), "one Host bucket per landing block");
+    HostAllocationBatch batch;
+    batch.blocks.resize(groups.size());
+    batch.stats.requested = groups.size();
+    batch.stats.unallocated = groups.size();
+    std::vector<TierEvictionPlanner::VictimSet> victims;
+    {
+        TierEvictionPlanner planner{store_, history_, *store_.HostPool(), CacheTier::kHost};
+        auto demand = EmptyBlockDemands(store_);
+        for (std::size_t i = 0; i < groups.size(); ++i) ++demand[groups[i]].blocks_by_bucket[buckets[i]];
+        if (!planner.Fit(demand)) return batch;
+        planner.Minimize(demand);
+        victims = planner.TakeVictims();
+    }
+    for (const auto& set : victims)
+        for (const auto& [group, location] : set.members)
+            if (store_.Groups()[group].Index().Contains(*store_.HostPool(), location))
+                FatalCheck(evictor_.EvictHostCachedBlock(group, location, &CacheEvictor::HostEvictionStats::lru),
+                           "a planned Host landing victim became pinned");
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+        auto blocks = store_.HostPool()->AcquireBlocksInBuckets(groups[i], buckets.subspan(i, 1));
+        FatalCheck(blocks.size() == 1, "a whole Host landing must fit its preview");
+        batch.blocks[i] = std::move(blocks.front());
+    }
+    batch.stats.allocated = groups.size();
+    batch.stats.unallocated = 0;
+    return batch;
+}
+
+HostCache::HostAllocationBatch HostCache::acquireGdsBlocks(std::span<const std::uint32_t> groups,
+                                                           std::span<const std::int32_t> buckets,
+                                                           bool allow_logical_loss, bool whole) {
+    _assert(groups.size() == buckets.size(), "one Host bucket per requested block");
+    std::vector<std::size_t> ends(groups.size());
+    std::iota(ends.begin(), ends.end(), 1);
+    if (whole && !ends.empty()) ends = {groups.size()};
+    auto selected = PlanTieredHostAllocation(store_, groups, buckets, ends, allow_logical_loss, false);
+    if (whole && !std::ranges::all_of(selected.accepted, [](bool accepted) { return accepted; })) {
+        HostAllocationBatch rejected;
+        rejected.blocks.resize(groups.size());
+        rejected.stats.requested = groups.size();
+        rejected.stats.unallocated = groups.size();
+        return rejected;
+    }
+    const auto victims = TieredVictims(selected.plan, std::pmr::get_default_resource());
+    FatalCheck(evictor_
+                   .EvictPlanned(victims, false,
+                                 CacheEvictor::VictimReasons{
+                                     .victim = &CacheEvictor::DeviceEvictionStats::admission,
+                                     .stranded_suffix = &CacheEvictor::DeviceEvictionStats::stranded_suffix,
+                                     .request_reclaim = &CacheEvictor::DeviceEvictionStats::request_reclaim})
+                   .empty(),
+               "a joint Host plan cannot reclaim live Device owners");
+    HostAllocationBatch batch;
+    batch.blocks.resize(groups.size());
+    batch.stats.requested = groups.size();
+    for (std::size_t g = 0; g < store_.Groups().size(); ++g) {
+        std::vector<std::size_t> rows;
+        std::vector<std::int32_t> owners;
+        for (std::size_t row = 0; row < groups.size(); ++row)
+            if (selected.accepted[row] && groups[row] == g) {
+                rows.push_back(row);
+                owners.push_back(buckets[row]);
+            }
+        auto blocks = store_.HostPool()->AcquireBlocksInBuckets(static_cast<std::uint32_t>(g), owners);
+        FatalCheck(blocks.size() == rows.size(), "joint Host placement did not fit its preview");
+        for (std::size_t i = 0; i < rows.size(); ++i) batch.blocks[rows[i]] = std::move(blocks[i]);
+        batch.stats.allocated += rows.size();
+    }
+    batch.stats.unallocated = batch.stats.requested - batch.stats.allocated;
+    return batch;
+}
+
 CacheBlockRef HostCache::AcquireHostBlock(std::uint32_t group_id, std::int32_t bucket) {
     const std::array groups{group_id};
     const std::array buckets{bucket};
@@ -178,6 +267,7 @@ HostCache::HostPlacementPlan HostCache::planHostBoundaries(std::span<const std::
                 "Host block bucket is outside the group's shard count");
         ++block_demands[group_ids[row]].blocks_by_bucket[buckets[row]];
     }
+    if (store_.UsesGds()) return planHostSegments(group_ids, buckets, boundaries);
     TierEvictionPlanner planner{store_, history_, *store_.HostPool(), CacheTier::kHost};
     HostPlacementPlan plan;
     if (planner.Fits(block_demands)) {
@@ -291,6 +381,33 @@ void HostCache::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key,
         node->latest_state_access_epoch =
             std::max({node->latest_state_access_epoch, metadata.eviction.last_access_epoch, metadata.max_access_epoch});
     }
+}
+
+void HostCache::TouchHostKeys(std::span<const CacheKey> keys) {
+    _assert(store_.HostPool() != nullptr, "TouchHostKeys requires a host pool");
+    const std::uint64_t access_epoch = history_.IssueAccessEpoch();
+    for (const CacheKey& key : keys) {
+        _assert(key.group_id < store_.Groups().size(), "Host touch key group id out of range");
+        PrefixCacheIndex& index = store_.Groups()[key.group_id].Index();
+        // TouchExisting refreshes the entries of the keys whose source block
+        // is present: the entry's own block stands for it.
+        const CacheBlockRef block = index.Find(*store_.HostPool(), key);
+        if (!block) {
+            continue;
+        }
+        index.TouchExisting(*store_.HostPool(), std::span{&key, 1}, std::span{&block, 1}, access_epoch,
+                            /*session=*/nullptr);
+        // A hit keeps its tail young under the per-prior cap.
+        store_.Boundaries().TouchTail(key.content_hash);
+    }
+}
+
+bool HostCache::TryEvictHostEntry(const CacheKey& key) {
+    _assert(store_.HostPool() != nullptr, "TryEvictHostEntry requires a host pool");
+    _assert(key.group_id < store_.Groups().size(), "Host entry key group id out of range");
+    const std::optional<CacheBlockLocation> location = store_.LocationOf(*store_.HostPool(), key.group_id, key);
+    return !location ||
+           evictor_.EvictHostCachedBlock(key.group_id, *location, &CacheEvictor::HostEvictionStats::released);
 }
 
 void HostCache::CacheHostTail(const ContentHash& prior, const TailPublication& tail) {

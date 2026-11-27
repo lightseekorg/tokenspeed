@@ -94,6 +94,7 @@ def test_beam_scheduler_preserves_nonmixed_capacity_and_explicit_opt_in(mixed):
         enable_kv_cache_events=False,
         prefix_replay_tokens=0,
         peer_config=None,
+        shared_l2_config=None,
         num_disk_pages=0,
         disk_config=None,
     )

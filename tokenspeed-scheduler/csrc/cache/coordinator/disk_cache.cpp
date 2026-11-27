@@ -126,9 +126,14 @@ bool DiskCache::DropUnreadableEntry(const CacheKey& key) {
     if (store_.DiskPool() == nullptr) {
         return false;
     }
-    const std::optional<CacheBlockLocation> location = store_.LocationOf(*store_.DiskPool(), key.group_id, key);
-    return location.has_value() &&
-           evictor_.EvictDiskCachedBlock(key.group_id, *location, &CacheEvictor::DiskEvictionStats::read_failure);
+    return evictor_.InvalidateDiskEntry(key);
+}
+
+bool DiskCache::DropUnreadableEntry(const CacheKey& key, const CacheBlockRef& source) {
+    // Another read may already have invalidated this source, and cleaning
+    // may have published a new copy under the same immutable content key.
+    if (!source || AcquireDiskCachedBlock(key) != source) return false;
+    return DropUnreadableEntry(key);
 }
 
 std::int32_t DiskCache::NumDiskCachedBlocks() const {

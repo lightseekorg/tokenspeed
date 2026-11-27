@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from kda_replay_reference import (
+from kda_gate_reference import (
     _gate_tiling,
     _gate_tiling_dot,
     batched_kda_gate_precompute_dot_kernel,

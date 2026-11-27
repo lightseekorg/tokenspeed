@@ -291,6 +291,20 @@ TEST_F(AlignedStateCheckpointSuite, A4097TokenRequestSavesItsInteriorCheckpointI
     EXPECT_EQ(hit.state_row.at(0), checkpoint);
 }
 
+TEST_F(AlignedStateCheckpointSuite, RejectsGdsWithoutPrefixCacheBeforeBuildingPools) {
+    auto cfg = MakeConfig();
+    cfg.state_checkpoint_in_forward = false;
+    cfg.disable_prefix_cache = true;
+    cfg.prefix_cache_evict_policy = "gds";
+    cfg.prefix_cache_gds_prefill_cost = std::array<double, 2>{1, 0};
+    try {
+        Scheduler scheduler{cfg};
+        FAIL() << "GDS cannot retain unpublished prefixes";
+    } catch (const std::invalid_argument& error) {
+        EXPECT_NE(std::string{error.what()}.find("gds requires prefix caching"), std::string::npos);
+    }
+}
+
 TEST_F(AlignedStateCheckpointSuite, RejectsBudgetSmallerThanOneSegment) {
     auto cfg = MakeConfig();
     cfg.max_scheduled_tokens = 4095;
@@ -5895,6 +5909,120 @@ TEST(InputCheckpointRetention, RefreshPreservesSessionOwnershipAcrossTiers) {
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).Inspect(device, device_key)->metadata.eviction.last_access_epoch, 0u);
     EXPECT_EQ(coordinator.GroupPrefixIndex(1).Inspect(host, host_key)->metadata.eviction.last_access_epoch, 0u);
     EXPECT_EQ(coordinator.DemoteSession("session", false), 0u);
+}
+
+// A State group that defers its decode state (CacheGroupConfig::
+// deferred_decode_state) keeps a decoding request's accepted records in its
+// request slot, outside the live block its decode steps write in place, until
+// the runtime folds them in where a plan says (ExecutionPlan::state_folds).
+class StateFoldSuite : public StateCheckpointSuite {
+protected:
+    using Folds = std::map<std::string, std::vector<std::pair<std::int32_t, std::int32_t>>>;
+
+    // `snapshot_pages` 0 keeps the suite's pool, which holds any image.
+    void Start(bool deferred, std::int32_t snapshot_pages, std::int32_t force_retraction_interval) {
+        config_ = WithHostPackingFromDevice(MakeConfig());
+        for (CacheGroupConfig& group : config_.cache_groups) {
+            group.deferred_decode_state = deferred && group.attn_kind == AttnKind::kState;
+        }
+        if (snapshot_pages > 0) {
+            config_.snapshot_allocator.total_pages = snapshot_pages;
+        }
+        config_.debug_force_retraction_interval = force_retraction_interval;
+        scheduler_ = std::make_unique<Scheduler>(config_);
+    }
+
+    // Per deferred group, `id`'s request pool index and live block (slot 1)
+    // in `plan`'s batch: what its retraction lists for the fold.
+    Folds LiveBlocks(const ExecutionPlan& plan, const std::string& id) const {
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_TRUE_OR_RETURN(batch != nullptr, {});
+        const auto it = std::ranges::find(batch->request_ids, id);
+        ASSERT_TRUE_OR_RETURN(it != batch->request_ids.end(), {});
+        const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
+        const auto tables = batch->BlockTables();
+        Folds folds;
+        for (const CacheGroupConfig& group : config_.cache_groups) {
+            if (group.deferred_decode_state) {
+                folds[group.group_id].emplace_back(batch->request_pool_indices.at(row),
+                                                   tables.at(group.group_id).at(row).at(1));
+            }
+        }
+        return folds;
+    }
+};
+
+TEST_F(StateFoldSuite, ARetractionListsTheDecodingVictimsLiveBlocksToFold) {
+    for (const bool deferred : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "deferred=" << deferred);
+        Start(deferred, /*snapshot_pages=*/0, /*force_retraction_interval=*/1);
+        Submit(RequestWithTokens("r", MakeTokens(6)));
+        PlanOnce();
+        SendForwardDone("r", {101});
+        const Folds live = LiveBlocks(PlanOnce(), "r");
+        EXPECT_EQ(live.size(), deferred ? 3u : 0u);
+        SendForwardDone("r", {102});
+        std::optional<ExecutionPlan> retraction;
+        for (int round = 0; round < 3 && scheduler_->RetractedSize() == 0; ++round) {
+            retraction = PlanOnce();
+        }
+        ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+        // The image reads these blocks; no peer is configured, and the fold
+        // does not depend on one.
+        EXPECT_EQ(retraction->state_folds, live);
+        EXPECT_FALSE(retraction->state_commit_fence.has_value());
+    }
+}
+
+// A snapshot pool of one usable page and no Host tier: the image the split
+// plans after the publication cannot be held, so the victim is aborted, but
+// its publication stands and a later prompt resumes from its endpoint. The
+// plan still lists the block for the fold, which completes that endpoint.
+TEST_F(StateFoldSuite, ARefusedImageStillFoldsTheEndpointItsRetractionPublished) {
+    Start(/*deferred=*/true, /*snapshot_pages=*/2, /*force_retraction_interval=*/0);
+    Submit(RequestWithTokens("r", MakeTokens(6)));
+    PlanOnce();
+    SendForwardDone("r", {101});
+    const Folds live = LiveBlocks(PlanOnce(), "r");
+    ASSERT_EQ(live.size(), 3u);
+    SendForwardDone("r", {102});
+
+    ExecutionPlan plan;
+    ASSERT_TRUE(SchedulerTestAccess::RetractVictim(*scheduler_, "r", plan).has_value());
+    ASSERT_EQ(plan.aborts.size(), 1u);
+    EXPECT_EQ(plan.aborts.front().request_id, "r");
+    EXPECT_EQ(plan.state_folds, live);
+
+    const Resume hit = Probe("hit", {1, 2, 3, 4, 5, 6, 101, 77});
+    EXPECT_EQ(hit.prefix_tokens, 7);
+    EXPECT_EQ(hit.state_row.at(0), live.at("state0").front().second) << "the hit reads the folded block";
+}
+
+// "a" finishes at 9 computed tokens and publishes that endpoint; "b" extends
+// the same tokens to the same point and is retracted there. b's publication
+// swaps its live blocks for a's equal entries, which hold the complete state,
+// so nothing is folded into them.
+TEST_F(StateFoldSuite, ABlockThePublicationSwappedForAnEqualEntryIsNotFolded) {
+    Start(/*deferred=*/true, /*snapshot_pages=*/2, /*force_retraction_interval=*/0);
+    Submit(RequestWithTokens("a", MakeTokens(6)));
+    PlanOnce();
+    for (const std::int32_t token : {101, 102, 103}) {
+        SendForwardDone("a", {token});
+        PlanOnce();
+    }
+    SendForwardDone("a", {104});
+    SendFinish("a");
+    PlanOnce();
+
+    Submit(RequestWithTokens("b", {1, 2, 3, 4, 5, 6, 101, 102}));
+    PlanOnce();
+    SendForwardDone("b", {103});
+    ASSERT_EQ(LiveBlocks(PlanOnce(), "b").size(), 3u);
+    SendForwardDone("b", {104});
+
+    ExecutionPlan plan;
+    ASSERT_TRUE(SchedulerTestAccess::RetractVictim(*scheduler_, "b", plan).has_value());
+    EXPECT_TRUE(plan.state_folds.empty());
 }
 
 }  // namespace tokenspeed::test

@@ -62,10 +62,14 @@ from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
     SamplingBackendConfig,
     SpeculativeSamplingPools,
 )
+from tokenspeed.runtime.sampling.backends.flashinfer import (  # noqa: E402
+    FlashInferSamplingBackend,
+)
 from tokenspeed.runtime.sampling.backends.triton import (  # noqa: E402
     TritonSamplingBackend,
 )
 from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ  # noqa: E402
+from tokenspeed.runtime.utils.env import global_server_args_dict  # noqa: E402
 
 N = 4  # verify width: anchor + 3 drafts
 STEPS = N - 1
@@ -251,9 +255,10 @@ def test_a_landed_or_readmitted_slot_takes_a_new_chain_after_the_reset():
     assert states.future_draft_q.pos[1].tolist() == [0, *lane[0].tolist()]
 
 
-def test_base_dflash_refuses_the_flag_at_bind():
-    # Base DFLASH (no candidate selector) proposes the argmax of every block
-    # row; only the loaded checkpoint tells it apart from DFlash2.
+def test_base_dflash_refuses_a_verifier_that_reads_no_dense_q():
+    # Base DFLASH (no candidate selector) records the dense q; the triton
+    # verifier reads only DFlash2's sparse q, so only the loaded checkpoint
+    # (hence the drafter) can tell this pairing is wrong.
     drafter = DFlash.__new__(DFlash)
     drafter.runtime_states = RuntimeStates(
         req_pool_size=POOL,
@@ -262,9 +267,46 @@ def test_base_dflash_refuses_the_flag_at_bind():
         output_length=N,
         device="cpu",
     )
-    with pytest.raises(ValueError, match="needs a DFlash2 draft"):
+    with pytest.raises(ValueError, match="records a dense draft q"):
         drafter.bind_sampling_backend(_triton_backend(enable_speculative_sampling=True))
+    # Off, nothing is checked.
     drafter.bind_sampling_backend(_triton_backend(enable_speculative_sampling=False))
+
+
+@pytest.mark.parametrize(
+    ("rejection_method", "reads_sparse"), [("standard", True), ("block", False)]
+)
+def test_triton_reads_the_sparse_q_except_under_block_verification(
+    monkeypatch, rejection_method, reads_sparse
+):
+    # Block verification reads the dense q the chain drafters record; the
+    # DFlash2 chain verify reads the sparse one. The drafter's pairing check
+    # asks the backend, so the answer has to follow the verify rule.
+    monkeypatch.setitem(
+        global_server_args_dict, "speculative_rejection_sample_method", rejection_method
+    )
+    backend = _triton_backend(enable_speculative_sampling=True)
+    assert backend.reads_sparse_draft_q() is reads_sparse
+    # Without the flag block verification never runs, so the sparse q stays.
+    off = _triton_backend(enable_speculative_sampling=False)
+    assert off.reads_sparse_draft_q() is True
+
+
+def test_dflash2_refuses_a_verifier_that_reads_no_sparse_q():
+    # FlashInfer reads the dense rows only; DFlash2 records the sparse q.
+    config = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
+        enable_speculative_sampling=True,
+        sampling_stream="batch",
+        logprob_order="torch",
+        max_bs=MAX_BS,
+        max_draft_tokens_per_req=N,
+        max_req_pool_size=POOL,
+        vocab_size=VOCAB,
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="records a sparse draft q"):
+        _dflash2(_states()).bind_sampling_backend(FlashInferSamplingBackend(config))
 
 
 def _dflash2(states: RuntimeStates) -> DFlash2:
@@ -363,6 +405,7 @@ def _executor_config(spec_algo: str) -> ModelExecutorConfig:
         enable_memory_saver=False,
         spec_algo=spec_algo,
         spec_num_tokens=N,
+        acl_graph_memory_policy="discard",
     )
 
 
@@ -372,6 +415,8 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
     executor = ModelExecutor.__new__(ModelExecutor)
     # No drafter keeps its draft head sharded, so q stays over whole rows.
     executor.drafter = None
+    # With no drafter to ask (a pipeline stage before the last), DFLASH keeps
+    # the old rule: it allocates no dense rows.
     for spec_algo, dense in (("DFLASH", False), ("DSPARK", True)):
         executor.runtime_states = RuntimeStates(
             req_pool_size=POOL,
@@ -383,6 +428,22 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
         config = _executor_config(spec_algo)
         executor._init_draft_probs(config, N)
         assert (executor.runtime_states.draft_probs is not None) == dense
+
+    # With a drafter, the q it records decides: DFlash2 records the sparse q,
+    # base DFLASH the dense rows.
+    for drafter_cls, dense in ((DFlash2, False), (DFlash, True)):
+        executor.drafter = drafter_cls.__new__(drafter_cls)
+        executor.runtime_states = RuntimeStates(
+            req_pool_size=POOL,
+            input_vocab_size=VOCAB,
+            vocab_size=VOCAB,
+            output_length=N,
+            device="cpu",
+        )
+        executor._samples_from_vocab_shard = False
+        executor._init_draft_probs(_executor_config("DFLASH"), N)
+        assert (executor.runtime_states.draft_probs is not None) == dense
+    executor.drafter = None
 
     drafter = DSpark.__new__(DSpark)
     BaseDrafter.__init__(
@@ -409,6 +470,78 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
     # record no q, so verify would reject every draft.
     assert isinstance(drafter.draft_sampler, DraftProposalSampler)
     assert not drafter.logits_processor.do_argmax
+
+
+class _HeadlessDraftModel(torch.nn.Module):
+    """A DFLASH draft model: no ``lm_head``, it projects through the target's."""
+
+    def __init__(self):
+        super().__init__()
+        self.logits_processor = SimpleNamespace()
+
+
+@pytest.mark.parametrize("drafter_cls", [DFlash, DFlash2])
+@pytest.mark.parametrize(
+    "draft_model_runner",
+    [SimpleNamespace(model=_HeadlessDraftModel()), None],
+    ids=["headless-draft-model", "no-draft-model-runner"],
+)
+def test_block_drafters_never_keep_their_logits_on_a_vocab_shard(
+    drafter_cls, draft_model_runner
+):
+    # With a target head sharded over TP and a verifier that reads q per shard
+    # (sonic), the executor asks the drafter whether its steps stay sharded.
+    # A block drafter has no per-step shard, so it answers before reading the
+    # draft model at all: it has no ``lm_head`` of its own to inspect (it
+    # projects through the target's), and the base method's old order read
+    # ``model.lm_head`` first and raised AttributeError at startup.
+    drafter = drafter_cls.__new__(drafter_cls)
+    BaseDrafter.__init__(
+        drafter,
+        spec_num_tokens=N,
+        draft_model_runner=draft_model_runner,
+    )
+    assert drafter.keep_draft_logits_vocab_sharded(lambda *args: True, 0) is False
+
+
+def test_executor_records_a_base_dflash_q_over_whole_rows_under_a_sharded_target():
+    # The same pairing through the executor's own decision: the target's sampled
+    # rows stay vocab-sharded and the verifier takes q per shard, yet base DFLASH
+    # (whose block is projected whole) records whole rows instead of a shard.
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.runtime_states = RuntimeStates(
+        req_pool_size=POOL,
+        input_vocab_size=VOCAB,
+        vocab_size=VOCAB,
+        output_length=N,
+        device="cpu",
+    )
+    drafter = DFlash.__new__(DFlash)
+    BaseDrafter.__init__(
+        drafter,
+        spec_num_tokens=N,
+        draft_model_runner=SimpleNamespace(model=_HeadlessDraftModel()),
+    )
+    executor.drafter = drafter
+    executor._samples_from_vocab_shard = True
+    executor.sampling_backend = SimpleNamespace(
+        verifies_vocab_shard_draft_probs=lambda: True,
+        supports_vocab_shard=lambda *args: True,
+    )
+    executor.model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            lm_head=SimpleNamespace(
+                shard_indices=SimpleNamespace(
+                    org_vocab_start_index=0, num_org_elements=VOCAB // 2
+                )
+            )
+        )
+    )
+
+    executor._init_draft_probs(_executor_config("DFLASH"), N)
+
+    # One row per pool slot plus the reserved padding slot, over every column.
+    assert executor.runtime_states.draft_probs.shape == (POOL + 1, N, VOCAB)
 
 
 if __name__ == "__main__":

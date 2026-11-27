@@ -1,0 +1,71 @@
+api_version: ci.tokenspeed.io/v1
+name: eval-qwen3.8-flash-next-nvfp4-deferred-gdn-gsm8k
+type: eval
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+# The model modules this task serves; pull requests changing only other models skip it.
+model_sources:
+  - python/tokenspeed/runtime/models/qwen3_5.py
+  - python/tokenspeed/runtime/models/qwen3_5_moe.py
+  - python/tokenspeed/runtime/models/qwen3_vision.py
+  - python/tokenspeed/runtime/models/qwen4_exp.py
+  - python/tokenspeed/runtime/models/qwen4_exp_monokernel.py
+runner:
+  labels:
+    - b200-2gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+server:
+  command: >-
+    ts serve
+    --model nvidia/Qwen3.8-Flash-Next-NVFP4
+    --revision fc694b54fb0174e0913e6adf86691ef85a4ead47
+    --trust-remote-code
+    --language-model-only
+    --tensor-parallel-size 2
+    --expert-parallel-size 2
+    --moe-backend flashinfer_trtllm
+    --kv-cache-dtype bfloat16
+    --mamba-ssm-dtype bfloat16
+    --speculative-algorithm MTP
+    --speculative-num-steps 3
+    --speculative-num-draft-tokens 4
+    --speculative-eagle-topk 1
+    --enable-deferred-gdn-state
+    --hf-overrides '{"index_share_for_mtp_iteration":true}'
+    --reasoning-parser qwen3
+    --tool-call-parser qwen_xml
+    --gpu-memory-utilization 0.6
+    --kvstore-size 4
+    --max-model-len 8192
+    --max-num-seqs 16
+    --max-cudagraph-capture-size 16
+    --sampling-backend greedy
+    --host 127.0.0.1
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+eval:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/evalscope-perf/bin/evalscope eval
+    --model nvidia/Qwen3.8-Flash-Next-NVFP4
+    --api-url http://127.0.0.1:8000/v1
+    --api-key EMPTY_TOKEN
+    --datasets gsm8k
+    --dataset-hub huggingface
+    --dataset-args '{"gsm8k":{"dataset_id":"openai/gsm8k"}}'
+    --eval-batch-size 16
+    --stream
+    --generation-config '{"do_sample":false,"temperature":0.0,"max_tokens":1024,"extra_body":{"chat_template_kwargs":{"enable_thinking":false}}}'
+report:
+  github_step_summary: true
+score_threshold: 0.96

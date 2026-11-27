@@ -205,6 +205,24 @@ StorageQuery StorageQueries::MissingStorageKeys(const PromptPrefix& prompt, std:
 
 StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                                         std::size_t max_blocks) {
+    return reserveStoragePrefix(prompt, hits, max_blocks, max_blocks, nullptr, nullptr);
+}
+
+StorageReservation StorageQueries::ReserveExactStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
+                                                             std::size_t available, std::size_t limit, bool& retry) {
+    retry = false;
+    return reserveStoragePrefix(prompt, hits, available, limit, &retry, nullptr);
+}
+
+StorageReservation StorageQueries::ReserveDiskPrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
+                                                     std::size_t max_blocks) {
+    FatalCheck(store_.DiskPool() != nullptr, "Disk prefix reservation requires a Disk pool");
+    return reserveStoragePrefix(prompt, hits, max_blocks, max_blocks, nullptr, store_.DiskPool());
+}
+
+StorageReservation StorageQueries::reserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
+                                                        std::size_t max_blocks, std::size_t limit, bool* exact_retry,
+                                                        const BlockPool* source_pool) {
     const std::unordered_set<CacheKey, CacheKeyHash> remote(hits.begin(), hits.end());
     // The Device-only probe: the reservation matches the Host suffix (Host and
     // remote) above its boundary again, under the same Host-suffix rule as
@@ -226,12 +244,15 @@ StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prom
         result.keys.clear();
         result.logical_blocks.clear();
         result.blocks.clear();
+        result.sources.clear();
         result.tail.reset();
         result.tail_prior = ContentHash{};
         const auto suffix = prober_.ProbeHostSuffix(candidate, group_keys, store_.MatchOrder(),
                                                     device_only.num_common_tokens, &remote, device_only);
         const PrefixProbe::Tier& probe = suffix.host;
-        if (probe.num_common_tokens <= device_only.num_common_tokens) return {};
+        if (probe.num_common_tokens <= device_only.num_common_tokens ||
+            (exact_retry && probe.num_common_tokens != prompt.max_tokens))
+            return {};
         const auto pin = [&](const CacheKey& key, std::int32_t logical_block) {
             auto ref = store_.AcquireHostCachedBlock(key);
             if (ref) {
@@ -254,19 +275,44 @@ StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prom
             result.tail = TailPublication{.tail_tokens = probe.tail->tail_tokens, .hash = probe.tail->hash};
         }
         if (result.keys.empty()) return {};
-        if (result.keys.size() + warm_blocks.size() <= max_blocks) {
-            auto allocation = host_.AcquireHostBlocks(groups, buckets);
+        const auto needed = result.keys.size() + warm_blocks.size();
+        if (exact_retry && needed > limit) return {};
+        if (needed <= max_blocks) {
+            if (source_pool) {
+                for (const auto& key : result.keys) {
+                    auto source = store_.Groups()[key.group_id].Index().Find(*source_pool, key);
+                    if (!source) return {};
+                    result.sources.push_back(std::move(source));
+                }
+            }
+            auto allocation = host_.AcquireHostLanding(groups, buckets);
             if (allocation.stats.allocated == groups.size()) {
                 result.num_tokens = probe.num_common_tokens;
                 result.blocks = std::move(allocation.blocks);
                 return result;
             }
         }
+        if (exact_retry) {
+            *exact_retry = true;
+            return {};
+        }
         // Re-run the matcher; a window/state mask cannot be truncated safely.
         candidate.max_tokens = probe.num_common_tokens - 1;
         candidate.tail.reset();
     }
     return {};
+}
+
+std::int32_t StorageQueries::ResumableStorageTokens(const PromptPrefix& prompt, std::span<const CacheKey> hits) const {
+    if (hits.empty() || prompt.max_tokens <= 0) return 0;
+    const std::unordered_set<CacheKey, CacheKeyHash> remote(hits.begin(), hits.end());
+    const PreparedPrefixKeys keys = prober_.ResolvePreparedPrefixKeys(prompt);
+    const auto& group_keys = *keys;
+    const PrefixProbe::Tier device_only =
+        prober_.ProbeTier(prompt, group_keys, store_.MatchOrder(), /*claim_partial=*/true);
+    const auto suffix = prober_.ProbeHostSuffix(prompt, group_keys, store_.MatchOrder(), device_only.num_common_tokens,
+                                                &remote, device_only);
+    return std::max(device_only.num_common_tokens, suffix.host.num_common_tokens);
 }
 
 PrefixProber::PrefixListing StorageQueries::ListWithDisk(const PromptPrefix& prompt,

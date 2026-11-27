@@ -35,6 +35,7 @@ import functools
 import glob
 import hashlib
 import json
+import logging
 import os
 import re
 from collections.abc import Callable, Sequence
@@ -63,6 +64,7 @@ _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
     "auto": (("*.safetensors",), ("*.bin",), ("*.pt",)),
     "safetensors": (("*.safetensors",),),
     "instanttensor": (("*.safetensors",),),
+    "runai_streamer": (("*.safetensors",),),
     "mistral": (("consolidated*.safetensors",),),
     "pt": (("*.pt",),),
     "npcache": (("*.bin",),),
@@ -70,9 +72,31 @@ _LOAD_FORMAT_WEIGHT_PATTERN_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
     "dummy": (),
     "extensible": (("*.safetensors",), ("*.bin",), ("*.pt",)),
 }
+# Run:ai streamer tuning knobs affect only I/O scheduling, never weight bytes.
+_RUNAI_STREAMER_TUNING_KEYS = frozenset(
+    {"concurrency", "memory_limit", "distributed", "distributed_scope"}
+)
+# Keep in lockstep with object_store._OBJECT_STORE_SCHEMES without importing
+# tokenspeed.runtime.model_loader (which pulls in torch/transformers and breaks
+# CPU-only L3 environments).
+_OBJECT_STORE_SCHEMES = ("gs://", "s3://")
 # Keep in lockstep with ShardedStateLoader.DEFAULT_PATTERN.
 _SHARDED_STATE_DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 _SHARDED_STATE_FIELD_RE = re.compile(r"\{(?:rank|part)(?::[^}]*)?\}")
+
+
+def _is_object_store_uri(path: str) -> bool:
+    return path.startswith(_OBJECT_STORE_SCHEMES)
+
+
+def _parse_object_store_uri(uri: str) -> tuple[str, str, str]:
+    if not _is_object_store_uri(uri):
+        raise ValueError(f"Unsupported object-store URI: {uri!r}")
+    scheme, _, rest = uri.partition("://")
+    bucket, _, prefix = rest.partition("/")
+    if not bucket:
+        raise ValueError(f"Object-store URI is missing bucket name: {uri!r}")
+    return scheme, bucket, prefix.strip("/")
 
 
 def cache_layout_signature(
@@ -152,6 +176,21 @@ def l3_cache_quantization_id(
     )
 
 
+def warn_if_unpinned_peer_weights(
+    weight_version: str, revisions: Sequence[str]
+) -> None:
+    """Warn when live peers have no explicit version covering all loaded weights."""
+    if weight_version.strip() in ("", "default") and any(
+        not _HF_COMMIT_HASH_RE.fullmatch(revision) for revision in revisions
+    ):
+        logging.getLogger(__name__).warning(
+            "Peer prefix sharing uses the default weight identity and an unpinned "
+            "model revision. Replicas that load different weights can reuse incorrect KV. "
+            "Set --weight-version for the target and draft weights together, or pin "
+            "each loaded model revision to an immutable commit."
+        )
+
+
 def l3_checkpoint_id(
     model_path: str,
     *,
@@ -188,7 +227,10 @@ def l3_checkpoint_id(
     (``ShardedStateLoader.DEFAULT_PATTERN`` when unset), not leftover
     default-named shards. ``npcache`` fingerprints ``np/weight_names.json``
     and the listed NumPy files when that cache exists, because the loader
-    then skips the ``*.bin`` bytes. Hugging Face hub ids still prefer the
+    then skips the ``*.bin`` bytes. Object-store checkpoints (``gs://``,
+    ``s3://``) hash the remote objects' version tokens (GCS ``generation``,
+    S3 ``ETag`` + ``Size``) across metadata files, custom ``*.py`` modules,
+    and selected weight shards. Hugging Face hub ids still prefer the
     loaded config commit, then a cached snapshot directory, then a
     pinned ``--revision``. The returned id always includes the
     normalized load format so two deployments that share a directory
@@ -198,24 +240,44 @@ def l3_checkpoint_id(
 
     if not isinstance(model_loader_extra_config, dict):
         raise TypeError("model_loader_extra_config must be a dict")
-    extra_json = json.dumps(
-        model_loader_extra_config, sort_keys=True, separators=(",", ":")
-    )
-    fmt = _normalize_load_format(load_format)
+    raw_fmt = _normalize_load_format(load_format)
+    if raw_fmt == "runai_streamer":
+        # Run:ai streams the exact same safetensors bytes; strip I/O tuning
+        # knobs and normalize to "safetensors" so P/D replicas with different
+        # concurrency/distributed settings share the same L3 namespace.
+        extra_for_id = {
+            k: v
+            for k, v in model_loader_extra_config.items()
+            if k not in _RUNAI_STREAMER_TUNING_KEYS
+        }
+        fmt = "safetensors"
+    else:
+        extra_for_id = model_loader_extra_config
+        fmt = raw_fmt
+    extra_json = json.dumps(extra_for_id, sort_keys=True, separators=(",", ":"))
     ext_digest = _extensible_fingerprint(ext_yaml, load_format=fmt)
+    if _is_object_store_uri(model_path):
+        normalized_uri = model_path.rstrip("/")
+        return _checkpoint_id_with_load_format(
+            "objstore-"
+            + _object_store_checkpoint_fingerprint(normalized_uri, fmt, extra_json),
+            load_format=fmt,
+            extra_config=extra_for_id,
+            ext_digest=ext_digest,
+        )
     if os.path.isdir(model_path):
         snapshot = _snapshot_commit_hash(model_path)
         if snapshot is not None:
             return _checkpoint_id_with_load_format(
                 snapshot,
                 load_format=fmt,
-                extra_config=model_loader_extra_config,
+                extra_config=extra_for_id,
                 ext_digest=ext_digest,
             )
         return _checkpoint_id_with_load_format(
             "local-" + _local_checkpoint_fingerprint(model_path, fmt, extra_json),
             load_format=fmt,
-            extra_config=model_loader_extra_config,
+            extra_config=extra_for_id,
             ext_digest=ext_digest,
         )
     commit = getattr(hf_config, "_commit_hash", None)
@@ -223,7 +285,7 @@ def l3_checkpoint_id(
         return _checkpoint_id_with_load_format(
             commit,
             load_format=fmt,
-            extra_config=model_loader_extra_config,
+            extra_config=extra_for_id,
             ext_digest=ext_digest,
         )
     model_dir = _resolved_model_dir(model_path, revision=revision)
@@ -233,20 +295,20 @@ def l3_checkpoint_id(
             return _checkpoint_id_with_load_format(
                 snapshot,
                 load_format=fmt,
-                extra_config=model_loader_extra_config,
+                extra_config=extra_for_id,
                 ext_digest=ext_digest,
             )
         return _checkpoint_id_with_load_format(
             "local-" + _local_checkpoint_fingerprint(model_dir, fmt, extra_json),
             load_format=fmt,
-            extra_config=model_loader_extra_config,
+            extra_config=extra_for_id,
             ext_digest=ext_digest,
         )
     if isinstance(revision, str) and _HF_COMMIT_HASH_RE.fullmatch(revision):
         return _checkpoint_id_with_load_format(
             revision,
             load_format=fmt,
-            extra_config=model_loader_extra_config,
+            extra_config=extra_for_id,
             ext_digest=ext_digest,
         )
     raise ValueError(
@@ -332,6 +394,8 @@ def _snapshot_commit_hash(snapshot_path: str) -> str | None:
 def _resolved_model_dir(model_path: str, *, revision: str) -> str | None:
     if os.path.isdir(model_path):
         return model_path
+    if _is_object_store_uri(model_path):
+        return None
     try:
         from huggingface_hub import snapshot_download
 
@@ -732,6 +796,109 @@ def _local_checkpoint_code_files(model_dir: str) -> tuple[tuple[str, str], ...]:
                 rel = "/".join((*rel_dir.split(os.sep), name))
             found.append((rel, path))
     return tuple(found)
+
+
+def _is_remote_checkpoint_code(rel: str) -> bool:
+    if not rel.endswith(".py"):
+        return False
+    parts = rel.split("/")
+    return all(
+        part and part != "__pycache__" and not part.startswith(".") for part in parts
+    )
+
+
+def _list_object_store_versions(uri: str) -> tuple[tuple[str, str], ...]:
+    """Return sorted ``(relative_path, version_token)`` pairs under ``uri``."""
+    scheme, bucket_name, prefix = _parse_object_store_uri(uri)
+    list_prefix = f"{prefix}/" if prefix else ""
+    entries: list[tuple[str, str]] = []
+    if scheme == "gs":
+        try:
+            from google.cloud import storage
+        except ImportError as exc:
+            raise ImportError(
+                "Computing L3 checkpoint ids for gs:// URIs requires "
+                "google-cloud-storage."
+            ) from exc
+        bucket = storage.Client().bucket(bucket_name)
+        for blob in bucket.list_blobs(prefix=list_prefix):
+            rel = blob.name[len(list_prefix) :]
+            if rel and not rel.endswith("/"):
+                if blob.generation is None:
+                    raise ValueError(
+                        f"GCS object {blob.name!r} under {uri!r} has no generation"
+                    )
+                entries.append((rel, f"gen:{blob.generation}"))
+    elif scheme == "s3":
+        try:
+            import boto3
+        except ImportError as exc:
+            raise ImportError(
+                "Computing L3 checkpoint ids for s3:// URIs requires boto3."
+            ) from exc
+        paginator = boto3.client("s3").get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket_name, Prefix=list_prefix):
+            for obj in page.get("Contents", ()):
+                rel = obj["Key"][len(list_prefix) :]
+                if rel and not rel.endswith("/"):
+                    etag = str(obj.get("ETag", "")).strip('"')
+                    size = obj.get("Size")
+                    if not etag or size is None:
+                        raise ValueError(
+                            f"S3 object {obj.get('Key')!r} under {uri!r} is missing "
+                            "ETag or Size metadata"
+                        )
+                    entries.append((rel, f"etag:{etag}:size:{size}"))
+    else:
+        raise ValueError(f"Unsupported object-store scheme: {scheme!r}")
+    entries.sort(key=lambda item: item[0])
+    return tuple(entries)
+
+
+@functools.cache
+def _object_store_checkpoint_fingerprint(
+    normalized_uri: str, load_format: str, extra_config_json: str
+) -> str:
+    """Hash remote version tokens for metadata, custom code, and selected weights."""
+    extra_config = json.loads(extra_config_json)
+    if not isinstance(extra_config, dict):
+        raise TypeError("model_loader_extra_config must be a dict")
+    entries = _list_object_store_versions(normalized_uri)
+    for rel, version in entries:
+        if not isinstance(version, str) or not version.strip():
+            raise ValueError(
+                f"Remote object {rel!r} under {normalized_uri!r} has no version token"
+            )
+    top_level_names = tuple(rel for rel, _ in entries if "/" not in rel)
+    if load_format == "sharded_state":
+        match_glob = _sharded_state_match_glob(_sharded_state_pattern(extra_config))
+        selected_weights = frozenset(
+            rel for rel, _ in entries if fnmatch.fnmatch(rel, match_glob)
+        )
+    else:
+        selected_weights = _selected_weight_names(
+            top_level_names, load_format=load_format
+        )
+    if load_format != "dummy" and not selected_weights:
+        raise ValueError(
+            f"L3 namespace cannot fingerprint {normalized_uri!r}: "
+            f"no weight objects matched load_format={load_format!r}"
+        )
+    selected_records = [
+        (rel, version)
+        for rel, version in entries
+        if (
+            ("/" not in rel and rel in _CHECKPOINT_METADATA_FILES)
+            or _is_remote_checkpoint_code(rel)
+            or rel in selected_weights
+        )
+    ]
+    payload = json.dumps(
+        {"uri": normalized_uri, "objects": selected_records},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 @functools.cache

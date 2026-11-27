@@ -33,6 +33,7 @@ from tokenspeed_engine.scheduler import (
     CacheGroupConfig,
     DiskConfig,
     SchedulerConfig,
+    SharedL2Config,
     StorageConfig,
 )
 
@@ -53,15 +54,16 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
     scheduler_role,
 )
 
-# The Host cache's ACKs, as the scheduler binds them: an L2 write-back or
-# load-back ticket, a retraction image's snapshot store, a restore. The data
-# plane reports them to the Rust control plane as ``(kind, op_id)`` payloads.
-_CACHE_EVENT_TYPES = {
-    "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
-    "LoadBackDoneEvent": Cache.LoadBackDoneEvent,
-    "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
-    "RestoreDoneEvent": Cache.RestoreDoneEvent,
-}
+# The data plane reports Host cache and state commit ACKs as ``(kind, op_id)``.
+_CACHE_EVENT_TYPES = frozenset(
+    {
+        "WriteBackDoneEvent",
+        "LoadBackDoneEvent",
+        "SnapshotDoneEvent",
+        "RestoreDoneEvent",
+        "StateCommitDoneEvent",
+    }
+)
 # make_config's host_write_policy names; ServerArgs validates the flag.
 _HOST_WRITE_POLICIES = {
     "write_through": SchedulerConfig.HostWritePolicy.WriteThrough,
@@ -122,6 +124,9 @@ def make_config(
     enable_l3_storage: bool,
     role: str,
     *,
+    prefix_cache_evict_policy: str,
+    prefix_cache_gds_prefill_cost: Sequence[float] | None,
+    prefix_cache_gds_disk_block_costs: Sequence[float],
     max_resident_requests: int,
     num_snapshot_pages: int,
     host_group_packing: Sequence[int],
@@ -133,6 +138,7 @@ def make_config(
     prefill_decode_interval: int,
     prefill_decode_min_interval: int,
     max_consecutive_prefill_rounds: int,
+    prefill_interval_min_decoding: int,
     decode_allocation_policy: str | None = None,
     debug_force_retraction_interval: int = 0,
     debug_force_retraction_max_per_request: int | None = None,
@@ -151,6 +157,7 @@ def make_config(
     checkpoint_retention_requests: int | None = None,
     checkpoint_retention_leaf_distance: int | None = None,
     prefill_chunk_yield_tokens: int = 0,
+    shared_l2_config: SharedL2Config | None = None,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -208,6 +215,12 @@ def make_config(
             that reaches it owes the decodes the whole interval again, and a
             prompt's held-back count restarts whenever one of its chunks
             runs. 0 keeps the unbounded suspension. Fused role only.
+        prefill_interval_min_decoding: ``--prefill-interval-min-decoding``:
+            a round owes the intervals' decode rounds only while at least
+            this many requests are ready to decode; below it,
+            max_consecutive_prefill_rounds back-to-back prefill rounds that
+            hold a decode back are still followed by one decode round. 0
+            always owes them. Fused role only.
         decode_allocation_policy:
             ``--disaggregation-decode-allocation-policy``, a prefill-role
             setting and None on every other role: ``"early"``, which None is
@@ -272,6 +285,10 @@ def make_config(
             (``SchedulerConfig::Validate`` refuses it elsewhere). The prefill
             role fills the budget a chunk leaves on its own whatever this
             value (docs/design/scheduler.md section 1.1).
+        shared_l2_config: With a shared L2 pool as the Host tier
+            (``--shared-l2-config``), the scheduler's limits on its writes, a
+            ``SharedL2Config``: the Host pages are then the pool's proxy and
+            hold no bytes. None without a pool.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -328,18 +345,20 @@ def make_config(
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.prefix_replay_tokens = prefix_replay_tokens
+    # Leave optional features at the binding's defaults on older engines.
+    # Explicit opt-ins still raise if the installed binding cannot support them.
     if state_checkpoint_in_forward:
-        # Set only when on: off is the binding's default, so the runtime keeps
-        # working with a scheduler wheel released before this field, where
-        # turning the option on raises AttributeError here instead of being
-        # ignored.
         cfg.state_checkpoint_in_forward = True
     if demote_superseded_state_checkpoints:
-        # Set only when on, as above.
         cfg.demote_superseded_state_checkpoints = True
     if drop_short_prompt_end_checkpoints:
-        # Likewise set only when on.
         cfg.drop_short_prompt_end_checkpoints = True
+    if prefix_cache_evict_policy != "lru":
+        cfg.prefix_cache_evict_policy = prefix_cache_evict_policy
+    if prefix_cache_gds_prefill_cost is not None:
+        cfg.prefix_cache_gds_prefill_cost = prefix_cache_gds_prefill_cost
+    if prefix_cache_gds_disk_block_costs:
+        cfg.prefix_cache_gds_disk_block_costs = list(prefix_cache_gds_disk_block_costs)
     if checkpoint_retention_requests is not None:
         # Set only when given, as above: an older scheduler wheel keeps its
         # plain LRU by default and refuses an explicit value.
@@ -349,6 +368,9 @@ def make_config(
     if prefill_chunk_yield_tokens:
         # Set only when on, for the same reason.
         cfg.prefill_chunk_yield_tokens = prefill_chunk_yield_tokens
+    if shared_l2_config is not None:
+        # Likewise set only with a pool.
+        cfg.shared_l2_config = shared_l2_config
     cfg.disable_l2_cache = disable_l2_cache
     cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 
@@ -363,6 +385,9 @@ def make_config(
     if max_consecutive_prefill_rounds:
         # Set only when on, for the same reason.
         cfg.max_consecutive_prefill_rounds = max_consecutive_prefill_rounds
+    if prefill_interval_min_decoding:
+        # Set only when on, for the same reason.
+        cfg.prefill_interval_min_decoding = prefill_interval_min_decoding
     if enable_short_prefill_first:
         # Older scheduler wheels retain FIFO and reject an explicit opt-in.
         cfg.enable_short_prefill_first = True
@@ -446,7 +471,7 @@ def resolve_dspark_prefix_replay_tokens(
     *,
     speculative_algorithm: str | None,
     enable_prefix_caching: bool,
-    enable_kvstore: bool,
+    has_host_tier: bool,
     disaggregation_mode: str,
     draft_model_path_use_base: bool,
     draft_model_config: Any | None,
@@ -458,7 +483,9 @@ def resolve_dspark_prefix_replay_tokens(
     are cache resident. Same-checkpoint DSpark configurations without that
     capability remain fail-closed. External generic DSpark configurations
     keep their existing scheduler behavior until they advertise an
-    equivalent contract.
+    equivalent contract. ``has_host_tier`` says whether the scheduler has a
+    Host tier: the local Host L2, or a shared L2 pool in its place
+    (``ServerArgs.has_host_tier``).
     """
 
     if speculative_algorithm != "DSPARK":
@@ -486,10 +513,10 @@ def resolve_dspark_prefix_replay_tokens(
         return 0
     # A drafter-private context cannot be restored from the host tier, with or
     # without prefix reuse.
-    if enable_kvstore:
+    if has_host_tier:
         raise ValueError(
-            "DSPARK captured-context replay does not support KVStore; "
-            "use --disable-kvstore."
+            "DSPARK captured-context replay does not support KVStore or a "
+            "shared L2 pool; use --disable-kvstore without --shared-l2-config."
         )
     if not enable_prefix_caching:
         return 0
@@ -505,7 +532,7 @@ def cache_event_to_payload(event) -> dict:
     """A cache ACK as the payload the host's data plane reports
     (``HostDataPlane.poll_cache_events``).
 
-    ``(kind, op_id)`` identifies a completed Host copy.
+    ``(kind, op_id)`` identifies a completed Host copy or state commit fence.
     """
     kind = type(event).__name__
     if kind not in _CACHE_EVENT_TYPES:
@@ -741,7 +768,9 @@ def cache_ops_from_plan(
     L2 wire batches pass through; snapshot/restore batches become per-request
     operations. Host-only QUERY/GET/PUT/Cancel descriptors and Disk
     operations go to the storage tuple: the engine host's L3 and Disk
-    executors run them. Unknown kinds fail the whole conversion without
+    executors run them. A shared L2 pool's write, release and touch ops are
+    left out: the engine host's loop reads them from the plan and hands them
+    to the pool's client. Unknown kinds fail the whole conversion without
     partial submission.
 
     ``request_admission`` resolves each snapshot/restore request while the
@@ -780,6 +809,17 @@ def cache_ops_from_plan(
             ),
         ):
             storage.append(op)
+        elif isinstance(
+            op,
+            (
+                Cache.SharedL2ReleaseOp,
+                Cache.SharedL2WriteOp,
+                Cache.SharedL2TouchOp,
+            ),
+        ):
+            # The engine host's loop hands a plan's shared L2 ops to the
+            # pool's client.
+            continue
         else:
             raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
     return CacheOperations(tuple(device), tuple(storage))

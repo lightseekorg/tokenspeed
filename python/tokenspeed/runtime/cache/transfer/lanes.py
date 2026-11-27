@@ -45,6 +45,7 @@ import torch
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferGeometry,
     HostTransferWorkspace,
+    StagingBuffer,
     build_host_transfer_geometry,
     transfer_cache_blocks,
 )
@@ -270,18 +271,22 @@ def pinned_host_bytes(nbytes: int) -> int:
     return 1 << (nbytes - 1).bit_length()
 
 
-def largest_pinned_fit(room_bytes: int, *, block_bytes: int) -> int:
+def largest_pinned_fit(
+    room_bytes: int, *, block_bytes: int, padding_bytes: int = 0
+) -> int:
     """Largest whole-block buffer fitting the configured pinned allocator."""
     if block_bytes <= 0:
         raise ValueError("block_bytes must be positive")
-    if room_bytes <= 0:
+    if padding_bytes < 0:
+        raise ValueError("padding_bytes must be non-negative")
+    if room_bytes <= padding_bytes:
         return 0
-    aligned_bytes = room_bytes // block_bytes * block_bytes
-    if pinned_host_bytes(aligned_bytes) <= room_bytes:
+    aligned_bytes = (room_bytes - padding_bytes) // block_bytes * block_bytes
+    if pinned_host_bytes(aligned_bytes + padding_bytes) <= room_bytes:
         return aligned_bytes
     # Block alignment can cross back below a non-power-of-two rounding limit.
     rounded_room = 1 << (room_bytes.bit_length() - 1)
-    return rounded_room // block_bytes * block_bytes
+    return max(0, (rounded_room - padding_bytes) // block_bytes) * block_bytes
 
 
 def check_host_memory(
@@ -391,7 +396,7 @@ def build_transfer_geometry(
         num_device_lcm_blocks=layout.num_lcm_blocks,
         num_device_buffers=len(layout.buffers),
     )
-    if io_backend == "kernel" and device.type != "npu":
+    if io_backend == "kernel":
         geometry = geometry.bind(device, non_blocking=False)
     return geometry
 
@@ -403,14 +408,21 @@ class HostTransferLane:
     workspace's pinned metadata staging. Two submissions that must never wait
     on each other's staging (L2's stream-ordered and pinned write-backs; the
     snapshot executor's stores and restores) take separate lanes.
-    Device metadata uses the arena's CPU-backed pool, including later growth
-    on the transfer stream, so it follows the drained weights sleep/wake.
+    Device metadata uses the cache transfer pool, including later growth
+    on the transfer stream.
     """
 
     __slots__ = ("metadata_done", "workspace", "_memory_saver_adapter")
 
-    def __init__(self, memory_saver_adapter: TorchMemorySaverAdapter) -> None:
+    def __init__(
+        self,
+        memory_saver_adapter: TorchMemorySaverAdapter,
+        *,
+        staging_buffer: StagingBuffer | None = None,
+    ) -> None:
         self.workspace = HostTransferWorkspace()
+        if staging_buffer is not None:
+            self.workspace.bind_staging_buffer(staging_buffer)
         self.metadata_done = None
         self._memory_saver_adapter = memory_saver_adapter
 
@@ -441,7 +453,7 @@ class HostTransferLane:
         )
         with (
             device_module.stream(stream),
-            self._memory_saver_adapter.named_region("workspace"),
+            self._memory_saver_adapter.named_region("cache_transfer"),
         ):
             mode = self.workspace.prepare_backend(
                 device_buffers, host_buffer, backend=backend

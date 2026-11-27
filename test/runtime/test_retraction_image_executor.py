@@ -146,7 +146,9 @@ class _Pool:
         self.arena = SimpleNamespace(
             cache_group_specs=contract.group_specs,
             runtime_contract=contract,
-            memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+            memory_saver_adapter=TorchMemorySaverAdapter.create(
+                enable=False, device="cpu"
+            ),
         )
         self.load_tracker = None
 
@@ -1035,7 +1037,9 @@ def test_a_lane_completes_a_zero_row_copy_without_touching_the_transport(backend
         assert num_blocks > 0, "the transport was asked for a zero-row transfer"
 
     with patch.object(lanes_module, "HostTransferWorkspace", Mock):
-        lane = HostTransferLane(TorchMemorySaverAdapter.create(enable=False))
+        lane = HostTransferLane(
+            TorchMemorySaverAdapter.create(enable=False, device="cpu")
+        )
     lane.workspace.load_block_transfers.side_effect = fake_load
     lane.workspace.commit_block_transfers.side_effect = fake_commit
     lane.workspace.prepare_backend.return_value = SimpleNamespace(
@@ -1201,7 +1205,9 @@ def _round_trip_two_ranks(io_backend, executors):
                 arena=SimpleNamespace(
                     cache_group_specs=contract.group_specs,
                     runtime_contract=contract,
-                    memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+                    memory_saver_adapter=TorchMemorySaverAdapter.create(
+                        enable=False, device="cpu"
+                    ),
                 ),
             )
             executors[rank] = HostCacheExecutor(

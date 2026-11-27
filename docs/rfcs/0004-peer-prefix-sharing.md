@@ -61,7 +61,7 @@ engines.
   messages and answers them.
 
 Holder and reader must share the cache namespace: the same deployment
-identity (checkpoint, layout, attention TP, KV parallelism, backends,
+identity (configured model and revision, layout, attention TP, KV parallelism, backends,
 quantization, compatibility epoch) and weight version. Under `numerics=auto`,
 the live peer identity allows different MoE expert-parallel sizes. Other
 numerical policies and persistent L3 keys retain the expert-parallel size.
@@ -121,13 +121,17 @@ while it waits for the previous forward (`complete`), which for a long
 prefill chunk is hundreds of milliseconds; answering at the next round would
 make every lookup and pin wait that long. The scheduler is therefore shared
 with the servicer under a lock that the control thread holds through a
-round's scheduler work and releases while it waits on the device or on an
-idle frontend. A loop waiting on a transfer -- a prefill replica on its PD
-sends, a landing on its reads -- does neither and spins through
-empty rounds, so the control thread also hands the lock to a waiting servicer
-once per round. The servicer answers with reads only (`AnswerPeerLookup`,
-`PeerPagesMatch`, `PeerLeaseHeld`, `PlanCalls`): an answer costs a network
-round trip plus at most the rest of a round's scheduler work.
+round's scheduler work and releases while it waits on the device, on an idle
+frontend, on a paused round's sleep (when no device copies were just queued),
+or on an attention-DP collective (`gate`'s `all_reduce` on single-member
+replicas and `dp_round`'s `all_gather` on frozen rounds) or idle forward when
+no forward or device copy batch is still queued on the device. A loop waiting
+on a transfer -- a prefill replica on its PD sends, a landing on its reads --
+does none of those and spins through empty rounds, so the control thread also
+hands the lock to a waiting servicer once per round. The servicer answers with
+reads only (`AnswerPeerLookup`, `PeerPagesMatch`, `PeerLeaseHeld`,
+`PlanCalls`), dropping and retaking the lock per RPC: an answer costs a
+network round trip plus at most the rest of a round's scheduler work.
 
 **Changes at the head.** What a message changes -- a lookup's soft pin, a
 pin's block references, a release's demotion -- is not applied by the
@@ -136,7 +140,12 @@ results the round feeds back, it would interleave differently from the
 other members' and their access epochs, hence their eviction orders, would
 diverge. The servicer queues each change instead; the round's relay carries
 the queue to every member, and each applies it at the next head before any
-other event, in the order the answers were given (`advance_peer`).
+other event, in the order the answers were given (`advance_peer`). Mid-round
+points that follow an unlocked window before planning, flushing, or draining
+(`gate`, `finish_drain` when a reload or `kv_cache` release drain is active,
+and warm-up cache clears) also drain and share queued holder changes across
+the replica (`sync_peer_holder_changes`) so hard pins are visible before a
+cache clear or next plan runs.
 
 The answers hold until then because nothing leaves a holder's cache outside
 a plan: eviction, dead-entry collection and compaction run only while one is
@@ -144,7 +153,9 @@ built, and the next plan is built after the head that applies the pin. A
 member whose data plane still runs the plan dispatched before the answer
 touches no page an accepted pin named: that plan's evictions were already in
 the scheduler state the answer read, and the pin rejects Device pages whose
-H2D load has not been acknowledged by every replica member.
+H2D load has not been acknowledged by every replica member, and decoded
+endpoints a retraction published whose deferred state commit has not been
+acknowledged (below).
 
 **Lookup and soft pin.** The holder probes its own Device and Host prefix
 with the ordinary matchers, so a hybrid model's reply is already cut to a
@@ -152,8 +163,10 @@ boundary its SWA window and State checkpoints can resume from, and lists the
 pages a reader's table would hold at each slot. A soft pin holds no block
 reference: the lookup's change refreshes the entries, as a hit does, so they
 leave last, and keeps the prompt up to the answered boundary. A soft pin
-expires after a short deadline (hundreds of milliseconds). Soft pins never
-cost the holder capacity it needs.
+expires after a bounded deadline (about 2 s at the default 50 ms answer timeout,
+scaled with `--peer-prefix-answer-timeout-ms` and capped at the 30 s hard-pin
+lifetime so a hard pin never shortens it and the servicer's record lifetime
+always outlives it). Soft pins never cost the holder capacity it needs.
 
 **Admission.** The reader admits the request against its own Device
 capacity, treating the peer span as tokens that will arrive rather than be
@@ -165,15 +178,20 @@ whole.
 
 **Pin.** The servicer checks that the lookup's prompt, up to the answered
 boundary, still resolves to exactly the answered pages and that none of its
-Device pages is an unacknowledged prefix-load destination. Local forwards
-can use these indexed pages through their layerwise H2D fences; remote reads
-have no such ordering. A pin refused during a load falls back locally;
+Device pages is an unacknowledged prefix-load destination. Nor may it be a
+decoded endpoint that a retraction published in a State group whose decode
+state the runtime commits only at that retraction
+(`CacheGroupConfig::deferred_decode_state`, KDA): the plan carries a
+`state_commit_fence`, and the pin waits for its `StateCommitDone`. Local
+forwards can use these indexed pages through their layerwise H2D fences and
+device order; remote reads have no such ordering. A pin refused during a load
+or a commit falls back locally;
 unrelated Device pages and published Host pages remain available. An accepted
 answer queues the hard pin of exactly those pages; a pin that finds them
 changed at the head holds nothing. The hard pin takes block references
 (`CacheBlockRef`), so the pages can neither be evicted, relocated by
-compaction nor moved by write-back. It has its own deadline, after which the holder's scheduler
-releases it and leaves a tombstone.
+compaction nor moved by write-back. Coordinated holders release expired pins
+and leave a tombstone. Independent holders use the liveness policy below.
 
 **Read.** Readers pull: one-sided reads from the holder's registered Device
 cache or Host pool into the reader's Device pages. The holder's data plane
@@ -218,8 +236,10 @@ a send failure clears the query immediately. Later landings can ask again
 after a lost request or reply, and a weight update clears outstanding queries
 along with the cached layouts.
 
-**A reader goes down:** the holder's soft and hard pins expire by their
-deadlines; nothing leaks.
+**A reader goes down.** Soft leases expire on both drivers. Coordinated
+holders expire hard pins under their existing timing contract. Independent
+holders keep hard references until RELEASE or transport teardown. The
+autonomous liveness policy below reports abandoned pins to the launcher.
 
 **A holder restarts** under the same name: its answers and layout carry its
 incarnation, and a reader drops a layout, and any answer, of another
@@ -245,8 +265,7 @@ landing given up, so no late write lands in a page another request was given.
 A read that succeeded retired every write before it returned.
 
 **A flush on the holder** (a weight update) is refused while a hard pin holds
-pages, as while a PD transfer is in flight, and proceeds once the pins end,
-within one hard-pin lifetime. A soft pin holds nothing; a pin after the flush
+pages, as while a PD transfer is in flight, and proceeds once the pins end. A soft pin holds nothing; a pin after the flush
 finds the pages changed.
 
 ### Overlap
@@ -277,8 +296,12 @@ engine can unregister its memory.
   peer-to-peer path), selected by the transfer engine from the two endpoints.
 
 Control messages (lookup, pin, release) travel between the replicas'
-servicers over ZMQ, not through the data plane. A holder's name is its
-servicer's endpoint (`host:port`, one per attention-DP replica), which the
+servicers over ZMQ, not through the data plane. A fast demux thread delivers
+replies and answers layout queries without waiting on the scheduler lock,
+while the servicer thread drains queued lookup, pin and release RPCs, releasing
+the scheduler lock after each RPC so a burst does not delay the control loop.
+A holder's name is its
+logical endpoint on its node's shared control port, which the
 router's hint carries; on first contact a reader fetches the holder's layout:
 its incarnation and identity, and per rank its transfer engine session and
 the field geometry of its Device arena and Host pool for every cache group.
@@ -367,8 +390,10 @@ moving PD itself onto the new read entry point.
 
 ### Configuration
 
-`--peer-prefix-port` turns sharing on; attention-DP rank `r` binds
-`port + r`, and a replica's name is `host:port`, with the host from
+`--peer-prefix-port` turns sharing on; each node binds one public port. Rank zero is
+`host:port` and other attention-DP replicas are `host:port/rank`. The first
+local replica leader forwards control frames to the addressed sibling over
+loopback. The host comes from
 `--peer-prefix-host` (the address the worker advertises to the router) or
 else the detected local address. A holder hint must name the holder exactly
 so: a reader matches the holder's answers by that name.
@@ -446,3 +471,137 @@ pushed with it ([RFC 0006](0006-disk-tier.md)), by the holder's `source_tier`:
 Scheduler gauges track leases, hard-pinned blocks and requests looking or landing.
 A reader process that dies before terminal observation cannot report a completed
 sample; frontend failures and holder expiry remain independently observable.
+
+### Protocol progress by replica topology
+
+When peer prefix sharing is enabled, the runtime selects the protocol owner
+from the number of members in the replica and the scheduler's configured
+landing tier. A multi-member replica advances transfers in coordinated rounds.
+Each shard owns part of the KV and reports its fence and READ outcome before
+the replica releases the source or publishes the prefix. A single-member
+replica uses a peer worker for Host or Device landings. Multiple independent
+replicas can share a machine and still use the single-member path.
+
+### Single-member Host landings
+
+The scheduler issues a revocable Host reservation grant for the lookup and
+consumes the terminal result in a normal round. The protocol worker tries the
+cache lock to reserve unpublished destinations up to the granted boundary.
+The lookup deadline applies to reply arrival. After a timely hit the worker retries
+cache contention and unavailable Host credits, and the normal admission pass may
+schedule the prompt locally until a destination is reserved. Committing local
+admission or cancelling the request revokes the outstanding grant. Tier copies
+and peer reads may overlap on separate pages. Each ticket retains its existing
+block references through DMA retirement. Publishing a duplicate key adopts the
+canonical Host reference. An aborted transfer releases its unpublished blocks
+on retirement. Only the scheduler can
+publish a completed landing for its owning request. A successful Host transfer
+whose request gave up its reservation increments `unused_host_landings`.
+An incomplete transfer increments `failed_landings`.
+
+The existing servicer timestamps and forwards incoming messages to the existing
+Host protocol worker. The worker registers its wake handle before draining any
+queue, so the first arrival can also wake an idle worker. A pending lookup, PIN or reservation yields on cache
+contention. RELEASE uses a capability bound to the hard lease's existing
+source references. It drops their strong counts before acknowledging, including
+while DP is waiting in a forward. Only the cache owner runs uniqueness observers,
+demotes cache entries and returns unused storage to its pool. Duplicate releases
+receive the same answer during the record lifetime. No extra thread is needed.
+
+During shutdown the independent worker drops queued reservations and grants,
+cancels landings still waiting to start a read, and drains submitted reads
+and active holder pins. It continues serving RELEASE while draining.
+
+### Single-member Device landings
+
+Device (HBM) landings use adaptive admission and checkpoint-validated PIN.
+The scheduler grants the reader
+pages in a normal admission round. The peer worker starts the PIN exchange
+only after the grant's Device fence. Its lookup deadline is measured at reply
+arrival. The normal plan consumes the completed READ and RELEASE.
+
+Adaptive admission probes the local prefix again when the request reaches
+its place in the prefill queue. It compares the compute saved on the additional
+prefix with the estimated exposed wait for a landing, including failed attempts.
+The estimate starts with experimental Lite17B values and updates from retired
+attempts on this reader, grouped by the combination of Device, Host and Disk
+sources and by locality. Disk pushes have independent feedback from Host reads. Successful
+samples price the interval from writable pages through RELEASE acknowledgement.
+The first sample replaces the prior. After eight samples the update weight is
+1/8. The scheduler separately measures dispatch to writable pages and RELEASE
+to the first scheduled prefill round. It adds the median combined local wait
+of the last five completed admissions with the same batch condition (empty,
+partially occupied, or full), then subtracts the estimated time before a local
+prefill slot once. Before five such samples it assumes zero local delay.
+On an idle reader, a stable request-ID hash assigns one in sixteen eligible
+borderline cases to try a READ when a fourfold cheaper landing would clear
+the same 20 ms margin. Fresh local matches and capacity checks still apply.
+Regular local
+admission may commit first; a request still waiting for capacity can be
+reconsidered next round. The existing block references hold committed landing
+destinations through transfer retirement and cancellation.
+
+The reader includes the original checkpoint in the PIN. If the lookup's
+soft lease has expired, the holder resolves the same checkpoint and acquires
+references in the same exchange. The reader checks the holder incarnation,
+namespace, prefix length and full source-page mapping against the lookup
+and its writable grant before issuing DMA. Eviction or a changed mapping
+falls back to local prefill without a second lookup. While the holder has
+unretired replay work, both ordinary and checkpoint PINs reject any mapping
+containing Device pages. Host-only mappings remain eligible. In coordinated
+mode, the control loop's idle/DP-round/`gate()` lock-release windows also wait
+until pending device `pages_to_copy` batches have retired behind a completed
+forward before handing `scheduler.lock()` to `ts-peer-servicer`; the
+pre-existing round-head `bump` and `complete()` lock windows remain unchanged
+and can still hand the scheduler over while an in-flight copy batch is pending.
+
+Coordinated replicas keep their existing namespace. Independent Host and Device
+replicas use `async-host-v2:` and `async-device-v3:` respectively. During a
+rolling upgrade, endpoints with different protocol versions fall back to local
+prefill. A matching version is required on both sides for hard-pin liveness.
+
+An autonomous reader retries a missing RELEASE acknowledgement once. A READ
+still running after one third of the record lifetime renews its existing hard
+pin and repeats at that interval until retirement. Short reads send no renewal.
+A holder that receives neither renewal nor RELEASE for a full record lifetime
+(60 seconds by default) reports an engine error identifying the lease. Recovery
+requires replacing the holder process and its registered transport session.
+The error leaves the native pin in place so a timer cannot recycle live DMA pages.
+
+After 30 seconds without an admitted attempt on a degraded Device path, an
+idle reader may probe a prefix that met the original cold-start gain threshold.
+Per-request cost and feedback details are logged at debug level.
+
+Reader decision details are available in `tokenspeed:peer_decisions_total`.
+Local admission and no-attempt reasons count once at request termination and
+describe the last observed choice. Incompatible lookup replies are classified
+when received, using their existing progress protocol and namespace identity.
+
+Each holder owner exports `tokenspeed:peer_holder_events_total` on its own
+replica. The outcomes are lookup hit or miss, PIN accepted or rejected, and
+RELEASE after a successful READ, cleanup, or rejection. A read release
+confirms that the holder accepted the reader's success indication. Only the
+reader observes how much KV its following forward uses. These metrics need
+no changes to the peer messages.
+
+At first prefill dispatch, the total prefix hit ratio includes the confirmed
+Device peer interval that the forward skips beyond the reader's local hit.
+`tokenspeed:prefix_peer_hit_tokens_total` counts these additional tokens.
+A peer landing on Host already contributes through the normal Host cache hit.
+A failed Device landing contributes only the local retry's hit and prompt.
+Decode's local admission ratio measures its own cache independently.
+
+On the independent reader, `lookup_reply_to_scheduler` times a positive reply
+from arrival to collection by the control loop. Device landings with complete
+timestamps also expose `grant_to_writable`, `writable_to_terminal`, and
+`terminal_to_scheduler` through the stage histogram. The writable-to-terminal
+interval includes the protocol work that follows the destination fence.
+
+### Paired draft checkpoints
+
+A recipe can opt a DFLASH sliding-window draft into the sharded Device protocol.
+Set the same explicit `--weight-version` on the reader and holder. The version
+identifies the immutable target and draft pair and must change when either
+checkpoint changes. Register the draft fields alongside the target fields.
+An unsharded sliding-window group retains the sink and the window at the
+landing boundary. Its per-rank K and V fields can still be head-partitioned.

@@ -41,6 +41,19 @@ bool LoneRequestRecovery::alone(const Request& request) const {
     return !OthersHoldPages(requests_, request);
 }
 
+// The shared L2 pool's case in the compaction gates (AdmitFirstChunk,
+// AdmitStep). A page published for the pool waits in the store queue,
+// pinning nothing, until a plan's write takes it
+// (TierTransferManager::StartSharedL2Writes), and the pool's client reads a
+// write's Device blocks over RDMA, outside the device's streams. A
+// compaction that moved a queued page would have the same plan's write name
+// a block the plan's copy has yet to fill, so no compaction runs while a
+// page is queued; a write that started pins its pages
+// (HasPinnedStoresInFlight).
+bool LoneRequestRecovery::hasPendingSharedL2Stores() const {
+    return config_.shared_l2_config && coordinator_.Host().HasPendingStores();
+}
+
 std::optional<AdmissionResult> LoneRequestRecovery::record(ExecutionPlan& plan,
                                                            std::optional<AdmissionResult> admission) {
     if (admission) {
@@ -98,7 +111,7 @@ std::optional<AdmissionResult> LoneRequestRecovery::AdmitFirstChunk(ExecutionPla
     // A Submitted request holds no pages, so nothing of its own is in flight;
     // what may scatter is the hit pages, which move with their entries.
     if (!admission && !tier_transfers_.HasLoadBacksInFlight() && !tier_transfers_.HasPinnedStoresInFlight() &&
-        !acted_in_plan_) {
+        !hasPendingSharedL2Stores() && !acted_in_plan_) {
         admission =
             compactAndRetry(plan, request, PrefixProbe{prefix}, demands, RequestProgress{},
                             /*copy_in_blocks=*/{}, copy_in_point, [&] { return admit_alone(std::move(prefix)); });
@@ -130,7 +143,8 @@ std::optional<AdmissionResult> LoneRequestRecovery::AdmitStep(ExecutionPlan& pla
     // fewer parents and the step is retried once in this plan build. Never
     // twice in one plan.
     if (!admission && request.ResultsInFlight() == 0 && !tier_transfers_.HasLoadBacksInFlight() &&
-        !tier_transfers_.HasPinnedStoresInFlight() && !PdTransferInFlight(config_.role, request) && !acted_in_plan_) {
+        !tier_transfers_.HasPinnedStoresInFlight() && !hasPendingSharedL2Stores() &&
+        !PdTransferInFlight(config_.role, request) && !acted_in_plan_) {
         admission = compactAndRetry(plan, request, coordinator_.Prober().ProbePrefix(std::span<const std::string>{}),
                                     demands, progress, copy_ins.held, copy_in_point, attempt);
         // A page this admission publishes cannot move: the runtime stores it

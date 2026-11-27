@@ -109,7 +109,7 @@ bool PdTransferInFlight(Role role, const Request& request) {
             // peer has read its pages.
             return request.HoldsPages() && !request.Is<fsm::Finishing>();
         case Role::kFused:
-            return false;
+            return request.Is<fsm::PdTransferring>();
     }
     return false;
 }

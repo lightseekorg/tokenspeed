@@ -37,7 +37,7 @@ use std::{
         mpsc, Arc, Condvar, Mutex, MutexGuard,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use ts_collective::{Group, Mesh, Reduce};
@@ -1255,6 +1255,9 @@ pub struct DecodePeer {
     /// registers the same requests in the same order).
     order: Vec<String>,
     receivers: HashMap<String, Receiver>,
+    /// Active (including draining) rooms owned by `receivers`, maintained only
+    /// on the scheduling loop thread for replica-identical admission checks.
+    active_rooms: HashMap<u64, String>,
     timeout_logged: bool,
     drain_logged_at: Option<Instant>,
 }
@@ -1351,6 +1354,7 @@ impl DecodePeer {
                 waiting_timeout: config.waiting_timeout,
                 order: Vec::new(),
                 receivers: HashMap::new(),
+                active_rooms: HashMap::new(),
                 timeout_logged: false,
                 drain_logged_at: None,
             },
@@ -1410,6 +1414,7 @@ impl DecodePeer {
         let Some(receiver) = self.receivers.remove(rid) else {
             return;
         };
+        self.active_rooms.remove(&receiver.room);
         self.order.retain(|tracked| tracked != rid);
         let mut state = self.shared.state();
         state.clear(receiver.room, &receiver.addr);
@@ -1434,8 +1439,18 @@ fn join_host_port(host: &str, port: u16) -> String {
 
 impl TransferPeer for DecodePeer {
     fn register(&mut self, rid: &str, bootstrap: &BootstrapInfo) -> Result<(), PdError> {
-        self.reap_connect_workers();
         let room = bootstrap.room;
+        if self.receivers.contains_key(rid) {
+            return Err(PdError::Peer(format!(
+                "request {rid} is already registered with the Decode transfer peer"
+            )));
+        }
+        if let Some(existing) = self.active_rooms.get(&room) {
+            return Err(PdError::Peer(format!(
+                "bootstrap room {room} for request {rid} is already active for request {existing}"
+            )));
+        }
+        self.reap_connect_workers();
         let addr = join_host_port(&bootstrap.host, bootstrap.port);
         {
             let mut state = self.shared.state();
@@ -1443,24 +1458,20 @@ impl TransferPeer for DecodePeer {
             state.rooms_by_rid.insert(rid.to_owned(), room);
             state.rooms.update(room, TransferPoll::Bootstrapping);
         }
-        if self
-            .receivers
-            .insert(
-                rid.to_owned(),
-                Receiver {
-                    room,
-                    addr: addr.clone(),
-                    started: Instant::now(),
-                    noticed: None,
-                    local: TransferPoll::Bootstrapping,
-                    concluded: None,
-                    draining: None,
-                },
-            )
-            .is_none()
-        {
-            self.order.push(rid.to_owned());
-        }
+        self.receivers.insert(
+            rid.to_owned(),
+            Receiver {
+                room,
+                addr: addr.clone(),
+                started: Instant::now(),
+                noticed: None,
+                local: TransferPoll::Bootstrapping,
+                concluded: None,
+                draining: None,
+            },
+        );
+        self.order.push(rid.to_owned());
+        self.active_rooms.insert(room, rid.to_owned());
         if !self.connect.contains_key(&addr) {
             let (sender, rooms) = mpsc::channel();
             let shared = self.shared.clone();
@@ -1646,7 +1657,15 @@ impl TransferPeer for DecodePeer {
                 let bootstrap_token = landed.bootstrap_token.ok_or_else(|| {
                     PdError::Peer(format!("{rid}'s KV landed without its first token"))
                 })?;
+                let wait_started = state.waiting_since.get(&receiver.room).copied();
                 drop(state);
+                let kv_ready_at = (SystemTime::now(), Instant::now());
+                if replica.index() == 0 {
+                    if let (Some(metrics), Some(started)) = (&self.shared.metrics, wait_started) {
+                        let waited = kv_ready_at.1.duration_since(started);
+                        metrics.observe_decode_kv_wait(waited.as_secs_f64());
+                    }
+                }
                 tracing::info!(
                     rid,
                     bootstrap_room = receiver.room,
@@ -1662,6 +1681,7 @@ impl TransferPeer for DecodePeer {
                     bootstrap_logprob: landed.bootstrap_logprob,
                     spec_candidate_ids: landed.spec_candidate_ids,
                     request_pool_index,
+                    kv_ready_at,
                 }));
                 ended.push(rid.clone());
             }
@@ -1693,6 +1713,10 @@ impl TransferPeer for DecodePeer {
 
     fn has_in_flight(&self) -> bool {
         !self.order.is_empty()
+    }
+
+    fn has_room(&self, room: u64) -> bool {
+        self.active_rooms.contains_key(&room)
     }
 
     fn cancel(&mut self, rid: &str) {

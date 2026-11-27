@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.cache.host_storage import host_block_capacity
@@ -37,7 +38,6 @@ from tokenspeed.runtime.cache.l3.config import (
     MooncakeStoreSettings,
     parse_extra_config,
 )
-from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
@@ -55,8 +55,7 @@ def model_checkpoint_id(server_args: ServerArgs, model_config: ModelConfig) -> s
         hf_config=model_config.hf_config,
         revision=str(model_config.revision or ""),
         load_format=str(server_args.load_format),
-        # LoadConfig uses this same empty extra-config.
-        model_loader_extra_config={},
+        model_loader_extra_config=server_args.model_loader_extra_config,
         ext_yaml=str(server_args.ext_yaml or ""),
     )
 
@@ -119,6 +118,8 @@ def mooncake_store_library() -> str:
     """The Mooncake store library the engine host loads:
     ``TOKENSPEED_MOONCAKE_STORE_LIBRARY``, else the store's C ABI the
     tokenspeed-mooncake wheel installs."""
+    from tokenspeed.runtime.utils.env import envs
+
     override = envs.TOKENSPEED_MOONCAKE_STORE_LIBRARY.get()
     if override:
         return override
@@ -137,62 +138,31 @@ def mooncake_store_library() -> str:
     return path
 
 
-def cache_deployment_id(
+def _cache_checkpoint_ids(
     server_args: ServerArgs,
     model_config: ModelConfig,
     draft_model_config: ModelConfig | None,
-    *,
-    host_cache: HostCacheResources,
     world_cpu_group: ProcessGroup | None,
-    for_peer: bool = False,
-) -> str:
-    """The cache namespace's deployment id: everything that shapes a cached
-    page's bytes (``storage_deployment_id``). Pages are shared only under one
-    id -- through the L3 tier, or between peer replicas
-    (``cache/peer.py``).
+    *,
+    for_peer: bool,
+) -> list[str]:
+    if for_peer:
+        from tokenspeed.runtime.cache.l3.identity import warn_if_unpinned_peer_weights
 
-    Args:
-        server_args: Resolved launch settings; numerical choices are snapshotted.
-        model_config: Target checkpoint configuration, without model weights.
-        draft_model_config: Draft checkpoint configuration, or None.
-        host_cache: Shared Host resources and resolved CPU cache facts.
-        for_peer: Apply the live peer cache compatibility rules.
-        world_cpu_group: The existing Gloo world group for checkpoint agreement;
-            None in a single-process deployment. Every rank calls this.
+        target = str(model_config.revision or "")
+        draft = (
+            str(draft_model_config.revision or "")
+            if draft_model_config is not None
+            else ""
+        )
+        if server_args.mapping.rank == 0:
+            revisions = [target] if draft_model_config is None else [target, draft]
+            warn_if_unpinned_peer_weights(server_args.weight_version, revisions)
+        return [target, draft]
 
-    Returns:
-        The id; the weight version is not part of it.
-    """
-    from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS
-
-    eagle3_layers_to_capture: tuple[int, ...] = ()
-    if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS:
-        configured_layers = server_args.eagle3_layers_to_capture
-        if configured_layers:
-            eagle3_layers_to_capture = tuple(int(layer) for layer in configured_layers)
-        elif draft_model_config is not None:
-            from tokenspeed.runtime.execution.factory import _eagle_aux_layer_ids
-
-            draft_layers = _eagle_aux_layer_ids(draft_model_config.hf_config)
-            if draft_layers:
-                eagle3_layers_to_capture = tuple(int(layer) for layer in draft_layers)
-    attention_backend_name = host_cache.attention_backend_name
-    draft_attention_backend_name = host_cache.draft_attention_backend_name
-    from tokenspeed.runtime.cache.l3.identity import cache_layout_signature
-
-    cache_signature = cache_layout_signature(
-        host_cache,
-        cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
-        checkpoint_granularities=host_cache.checkpoint_granularities,
-    )
     import torch.distributed as dist
 
-    from tokenspeed.runtime.cache.l3.identity import (
-        L3_RUNTIME_COMPAT,
-        l3_cache_quantization_id,
-        share_l3_checkpoint_ids,
-        storage_deployment_id,
-    )
+    from tokenspeed.runtime.cache.l3.identity import share_l3_checkpoint_ids
 
     initialized = dist.is_available() and dist.is_initialized()
     if world_cpu_group is not None:
@@ -216,11 +186,122 @@ def cache_deployment_id(
         dist.all_gather_object(gathered, payload, group=world_cpu_group)
         return gathered
 
-    checkpoint_id, draft_revision = share_l3_checkpoint_ids(
+    return share_l3_checkpoint_ids(
         [checkpoint_id, draft_revision],
         rank=rank,
         world_size=world_size,
         gather=gather_checkpoint_ids,
+    )
+
+
+def cache_deployment_id(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    draft_model_config: ModelConfig | None,
+    *,
+    host_cache: HostCacheResources,
+    world_cpu_group: ProcessGroup | None,
+    for_peer: bool = False,
+) -> str:
+    """The cache namespace's deployment id: everything that shapes a cached
+    page's bytes (``storage_deployment_id``). Pages are shared only under one
+    id -- through the L3 tier, or between peer replicas
+    (``cache/peer.py``).
+
+    Args:
+        server_args: Resolved launch settings; numerical choices are snapshotted.
+        model_config: Target checkpoint configuration, without model weights.
+        draft_model_config: Draft checkpoint configuration, or None.
+        host_cache: Shared Host resources and resolved CPU cache facts.
+        for_peer: Apply the live peer cache compatibility rules.
+        world_cpu_group: Gloo group for multi-rank persistent L3 checkpoint
+            agreement. Live peers and single-process L3 pass None.
+
+    Returns:
+        The id; the weight version is not part of it.
+    """
+    return cache_layout_deployment_id(
+        server_args,
+        model_config,
+        draft_model_config,
+        cache_layout=host_cache,
+        checkpoint_granularities=host_cache.checkpoint_granularities,
+        group_shard_counts=host_cache.ownership.shard_counts,
+        attention_backend_name=host_cache.attention_backend_name,
+        draft_attention_backend_name=host_cache.draft_attention_backend_name,
+        world_cpu_group=world_cpu_group,
+        for_peer=for_peer,
+    )
+
+
+def cache_layout_deployment_id(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    draft_model_config: ModelConfig | None,
+    *,
+    cache_layout: Any,
+    checkpoint_granularities: tuple[tuple[str, int], ...],
+    group_shard_counts: Sequence[int],
+    attention_backend_name: str,
+    draft_attention_backend_name: str,
+    world_cpu_group: ProcessGroup | None,
+    for_peer: bool,
+) -> str:
+    """``cache_deployment_id`` from the cache facts themselves, for a rank
+    that has no ``HostCacheResources``: a rank of a shared L2 pool, which
+    allocates no Host storage and which the pool admits by this id
+    (``cache/shared_l2``).
+
+    Args:
+        server_args: Resolved launch settings; numerical choices are snapshotted.
+        model_config: Target checkpoint configuration, without model weights.
+        draft_model_config: Draft checkpoint configuration, or None.
+        cache_layout: The packed Host CacheBlock layout, as
+            ``cache_layout_signature`` reads it.
+        checkpoint_granularities: The groups whose checkpoints are coarser
+            than a page, with their granularity.
+        group_shard_counts: Each cache group's shard count.
+        attention_backend_name: The resolved target attention backend.
+        draft_attention_backend_name: The resolved draft attention backend.
+        world_cpu_group: The existing Gloo world group for checkpoint agreement;
+            None in a single-process deployment. Every rank calls this.
+        for_peer: Apply the live peer cache compatibility rules.
+
+    Returns:
+        The id; the weight version is not part of it.
+    """
+    from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS
+
+    eagle3_layers_to_capture: tuple[int, ...] = ()
+    if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS:
+        configured_layers = server_args.eagle3_layers_to_capture
+        if configured_layers:
+            eagle3_layers_to_capture = tuple(int(layer) for layer in configured_layers)
+        elif draft_model_config is not None:
+            from tokenspeed.runtime.execution.factory import _eagle_aux_layer_ids
+
+            draft_layers = _eagle_aux_layer_ids(draft_model_config.hf_config)
+            if draft_layers:
+                eagle3_layers_to_capture = tuple(int(layer) for layer in draft_layers)
+    from tokenspeed.runtime.cache.l3.identity import cache_layout_signature
+
+    cache_signature = cache_layout_signature(
+        cache_layout,
+        cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
+        checkpoint_granularities=checkpoint_granularities,
+    )
+    from tokenspeed.runtime.cache.l3.identity import (
+        L3_RUNTIME_COMPAT,
+        l3_cache_quantization_id,
+        storage_deployment_id,
+    )
+
+    checkpoint_id, draft_revision = _cache_checkpoint_ids(
+        server_args,
+        model_config,
+        draft_model_config,
+        world_cpu_group,
+        for_peer=for_peer,
     )
     pipeline_rank = server_args.mapping.pp_rank if server_args.mapping.has_pp else 0
     if draft_model_config is not None:
@@ -241,7 +322,7 @@ def cache_deployment_id(
         cache_signature=cache_signature,
         pipeline_rank=pipeline_rank,
         attn_tp_size=int(server_args.mapping.attn.tp_size),
-        group_shard_counts=host_cache.ownership.shard_counts,
+        group_shard_counts=group_shard_counts,
         draft_model=draft_model,
         draft_revision=draft_revision,
         cache_quantization=cache_quantization,

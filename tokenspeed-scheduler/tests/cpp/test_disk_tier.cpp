@@ -26,7 +26,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstdint>
+#include <memory_resource>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -34,6 +37,7 @@
 #include <vector>
 
 #include "cache/coordinator/cache_coordinator.h"
+#include "cache/coordinator/gds_tiered.h"
 #include "cache/core/block_pool.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "cache/tier/disk_manager.h"
@@ -95,26 +99,36 @@ struct Prompt {
 
 class DiskTierCache {
 public:
-    DiskTierCache(std::vector<CacheGroupSpec> specs, std::int32_t disk_parents, DiskConfig limits = Limits())
+    DiskTierCache(std::vector<CacheGroupSpec> specs, std::int32_t disk_parents, DiskConfig limits = Limits(),
+                  std::int32_t host_parents = 64)
         : device{64, Packing(specs)},
-          host{64, Packing(specs)},
+          host{host_parents, Packing(specs)},
           disk{disk_parents, Packing(specs)},
           coordinator{MakeCoordinator(specs, kGrain, device, /*enable_l3_storage=*/false, &host, &disk,
                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
                                       /*write_back_evictions=*/true, /*checkpoint_retention_requests=*/0)},
           disks{coordinator, limits} {}
 
+    std::vector<BlockTable> OnDevice(const Prompt& prompt) {
+        std::vector<BlockTable> tables(coordinator.NumGroups());
+        EXPECT_TRUE(AdmitForTest(coordinator, tables, static_cast<std::int32_t>(prompt.tokens.size())));
+        coordinator.CacheCompletedBlocks(
+            tables,
+            RequestProgress{.completed_pages = CompletedPages{.tokens = prompt.tokens,
+                                                              .prefix_hashes = prompt.hashes,
+                                                              .publish_state = true,
+                                                              .boundary_kind = CacheBoundaryKind::kEndpoint,
+                                                              .stream_completed_to_host = false},
+                            .num_computed_tokens = static_cast<std::int32_t>(prompt.tokens.size())},
+            CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+        return tables;
+    }
+
     // Publishes the prompt on the Device -- a checkpoint at its end with State
     // groups -- copies every entry to a fresh Host block, as a write-back would,
     // and empties the Device: the prompt then lives in dirty Host entries.
     std::vector<CacheKey> OnHostOnly(const Prompt& prompt) {
-        std::vector<BlockTable> tables(coordinator.NumGroups());
-        EXPECT_TRUE(AdmitForTest(coordinator, tables, static_cast<std::int32_t>(prompt.tokens.size())));
-        CacheCompletedBlocksForTest(coordinator, tables, prompt.hashes,
-                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
-                                    /*first_new_prefix_page=*/0, static_cast<std::int32_t>(prompt.tokens.size()),
-                                    CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
-                                    /*publish_state=*/true);
+        auto tables = OnDevice(prompt);
         coordinator.Free(tables);
         std::vector<CacheKey> keys = DeviceKeys(prompt);
         for (const CacheKey& key : keys) {
@@ -125,6 +139,22 @@ public:
         EXPECT_TRUE(coordinator.ClearDeviceCache());
         return keys;
     }
+
+    // A write-back's Host placement of `rows` Full blocks as one segment.
+    HostCache::HostAllocationBatch PlaceSegment(std::size_t rows) {
+        const std::vector<std::uint32_t> groups(rows, 0);
+        const std::vector<std::int32_t> buckets(rows, 0);
+        const std::array segments{HostCache::HostSegmentRows{.first_row = 0, .past_end_row = rows}};
+        return coordinator.Host().AcquireHostSegments(groups, buckets, segments);
+    }
+
+    // Writes keys to the Disk: their Host entries become clean.
+    void CleanAll(std::span<const CacheKey> keys) {
+        const DiskOperation write = Clean(keys);
+        disks.Complete(cache::DiskDone{.op_id = write.op_id, .success = true});
+    }
+
+    bool OnHost(const CacheKey& key) const { return coordinator.Host().ContainsHostCachedBlock(key); }
 
     // The prompt's keys the Device indexes, Full pages first.
     std::vector<CacheKey> DeviceKeys(const Prompt& prompt) const {
@@ -421,6 +451,63 @@ TEST(DiskTierTest, AStateCheckpointIsCleanedWithItsHistoryAndPrefetchedWithIt) {
     EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
 }
 
+// A Host placement drops clean entries -- the Disk holds them too -- before
+// dirty ones, whatever their age (docs/rfcs/0006-disk-tier.md, Invariant 3).
+TEST(DiskTierTest, AWriteBackPlacementDropsANewerCleanPageBeforeAnOlderDirtyOne) {
+    DiskTierCache cache(FullOnly(), /*disk_parents=*/16, Limits(), /*host_parents=*/4);
+    const std::vector<CacheKey> dirty = cache.OnHostOnly(Prompt(2, 1));
+    const std::vector<CacheKey> clean = cache.OnHostOnly(Prompt(2, 2));
+    cache.CleanAll(clean);
+    ASSERT_EQ(cache.coordinator.Host().NumFreeLcmBlocks(), 0);
+
+    const HostCache::HostAllocationBatch batch = cache.PlaceSegment(1);
+    EXPECT_EQ(batch.stats.allocated, 1u);
+    EXPECT_FALSE(cache.OnHost(clean[1])) << "the clean leaf leaves, though it is the newest";
+    EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(clean[1]));
+    EXPECT_TRUE(cache.OnHost(clean[0]));
+    EXPECT_TRUE(std::ranges::all_of(dirty, [&](const CacheKey& key) { return cache.OnHost(key); }))
+        << "no dirty entry is lost while a clean one can make room";
+    EXPECT_EQ(cache.coordinator.Evictor().HostEvictions().clean.blocks, 1u);
+    EXPECT_EQ(cache.coordinator.Evictor().HostEvictions().lru.blocks, 0u);
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
+TEST(DiskTierTest, AWriteBackPlacementDropsACleanCheckpointWithItsHistoryBeforeADirtyOne) {
+    DiskTierCache cache(FullAndState(), /*disk_parents=*/16, Limits(), /*host_parents=*/8);
+    const std::vector<CacheKey> dirty = cache.OnHostOnly(Prompt(3, 1));
+    const std::vector<CacheKey> clean = cache.OnHostOnly(Prompt(3, 2));
+    ASSERT_EQ(clean.size(), 4u) << "three pages and the checkpoint at the prompt end";
+    cache.CleanAll(clean);
+    ASSERT_EQ(cache.coordinator.Host().NumFreeLcmBlocks(), 0);
+
+    EXPECT_EQ(cache.PlaceSegment(1).stats.allocated, 1u);
+    EXPECT_TRUE(std::ranges::none_of(clean, [&](const CacheKey& key) { return cache.OnHost(key); }));
+    EXPECT_TRUE(std::ranges::all_of(dirty, [&](const CacheKey& key) { return cache.OnHost(key); }));
+    EXPECT_EQ(cache.coordinator.Evictor().HostEvictions().clean.blocks, 4u);
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
+// A checkpoint whose State the Disk holds still ranks as dirty when the
+// victim it becomes would take a Host page the Disk lacks.
+TEST(DiskTierTest, ACleanCheckpointAboveADirtyPageRanksAsDirty) {
+    DiskTierCache cache(FullAndState(), /*disk_parents=*/16, Limits(), /*host_parents=*/8);
+    const std::vector<CacheKey> older = cache.OnHostOnly(Prompt(3, 1));
+    const std::vector<CacheKey> newer = cache.OnHostOnly(Prompt(3, 2));
+    cache.CleanAll(newer);
+    // The newer prompt's root page is dirty again; its checkpoint is not.
+    ASSERT_TRUE(cache.coordinator.Disk().DropUnreadableEntry(newer[0]));
+    ASSERT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(newer.back()));
+
+    EXPECT_EQ(cache.PlaceSegment(1).stats.allocated, 1u);
+    EXPECT_TRUE(std::ranges::all_of(newer, [&](const CacheKey& key) { return cache.OnHost(key); }))
+        << "taking the newer checkpoint would take its dirty root page along";
+    EXPECT_TRUE(std::ranges::none_of(older, [&](const CacheKey& key) { return cache.OnHost(key); }))
+        << "the older checkpoint leaves first, by recency";
+    EXPECT_EQ(cache.coordinator.Evictor().HostEvictions().clean.blocks, 0u);
+    EXPECT_EQ(cache.coordinator.Evictor().HostEvictions().lru.blocks, 4u);
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
 // A holder lists, for a peer, each page from the fastest tier holding it;
 // its Disk pages are pushed (docs/rfcs/0006-disk-tier.md, Peer sharing).
 TEST(DiskTierTest, APeerListingNamesEachPageFromTheFastestTierHoldingIt) {
@@ -459,7 +546,7 @@ TEST(DiskTierTest, APeerListingNamesEachPageFromTheFastestTierHoldingIt) {
     exports.Lookup(cache.coordinator, lookup, /*now_us=*/0);
     exports.Pin(cache.coordinator,
                 cache::PeerPin{.lease = lookup.lease, .num_tokens = answer.num_tokens, .pages = answer.pages},
-                /*now_us=*/1);
+                /*now_us=*/1, nullptr);
     EXPECT_TRUE(exports.Held(lookup.lease));
     EXPECT_EQ(cache.coordinator.Disk().NumPinnedDiskCachedBlocks(), 2);
     exports.Release(cache.coordinator, cache::PeerRelease{.lease = lookup.lease, .demote = false}, /*now_us=*/2);
@@ -791,6 +878,827 @@ TEST(DiskTierConfigTest, ADiskTierNeedsHostWriteBackAndItsLimits) {
     config.disk_config->max_host_blocks = 1;
     config.disk_allocator.total_pages = 1;
     EXPECT_THROW(config.Validate(), std::invalid_argument) << "disk_config without a Disk tier";
+}
+
+TEST(DiskTierTest, CleaningAdmissionAndReadSlotReservation) {
+    // 1. Cleaning reserves foreground read slots (`max_write_ops = max(1, 4/4) = 1`).
+    DiskConfig limits = Limits();
+    limits.max_operations = 4;
+    limits.max_blocks_per_operation = 1;
+    DiskTierCache c1(FullOnly(), 16, limits);
+    c1.disks.QueueCleaning(c1.OnHostOnly(Prompt(2, 1)));
+    c1.disks.QueueCleaning(c1.OnHostOnly(Prompt(2, 2)));
+    c1.disks.StartCleaning();
+    ASSERT_EQ(c1.disks.TakeCommands().size(), 1u);
+    c1.disks.StartCleaning();
+    EXPECT_TRUE(c1.disks.TakeCommands().empty());
+    EXPECT_TRUE(c1.disks.HasReadCredits());
+
+    // 2. min_clean_tokens and require_reuse_for_cleaning drop unready branches.
+    DiskConfig gated = Limits();
+    gated.min_clean_tokens = 12;
+    DiskTierCache c2(FullOnly(), 16, gated);
+    c2.disks.QueueCleaning(c2.OnHostOnly(Prompt(2, 1)));  // 8 < 12
+    c2.disks.StartCleaning();
+    EXPECT_EQ(c2.disks.DroppedCleanings(), 2u);
+    const auto long_keys = c2.OnHostOnly(Prompt(4, 2));  // 16 >= 12
+    EXPECT_EQ(c2.Clean(std::span{long_keys}.last(1)).group_ids.size(), 4u);
+
+    DiskConfig reuse = Limits();
+    reuse.require_reuse_for_cleaning = true;
+    DiskTierCache c3(FullOnly(), 16, reuse);
+    const auto cold = c3.OnHostOnly(Prompt(2, 1));
+    c3.disks.QueueCleaning(cold);
+    c3.disks.StartCleaning();
+    // Not reused yet: nothing is written, and nothing is given up either.
+    EXPECT_TRUE(c3.disks.TakeCommands().empty());
+    EXPECT_EQ(c3.disks.DroppedCleanings(), 0u);
+    EXPECT_EQ(c3.disks.NumAwaitingReuse(), 2u);
+    // A later admission acquires the Host entries: the next plan cleans them.
+    {
+        auto& index = c3.coordinator.Store().Groups()[0].Index();
+        const auto probe = FullAttnMatcher{}.Probe(index, c3.host, cold, 0, 2, /*extra_hits=*/nullptr);
+        const PrefixMatch reused =
+            index.AcquireMatched(c3.host, cold, 0, probe, CacheCoordinatorTestAccess::NextAccessEpoch(c3.coordinator),
+                                 /*session=*/nullptr);
+        EXPECT_EQ(reused.blocks.size(), 2u);
+    }
+    c3.disks.StartCleaning();
+    const auto writes = c3.disks.TakeCommands();
+    ASSERT_EQ(writes.size(), 1u);
+    EXPECT_EQ(writes[0].group_ids.size(), 2u);
+    EXPECT_EQ(c3.disks.NumAwaitingReuse(), 0u);
+    EXPECT_EQ(c3.disks.DroppedCleanings(), 0u);
+
+    // An entry the Host drops while it waits is forgotten.
+    DiskTierCache c4(FullOnly(), 16, reuse);
+    const auto gone = c4.OnHostOnly(Prompt(2, 3));
+    c4.disks.QueueCleaning(gone);
+    c4.disks.StartCleaning();
+    c4.EvictFromHost(std::span{gone}.last(1));
+    c4.EvictFromHost(std::span{gone}.first(1));
+    c4.disks.StartCleaning();
+    EXPECT_EQ(c4.disks.NumAwaitingReuse(), 0u);
+    EXPECT_EQ(c4.disks.DroppedCleanings(), 2u);
+}
+
+TEST(DiskTierTest, PartialHostCreditExhaustionRetryableAndInt32BlockBound) {
+    DiskConfig limits = Limits();
+    limits.max_operations = 4;
+    limits.max_blocks_per_operation = 8;
+    limits.max_host_blocks = 5;
+    limits.max_write_host_blocks = 5;
+    DiskTierCache cache(FullAndState(), 16, limits);
+    const Prompt p1(3, 1), p2(3, 2);
+    const auto k1 = cache.OnHostOnly(p1), k2 = cache.OnHostOnly(p2);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(k1).op_id, .success = true});
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(k2).op_id, .success = true});
+    cache.EvictFromHost(k1);
+    cache.EvictFromHost(k2);
+    const auto r1 = cache.disks.TryStartRead(p1.Prefix(), /*local_tokens=*/0);
+    ASSERT_TRUE(r1.lease);
+    const auto r2 = cache.disks.TryStartRead(p2.Prefix(), /*local_tokens=*/0);
+    EXPECT_FALSE(r2.lease);
+    EXPECT_TRUE(r2.retryable);
+
+    SchedulerConfig cfg{};
+    cfg.prefix_granularity = 4;
+    cfg.device_allocator.total_pages = 9;
+    cfg.host_allocator.total_pages = 9;
+    cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+    cfg.max_scheduled_tokens = 64;
+    cfg.max_batch_size = 4;
+    cfg.max_resident_requests = 4;
+    cfg.cache_groups.push_back(
+        CacheGroupConfig{.group_id = "full", .block_granularity = 4, .total_pages = 9, .attn_kind = AttnKind::kFull});
+    cfg.host_group_packing = {4};
+    SetTestSnapshotPool(cfg);
+    cfg.disk_allocator.total_pages = (std::numeric_limits<std::int32_t>::max() / 4) + 2;
+    cfg.disk_config = Limits();
+    EXPECT_THROW(cfg.Validate(), std::invalid_argument);
+}
+
+TEST_F(DiskTierKvEventsTest, FailedReadDropsDiskEntryAndUnblocksWithoutPermanentLockout) {
+    Tick(1);
+    SeedOnHost();
+    scheduler_->DrainKvEvents();
+    const auto writes = DiskOps(PlanOnce());
+    ASSERT_EQ(writes.size(), 1u);
+    AckDisk(writes[0], /*success=*/true);
+    ASSERT_FALSE(scheduler_->DrainKvEvents().empty());
+    DropSeedFromHost();
+
+    Submit(RequestSpec{.request_id = "hit", .tokens = MakeTokens(9), .max_new_tokens = 1});
+    const ExecutionPlan prefetch = PlanOnce();
+    ASSERT_TRUE(Idle(prefetch));
+    const auto reads = DiskOps(prefetch);
+    ASSERT_EQ(reads.size(), 1u);
+
+    // Failed Disk read drops the unreadable Disk entry and lets the request admit locally.
+    AckDisk(reads[0], /*success=*/false);
+    EXPECT_EQ(scheduler_->GetDiskStats().disk_blocks, 0u);
+    EXPECT_EQ(scheduler_->GetDiskStats().failed_reads, 1u);
+    const ExecutionPlan admitted = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(admitted);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{4});
+}
+
+TEST_F(DiskTierKvEventsTest, SaturatedDiskCreditsDeferRetryUntilInFlightOperationFinishes) {
+    Tick(1);
+    SeedOnHost();
+    const auto writes = DiskOps(PlanOnce());
+    ASSERT_EQ(writes.size(), 1u);
+    AckDisk(writes[0], /*success=*/true);
+    DropSeedFromHost();
+
+    // First request consumes the sole Disk read operation slot (`max_operations = 1`?
+    // Fill remaining slots or saturate read credits by submitting multiple hits).
+    const std::vector<std::int32_t> tokens = MakeTokens(9);
+    for (int i = 0; i < 4; ++i) {
+        Submit(RequestSpec{.request_id = "r" + std::to_string(i), .tokens = tokens, .max_new_tokens = 1});
+    }
+    // Plan with forward disallowed so waiting requests stay queued while read credits saturate.
+    const ExecutionPlan first = scheduler_->NextExecutionPlan({.allow_prefill = false});
+    const auto first_reads = DiskOps(first);
+    ASSERT_FALSE(first_reads.empty());
+    // While in-flight operations occupy all credits, another round emits no duplicate reads
+    // and leaves waiting requests ready to retry once credits free up.
+    const ExecutionPlan second = scheduler_->NextExecutionPlan({.allow_prefill = false});
+    EXPECT_TRUE(DiskOps(second).empty());
+    for (const auto& op : first_reads) {
+        AckDisk(op, /*success=*/true);
+    }
+    const ExecutionPlan admitted = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(admitted);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_FALSE(batch->request_ids.empty());
+}
+
+TEST(DiskTierTest, HybridStateDiskOnlyResidencyAndHotDescendantVisibility) {
+    DiskTierCache cache(FullAndState(), 16);
+    std::vector<ContentHash> observed;
+    cache.coordinator.SetCacheMutationSink([&](const CacheKey& key, CacheMutation m) {
+        if (m == CacheMutation::kLowerTierResidency) observed.push_back(key.content_hash);
+    });
+
+    const Prompt turn1(2, 41), turn2(4, 41);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(cache.OnHostOnly(turn1)).op_id, .success = true});
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(cache.OnHostOnly(turn2)).op_id, .success = true});
+
+    // Evicting P1 State while descendant P3 State stays on Host keeps RAM visibility.
+    const ContentHash p1{turn1.hashes[1]}, p3{turn2.hashes[3]};
+    cache.EvictFromHost(std::vector<CacheKey>{CacheKey{.group_id = 1, .content_hash = p1}});
+    for (const auto& h : turn2.hashes) {
+        EXPECT_TRUE(
+            cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{h}}, 0).host_publishable);
+    }
+
+    // Evicting P3 State too makes all pages Disk-only and notifies every ancestor with kLowerTierResidency.
+    observed.clear();
+    cache.EvictFromHost(std::vector<CacheKey>{CacheKey{.group_id = 1, .content_hash = p3}});
+    for (const auto& h : turn2.hashes) {
+        const ContentHash ch{h};
+        EXPECT_NE(std::ranges::find(observed, ch), observed.end());
+        const auto st = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ch}, 0);
+        EXPECT_FALSE(st.host_publishable);
+        EXPECT_TRUE(st.disk_publishable);
+    }
+
+    // Prefetching P3 State back to Host restores host_publishable and notifies P1.
+    observed.clear();
+    StorageLease read = cache.disks.StartRead(turn2.Prefix());
+    ASSERT_TRUE(read);
+    ASSERT_EQ(cache.disks.TakeCommands().size(), 1u);
+    cache.disks.Complete(cache::DiskDone{.op_id = read.OperationId(), .success = true});
+    EXPECT_NE(std::ranges::find(observed, p1), observed.end());
+    for (const auto& h : turn2.hashes) {
+        EXPECT_TRUE(
+            cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{h}}, 0).host_publishable);
+    }
+    EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
+DiskConfig GdsDiskLimits() {
+    auto limits = Limits();
+    limits.max_host_blocks = 64;
+    limits.max_write_host_blocks = 64;
+    return limits;
+}
+
+void ConfigureDiskGds(DiskTierCache& cache) {
+    cache.coordinator.ConfigureEviction(
+        PrefixCacheEvictionConfig::Gds(PrefillCost{1, 0}, std::vector<double>(cache.coordinator.NumGroups(), 0.01)));
+}
+
+void CopyToDisk(DiskTierCache& cache, std::span<const CacheKey> keys) {
+    for (const auto& key : keys) {
+        const std::array group{key.group_id};
+        const std::array<std::int32_t, 1> bucket{0};
+        auto batch = cache.coordinator.Disk().AcquireDiskBlocks(group, bucket);
+        ASSERT_EQ(batch.allocated, 1u);
+        const auto source = cache.coordinator.Store().Groups()[key.group_id].Index().Inspect(cache.host, key);
+        ASSERT_TRUE(source);
+        cache.coordinator.Disk().CacheDiskBlock(batch.blocks[0], key, source->metadata);
+    }
+}
+
+std::vector<CacheBlockRef> HoldFreeHost(DiskTierCache& cache) {
+    std::vector<CacheBlockRef> held;
+    const std::array<std::int32_t, 1> bucket{0};
+    for (;;) {
+        auto blocks = cache.host.AcquireBlocksInBuckets(0, bucket);
+        if (blocks.empty()) return held;
+        held.push_back(std::move(blocks.front()));
+    }
+}
+
+TEST(DiskGdsTest, CleaningGatesTheTipAndPreservesColdAncestorDependencies) {
+    for (bool disk_tip : {false, true}) {
+        SCOPED_TRACE(disk_tip);
+        auto limits = GdsDiskLimits();
+        limits.min_clean_tokens = 12;
+        limits.require_reuse_for_cleaning = true;
+        DiskTierCache cache(FullAndState(), 32, limits);
+        ConfigureDiskGds(cache);
+        const auto short_keys = cache.OnHostOnly(Prompt(2, 1));
+        const auto long_keys = cache.OnHostOnly(Prompt(4, 2));
+        cache.disks.StartCleaning();
+        EXPECT_TRUE(cache.disks.TakeCommands().empty());
+        // Reuse both tips: the short branch stays gated by length. Cold
+        // ancestors still belong to the eligible long branch's Disk closure.
+        for (const auto& key : {short_keys[1], long_keys[3]}) {
+            const std::array tip{key};
+            auto& index = cache.coordinator.Store().Groups()[0].Index();
+            const auto probe = FullAttnMatcher{}.Probe(index, cache.host, tip, 0, 1, /*extra_hits=*/nullptr);
+            const auto reused = index.AcquireMatched(cache.host, tip, 0, probe,
+                                                     CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator),
+                                                     /*session=*/nullptr);
+            ASSERT_EQ(reused.blocks.size(), 1u);
+        }
+        const std::array tip{long_keys[3]};
+        if (disk_tip) {
+            CopyToDisk(cache, tip);
+            cache.EvictFromHost(tip);
+        }
+        cache.disks.StartCleaning();
+        const auto writes = cache.disks.TakeCommands();
+        ASSERT_EQ(writes.size(), 1u);
+        EXPECT_EQ(writes[0].group_ids.size(), long_keys.size() - (disk_tip ? 1u : 0u));
+        cache.disks.Complete(cache::DiskDone{writes[0].op_id, true});
+        for (const auto& key : long_keys) EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(key));
+        for (const auto& key : short_keys) EXPECT_FALSE(cache.coordinator.Disk().ContainsDiskCachedBlock(key));
+    }
+}
+
+TEST(DiskGdsTest, CleaningLeavesReadCreditsAndPartialHostCreditsRemainRetryable) {
+    auto limits = GdsDiskLimits();
+    limits.max_host_blocks = 5;
+    limits.max_write_host_blocks = 5;
+    limits.max_blocks_per_operation = 8;
+    DiskTierCache cache(FullAndState(), 32, limits, /*host_parents=*/12);
+    ConfigureDiskGds(cache);
+    const Prompt first(3, 1), second(3, 2);
+    const auto first_keys = cache.OnHostOnly(first);
+    const auto second_keys = cache.OnHostOnly(second);
+    CopyToDisk(cache, first_keys);
+    CopyToDisk(cache, second_keys);
+    cache.EvictFromHost(first_keys);
+    cache.EvictFromHost(second_keys);
+    const auto first_read = cache.disks.TryStartRead(first.Prefix(), /*local_tokens=*/0);
+    ASSERT_TRUE(first_read.lease);
+    const auto second_read = cache.disks.TryStartRead(second.Prefix(), /*local_tokens=*/0);
+    EXPECT_FALSE(second_read.lease);
+    EXPECT_TRUE(second_read.retryable);
+    cache.disks.TakeCommands();
+    cache.disks.Complete(cache::DiskDone{first_read.lease.OperationId(), true});
+
+    auto write_limits = GdsDiskLimits();
+    write_limits.max_blocks_per_operation = 1;
+    DiskTierCache writing(FullAndState(), 32, write_limits);
+    ConfigureDiskGds(writing);
+    writing.OnHostOnly(Prompt(2, 3));
+    writing.OnHostOnly(Prompt(2, 4));
+    writing.disks.StartCleaning();
+    ASSERT_EQ(writing.disks.TakeCommands().size(), 1u);
+    writing.disks.StartCleaning();
+    EXPECT_TRUE(writing.disks.TakeCommands().empty());
+    EXPECT_TRUE(writing.disks.HasReadCredits());
+}
+
+TEST(DiskGdsTest, DiskAncestorProtectsHostStateAndReadArrivalDoesNotCountAsReuse) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const Prompt a(4, 1), b(1, 2);
+    const auto a_keys = cache.OnHostOnly(a);
+    const auto b_keys = cache.OnHostOnly(b);
+    {
+        const auto used = cache.coordinator.ExportListing(
+            cache.coordinator.Prober().ListPrefix(cache.coordinator.Prober().ProbePromptPrefix(b.Prefix())));
+        ASSERT_GT(used.num_tokens, 0);
+    }
+    CopyToDisk(cache, std::span{a_keys}.first(1));
+    cache.EvictFromHost(std::span{a_keys}.first(1));
+    const ContentHash hash{a.hashes.back()};
+    auto& store = cache.coordinator.Store();
+    const auto route = store.RecoveryDependencies().At(hash);
+    EXPECT_FALSE(route.ready);
+    EXPECT_TRUE(route.disk_recoverable);
+    EXPECT_NEAR(route.disk_read_cost, 0.01, 1e-12);
+    EXPECT_EQ(store.GdsStats().broken_units, 0u);
+    auto held = HoldFreeHost(cache);
+    auto destination = cache.coordinator.Host().AcquireHostBlock(1, 0);
+    ASSERT_TRUE(destination);
+    EXPECT_TRUE(cache.coordinator.Host().ContainsHostCachedBlock(a_keys.back()));
+    EXPECT_FALSE(cache.coordinator.Host().ContainsHostCachedBlock(b_keys.back()));
+    EXPECT_GT(store.GdsStats().host_watermark, 0);
+    auto before = store.Checkpoints().RecoveryPoints();
+    auto read = cache.disks.StartRead(a.Prefix());
+    ASSERT_TRUE(read);
+    auto commands = cache.disks.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u);
+    EXPECT_EQ(commands[0].group_ids.size(), 1u);
+    cache.disks.Complete(cache::DiskDone{read.OperationId(), true});
+    EXPECT_TRUE(store.RecoveryDependencies().At(hash).ready);
+    EXPECT_EQ(cache.HostHitTokens(a), 16);
+    const auto after = store.Checkpoints().RecoveryPoints();
+    ASSERT_EQ(before.size(), after.size());
+    EXPECT_DOUBLE_EQ(before.front().stamp, after.front().stamp);
+    EXPECT_DOUBLE_EQ(before.front().host_stamp, after.front().host_stamp);
+}
+
+TEST(DiskGdsTest, RejectedHostSegmentRestoresCoverageBeforeLaterSingleRows) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const Prompt prompt(1, 1);
+    const auto keys = cache.OnHostOnly(prompt);
+    ASSERT_EQ(keys.size(), 2u);
+    CopyToDisk(cache, std::span{keys}.first(1));
+    auto held = HoldFreeHost(cache);
+    const std::array<std::uint32_t, 5> groups{1, 1, 1, 1, 1};
+    const std::array<std::int32_t, 5> buckets{0, 0, 0, 0, 0};
+    const std::array<std::size_t, 4> ends{2, 3, 4, 5};
+    const auto& store = cache.coordinator.Store();
+    // Only the clean KV page can leave. The two-row segment tries that
+    // removal but cannot fit; one following row can use it, and no more can.
+    auto selected = PlanTieredHostAllocation(store, groups, buckets, ends, false, false);
+    EXPECT_EQ(selected.accepted, (std::vector<bool>{false, false, true, false, false}));
+    ASSERT_EQ(selected.plan->host_removals.size(), 1u);
+    EXPECT_EQ(selected.plan->host_removals.front().key, keys.front());
+    EXPECT_EQ(selected.plan->stats.host_clean_copies_released, 1u);
+    EXPECT_EQ(selected.plan->stats.host_copy_rejections, 4u);
+    EXPECT_TRUE(selected.plan->losses.empty());
+    EXPECT_TRUE(selected.plan->fresh_rejections.empty());
+    EXPECT_DOUBLE_EQ(selected.plan->stats.host_watermark, 0);
+    for (const auto& key : keys) EXPECT_TRUE(cache.OnHost(key));
+
+    std::pmr::monotonic_buffer_resource arena;
+    auto victims = TieredVictims(selected.plan, &arena);
+    CacheCoordinatorTestAccess::CommitVictims(cache.coordinator, victims);
+    EXPECT_FALSE(cache.OnHost(keys.front()));
+    EXPECT_TRUE(cache.OnHost(keys.back()));
+    EXPECT_EQ(cache.host.NumEmptyLcmBlocks(), 1);
+    EXPECT_TRUE(store.RecoveryDependencies().At(ContentHash{prompt.hashes.back()}).disk_recoverable);
+    EXPECT_EQ(store.GdsStats().logical_evictions, 0u);
+    EXPECT_DOUBLE_EQ(store.GdsStats().host_watermark, 0);
+}
+
+TEST(DiskGdsTest, OptionalRowsReclaimDeviceDuplicatesThenDiskCopiesWithoutLogicalLoss) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const Prompt old(1, 1), active(1, 2);
+    const auto old_keys = cache.OnHostOnly(old);
+    CopyToDisk(cache, std::span{old_keys}.first(1));
+    auto tables = cache.OnDevice(active);
+    const CacheKey duplicate{.group_id = 1, .content_hash = ContentHash{active.hashes.back()}};
+    {
+        auto block = cache.host.AcquireBlock(1);
+        ASSERT_TRUE(block);
+        cache.coordinator.Host().CacheHostBlock(block, duplicate, std::nullopt);
+    }
+    auto held = HoldFreeHost(cache);
+    const std::array<std::uint32_t, 3> groups{1, 1, 1};
+    const std::array<std::int32_t, 3> buckets{};
+    auto placed = cache.coordinator.Host().AcquireHostCopies(groups, buckets);
+    ASSERT_EQ(placed.blocks.size(), groups.size());
+    EXPECT_TRUE(placed.blocks[0]);
+    EXPECT_TRUE(placed.blocks[1]);
+    EXPECT_FALSE(placed.blocks[2]);
+    EXPECT_FALSE(cache.OnHost(duplicate));
+    EXPECT_FALSE(cache.OnHost(old_keys.front()));
+    EXPECT_TRUE(cache.OnHost(old_keys.back()));
+    const auto& store = cache.coordinator.Store();
+    const auto& route = store.RecoveryDependencies().At(ContentHash{old.hashes.back()});
+    EXPECT_TRUE(route.disk_recoverable);
+    EXPECT_GT(route.disk_read_cost, 0);
+    EXPECT_TRUE(store.RecoveryDependencies().At(duplicate.content_hash).device_ready);
+    EXPECT_EQ(store.GdsStats().host_clean_copies_released, 1u);
+    EXPECT_EQ(store.GdsStats().host_copy_rejections, 1u);
+    EXPECT_EQ(store.GdsStats().logical_evictions, 0u);
+    EXPECT_EQ(store.GdsStats().logical_rejections, 0u);
+    EXPECT_DOUBLE_EQ(store.GdsStats().host_watermark, 0);
+    cache.coordinator.Free(tables);
+}
+
+TEST(DiskGdsTest, CleanStatePrecedesDirtyLossUnderBothPolicies) {
+    for (bool gds : {false, true}) {
+        SCOPED_TRACE(gds);
+        DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+        if (gds) ConfigureDiskGds(cache);
+        const auto a = cache.OnHostOnly(Prompt(4, 1));
+        const auto b = cache.OnHostOnly(Prompt(1, 2));
+        CopyToDisk(cache, std::span{a}.last(1));
+        auto held = HoldFreeHost(cache);
+        auto block = cache.coordinator.Host().AcquireHostBlock(1, 0);
+        ASSERT_TRUE(block);
+        EXPECT_FALSE(cache.coordinator.Host().ContainsHostCachedBlock(a.back()));
+        EXPECT_TRUE(cache.coordinator.Host().ContainsHostCachedBlock(b.back()));
+        EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(a.back()));
+        const auto stats = cache.coordinator.Store().GdsStats();
+        EXPECT_DOUBLE_EQ(stats.host_watermark, 0);
+        EXPECT_EQ(stats.logical_evictions, 0u);
+        EXPECT_EQ(stats.logical_rejections, 0u);
+        if (gds) EXPECT_EQ(stats.host_clean_copies_released, 1u);
+    }
+}
+
+TEST(DiskGdsTest, BlockPlacementReclaimsDeadEntriesBeforeCleanCopies) {
+    for (bool gds : {false, true}) {
+        for (bool whole : {false, true}) {
+            for (bool gap : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << gds << ":" << whole << ":" << gap);
+                DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+                if (gds) ConfigureDiskGds(cache);
+                const auto clean = cache.OnHostOnly(Prompt(1, 1));
+                CopyToDisk(cache, clean);
+                const auto dead = cache.OnHostOnly(Prompt(2, 2));
+                cache.EvictFromHost(gap ? std::span{dead}.first(1) : std::span{dead}.last(1));
+                const auto dead_before =
+                    std::ranges::count_if(dead, [&](const CacheKey& key) { return cache.OnHost(key); });
+                auto held = HoldFreeHost(cache);
+                const std::array<std::uint32_t, 1> groups{0};
+                const std::array<std::int32_t, 1> buckets{0};
+                auto placed = whole ? cache.coordinator.Host().AcquireHostLanding(groups, buckets)
+                                    : cache.coordinator.Host().AcquireHostBlocks(groups, buckets);
+                ASSERT_EQ(placed.stats.allocated, 1u);
+                for (const auto& key : clean) EXPECT_TRUE(cache.OnHost(key));
+                EXPECT_LT(std::ranges::count_if(dead, [&](const CacheKey& key) { return cache.OnHost(key); }),
+                          dead_before);
+                EXPECT_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
+            }
+        }
+    }
+}
+
+TEST(DiskGdsTest, BlockPlacementReclaimsDeviceCopiesBeforeCleanCopies) {
+    for (bool gds : {false, true}) {
+        for (bool whole : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << gds << ":" << whole);
+            DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+            if (gds) ConfigureDiskGds(cache);
+            const auto clean = cache.OnHostOnly(Prompt(1, 1));
+            CopyToDisk(cache, clean);
+            const Prompt duplicate_prompt(1, 2);
+            const auto duplicate = cache.OnHostOnly(duplicate_prompt);
+            auto device_tables = cache.OnDevice(duplicate_prompt);
+            auto held = HoldFreeHost(cache);
+            const std::array<std::uint32_t, 2> groups{0, 1};
+            const std::array<std::int32_t, 2> buckets{0, 0};
+            auto placed = whole ? cache.coordinator.Host().AcquireHostLanding(groups, buckets)
+                                : cache.coordinator.Host().AcquireHostBlocks(groups, buckets);
+            ASSERT_EQ(placed.stats.allocated, 2u);
+            for (const auto& key : clean) EXPECT_TRUE(cache.OnHost(key));
+            for (const auto& key : duplicate) EXPECT_FALSE(cache.OnHost(key));
+            EXPECT_EQ(cache.coordinator.Prober().ProbePromptPrefix(duplicate_prompt.Prefix()).device.num_common_tokens,
+                      4);
+            EXPECT_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
+            cache.coordinator.Free(device_tables);
+        }
+    }
+}
+
+TEST(DiskGdsTest, BlockPlacementKeepsHostDescendantsOfADiskAncestorLive) {
+    for (bool gds : {false, true}) {
+        SCOPED_TRACE(gds);
+        DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+        if (gds) ConfigureDiskGds(cache);
+        const auto clean = cache.OnHostOnly(Prompt(1, 1));
+        CopyToDisk(cache, clean);
+        const auto disk_backed = cache.OnHostOnly(Prompt(2, 2));
+        CopyToDisk(cache, std::span{disk_backed}.first(1));
+        cache.EvictFromHost(std::span{disk_backed}.first(1));
+        auto held = HoldFreeHost(cache);
+        auto block = cache.coordinator.Host().AcquireHostBlock(1, 0);
+        ASSERT_TRUE(block);
+        for (const auto& key : std::span{disk_backed}.subspan(1)) EXPECT_TRUE(cache.OnHost(key));
+        EXPECT_LT(std::ranges::count_if(clean, [&](const CacheKey& key) { return cache.OnHost(key); }), clean.size());
+        EXPECT_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
+    }
+}
+
+TEST(DiskGdsTest, AFailedWholeLandingLeavesHostContentAndPolicyUnchanged) {
+    for (bool gds : {false, true}) {
+        SCOPED_TRACE(gds);
+        DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+        if (gds) ConfigureDiskGds(cache);
+        const auto keys = cache.OnHostOnly(Prompt(1, 1));
+        auto held = HoldFreeHost(cache);
+        const auto before = cache.coordinator.Store().GdsStats();
+        const std::array<std::uint32_t, 3> groups{1, 1, 1};
+        const std::array<std::int32_t, 3> buckets{0, 0, 0};
+        auto landing = cache.coordinator.Host().AcquireHostLanding(groups, buckets);
+        EXPECT_EQ(landing.stats.allocated, 0u);
+        for (const auto& key : keys) EXPECT_TRUE(cache.coordinator.Host().ContainsHostCachedBlock(key));
+        const auto after = cache.coordinator.Store().GdsStats();
+        EXPECT_EQ(after.committed_plans, before.committed_plans);
+        EXPECT_EQ(after.logical_evictions, before.logical_evictions);
+        EXPECT_DOUBLE_EQ(after.host_watermark, before.host_watermark);
+    }
+}
+
+TEST(DiskGdsTest, DiskRemovalInvalidatesRoutesEvenWhileAnIoOwnerKeepsTheBytes) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const Prompt prompt(3, 1);
+    const auto keys = cache.OnHostOnly(prompt);
+    CopyToDisk(cache, std::span{keys}.first(1));
+    cache.EvictFromHost(std::span{keys}.first(1));
+    auto source = cache.coordinator.Disk().AcquireDiskCachedBlock(keys[0]);
+    const auto free_before = cache.disk.NumEmptyLcmBlocks();
+    ASSERT_TRUE(cache.coordinator.Disk().DropUnreadableEntry(keys[0]));
+    EXPECT_FALSE(cache.coordinator.Disk().ContainsDiskCachedBlock(keys[0]));
+    EXPECT_EQ(cache.disk.NumEmptyLcmBlocks(), free_before);
+    EXPECT_FALSE(cache.coordinator.Store().RecoveryDependencies().At(ContentHash{prompt.hashes.back()}).Available());
+    EXPECT_EQ(cache.coordinator.Store().GdsStats().disk_route_losses, 1u);
+    EXPECT_DOUBLE_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
+    source.reset();
+    EXPECT_EQ(cache.disk.NumEmptyLcmBlocks(), free_before + 1);
+}
+
+TEST(DiskGdsTest, CleaningUsesCurrentHostScoresInsteadOfAckOrder) {
+    auto limits = GdsDiskLimits();
+    limits.max_blocks_per_operation = 1;
+    DiskTierCache cache(FullAndState(), 32, limits);
+    ConfigureDiskGds(cache);
+    const auto older = cache.OnHostOnly(Prompt(4, 1));
+    const auto cheaper = cache.OnHostOnly(Prompt(1, 2));
+    cache.disks.QueueCleaning(older);
+    cache.disks.QueueCleaning(cheaper);
+    cache.disks.StartCleaning();
+    const auto commands = cache.disks.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u);
+    ASSERT_EQ(commands[0].host_blocks.size(), 1u);
+    auto source =
+        cache.coordinator.Store().Groups()[cheaper.front().group_id].Index().Find(cache.host, cheaper.front());
+    EXPECT_EQ(commands[0].host_blocks[0], cache.coordinator.Allocator(0).ResolveCacheBlockId(*source));
+    EXPECT_EQ(commands[0].group_ids[0], 0u) << "history before its State";
+    EXPECT_DOUBLE_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
+    cache.disks.Complete(cache::DiskDone{commands[0].op_id, true});
+}
+
+TEST(DiskGdsTest, CleaningUsesTheDirtyIndexWithoutAccumulatingAckNotifications) {
+    auto limits = GdsDiskLimits();
+    limits.max_queued_cleanings = 1;
+    DiskTierCache cache(FullAndState(), 32, limits);
+    ConfigureDiskGds(cache);
+    const auto keys = cache.OnHostOnly(Prompt(1, 1));
+    for (int repeat = 0; repeat < 3; ++repeat) cache.disks.QueueCleaning(keys);
+    EXPECT_EQ(cache.disks.NumQueuedCleanings(), 0u);
+    EXPECT_EQ(cache.disks.DroppedCleanings(), 0u);
+    cache.disks.StartCleaning();
+    const auto commands = cache.disks.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u);
+    EXPECT_EQ(commands.front().group_ids.size(), keys.size());
+    cache.disks.Complete(cache::DiskDone{commands.front().op_id, true});
+    for (const auto& key : keys) EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(key));
+    EXPECT_EQ(cache.disks.DroppedCleanings(), 0u);
+}
+
+TEST(DiskGdsTest, DiskLossMakesHostDirtyWithoutAnotherWriteBackAck) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const auto keys = cache.OnHostOnly(Prompt(1, 1));
+    CopyToDisk(cache, keys);
+    for (const auto& key : keys) ASSERT_TRUE(cache.coordinator.Disk().DropUnreadableEntry(key));
+    EXPECT_EQ(cache.disks.NumQueuedCleanings(), 0u);
+    cache.disks.StartCleaning();
+    auto commands = cache.disks.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u);
+    EXPECT_EQ(commands[0].group_ids.size(), keys.size());
+    cache.disks.Complete(cache::DiskDone{commands[0].op_id, true});
+    for (const auto& key : keys) EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(key));
+}
+
+TEST(DiskGdsTest, CreditRejectionDoesNotEvictHostForAnUnstartedRead) {
+    auto limits = GdsDiskLimits();
+    limits.max_operations = 1;
+    DiskTierCache cache(FullAndState(), 32, limits);
+    ConfigureDiskGds(cache);
+    const Prompt disk_prompt(1, 1);
+    const auto disk_keys = cache.OnHostOnly(disk_prompt);
+    CopyToDisk(cache, disk_keys);
+    cache.EvictFromHost(disk_keys);
+    const auto host_keys = cache.OnHostOnly(Prompt(1, 2));
+    cache.disks.StartCleaning();
+    auto commands = cache.disks.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u);
+    auto held = HoldFreeHost(cache);
+    const auto before = cache.coordinator.Store().GdsStats();
+    EXPECT_FALSE(cache.disks.StartRead(disk_prompt.Prefix()));
+    for (const auto& key : host_keys) EXPECT_TRUE(cache.coordinator.Host().ContainsHostCachedBlock(key));
+    EXPECT_EQ(cache.coordinator.Store().GdsStats().committed_plans, before.committed_plans);
+    EXPECT_DOUBLE_EQ(cache.coordinator.Store().GdsStats().host_watermark, before.host_watermark);
+    cache.disks.Complete(cache::DiskDone{commands[0].op_id, true});
+}
+
+TEST(DiskGdsTest, HandoffStopsQueuedCleaningAndSuppressesAnIssuedWritesPublication) {
+    for (bool issued : {false, true}) {
+        SCOPED_TRACE(issued);
+        DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+        ConfigureDiskGds(cache);
+        const auto keys = cache.OnHostOnly(Prompt(2, 1));
+        cache.disks.StartCleaning();
+        std::vector<DiskOperation> commands;
+        if (issued) commands = cache.disks.TakeCommands();
+        ASSERT_EQ(cache.disks.NumOperations(), 1u);
+        const auto epoch = CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator);
+        EXPECT_GT(cache.coordinator.DemoteExportedChain(keys, epoch), 0);
+        if (issued) {
+            ASSERT_EQ(commands.size(), 1u);
+            EXPECT_GT(cache.coordinator.Host().NumPinnedHostCachedBlocks(), 0);
+            cache.disks.Complete(cache::DiskDone{commands[0].op_id, true});
+        } else {
+            EXPECT_TRUE(cache.disks.TakeCommands().empty());
+        }
+        for (const auto& key : keys) EXPECT_FALSE(cache.coordinator.Disk().ContainsDiskCachedBlock(key));
+        EXPECT_EQ(cache.coordinator.Host().NumPinnedHostCachedBlocks(), 0);
+        EXPECT_EQ(cache.disks.NumOperations(), 0u);
+    }
+}
+
+TEST(DiskGdsTest, NewUseCancelsHandoffBeforeCleaningAckAtTheSameWatermark) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const Prompt prompt(2, 1);
+    const auto keys = cache.OnHostOnly(prompt);
+    cache.disks.StartCleaning();
+    auto commands = cache.disks.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u);
+    const auto epoch = CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator);
+    ASSERT_GT(cache.coordinator.DemoteExportedChain(keys, epoch), 0);
+    auto exported = cache.coordinator.ExportListing(
+        cache.coordinator.Prober().ListPrefix(cache.coordinator.Prober().ProbePromptPrefix(prompt.Prefix())));
+    EXPECT_GT(exported.num_tokens, 0);
+    cache.disks.Complete(cache::DiskDone{commands[0].op_id, true});
+    for (const auto& key : keys) EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(key));
+    EXPECT_DOUBLE_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
+}
+
+TEST(DiskGdsTest, CleaningWaitsForPublishedPrerequisitesAndKeepsThemDuringPlacement) {
+    auto limits = GdsDiskLimits();
+    limits.max_blocks_per_operation = 1;
+    DiskTierCache cache(FullAndState(), 1, limits);
+    ConfigureDiskGds(cache);
+    const auto keys = cache.OnHostOnly(Prompt(1, 1));
+    cache.disks.StartCleaning();
+    cache.disks.StartCleaning();
+    auto commands = cache.disks.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u) << "an in-flight ancestor is not a Disk prerequisite";
+    EXPECT_EQ(commands[0].group_ids, std::vector<std::uint32_t>{0});
+    cache.disks.Complete(cache::DiskDone{commands[0].op_id, false});
+    cache.disks.StartCleaning();
+    commands = cache.disks.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u);
+    EXPECT_EQ(commands[0].group_ids, std::vector<std::uint32_t>{0});
+    cache.disks.Complete(cache::DiskDone{commands[0].op_id, true});
+    cache.disks.StartCleaning();
+    EXPECT_TRUE(cache.disks.TakeCommands().empty()) << "one Disk parent cannot hold the whole closure";
+    EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(keys.front()));
+    EXPECT_FALSE(cache.coordinator.Disk().ContainsDiskCachedBlock(keys.back()));
+    EXPECT_EQ(cache.coordinator.Host().NumPinnedHostCachedBlocks(), 0);
+}
+
+TEST(DiskGdsTest, CleaningVisitorStopsBeforeLaterCandidateExpansion) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    // A merged HLD interval must not price KV blocks as the much larger State block.
+    cache.coordinator.ConfigureEviction(PrefixCacheEvictionConfig::Gds(PrefillCost{1, 0}, {0.01, 10}));
+    cache.OnHostOnly(Prompt(4, 1));
+    cache.OnHostOnly(Prompt(4, 2));
+    std::vector<ContentHash> candidates;
+    VisitGdsHostCleaningCandidates(cache.coordinator.Store(), [&](HostCleaningCandidate candidate) {
+        candidates.push_back(candidate.hash);
+        return true;
+    });
+    ASSERT_EQ(candidates.size(), 2u);
+    std::vector<ContentHash> visited;
+    VisitGdsHostCleaningCandidates(cache.coordinator.Store(), [&](HostCleaningCandidate candidate) {
+        visited.push_back(candidate.hash);
+        return false;
+    });
+    EXPECT_EQ(visited, std::vector<ContentHash>{candidates.front()});
+}
+
+TEST(DiskGdsTest, AnOlderMemoryAncestorCanBeCheaperThanTheNearestDiskAncestor) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    cache.coordinator.ConfigureEviction(PrefixCacheEvictionConfig::Gds(PrefillCost{1, 0}, {0.01, 10}));
+    cache.OnHostOnly(Prompt(1, 1));
+    const auto middle = cache.OnHostOnly(Prompt(2, 1));
+    const Prompt deep(4, 1);
+    cache.OnHostOnly(deep);
+    CopyToDisk(cache, std::span{middle}.last(1));
+    cache.EvictFromHost(std::span{middle}.last(1));
+    std::vector<HostCleaningCandidate> candidates;
+    VisitGdsHostCleaningCandidates(cache.coordinator.Store(), [&](HostCleaningCandidate candidate) {
+        candidates.push_back(std::move(candidate));
+        return true;
+    });
+    const auto found =
+        std::ranges::find_if(candidates, [&](const auto& c) { return c.hash == ContentHash{deep.hashes.back()}; });
+    ASSERT_NE(found, candidates.end());
+    // Resume at 4 costs 12; resume at 8 costs 10 + 8. The deep point
+    // exclusively retains two KV slots and its State slot.
+    EXPECT_DOUBLE_EQ(found->score, 12.0 / 3);
+}
+
+TEST(DiskGdsTest, ALateFailedReadDoesNotInvalidateANewCopyOfTheSameKey) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const auto keys = cache.OnHostOnly(Prompt(1, 1));
+    CopyToDisk(cache, keys);
+    auto old_source = cache.coordinator.Disk().AcquireDiskCachedBlock(keys.front());
+    ASSERT_TRUE(cache.coordinator.Disk().DropUnreadableEntry(keys.front(), old_source));
+    CopyToDisk(cache, std::span{keys}.first(1));
+    EXPECT_FALSE(cache.coordinator.Disk().DropUnreadableEntry(keys.front(), old_source));
+    EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(keys.front()));
+    EXPECT_NE(cache.coordinator.Disk().AcquireDiskCachedBlock(keys.front()), old_source);
+}
+
+TEST(DiskGdsTest, DiskOnlyTailRestoresFullHistoryStateAndTheRequiredWindow) {
+    auto specs = FullAndState();
+    specs.push_back({.attn_kind = AttnKind::kSlidingWindow,
+                     .sliding_window = 4,
+                     .cache_blocks_per_lcm_block = 2,
+                     .block_granularity = 2});
+    DiskTierCache cache(specs, 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    Prompt prompt(3, 1);
+    prompt.tokens.resize(11);
+    prompt.hashes.resize(2);
+    auto prefix = prompt.Prefix();
+    prefix.tail = TailPublication{
+        .tail_tokens = 3, .hash = HashPrefixPage(std::span{prompt.tokens}.last(3), ContentHash{prompt.hashes.back()})};
+    std::vector<BlockTable> tables(specs.size());
+    ASSERT_TRUE(AdmitForTest(cache.coordinator, tables, 11));
+    cache.coordinator.CacheCompletedBlocks(
+        tables,
+        {.completed_pages =
+             CompletedPages{
+                 .tokens = prompt.tokens, .prefix_hashes = prompt.hashes, .tail = prefix.tail, .publish_state = true},
+         .num_computed_tokens = 11},
+        CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator));
+    cache.coordinator.Free(tables);
+    const auto required = cache.coordinator.Storage().SharedPrefixKeys(prefix, 64);
+    ASSERT_EQ(required.max_tokens, 11);
+    for (const auto& key : required.keys) {
+        auto block = cache.coordinator.Host().AcquireHostBlock(key.group_id, 0);
+        ASSERT_TRUE(block);
+        cache.coordinator.Host().CacheHostBlock(block, key, std::nullopt);
+    }
+    cache.coordinator.Host().CacheHostTail(ContentHash{prompt.hashes.back()}, *prefix.tail);
+    ASSERT_TRUE(cache.coordinator.ClearDeviceCache());
+    CopyToDisk(cache, required.keys);
+    cache.EvictFromHost(required.keys);
+    const auto route = cache.coordinator.Store().RecoveryDependencies().At(prefix.tail->hash);
+    EXPECT_TRUE(route.disk_recoverable);
+    EXPECT_FALSE(route.ready);
+    EXPECT_NEAR(route.disk_read_cost, required.keys.size() * 0.01, 1e-12);
+    auto lease = cache.disks.StartRead(prefix);
+    ASSERT_TRUE(lease);
+    const auto commands = cache.disks.TakeCommands();
+    ASSERT_EQ(commands.size(), 1u);
+    EXPECT_EQ(commands[0].group_ids.size(), required.keys.size());
+    cache.disks.Complete(cache::DiskDone{lease.OperationId(), true});
+    EXPECT_EQ(cache.coordinator.Prober().ProbePromptPrefix(prefix).host.num_common_tokens, 11);
+    EXPECT_TRUE(cache.coordinator.Store().RecoveryDependencies().At(prefix.tail->hash).ready);
+}
+
+TEST(DiskGdsTest, CleanPlacementPricesSharedReadsBeforeUniqueReads) {
+    DiskTierCache cache(FullAndState(), 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const auto shallow = cache.OnHostOnly(Prompt(1, 1));
+    const auto deep = cache.OnHostOnly(Prompt(3, 1));
+    // The oldest KV belongs to both points. The deep State has one
+    // consumer, with the same block cost and physical relief.
+    CopyToDisk(cache, std::span{shallow}.first(1));
+    CopyToDisk(cache, std::span{deep}.last(1));
+    auto held = HoldFreeHost(cache);
+    auto destination = cache.coordinator.Host().AcquireHostBlock(1, 0);
+    ASSERT_TRUE(destination);
+    EXPECT_TRUE(cache.coordinator.Host().ContainsHostCachedBlock(shallow.front()));
+    EXPECT_FALSE(cache.coordinator.Host().ContainsHostCachedBlock(deep.back()));
+    EXPECT_TRUE(cache.coordinator.Host().ContainsHostCachedBlock(shallow.back()));
+    EXPECT_DOUBLE_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
+    EXPECT_EQ(cache.coordinator.Store().GdsStats().logical_evictions, 0u);
 }
 
 }  // namespace

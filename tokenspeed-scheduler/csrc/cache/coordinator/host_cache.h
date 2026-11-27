@@ -30,7 +30,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <limits>
 #include <optional>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -96,13 +99,23 @@ public:
     // demoted entries (SetCheckpointDemotion): free Host space would take
     // them back.
     void QueueCachedBlocksForStore(std::span<const std::string> content_hashes);
-    std::vector<StoreCandidate> TakePendingStores();
+    // The oldest store candidates, at most max_candidates of them (all of
+    // them by default); the rest stay queued for a later drain. A candidate
+    // of an ended session is dropped.
+    std::vector<StoreCandidate> TakePendingStores(std::size_t max_candidates = std::numeric_limits<std::size_t>::max());
+    bool HasPendingStores() const { return !pending_stores_.empty(); }
     // One Host block per (group, bucket), with free capacity assigned first
     // in input order. The shared eviction plan funds remaining rows globally;
     // failed rows and unnecessary tentative victims evict nothing. A State
     // checkpoint takes its unpinned State siblings at the same boundary along.
     // A shortfall leaves an empty reference, without blocking later rows.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
+                                          std::span<const std::int32_t> buckets);
+    // A storage boundary must land whole. A failed trial evicts nothing.
+    HostAllocationBatch AcquireHostLanding(std::span<const std::uint32_t> group_ids,
+                                           std::span<const std::int32_t> buckets);
+    // Optional publication copies may be skipped without dropping a recovery point.
+    HostAllocationBatch AcquireHostCopies(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
     // One segment of an AcquireHostSegments batch, or one boundary of a
     // retraction image's (NumHostBoundariesThatFit): rows [first_row,
@@ -139,7 +152,10 @@ public:
     // (a shared State access epoch proves the continuation), newest Device
     // copy first; then safe closed-group KV duplicates, held Device copies
     // first and newer Device copies first within each ownership class; then
-    // Host-only cache, least recently used first. A Host-only checkpoint
+    // clean Host-only cache (with a Disk tier: the Disk holds every entry
+    // the victim takes; a checkpoint whose victim would take a dirty page
+    // ranks as dirty), least recently used first; then the dirty Host-only
+    // cache, least recently used first. A Host-only checkpoint
     // boundary whose checkpoints are all demoted (SetCheckpointDemotion) goes
     // after the held copies and before the unheld ones. A missing Device window
     // still protects every closed-group Host page in the required suffix.
@@ -183,6 +199,18 @@ public:
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key,
                         std::optional<PrefixCacheIndex::CachedBlockMetadata> inherited_metadata);
     void CacheHostTail(const ContentHash& prior, const TailPublication& tail);
+    // Refreshes the Host entries of `keys` as a Device hit on them does; a
+    // key the Host does not hold is skipped. For the owner of a shared L2
+    // pool (SharedL2Pool), whose ranks' Device hits reach it as keys.
+    void TouchHostKeys(std::span<const CacheKey> keys);
+    // A rank whose Host tier is a proxy of a shared L2 pool (SharedL2Proxy)
+    // mirrors the pool's pinned pages as Host entries and gives each up once
+    // nothing on the rank holds it.
+    //
+    // Evicts key's Host entry, as Host eviction does (a State checkpoint's
+    // unpinned State siblings leave with it), unless something holds its
+    // block: false then. A key the Host no longer holds is dropped already.
+    bool TryEvictHostEntry(const CacheKey& key);
     // Queues a newly published Device entry for D2H Store (write-through).
     void QueueStore(CacheKey key) { pending_stores_.push_back(StoreCandidate{.key = std::move(key)}); }
     // Drops the queued stores no drain took (ClearDeviceCache), counting them.
@@ -214,23 +242,8 @@ private:
         };
         std::size_t num_placed{0};
         std::vector<Victim> victims;
+        std::shared_ptr<const TieredGdsPlan> tiered;
     };
-    struct HostKvDuplicateCandidate {
-        std::uint32_t group_id{0};
-        CacheBlockLocation location;
-        std::int32_t boundary_tokens{0};
-        // A request holds the Device copy. The visit yields every held copy
-        // before the unheld ones; a Host plan with demoted checkpoint
-        // boundaries next stops at the first unheld one.
-        bool device_in_use{false};
-    };
-    // Unpinned Host KV copies backed by a contiguous Device KV prefix,
-    // excluding pages a sliding group can force into a Host suffix. Visit in
-    // priority order and stop as soon as the callback returns false.
-    // Defined in host_segments.cpp; callers must stay in that translation
-    // unit unless the template definition is moved into a header.
-    template <typename Visitor>
-    void visitHostKvDuplicateCandidates(Visitor&& visit) const;
     // The plan AcquireHostSegments carries out and planHostBoundaries'
     // segment step reuses.
     HostPlacementPlan planHostSegments(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
@@ -247,11 +260,14 @@ private:
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries, bool place_by_segments) const;
 
+    HostAllocationBatch acquireGdsBlocks(std::span<const std::uint32_t> group_ids,
+                                         std::span<const std::int32_t> buckets, bool allow_logical_loss, bool whole);
+
     CacheStore& store_;
     CacheEvictor& evictor_;
     AdmissionHistory& history_;
     bool write_back_evictions_{false};
-    std::vector<StoreCandidate> pending_stores_;
+    std::deque<StoreCandidate> pending_stores_;
     // Accounting only.
     std::uint64_t store_candidates_dropped_by_flush_{0};
 };

@@ -88,6 +88,12 @@ struct CacheGroupConfig {
     // token count and must be produced by prefill. 1 preserves arbitrary
     // natural checkpoints, including decode endpoints. No row span.
     std::int32_t checkpoint_granularity{1};
+    // The runtime keeps part of a decoding request's state outside the live
+    // block and commits it there only when a retraction images the request
+    // (KDA's request-slot records). Local readers order behind that commit on
+    // the device; a decoded endpoint a retraction publishes is withheld from
+    // peers until the runtime acknowledges it (cache::StateCommitDone).
+    bool deferred_decode_state{false};
 
     void Validate() const;
     // Validate() without the total_pages check: every field the capacity

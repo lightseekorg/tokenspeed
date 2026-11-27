@@ -252,7 +252,9 @@ def test_offload_probe_budget_includes_hot_storage(monkeypatch) -> None:
 
 
 def test_the_override_reaches_the_plan_through_the_factory_seam() -> None:
-    template = _kimi_k3_recipe()
+    from test.runtime.conftest import kimi_recipe
+
+    template = kimi_recipe(max_bs=8)
     built = setup.prepare_cache_setup(
         family="kimi_k3",
         server_args=template.server_args,
@@ -486,6 +488,10 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
         enable_prefix_caching=False,
         enable_memory_saver=False,
         enable_kvstore=False,
+        # Read where the Host cache executor is built: no Host tier and no
+        # shared L2 pool here.
+        has_host_tier=False,
+        shared_l2_config=None,
         spec_context_pad=0,
         device="cuda",
     )
@@ -510,6 +516,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
             max_resident_requests=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
             peer_outbox=None,
+            shared_l2_handle=None,
         )
     return charged, set(reads), stack[0]
 
@@ -687,7 +694,6 @@ def test_pool_staged_verify_scratch_keeps_the_serving_concurrency(monkeypatch) -
 
     for family in sorted(_RECIPES):
         assert _RECIPES[family]().verify_scratch_in_pool() is False, family
-    monkeypatch.setattr(kda_ops, "kda_replay_commit_supported", lambda *a, **k: True)
     monkeypatch.setattr(
         kda_ops, "kda_fused_paged_verify_uses_split_producers", lambda *a, **k: True
     )

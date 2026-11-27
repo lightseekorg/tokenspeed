@@ -162,7 +162,11 @@ impl HostPool {
         // Widened before multiplying: block ids reach the pool's size.
         let offset = (index / host.packing)
             .checked_mul(host.parent_bytes)
-            .and_then(|parent| parent.checked_add((index % host.packing) * host.block_bytes))
+            .and_then(|parent| {
+                (index % host.packing)
+                    .checked_mul(host.block_bytes)?
+                    .checked_add(parent)
+            })
             .ok_or(GeometryError::Overflow)?;
         self.address
             .checked_add(offset)
@@ -186,7 +190,7 @@ impl HostPool {
 impl RankGeometry {
     /// Where `field` of `page` lives on this rank: its Device page, or its
     /// packed Host block.
-    fn field_address(
+    pub(super) fn field_address(
         &self,
         page: &PeerPageView,
         field: &DeviceField,

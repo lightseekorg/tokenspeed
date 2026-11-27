@@ -60,10 +60,16 @@ import torch
 from tokenspeed_engine.scheduler import Cache
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferWorkspace,
+    StagingBuffer,
     transfer_cache_blocks,
     wait_layer_ready,
 )
+from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.cache.host_allocation import (
+    HOST_BUFFER_ALIGNMENT_BYTES,
+    host_register_enabled,
+)
 from tokenspeed.runtime.cache.host_storage import (
     HostCacheStorage,
     compute_host_group_packing,
@@ -92,6 +98,7 @@ from tokenspeed.runtime.cache.transfer.observations import (
     CompletedObservations,
     CopyCounts,
     ObservationBatch,
+    PendingCopyTiming,
     count_owned_rows,
     observe_copy,
 )
@@ -158,6 +165,7 @@ class _Ack(NamedTuple):
     kind: _AckKind
     op_ids: list[int]
     observations: ObservationBatch = ObservationBatch()
+    timing: PendingCopyTiming | None = None
 
 
 def _num_host_lcm_blocks(
@@ -229,8 +237,8 @@ class HostCacheExecutor:
                 ``host_size_gb`` is 0; capped to what fits in every rank's
                 share of its node's Host memory.
             host_size_gb: L2 size in decimal gigabytes; overrides the ratio
-                when positive and is never capped: one that does not fit is
-                refused.
+                when positive. Alignment may reduce whole blocks to avoid a
+                larger pinned bucket; one that exceeds Host memory is refused.
             snapshot_pool: The retraction snapshot pool's knobs as
                 ``ServerArgs`` resolved them, sized here against this
                 rank's layout (``resolve_retraction_pool``); a disabled
@@ -258,6 +266,7 @@ class HostCacheExecutor:
                 overflow reports a loss without changing scheduler ACKs.
         """
         self._cache_observations = CompletedObservations(cache_observation_capacity)
+        self._next_copy_batch_id: int = 0
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
         if not l2_tier and snapshot_pool.disabled:
@@ -335,28 +344,67 @@ class HostCacheExecutor:
         share_bytes, share_source = host_memory_share(
             nprocs_per_node=nprocs_per_node, headroom_bytes=host_headroom_bytes
         )
+        align_host_buffer = l2_tier and (
+            block_alignment > 1
+            or (current_platform().is_nvidia and host_register_enabled())
+        )
+        alignment_padding = HOST_BUFFER_ALIGNMENT_BYTES - 1 if align_host_buffer else 0
         # Size each buffer using the effective pinned allocator configuration.
         pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
             arena_bytes
         )
+        aligned_l2_blocks = host_lcm_blocks
+        if l2_tier and alignment_padding:
+            requested_l2_bytes = host_lcm_blocks * host_lcm_block_bytes
+            reservation = pinned_host_bytes(requested_l2_bytes)
+            padded_reservation = pinned_host_bytes(
+                requested_l2_bytes + alignment_padding
+            )
+            if padded_reservation > max(
+                reservation, requested_l2_bytes + alignment_padding
+            ):
+                aligned_blocks = (
+                    largest_pinned_fit(
+                        reservation,
+                        block_bytes=host_lcm_block_bytes,
+                        padding_bytes=alignment_padding,
+                    )
+                    // host_lcm_block_bytes
+                )
+                if 0 < aligned_blocks < host_lcm_blocks:
+                    aligned_l2_blocks = aligned_blocks
+                    if host_size_gb > 0:
+                        logger.warning(
+                            f"Reduced Host L2 from {host_lcm_blocks} to "
+                            f"{aligned_blocks} LCM blocks to keep alignment padding "
+                            f"within its {reservation / 1e9:.2f} GB pinned reservation"
+                        )
+                        host_lcm_blocks = aligned_blocks
         # The L2 blocks every rank's share holds beside the pool. Agreeing on
         # it is also a barrier: no rank pins before every rank read its share.
-        fitting_l2_blocks = _min_over_ranks(
+        fitting_l2_blocks = (
             largest_pinned_fit(
-                share_bytes - pool_pinned_bytes, block_bytes=host_lcm_block_bytes
+                share_bytes - pool_pinned_bytes,
+                block_bytes=host_lcm_block_bytes,
+                padding_bytes=alignment_padding,
             )
-            // host_lcm_block_bytes,
-            world_cpu_group,
+            // host_lcm_block_bytes
         )
+        if host_size_gb <= 0:
+            # PP stages can cross different buckets; agree on the ratio's count.
+            fitting_l2_blocks = min(fitting_l2_blocks, aligned_l2_blocks)
+        fitting_l2_blocks = _min_over_ranks(fitting_l2_blocks, world_cpu_group)
         if l2_tier and host_size_gb <= 0 and 0 < fitting_l2_blocks < host_lcm_blocks:
             # Only the ratio's size shrinks, to one size on every rank: the
             # mirrored schedulers share one Host page count. An explicit
-            # --kvstore-size that does not fit is refused below instead.
+            # --kvstore-size that does not fit is refused below instead,
+            # after accounting for alignment within its original reservation.
             logger.warning(
                 "Capped the compact Host L2 from "
                 f"{host_lcm_blocks * host_lcm_block_bytes / 1e9:.2f} GB to "
                 f"{fitting_l2_blocks * host_lcm_block_bytes / 1e9:.2f} GB per "
-                "rank, the most every rank's share of its node holds: "
+                "rank, fitting alignment padding within the requested pinned "
+                "reservation and every rank's Host memory share: "
                 f"--kvstore-ratio {host_ratio} asks for more. The "
                 f"{nprocs_per_node} ranks of a node pin Host memory together, "
                 "under the pinned allocator settings; this rank's share "
@@ -396,7 +444,8 @@ class HostCacheExecutor:
         )
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # Both tiers count against the one check, at the sizes they pin.
-        l2_pinned_bytes = pinned_host_bytes(l2_bytes)
+        l2_allocation_bytes = l2_bytes + alignment_padding
+        l2_pinned_bytes = pinned_host_bytes(l2_allocation_bytes)
         check_host_memory(
             l2_pinned_bytes + pool_pinned_bytes,
             share_bytes=share_bytes,
@@ -419,6 +468,7 @@ class HostCacheExecutor:
                 group_specs=contract.group_specs,
                 num_host_lcm_blocks=host_lcm_blocks,
                 block_alignment=block_alignment,
+                align_host_buffer=align_host_buffer,
             )
             # Scheduler block ids on both ends of every L2 copy to this rank's
             # local ids.
@@ -444,6 +494,7 @@ class HostCacheExecutor:
                 group_specs=contract.group_specs,
                 num_host_lcm_blocks=snapshot_lcm_blocks,
                 block_alignment=block_alignment,
+                align_host_buffer=False,
             )
             self.snapshot_block_owners = BlockOwnerTranslation.for_host_pool(
                 self.layout,
@@ -502,7 +553,7 @@ class HostCacheExecutor:
         self.load_stream = new_cache_stream(load_stream_priority())
         # Both streams consume these immutable tables; the kernel backend
         # publishes them to the Device once. One geometry per Host buffer.
-        with self._memory_saver_adapter.named_region("workspace"):
+        with self._memory_saver_adapter.named_region("cache_transfer"):
             if l2_tier:
                 self._transfer_geometry = build_transfer_geometry(
                     self.layout, self.host_storage, io_backend=io_backend
@@ -514,12 +565,49 @@ class HostCacheExecutor:
         # One staging lane per submission kind a round may make, so none
         # waits on another's pinned metadata tables: the stream-ordered and
         # pinned L2 write-backs, the snapshot store, and the restore's two
-        # tiers.
-        self._ordered_write_lane = HostTransferLane(self._memory_saver_adapter)
-        self._pinned_write_lane = HostTransferLane(self._memory_saver_adapter)
-        self._snapshot_write_lane = HostTransferLane(self._memory_saver_adapter)
-        self._restore_l2_lane = HostTransferLane(self._memory_saver_adapter)
-        self._restore_pool_lane = HostTransferLane(self._memory_saver_adapter)
+        # tiers. On Ascend NPU, lanes sharing one transfer stream also share one
+        # discardable HBM staging buffer under ``kv_cache`` so colocated RL
+        # sleep frees it without CPU backup.
+        self._write_staging: StagingBuffer | None = None
+        self._load_staging: StagingBuffer | None = None
+        device = self.layout.buffers[0].device
+        if device.type == "npu" and io_backend == "kernel":
+
+            def _allocate_npu_staging(
+                nbytes: int, target_device: torch.device
+            ) -> torch.Tensor:
+                with self._memory_saver_adapter.region(
+                    tag="kv_cache", enable_cpu_backup=False
+                ):
+                    return torch.empty(nbytes, dtype=torch.uint8, device=target_device)
+
+            self._write_staging = StagingBuffer(allocator=_allocate_npu_staging)
+            self._load_staging = StagingBuffer(allocator=_allocate_npu_staging)
+        write_lane_kwargs = (
+            {"staging_buffer": self._write_staging}
+            if self._write_staging is not None
+            else {}
+        )
+        load_lane_kwargs = (
+            {"staging_buffer": self._load_staging}
+            if self._load_staging is not None
+            else {}
+        )
+        self._ordered_write_lane = HostTransferLane(
+            self._memory_saver_adapter, **write_lane_kwargs
+        )
+        self._pinned_write_lane = HostTransferLane(
+            self._memory_saver_adapter, **write_lane_kwargs
+        )
+        self._snapshot_write_lane = HostTransferLane(
+            self._memory_saver_adapter, **write_lane_kwargs
+        )
+        self._restore_l2_lane = HostTransferLane(
+            self._memory_saver_adapter, **load_lane_kwargs
+        )
+        self._restore_pool_lane = HostTransferLane(
+            self._memory_saver_adapter, **load_lane_kwargs
+        )
         # A tracker waits for an event set's previous final-layer event before
         # reusing its index. Aligning workspaces to those indices keeps each
         # load's pinned and Device block-ID tables immutable until all
@@ -535,6 +623,9 @@ class HostCacheExecutor:
             self._load_workspaces = tuple(
                 HostTransferWorkspace() for _ in range(load_workspace_count)
             )
+            if self._load_staging is not None:
+                for workspace in self._load_workspaces:
+                    workspace.bind_staging_buffer(self._load_staging)
 
         # Submission runs on the forward thread and polling on the control
         # plane (event queries only). Every copy of every kind -- L2
@@ -573,7 +664,7 @@ class HostCacheExecutor:
             ):
                 with (
                     device_module.stream(stream),
-                    self._memory_saver_adapter.named_region("workspace"),
+                    self._memory_saver_adapter.named_region("cache_transfer"),
                 ):
                     for workspace in workspaces:
                         workspace.prepare_backend(
@@ -584,16 +675,30 @@ class HostCacheExecutor:
         self.write_stream.synchronize()
         self.load_stream.synchronize()
 
-        if snapshot_lcm_blocks and io_backend == "kernel":
+        if self._write_staging is not None and self._load_staging is not None:
+            min_staging_bytes = max(
+                (
+                    block_bytes
+                    for storage in (self.host_storage, self.snapshot_storage)
+                    if storage is not None
+                    for block_bytes in storage.host_cache_block_bytes
+                ),
+                default=1,
+            )
+            self._write_staging.acquire(min_staging_bytes, device)
+            self._load_staging.acquire(min_staging_bytes, device)
+
+        if (snapshot_lcm_blocks or device.type == "npu") and io_backend == "kernel":
             self._warmup_restore_transfers()
 
     def _warmup_restore_transfers(self) -> None:
         """Warm each Host tier's unflagged H2D restore, preserving Device bytes."""
         # Host blocks must still be unassigned for this scratch round trip.
-        # Use one group so compact Host-parent writes cannot overlap.
-        group_index = next(
+        # Warm one field-bearing group at a time so compact Host-parent writes
+        # never overlap while every group's alignment variant compiles at init.
+        group_indices = [
             i for i, group in enumerate(self.layout.groups) if group.fields
-        )
+        ]
         for storage, geometry, lane in (
             (self.host_storage, self._transfer_geometry, self._restore_l2_lane),
             (
@@ -612,9 +717,10 @@ class HostCacheExecutor:
                 prerequisite_stream=device_module.current_stream(),
                 backend=self.transfer_backend,
             )
-            lane.start_d2h([(group_index, 1, 1)], **launch)
-            lane.start_h2d([(group_index, 1, 1)], **launch)
-            self.load_stream.synchronize()
+            for group_index in group_indices:
+                lane.start_d2h([(group_index, 1, 1)], **launch)
+                lane.start_h2d([(group_index, 1, 1)], **launch)
+                self.load_stream.synchronize()
 
     def submit_write_backs(
         self, cache_ops: Sequence, *, prerequisite_stream, fence_stream
@@ -1262,7 +1368,7 @@ class HostCacheExecutor:
             # Resolve the transport before choosing the consumer wait protocol.
             with (
                 device_module.stream(self.load_stream),
-                self._memory_saver_adapter.named_region("workspace"),
+                self._memory_saver_adapter.named_region("cache_transfer"),
             ):
                 mode = workspace.prepare_backend(
                     self.layout.buffers,
@@ -1279,6 +1385,18 @@ class HostCacheExecutor:
                     flags = workspace.prepare_layer_ready(len(layer_slices), device)
                     for load_events, _ in active_trackers:
                         load_events.layer_ready_init_event.record(self.load_stream)
+            timing = None
+            if self._cache_observations.enabled:
+                self._next_copy_batch_id += 1
+                timing = PendingCopyTiming(
+                    batch_id=self._next_copy_batch_id,
+                    backend=mode.backend,
+                    groups=self.layout.groups,
+                    rows=transfers,
+                    device_kind=device.type,
+                    device_module=device_module,
+                    stream=self.load_stream,
+                )
             if mode.layer_ready:
                 flag_offset = 0
                 for load_events, consumer_count in active_trackers:
@@ -1335,9 +1453,17 @@ class HostCacheExecutor:
                         flat_layer_index += 1
             if finish is None:
                 raise RuntimeError("cache transfer layout has no layer consumers")
+            if timing is not None and timing.finish is not None:
+                timing.finish.record(self.load_stream)
+                finish = timing.finish
             self._completions.push(
                 finish,
-                _Ack(kind=_AckKind.LOAD_BACK, op_ids=op_ids, observations=observations),
+                _Ack(
+                    kind=_AckKind.LOAD_BACK,
+                    op_ids=op_ids,
+                    observations=observations,
+                    timing=timing,
+                ),
             )
             return load_index
         except BaseException as original_error:
@@ -1393,7 +1519,12 @@ class HostCacheExecutor:
                 results.extend(self._restore_done(op_id) for op_id in ack.op_ids)
             if self._cache_observations.enabled:
                 with self._ack_lock:
-                    self._cache_observations.extend(ack.observations)
+                    observed = (
+                        ack.timing.complete(ack.observations)
+                        if ack.timing is not None
+                        else ack.observations
+                    )
+                    self._cache_observations.extend(observed)
         return results
 
     def poll_cache_observations(self) -> tuple[list[dict], int]:

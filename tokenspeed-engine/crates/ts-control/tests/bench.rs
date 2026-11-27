@@ -75,6 +75,7 @@ fn result(tokens: &[i32], lengths: &[i32]) -> ForwardResult {
         output_logprobs: None,
         output_token_cumulative_probs: None,
         nan_flags: None,
+        request_ends: None,
         next_input_ids: None,
         serving_compiles: None,
         grammar_terminated_at: None,
@@ -98,6 +99,7 @@ fn bench_commit_decode() {
         1,
         Some(1 << 24),
         Role::Plain,
+        false,
         NO_FINISH_LOG,
         false,
         None,
@@ -268,7 +270,15 @@ impl DataPlane for InstantDevice {
         Ok(Vec::new())
     }
 
-    fn release(&mut self, _: &[String]) -> Result<(), DataPlaneError> {
+    fn replay_retirement_enabled(&self) -> bool {
+        false
+    }
+
+    fn poll_replay_retirement(&mut self) -> Result<u64, DataPlaneError> {
+        unreachable!("no recurrent State in the benchmark")
+    }
+
+    fn release(&mut self, _: &[String], _: Option<u64>) -> Result<(), DataPlaneError> {
         Ok(())
     }
 
@@ -302,6 +312,14 @@ impl DataPlane for InstantDevice {
         unreachable!("no control operation in the benchmark")
     }
 
+    fn check_memory_transition(
+        &mut self,
+        _: &[String],
+        _: bool,
+    ) -> Result<(bool, String), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
     fn release_memory(&mut self, _: &[String]) -> Result<(), DataPlaneError> {
         unreachable!("no control operation in the benchmark")
     }
@@ -311,6 +329,10 @@ impl DataPlane for InstantDevice {
     }
 
     fn resume_memory(&mut self, _: &[String]) -> Result<(), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
+    fn finish_memory_resume(&mut self) -> Result<(), DataPlaneError> {
         unreachable!("no control operation in the benchmark")
     }
 
@@ -426,7 +448,9 @@ fn round_loop_config(shape: &RoundShape, pages: usize) -> LoopConfig {
         request_token_history: false,
         request_token_history_lookback: None,
         controls: ControlConfig {
+            backup_device_kv: false,
             memory_saver: false,
+            replica_memory_transitions: false,
             memory_regions: Vec::new(),
             shared_weight_version: None,
             allow_reload_forward: false,
@@ -496,6 +520,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             1,
             Some(1 << 24),
             Role::Plain,
+            false,
             NO_FINISH_LOG,
             false,
             None,

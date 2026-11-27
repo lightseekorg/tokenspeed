@@ -41,6 +41,7 @@ from tokenspeed.runtime.cache.peer import (  # noqa: E402
     peer_host_regions,
     peer_incarnation,
     peer_scheduler_config,
+    peer_semantic_id,
 )
 from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
     CacheField,
@@ -56,6 +57,25 @@ from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 NUM_LCM_BLOCKS = 6
+
+
+def test_peer_identity_binds_the_generation_and_effective_state_encoding():
+    abi = {"state": "native-kda-v1", "index_rope": False}
+    base = peer_semantic_id("model", None, "7", abi)
+    assert len(base) == 32
+    assert peer_semantic_id("model", "main", "7", dict(reversed(abi.items()))) == base
+    assert peer_semantic_id("another-model", None, "7", abi) != base
+    assert peer_semantic_id("model", None, "8", abi) != base
+    assert peer_semantic_id("model", None, "7", {**abi, "index_rope": True}) != base
+    assert peer_semantic_id("model", "main", "default", abi) == b""
+    assert len(peer_semantic_id("model", "a" * 40, "default", abi)) == 32
+    assert peer_semantic_id("model", None, "7", None) == b""
+    pair = peer_semantic_id("model", None, "7", abi, paired_weights=True)
+    assert len(pair) == 32 and pair != base
+    assert peer_semantic_id("model", None, "8", abi, paired_weights=True) != pair
+    assert (
+        peer_semantic_id("model", "a" * 40, "default", abi, paired_weights=True) == b""
+    )
 
 
 def test_peer_host_region_plans_cover_the_pool_without_splitting_a_parent():
@@ -134,6 +154,7 @@ def _setup():
         group_specs=(_spec("full", "full_history"), _spec("swa", "full_history")),
         num_host_lcm_blocks=NUM_LCM_BLOCKS,
         block_alignment=1,
+        align_host_buffer=False,
     )
     field_addresses = {
         field.field_id: device.data_ptr() + field.device_block_zero_offset_bytes
@@ -187,6 +208,22 @@ def test_the_geometry_addresses_the_bytes_the_cache_holds():
         (host_base, storage.host_buffer_bytes),
     )
 
+    split_first = 2 * storage.host_lcm_block_bytes
+    split_rest = storage.host_buffer_bytes - split_first
+    split_geometry = build_peer_geometry(
+        scheduler_group_ids=("full", "swa"),
+        groups=groups,
+        field_addresses=field_addresses,
+        device_regions=((device.data_ptr(), device.numel()),),
+        host_storage=storage,
+        host_region_planner=lambda length, parent: (2 * parent, length - 2 * parent),
+    )
+    assert split_geometry.regions == (
+        (device.data_ptr(), device.numel()),
+        (host_base, split_first),
+        (host_base + split_first, split_rest),
+    )
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned Host memory")
 def test_a_host_layout_out_of_the_schedulers_order_is_refused():
@@ -220,6 +257,7 @@ def _peer_args(**overrides) -> ServerArgs:
     args.kvstore_storage_backend = None
     args.pipeline_parallel_size = 1
     args.query_context_parallel_size = 1
+    args.enable_memory_saver = False
     args.mapping = Mapping(rank=0, world_size=2, attn_tp_size=1, attn_dp_size=2)
     for name, value in overrides.items():
         setattr(args, name, value)
@@ -252,6 +290,7 @@ def test_host_landings_take_a_share_of_the_host_blocks():
         answer_timeout_ms=50,
         min_fetch_tokens=256,
         num_host_blocks=100,
+        versioned_shards=False,
     )
     host = peer_scheduler_config(landing_tier="host", **common)
     assert host.landing_tier == ts.PeerLandingTier.Host
@@ -262,6 +301,63 @@ def test_host_landings_take_a_share_of_the_host_blocks():
     assert (device.max_host_landing_blocks, device.host_ready_timeout_us) == (0, 0)
 
 
+def test_peer_scheduler_config_scales_soft_pin_and_host_ready_with_answer_timeout():
+    pytest.importorskip("tokenspeed_engine.scheduler")
+    base = {
+        "name": "10.0.0.2:7100",
+        "incarnation": 3,
+        "min_fetch_tokens": 256,
+        "num_host_blocks": 100,
+        "versioned_shards": False,
+    }
+    # 50 ms: soft_pin = max(2.0, 2*0.05 + 2.0) = 2.1s, host_ready = max(5.0, 0.05 + 5.0) = 5.05s
+    low = peer_scheduler_config(landing_tier="host", answer_timeout_ms=50, **base)
+    assert low.soft_pin_us == 2_100_000
+    assert low.host_ready_timeout_us == 5_050_000
+    assert low.lookup_timeout_us == 50_000
+
+    # 1000 ms: soft_pin = 4.0s, host_ready = 6.0s
+    mid = peer_scheduler_config(landing_tier="host", answer_timeout_ms=1000, **base)
+    assert mid.soft_pin_us == 4_000_000
+    assert mid.host_ready_timeout_us == 6_000_000
+    assert mid.lookup_timeout_us == 1_000_000
+
+    # 5000 ms: soft_pin = 12.0s (> 2.0s hardcoded floor!), host_ready = 10.0s
+    high = peer_scheduler_config(landing_tier="host", answer_timeout_ms=5000, **base)
+    assert high.soft_pin_us == 12_000_000
+    assert high.host_ready_timeout_us == 10_000_000
+    assert high.lookup_timeout_us == 5_000_000
+
+    # Device landing scales soft_pin without dropping below the 2 s SOFT_PIN_S
+    # floor or exceeding HARD_PIN_S, while leaving host_ready_timeout_us == 0.
+    dev_low = peer_scheduler_config(landing_tier="device", answer_timeout_ms=50, **base)
+    assert dev_low.soft_pin_us == 2_200_000
+    assert dev_low.host_ready_timeout_us == 0
+
+    dev_mid = peer_scheduler_config(
+        landing_tier="device", answer_timeout_ms=1000, **base
+    )
+    assert dev_mid.soft_pin_us == 6_000_000
+    assert dev_mid.host_ready_timeout_us == 0
+
+    dev_high = peer_scheduler_config(
+        landing_tier="device", answer_timeout_ms=5000, **base
+    )
+    assert dev_high.soft_pin_us == 22_000_000
+    assert dev_high.host_ready_timeout_us == 0
+
+    # Large answer timeouts clamp soft_pin to HARD_PIN_S (30 s) so a Pin never
+    # shortens a lease and RECORD_LIFETIME_S always outlives it.
+    dev_clamped = peer_scheduler_config(
+        landing_tier="device", answer_timeout_ms=12000, **base
+    )
+    assert dev_clamped.soft_pin_us == 30_000_000 == dev_clamped.hard_pin_us
+    host_clamped = peer_scheduler_config(
+        landing_tier="host", answer_timeout_ms=20000, **base
+    )
+    assert host_clamped.soft_pin_us == 30_000_000 == host_clamped.hard_pin_us
+
+
 @pytest.mark.parametrize(
     "overrides,refused",
     [
@@ -270,6 +366,7 @@ def test_host_landings_take_a_share_of_the_host_blocks():
         ({"kvstore_storage_backend": "mooncake"}, "--kvstore-storage-backend"),
         ({"pipeline_parallel_size": 2}, "--pipeline-parallel-size"),
         ({"query_context_parallel_size": 2}, "--query-context-parallel-size"),
+        ({"enable_memory_saver": True}, "--enable-memory-saver.*Mooncake MRs"),
     ],
 )
 def test_peer_sharing_refuses_what_it_does_not_run_with(overrides, refused):
@@ -277,13 +374,15 @@ def test_peer_sharing_refuses_what_it_does_not_run_with(overrides, refused):
         _peer_args(**overrides).validate_peer_prefix_options()
 
 
-def test_every_attention_dp_rank_needs_a_valid_port():
-    # Rank 1 binds 65535.
-    _peer_args(peer_prefix_port=65534).validate_peer_prefix_options()
-    with pytest.raises(ValueError, match="valid ports"):
-        _peer_args(peer_prefix_port=65535).validate_peer_prefix_options()
-    with pytest.raises(ValueError, match="valid ports"):
-        _peer_args(peer_prefix_port=0).validate_peer_prefix_options()
+def test_attention_dp_replicas_share_one_public_port():
+    from tokenspeed.runtime.cache.peer import peer_endpoint_name
+
+    _peer_args(peer_prefix_port=65535).validate_peer_prefix_options()
+    assert peer_endpoint_name("::1", 65535, 0) == "[::1]:65535"
+    assert peer_endpoint_name("::1", 65535, 31) == "[::1]:65535/31"
+    for port in (0, 65536):
+        with pytest.raises(ValueError, match="1..65535"):
+            _peer_args(peer_prefix_port=port).validate_peer_prefix_options()
 
 
 @pytest.mark.parametrize(

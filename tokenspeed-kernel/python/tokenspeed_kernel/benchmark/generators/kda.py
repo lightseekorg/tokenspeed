@@ -20,8 +20,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Collection
-from dataclasses import dataclass
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -38,11 +38,9 @@ from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
-    "prepare_kda_fused_paged_decode",
     "prepare_kda_fused_paged_verify",
-    "prepare_kda_paged_decode",
     "prepare_kda_paged_prefill",
-    "prepare_kda_replay_commit",
+    "prepare_kda_retained_commit",
 ]
 
 
@@ -88,8 +86,6 @@ _MODEL_PROFILES = {
     ),
 }
 _IMPLEMENTED_RECURRENT_LAYOUTS = frozenset({"k_major", "v_major"})
-_IMPLEMENTED_STATE_PAGE_RELATIONS = frozenset({"in_place", "distinct"})
-_DISTINCT_WRITE_PAGE_OFFSET = 16
 
 
 def _implemented_value(
@@ -202,29 +198,6 @@ def _packed_beta_logits(
     return beta.view(1, tokens, profile.heads)
 
 
-def _packed_decode_qkv(
-    batch: int,
-    heads: int,
-    key_dim: int,
-    value_dim: int,
-    *,
-    dtype: torch.dtype,
-    generator: torch.Generator,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    widths = (heads * key_dim, heads * key_dim, heads * value_dim)
-    packed = _randn(
-        (batch, sum(widths)),
-        dtype=dtype,
-        generator=generator,
-    )
-    q_flat, k_flat, v_flat = packed.split(widths, dim=-1)
-    return (
-        q_flat.view(1, batch, heads, key_dim),
-        k_flat.view(1, batch, heads, key_dim),
-        v_flat.view(1, batch, heads, value_dim),
-    )
-
-
 def _packed_prefill_inputs(
     tokens: int,
     profile: _KdaModelProfile,
@@ -266,48 +239,6 @@ def _decay_parameters(
         generator=generator,
     )
     return a_log, dt_bias
-
-
-def _strided_state_pool(
-    state_pages: int,
-    heads: int,
-    value_dim: int,
-    key_dim: int,
-    page_stride: int,
-    *,
-    device: torch.device | str = "cuda",
-) -> torch.Tensor:
-    payload = heads * value_dim * key_dim
-    storage_size = (state_pages - 1) * page_stride + payload
-    storage = torch.empty(storage_size, dtype=torch.float32, device=device)
-    return torch.as_strided(
-        storage,
-        (state_pages, heads, value_dim, key_dim),
-        (page_stride, value_dim * key_dim, key_dim, 1),
-    )
-
-
-def _state_page_indices(
-    batch: int,
-    relation: str,
-    *,
-    device: torch.device | str = "cuda",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    read_indices = torch.arange(1, batch + 1, dtype=torch.int32, device=device)
-    write_indices = (
-        read_indices.clone()
-        if relation == "in_place"
-        else read_indices + _DISTINCT_WRITE_PAGE_OFFSET
-    )
-    return read_indices, write_indices
-
-
-def _parse_state_page_relation(parameters: dict[str, Any]) -> str:
-    return _implemented_value(
-        "state_page_relation",
-        parameters["state_page_relation"],
-        _IMPLEMENTED_STATE_PAGE_RELATIONS,
-    )
 
 
 def _normalize_common_parameters(
@@ -413,12 +344,7 @@ def prepare_kda_paged_prefill(
         # Preserve the model's device conversion inside the captured work. The
         # hint must bind to the converted tensor to avoid a host read in capture.
         kernel_cu_seqlens = cu_seqlens.to(dtype=torch.int32).contiguous()
-        set_total_chunks_hint_uniform(
-            batch,
-            tokens_per_sequence,
-            kernel_cu_seqlens,
-            (64,),
-        )
+        set_total_chunks_hint_uniform(batch, tokens_per_sequence, kernel_cu_seqlens)
         return kda_ops.kda_paged_prefill(
             q,
             k,
@@ -464,159 +390,12 @@ def prepare_kda_paged_prefill(
     )
 
 
-def prepare_kda_paged_decode(
-    request: BenchmarkRequest,
-    platform: PlatformInfo,
-) -> PreparedBenchmark:
-    """Prepare a single-token KDA decode benchmark."""
-
-    (
-        model_profile,
-        heads,
-        key_dim,
-        value_dim,
-        dtype,
-        lower_bound,
-        recurrent_layout,
-    ) = _normalize_common_parameters(request)
-    batch = request.parameters["batch"]
-    state_page_relation = _parse_state_page_relation(request.parameters)
-    minimum_state_pages = (
-        _DISTINCT_WRITE_PAGE_OFFSET + batch + 1
-        if state_page_relation == "distinct"
-        else batch + 1
-    )
-    state_pages = request.parameters["state_pages"]
-    if state_pages < minimum_state_pages:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"KDA decode state_pages must be at least {minimum_state_pages}",
-        )
-    state_page_stride = request.parameters["state_page_stride"]
-    state_payload = heads * value_dim * key_dim
-    if state_page_stride < state_payload:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"KDA state_page_stride must be at least {state_payload}",
-        )
-    traits: dict[str, object] = {
-        "indexed_state": True,
-        "single_token": True,
-        "recurrent_layout": recurrent_layout,
-    }
-
-    load_builtin_kernels()
-    spec = _select_registration(request, platform, traits)
-
-    generator = _generator(request.seed)
-    q, k, v = _packed_decode_qkv(
-        batch,
-        heads,
-        key_dim,
-        value_dim,
-        dtype=dtype,
-        generator=generator,
-    )
-    g_raw = _randn((1, batch, heads, key_dim), dtype=dtype, generator=generator)
-    beta_logits = _packed_beta_logits(
-        batch,
-        _MODEL_PROFILES[model_profile],
-        dtype=dtype,
-        generator=generator,
-    )
-    a_log, dt_bias = _decay_parameters(heads, key_dim, generator=generator)
-    state_pool = _strided_state_pool(
-        state_pages,
-        heads,
-        value_dim,
-        key_dim,
-        state_page_stride,
-    )
-    read_indices, write_indices = _state_page_indices(
-        batch,
-        state_page_relation,
-    )
-    touched_indices = torch.unique(torch.cat((read_indices, write_indices))).to(
-        torch.int64
-    )
-    state_pool_snapshot = _randn(
-        (touched_indices.numel(), heads, value_dim, key_dim),
-        dtype=torch.float32,
-        generator=generator,
-    )
-    state_pool.index_copy_(0, touched_indices, state_pool_snapshot)
-    cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
-
-    from tokenspeed_kernel.ops.attention import kda as kda_ops
-
-    def reset() -> None:
-        state_pool.index_copy_(0, touched_indices, state_pool_snapshot)
-
-    def invoke() -> object:
-        return kda_ops.kda_paged_decode(
-            q,
-            k,
-            v,
-            g_raw,
-            beta_logits,
-            a_log,
-            dt_bias,
-            state_pool=state_pool,
-            read_indices=read_indices,
-            write_indices=write_indices,
-            cu_seqlens=cu_seqlens,
-            lower_bound=lower_bound,
-            override=request.registration,
-            solution=request.solution,
-            recurrent_layout=recurrent_layout,
-        )
-
-    normalized = {
-        **_common_normalized(
-            model_profile=model_profile,
-            heads=heads,
-            key_dim=key_dim,
-            value_dim=value_dim,
-            dtype=dtype,
-            lower_bound=lower_bound,
-            recurrent_layout=recurrent_layout,
-        ),
-        "batch": batch,
-        "tokens_per_sequence": 1,
-        "state_pages": state_pages,
-        "state_page_stride": state_page_stride,
-        "state_page_relation": state_page_relation,
-        "qkv_token_stride": q.stride(1),
-        "beta_token_stride": beta_logits.stride(1),
-        "read_write_alias": state_page_relation == "in_place",
-    }
-    return PreparedBenchmark(
-        registration=spec,
-        invocation=PreparedInvocation(
-            invoke=invoke,
-            reset=reset,
-        ),
-        parameters=normalized,
-        validation=None,
-    )
-
-
 def _positive_parameter(parameters: dict[str, Any], name: str) -> int:
     value = parameters[name]
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             f"KDA parameter {name!r} must be a positive integer",
-        )
-    return value
-
-
-def _bool_parameter(parameters: dict[str, Any], name: str) -> bool:
-    value = parameters[name]
-    if not isinstance(value, bool):
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            f"KDA parameter {name!r} must be a boolean",
         )
     return value
 
@@ -801,81 +580,350 @@ def _require_state_pages(state_pages: int, required: int) -> None:
         )
 
 
-def prepare_kda_fused_paged_decode(
-    request: BenchmarkRequest,
-    platform: PlatformInfo,
-) -> PreparedBenchmark:
-    """Prepare fused single-token KDA decode from the packed input projection.
+_DEFAULT_HISTORY_CAPACITY = 16
 
-    One call runs the short convolution, decay-gate projection, recurrent
-    update against paged state.
+
+def _history_capacity(parameters: Mapping[str, Any], window: int) -> int:
+    # Match the runtime default (--kda-history-capacity = 16); a window wider
+    # than 16 must pass history_capacity explicitly.
+    raw = parameters.get("history_capacity")
+    capacity = _DEFAULT_HISTORY_CAPACITY if raw is None else raw
+    if type(capacity) is not int or capacity < window:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"KDA history_capacity must be an integer at least draft_token_num ({window})",
+        )
+    return capacity
+
+
+def _retained_benchmark_layer(
+    common, window, capacity, generator, reads, live, metadata, stamps, count, verified
+):
+    """One layer's verify inputs over the request slots' shared counts.
+
+    ``count`` is the INT32 [slots, 1] accepted count every layer shares and
+    ``verified`` the count its verify reads: the same tensor when no commit
+    follows, else a copy of the round's starting count, which the timed
+    commits leave as it is.
     """
+    from tokenspeed_kernel.ops.attention import kda as kda_ops
 
-    common = _fused_common(request)
     profile = common["profile"]
-    batch = common["batch"]
-    dtype = common["dtype"]
-    state_page_relation = _parse_state_page_relation(request.parameters)
-    write_page_offset = (
-        _DISTINCT_WRITE_PAGE_OFFSET if state_page_relation == "distinct" else 0
+    rows = reads.numel() * window
+    projection = _fused_projection(
+        rows, profile, dtype=common["dtype"], generator=generator
     )
-    _require_state_pages(common["state_pages"], batch + 1 + write_page_offset)
-    traits = {
-        "num_heads": profile.heads,
-        "head_dim": profile.head_dim,
-        "conv_kernel_size": common["conv_kernel_size"],
-        "paged_state": True,
-        "recurrent_layout": common["recurrent_layout"],
-    }
-
-    load_builtin_kernels()
-    spec = _select_registration(request, platform, traits)
-
-    generator = _generator(request.seed)
-    # Decode hands the kernel strided views of the projection rows.
-    projection = _fused_projection(batch, profile, dtype=dtype, generator=generator)
     weights = _fused_layer_weights(
-        profile, common["conv_kernel_size"], dtype=dtype, generator=generator
+        profile, common["conv_kernel_size"], dtype=common["dtype"], generator=generator
     )
-    conv_pool, state_pool = _state_arena(
+    conv, state = _state_arena(
         common["state_pages"],
         common["state_page_bytes"],
         profile,
         common["conv_kernel_size"],
     )
-    read_indices, write_indices = _state_page_indices(batch, state_page_relation)
-    touched = torch.unique(torch.cat((read_indices, write_indices))).to(torch.int64)
-    _fill_state_pages(conv_pool, state_pool, touched, generator=generator)
-    conv_snapshot = conv_pool[touched].clone()
-    state_snapshot = state_pool[touched].clone()
-    cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+    _fill_state_pages(conv, state, reads.long(), generator=generator)
+    shape = (reads.numel(), profile.heads, capacity, profile.head_dim)
+    history = kda_ops.KdaRetainedHistory(
+        torch.zeros(shape, device="cuda"),
+        torch.zeros(shape, device="cuda"),
+        torch.zeros(shape, device="cuda"),
+        verified,
+        live,
+        metadata[:, 0],
+    )
+    records = kda_ops.KdaRetainedRecords(
+        torch.empty_like(projection.mixed_qkv),
+        history,
+        metadata,
+        stamps,
+        torch.arange(reads.numel() + 1, device="cuda", dtype=torch.int32) * window,
+    )
+    return dict(
+        projection=projection,
+        weights=weights,
+        conv=conv,
+        state=state,
+        records=records,
+        count=count,
+        reads=reads,
+        window=window,
+    )
 
+
+def _invoke_retained_layer(layer, common, *, override, solution):
     from tokenspeed_kernel.ops.attention import kda as kda_ops
 
-    def reset() -> None:
-        conv_pool[touched] = conv_snapshot
-        state_pool[touched] = state_snapshot
-
-    def invoke() -> object:
-        return kda_ops.try_kda_fused_paged_decode(
+    profile = common["profile"]
+    projection, weights, records = (
+        layer["projection"],
+        layer["weights"],
+        layer["records"],
+    )
+    split = not kda_ops.kda_fused_paged_verify_fuses_producers(
+        common["dtype"],
+        recurrent_layout=common["recurrent_layout"],
+        num_heads=profile.heads,
+        head_dim=profile.head_dim,
+        draft_token_num=layer["window"],
+        batch_size=layer["reads"].numel(),
+    )
+    producers = {}
+    if split:
+        producers["g_raw"] = torch.nn.functional.linear(
+            projection.f_a_out, weights.f_b_weight
+        )
+        # As in serving, the convolution keeps the pre-convolution rows, so
+        # the split verify has none to copy.
+        producers["conv_qkv"] = kda_ops.kda_verify_conv_update(
             projection.mixed_qkv,
             weights.conv_weights,
-            conv_pool,
-            projection.f_a_out,
-            weights.f_b_weight,
-            projection.beta_logits,
-            weights.a_log,
-            weights.dt_bias,
-            state_pool=state_pool,
-            read_indices=read_indices,
-            write_indices=write_indices,
+            layer["conv"],
+            layer["reads"],
             num_heads=profile.heads,
             head_dim=profile.head_dim,
-            cu_seqlens=cu_seqlens,
-            lower_bound=common["lower_bound"],
+            draft_token_num=layer["window"],
+            query_start_loc=records.query_start_loc,
+            original_qkv=records.original_qkv,
             recurrent_layout=common["recurrent_layout"],
-            override=request.registration,
-            solution=request.solution,
+        )
+        records = replace(records, original_qkv=None)
+    return kda_ops.kda_fused_paged_verify(
+        projection.mixed_qkv,
+        weights.conv_weights,
+        layer["conv"],
+        projection.f_a_out,
+        weights.f_b_weight,
+        projection.beta_logits,
+        weights.a_log,
+        weights.dt_bias,
+        state_pool=layer["state"],
+        read_indices=layer["reads"],
+        num_heads=profile.heads,
+        head_dim=profile.head_dim,
+        draft_token_num=layer["window"],
+        lower_bound=common["lower_bound"],
+        recurrent_layout=common["recurrent_layout"],
+        retained_records=records,
+        output_norm=None,
+        override=override,
+        solution=solution,
+        **producers,
+    )
+
+
+def prepare_kda_fused_paged_verify(
+    request: BenchmarkRequest, platform: PlatformInfo
+) -> PreparedBenchmark:
+    """Benchmark a candidate window at a fixed accepted history length."""
+    common = _fused_common(request)
+    profile, batch = common["profile"], common["batch"]
+    window = _positive_parameter(request.parameters, "draft_token_num")
+    capacity = _history_capacity(request.parameters, window)
+    history_length = request.parameters.get("history_length", 0)
+    if type(history_length) is not int or not 0 <= history_length <= capacity - window:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"KDA history_length must be an integer from 0 to {capacity - window}",
+        )
+    _require_state_pages(common["state_pages"], batch + 1)
+    load_builtin_kernels()
+    spec = _select_registration(
+        request,
+        platform,
+        {
+            "num_heads": profile.heads,
+            "head_dim": profile.head_dim,
+            "paged_state": True,
+            "retained_history": True,
+            "recurrent_layout": common["recurrent_layout"],
+            "spec_query_len": window,
+            "batch_size": batch,
+        },
+    )
+    reads = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+    metadata = torch.zeros(batch, 3, device="cuda", dtype=torch.int64)
+    metadata[:, 0] = torch.arange(batch, device="cuda")
+    metadata[:, 2] = history_length
+    stamps = torch.full((batch, window, 2), -1, device="cuda", dtype=torch.int64)
+    generator = _generator(request.seed)
+    # No commit follows, so the verify reads the count itself.
+    count = torch.zeros(batch, 1, device="cuda", dtype=torch.int32)
+    layer = _retained_benchmark_layer(
+        common,
+        window,
+        capacity,
+        generator,
+        reads,
+        reads.clone(),
+        metadata,
+        stamps,
+        count,
+        count,
+    )
+    initial_conv, initial_state = layer["conv"].clone(), layer["state"].clone()
+    history = layer["records"].history
+    accepted = slice(0, history_length)
+    history.length.fill_(history_length)
+    if history_length:
+        # Every request slot has an accepted prefix. Reset the candidate
+        # suffix between timings and keep those immutable records in place.
+        history.correction[:, :, accepted].normal_(std=0.02, generator=generator)
+        keys = history.key[:, :, accepted]
+        keys.normal_(generator=generator)
+        keys.copy_(torch.nn.functional.normalize(keys, dim=-1))
+        history.decay[:, :, accepted].uniform_(0.7, 0.95, generator=generator)
+
+    def reset():
+        layer["conv"].copy_(initial_conv)
+        layer["state"].copy_(initial_state)
+        history.length.fill_(history_length)
+        for records in (history.correction, history.key, history.decay):
+            records[:, :, history_length : history_length + window].zero_()
+        stamps.fill_(-1)
+
+    def invoke():
+        return _invoke_retained_layer(layer, common, override=spec.name, solution=None)
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke, reset=reset),
+        parameters={
+            **common["normalized"],
+            "draft_token_num": window,
+            "history_capacity": capacity,
+            "history_length": history_length,
+            "projection_row_stride": layer["projection"].f_a_out.stride(0),
+        },
+        validation=None,
+    )
+
+
+def prepare_kda_retained_commit(
+    request: BenchmarkRequest, platform: PlatformInfo
+) -> PreparedBenchmark:
+    """Time all-layer retained commit from fresh verify-derived records each replay."""
+    common = _fused_common(request)
+    profile, batch = common["profile"], common["batch"]
+    window = _positive_parameter(request.parameters, "draft_token_num")
+    capacity = _history_capacity(request.parameters, window)
+    take = _positive_parameter(request.parameters, "accepted_length")
+    layers = _positive_parameter(request.parameters, "layers")
+    groups = _positive_parameter(request.parameters, "state_groups")
+    if take > window or layers % groups:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Accepted length must fit the window and layers must divide evenly into state groups",
+        )
+    _require_state_pages(common["state_pages"], 2 * batch + 1)
+    load_builtin_kernels()
+    spec = _select_registration(
+        request,
+        platform,
+        {
+            "batched_layers": True,
+            "retained_history": True,
+            "num_heads": profile.heads,
+            "head_dim": profile.head_dim,
+            "recurrent_layout": common["recurrent_layout"],
+        },
+    )
+    kernel = KernelRegistry.get().get_impl(spec.name)
+    reads = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
+    live = reads + batch
+    metadata = torch.zeros(batch, 3, device="cuda", dtype=torch.int64)
+    metadata[:, 0] = torch.arange(batch, device="cuda")
+    stamps = torch.full(
+        (layers, batch, window, 2), -1, device="cuda", dtype=torch.int64
+    )
+    generator = _generator(request.seed)
+    # Every layer shares a request's count; its verify read the round's start.
+    replay_length = torch.zeros(batch, 1, device="cuda", dtype=torch.int32)
+    verified = replay_length.clone()
+    layer_inputs, descriptors, before = [], [], []
+    for layer_idx in range(layers):
+        layer = _retained_benchmark_layer(
+            common,
+            window,
+            capacity,
+            generator,
+            reads,
+            live,
+            metadata,
+            stamps[layer_idx],
+            replay_length,
+            verified,
+        )
+        _invoke_retained_layer(layer, common, override=None, solution=None)
+        conv = layer["conv"]
+        qkv, state = layer["records"].original_qkv, layer["state"]
+        descriptors.append(
+            [
+                qkv.data_ptr(),
+                conv.data_ptr(),
+                conv.shape[0],
+                qkv.stride(0),
+                conv.stride(0),
+                conv.stride(1),
+                conv.stride(2),
+                state.data_ptr(),
+                *state.stride(),
+            ]
+        )
+        layer_inputs.append(layer)
+        before.append(conv.clone())
+    descriptors = torch.tensor(descriptors, device="cuda", dtype=torch.uint64)
+    initial_count = replay_length.clone()
+    group_indices = torch.arange(layers, device="cuda", dtype=torch.int32) // (
+        layers // groups
+    )
+    read_indices = reads.expand(groups, batch).contiguous()
+    write_indices = live.expand(groups, batch).contiguous()
+    accepted = torch.full((batch,), take, device="cuda", dtype=torch.int32)
+    # The timed commit is a step in which no request ends, so it reads no
+    # record; the first layer's records stand in for every layer's.
+    first = layer_inputs[0]["records"].history
+    records = [
+        field[:, None].expand(-1, layers, -1, -1, -1)
+        for field in (first.correction, first.key, first.decay)
+    ]
+    request_stopped = torch.zeros(batch, device="cuda", dtype=torch.bool)
+    # No request ends in the measured rounds, so no row's report changes.
+    request_ends = torch.zeros(batch, device="cuda", dtype=torch.int32)
+
+    def reset():
+        for layer, conv in zip(layer_inputs, before):
+            layer["conv"].copy_(conv)
+        replay_length.copy_(initial_count)
+
+    def invoke():
+        # Keep the layers' tensors alive while descriptors contain their addresses.
+        _ = layer_inputs
+        return kernel(
+            descriptors=descriptors,
+            group_indices=group_indices,
+            read_indices=read_indices,
+            write_indices=write_indices,
+            accepted_length=accepted,
+            query_start_loc=layer_inputs[0]["records"].query_start_loc,
+            record_slots=metadata[:, 0],
+            record_slot_count=batch,
+            record_metadata=metadata,
+            record_stamps=stamps,
+            retained_correction=records[0],
+            retained_key=records[1],
+            retained_decay=records[2],
+            replay_length=replay_length,
+            request_stopped=request_stopped,
+            request_ends=request_ends,
+            draft_token_num=window,
+            history_capacity=capacity,
+            num_heads=profile.heads,
+            head_dim=profile.head_dim,
+            conv_width=common["conv_kernel_size"],
+            activation_dtype=common["dtype"],
+            conv_state_dtype=layer_inputs[0]["conv"].dtype,
+            recurrent_state_dtype=layer_inputs[0]["state"].dtype,
         )
 
     return PreparedBenchmark(
@@ -883,386 +931,11 @@ def prepare_kda_fused_paged_decode(
         invocation=PreparedInvocation(invoke=invoke, reset=reset),
         parameters={
             **common["normalized"],
-            "state_page_relation": state_page_relation,
-            "projection_row_stride": projection.mixed_qkv.stride(0),
-        },
-        validation=None,
-    )
-
-
-def prepare_kda_fused_paged_verify(
-    request: BenchmarkRequest,
-    platform: PlatformInfo,
-) -> PreparedBenchmark:
-    """Prepare fused KDA target verify over ``draft_token_num`` rows per request.
-
-    No-store verification captures FP32 corrections and K/raw gates on both
-    vendors. Producer work is timed with
-    verification; allocations remain outside the measured invocation.
-    """
-
-    common = _fused_common(request)
-    profile = common["profile"]
-    batch = common["batch"]
-    dtype = common["dtype"]
-    draft_token_num = _positive_parameter(request.parameters, "draft_token_num")
-    capture_replay = _bool_parameter(request.parameters, "capture_replay")
-    store_states = _bool_parameter(request.parameters, "store_states")
-    _require_state_pages(common["state_pages"], batch + 1)
-    traits = {
-        "num_heads": profile.heads,
-        "head_dim": profile.head_dim,
-        "paged_state": True,
-        "recurrent_layout": common["recurrent_layout"],
-        "store_states": store_states,
-    }
-
-    load_builtin_kernels()
-    spec = _select_registration(request, platform, traits)
-    records = not store_states
-    split_producers = spec.traits.get("split_producers") == frozenset({True})
-    if records and not capture_replay:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "Records verification requires capture_replay=True",
-        )
-
-    rows = batch * draft_token_num
-    width = profile.heads * profile.head_dim
-    generator = _generator(request.seed)
-    projection = _fused_projection(rows, profile, dtype=dtype, generator=generator)
-    # Verify is not a decode forward, so the model compacts Q/K/V first.
-    mixed_qkv = projection.mixed_qkv.contiguous()
-    weights = _fused_layer_weights(
-        profile, common["conv_kernel_size"], dtype=dtype, generator=generator
-    )
-    conv_pool, state_pool = _state_arena(
-        common["state_pages"],
-        common["state_page_bytes"],
-        profile,
-        common["conv_kernel_size"],
-    )
-    read_indices, write_indices = _state_page_indices(batch, "in_place")
-    _fill_state_pages(
-        conv_pool, state_pool, read_indices.to(torch.int64), generator=generator
-    )
-
-    from tokenspeed_kernel.ops.attention import kda as kda_ops
-
-    record_payload = None
-    raw_qkv = None
-    if records:
-        metadata = torch.zeros((batch, 3), dtype=torch.int64, device="cuda")
-        metadata[:, 0] = torch.arange(batch, device="cuda")
-        raw_qkv = torch.empty_like(mixed_qkv)
-        record_payload = kda_ops.KdaReplayRecords(
-            original_qkv=None if split_producers else raw_qkv,
-            correction=torch.empty(
-                batch,
-                draft_token_num,
-                profile.heads,
-                profile.head_dim,
-                dtype=torch.float32,
-                device="cuda",
-            ).transpose(1, 2),
-            key_gate=torch.empty(
-                batch,
-                draft_token_num,
-                profile.heads,
-                2 * profile.head_dim,
-                dtype=dtype,
-                device="cuda",
-            ).transpose(1, 2),
-            metadata=metadata,
-            stamps=torch.full(
-                (batch, draft_token_num, 2), -1, dtype=torch.int64, device="cuda"
-            ),
-            query_start_loc=torch.arange(batch + 1, dtype=torch.int32, device="cuda")
-            * draft_token_num,
-        )
-    conv_scratch = conv_pool
-    state_scratch = None
-    if store_states:
-        conv_scratch = torch.empty(
-            (rows, *conv_pool.shape[1:]), dtype=conv_pool.dtype, device="cuda"
-        )
-        state_scratch = torch.empty(
-            (rows, *state_pool.shape[1:]), dtype=state_pool.dtype, device="cuda"
-        )
-        write_indices = torch.arange(rows, dtype=torch.int32, device="cuda").view(
-            batch, draft_token_num
-        )
-
-    def invoke() -> object:
-        producers = {}
-        if records:
-            producers = {
-                "g_raw": (
-                    torch.nn.functional.linear(projection.f_a_out, weights.f_b_weight)
-                    if split_producers
-                    else None
-                ),
-                "conv_qkv": (
-                    kda_ops.kda_verify_conv_update(
-                        mixed_qkv,
-                        weights.conv_weights,
-                        conv_pool,
-                        read_indices,
-                        num_heads=profile.heads,
-                        head_dim=profile.head_dim,
-                        draft_token_num=draft_token_num,
-                        recurrent_layout=common["recurrent_layout"],
-                        bias=None,
-                        original_qkv=raw_qkv,
-                    )
-                    if split_producers
-                    else None
-                ),
-            }
-        return kda_ops.try_kda_fused_paged_verify(
-            mixed_qkv,
-            weights.conv_weights,
-            conv_pool,
-            conv_scratch,
-            projection.f_a_out,
-            weights.f_b_weight,
-            projection.beta_logits,
-            weights.a_log,
-            weights.dt_bias,
-            state_pool=state_pool,
-            state_scratch=state_scratch,
-            read_indices=read_indices,
-            write_indices=write_indices,
-            num_heads=profile.heads,
-            head_dim=profile.head_dim,
-            draft_token_num=draft_token_num,
-            lower_bound=common["lower_bound"],
-            recurrent_layout=common["recurrent_layout"],
-            override=spec.name,
-            solution=request.solution,
-            store_states=store_states,
-            replay_records=record_payload,
-            output_norm=None,
-            **producers,
-        )
-
-    return PreparedBenchmark(
-        registration=spec,
-        invocation=PreparedInvocation(invoke=invoke),
-        parameters={
-            **common["normalized"],
-            "draft_token_num": draft_token_num,
-            "capture_replay": capture_replay,
-            "store_states": store_states,
-            "projection_row_stride": projection.f_a_out.stride(0),
-        },
-        validation=None,
-    )
-
-
-def prepare_kda_replay_commit(
-    request: BenchmarkRequest,
-    platform: PlatformInfo,
-) -> PreparedBenchmark:
-    """Prepare the batched KDA replay commit across every KDA layer.
-
-    Inputs are records produced by a real verify before timing on both
-    vendors. Commits write separate
-    pages so repeated measurements read the same checkpoint and records.
-    """
-
-    common = _fused_common(request)
-    profile = common["profile"]
-    batch = common["batch"]
-    dtype = common["dtype"]
-    parameters = request.parameters
-    draft_token_num = _positive_parameter(parameters, "draft_token_num")
-    accepted_length = _positive_parameter(parameters, "accepted_length")
-    layers = _positive_parameter(parameters, "layers")
-    state_groups = _positive_parameter(parameters, "state_groups")
-    if accepted_length > draft_token_num:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "KDA accepted_length cannot exceed draft_token_num",
-        )
-    if layers % state_groups:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "KDA layers must divide evenly into state_groups",
-        )
-    _require_state_pages(common["state_pages"], 2 * batch + 1)
-    traits = {
-        "batched_layers": True,
-        "flat_state": True,
-        "num_heads": profile.heads,
-        "head_dim": profile.head_dim,
-    }
-
-    load_builtin_kernels()
-    spec = _select_registration(request, platform, traits)
-    kernel = KernelRegistry.get().get_impl(spec.name)
-    from tokenspeed_kernel.ops.attention import kda as kda_ops
-
-    rows = batch * draft_token_num
-    width = profile.heads * profile.head_dim
-    generator = _generator(request.seed)
-    payload_qkv = torch.empty(layers, rows, 3 * width, dtype=dtype, device="cuda")
-    payload_f_a = torch.empty(layers, rows, width, dtype=torch.float32, device="cuda")
-    payload_beta = torch.empty(layers, rows, 2 * width, dtype=dtype, device="cuda")
-    record_metadata = torch.zeros(batch, 3, dtype=torch.int64, device="cuda")
-    record_metadata[:, 0] = torch.arange(batch, device="cuda")
-    record_stamps = torch.full(
-        (layers, batch, draft_token_num, 2), -1, dtype=torch.int64, device="cuda"
-    )
-    read_pages = torch.arange(1, batch + 1, dtype=torch.int32, device="cuda")
-    layer_tensors = []
-    descriptor_rows = []
-    for layer in range(layers):
-        weights = _fused_layer_weights(
-            profile, common["conv_kernel_size"], dtype=dtype, generator=generator
-        )
-        conv_pool, state_pool = _state_arena(
-            common["state_pages"],
-            common["state_page_bytes"],
-            profile,
-            common["conv_kernel_size"],
-        )
-        _fill_state_pages(
-            conv_pool, state_pool, read_pages.to(torch.int64), generator=generator
-        )
-        layer_tensors.append((weights, conv_pool, state_pool))
-        projection = _fused_projection(rows, profile, dtype=dtype, generator=generator)
-        split_producers = kda_ops.kda_fused_paged_verify_uses_split_producers(
-            dtype,
-            store_states=False,
-            recurrent_layout=common["recurrent_layout"],
-            num_heads=profile.heads,
-            head_dim=profile.head_dim,
-        )
-        record_payload = kda_ops.KdaReplayRecords(
-            original_qkv=None if split_producers else payload_qkv[layer],
-            correction=payload_f_a[layer]
-            .view(batch, draft_token_num, profile.heads, profile.head_dim)
-            .transpose(1, 2),
-            key_gate=payload_beta[layer]
-            .view(batch, draft_token_num, profile.heads, 2 * profile.head_dim)
-            .transpose(1, 2),
-            metadata=record_metadata,
-            stamps=record_stamps[layer],
-            query_start_loc=torch.arange(batch + 1, dtype=torch.int32, device="cuda")
-            * draft_token_num,
-        )
-        output = kda_ops.try_kda_fused_paged_verify(
-            projection.mixed_qkv,
-            weights.conv_weights,
-            conv_pool,
-            conv_pool,
-            projection.f_a_out,
-            weights.f_b_weight,
-            projection.beta_logits,
-            weights.a_log,
-            weights.dt_bias,
-            state_pool=state_pool,
-            state_scratch=None,
-            read_indices=read_pages,
-            write_indices=read_pages,
-            num_heads=profile.heads,
-            head_dim=profile.head_dim,
-            draft_token_num=draft_token_num,
-            lower_bound=common["lower_bound"],
-            recurrent_layout=common["recurrent_layout"],
-            store_states=False,
-            replay_records=record_payload,
-            g_raw=(
-                torch.nn.functional.linear(projection.f_a_out, weights.f_b_weight)
-                if split_producers
-                else None
-            ),
-            conv_qkv=(
-                kda_ops.kda_verify_conv_update(
-                    projection.mixed_qkv,
-                    weights.conv_weights,
-                    conv_pool,
-                    read_pages,
-                    num_heads=profile.heads,
-                    head_dim=profile.head_dim,
-                    draft_token_num=draft_token_num,
-                    recurrent_layout=common["recurrent_layout"],
-                    bias=None,
-                    original_qkv=payload_qkv[layer],
-                )
-                if split_producers
-                else None
-            ),
-            output_norm=None,
-        )
-        if output is None:
-            raise BenchmarkCaseError(
-                BenchmarkStatus.NOT_APPLICABLE,
-                "Records commit requires a matching verify kernel",
-            )
-        descriptor_rows.append(
-            [
-                payload_qkv[layer].data_ptr(),
-                weights.conv_weights.data_ptr(),
-                conv_pool.data_ptr(),
-                payload_f_a[layer].data_ptr(),
-                0,
-                payload_beta[layer].data_ptr(),
-                weights.a_log.data_ptr(),
-                weights.dt_bias.data_ptr(),
-                state_pool.data_ptr(),
-                0,
-            ]
-        )
-    descriptors = torch.tensor(descriptor_rows, dtype=torch.uint64, device="cuda")
-    layers_per_group = layers // state_groups
-    group_indices = torch.arange(layers, dtype=torch.int32, device="cuda").div_(
-        layers_per_group, rounding_mode="floor"
-    )
-    read_indices = read_pages.expand(state_groups, batch).contiguous()
-    write_indices = (read_indices + batch).contiguous()
-    accepted = torch.full((batch,), accepted_length, dtype=torch.int32, device="cuda")
-    _, first_conv, first_state = layer_tensors[0]
-
-    def invoke() -> object:
-        # Hold every layer's tensors: the descriptors only record addresses.
-        _ = layer_tensors, payload_qkv, payload_f_a, payload_beta
-        payload_args = {
-            "correction_stride": payload_f_a.stride(1),
-            "key_gate_stride": payload_beta.stride(1),
-            "activation_dtype": dtype,
-            "conv_state_dtype": first_conv.dtype,
-            "record_metadata": record_metadata,
-            "record_stamps": record_stamps,
-        }
-        return kernel(
-            descriptors=descriptors,
-            group_indices=group_indices,
-            read_indices=read_indices,
-            write_indices=write_indices,
-            accepted_length=accepted,
-            draft_token_num=draft_token_num,
-            num_heads=profile.heads,
-            head_dim=profile.head_dim,
-            qkv_stride=payload_qkv.stride(1),
-            conv_stride=first_conv.stride(0),
-            state_stride=first_state.stride(0),
-            conv_width=common["conv_kernel_size"],
-            lower_bound=common["lower_bound"],
-            state_dtype=first_state.dtype,
-            **payload_args,
-        )
-
-    return PreparedBenchmark(
-        registration=spec,
-        invocation=PreparedInvocation(invoke=invoke),
-        parameters={
-            **common["normalized"],
-            "draft_token_num": draft_token_num,
-            "accepted_length": accepted_length,
+            "draft_token_num": window,
+            "accepted_length": take,
             "layers": layers,
-            "state_groups": state_groups,
+            "state_groups": groups,
+            "history_capacity": capacity,
             "write_page_relation": "distinct",
         },
         validation=None,

@@ -18,8 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# xgrammar's C++ core as a static library, from the source release of the
-# version the Python package pins (python/pyproject.toml). The wheels ship
+# xgrammar's C++ core as a static library, from the tokenspeed-xgrammar
+# release the Python package pins (python/pyproject.toml). The wheels ship
 # neither headers nor the library. Set FETCHCONTENT_SOURCE_DIR_XGRAMMAR to an
 # unpacked source tree to build offline.
 cmake_minimum_required(VERSION 3.18)
@@ -28,8 +28,8 @@ project(ts_grammar LANGUAGES CXX)
 include(FetchContent)
 FetchContent_Declare(
   xgrammar
-  URL https://files.pythonhosted.org/packages/03/0f/29f521535729be740779c2c98b630ef6607cf28be9b669895dd2b821ff63/xgrammar-0.2.8.tar.gz
-  URL_HASH SHA256=8305646fd2b319d6c3003f51a1665e54cbbe9cba1fb636bc41d0b46434ccbb80
+  URL https://files.pythonhosted.org/packages/6f/11/871e03e361459a337d11d335a4d43c4c824308fc8379960fff6b4662a52c/tokenspeed_xgrammar-0.2.9.post20261125.tar.gz
+  URL_HASH SHA256=ac14d53fcc509b663b617708ef2d213f32d6c5d32eedf90de0602a8bcbb4b338
 )
 # xgrammar reads its options from config.cmake in the top binary directory
 # first: the core only, no Python bindings.

@@ -79,11 +79,11 @@ dependencies = [
     "tokenspeed-smg==1.16.0.post20261121",
     "tokenspeed-smg-grpc-proto==0.5.0.post20261121",
     "tokenspeed-smg-grpc-servicer==0.16.0.post20261121",
+    "tokenspeed-xgrammar==0.2.9.post20261125",
     "tqdm",
     "transformers==5.12.0",
     "uv",
     "uvicorn",
-    "xgrammar==0.2.8",
     "viztracer",
 ]
 
@@ -95,8 +95,10 @@ ts = "tokenspeed.cli:main"
 "Homepage" = "https://github.com/lightseekorg/tokenspeed"
 
 [project.optional-dependencies]
+ascend-memory-saver = ["torch-npu-memory-saver==0.1.6"]
 # Capped: 0.1.9 clones internally, so a release that stops would alias silently.
 instanttensor = ["instanttensor>=0.1.9,<0.2"]
+runai = ["runai-model-streamer>=0.16.1"]
 
 [tool.setuptools]
 license-files = ["LICENSE", "THIRDPARTYNOTICES"]

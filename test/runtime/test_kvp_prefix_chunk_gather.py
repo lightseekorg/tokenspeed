@@ -1091,6 +1091,7 @@ def test_startup_keeps_nccl_beside_fused_dp_projections(startup_verdicts):
             output_size=128,
             max_tokens=16,
             dtype=torch.bfloat16,
+            weight_dtype=torch.bfloat16,
             device=torch.device("cpu"),
         ),
         backend=None,

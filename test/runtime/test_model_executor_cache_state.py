@@ -116,6 +116,55 @@ def test_remote_prefill_seeds_the_complete_prompt_length(monkeypatch):
     assert executor.runtime_states.valid_cache_lengths[13].item() == 13
 
 
+def test_a_landing_clears_the_working_state_its_slot_kept(monkeypatch):
+    """A slot's previous owner may leave working state the device never
+    cleared (KDA's accepted records of a request ended on the host), and a
+    retraction may fold a landed request before its first forward: the
+    landing clears it, for its own rows only, on the execution stream."""
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    class _SlotCounts(CachePoolBinding):
+        def __init__(self):
+            super().__init__()
+            self.counts = torch.arange(1, 21, dtype=torch.int32)
+            self.streams = []
+
+        def reset_request_workspace(self, request_slots, *, stream):
+            self.streams.append(stream)
+            self.counts[request_slots] = 0
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.attn_backend = _SlotCounts()
+    executor.device = "cpu"
+    executor.device_module = torch.cuda
+    executor.default_stream = object()
+    executor.execution_stream = _ExecutionStream()
+    executor.runtime_states = _RuntimeStates()
+
+    forward_op = SimpleNamespace(
+        request_pool_indices=[7, 11, 13],
+        prefill_lengths=[15, 17, 19],
+        extend_prefix_lens=[0, 0],
+        num_extends=lambda: 2,
+    )
+
+    torch_tensor = torch.tensor
+
+    def tensor_without_pinning(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return torch_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", tensor_without_pinning)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+
+    executor.reset_remote_prefill_cache_lengths(forward_op)
+
+    counts = executor.attn_backend.counts
+    assert counts[[7, 11]].tolist() == [0, 0]
+    assert counts[13].item() == 14, "not landed by this op"
+    assert executor.attn_backend.streams == [executor.execution_stream]
+
+
 def test_remote_slot_preparation_orders_behind_the_default_stream(monkeypatch):
     """The slot a remote admission is granted may be the one a retraction in
     the same plan imaged: the snapshot store reads it on the write stream and
@@ -183,11 +232,13 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     )
     executor.grammar_runtime = None
     executor.drafter = _Drafter(spec_num_tokens=4)
+    executor.forward_step = SimpleNamespace(draft_overlap=None)
     executor.tree_spec = None
     executor.dspark_context_producer = None
     executor.config = SimpleNamespace(spec_algo="EAGLE3", pp_size=1, output_length=4)
     executor.runtime_states = SimpleNamespace(
         future_input_map=_FutureInputMap(),
+        valid_cache_lengths=torch.zeros(1, dtype=torch.int32),
         mark_spec_candidates_drafted=lambda _rows: events.append("candidates-real"),
         vocab_size=32,
     )

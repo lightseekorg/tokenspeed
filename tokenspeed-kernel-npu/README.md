@@ -24,6 +24,9 @@ Transformers 5.12.0, Triton 3.2.0, and Triton-Ascend 3.2.1. The setup script
 records every Python package mutation needed by this Ascend path, including the
 `apache-tvm-ffi==0.1.13` build dependency and editable install of this package.
 
+For the optional Ascend Memory Saver package, PTA requirements and startup
+instructions, see the [serving guide](../docs/serving/ascend-memory-saver.md).
+
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.
 
