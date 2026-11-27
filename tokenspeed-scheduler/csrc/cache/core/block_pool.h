@@ -262,7 +262,9 @@ public:
     // FIFO parent and switches `preferred_parent` to it while strictly more
     // than `affinity.reserved_empty_parents` empty parents remain, and falls
     // back to the densest partial parent once empty parents reach the reserve.
-    // All or nothing on insufficient capacity. `packing == 1` bypasses affinity.
+    // All or nothing on insufficient unreserved capacity (leaving at least
+    // `affinity.reserved_empty_parents` empty parents untouched).
+    // `packing == 1` bypasses affinity.
     std::vector<CacheBlockRef> AcquireBlocksWithAffinity(std::uint32_t group_id, std::int32_t num,
                                                          std::span<const std::int32_t> bucket_loads,
                                                          ParentAffinity affinity) {
@@ -295,7 +297,9 @@ public:
     // parent (updating `preferred_parent` for the rest of the call) while
     // strictly more than `affinity.reserved_empty_parents` empty parents
     // remain, else falls back to the bucket's densest partial parent. All or
-    // nothing on insufficient capacity; `packing == 1` bypasses affinity.
+    // nothing on insufficient unreserved capacity (leaving at least
+    // `affinity.reserved_empty_parents` empty parents untouched);
+    // `packing == 1` bypasses affinity.
     std::vector<CacheBlockRef> AcquireBlocksInBucketsWithAffinity(std::uint32_t group_id,
                                                                   std::span<const std::int32_t> buckets,
                                                                   ParentAffinity affinity) {
@@ -325,8 +329,8 @@ public:
         if (max_num <= 0) {
             return {};
         }
-        const auto take = static_cast<std::int32_t>(
-            std::min(static_cast<std::size_t>(max_num), availableBlocks(group_id, cache_blocks_per_lcm_block)));
+        const auto take = static_cast<std::int32_t>(std::min(
+            static_cast<std::size_t>(max_num), availableBlocks(group_id, cache_blocks_per_lcm_block, std::nullopt)));
         return take > 0 ? acquireAvailableBlocks(group_id, cache_blocks_per_lcm_block, take, {}, std::nullopt)
                         : std::vector<CacheBlockRef>{};
     }
@@ -585,10 +589,20 @@ private:
         return group_availability_[group_id];
     }
 
-    std::size_t availableBlocks(std::uint32_t group_id, std::int32_t packing) const {
+    std::int64_t unreservedEmptyParents(std::optional<ParentAffinity> affinity) const noexcept {
+        const auto empty = static_cast<std::int64_t>(free_parent_ids_.size());
+        if (!affinity) {
+            return empty;
+        }
+        return std::max<std::int64_t>(0, empty - affinity->reserved_empty_parents);
+    }
+
+    std::size_t availableBlocks(std::uint32_t group_id, std::int32_t packing,
+                                std::optional<ParentAffinity> affinity) const {
         const auto& group = placement(group_id);
         _assert(group.packing == packing, "cache group packing changed after construction");
-        return group.FreeSlots() + free_parent_ids_.size() * static_cast<std::size_t>(packing);
+        const auto empty = static_cast<std::size_t>(unreservedEmptyParents(affinity));
+        return group.FreeSlots() + empty * static_cast<std::size_t>(packing);
     }
 
     void removeAvailability(GroupAvailability& group, const LcmBlock& parent, std::int32_t id) noexcept {
@@ -646,7 +660,7 @@ private:
     }
 
     GroupAvailability& prepareAvailability(std::uint32_t group_id, std::int32_t packing) {
-        (void)availableBlocks(group_id, packing);
+        (void)availableBlocks(group_id, packing, std::nullopt);
         if (placement(group_id).parents_by_bucket.empty()) {
             RegisterGroup(group_id, packing, 1);
         }
@@ -711,7 +725,7 @@ private:
                 _assert(load >= 0, "allocation bucket loads must be non-negative");
             }
         }
-        if (availableBlocks(group_id, cache_blocks_per_lcm_block) < static_cast<std::size_t>(num)) {
+        if (availableBlocks(group_id, cache_blocks_per_lcm_block, affinity) < static_cast<std::size_t>(num)) {
             return {};
         }
         return acquireAvailableBlocks(group_id, cache_blocks_per_lcm_block, num, bucket_loads, affinity);
@@ -741,7 +755,7 @@ private:
             ++blocks_by_bucket[static_cast<std::size_t>(bucket)];
         }
         if (ParentsNeededForBuckets(blocks_by_bucket, group.free_slots_by_bucket, /*any_bucket_blocks=*/0, packing) >
-            static_cast<std::int64_t>(free_parent_ids_.size())) {
+            unreservedEmptyParents(affinity)) {
             return {};
         }
         std::optional<std::int32_t> preferred_parent = affinity ? affinity->preferred_parent : std::nullopt;

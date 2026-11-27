@@ -1296,5 +1296,73 @@ TEST(BlockPoolRequestAwareTest, LateWiderShardRegistrationPreservesLiveIntrusive
     EXPECT_EQ(pool.NumOccupiedSlots(), 0);
 }
 
+TEST(BlockPoolRequestAwareTest, AffinityPreflightRespectsReserveFloorWhenNoCompatibleHolesExist) {
+    // Ordinary affinity acquisition with one full parent, one empty parent, and
+    // reserved_empty_parents == 1 must fail without consuming the reserve.
+    {
+        BlockPool pool(/*num_lcm_blocks=*/2, {4, 1});
+        auto full = pool.AcquireBlocks(0, 4);
+        ASSERT_EQ(full.size(), 4u);
+        ASSERT_EQ(pool.NumEmptyLcmBlocks(), 1);
+        ASSERT_EQ(pool.NumFreeSlots(0), 0);
+
+        EXPECT_TRUE(pool.AcquireBlocksWithAffinity(
+                            0, 1, {}, ParentAffinity{.preferred_parent = std::nullopt, .reserved_empty_parents = 1})
+                        .empty());
+        EXPECT_TRUE(
+            pool.AcquireBlocksWithAffinity(0, 1, {}, ParentAffinity{.preferred_parent = 1, .reserved_empty_parents = 3})
+                .empty());
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+        EXPECT_EQ(pool.NumFreeSlots(0), 0);
+    }
+
+    // All-or-nothing: when bound holes plus unreserved empty parents fall short
+    // of the requested count, neither the hole nor the reserved empty parent is
+    // touched.
+    {
+        BlockPool pool(/*num_lcm_blocks=*/2, {4, 1});
+        auto partial = pool.AcquireBlocks(0, 3);
+        ASSERT_EQ(partial.size(), 3u);
+        ASSERT_EQ(pool.NumEmptyLcmBlocks(), 1);
+        ASSERT_EQ(pool.NumFreeSlots(0), 1);
+
+        EXPECT_TRUE(
+            pool.AcquireBlocksWithAffinity(0, 2, {}, ParentAffinity{.preferred_parent = 1, .reserved_empty_parents = 1})
+                .empty());
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+        EXPECT_EQ(pool.NumFreeSlots(0), 1);
+    }
+
+    // Bucket-exact affinity acquisition at the reserve floor with holes only in
+    // another bucket (or too few compatible holes) must fail without touching
+    // other-bucket holes or consuming the reserved empty parent.
+    {
+        BlockPool pool(/*num_lcm_blocks=*/3, {4, 1});
+        pool.RegisterGroup(/*group_id=*/0, /*packing=*/4, /*shard_count=*/2);
+        const std::array<std::int32_t, 2> fill_bucket1{1, 1};
+        auto b1_full = pool.AcquireBlocksInBuckets(0, fill_bucket1);
+        ASSERT_EQ(b1_full.size(), 2u);
+        ASSERT_EQ(pool.NumEmptyLcmBlocks(), 2);
+        ASSERT_EQ(pool.FreeSlotsByBucket(0)[0], 2);
+        ASSERT_EQ(pool.FreeSlotsByBucket(0)[1], 0);
+
+        const std::array<std::int32_t, 2> need_both{0, 1};
+        EXPECT_TRUE(pool.AcquireBlocksInBucketsWithAffinity(
+                            0, need_both, ParentAffinity{.preferred_parent = 1, .reserved_empty_parents = 2})
+                        .empty());
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+        EXPECT_EQ(pool.FreeSlotsByBucket(0)[0], 2);
+        EXPECT_EQ(pool.FreeSlotsByBucket(0)[1], 0);
+
+        const std::array<std::int32_t, 1> need_b1{1};
+        EXPECT_TRUE(pool.AcquireBlocksInBucketsWithAffinity(
+                            0, need_b1, ParentAffinity{.preferred_parent = std::nullopt, .reserved_empty_parents = 2})
+                        .empty());
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+        EXPECT_EQ(pool.FreeSlotsByBucket(0)[0], 2);
+        EXPECT_EQ(pool.FreeSlotsByBucket(0)[1], 0);
+    }
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

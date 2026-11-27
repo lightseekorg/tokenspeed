@@ -145,9 +145,9 @@ For packed non-State Device groups whose virtual packing
 (`physical_packing * shard_count`) lies in `(1, 64]`, admission and restore
 apply **request-aware placement** (`ParentAffinity`) so concurrent requests do
 not interleave private pages across the same LCM parents and block whole-parent
-reclamation when a request finishes. Affinity is derived from the request's
-private tail without extra per-request state, and never reuses shared or cached
-prefix parents. Each allocation step tries:
+reclamation when a request finishes. Preferred-parent selection derives affinity
+from the request's private tail without extra per-request state and never picks
+shared or cached prefix parents. Each allocation step tries:
 
 * **Preferred parent** — a free slot in the request's current private parent,
   preserving KV-parallel bucket balance.
@@ -155,7 +155,8 @@ prefix parents. Each allocation step tries:
   remain above the reserve held for later groups in the same admission step,
   becoming the new preferred parent.
 * **Hole-first fallback** — the densest partial parent once empty parents reach
-  that reserve floor.
+  that reserve floor; this fallback may place private blocks beside shared or
+  cached prefix blocks.
 
 `State` groups, `packing == 1` groups, and compact Host/snapshot tiers always
 bypass affinity and stay hole-first. As a placement heuristic, wider virtual
