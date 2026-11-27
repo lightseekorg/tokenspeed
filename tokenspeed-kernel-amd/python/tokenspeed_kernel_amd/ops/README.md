@@ -1130,6 +1130,54 @@ either ranks the few keys sharing the resulting 24-bit prefix in LDS or
 counts their last 8 bits, then emits the rest of the row's top-k and zeroes
 the row's histogram and counters.
 
+### gfx950 DCP candidate merge
+
+`gluon_dsa_merge_candidates_gfx950` in `dsa/candidate_merge.py` is
+`dsa_merge_candidates` in one launch: it selects each row's global top-k from
+every KVP rank's gathered candidates without a `torch.topk`.
+
+#### Contract
+
+- Records are contiguous int32 `[ranks, rows, candidates, 2]` (position, FP32
+  score bits) pairs in the all-gather's rank-major layout. The outputs are
+  int32 `[rows, topk]` positions and `[rows]` counts.
+- The selection is bit for bit `select_through_threshold` over an exact top-k,
+  as in `triton_dsa_merge_candidates` and `cuda_dsa_merge_candidates`: every
+  live candidate above the k-th largest live score, then the first tied ones
+  in candidate order up to `topk`, written in candidate order and padded with
+  -1. A negative position, a NaN or a `-inf` score makes a candidate not live;
+  `+inf` is live, and both zeros tie.
+- A row's `ranks * candidates`, rounded up to a power of two, stay in
+  registers: at most 32768 (`merge_candidates_supported`). Larger merges keep
+  the portable kernel. Rows are a runtime value, and record offsets are
+  64-bit.
+
+#### Algorithm
+
+One program takes a row (8 warps, 16 past 16384 candidates, so each lane
+holds at most 32) and loads each record as one 64-bit value;
+the keys order larger scores first. Up to four 8-bit radix passes over the
+live keys find the bucket holding the k-th smallest, k = min(live, topk), and
+stop once that bucket is taken whole (keys spread over many exponents need
+two). Then one block scan carries the running counts of the live keys below
+the bucket and in it, packed in the two halves of an int32, which places each
+kept candidate in candidate order.
+
+- Histogram contention: a row's scores mostly share their sign and exponent,
+  and runs of equal scores share every digit, so every pass's histogram keeps
+  8 copies of each bucket, lane l adding to copy l % 8. All-equal rows then
+  take ~20 us per row instead of ~57 us with one copy. The first pass adds
+  zero for dead candidates to per-lane slots (unmasked atomics, no branch);
+  later passes, where few keys usually still match, mask their atomics so a
+  wave skips the instructions none of its lanes issue.
+- Digit search: every wave reads the whole histogram, lane i holding buckets
+  [4i, 4i + 4) with their copies, and finds the digit with in-lane sums and a
+  DPP prefix sum (`wave_inclusive_sum_i32`), so a pass needs no cross-wave
+  exchange. The first pass's total gives k. The four histograms (32 KiB) are
+  zeroed once.
+- Registers: 118 VGPRs for 32 candidates per lane, two 8-warp programs per
+  CU. 64 per lane on 8 warps took 217 VGPRs and ran up to 14% slower.
+
 ### DeepSeek V4.1 CSA2 index selection
 
 CSA2 picks, for each query, the KV rows its sparse attention reads. The
