@@ -682,9 +682,12 @@ def post_load_transformed_modules(model: nn.Module) -> list[str]:
         ``named_modules`` order; empty when every hook is a no-op.
     """
     from tokenspeed.runtime.layers.moe.expert import MoELayer
+    from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
     from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 
-    no_op_hooks = no_op_post_load_hooks()
+    no_op_hooks: frozenset[Any] = no_op_post_load_hooks()
+    if isinstance(model, BaseCausalLM):
+        no_op_hooks = no_op_hooks | model.reloadable_post_load_hooks()
     transformed: list[str] = []
     for name, module in model.named_modules():
         owners = [type(module)]
@@ -699,7 +702,7 @@ def post_load_transformed_modules(model: nn.Module) -> list[str]:
                 preprocessor = (getattr(module, "plan", None) or {}).get(
                     "weight_preprocessor"
                 )
-                if preprocessor is None:
+                if preprocessor is None or preprocessor in no_op_hooks:
                     continue
                 owner_name = getattr(preprocessor, "__name__", repr(preprocessor))
             elif hook is DeepseekV4MoE.process_weights_after_loading:
@@ -794,8 +797,20 @@ class DummyModelLoader(BaseModelLoader):
             # give those random values as well. This also overwrites the
             # values a floating-point parameter's dummy initializer set, so a
             # copy post-processing derived from such a parameter does not
-            # match it afterwards.
-            initialize_dummy_weights(model)
+            # match it afterwards. Skip composite peer-weight views: finalize
+            # already copied and distributed the initialized owned shards and
+            # shared staging pools must not be overwritten across layers.
+            from tokenspeed.runtime.layers.moe.peer_weights import (
+                peer_weights_controller_for,
+            )
+
+            exclude_data_ptrs: set[int] | None = None
+            controller = peer_weights_controller_for(model)
+            if controller is not None and controller.finalized:
+                exclude_data_ptrs = {
+                    p.data_ptr() for p in controller.managed_parameters() if p.numel()
+                }
+            initialize_dummy_weights(model, exclude_data_ptrs=exclude_data_ptrs)
         return model.eval()
 
 

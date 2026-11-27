@@ -541,7 +541,7 @@ class ModelRunner:
         Returns:
             ``(ok, message)`` for the control plane.
         """
-        if self.mapping.moe_weight_sharing_size is not None:
+        if self.mapping.moe_weight_sharing_size is not None and self.device != "npu":
             return (
                 False,
                 "Peer expert weights are immutable; restart to change the checkpoint",
@@ -611,7 +611,7 @@ class ModelRunner:
             post_load_transformed_modules,
         )
 
-        if self.mapping.moe_weight_sharing_size is not None:
+        if self.mapping.moe_weight_sharing_size is not None and self.device != "npu":
             return (
                 False,
                 "Peer expert weights are immutable; restart to change the checkpoint",
@@ -625,22 +625,23 @@ class ModelRunner:
                 and self.server_args.enable_memory_saver
                 and self.server_args.weight_memory_policy == "discard"
             )
-            coordinated_restore = require_complete
-            with ExitStack() as session:
-                ignored_disk_names: frozenset[str] = frozenset()
-                if coordinated_restore:
-                    # A local preparation or copy error must reach peers before
-                    # any rank enters a post-load collective.
-                    cpu_group = (
-                        pg_manager.get_process_group("gloo", self.mapping.world_group)
-                        if len(self.mapping.world_group) > 1
-                        else None
-                    )
-                    session.enter_context(
-                        weight_update_session(
-                            [self.model], require_complete=True, cpu_group=cpu_group
-                        )
-                    )
+            has_peer_weights = self.mapping.moe_weight_sharing_size is not None
+            coordinated_restore = require_complete or has_peer_weights
+            ignored_disk_names: frozenset[str] = frozenset()
+            shapes = None
+            weights = None
+
+            def _prepare_disk_load(*, fail_by_raising: bool) -> tuple[bool, str] | None:
+                """Validate disk reloadability and open the checkpoint tensor stream.
+
+                Populates the enclosing ``ignored_disk_names``, ``shapes``, and
+                ``weights`` bindings consumed by ``_counted``. When
+                ``fail_by_raising`` is True (used inside a coordinated group
+                preflight), failures raise ``ValueError``; otherwise, returns
+                ``(False, message)`` on validation failure or ``None`` on success.
+                """
+                nonlocal ignored_disk_names, shapes, weights
+                if require_complete:
                     ignored_disk_names = (
                         self.model.weight_discard_ignored_disk_checkpoint_names()
                     )
@@ -656,7 +657,7 @@ class ModelRunner:
                         + "), and a checkpoint holds them untransformed. Nothing was "
                         f"written; restart the engine with {model_path!r} instead"
                     )
-                    if coordinated_restore:
+                    if fail_by_raising:
                         raise ValueError(message)
                     return False, message
                 loader = get_model_loader(
@@ -682,7 +683,7 @@ class ModelRunner:
                         f"{type(loader).__name__}, which does not read checkpoint "
                         "files; an in-place reload needs a file-backed format"
                     )
-                    if coordinated_restore:
+                    if fail_by_raising:
                         raise ValueError(message)
                     return False, message
                 if (
@@ -698,21 +699,42 @@ class ModelRunner:
                     loader, model_path, ignored_disk_names
                 )
                 if problem is not None:
-                    if coordinated_restore:
+                    if fail_by_raising:
                         raise ValueError(f"{problem}; nothing was written")
                     return False, f"{problem}; nothing was written"
                 weights = loader.get_checkpoint_weights(
                     model_path, None, self.model, self.model_config.mapping
                 )
+                return None
 
-                def _counted():
-                    nonlocal consumed
-                    for name, tensor in weights:
-                        consumed += 1
-                        yield name, tensor
+            def _counted():
+                nonlocal consumed
+                assert weights is not None
+                for name, tensor in weights:
+                    consumed += 1
+                    yield name, tensor
 
-                # Ordinary live loads retain the mainline preflight timing.
-                if not coordinated_restore:
+            with ExitStack() as session:
+                if coordinated_restore:
+                    # A local preparation or copy error must reach peers before
+                    # any rank enters peer quiesce or post-load collectives.
+                    cpu_group = (
+                        pg_manager.get_process_group("gloo", self.mapping.world_group)
+                        if len(self.mapping.world_group) > 1
+                        else None
+                    )
+                    session.enter_context(
+                        weight_update_session(
+                            [self.model],
+                            require_complete=require_complete,
+                            cpu_group=cpu_group,
+                            preflight=lambda: _prepare_disk_load(fail_by_raising=True),
+                        )
+                    )
+                else:
+                    failure = _prepare_disk_load(fail_by_raising=False)
+                    if failure is not None:
+                        return failure
                     session.enter_context(
                         weight_update_session(
                             [self.model],
