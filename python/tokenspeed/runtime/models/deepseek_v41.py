@@ -109,7 +109,9 @@ from tokenspeed_kernel.ops.quantization import (
     silu_and_mul_quantize_fp8_group32,
 )
 from tokenspeed_kernel.ops.residual import (
+    is_mega_mhc_capture_safe,
     mhc_apply_pre_quantize_fp8,
+    mhc_boundary_max_decode_tokens,
     prepare_mhc_boundary_weight,
     try_mhc_shifted_post_pre_boundary,
     try_mhc_shifted_post_pre_norm,
@@ -1957,9 +1959,6 @@ class V41HCPost:
         return v41_hc_post(self.x, residual, self.post, self.comb)
 
 
-_MHC_BOUNDARY_MAX_DECODE_TOKENS = 336
-
-
 def _refresh_boundary_weight(
     existing: torch.Tensor | None, fn: torch.Tensor
 ) -> torch.Tensor | None:
@@ -2014,9 +2013,12 @@ def _v41_hc_post_pre(
             pending.reduce_group,
         )
         return residual, x, None, None
-    if not prefer_overlap:
-        # Prefill / PrefillGraph (stream-warmed under DeepGEMM >= 2.8.2):
-        # prefer MegaMHC here since it emits quantized wq_a_wkv inputs too.
+    if not prefer_overlap and (
+        is_mega_mhc_capture_safe() or not is_breakable_capture_active()
+    ):
+        # Prefill / PrefillGraph (stream-warmed when DeepGEMM >= 2.8.2):
+        # prefer MegaMHC here since it emits quantized wq_a_wkv inputs too;
+        # older DeepGEMM versions stay excluded under breakable capture.
         join = (
             try_mhc_shifted_post_pre_norm_quantize_fp8
             if quantize_fp8
@@ -2040,7 +2042,10 @@ def _v41_hc_post_pre(
             return residual, x, (pre, post, comb), tuple(quantized) or None
     if boundary_weight is not None and (
         (not prefer_overlap and not quantize_fp8)
-        or (prefer_overlap and 0 < residual.shape[0] <= _MHC_BOUNDARY_MAX_DECODE_TOKENS)
+        or (
+            prefer_overlap
+            and 0 < residual.shape[0] <= mhc_boundary_max_decode_tokens(residual.device)
+        )
     ):
         shifted = try_mhc_shifted_post_pre_boundary(
             pending.x,

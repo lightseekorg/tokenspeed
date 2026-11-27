@@ -920,6 +920,24 @@ def try_mhc_shifted_post_pre_norm_quantize_fp8(
     )
 
 
+def is_mega_mhc_capture_safe() -> bool:
+    """Return True when DeepGEMM supports epoch-based stream capture (>= 2.8.2)."""
+    from tokenspeed_kernel.thirdparty.cuda.mega_mhc import (
+        is_mega_mhc_capture_safe as _is_mega_mhc_capture_safe,
+    )
+
+    return _is_mega_mhc_capture_safe()
+
+
+def mhc_boundary_max_decode_tokens(device: _torch.device | str | int) -> int:
+    """Return the max token count fitting one resident ``mhc_boundary`` wave."""
+    from tokenspeed_kernel.ops.residual._cute_dsl.mhc_boundary import (
+        mhc_boundary_max_decode_tokens_cute_dsl,
+    )
+
+    return mhc_boundary_max_decode_tokens_cute_dsl(device)
+
+
 def prepare_mhc_boundary_weight(weight: _torch.Tensor) -> _torch.Tensor | None:
     """Pack FP32 ``[24, 4 * hidden]`` mHC weights for Blackwell ``mhc_boundary``.
 
@@ -1350,8 +1368,10 @@ __all__ = [
     "boundary_gathers_mailbox",
     "gated_residual_combine",
     "gated_residual_mix",
+    "is_mega_mhc_capture_safe",
     "mhc_apply_pre",
     "mhc_apply_pre_quantize_fp8",
+    "mhc_boundary_max_decode_tokens",
     "mhc_fused_hc",
     "mhc_init",
     "mhc_mixes",

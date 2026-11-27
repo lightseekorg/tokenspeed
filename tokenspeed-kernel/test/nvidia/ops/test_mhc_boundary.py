@@ -32,6 +32,7 @@ pytest.importorskip("cutlass")
 
 from tokenspeed_kernel import platform  # noqa: E402
 from tokenspeed_kernel.ops.residual import (  # noqa: E402
+    mhc_boundary_max_decode_tokens,
     prepare_mhc_boundary_weight,
     try_mhc_shifted_post_pre_boundary,
     try_mhc_shifted_post_pre_norm,
@@ -40,9 +41,7 @@ from tokenspeed_kernel.ops.residual import (  # noqa: E402
 from tokenspeed_kernel.thirdparty.cuda.mega_mhc import (  # noqa: E402
     is_mega_mhc_available,
 )
-from tokenspeed_kernel.thirdparty.cute_dsl import (  # noqa: E402
-    mhc_boundary as cute_mhc,
-)
+from tokenspeed_kernel.thirdparty.cute_dsl import mhc_boundary as cute_mhc  # noqa: E402
 
 if not (
     platform.ArchVersion(10, 0)
@@ -114,9 +113,7 @@ def _reference(args: dict):
     proj = (flat @ args["raw_weight"].T) * hc_rstd
     scale = args["scale"]
     base = args["base"]
-    new_pre = (
-        torch.sigmoid(proj[:, :4] * scale[0] + base[:4]) + args["hc_eps"]
-    )
+    new_pre = torch.sigmoid(proj[:, :4] * scale[0] + base[:4]) + args["hc_eps"]
     new_post = torch.sigmoid(proj[:, 4:8] * scale[1] + base[4:8]) * 2.0
     m = (proj[:, 8:] * scale[2] + base[8:]).view(-1, 4, 4)
     m = m - m.amax(-1, keepdim=True)
@@ -129,6 +126,41 @@ def _reference(args: dict):
     return new_residual, layer_input, new_pre, new_post, m
 
 
+def _reference_fp64(args: dict):
+    x64 = args["x"].double()
+    res64 = args["residual"].double()
+    pre64 = args["pre"].double()
+    post64 = args["post"].double()
+    comb64 = args["comb"].double()
+    new_residual = (
+        (comb64[..., None] * res64[:, :, None, :]).sum(1)
+        + post64[..., None] * x64[:, None, :]
+    ).bfloat16()
+    r = new_residual.double()
+    collapsed = (pre64[..., None] * r).sum(1).bfloat16()
+    cf = collapsed.double()
+    norm_rstd = torch.rsqrt(cf.square().mean(-1, keepdim=True) + args["norm_eps"])
+    layer_input = (cf * norm_rstd * args["norm_weight"].double()).bfloat16()
+
+    hidden = r.shape[-1]
+    flat = r.reshape(-1, 4 * hidden)
+    hc_rstd = torch.rsqrt(flat.square().mean(-1, keepdim=True) + args["rms_eps"])
+    proj = (flat @ args["raw_weight"].double().T) * hc_rstd
+    scale = args["scale"].double()
+    base = args["base"].double()
+    new_pre = torch.sigmoid(proj[:, :4] * scale[0] + base[:4]) + args["hc_eps"]
+    new_post = torch.sigmoid(proj[:, 4:8] * scale[1] + base[4:8]) * 2.0
+    m = (proj[:, 8:] * scale[2] + base[8:]).view(-1, 4, 4)
+    m = m - m.amax(-1, keepdim=True)
+    m = torch.exp(m)
+    m = m / m.sum(-1, keepdim=True) + args["hc_eps"]
+    m = m / (m.sum(-2, keepdim=True) + args["hc_eps"])
+    for _ in range(1, args["sinkhorn_iters"]):
+        m = m / (m.sum(-1, keepdim=True) + args["hc_eps"])
+        m = m / (m.sum(-2, keepdim=True) + args["hc_eps"])
+    return new_residual, layer_input, new_pre.float(), new_post.float(), m.float()
+
+
 @pytest.mark.parametrize(
     "tokens", [1, 14, 15, 17, 33, 64, 128, 224, 336, 337, 512, 1024, 2048]
 )
@@ -138,7 +170,16 @@ def test_mhc_boundary_matches_reference_and_preserves_inputs(tokens, hidden, ite
     args = _inputs(tokens, hidden, iters)
     snapshots = {
         k: args[k].clone()
-        for k in ("x", "residual", "pre", "post", "comb", "scale", "base", "norm_weight")
+        for k in (
+            "x",
+            "residual",
+            "pre",
+            "post",
+            "comb",
+            "scale",
+            "base",
+            "norm_weight",
+        )
     }
     actual = _call_boundary(args)
     assert actual is not None
@@ -159,9 +200,14 @@ def test_mhc_boundary_matches_reference_and_preserves_inputs(tokens, hidden, ite
 
     for got, ref in zip(actual, _reference(args), strict=True):
         torch.testing.assert_close(got, ref, atol=0.02, rtol=0.01)
+    ref64 = _reference_fp64(args)
+    for got, ref in zip(actual[2:], ref64[2:], strict=True):
+        torch.testing.assert_close(got, ref, atol=5e-4, rtol=5e-4)
 
     if hidden % 1024 == 0 and is_mega_mhc_available():
-        mega_args = {k: v for k, v in args.items() if k not in ("raw_weight", "boundary_weight")}
+        mega_args = {
+            k: v for k, v in args.items() if k not in ("raw_weight", "boundary_weight")
+        }
         mega_args["weight"] = args["raw_weight"]
         mega = try_mhc_shifted_post_pre_norm(**mega_args)
         assert mega is not None
@@ -235,8 +281,10 @@ def test_mhc_boundary_cudagraph_replay_and_interleaved_graphs():
             eager = _call_boundary(args)
             assert eager is not None
             for got, ref in zip(captured, eager, strict=True):
-                assert torch.equal(got.view(torch.uint8) if got.dtype == torch.bfloat16 else got,
-                                   ref.view(torch.uint8) if ref.dtype == torch.bfloat16 else ref), f"step={step}"
+                assert torch.equal(
+                    got.view(torch.uint8) if got.dtype == torch.bfloat16 else got,
+                    ref.view(torch.uint8) if ref.dtype == torch.bfloat16 else ref,
+                ), f"step={step}"
 
 
 @pytest.mark.parametrize(
@@ -261,7 +309,10 @@ def test_mhc_boundary_unsupported_inputs_return_none(case):
     elif case == "empty":
         args = _inputs(0, 2560, 20)
     elif case == "hidden":
-        assert prepare_mhc_boundary_weight(torch.randn(24, 4 * 1024, device="cuda")) is None
+        assert (
+            prepare_mhc_boundary_weight(torch.randn(24, 4 * 1024, device="cuda"))
+            is None
+        )
         return
     elif case == "unaligned_x":
         raw = torch.empty(17 * 2560 + 4, dtype=torch.bfloat16, device="cuda").normal_()
@@ -297,10 +348,30 @@ def test_mhc_boundary_reads_and_writes_past_2gb():
                 "post": args["post"][sl],
                 "comb": args["comb"][sl],
             }
-            for got, ref in zip(
-                (t[sl] for t in actual), _reference(sub), strict=True
-            ):
+            for got, ref in zip((t[sl] for t in actual), _reference(sub), strict=True):
                 torch.testing.assert_close(got, ref, atol=0.02, rtol=0.01)
     finally:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
+
+
+def test_mhc_boundary_hi_lo_split_fp64_precision_and_cluster_limit():
+    props = torch.cuda.get_device_properties("cuda")
+    expected_clusters = max(1, (2 * props.multi_processor_count) // cute_mhc.CLUSTER)
+    assert cute_mhc.max_decode_wave_clusters("cuda") == expected_clusters
+    assert mhc_boundary_max_decode_tokens("cuda") == expected_clusters * cute_mhc.TILE
+
+    args = _inputs(33, 5120, 20, seed=107)
+    raw = args["raw_weight"] * 8.0
+    bw = prepare_mhc_boundary_weight(raw)
+    assert bw is not None
+    args["raw_weight"] = raw
+    args["boundary_weight"] = bw
+    actual = _call_boundary(args)
+    assert actual is not None
+    ref64 = _reference_fp64(args)
+    for got, ref in zip(actual[:2], ref64[:2], strict=True):
+        torch.testing.assert_close(got, ref, atol=0.02, rtol=0.01)
+    # Without the hi+lo BF16 weight split, 8x weights shift projections by ~5e-3+.
+    for got, ref in zip(actual[2:], ref64[2:], strict=True):
+        torch.testing.assert_close(got, ref, atol=5e-4, rtol=5e-4)

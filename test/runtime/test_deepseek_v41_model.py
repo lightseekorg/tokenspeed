@@ -5084,20 +5084,23 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
     [
         (ForwardMode.DECODE, 17),
         (ForwardMode.DECODE, 128),
-        (ForwardMode.DECODE, 400),
+        (ForwardMode.DECODE, None),
         (ForwardMode.EXTEND, 128),
     ],
 )
 def test_mhc_boundary_gpu_layer_and_prefill_graph_matches_fallback(
     monkeypatch, mode, tokens
 ):
-    """Prepared layers use mhc_boundary for single-wave Decode (<=336) and
-    MegaMHC inside BreakableCapture, falling back to StreamFork above 336."""
+    """Prepared layers use mhc_boundary for single-wave Decode and MegaMHC
+    inside BreakableCapture when DeepGEMM is capture-safe, falling back
+    outside the single-wave limit or on older DeepGEMM versions."""
     pytest.importorskip("cutlass")
     from contextlib import contextmanager
     from unittest.mock import Mock
 
     from tokenspeed_kernel.ops.residual import (
+        is_mega_mhc_capture_safe,
+        mhc_boundary_max_decode_tokens,
         prepare_mhc_boundary_weight,
         warmup_mhc_boundary,
     )
@@ -5109,6 +5112,10 @@ def test_mhc_boundary_gpu_layer_and_prefill_graph_matches_fallback(
 
     if prepare_mhc_boundary_weight(torch.empty(24, 4 * 5120, device="cuda")) is None:
         pytest.skip("requires Blackwell SM100-109 CuTe DSL mhc_boundary support")
+
+    decode_wave_limit = mhc_boundary_max_decode_tokens("cuda")
+    if tokens is None:
+        tokens = decode_wave_limit + 64
 
     torch.manual_seed(43)
     hidden, iters = 5120, 20
@@ -5214,7 +5221,7 @@ def test_mhc_boundary_gpu_layer_and_prefill_graph_matches_fallback(
     monkeypatch.setattr(layer.hc_stream_fork, "scope", record_scope)
     actual = _complete_layer(*args)
 
-    if mode == ForwardMode.DECODE and tokens <= 336:
+    if mode == ForwardMode.DECODE and tokens <= decode_wave_limit:
         assert boundary_calls.call_count == 2
         assert mega_calls.call_count == 0
         assert scopes == [False, False]
@@ -5261,6 +5268,21 @@ def test_mhc_boundary_gpu_layer_and_prefill_graph_matches_fallback(
             for got, ref in zip(captured[:2], eager[:2], strict=True):
                 torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
     elif mode == ForwardMode.EXTEND and tokens == 128:
+        with monkeypatch.context() as mp:
+            mp.setattr(v41, "is_mega_mhc_capture_safe", lambda: False)
+            guarded_cap = BreakableCapture()
+            with active_forward(ctx):
+                mega_calls.reset_mock()
+                boundary_calls.reset_mock()
+                with guarded_cap:
+                    guarded_out = _complete_layer(*args)
+                assert mega_calls.call_count == 0
+                assert boundary_calls.call_count == 2
+                for got, ref in zip(guarded_out[:2], expected[:2], strict=True):
+                    torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
+
+        if not is_mega_mhc_capture_safe():
+            return
         cap = BreakableCapture()
         with active_forward(ctx):
             cap.stream.wait_stream(torch.cuda.current_stream())

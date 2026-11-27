@@ -40,6 +40,7 @@ both Decode graphs and ``PrefillGraph``.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 
 import cutlass
@@ -53,16 +54,15 @@ from cutlass.utils import SmemAllocator
 CLUSTER = 16
 THREADS = 320
 MMA_WARPS = 10
-CLUSTERS = 14
 MULT = 4
 MIXES = 24
 # Floats per pushed token partial: 24 mixes, sum of squares of residual_cur, padding.
 RECV = 28
 TILE = 24
-MAX_DECODE_WAVE_TOKENS = CLUSTERS * TILE
 MAX_TOKENS = 1 << 20
-# 9 bucketed tile sizes keep 1-wave Decode spread across all 14 clusters (<=336)
-# while tile=24 also covers multi-wave PrefillGraph batches via dynamic sym_int.
+# 9 bucketed tile sizes keep 1-wave Decode spread across all resident clusters
+# (at most 24 * max_decode_wave_clusters(device), e.g. 336 on 112 SMs) while
+# tile=24 also covers multi-wave PrefillGraph batches via dynamic sym_int.
 TILES = (1, 2, 3, 4, 6, 8, 12, 16, 24)
 PREFETCH = 4
 # Measured per-tile schedules: (one 8-wide chunk per pass, L2 weight prefetch).
@@ -631,6 +631,10 @@ class MhcBoundaryKernel:
             post_mult,
             norm_eps,
         ).launch(
+            # Deadlock-free launch: each CLUSTER=16 CTA cluster reduces solely
+            # inside cluster DSMEM for its own disjoint token tile and never
+            # waits on another cluster (monokernel deadlock rule), so multi-wave
+            # launches remain safe at any SM count.
             grid=[tiles * CLUSTER, 1, 1],
             block=[THREADS, 1, 1],
             cluster=[CLUSTER, 1, 1],
@@ -1103,9 +1107,7 @@ def prepare_boundary_weight(fn: torch.Tensor) -> torch.Tensor:
         raise ValueError("prepare_boundary_weight width must be divisible by 4")
     hidden = fn.shape[1] // MULT
     if not MhcBoundaryKernel.supports(hidden, MULT, TILE):
-        raise ValueError(
-            f"Unsupported hidden={hidden} for mhc_boundary weight packing"
-        )
+        raise ValueError(f"Unsupported hidden={hidden} for mhc_boundary weight packing")
     hidden_slice = hidden // CLUSTER
     bits = fn.contiguous().view(torch.int32)
     rounded = ((bits + 0x1000) & -0x2000).view(torch.float32)
@@ -1133,11 +1135,28 @@ def prepare_boundary_weight(fn: torch.Tensor) -> torch.Tensor:
     )
 
 
-def boundary_tile(tokens: int) -> int:
-    """Return the token tile for ``tokens`` (1-wave for ``<=336``, ``TILE`` above)."""
-    if tokens > MAX_DECODE_WAVE_TOKENS:
+@functools.lru_cache(maxsize=16)
+def max_decode_wave_clusters(device: torch.device | str | int) -> int:
+    """Return clusters fitting concurrently in one wave at 2 CTAs per SM."""
+    if isinstance(device, int):
+        idx = device
+    else:
+        dev = torch.device(device)
+        idx = dev.index if dev.index is not None else torch.cuda.current_device()
+    sm_count = torch.cuda.get_device_properties(idx).multi_processor_count
+    return max(1, (2 * sm_count) // CLUSTER)
+
+
+def max_decode_wave_tokens(device: torch.device | str | int) -> int:
+    """Maximum token count fitting in one resident cluster wave on ``device``."""
+    return max_decode_wave_clusters(device) * TILE
+
+
+def boundary_tile(tokens: int, *, clusters: int) -> int:
+    """Return the token tile for ``tokens`` (1-wave within ``clusters * TILE``)."""
+    if tokens > clusters * TILE:
         return TILE
-    return next(tile for tile in TILES if tile * CLUSTERS >= tokens)
+    return next(tile for tile in TILES if tile * clusters >= tokens)
 
 
 def _mat(dtype, *shape):
@@ -1217,12 +1236,7 @@ def boundary_inputs_eligible(
     norm_weight: torch.Tensor,
 ) -> bool:
     """Return True when all tensor shapes, alignments, and dims fit ``mhc_boundary``."""
-    if (
-        not x.is_cuda
-        or x.ndim != 2
-        or residual.ndim != 3
-        or sinkhorn_iters < 1
-    ):
+    if not x.is_cuda or x.ndim != 2 or residual.ndim != 3 or sinkhorn_iters < 1:
         return False
     tokens, hidden = x.shape
     if not 0 < tokens <= MAX_TOKENS:
@@ -1294,7 +1308,7 @@ def mhc_shifted_post_pre_boundary(
         device_index,
         hidden,
         int(num_sinkhorn_iters),
-        boundary_tile(tokens),
+        boundary_tile(tokens, clusters=max_decode_wave_clusters(device_index)),
         use_pdl,
     )
     kernel = _KERNELS.get(key)

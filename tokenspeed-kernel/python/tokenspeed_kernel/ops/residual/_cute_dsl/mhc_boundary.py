@@ -50,6 +50,17 @@ def _blackwell_cute_dsl_available() -> bool:
     )
 
 
+def mhc_boundary_max_decode_tokens_cute_dsl(device: torch.device | str | int) -> int:
+    """Return max tokens fitting one 16-CTA cluster wave on ``device`` (or 0)."""
+    if not _blackwell_cute_dsl_available():
+        return 0
+    from tokenspeed_kernel.thirdparty.cute_dsl.mhc_boundary import (
+        max_decode_wave_tokens,
+    )
+
+    return max_decode_wave_tokens(device)
+
+
 def prepare_boundary_weight_cute_dsl(weight: torch.Tensor) -> torch.Tensor | None:
     """Pack ``[24, 4 * hidden]`` FP32 weights for Blackwell ``mhc_boundary``, or None."""
     if not _blackwell_cute_dsl_available() or not weight.is_cuda:

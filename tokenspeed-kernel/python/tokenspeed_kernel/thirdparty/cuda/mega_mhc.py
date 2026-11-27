@@ -36,6 +36,9 @@ def _api():
     return deep_gemm
 
 
+_MIN_CAPTURE_SAFE_DEEPGEMM_VERSION = "2.8.2"
+
+
 @lru_cache(maxsize=1)
 def is_mega_mhc_available() -> bool:
     try:
@@ -43,6 +46,25 @@ def is_mega_mhc_available() -> bool:
     except (ImportError, OSError):
         return False
     return True
+
+
+def is_mega_mhc_capture_safe() -> bool:
+    """Return True when DeepGEMM exposes epoch split barriers (>= 2.8.2)."""
+    if not is_mega_mhc_available():
+        return False
+    try:
+        mod = _api()
+    except (ImportError, OSError):
+        return False
+    raw = getattr(mod, "__version__", None)
+    if not raw:
+        return False
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return Version(str(raw)) >= Version(_MIN_CAPTURE_SAFE_DEEPGEMM_VERSION)
+    except InvalidVersion:
+        return False
 
 
 def _launch(
