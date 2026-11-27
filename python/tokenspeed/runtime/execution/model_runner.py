@@ -663,6 +663,9 @@ class ModelRunner:
                     LoadConfig(
                         load_format=load_format,
                         download_dir=self.server_args.download_dir,
+                        model_loader_extra_config=(
+                            self.server_args.model_loader_extra_config
+                        ),
                         ext_yaml=self.server_args.ext_yaml,
                         weight_loader_prefetch_checkpoints=(
                             self.server_args.weight_loader_prefetch_checkpoints

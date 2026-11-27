@@ -783,3 +783,201 @@ fn peer_prediction_error_pairs_samples_and_omits_missing_predictions() {
         );
     }
 }
+
+#[test]
+fn host_state_recovery_gain_is_independent_of_loaded_kv_tokens() {
+    let directory = scratch_dir("recovery-gain");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+    );
+    engine.record_prefix_hits(128, 96, 0, 0);
+    engine.record_prefix_recovery(64, 16);
+    engine.record_prefix_recovery(0, 0);
+    let Some(text) = render(&directory) else {
+        return;
+    };
+    assert!(text.contains("tokenspeed:prefix_host_gain_tokens_total{app_key=\"\",dp_rank=\"0\",model_name=\"m\"} 64.0"), "{text}");
+    assert!(text.contains("tokenspeed:prefix_unresumable_kv_tokens_total{app_key=\"\",dp_rank=\"0\",model_name=\"m\"} 16.0"), "{text}");
+}
+
+#[test]
+fn gds_totals_are_exported_once_and_watermark_can_reset_on_clear() {
+    let directory = scratch_dir("gds");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let mut engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+    );
+    let stats = ts_metrics::GdsStats {
+        evicted_units: 3,
+        retention_rejections: 2,
+        fallback_units: 4,
+        watermark: 1.25,
+        host_watermark: 2.5,
+        logical_evictions: 5,
+        host_copies_reserved: 7,
+        host_copy_rejections: 11,
+        host_clean_copies_released: 13,
+        disk_route_losses: 17,
+        disk_recoverable_units: 3,
+        checkpoint_planned: 3,
+        checkpoint_allocated: 2,
+        checkpoint_materialized: 2,
+        checkpoint_published: 1,
+        checkpoint_cancelled: 1,
+        checkpoint_extra_blocks: 4,
+        checkpoint_chunk_end_fallbacks: 1,
+        checkpoint_fresh_rejected: 1,
+        checkpoint_rejected_extra_blocks: 2,
+        checkpoint_rejected_unmeasured: 1,
+        committed_plans: 2,
+        planning_nanoseconds: 500_000_000,
+        ready_units: 7,
+        device_ready_units: 5,
+        pending_units: 2,
+        broken_units: 1,
+        dependency_points: 10,
+        dependency_ranges: 20,
+        dependency_leaves: 30,
+        ..Default::default()
+    };
+    engine.record_gds_evictions(stats);
+    engine.record_gds_evictions(stats);
+    engine.record_gds_evictions(ts_metrics::GdsStats {
+        watermark: 0.0,
+        host_watermark: 0.0,
+        ..stats
+    });
+    let Some(text) = render(&directory) else {
+        return;
+    };
+    for (outcome, count) in [
+        ("evicted_units", 3),
+        ("retention_rejections", 2),
+        ("fallback_units", 4),
+        ("logical_evictions", 5),
+        ("host_copies_reserved", 7),
+        ("host_copy_rejections", 11),
+        ("host_clean_copies_released", 13),
+        ("disk_route_losses", 17),
+        ("committed_plans", 2),
+    ] {
+        assert!(text.contains(&format!("tokenspeed:gds_outcomes_total{{app_key=\"\",dp_rank=\"0\",model_name=\"m\",outcome=\"{outcome}\"}} {count}.0")), "{text}");
+    }
+    for (event, count) in [
+        ("planned", 3),
+        ("allocated", 2),
+        ("materialized", 2),
+        ("published", 1),
+        ("cancelled", 1),
+        ("extra_blocks", 4),
+        ("chunk_end_fallbacks", 1),
+        ("fresh_rejected", 1),
+        ("rejected_extra_blocks", 2),
+        ("rejected_unmeasured", 1),
+    ] {
+        assert!(text.contains(&format!("tokenspeed:checkpoint_events_total{{app_key=\"\",dp_rank=\"0\",event=\"{event}\",model_name=\"m\"}} {count}.0")), "{text}");
+    }
+    assert!(
+        text.contains(
+            "tokenspeed:gds_plan_seconds_total{app_key=\"\",dp_rank=\"0\",model_name=\"m\"} 0.5"
+        ),
+        "{text}"
+    );
+    for (state, count) in [
+        ("ready", 7),
+        ("device_ready", 5),
+        ("pending", 2),
+        ("disk_recoverable", 3),
+        ("broken", 1),
+    ] {
+        assert!(text.contains(&format!("tokenspeed:gds_recovery_units{{app_key=\"\",dp_rank=\"0\",model_name=\"m\",state=\"{state}\"}} {count}.0")), "{text}");
+    }
+    for (kind, count) in [("points", 10), ("ranges", 20), ("leaves", 30)] {
+        assert!(text.contains(&format!("tokenspeed:gds_dependency_metadata{{app_key=\"\",dp_rank=\"0\",kind=\"{kind}\",model_name=\"m\"}} {count}.0")), "{text}");
+    }
+    assert!(
+        text.contains("tokenspeed:gds_watermark{app_key=\"\",dp_rank=\"0\",model_name=\"m\"} 0.0"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "tokenspeed:gds_host_watermark{app_key=\"\",dp_rank=\"0\",model_name=\"m\"} 0.0"
+        ),
+        "{text}"
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn physical_release_samples_distinguish_slots_parents_groups_and_tiers() {
+    let directory = scratch_dir("cache-releases");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let mut engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+    );
+    let samples = vec![
+        ts_metrics::CacheReleaseStats {
+            group_id: 0,
+            host: false,
+            child_slots: 2,
+            parents: 1,
+        },
+        ts_metrics::CacheReleaseStats {
+            group_id: 0,
+            host: true,
+            child_slots: 3,
+            parents: 2,
+        },
+        ts_metrics::CacheReleaseStats {
+            group_id: 1,
+            host: false,
+            child_slots: 1,
+            parents: 0,
+        },
+    ];
+    engine.record_cache_releases(samples.clone());
+    // A reordered sample is still the same cumulative observation.
+    engine.record_cache_releases(samples.into_iter().rev().collect());
+    let Some(text) = render(&directory) else {
+        return;
+    };
+    for (group, tier, unit, count) in [
+        (0, "device", "child_slots", 2),
+        (0, "device", "parents", 1),
+        (0, "host", "child_slots", 3),
+        (0, "host", "parents", 2),
+        (1, "device", "child_slots", 1),
+    ] {
+        assert!(text.contains(&format!("tokenspeed:cache_releases_total{{app_key=\"\",dp_rank=\"0\",group=\"{group}\",model_name=\"m\",tier=\"{tier}\",unit=\"{unit}\"}} {count}.0")), "{text}");
+    }
+    assert!(!text.contains("group=\"1\",model_name=\"m\",tier=\"device\",unit=\"parents\""));
+    std::fs::remove_dir_all(directory).unwrap();
+}

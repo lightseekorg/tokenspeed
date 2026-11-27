@@ -1175,6 +1175,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         drafter_attention_backend=None,
         dsa_index_k_format=None,
         load_format="auto",
+        download_dir=None,
         disaggregation_mode="null",
         decode_monokernel=False,
         enable_ple_hot_cache=False,

@@ -50,11 +50,16 @@ IRIS_ALL_REDUCE_MAX_BYTES = 512 << 10
 _PACKED_WORD_BYTES = 8
 _TWO_SHOT_WORLD_SIZES = (4, 8)
 _PRODUCER_TWO_SHOT_MIN_BYTES = {4: 160 << 10, 8: 96 << 10}
-_PRODUCER_DIRECT_GL_DTYPES = {
-    torch.bfloat16: gl.bfloat16,
-    torch.float16: gl.float16,
-    torch.float32: gl.float32,
-}
+# Model discovery imports this adapter on Ascend, where Gluon is unavailable.
+_PRODUCER_DIRECT_GL_DTYPES = (
+    {
+        torch.bfloat16: gl.bfloat16,
+        torch.float16: gl.float16,
+        torch.float32: gl.float32,
+    }
+    if gl is not None
+    else {}
+)
 IRIS_AR_RMSNORM_STATES: dict = {}
 
 

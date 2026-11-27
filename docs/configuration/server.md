@@ -15,7 +15,8 @@ For a compact compatibility table, see
 | `--model` | Equivalent to positional `model`. |
 | `--tokenizer` | Tokenizer path when it differs from the model path. |
 | `--tokenizer-mode` | Select tokenizer behavior. `auto` uses fast tokenizers and model-specific hooks when available. |
-| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
+| `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `runai_streamer`, `npcache`, `dummy`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. `runai_streamer` requires `runai-model-streamer>=0.16.1` and streams safetensors from local paths or object-store URIs (`gs://`, `s3://`). |
+| `--model-loader-extra-config` | Optional JSON object of loader-specific options. For `runai_streamer` (requires `runai-model-streamer>=0.16.1`, or `pip install "tokenspeed[runai]"`): `concurrency` (positive int), `memory_limit` (non-negative int bytes), `distributed` (bool), and `distributed_scope` (`"local"` or `"global"`, required when `distributed` is `true` and rejected when `false`). `"local"` sets `RUNAI_STREAMER_DIST_GLOBAL=0` (broadcast within each node); `"global"` sets `RUNAI_STREAMER_DIST_GLOBAL=1` (shard reads and broadcast across all hosts in the default NCCL process group). Distributed streaming requires CUDA and a multi-rank process group with NCCL serving CUDA, pins `RUNAI_STREAMER_DIST=1`, and streams through `cuda:<rank>` (subject to `runai-model-streamer`'s internal `2 * max_chunk` free-VRAM check). Yielded tensors are copied out of streamer staging buffers to standalone CPU storage in both distributed and non-distributed modes. |
 | `--trust-remote-code` | Allow custom model code from the model repository. |
 | `--revision` | Model branch, tag, or commit. |
 | `--download-dir` | Hugging Face download/cache directory. |
@@ -1826,6 +1827,36 @@ prompt resumes from both. The cost: a step that evicts must finish copying
 the evicted pages to the Host before its forward pass can write over them,
 so the copy adds to that step's time.
 
+For hybrid models, `--prefix-cache-evict-policy gds` with explicit
+`--prefix-cache-gds-prefill-cost D E` coordinates Device and Host logical
+retention. It requires prefix caching after role resolution; the vision-only
+`encode` role disables that cache and rejects GDS. Enabling GDS requires an
+engine whose bundled scheduler supports it. Default `lru` and disabled
+checkpoint options leave optional native fields unset for older engines;
+explicit unsupported options fail instead of being ignored.
+Under write-back it reserves necessary Host copies before releasing
+Device addresses; this may copy additional history needed for a legal Host
+suffix. Pure migration and duplicate removal do not advance logical eviction
+watermarks. Host pressure uses the same dependency contract. Under
+write-through, an optional replica may be skipped to preserve another point's
+only recovery route; sources remain pinned until ACK. See
+[hybrid recovery eviction](../design/cache-concepts.md#hybrid-recovery-eviction).
+The default `lru` policy retains the existing retention policy. With a Disk
+tier, both policies reclaim safe clean Host copies before dirty entries.
+
+GDS with Disk additionally requires `--prefix-cache-gds-disk-read-cost A B`,
+where finite `A >= 0` is cost per read block and `B > 0` is cost per aligned
+byte, in the same units as the prefill coefficients. The estimate sums unique
+blocks across cache groups; it does not model queue delay or SSD concurrency.
+Published Disk copies preserve recovery routes and lower Host placement cost;
+Disk itself keeps its existing LRU/retention policy and requires write-back L2.
+Cleaning follows current Host GDS scores, with history written before State.
+
+See the [GDS calibration tools](https://github.com/lightseekorg/tokenspeed/blob/main/test/cache_gds_calibration/README.md) for
+measuring prefill and native Disk costs, fitting `D/E` and `A/B`, and validating
+the coefficients before exporting configuration; native collection defaults to
+the eight-case `cases_quick.json` matrix.
+
 `write_back` runs on every role. On `--disaggregation-mode decode` the
 history a decode server evicted stays reusable from its Host: a later
 request's remote admission loads its Host hit, and the prefill server sends
@@ -1842,7 +1873,7 @@ Under `write_back`:
   when it releases `kv_cache`, loses what only the GPU holds. The Host pages
   that continue a prefix only the GPU held stay in Host L2: they serve hits
   again once a request recomputes that prefix on the GPU, and otherwise leave
-  only through Host LRU eviction. `/flush_cache` clears both tiers under
+  through Host pressure eviction. `/flush_cache` clears both tiers under
   either policy.
 - Not everything the GPU evicts reaches the Host: what a request releases
   itself, what nothing can resume from any more, and pages evicted together

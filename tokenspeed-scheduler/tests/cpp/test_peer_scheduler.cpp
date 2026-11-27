@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -258,9 +259,39 @@ protected:
 
 // A holder that computed the prompt itself, on full-history and hybrid group
 // sets.
-class PeerSchedulerTest : public ::testing::TestWithParam<bool>, protected PeerPair {
+struct PeerCacheScenario {
+    const char* name;
+    bool hybrid;
+    bool gds;
+    SchedulerConfig::HostWritePolicy reader_write_policy;
+};
+
+constexpr PeerCacheScenario kPeerCacheScenarios[] = {
+    {"Full", false, false, SchedulerConfig::HostWritePolicy::kWriteThrough},
+    {"Hybrid", true, false, SchedulerConfig::HostWritePolicy::kWriteThrough},
+    {"HybridGdsWriteThrough", true, true, SchedulerConfig::HostWritePolicy::kWriteThrough},
+    {"HybridGdsWriteBackReader", true, true, SchedulerConfig::HostWritePolicy::kWriteBack},
+};
+
+SchedulerConfig PeerPolicyConfig(SchedulerConfig config, const PeerCacheScenario& scenario,
+                                 SchedulerConfig::HostWritePolicy write_policy) {
+    config.host_write_policy = write_policy;
+    if (scenario.gds) {
+        config.prefix_cache_evict_policy = "gds";
+        config.prefix_cache_gds_prefill_cost = std::array{1.0, 0.5};
+    }
+    return config;
+}
+
+// The holder writes through so the H2D-before-PIN case has completed Host
+// copies. The reader exercises both policies and both landing tiers.
+class PeerSchedulerTest : public ::testing::TestWithParam<PeerCacheScenario>, protected PeerPair {
 protected:
-    PeerSchedulerTest() : PeerPair(PeerConfigFor("holder", GetParam()), PeerConfigFor("reader", GetParam())) {}
+    PeerSchedulerTest()
+        : PeerPair(PeerPolicyConfig(PeerConfigFor("holder", GetParam().hybrid), GetParam(),
+                                    SchedulerConfig::HostWritePolicy::kWriteThrough),
+                   PeerPolicyConfig(PeerConfigFor("reader", GetParam().hybrid), GetParam(),
+                                    GetParam().reader_write_policy)) {}
 
     // The holder prefills `tokens` and finishes, publishing them.
     ExecutionPlan HolderComputes(const std::vector<std::int32_t>& tokens) {
@@ -273,8 +304,8 @@ protected:
     }
 };
 
-INSTANTIATE_TEST_SUITE_P(Groups, PeerSchedulerTest, ::testing::Bool(),
-                         [](const ::testing::TestParamInfo<bool>& info) { return info.param ? "Hybrid" : "Full"; });
+INSTANTIATE_TEST_SUITE_P(Groups, PeerSchedulerTest, ::testing::ValuesIn(kPeerCacheScenarios),
+                         [](const ::testing::TestParamInfo<PeerCacheScenario>& info) { return info.param.name; });
 
 TEST_P(PeerSchedulerTest, RenewedPinRequiresExactCheckpointAndEveryOriginalBlock) {
     const auto tokens = MakeAlignedTokens(8, kP);
@@ -546,7 +577,7 @@ TEST_P(PeerSchedulerTest, AReaderLandsTheHoldersPrefixAndComputesTheRest) {
                                      [group](const PeerPage& page) { return page.group_id == group; });
     };
     EXPECT_EQ(destinations_of(0), static_cast<std::ptrdiff_t>(tokens.size() / kP)) << "every full page";
-    if (GetParam()) {
+    if (GetParam().hybrid) {
         EXPECT_EQ(destinations_of(1), 2) << "the window behind the landing's end";
         EXPECT_EQ(destinations_of(2), 1) << "the State group's live slot";
         EXPECT_TRUE(std::ranges::any_of(fetch.destinations, [](const PeerPage& page) {
@@ -999,9 +1030,13 @@ SchedulerConfig HostLandingConfigFor(const std::string& name, bool hybrid) {
     return cfg;
 }
 
-class PeerHostLandingTest : public ::testing::TestWithParam<bool>, protected PeerPair {
+class PeerHostLandingTest : public ::testing::TestWithParam<PeerCacheScenario>, protected PeerPair {
 protected:
-    PeerHostLandingTest() : PeerPair(PeerConfigFor("holder", GetParam()), HostLandingConfigFor("reader", GetParam())) {}
+    PeerHostLandingTest()
+        : PeerPair(PeerPolicyConfig(PeerConfigFor("holder", GetParam().hybrid), GetParam(),
+                                    SchedulerConfig::HostWritePolicy::kWriteThrough),
+                   PeerPolicyConfig(HostLandingConfigFor("reader", GetParam().hybrid), GetParam(),
+                                    GetParam().reader_write_policy)) {}
 
     void HolderComputes(const std::vector<std::int32_t>& tokens) {
         holder_.SubmitRequests({RequestSpec{.request_id = "h", .tokens = tokens, .max_new_tokens = 1}});
@@ -1024,8 +1059,8 @@ protected:
     }
 };
 
-INSTANTIATE_TEST_SUITE_P(Groups, PeerHostLandingTest, ::testing::Bool(),
-                         [](const ::testing::TestParamInfo<bool>& info) { return info.param ? "Hybrid" : "Full"; });
+INSTANTIATE_TEST_SUITE_P(Groups, PeerHostLandingTest, ::testing::ValuesIn(kPeerCacheScenarios),
+                         [](const ::testing::TestParamInfo<PeerCacheScenario>& info) { return info.param.name; });
 
 TEST_P(PeerHostLandingTest, ALandingIntoHostIsAdmittedAsAHostHit) {
     const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
@@ -1042,7 +1077,7 @@ TEST_P(PeerHostLandingTest, ALandingIntoHostIsAdmittedAsAHostHit) {
                                      [group](const PeerPage& page) { return page.group_id == group; });
     };
     EXPECT_EQ(destinations_of(0), static_cast<std::ptrdiff_t>(tokens.size() / kP)) << "every full page";
-    if (GetParam()) {
+    if (GetParam().hybrid) {
         EXPECT_EQ(destinations_of(1), 2) << "the window behind the landing's end";
         EXPECT_TRUE(std::ranges::any_of(fetch.destinations, [](const PeerPage& page) {
             return page.group_id == 2 && page.slot == kPeerStateSlot;

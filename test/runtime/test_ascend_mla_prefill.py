@@ -640,6 +640,13 @@ def test_unsupported_mla_cache_keeps_prefix_history_without_transport(
     monkeypatch.delenv("TOKENSPEED_DSA_CP_LIBRARY", raising=False)
     pool, backend = _prefill_cache_and_backend(monkeypatch)
     backend.set_cache_pool(pool)
+    backend.configure_runtime(
+        block_granularity=128,
+        virtual_block_count=pool.arena.runtime_contract.virtual_block_counts[
+            "full_attention"
+        ],
+        shard_count=1,
+    )
     assert backend.preallocate_prefill_workspace() == 0
     rows = pool.get_key_buffer(0).view(-1, 576)
     rows[128:255].fill_(7)
@@ -689,7 +696,7 @@ def test_mla_backend_reuses_workspace_after_consumption(monkeypatch, tmp_path):
         null_rows=128,
         history_capacity=8192,
         degree=1,
-        has_index=True,
+        has_index=False,
     )
     pool, backend = _prefill_cache_and_backend(monkeypatch)
     manager = groups.ProcessGroupManager()

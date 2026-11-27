@@ -72,6 +72,9 @@ def _scheduler(ts, make_config):
     ]
     return ts.Scheduler(
         make_config(
+            prefix_cache_evict_policy="lru",
+            prefix_cache_gds_prefill_cost=None,
+            prefix_cache_gds_disk_block_costs=(),
             num_device_pages=65,
             max_scheduled_tokens=256,
             max_batch_size=4,

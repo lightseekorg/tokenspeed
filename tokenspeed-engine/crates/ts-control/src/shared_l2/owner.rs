@@ -193,34 +193,41 @@ impl Owner {
         let OwnerSocket {
             runtime, socket, ..
         } = socket;
-        let mut next_sweep = Instant::now() + self.client_timeout / 4;
-        while !stop.load(Ordering::Relaxed) {
-            match runtime.block_on(async { tokio::time::timeout(SOCKET_POLL, socket.recv()).await })
-            {
-                Ok(Ok(request)) => {
-                    // The envelope (the identity, then a REQ's request id and
-                    // empty delimiter or a rank's correlation frame) goes
-                    // back unchanged.
-                    let mut frames = request.into_vec();
-                    let payload = frames.pop().expect("a message has frames");
-                    frames.push(Bytes::from(self.handle(payload, Instant::now())));
-                    let reply = ZmqMessage::try_from(frames).expect("a message has frames");
-                    // A client that left gets no reply; the others are
-                    // served on.
-                    if let Err(error) = runtime.block_on(socket.send(reply)) {
-                        tracing::warn!(%error, "a shared L2 reply was not sent");
+        // One `block_on` for the whole loop: a multi-megabyte request spends
+        // tokio's cooperative budget, which defers the peer's wake until the
+        // runtime parks, and a per-message `block_on` that returns first loses
+        // that wake, so the connection would never be read again.
+        runtime.block_on(async {
+            let mut next_sweep = Instant::now() + self.client_timeout / 4;
+            while !stop.load(Ordering::Relaxed) {
+                match tokio::time::timeout(SOCKET_POLL, socket.recv()).await {
+                    Ok(Ok(request)) => {
+                        // The envelope (the identity, then a REQ's request id
+                        // and empty delimiter or a rank's correlation frame)
+                        // goes back unchanged.
+                        let mut frames = request.into_vec();
+                        let payload = frames.pop().expect("a message has frames");
+                        frames.push(Bytes::from(self.handle(payload, Instant::now())));
+                        let reply = ZmqMessage::try_from(frames).expect("a message has frames");
+                        // A client that left gets no reply; the others are
+                        // served on.
+                        if let Err(error) = socket.send(reply).await {
+                            tracing::warn!(%error, "a shared L2 reply was not sent");
+                        }
                     }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "the shared L2 owner's socket failed")
+                    }
+                    // No request within the wait.
+                    Err(_) => {}
                 }
-                Ok(Err(error)) => tracing::warn!(%error, "the shared L2 owner's socket failed"),
-                // No request within the wait.
-                Err(_) => {}
+                let now = Instant::now();
+                if now >= next_sweep {
+                    next_sweep = now + self.client_timeout / 4;
+                    self.disconnect_timed_out_clients(now);
+                }
             }
-            let now = Instant::now();
-            if now >= next_sweep {
-                next_sweep = now + self.client_timeout / 4;
-                self.disconnect_timed_out_clients(now);
-            }
-        }
+        });
     }
 
     /// Drop every client last heard more than the client timeout before

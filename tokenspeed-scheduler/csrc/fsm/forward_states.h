@@ -48,6 +48,13 @@ enum class PrefillSource { kLocal, kRemote, kPeer };
 // A scheduling attempt advances this in place and StagedCacheProgress
 // (scheduler/operations/progress.h) undoes the advance when the attempt
 // fails: a field an attempt changes must be restored there.
+struct MaterializedCheckpoint {
+    std::int32_t tokens;
+    std::int32_t computed_tokens;
+    std::vector<CacheBlockRef> blocks;
+    std::shared_ptr<CheckpointLifecycle> lifecycle;
+};
+
 struct CacheProgress {
     // One source of truth for both the next hash-chain seed and the cumulative
     // history needed to publish a resumable boundary across chunk edges.
@@ -69,6 +76,14 @@ struct CacheProgress {
     // (AdvanceRequestProgress); zero tokens means none is pending.
     std::int32_t state_checkpoint_tokens{0};
     std::vector<CacheBlockRef> state_checkpoint_blocks;
+    std::shared_ptr<CheckpointLifecycle> checkpoint_lifecycle;
+    std::optional<MaterializedCheckpoint> TakeMaterializedCheckpoint(std::int32_t computed_tokens) {
+        if (state_checkpoint_tokens == 0 || computed_tokens < state_checkpoint_tokens) return std::nullopt;
+        if (checkpoint_lifecycle) checkpoint_lifecycle->Materialize();
+        return MaterializedCheckpoint{std::exchange(state_checkpoint_tokens, 0), computed_tokens,
+                                      std::exchange(state_checkpoint_blocks, {}),
+                                      std::exchange(checkpoint_lifecycle, {})};
+    }
     // The blocks of the checkpoint the latest publication point published,
     // held until the next one so the publication's spans stay valid; the
     // index keeps them cached, unless another request published the
@@ -76,6 +91,7 @@ struct CacheProgress {
     // retraction drops them once its publication is applied (a Retracted
     // request holds no Device block).
     std::vector<CacheBlockRef> published_state_checkpoint_blocks;
+    std::shared_ptr<CheckpointLifecycle> published_checkpoint_lifecycle;
     // The boundary of the in-forward State checkpoint the request published
     // -- from its block, or from the live slot of a chunk that ended there --
     // zero without one. Kept after the blocks are let go: the finish reads it

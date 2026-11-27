@@ -115,14 +115,13 @@ def _run_launcher(workers, server_args, path, logging_signal, writer):
     """Run the headless launcher with its ranks replaced by ``workers``
     (``(target, args)`` each), with ``path`` first on ``sys.path``, and
     report how it ended and what of them it left running."""
-    # Multiprocessing and the standalone metrics relay both need the probe.
-    sys.path[:0] = path
+    # Spawned processes and standalone relay subprocesses inherit this path.
     if path:
-        pythonpath = [*path]
-        inherited = os.environ.get("PYTHONPATH")
-        if inherited:
-            pythonpath.append(inherited)
-        os.environ["PYTHONPATH"] = os.pathsep.join(pythonpath)
+        sys.path[:0] = path
+        existing = os.environ.get("PYTHONPATH")
+        os.environ["PYTHONPATH"] = os.pathsep.join(
+            [*path, existing] if existing else path
+        )
     from tokenspeed.runtime.entrypoints import engine as engine_module
     from tokenspeed.runtime.utils.server_args import ServerArgs
 

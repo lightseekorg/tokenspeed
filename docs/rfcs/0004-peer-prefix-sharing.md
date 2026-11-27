@@ -596,3 +596,12 @@ from arrival to collection by the control loop. Device landings with complete
 timestamps also expose `grant_to_writable`, `writable_to_terminal`, and
 `terminal_to_scheduler` through the stage histogram. The writable-to-terminal
 interval includes the protocol work that follows the destination fence.
+
+### Paired draft checkpoints
+
+A recipe can opt a DFLASH sliding-window draft into the sharded Device protocol.
+Set the same explicit `--weight-version` on the reader and holder. The version
+identifies the immutable target and draft pair and must change when either
+checkpoint changes. Register the draft fields alongside the target fields.
+An unsharded sliding-window group retains the sink and the window at the
+landing boundary. Its per-rank K and V fields can still be head-partitioned.
