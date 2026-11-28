@@ -261,7 +261,6 @@ def _ple_page_scatter_kernel(
 def _ple_host_gather_rows(
     table_address,
     ids_ptr,
-    scale_value,
     scale_ptr,
     out_ptr,
     head_dim,
@@ -287,7 +286,9 @@ def _ple_host_gather_rows(
 
     The dequant scale mirrors how the table was quantized, independent of
     offloading. An offline FP8 checkpoint publishes one whole-table factor, so
-    ``ROW_SCALE`` is false and the scalar ``scale_value`` is used. A
+    ``ROW_SCALE`` is false and the factor is read from ``scale_ptr[0]`` (a
+    device value, so a weight update that rescales the table reaches graph
+    replays). A
     compute-dtype checkpoint is quantized online, one row at a time, so
     ``ROW_SCALE`` is true and each row's factor is read from ``scale_ptr`` at
     its local id (folded row-0 for shard-masked rows is harmless: the output
@@ -323,7 +324,7 @@ def _ple_host_gather_rows(
                 * tl.load(scale_ptr + local_id, mask=in_range, other=0.0)[:, None]
             )
         else:
-            values = values * scale_value
+            values = values * tl.load(scale_ptr)
     destination = (
         tl.load(destination_ptr + row, row < rows, other=0).to(tl.int64)
         if SORTED
@@ -340,7 +341,6 @@ def _ple_host_gather_rows(
 def _ple_host_gather_kernel(
     table_address,
     ids_ptr,
-    scale_value,
     scale_ptr,
     out_ptr,
     head_dim,
@@ -365,7 +365,6 @@ def _ple_host_gather_kernel(
     _ple_host_gather_rows(
         table_address,
         ids_ptr,
-        scale_value,
         scale_ptr,
         out_ptr,
         head_dim,
@@ -387,7 +386,6 @@ def _ple_host_gather_kernel(
 def _ple_host_gather_persistent_kernel(
     table_address,
     ids_ptr,
-    scale_value,
     scale_ptr,
     out_ptr,
     head_dim,
@@ -418,7 +416,6 @@ def _ple_host_gather_persistent_kernel(
         _ple_host_gather_rows(
             table_address,
             ids_ptr,
-            scale_value,
             scale_ptr,
             out_ptr,
             head_dim,

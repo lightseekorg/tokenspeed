@@ -507,5 +507,74 @@ def test_device_table_scale_dequantizes_the_device_lookup():
     lookup.load_shard(table, 0, 1, prescanned=False)
     ids = torch.tensor([[1, 6], [7, 0]], device="cuda")
     weight = lookup.ngram_embedding.weight.data
-    expected = (weight[ids].float() * lookup.device_table_scale).bfloat16()
+    scale = lookup.device_table_scale
+    assert scale.dtype == torch.float32 and scale.shape == (1,)
+    expected = (weight[ids].float() * scale).bfloat16()
     assert torch.equal(lookup.gather_device(ids), expected.flatten(-2))
+
+
+@pytest.mark.parametrize("offload", [False, True], ids=["device", "host"])
+def test_scale_updates_reach_a_captured_fp8_lookup(offload):
+    """A weight update after a CUDA graph captured an FP8 table lookup
+    rewrites the rows in place and changes the scale, by a new checkpoint
+    scale (``load_scale``) or by online re-quantization
+    (``set_online_scale``). The scale tensor keeps its address, and the
+    replay dequantizes the new rows with the new scale."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    vocab, heads, dim, tokens = 64, 2, 16, 5
+    lookup = ple_lookup.PLELookup(
+        _mapping_class()(rank=0, world_size=1),
+        vocab_size=vocab,
+        ngram_heads=heads,
+        head_dim=dim,
+        storage_dtype=torch.float8_e4m3fn,
+        output_dtype=torch.bfloat16,
+        offload=offload,
+        table_layout="global_sharded",
+        enable_hot_cache=False,
+        prefix="",
+    )
+    if not offload:
+        lookup = lookup.cuda()
+    generator = torch.Generator().manual_seed(11)
+
+    def rows(spread: float) -> torch.Tensor:
+        return torch.randn(vocab, dim, generator=generator) * spread
+
+    lookup.load_shard(rows(4.0).to(torch.float8_e4m3fn), 0, 1, prescanned=False)
+    lookup.load_scale(torch.tensor(0.125))
+    scale = lookup.device_table_scale
+    address = scale.data_ptr()
+    ids = torch.randint(0, vocab, (tokens, heads), generator=generator).cuda()
+    layout = lookup.make_layout(None, tokens)
+
+    def run() -> torch.Tensor:
+        return lookup.finish(lookup.start(ids, layout))
+
+    def expected(table_scale: float) -> torch.Tensor:
+        table = lookup.ngram_embedding.weight.detach().float().cpu()
+        return (table[ids.cpu()] * table_scale).bfloat16().flatten(1)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        result = run()
+    graph.replay()
+    torch.testing.assert_close(result.cpu(), expected(0.125), rtol=0, atol=0)
+
+    # A new FP8 checkpoint: raw rows, then their scale tensor.
+    lookup.load_shard(rows(8.0).to(torch.float8_e4m3fn), 0, 1, prescanned=False)
+    lookup.load_scale(torch.tensor(0.03125))
+    graph.replay()
+    torch.testing.assert_close(result.cpu(), expected(0.03125), rtol=0, atol=0)
+
+    # A BF16 checkpoint, quantized online with a scale from its maximum.
+    source = rows(3.0).bfloat16()
+    lookup.load_shard(source, 0, 1, prescanned=False)
+    online = (source.float().abs().max() / 448).bfloat16().item()
+    assert online not in (0.125, 0.03125)
+    graph.replay()
+    torch.testing.assert_close(result.cpu(), expected(online), rtol=0, atol=0)
+    assert lookup.device_table_scale is scale
+    assert scale.data_ptr() == address

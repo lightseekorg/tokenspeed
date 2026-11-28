@@ -55,6 +55,8 @@ from tokenspeed.runtime.models.monokernel import (  # noqa: E402
 )
 from tokenspeed.runtime.models.qwen4_exp import (  # noqa: E402
     Qwen4ExpAttentionDecoderLayer,
+    Qwen4ExpForCausalLM,
+    Qwen4ExpForConditionalGeneration,
     Qwen4ExpLinearDecoderLayer,
     Qwen4ExpModel,
     Qwen4ExpMonokernelAttentionDecoderLayer,
@@ -285,6 +287,24 @@ def test_packing_fails_and_names_every_unserved_layer() -> None:
         "_Backbone", {0: [ATTENTION_TP], 2: [ATTENTION_TP, NOT_MXFP4]}
     )
     assert model.monokernel_state is None
+
+
+@pytest.mark.parametrize(
+    "entry", [Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration]
+)
+def test_a_packed_model_refuses_live_weight_updates(entry) -> None:
+    """Packing copies weights into the kernels' layouts, which a weight
+    update would not rewrite: a packed model refuses to open the session. An
+    unpacked one opens it."""
+    owner = entry.__new__(entry)
+    torch.nn.Module.__init__(owner)
+    owner.model = _Backbone([_PackingDelta(0), _PackingQSA(1)])
+    owner.begin_weight_update()
+    owner.abort_weight_update()
+    enable_decode_monokernels(owner.model)
+    with pytest.raises(RuntimeError, match="--decode-monokernel"):
+        owner.begin_weight_update()
+    assert not owner._weight_update_active
 
 
 def test_a_monokernel_layer_runs_other_forwards_with_its_regular_code() -> None:

@@ -328,9 +328,11 @@ class PleWeights:
     norm_conv: torch.Tensor
     conv_w: torch.Tensor  # BF16 [4 * HIDDEN, 4], depthwise conv
     # n-gram embedding table [rows, 160]: BF16, or FP8 E4M3 whose rows are
-    # value * table_scale
+    # value * table_scale[0]
     table: torch.Tensor
-    table_scale: float | None  # the FP8 table's scale; None for BF16
+    # The FP8 table's FP32 [1] scale, kept by reference (the kernel reads it
+    # in place); None for BF16
+    table_scale: torch.Tensor | None
     multipliers: torch.Tensor  # int64 [3], the n-gram hash multipliers
     sizes: torch.Tensor  # int64 [16], per-head vocabulary sizes
     offsets: torch.Tensor  # int64 [16], per-head table offsets
@@ -345,8 +347,8 @@ class PleWeights:
             self.norm_conv,
             self.conv_w,
             self.table,
-            # A BF16 table reads no scale (any float).
-            1.0 if self.table_scale is None else self.table_scale,
+            # A BF16 table reads no scale (any tensor).
+            self.table if self.table_scale is None else self.table_scale,
             self.multipliers,
             self.sizes,
             self.offsets,
@@ -362,7 +364,7 @@ def pack_ple(
     norm_conv: torch.Tensor,
     conv_w: torch.Tensor,
     table: torch.Tensor,
-    table_scale: float | None,
+    table_scale: torch.Tensor | None,
     multipliers: torch.Tensor,
     sizes: torch.Tensor,
     offsets: torch.Tensor,
@@ -380,8 +382,11 @@ def pack_ple(
             unsharded): BF16, or FP8 E4M3 (``torch.float8_e4m3fn``) that
             the kernel dequantizes as TokenSpeed's device lookup does,
             ``bf16(float(row) * table_scale)``.
-        table_scale: The FP8 table's scalar scale, exactly when ``table`` is
-            FP8; None for a BF16 table.
+        table_scale: The FP8 table's scale as an FP32 one-element device
+            tensor, exactly when ``table`` is FP8; None for a BF16 table.
+            Like ``table``, it is kept by reference and read by every
+            launch, so writing either in place (a weight update) reaches
+            launches already captured in CUDA graphs.
         multipliers, sizes, offsets: The n-gram hash parameters (int64 ``[3]``,
             ``[16]``, ``[16]``).
         eos: The EOS token id.
@@ -409,6 +414,16 @@ def pack_ple(
         )
     if (table.dtype == torch.float8_e4m3fn) != (table_scale is not None):
         raise ValueError("table_scale must be given exactly for an FP8 table")
+    if table_scale is not None and (
+        table_scale.numel() != 1
+        or table_scale.dtype != torch.float32
+        or table_scale.device != table.device
+    ):
+        raise ValueError(
+            "table_scale must be a one-element FP32 tensor on the table's "
+            f"device, got {table_scale.dtype} {tuple(table_scale.shape)} on "
+            f"{table_scale.device}"
+        )
 
     def bf16(t):
         return t.to(torch.bfloat16).contiguous()
@@ -420,7 +435,7 @@ def pack_ple(
         norm_conv=bf16(norm_conv),
         conv_w=bf16(conv_w.reshape(width, 4)),
         table=table,
-        table_scale=None if table_scale is None else float(table_scale),
+        table_scale=table_scale,
         multipliers=multipliers.to(torch.int64).contiguous(),
         sizes=sizes.to(torch.int64).contiguous(),
         offsets=offsets.to(torch.int64).contiguous(),

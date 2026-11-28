@@ -26,7 +26,7 @@ import functools
 
 import pytest
 import torch
-from utils import is_cdna4
+from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -48,6 +48,9 @@ from tokenspeed_kernel.ops.model.qwen4_exp.monokernel import (  # noqa: E402
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (  # noqa: E402
     preprocess_n16_mxfp4_weights,
+)
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.qwen4_exp import (  # noqa: E402
+    layer as qwen4_exp_layer,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
     dequantize_mxfp4,
@@ -621,10 +624,118 @@ def test_fp8_ple_table_equals_its_dequantized_bf16_table(rows):
         torch.cuda.synchronize()
         return state
 
-    quantized = run(fp8, scale, 3)
+    quantized = run(fp8, torch.tensor([scale], device=dev), 3)
     reference = run(dequantized, None, 4)
     for name in reference:
         assert torch.equal(quantized[name], reference[name]), name
+
+
+def test_fp8_ple_table_and_scale_written_in_place_reach_a_captured_launch():
+    """Packing keeps the FP8 table and its FP32 [1] scale tensor by
+    reference, and the launch loads the scale on device. A weight update that
+    rewrites both in place after a CUDA graph captured the launch therefore
+    reaches the replay: it computes what a launch with the BF16 table of the
+    new values does, and neither it nor an eager launch recompiles."""
+    g = torch.Generator().manual_seed(37)
+    dev = "cuda"
+    rows = 4
+    tensors = _delta_tensors(g, True)
+    old_scale, new_scale = 0.0234375, 0.01171875
+    table = (tensors["ple"]["table"].float() / old_scale).to(torch.float8_e4m3fn)
+    scale = torch.tensor([old_scale], device=dev)
+    new_values = (torch.randn(table.shape, generator=g) * 0.4).cuda()
+    new_table = (new_values / new_scale).to(torch.float8_e4m3fn)
+    dequantized = (new_table.float() * new_scale).bfloat16()
+    page_in = torch.arange(rows, dtype=torch.int32, device=dev) * 2 + 1
+    page_out = page_in + 1
+    pages = 2 * rows + 1
+    h = (torch.randn(rows, WIDTH, generator=g) * 3).bfloat16().cuda()
+    initial = {
+        "conv": torch.randn(pages, QKV, 3, generator=g).bfloat16().cuda(),
+        "ssm": (torch.randn(pages, 48, HEAD, HEAD, generator=g) * 0.1).cuda(),
+        "ple_state": torch.randn(pages, WIDTH, 9, generator=g).bfloat16().cuda(),
+        "context": torch.randint(10, 9000, (pages, 2), generator=g).cuda(),
+        "h_out": torch.zeros(rows, WIDTH, dtype=torch.bfloat16).cuda(),
+    }
+    tokens = torch.randint(10, 9000, (rows,), generator=g).cuda()
+
+    def pack(ple_table, table_scale):
+        ple = {**tensors["ple"], "table": ple_table, "table_scale": table_scale}
+        return prepare_qwen4_exp_delta_layer(
+            max_rows=rows, tensors={**tensors, "ple": ple}, dense_tiled=False
+        )
+
+    def launch(fused, state, step):
+        qwen4_exp_delta_layer_decode(
+            fused,
+            h,
+            state["h_out"],
+            chain=1,
+            conv_state=state["conv"],
+            ssm_state=state["ssm"],
+            state_in=page_in,
+            state_out=page_out,
+            conv_out=state["conv"],
+            conv_out_rows=page_out,
+            replay=None,
+            scratch=scratch,
+            step=step,
+            warm=None,
+            layer_index=0,
+            ple={
+                "token": tokens,
+                "context": state["context"],
+                "conv_state": state["ple_state"],
+                "page_in": page_in,
+                "page_out": page_out,
+                "context_out": state["context"],
+                "conv_out": state["ple_state"],
+            },
+        )
+
+    def reset(state):
+        for name, value in initial.items():
+            state[name].copy_(value)
+
+    quantized = pack(table, scale)
+    reference = pack(dequantized, None)
+    scratch = torch.zeros(
+        max(quantized.scratch_pairs, reference.scratch_pairs),
+        dtype=torch.int64,
+        device=dev,
+    )
+    # The step changes between launches that share the scratch.
+    step = torch.full((1,), 3, dtype=torch.int32, device=dev)
+    state = {name: value.clone() for name, value in initial.items()}
+    expected = {name: value.clone() for name, value in initial.items()}
+    # Compile both specializations eagerly, then capture the FP8 launch.
+    launch(reference, expected, step)
+    step.fill_(4)
+    launch(quantized, state, step)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch(quantized, state, step)
+    kernel = qwen4_exp_layer.gluon_qwen4_exp_delta_layer_gfx950
+    with assert_no_triton_compile(kernel):
+        # The weight update: new rows and a new scale, both in place.
+        table.copy_(new_table)
+        scale.fill_(new_scale)
+        reset(state)
+        step.fill_(6)
+        graph.replay()
+        reset(expected)
+        step.fill_(7)
+        launch(reference, expected, step)
+        torch.cuda.synchronize()
+        for name in expected:
+            assert torch.equal(state[name], expected[name]), name
+        reset(state)
+        step.fill_(8)
+        launch(quantized, state, step)
+        torch.cuda.synchronize()
+        for name in expected:
+            assert torch.equal(state[name], expected[name]), name
 
 
 @pytest.mark.parametrize("with_ple", [False, True])

@@ -68,7 +68,7 @@ def ple_host_gather(
     out: torch.Tensor,
     vocab_start: int,
     vocab_end: int,
-    scale: float | None,
+    scale: torch.Tensor | None,
     row_scale: torch.Tensor | None,
     *,
     table_shards: int,
@@ -85,8 +85,10 @@ def ple_host_gather(
             to ``[ids.numel(), head_dim]``. Rows outside this shard are zeroed.
         vocab_start: Inclusive global ID of the first local table row.
         vocab_end: Exclusive global ID after the last local table row.
-        scale: Per-tensor dequantization factor for an offline FP8 table, or
-            ``None`` when using per-row scaling or compute-dtype storage.
+        scale: Per-tensor dequantization factor for an offline FP8 table, an
+            FP32 one-element device tensor that the kernel reads at run time
+            (a CUDA graph replay sees its current value), or ``None`` when
+            using per-row scaling or compute-dtype storage.
         row_scale: Device tensor with one dequantization factor per local row
             for an online-quantized FP8 table, or ``None`` for scalar scaling
             or compute-dtype storage. Unsupported with shard_ptrs.
@@ -101,6 +103,15 @@ def ple_host_gather(
 
     if shard_ptrs is not None and row_scale is not None:
         raise ValueError("row_scale is unsupported with shard_ptrs")
+    if scale is not None and row_scale is not None:
+        raise ValueError("pass either scale or row_scale, not both")
+    if scale is not None and (
+        scale.numel() != 1 or scale.dtype != torch.float32 or scale.device != out.device
+    ):
+        raise ValueError(
+            "scale must be a one-element FP32 tensor on the output's device, got "
+            f"{scale.dtype} {tuple(scale.shape)} on {scale.device}"
+        )
     if table_shards < 1:
         raise ValueError("table_shards must be positive")
     rows = ids.numel()
@@ -108,6 +119,10 @@ def ple_host_gather(
         return out
     head_dim = out.shape[-1]
     flat_ids = ids.reshape(-1)
+    # Without a scale the kernel reads none; any pointer will do.
+    scale_ptr = (
+        row_scale if row_scale is not None else scale if scale is not None else out
+    )
     if shard_ptrs is None and table_shards == 1 and rows >= 131072:
         block_rows = 32
         sms = torch.cuda.get_device_properties(ids.device).multi_processor_count
@@ -116,8 +131,7 @@ def ple_host_gather(
         _ple_host_gather_persistent_kernel[(grid,)](
             current_platform().device_visible_data_ptr(table),
             flat_ids,
-            scale if scale is not None else 1.0,
-            row_scale if row_scale is not None else out,
+            scale_ptr,
             out.view(rows, head_dim),
             head_dim,
             vocab_start,
@@ -141,8 +155,7 @@ def ple_host_gather(
             else shard_ptrs
         ),
         flat_ids,
-        scale if scale is not None else 1.0,
-        row_scale if row_scale is not None else out,
+        scale_ptr,
         out.view(rows, head_dim),
         head_dim,
         vocab_start,

@@ -56,7 +56,9 @@ monokernel classes `Qwen4ExpMonokernelLinearDecoderLayer` and
   on the device, unsharded: BF16, or FP8 E4M3 with its scalar scale
   (`ple_embed_dtype` `float8_e4m3fn` without `ple_offload_embedding`), which
   `p1` dequantizes as TokenSpeed's device lookup does,
-  `bf16(float(value) * scale)`. The seam packs every layer once,
+  `bf16(float(value) * scale)`. The scale is the lookup's one-element FP32
+  device tensor, which `p1` loads like the table rows, so both stay
+  current in captured launches. The seam packs every layer once,
   after the weights load. Startup fails when a layer cannot be packed, and
   the error names each such layer with its reasons.
 - A layer runs its launch when the forward is a decode step of at most 8

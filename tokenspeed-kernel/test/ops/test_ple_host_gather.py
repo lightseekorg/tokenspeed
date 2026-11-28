@@ -44,7 +44,7 @@ def test_ple_host_gather_uses_device_visible_table_pointer(monkeypatch) -> None:
     args, kwargs = kernel.__getitem__.return_value.call_args
     assert args[0] == 12345
     assert args[1].shape == (2,)
-    assert args[4].shape == (2, 8)
+    assert args[3].shape == (2, 8)
     assert kwargs["IS_FP8"] is False
 
 
@@ -102,7 +102,7 @@ def test_host_gather_decode_and_prefill(head_dim, table_shards, scale_mode):
             out,
             vocab_start,
             vocab_start + 128,
-            scalar,
+            None if scalar is None else torch.tensor([scalar], device="cuda"),
             row_scale,
             table_shards=table_shards,
         )
@@ -140,7 +140,14 @@ def test_host_gather_large_table_offset(table_shards, tokens):
     out = torch.empty((ids.numel(), dim), device="cuda", dtype=torch.bfloat16)
     scale = 0.00019931793212890625
     ple.ple_host_gather(
-        table, ids, out, 0, table_rows, scale, None, table_shards=table_shards
+        table,
+        ids,
+        out,
+        0,
+        table_rows,
+        torch.tensor([scale], device="cuda"),
+        None,
+        table_shards=table_shards,
     )
     zero = torch.zeros(dim)
     expected = (
@@ -170,7 +177,15 @@ def test_peer_gather_shard_boundary_and_large_offset():
     ids = torch.tensor([-1, 0, rows - 1, rows, 2 * rows - 1, 2 * rows], device="cuda")
     out = torch.empty((ids.numel(), dim), dtype=torch.bfloat16, device="cuda")
     ple.ple_host_gather(
-        shards[0], ids, out, 0, 2 * rows, 0.5, None, table_shards=2, shard_ptrs=ptrs
+        shards[0],
+        ids,
+        out,
+        0,
+        2 * rows,
+        torch.tensor([0.5], device="cuda"),
+        None,
+        table_shards=2,
+        shard_ptrs=ptrs,
     )
     expected = torch.tensor([0, 0.5, 1, 1.5, 2, 0], dtype=out.dtype)
     torch.testing.assert_close(

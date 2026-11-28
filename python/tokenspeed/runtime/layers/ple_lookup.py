@@ -113,10 +113,11 @@ def materialize_ngram_table_on_host(
 def host_gather_ngram_rows(
     embedding: VocabParallelEmbedding,
     ids: torch.Tensor,
-    scale: float | None,
+    scale: torch.Tensor | None,
     out: torch.Tensor,
 ) -> torch.Tensor:
-    """Gather local host rows and apply the table's FP8 scale when present."""
+    """Gather local host rows and apply the table's FP8 scale (an FP32
+    ``[1]`` device tensor) when present."""
 
     return ple_host_gather(
         embedding.weight,
@@ -193,6 +194,11 @@ class PLELookup(nn.Module):
         self.embed_store_dtype = storage_dtype
         self.embed_output_dtype = output_dtype
         self.offload_embedding = offload
+        # The FP8 table's scale, held twice: a host copy for host-side math
+        # (load-time quantization, eager hot-cache lookups) and a persistent
+        # device copy for the lookups that CUDA graphs and the decode
+        # monokernel capture. Those read the device copy at run time, so a
+        # weight update that changes the scale (``_set_scale``) reaches them.
         self._checkpoint_weight_scale = 1.0
         self._gather_stream: torch.cuda.Stream | None = None
         self._host_cache: PLEHostCache | None = None
@@ -224,6 +230,13 @@ class PLELookup(nn.Module):
             torch.device("cuda", torch.cuda.current_device())
             if offload
             else self.ngram_embedding.weight.device
+        )
+        # Allocated with the weights (in the memory saver's weight region at
+        # model construction) and only ever written in place.
+        self.register_buffer(
+            "_device_scale",
+            torch.ones(1, dtype=torch.float32, device=self._compute_device),
+            persistent=False,
         )
         if enable_hot_cache:
             from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
@@ -387,7 +400,7 @@ class PLELookup(nn.Module):
         path applies afterwards is already implicit here, and the FP8 dequant
         happens inside the kernel instead of materializing an fp32 temporary.
         """
-        scale = self._checkpoint_weight_scale if self.embed_store_dtype else None
+        scale = self._device_scale if self.embed_store_dtype else None
         if self.peer_ptrs is not None:
             table = self.ngram_embedding
             return ple_host_gather(
@@ -421,29 +434,36 @@ class PLELookup(nn.Module):
         return embeddings
 
     @property
-    def device_table_scale(self) -> float | None:
-        """The scale of a device table stored in ``embed_store_dtype`` (its
-        rows dequantize as ``row.float() * scale``, see
-        :meth:`gather_device`), or None for a table in the output dtype."""
+    def device_table_scale(self) -> torch.Tensor | None:
+        """The scale of a device table stored in ``embed_store_dtype`` as an
+        FP32 ``[1]`` device tensor (its rows dequantize as
+        ``row.float() * scale``, see :meth:`gather_device`), or None for a
+        table in the output dtype. Weight updates rewrite the tensor in
+        place, so a kernel that keeps it reads the current scale."""
         if self.embed_store_dtype is None:
             return None
-        return self._checkpoint_weight_scale
+        return self._device_scale
 
     def gather_device(self, ids: torch.Tensor) -> torch.Tensor:
         """Read this rank's device table without reducing other ranks yet."""
         embeddings = self.ngram_embedding(ids, reduce_results=False)
         if self.embed_store_dtype is not None:
-            embeddings = (embeddings.float() * self._checkpoint_weight_scale).to(
+            embeddings = (embeddings.float() * self._device_scale).to(
                 self.embed_output_dtype
             )
         return embeddings.flatten(-2)
+
+    def _set_scale(self, scale: float) -> None:
+        """Store a new table scale in both copies, the device one in place."""
+        self._checkpoint_weight_scale = scale
+        self._device_scale.fill_(scale)
 
     def set_online_scale(self, local_amax: float) -> None:
         """Derive the shared BF16 scale once for the logical PLE table.
 
         Every rank of the table group must call it: the per-rank maxima are
         all-reduced into the table-wide maximum, and the resulting BF16 scale
-        is stored on the lookup as ``_checkpoint_weight_scale``.
+        becomes the table scale.
         """
         peak = torch.tensor(
             local_amax, dtype=torch.float32, device=self._compute_device
@@ -458,7 +478,7 @@ class PLELookup(nn.Module):
                 op=torch.distributed.ReduceOp.MAX,
                 group=process_group_manager.get_device_process_group(self.table_group),
             )
-        self._checkpoint_weight_scale = (peak / _PLE_FP8_MAX).to(torch.bfloat16).item()
+        self._set_scale((peak / _PLE_FP8_MAX).to(torch.bfloat16).item())
 
     @staticmethod
     def shard_amax(source: torch.Tensor) -> float:
@@ -574,4 +594,4 @@ class PLELookup(nn.Module):
                 self.ngram_embedding.weight.data.mul_(
                     scale / self._checkpoint_weight_scale
                 )
-        self._checkpoint_weight_scale = scale
+        self._set_scale(scale)

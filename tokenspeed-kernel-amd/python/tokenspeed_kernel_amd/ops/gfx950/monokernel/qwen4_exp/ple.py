@@ -101,9 +101,11 @@ class Weights:
     gc: gl.tensor  # norm_conv, the same
     conv_w: gl.tensor  # depthwise conv weight, BF16 [WIDTH, 4]
     # n-gram embedding table [rows, NGRAM_DIM]: BF16, or FP8 E4M3 whose
-    # values are row * table_scale
+    # values are row * table_scale[0]
     table: gl.tensor
-    table_scale: gl.tensor  # FP32 scale of an FP8 table (unused for BF16)
+    # FP32 [1], the FP8 table's scale, read on device so a weight update
+    # that rescales the table reaches captured launches (unread for BF16)
+    table_scale: gl.tensor
     multipliers: gl.tensor  # int64 [3], the n-gram hash multipliers
     sizes: gl.tensor  # int64 [NGRAM_HEADS], per-head vocabulary sizes
     offsets: gl.tensor  # int64 [NGRAM_HEADS], per-head table offsets
@@ -263,7 +265,8 @@ def _table_rows(weights, ids, used):
     TokenSpeed's device lookup does: ``bf16(float(value) * table_scale)``."""
     raw = gl.load(weights.table + ids, mask=used, other=0.0)
     if weights.table.dtype.element_ty != gl.bfloat16:
-        raw = (raw.to(gl.float32) * weights.table_scale).to(gl.bfloat16)
+        scale = gl.load(weights.table_scale)
+        raw = (raw.to(gl.float32) * scale).to(gl.bfloat16)
     return raw
 
 

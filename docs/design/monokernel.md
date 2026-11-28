@@ -247,7 +247,12 @@ So the post-verify commit stays the same. Tests check that a verify of
 **Kernels read weights in place where the layout allows.** Where the regular
 path's packed weights already have the tile order that the kernel's GEMV
 reads, the kernel reads them in place. The packer copies only what does not
-have that order. Each vendor README lists the layouts.
+have that order. Each vendor README lists the layouts. A live weight update
+writes only the regular path's parameters, so a model whose packer copies
+weights refuses the update instead of serving stale copies. A value that a
+weight update can change and that the kernel reads, such as a table's
+quantization scale, is a device tensor read in place, never a scalar kernel
+argument that a captured CUDA graph would freeze.
 
 ## Placement
 

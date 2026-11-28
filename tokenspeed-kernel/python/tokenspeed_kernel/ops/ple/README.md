@@ -8,7 +8,9 @@ Queries outside the shard produce zeros and leave the cache untouched. The
 cache handles eager lookups of at least 256 tokens, including prefill graph
 breaks. Sizes outside the supported int32 row-index range and smaller lookups
 use regular host gather. CUDA graph capture records regular host gather,
-and replay keeps that path. Per-row scales belong to the device-resident table
+and replay keeps that path. The regular gather reads a scalar FP8 scale from
+a one-element device tensor, so a replay sees the scale the table has now.
+Per-row scales belong to the device-resident table
 path; hot cache requires offloading and supports scalar-scaled FP8 or BF16.
 
 Explicitly enabling hot cache without offloading is an error. Initialization

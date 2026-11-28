@@ -3450,6 +3450,7 @@ def _ple_checkpoint_loader_stub(
         torch.float8_e4m3fn if store_dtype == torch.float8_e4m3fn else None
     )
     ple.lookup._checkpoint_weight_scale = 1.0
+    ple.lookup.register_buffer("_device_scale", torch.ones(1), persistent=False)
     ple.lookup._host_cache = None
     ple.lookup.offload_embedding = offload
     ple.lookup._compute_device = torch.device("cpu")
@@ -4048,9 +4049,8 @@ def _ngram_embedding_pair(
         values = rows.to(torch.float32)
         scale = (values.abs().amax() / 448.0).clamp_min(1e-12)
         payload = (values / scale).to(torch.float8_e4m3fn)
-        scale = float(scale)
-        device.lookup._checkpoint_weight_scale = scale
-        host.lookup._checkpoint_weight_scale = scale
+        device.lookup.load_scale(scale)
+        host.lookup.load_scale(scale)
     else:
         payload = rows
     device.lookup.ngram_embedding.weight.data.copy_(payload)
@@ -4073,7 +4073,16 @@ def test_ple_host_gather_shard_mask(store_fp8, scale_mode) -> None:
         else None
     )
     scalar = 0.5 if scale_mode == "scalar" else None
-    ple_host_gather(table, ids, out, 10, 14, scalar, scales, table_shards=4)
+    ple_host_gather(
+        table,
+        ids,
+        out,
+        10,
+        14,
+        None if scalar is None else torch.tensor([scalar], device="cuda"),
+        scales,
+        table_shards=4,
+    )
     expected = torch.zeros_like(out)
     for output_row, local_row in [(1, 0), (2, 3)]:
         scale = (

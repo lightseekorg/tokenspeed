@@ -415,6 +415,8 @@ class DeltaMonokernelLayer(_Qwen4ExpMonokernelLayer):
             lookup = embedding.lookup
             # The kernel gathers rows of a device table, BF16 or FP8 E4M3
             # with a scalar scale (dequantized as the device lookup does).
+            # The scale is the lookup's device tensor, which the kernel
+            # loads in place like the table.
             if (
                 lookup.offload_embedding
                 or lookup.embed_store_dtype not in (None, torch.float8_e4m3fn)

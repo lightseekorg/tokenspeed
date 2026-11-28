@@ -884,6 +884,22 @@ def load_qwen4_exp_weights(
     return loaded
 
 
+def _refuse_monokernel_weight_update(model: nn.Module) -> None:
+    """Refuse a live weight update of a backbone packed for decode monokernels.
+
+    Packing copies weights into the kernels' layouts (tiled BF16
+    projections, Gemma norm weights), and a weight update writes only the
+    checkpoint-layout parameters, so the launches would keep reading the old
+    weights. Raises before the first tensor is written.
+    """
+    if model.monokernel_state is not None:
+        raise RuntimeError(
+            "Qwen4-Exp: live weight updates are not supported with "
+            "--decode-monokernel: its packed weight copies are made once, "
+            "after loading, and a weight update does not rebuild them"
+        )
+
+
 class Qwen4ExpForCausalLM(BaseCausalLM):
     """Text-only Qwen4-Exp entry class."""
 
@@ -913,6 +929,10 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
     def post_quant_warmup(self) -> None:
         _warmup_qwen4_kernels(self.model)
         enable_decode_monokernels(self.model)
+
+    def begin_weight_update(self) -> None:
+        _refuse_monokernel_weight_update(self.model)
+        super().begin_weight_update()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -965,6 +985,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     def post_quant_warmup(self) -> None:
         _warmup_qwen4_kernels(self.model)
         enable_decode_monokernels(self.model)
+
+    def begin_weight_update(self) -> None:
+        _refuse_monokernel_weight_update(self.model)
+        super().begin_weight_update()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
