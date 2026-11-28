@@ -27,6 +27,7 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.gdn import GdnStateCheckpoints
 from tokenspeed_kernel.ops.attention.gdn._triton.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -45,9 +46,10 @@ CHUNK_SIZE = 64
         "STORE_FINAL_STATE": lambda args: args["ht"] is not None,
         "SAVE_NEW_VALUE": lambda args: args["v_new"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
+        "STORE_CHECKPOINTS": lambda args: args["checkpoint_states"] is not None,
     }
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit(do_not_specialize=["T", "checkpoint_every_chunks"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
     v,
@@ -60,6 +62,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     ht,
     cu_seqlens,
     chunk_offsets,
+    checkpoint_states,
+    checkpoint_cu_starts,
+    checkpoint_every_chunks,
     T,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -73,6 +78,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     STORE_FINAL_STATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    STORE_CHECKPOINTS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     if ENABLE_PDL:
@@ -278,6 +284,30 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_k = tl.load(p_k, boundary_check=(0, 1), padding_option="zero")
             b_h4 += tl.dot(b_k, b_v)
 
+        if STORE_CHECKPOINTS:
+            # The state after every checkpoint_every_chunks whole chunks of the
+            # sequence, FP32 K-last [rows, H, V, K] (GdnStateCheckpoints).
+            if ((i_t + 1) % checkpoint_every_chunks == 0) & ((i_t + 1) * BT <= T):
+                row = tl.load(checkpoint_cu_starts + i_n).to(tl.int64) + (
+                    (i_t + 1) // checkpoint_every_chunks - 1
+                )
+                o_ck = tl.arange(0, 64)
+                o_cv = i_v * BV + tl.arange(0, BV)
+                p_c = (
+                    checkpoint_states
+                    + (row * H + i_h) * V * K
+                    + o_cv[None, :] * K
+                    + o_ck[:, None]
+                )
+                m_c = (o_cv < V)[None, :] & (o_ck < K)[:, None]
+                tl.store(p_c, b_h1, mask=m_c)
+                if K > 64:
+                    tl.store(p_c + 64, b_h2, mask=m_c & (o_ck + 64 < K)[:, None])
+                if K > 128:
+                    tl.store(p_c + 128, b_h3, mask=m_c & (o_ck + 128 < K)[:, None])
+                if K > 192:
+                    tl.store(p_c + 192, b_h4, mask=m_c & (o_ck + 192 < K)[:, None])
+
     # epilogue
     if STORE_FINAL_STATE:
         p_ht = tl.make_block_ptr(ht, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0))
@@ -309,7 +339,10 @@ def chunk_gated_delta_rule_fwd_h(
     output_final_state: bool = False,
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
+    state_checkpoints: GdnStateCheckpoints | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Chunk recurrence; ``state_checkpoints`` also receives the FP32 state
+    after every ``every_n_tokens`` whole tokens of each sequence."""
     enable_pdl = pdl_enabled()
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
@@ -336,6 +369,18 @@ def chunk_gated_delta_rule_fwd_h(
 
     v_new = torch.empty_like(u) if save_new_value else None
 
+    if state_checkpoints is not None and (
+        state_checkpoints.every_n_tokens <= 0
+        or state_checkpoints.every_n_tokens % BT
+        or state_checkpoints.states.dtype != torch.float32
+        or not state_checkpoints.states.is_contiguous()
+        or state_checkpoints.states.shape[1:] != (H, V, K)
+    ):
+        raise ValueError(
+            f"state checkpoints need a positive multiple of {BT} tokens and a "
+            "contiguous FP32 K-last [rows, H, V, K] buffer"
+        )
+
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
@@ -351,6 +396,15 @@ def chunk_gated_delta_rule_fwd_h(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
+        checkpoint_states=(
+            None if state_checkpoints is None else state_checkpoints.states
+        ),
+        checkpoint_cu_starts=(
+            None if state_checkpoints is None else state_checkpoints.cu_starts
+        ),
+        checkpoint_every_chunks=(
+            1 if state_checkpoints is None else state_checkpoints.every_n_tokens // BT
+        ),
         T=T,
         H=H,
         Hg=Hg,

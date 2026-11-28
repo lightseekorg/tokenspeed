@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.platform import current_platform
@@ -35,6 +36,9 @@ from tokenspeed_kernel.signature import (
     format_signature,
     tensor_format,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
 
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
@@ -753,6 +757,7 @@ def gdn_decode_mtp(
     tree_ancestors: torch.Tensor | None,
     pending_replay: GdnPendingReplay | None,
     replay_payload: torch.Tensor | None = None,
+    output_norm: KdaOutputNorm | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> torch.Tensor:
@@ -822,13 +827,19 @@ def gdn_decode_mtp(
             the inputs' dtype, that a chunked ReplaySSM tree verify fills with
             each token's ``[k | v | a | b]`` as read. The CuTe DSL solution
             also fills this payload for a chain.
+        output_norm: The layer's gated output RMSNorm (``rmsnorm(o) * weight *
+            sigmoid(gate)`` per head over ``head_v_dim``, gate rows ``[B * T,
+            num_v_heads * head_v_dim]``) for the kernel to apply, or None for
+            the raw output. Only kernels declaring the ``output_norm`` trait
+            accept it (see ``gdn_verify_fuses_output_norm``).
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
     Returns:
-        Decode output shaped ``[B, T, num_v_heads, head_v_dim]`` (q.dtype).
-        Outputs for negative initial-state indices are undefined and must be
-        ignored, including on the FlashInfer FP32 path.
+        Decode output shaped ``[B, T, num_v_heads, head_v_dim]`` (q.dtype),
+        normed when ``output_norm`` is given. Outputs for negative
+        initial-state indices are undefined and must be ignored, including on
+        the FlashInfer FP32 path.
     """
     if output_state_indices is not None:
         if output_state_indices.shape != q.shape[:2]:
@@ -913,6 +924,7 @@ def gdn_decode_mtp(
         and _chain_rows_dense(q, k, v, a, b),
         "replay_payload": replay_payload is not None,
         "pending_replay": pending_replay is not None,
+        "output_norm": output_norm is not None,
         "strided_state": not initial_state.is_contiguous()
         or (output_state is not None and not output_state.is_contiguous()),
     }
@@ -928,6 +940,15 @@ def gdn_decode_mtp(
             pending_replay, q, k, v, a, b, initial_state, initial_state_indices
         )
         extra["pending_replay"] = pending_replay
+    if output_norm is not None:
+        if output_norm.gate.shape != (
+            q.shape[0] * q.shape[1],
+            v.shape[2] * v.shape[3],
+        ) or output_norm.weight.shape != (v.shape[3],):
+            raise ValueError(
+                "output_norm needs [B * T, HV * V] gate rows and a [V] weight"
+            )
+        extra["output_norm"] = output_norm
     if solution != "flashinfer" and not output_only:
         # Only the legacy FlashInfer solution retains its old padding contract;
         # other named solutions must still accept the actual state dtype. A
@@ -950,6 +971,10 @@ def gdn_decode_mtp(
         kernel.name
     ).traits.get("pending_replay", ()):
         raise ValueError("selected GDN verify kernel does not support pending replay")
+    if output_norm is not None and True not in KernelRegistry.get().get_by_name(
+        kernel.name
+    ).traits.get("output_norm", ()):
+        raise ValueError("selected GDN verify kernel does not apply an output norm")
     ShapeCapture.get().record(
         "attention",
         "gdn_decode_mtp",
@@ -1155,6 +1180,30 @@ def gdn_decode_supports(
         ``True`` when the default selection and the selection requiring
         ``trait`` pick the same kernel.
     """
+    return (
+        _gdn_decode_feature_kernel(
+            op,
+            dtype,
+            state_dtype=state_dtype,
+            traits=traits,
+            trait=trait,
+            solution=solution,
+        )
+        is not None
+    )
+
+
+def _gdn_decode_feature_kernel(
+    op: str,
+    dtype: torch.dtype,
+    *,
+    state_dtype: torch.dtype,
+    traits: dict[str, int | bool],
+    trait: str,
+    solution: str | None,
+) -> str | None:
+    """The kernel both the default selection and the one requiring ``trait``
+    pick (see ``gdn_decode_supports``), or None when they differ."""
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
     traits = dict(traits)
@@ -1185,6 +1234,7 @@ def gdn_decode_supports(
         )
         traits.setdefault("replay_payload", False)
         traits.setdefault("pending_replay", False)
+        traits.setdefault("output_norm", False)
     try:
         default = select_kernel(
             "attention",
@@ -1201,8 +1251,42 @@ def gdn_decode_supports(
             solution=solution,
         )
     except NoKernelFoundError:
-        return False
-    return default.name == featured.name
+        return None
+    return default.name if default.name == featured.name else None
+
+
+def gdn_verify_fuses_output_norm(
+    dtype: torch.dtype,
+    *,
+    state_dtype: torch.dtype,
+    traits: dict[str, int | bool],
+    solution: str | None,
+) -> bool:
+    """Whether the kernel ``gdn_decode_mtp`` selects by default for a verify
+    also applies the layer's gated output RMSNorm (its ``output_norm``).
+
+    Args:
+        dtype: q/k/v dtype.
+        state_dtype: Recurrent-state pool dtype.
+        traits: The verify call's traits, as for ``gdn_decode_supports``.
+        solution: The solution the caller forces, or ``None``.
+
+    Returns:
+        ``True`` when that kernel declares the ``output_norm`` trait and stays
+        selected with it.
+    """
+    kernel_name = _gdn_decode_feature_kernel(
+        "gdn_decode_mtp",
+        dtype,
+        state_dtype=state_dtype,
+        traits=traits,
+        trait="output_norm",
+        solution=solution,
+    )
+    # Undeclared traits do not filter kernels: check the declaration itself.
+    return kernel_name is not None and True in KernelRegistry.get().get_by_name(
+        kernel_name
+    ).traits.get("output_norm", ())
 
 
 def validate_replay_commit_args(
@@ -1514,6 +1598,7 @@ __all__ = [
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
     "gdn_tree_verify_needs_node_states",
+    "gdn_verify_fuses_output_norm",
     "validate_replay_commit_args",
     "validate_replay_commit_setup",
 ]
