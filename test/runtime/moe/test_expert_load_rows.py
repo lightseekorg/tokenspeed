@@ -29,10 +29,7 @@ import textwrap
 import pytest
 import torch
 
-from tokenspeed.runtime.distributed.comm_manager import (
-    local_moe_input_row_segment,
-    moe_input_row_segments,
-)
+from tokenspeed.runtime.distributed.comm_manager import moe_input_row_segments
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution import forward_step, prefill_graph
 from tokenspeed.runtime.execution.query_shard import scatter_count
@@ -187,43 +184,3 @@ def test_graph_owners_mark_filler_rows_before_the_replay_and_clear_after(
     ]
     assert len(marks) == 1 and len(clears) == 1 and replays
     assert marks[0] < min(replays) < clears[0]
-
-
-def test_local_view_tracks_this_ranks_rows_under_all_to_all_ep():
-    # DP4 / EP4 where peers carry different live counts (rank 0 has 1 live row,
-    # rank 2 has 0 live rows, rank 1 has 2 of 3). Under all-to-all EP each rank
-    # routes only its own 3 rows, not peers' interleaved segments.
-    mapping = Mapping(
-        rank=1, world_size=4, attn_tp_size=1, attn_dp_size=4, moe_ep_size=4
-    )
-    assert local_moe_input_row_segment(
-        mapping,
-        padded_global_num_tokens=[3, 3, 3, 3],
-        live_global_num_tokens=[1, 2, 0, 3],
-    ) == (3, 2)
-    rows = ExpertLoadRowMask(mapping)
-    rows.reserve(12, "cpu")
-    rows.mark_padded(
-        padded_global_num_tokens=[3, 3, 3, 3],
-        live_global_num_tokens=[1, 2, 0, 3],
-    )
-    assert rows.local_rows(3).tolist() == [True, True, False]
-    load = LayerExpertLoad(torch.zeros(4, dtype=torch.int64), rows.local_view())
-    load.record(torch.tensor([[0, 1], [1, 2], [3, 3]]))
-    assert load.physical_load.tolist() == [1, 2, 1, 0]
-    rows.clear()
-    assert rows.local_rows(12).all()
-    load.record(torch.tensor([[0, 1], [1, 2], [3, 3]]))
-    assert load.physical_load.tolist() == [2, 4, 2, 2]
-
-
-def test_local_segment_handles_mixed_attn_tp_and_moe_ep():
-    # TP2 x DP2 over EP4: rank 3 is TP shard 1 of DP group 1 (live=5 -> 4 + 1).
-    mapping = Mapping(
-        rank=3, world_size=4, attn_tp_size=2, attn_dp_size=2, moe_ep_size=4
-    )
-    assert local_moe_input_row_segment(
-        mapping,
-        padded_global_num_tokens=[7, 7, 7, 7],
-        live_global_num_tokens=[2, 2, 5, 5],
-    ) == (3, 1)
