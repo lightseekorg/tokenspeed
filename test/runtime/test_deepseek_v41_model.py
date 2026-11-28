@@ -5386,11 +5386,6 @@ def test_v41_moe_fused_router_placement_kwargs_and_load_warmup(monkeypatch):
         "kernel_record_expert_load",
         lambda ids, mask, load: load_warmup_dtypes.append(ids.dtype),
     )
-    monkeypatch.setattr(
-        global_server_args_dict,
-        "get",
-        global_server_args_dict.get,
-    )
     monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 1024)
 
     plain_moe = _make_moe("static")
@@ -5441,7 +5436,11 @@ def test_v41_moe_fused_router_eplb_parity_gpu(monkeypatch):
         [[0, 1, 2, 3, 0, 4, 5, 6, 7, 2]], dtype=torch.int64, device="cuda"
     )
 
-    monkeypatch.setitem(global_server_args_dict, "moe_runner_backend", "triton")
+    from tokenspeed.runtime.layers.moe import expert as expert_module
+    from tokenspeed.runtime.layers.moe.utils import MoeBackend
+
+    for module in (v41, v4, expert_module):
+        monkeypatch.setattr(module, "get_moe_backend", lambda: MoeBackend.TRITON)
     for algorithm in ("static", "dynamic"):
         placement = ExpertLocationMetadata.from_physical_to_logical_map(
             placement_map,
@@ -5463,8 +5462,8 @@ def test_v41_moe_fused_router_eplb_parity_gpu(monkeypatch):
             torch.eye(experts, device="cuda", dtype=torch.bfloat16) * 1.5
         )
         bias = torch.randn(experts, device="cuda", dtype=torch.float32) * 0.02
+        moe.gate.weight = nn.Parameter(gate_weight)
         with torch.no_grad():
-            moe.gate.weight.copy_(gate_weight)
             moe.gate.e_score_correction_bias.copy_(bias)
         moe.expert_dispatch_info = ExpertLocationDispatchInfo.init_new(
             layer_id=0,
@@ -5495,15 +5494,15 @@ def test_v41_moe_fused_router_eplb_parity_gpu(monkeypatch):
         moe.topk.topk_config.router_topk = "torch"
         unfused = moe._compute_topk_output(hidden, None)
         unfused_load = placement.physical_load[0].clone()
-        fused_order = torch.argsort(fused.topk_ids, dim=-1)
-        unfused_order = torch.argsort(unfused.topk_ids, dim=-1)
-        torch.testing.assert_close(
-            fused.topk_weights.gather(1, fused_order),
-            unfused.topk_weights.gather(1, unfused_order),
-            atol=2e-3,
-            rtol=2e-3,
-        )
         if algorithm == "static":
+            fused_order = torch.argsort(fused.topk_ids, dim=-1)
+            unfused_order = torch.argsort(unfused.topk_ids, dim=-1)
+            torch.testing.assert_close(
+                fused.topk_weights.gather(1, fused_order),
+                unfused.topk_weights.gather(1, unfused_order),
+                atol=2e-3,
+                rtol=2e-3,
+            )
             torch.testing.assert_close(
                 fused.topk_ids.gather(1, fused_order),
                 unfused.topk_ids.gather(1, unfused_order),
@@ -5522,4 +5521,10 @@ def test_v41_moe_fused_router_eplb_parity_gpu(monkeypatch):
                 unfused_logical.gather(1, unfused_l_order),
                 atol=0,
                 rtol=0,
+            )
+            torch.testing.assert_close(
+                fused.topk_weights.gather(1, fused_l_order),
+                unfused.topk_weights.gather(1, unfused_l_order),
+                atol=2e-3,
+                rtol=2e-3,
             )

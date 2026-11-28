@@ -107,7 +107,9 @@ def test_record_expert_load_gpu_matches_reference_and_captures_graph(
     topk_ids = backing_ids[:, 1 : 1 + top_k].to(id_dtype)
     live_backing = (torch.arange(rows + 13, device="cuda") % 5) != 0
     live_rows = live_backing[3:]
-    load_bank = torch.randint(0, 7, (3, physical_experts), dtype=load_dtype, device="cuda")
+    load_bank = torch.randint(
+        0, 7, (3, physical_experts), dtype=load_dtype, device="cuda"
+    )
     physical_load = load_bank[1]
     toggle = (
         None
@@ -120,9 +122,7 @@ def test_record_expert_load_gpu_matches_reference_and_captures_graph(
     assert torch.equal(physical_load, expected)
 
     # Empty forward is a safe no-op.
-    record_expert_load(
-        topk_ids[:0], live_rows, physical_load, recording_enabled=toggle
-    )
+    record_expert_load(topk_ids[:0], live_rows, physical_load, recording_enabled=toggle)
     assert torch.equal(physical_load, expected)
 
     # Verify CUDA Graph capture & replay accumulate deterministically.
@@ -153,16 +153,23 @@ def test_record_expert_load_does_not_recompile_across_batches(
     num_experts = 64
     # Intentionally slice at unaligned offsets to exercise do_not_specialize_on_alignment.
     load_bank = torch.zeros(3 * num_experts + 5, dtype=torch.int64, device="cuda")
-    ids_bank = torch.randint(
-        0, num_experts, (1024, 20), dtype=id_dtype, device="cuda"
-    )
+    ids_bank = torch.randint(0, num_experts, (1024, 20), dtype=id_dtype, device="cuda")
     live_bank = torch.ones(1050, dtype=torch.bool, device="cuda")
     live_bank[::7] = False
 
     record_expert_load(ids_bank[:1, :8], live_bank[:1], load_bank[:num_experts])
     with assert_no_triton_compile(expert_load._record_expert_load_kernel):
         for offset, (rows, top_k) in enumerate(
-            [(2, 8), (17, 6), (48, 8), (96, 8), (192, 12), (528, 8), (720, 16), (1024, 1)]
+            [
+                (2, 8),
+                (17, 6),
+                (48, 8),
+                (96, 8),
+                (192, 12),
+                (528, 8),
+                (720, 16),
+                (1024, 1),
+            ]
         ):
             load_start = (offset % 5) + 1
             layer_load = load_bank[load_start : load_start + num_experts]
