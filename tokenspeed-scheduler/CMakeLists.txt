@@ -58,6 +58,8 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/scheduler/lone_request_recovery.cpp
     csrc/scheduler/request.cpp
     csrc/scheduler/types.cpp
+    csrc/scheduler/prefill_policy.cpp
+    csrc/scheduler/prefill_scheduling.cpp
     csrc/scheduler/outside_event_handler.cpp
     csrc/scheduler/scheduler.cpp
 
@@ -192,6 +194,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_parent_fit_eviction.cpp
         tests/cpp/test_kv_cache_lifecycle.cpp
         tests/cpp/test_cache_scenarios.cpp
+        tests/cpp/test_prefill_policy.cpp
         tests/cpp/test_scheduler_plan.cpp
         tests/cpp/test_delayed_decode_admission.cpp
         tests/cpp/test_token_level_hits.cpp

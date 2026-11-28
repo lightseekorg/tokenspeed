@@ -80,6 +80,14 @@ SchedulerConfig validated(SchedulerConfig config) {
     return config;
 }
 
+// Keep configuration errors ahead of policy selection, as in the original
+// constructor. The shared constructor also validates explicitly injected policies.
+std::unique_ptr<PrefillPolicy> makeConfiguredPrefillPolicy(const SchedulerConfig& config) {
+    config.Validate();
+    return MakePrefillPolicy(config.prefill_policy.value_or(
+        config.enable_short_prefill_first ? PrefillPolicyKind::kShortPrefillFirst : PrefillPolicyKind::kFifo));
+}
+
 CacheKey eventKey(const CacheKey& key) {
     // External events describe one scheduler-level boundary. Fold every
     // group/child offset behind that boundary into the same accounting key.
@@ -92,9 +100,12 @@ CacheKey eventKey(const CacheKey& key) {
 
 }  // namespace
 
-Scheduler::Scheduler(SchedulerConfig config)
+Scheduler::Scheduler(SchedulerConfig config) : Scheduler(config, makeConfiguredPrefillPolicy(config)) {}
+
+Scheduler::Scheduler(SchedulerConfig config, std::unique_ptr<PrefillPolicy> prefill_policy)
     : config_{validated(std::move(config))},
       checkpoints_{config_.ResolveCheckpoints()},
+      prefill_policy_{std::move(prefill_policy)},
       req_pool_allocator_{config_.max_resident_requests},
       decode_slots_{config_.role == Role::kD ? config_.max_batch_size : 0},
       snapshot_slots_{config_.max_retracted_requests},
@@ -121,6 +132,7 @@ Scheduler::Scheduler(SchedulerConfig config)
               ? std::make_unique<PeerHostLandings>(coordinator_, config_.peer_config->max_host_landing_blocks)
               : nullptr} {
     coordinator_.ConfigureEviction(config_.ResolveEvictionConfig());
+    if (!prefill_policy_) throw std::invalid_argument("Scheduler: prefill policy must not be null");
     // config_.Validate() already ran; the body only derives state from it.
     if (shared_l2_proxy_) {
         coordinator_.SetDeviceHitCollection(true);

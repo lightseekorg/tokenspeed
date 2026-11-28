@@ -331,6 +331,7 @@ def scheduler_config_from_args(
         max_consecutive_prefill_rounds=server_args.max_consecutive_prefill_rounds,
         prefill_interval_min_decoding=server_args.prefill_interval_min_decoding,
         enable_short_prefill_first=server_args.enable_short_prefill_first,
+        prefill_policy=server_args.prefill_policy,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
         demote_superseded_state_checkpoints=server_args.checkpoint_config.retention.demote_superseded,
         drop_short_prompt_end_checkpoints=server_args.checkpoint_config.publication.drop_short_prompt_end,

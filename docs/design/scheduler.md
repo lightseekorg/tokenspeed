@@ -323,7 +323,23 @@ capacity model (§1.4) states the same split.
 
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
-`holdsHeadOfLine` breaks the candidate loop after scheduling a chunk of a
+Local prefill scheduling is selected once when Scheduler is constructed.
+The PrefillPolicy factory selects fifo or short-prefill-first through
+--prefill-policy. The --enable-short-prefill-first flag is temporarily
+retained for backward compatibility; use --prefill-policy short-prefill-first
+for new configurations and migrate existing uses to it. Omitting both
+selectors preserves the existing default; supplying both is rejected.
+These are the two production policies. Their Schedule methods
+run one shared serial template, and PrefillSchedulingContext reuses the
+scheduler's existing admission operations. Policies carry the request pointer
+and its position in the round's stable candidate span together. The context
+checks both in constant time before peer landing or admission, rejecting
+out-of-range positions and mismatched requests without rescanning the queue.
+Peer selection and the prefill
+gate run before carry probes, preserving the bounded probe window. Head-of-line stopping,
+oldest-request protection and P-role carry/fill retain the rules below.
+
+The serial policy stops selecting candidates after scheduling a chunk of a
 prefill that is still incomplete. Nothing behind it is scheduled that round
 (on the P role, whole prompts complete beside it in the budget its chunk
 leaves; see the end of this section). A resident chunk that fails
@@ -346,7 +362,7 @@ inside the same plan build (`SchedulePrefillEvent` picks the successor state
 by whether the window reaches `PrefillSize()`), so a prompt scheduled in full
 never holds the line. A round can therefore carry **several prefills that
 complete this round plus at most one truncated one — and the truncated one is
-necessarily last**, because `holdsHeadOfLine` seals the phase the moment it
+necessarily last**, because the serial policy seals the phase the moment it
 appears; a chunk that carries whole prompts (end of this section) is admitted
 before them, but its row moves behind theirs. The runtime relies on this order
 (`unified_path.md`, "Prefill requests without generated outputs"). With 6K of
@@ -392,7 +408,7 @@ keeps the prompts within N or the budget left, whichever is more: N bounds
 what the chunk gives way to, not what completes beside it. A prompt sharing
 the junction the chunk ends at is not filled — the State there is published
 only when the next chunk is admitted — and resumes there later. With
-`--enable-short-prefill-first` the fill takes the ranked prompts instead of
+--prefill-policy short-prefill-first the fill takes the ranked prompts instead of
 the list (see the following paragraphs).
 No carried or filled prompt holds the head of line, so the round is still
 *completing prefills + at most one truncated prefill*, and the truncated one
@@ -426,7 +442,7 @@ carried prompt could make the chunk's own request that victim.
 
 
 **New prompts retain submission order by default.**
-`--enable-short-prefill-first` opts in to ordering by prompt tokens minus
+--prefill-policy short-prefill-first opts in to ordering by prompt tokens minus
 currently reusable Device or Host prefixes, plus any tokens replayed to
 regenerate replayable groups; equal work preserves submission order. Resident chunks retain priority. The policy applies to P and fused
 local prefill; D's remote admission and decode ordering are unchanged.
