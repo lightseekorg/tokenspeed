@@ -8487,7 +8487,7 @@ def test_dense_format_signature_and_fast_selection_override(
     from tokenspeed_kernel.selection import kernel_override
     from tokenspeed_kernel.signature import dense_format_signature
 
-    sig = dense_format_signature(a=torch.bfloat16, b=torch.float8_e4m3fn)
+    sig = dense_format_signature(("a", "b"), (torch.bfloat16, torch.float8_e4m3fn))
     assert sig == format_signature(
         a=dense_tensor_format(torch.bfloat16),
         b=dense_tensor_format(torch.float8_e4m3fn),

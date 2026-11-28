@@ -3366,17 +3366,22 @@ class DeepseekV41AttentionBackend(AttentionBackend):
 
         if self.cache_pool is None:
             return
-        swa_cache = self.cache_pool.swa(0)
-        if not swa_cache.is_cuda:
+        swa_layer = next((i for i, o in enumerate(self.spec.kv_owners) if o < 0), -1)
+        owner = next((o for o in self.spec.kv_owners if o >= 0), -1)
+        swa_cache = self.cache_pool.swa(swa_layer) if swa_layer >= 0 else None
+        global_cache = self.cache_pool.global_kv(owner) if owner >= 0 else None
+        probe = swa_cache if swa_cache is not None else global_cache
+        if probe is None or not probe.is_cuda:
             return
-        device = swa_cache.device
-        owner = self.spec.kv_owners[0]
-        global_cache = self.cache_pool.global_kv(owner)
-        real_index_cache = self.cache_pool.index_k(owner)
+        device = probe.device
 
         # Empty-prefix dummy warmups never exercise SWA prefix or global history gathers.
         invalid_slots = torch.full((1,), -1, dtype=torch.int64, device=device)
-        dsv41.cache_gather(swa_cache, invalid_slots, self.swa_format, None)
+        if swa_cache is not None:
+            dsv41.cache_gather(swa_cache, invalid_slots, self.swa_format, None)
+        if owner < 0:
+            return
+        real_index_cache = self.cache_pool.index_k(owner)
         dsv41.cache_gather(
             global_cache,
             invalid_slots,
@@ -3385,6 +3390,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         )
 
         # Warm native sparse Reindex scoring + _finish_write_selection variants
+        # plus Full dense/paged scoring variants when dummy tokens <= sparse_window
         # against a small zero-initialized 512B-aligned cache view (no NaNs).
         row_bytes = real_index_cache.shape[2]
         page_stride = ((64 * row_bytes + 511) // 512) * 512
@@ -3421,6 +3427,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             ratio=self.spec.compress_ratios[owner],
             pages=2,
         )
+        # 1) Native Reindex (SPARSE=True, SLOTS=True, POOL=False)
         dsv41.index_topk(
             index_q,
             weights,
@@ -3430,6 +3437,42 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             candidates,
             self.spec.index_topk,
             0,
+            self.spec.candidate_block_size,
+            1,
+            8,
+            None,
+            None,
+            None,
+            slots=slots,
+        )
+        # 2) Dense Full candidate-source prefill (SPARSE=False, SLOTS=False, POOL=True)
+        dsv41.index_topk(
+            index_q,
+            weights,
+            safe_index_cache,
+            table,
+            visible_lens,
+            None,
+            self.spec.index_topk,
+            self.spec.candidate_topk,
+            self.spec.candidate_block_size,
+            1,
+            8,
+            None,
+            None,
+            dsv41.new_index_metadata(table, visible_lens, None, history_rows=(1,)),
+            slots=None,
+        )
+        # 3) Paged Full candidate-source decode <=64K (SPARSE=False, SLOTS=True, POOL=True)
+        dsv41.index_topk(
+            index_q,
+            weights,
+            safe_index_cache,
+            table,
+            visible_lens,
+            None,
+            self.spec.index_topk,
+            self.spec.candidate_topk,
             self.spec.candidate_block_size,
             1,
             8,

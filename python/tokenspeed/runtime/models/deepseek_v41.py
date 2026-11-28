@@ -150,6 +150,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41RowPlan,
+    zeroed_fused_output,
 )
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
@@ -1709,12 +1710,20 @@ class DeepseekV41Attention(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Execute variable-length KV writes, indexer selection, and attention eagerly."""
         backend, mode = ctx.attn_backend, ctx.forward_mode
+        if mode.is_idle():
+            if fused_decode:
+                return zeroed_fused_output(q, self.n_local_groups, 0)
+            return q.new_empty((0, self.n_local_heads, self.head_dim))
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         meta = rows.source
         source_positions, source_requests = meta.positions, meta.request_indices
         source_count = source_positions.numel()
         if source_count > q.shape[0]:
             raise ValueError("V4.1 hidden rows and backend query metadata disagree")
+        if source_count == 0:
+            if fused_decode:
+                return zeroed_fused_output(q, self.n_local_groups, 0)
+            return q.new_empty((0, self.n_local_heads, self.head_dim))
         q, swa, latent_or_comp, index_k_proj, index_weights = slice_to_real_tokens(
             source_count, q, swa, latent_or_comp, index_k_proj, index_weights
         )

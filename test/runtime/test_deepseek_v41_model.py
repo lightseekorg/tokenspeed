@@ -5108,7 +5108,7 @@ def test_dsv41_attention_inner_breakpoint_captures_projections_and_matches_eager
             _mapping(0, 1, 1),
             2,
             v41._ced_decoder_start(config),
-            _quant(),
+            v41_mxfp8_config(_quant()),
             "layers.2.attn",
             aux_stream=None,
         )
@@ -5168,5 +5168,41 @@ def test_dsv41_attention_inner_breakpoint_captures_projections_and_matches_eager
             meta.positions, x, _ctx(backend, 4, ForwardMode.EXTEND), reduce_output=True
         )
         torch.testing.assert_close(captured, expected, rtol=1e-2, atol=1e-2)
+
+        for fused_flag in (False, True):
+            idle_out = attn._sparse_attention_and_kv(
+                _ctx(backend, 0, ForwardMode.IDLE),
+                x.new_empty((0, attn.n_local_heads, attn.head_dim)),
+                x.new_empty((0, attn.head_dim)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                fused_flag,
+            )
+            if fused_flag:
+                assert idle_out[0].shape[0] == 0 and idle_out[1].shape[0] == 0
+            else:
+                assert idle_out.shape == (0, attn.n_local_heads, attn.head_dim)
     finally:
         hook.remove()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_v41_warmup_prefill_kernels_skips_negative_kv_owners():
+    """warmup_prefill_kernels() skips global cache warmup when kv_owners are all -1."""
+    from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+        DeepseekV41AttentionBackend,
+    )
+
+    backend = _backend("cuda:0", 2)
+    backend.warmup_prefill_kernels()
+    swa_only = DeepseekV41AttentionBackend(
+        backend.config, replace(backend.spec, kv_owners=(-1,))
+    )
+    swa_only.set_cache_pool(backend.cache_pool)
+    swa_only.warmup_prefill_kernels()
