@@ -55,7 +55,8 @@ not expose this loader or its extra configuration.
 
 Installed plugins may register typed options for the flat `--extra-server-args`
 JSON object, for example `--extra-server-args '{"extension_tile_size":64}'` when
-a plugin owns that field. Python callers pass the same dictionary through
+a plugin owns that field. This is the only CLI entry for plugin options;
+registration does not add per-field flags. Python callers pass the same dictionary through
 `ServerArgs(extra_server_args=...)`. Unknown fields, invalid values and duplicate
 field registrations are rejected. HF overrides remain for model definitions.
 See [plugin server arguments](../design/plugin-server-args.md) for registration

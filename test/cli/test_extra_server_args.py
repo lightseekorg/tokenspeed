@@ -59,17 +59,8 @@ def parser():
             undo()
 
 
-def test_flags_json_and_programmatic_values_agree(parser):
+def test_json_and_programmatic_values_agree(parser):
     values = {"implementation": "fused", "enabled": False, "capacity": 16}
-    flags = [
-        "--fixture-implementation",
-        "fused",
-        "--fixture-enabled",
-        "false",
-        "--fixture-capacity",
-        "16",
-    ]
-    assert collect_extra_server_args(parser.parse_args(flags)) == values
     assert (
         collect_extra_server_args(
             parser.parse_args(["--extra-server-args", json.dumps(values)])
@@ -81,34 +72,26 @@ def test_flags_json_and_programmatic_values_agree(parser):
     assert normalize_extra_server_args(json.loads(json.dumps(values))) == values
 
 
-def test_flags_complete_json_without_losing_explicit_false(parser):
-    args = parser.parse_args(
-        [
-            "--extra-server-args",
-            '{"capacity":8}',
-            "--fixture-implementation",
-            "native",
-            "--fixture-enabled",
-            "false",
-        ]
-    )
-    assert collect_extra_server_args(args) == {
-        "implementation": "native",
-        "capacity": 8,
-        "enabled": False,
-    }
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("--fixture-implementation", "native"),
+        ("--fixture-enabled", "false"),
+        ("--fixture-capacity", "16"),
+    ],
+)
+def test_individual_plugin_flags_are_not_a_transport(parser, flag, value):
+    with pytest.raises(SystemExit) as error:
+        parser.parse_args(
+            ["--extra-server-args", '{"implementation":"native"}', flag, value]
+        )
+    assert error.value.code == 2
 
 
-def test_conflicting_transports_are_rejected(parser):
-    args = parser.parse_args(
-        [
-            "--extra-server-args",
-            '{"implementation":"native"}',
-            "--fixture-implementation",
-            "fused",
-        ]
-    )
-    with pytest.raises(ValueError, match="Conflicting"):
+@pytest.mark.parametrize("values", [[], None, "{}"])
+def test_cli_json_requires_an_object(parser, values):
+    args = parser.parse_args(["--extra-server-args", json.dumps(values)])
+    with pytest.raises(TypeError, match="JSON object"):
         collect_extra_server_args(args)
 
 
@@ -170,16 +153,11 @@ def test_field_ownership_does_not_require_json_namespaces(parser):
             undo()
 
 
-def test_duplicate_transports_cannot_hide_an_invalid_boolean(parser):
+def test_cli_json_does_not_coerce_integer_to_boolean(parser):
     args = parser.parse_args(
-        [
-            "--extra-server-args",
-            '{"implementation":"native","enabled":1}',
-            "--fixture-enabled",
-            "true",
-        ]
+        ["--extra-server-args", '{"implementation":"native","enabled":1}']
     )
-    with pytest.raises(ValueError, match="Conflicting"):
+    with pytest.raises(ValueError, match="enabled"):
         collect_extra_server_args(args)
 
 

@@ -86,9 +86,9 @@ def register_extra_server_args(
 
     Frozen dataclass fields accept str/bool/int/float, homogeneous Literal choices
     and optional None. Fields tagged native_server_arg bind the matching native
-    ServerArgs value and cannot be supplied through extra JSON or plugin flags.
+    ServerArgs value and cannot be supplied through extra JSON.
     Model-derived state belongs to its execution owner, outside this schema.
-    CLI names are --<namespace>-<field-name>; boolean flags take true/false.
+    The CLI accepts one flat JSON object through --extra-server-args.
     Programmatic callers supply a flat mapping in ServerArgs.extra_server_args.
     Namespace ownership stays in the registry; field names must be unique.
     Failed plugin activation rolls this registration back with its other entries.
@@ -132,51 +132,19 @@ def register_extra_server_args(
     record_external("extra server arguments", namespace, undo)
 
 
-def _boolean(value: str) -> bool:
-    if value not in ("true", "false"):
-        raise argparse.ArgumentTypeError("expected true or false")
-    return value == "true"
-
-
 def add_extra_server_args(parser: argparse.ArgumentParser) -> None:
-    """Add registered flags and the flat JSON transport to a parser."""
+    """Add the sole CLI transport for registered plugin options."""
     parser.add_argument(
         "--extra-server-args",
         type=json.loads,
         default=argparse.SUPPRESS,
         help="JSON options registered by installed runtime plugins.",
     )
-    for namespace, schema in _SCHEMAS.items():
-        group = parser.add_argument_group(f"{namespace} server arguments")
-        hints = get_type_hints(schema.config_type)
-        for field in _argument_fields(schema.config_type):
-            scalar, choices = _scalar_type(hints[field.name])
-            group.add_argument(
-                f"--{namespace.replace('_', '-')}-{field.name.replace('_', '-')}",
-                dest=f"extra_server_args.{field.name}",
-                type=_boolean if scalar is bool else scalar,
-                choices=choices,
-                default=argparse.SUPPRESS,
-                help=field.metadata.get("help"),
-            )
 
 
 def collect_extra_server_args(args: argparse.Namespace) -> dict:
-    """Combine JSON and individual flags, rejecting contradictory values."""
-    raw = vars(args).get("extra_server_args", {})
-    if not isinstance(raw, dict):
-        raise TypeError("extra_server_args must be a JSON object")
-    result = copy.deepcopy(raw)
-    for key, value in vars(args).items():
-        if not key.startswith("extra_server_args."):
-            continue
-        _, name = key.split(".")
-        if name in result and (
-            type(result[name]) is not type(value) or result[name] != value
-        ):
-            raise ValueError(f"Conflicting extra server argument {name}")
-        result[name] = value
-    return normalize_extra_server_args(result)
+    """Validate the flat JSON input, preserving its explicit values."""
+    return normalize_extra_server_args(vars(args).get("extra_server_args", {}))
 
 
 def normalize_extra_server_args(values: dict) -> dict:

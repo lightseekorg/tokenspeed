@@ -4,15 +4,17 @@ Runtime plugins register typed launch options independently of HF model
 configuration. `ServerArgs.extra_server_args` is a flat dictionary of JSON
 scalars. Field ownership is internal to the registry: two plugins cannot
 register the same field, and unknown fields or invalid values fail before
-numerical policy resolution. JSON input and individual CLI flags use the same
-validation; conflicting explicit values are rejected.
+numerical policy resolution. The CLI accepts plugin options only through
+`--extra-server-args`; Python callers supply the same flat dictionary. Both
+entry points share validation and preserve explicit values.
 
 `register_extra_server_args(namespace, config_type, validate=...)` registers a
 frozen dataclass of scalar types, homogeneous `Literal` choices and optional
 `None`. Model-derived fields do not belong in this schema. A field tagged with
 `metadata={"native_server_arg": True}` binds the matching native `ServerArgs`
-value; it is excluded from plugin JSON, flags and public field ownership.
-Individual flags use `--<namespace>-<field>`, while JSON has no namespace wrapper.
+value; it is excluded from plugin JSON and public field ownership.
+Registration does not create individual plugin flags, and JSON has no namespace
+wrapper.
 An optional validator checks native argument interactions without initializing
 execution components. Registration participates in the loader's rollback.
 
