@@ -37,7 +37,7 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Literal, get_args
+from typing import Literal
 
 import pytest
 import torch
