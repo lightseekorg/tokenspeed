@@ -249,8 +249,12 @@ class GdnWYKernel:
         token_bound: Compile-time token bucket (4, 8 or 16).
         use_tma_qkv: Whether q, k and v tiles load through TMA.
         use_tma_state: Whether checkpoint state tiles load through TMA.
+        reuse_tma_value: Whether the output MMA reads the TMA value tile directly.
+        tma_value_columns: Value columns transferred, including shared row padding.
         gram_rows: Gram matrix side length (8 or 16).
-        key_chunk: Checkpoint key columns loaded per stage (64 or 128).
+        key_chunk: Checkpoint key columns per transfer (32, 64 or 128).
+        pipeline_stages: Input transfer buffers (1 or 2).
+        token_chunk: Token rows per QKV transfer buffer.
         reduction_bound: Token reduction bound derived from ``token_bound``
             (8 for short windows, 16 otherwise).
     """
@@ -270,6 +274,7 @@ class GdnWYKernel:
         use_tma_state: bool,
         gram_rows: int,
         key_chunk: int,
+        pipeline_stages: int,
     ):
         self.heads = heads
         self.vheads = vheads
@@ -282,8 +287,12 @@ class GdnWYKernel:
         self.token_bound = token_bound
         self.use_tma_qkv = use_tma_qkv
         self.use_tma_state = use_tma_state
+        self.reuse_tma_value = token_bound == 16 and use_tma_qkv
+        self.tma_value_columns = value_tile + (8 if self.reuse_tma_value else 0)
         self.gram_rows = gram_rows
         self.key_chunk = key_chunk
+        self.pipeline_stages = pipeline_stages
+        self.token_chunk = token_bound // pipeline_stages
         self.reduction_bound = 8 if token_bound <= 8 else 16
 
     @cute.jit
@@ -302,7 +311,7 @@ class GdnWYKernel:
         if cutlass.const_expr(self.use_tma_qkv):
             for operand in cutlass.range_constexpr(3):
                 tensor = qkv_tensors[operand]
-                columns = 128 if operand < 2 else self.value_tile
+                columns = 128 if operand < 2 else self.tma_value_columns
                 source = cute.make_tensor(
                     tensor.iterator,
                     cute.make_layout(
@@ -323,8 +332,8 @@ class GdnWYKernel:
                 atom, source = cpasync.make_tiled_tma_atom(
                     cpasync.CopyBulkTensorTileG2SOp(),
                     source,
-                    cute.make_layout((self.token_bound, columns), stride=(columns, 1)),
-                    (self.token_bound, columns),
+                    cute.make_layout((self.token_chunk, columns), stride=(columns, 1)),
+                    (self.token_chunk, columns),
                 )
                 atoms += (atom,)
                 sources += (source,)
@@ -492,6 +501,91 @@ class GdnWYKernel:
                         )
                     shared[row, column] = shared.element_type(value)
 
+    @cute.jit
+    def load_qkv(
+        self,
+        raw_q,
+        raw_k,
+        raw_v,
+        barriers,
+        atoms: tuple,
+        sources: tuple,
+        batch: Int32,
+        head: Int32,
+        hv: Int32,
+        tile: Int32,
+        stage: cutlass.Constexpr,
+    ):
+        """Issue TMA copies for one Q/K/V token chunk into its transfer buffer.
+
+        All CTA threads enter collectively. Warp 0 initializes the barrier array
+        when ``stage == 0``, arms the selected barrier and issues the three
+        copies; callers wait on that barrier before consuming the chunk. Stage 0
+        must run before any other stage.
+
+        Args:
+            raw_q, raw_k: Shared-memory buffers with layout
+                ``(token_chunk, 128, pipeline_stages)``.
+            raw_v: Shared-memory buffer with layout
+                ``(token_chunk, tma_value_columns, pipeline_stages)``.
+            barriers: One TMA transaction barrier per pipeline stage. Stage 0
+                initializes the full array; every call arms its own barrier once
+                and the caller waits for phase 0 before reading that stage.
+            atoms: Q/K/V TMA copy atoms for ``(token_chunk, 128)``,
+                ``(token_chunk, 128)`` and ``(token_chunk, tma_value_columns)``
+                tiles, respectively.
+            sources: Q/K/V TMA source tensors with logical layouts
+                ``(tokens, 128, heads, batch)``; the head dimension is H for Q/K
+                and HV for V.
+            batch: Request index in the source tensors.
+            head: Query/key head index.
+            hv: Value head index.
+            tile: Value tile index; columns start at ``tile * value_tile``.
+            stage: Zero-based compile-time stage index below ``pipeline_stages``;
+                selects the destination buffer and the token rows starting at
+                ``stage * token_chunk``.
+        """
+        warp = cute.arch.thread_idx()[0] // 32
+        qkv_barrier = cute.make_tensor(barriers.iterator + stage, cute.make_layout(1))
+        if warp == 0:
+            if cutlass.const_expr(stage == 0):
+                with cute.arch.elect_one():
+                    for i in cutlass.range_constexpr(self.pipeline_stages):
+                        cute.arch.mbarrier_init(barriers.iterator + i, 1)
+                cute.arch.mbarrier_init_fence()
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    qkv_barrier.iterator,
+                    (2 * 128 + self.tma_value_columns) * self.token_chunk * 2,
+                )
+            for i in cutlass.range_constexpr(3):
+                destination = raw_q if i == 0 else raw_k if i == 1 else raw_v
+                destination = destination[None, None, stage]
+                columns = 128 if i < 2 else self.tma_value_columns
+                source_head = head if i < 2 else hv
+                source_tile = 0 if i < 2 else tile
+                source_column = 0
+                if cutlass.const_expr(i == 2 and self.reuse_tma_value):
+                    # The padded box still advances by the unpadded value width.
+                    source_column = tile * self.value_tile
+                    source_tile = 0
+                source = cute.domain_offset(
+                    (stage * self.token_chunk, source_column, 0, 0), sources[i]
+                )
+                tile_qk = cute.local_tile(
+                    source,
+                    (self.token_chunk, columns),
+                    (0, source_tile, source_head, batch),
+                )
+                dst, src = cpasync.tma_partition(
+                    atoms[i],
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(destination, 0, 2),
+                    cute.group_modes(tile_qk, 0, 2),
+                )
+                cute.copy(atoms[i], src, dst, tma_bar_ptr=qkv_barrier.iterator)
+
     @cute.kernel
     def run(
         self,
@@ -543,6 +637,7 @@ class GdnWYKernel:
         warp, lane = tid // 32, tid % 32
         nh, tile, _ = cute.arch.block_idx()
         batch, hv = nh // self.vheads, nh % self.vheads
+        output_start = Int64(batch) * tokens
         head = hv // (self.vheads // self.heads)
         col_base = tile * self.value_tile
         tensors = tuple(
@@ -565,11 +660,24 @@ class GdnWYKernel:
         h_stride = self.key_chunk + 128 // pool.element_type.width
         state_barrier = None
         if cutlass.const_expr(self.use_tma_state):
-            # TMA zero-fills the columns beyond K128 into the ordinary row padding.
-            sH = smem.allocate_tensor(pool.element_type, h_layout, byte_alignment=128)
-            state_barrier = smem.allocate_tensor(
-                Int64, cute.make_layout(1), byte_alignment=8
+            # The TMA box includes row padding; only key_chunk columns enter MMA.
+            state_buffers = smem.allocate_tensor(
+                pool.element_type,
+                cute.make_layout(
+                    (self.value_tile, h_stride, self.pipeline_stages),
+                    stride=(h_stride, 1, self.value_tile * h_stride),
+                ),
+                byte_alignment=128,
             )
+            sH = state_buffers[None, None, 0]
+            state_barrier = smem.allocate_tensor(
+                Int64, cute.make_layout(self.pipeline_stages), byte_alignment=8
+            )
+            if cutlass.const_expr(self.pipeline_stages == 2):
+                if warp == 0:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_init(state_barrier.iterator + 1, 1)
+                    cute.arch.mbarrier_init_fence()
         else:
             sH = smem.allocate_tensor(
                 pool.element_type,
@@ -578,12 +686,13 @@ class GdnWYKernel:
                 ),
                 byte_alignment=16,
             )
-        sV = smem.allocate_tensor(
-            Float32,
-            cute.make_layout(
-                (workspace_rows, self.value_tile), stride=(self.value_tile + 4, 1)
-            ),
-        )
+        if cutlass.const_expr(not self.reuse_tma_value):
+            sV = smem.allocate_tensor(
+                Float32,
+                cute.make_layout(
+                    (workspace_rows, self.value_tile), stride=(self.value_tile + 4, 1)
+                ),
+            )
         sQK = smem.allocate_tensor(
             Float32,
             cute.make_layout(
@@ -594,46 +703,42 @@ class GdnWYKernel:
         sBeta = smem.allocate_tensor(Float32, cute.make_layout(16))
         sBits = smem.allocate_tensor(Int64, cute.make_layout(16))
         if cutlass.const_expr(self.use_tma_qkv):
-            raw_layout = cute.make_layout((self.token_bound, 128), stride=(128, 1))
+            raw_layout = cute.make_layout(
+                (self.token_chunk, 128, self.pipeline_stages),
+                stride=(128, 1, self.token_chunk * 128),
+            )
             raw_q = smem.allocate_tensor(q.element_type, raw_layout, byte_alignment=128)
             raw_k = smem.allocate_tensor(k.element_type, raw_layout, byte_alignment=128)
             raw_v = smem.allocate_tensor(
                 v.element_type,
                 cute.make_layout(
-                    (self.token_bound, self.value_tile), stride=(self.value_tile, 1)
+                    (self.token_chunk, self.tma_value_columns, self.pipeline_stages),
+                    stride=(
+                        self.tma_value_columns,
+                        1,
+                        self.token_chunk * self.tma_value_columns,
+                    ),
                 ),
                 byte_alignment=128,
             )
+            if cutlass.const_expr(self.reuse_tma_value):
+                sV = raw_v[None, None, 0]
             qkv_barrier = smem.allocate_tensor(
-                Int64, cute.make_layout(1), byte_alignment=8
+                Int64, cute.make_layout(self.pipeline_stages), byte_alignment=8
             )
-            if warp == 0:
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_init(qkv_barrier.iterator, 1)
-                cute.arch.mbarrier_init_fence()
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        qkv_barrier.iterator,
-                        (2 * 128 + self.value_tile) * self.token_bound * 2,
-                    )
-                for i in cutlass.range_constexpr(3):
-                    destination = raw_q if i == 0 else raw_k if i == 1 else raw_v
-                    columns = 128 if i < 2 else self.value_tile
-                    source_head = head if i < 2 else hv
-                    source_tile = 0 if i < 2 else tile
-                    tile_qk = cute.local_tile(
-                        sources[i],
-                        (self.token_bound, columns),
-                        (0, source_tile, source_head, batch),
-                    )
-                    dst, src = cpasync.tma_partition(
-                        atoms[i],
-                        0,
-                        cute.make_layout(1),
-                        cute.group_modes(destination, 0, 2),
-                        cute.group_modes(tile_qk, 0, 2),
-                    )
-                    cute.copy(atoms[i], src, dst, tma_bar_ptr=qkv_barrier.iterator)
+            self.load_qkv(
+                raw_q,
+                raw_k,
+                raw_v,
+                qkv_barrier,
+                atoms,
+                sources,
+                batch,
+                head,
+                hv,
+                tile,
+                0,
+            )
         width = self.heads * 128 + self.vheads * 128 + 2 * self.vheads
         # Keep raw gate reads independent of the following Q/K normalization.
         if cutlass.const_expr(self.token_bound == 4 and self.value_tile == 64):
@@ -667,10 +772,47 @@ class GdnWYKernel:
             0,
             True,
         )
+        if cutlass.const_expr(self.pipeline_stages == 2):
+            # Stage 1 transfers overlap normalization of stage 0 and WY preparation.
+            self.load_qkv(
+                raw_q,
+                raw_k,
+                raw_v,
+                qkv_barrier,
+                atoms,
+                sources,
+                batch,
+                head,
+                hv,
+                tile,
+                1,
+            )
+            next_barrier = cute.make_tensor(
+                state_barrier.iterator + 1, cute.make_layout(1)
+            )
+            self.load_state(
+                pool,
+                ps,
+                idx,
+                hv,
+                tile,
+                tid,
+                warp,
+                state_buffers[None, None, 1],
+                next_barrier,
+                state_atom,
+                state_source,
+                self.key_chunk,
+                False,
+            )
         if cutlass.const_expr(self.use_tma_qkv):
             cute.arch.sync_threads()
             cute.arch.mbarrier_wait(qkv_barrier.iterator, 0)
         for row_group in cutlass.range_constexpr(2 if self.token_bound <= 8 else 4):
+            if cutlass.const_expr(
+                self.pipeline_stages == 2 and row_group == self.token_chunk // 4
+            ):
+                cute.arch.mbarrier_wait(qkv_barrier.iterator + 1, 0)
             row = warp + row_group * 4
             rq = cute.make_rmem_tensor(4, Float32)
             rk = cute.make_rmem_tensor(4, Float32)
@@ -680,8 +822,20 @@ class GdnWYKernel:
                 if row < tokens:
                     if cutlass.const_expr(self.use_tma_qkv):
                         for part in cutlass.range_constexpr(4):
-                            rq[part] = Float32(raw_q[row, lane * 4 + part])
-                            rk[part] = Float32(raw_k[row, lane * 4 + part])
+                            rq[part] = Float32(
+                                raw_q[
+                                    row % self.token_chunk,
+                                    lane * 4 + part,
+                                    row // self.token_chunk,
+                                ]
+                            )
+                            rk[part] = Float32(
+                                raw_k[
+                                    row % self.token_chunk,
+                                    lane * 4 + part,
+                                    row // self.token_chunk,
+                                ]
+                            )
                     else:
                         q_offset = Int64(batch) * qs[0] + row * qs[1] + head * qs[2]
                         k_offset = Int64(batch) * ks[0] + row * ks[1] + head * ks[2]
@@ -774,53 +928,61 @@ class GdnWYKernel:
                             av
                         ), replay.element_type(bv)
             sG[tid], sBeta[tid], sBits[tid] = gate, beta, bits
-        for vector_step in cutlass.range_constexpr(
-            (8 if self.token_bound <= 8 else 16) * self.value_tile // (128 * 4)
-        ):
-            vector_offset = (tid + vector_step * 128) * 4
-            vector_row, vector_col = (
-                vector_offset // self.value_tile,
-                vector_offset % self.value_tile,
-            )
-            vector_values = cute.make_rmem_tensor(4, Float32)
-            vector_values.fill(0.0)
-            if vector_row < tokens:
-                if cutlass.const_expr(self.use_tma_qkv):
-                    for vector_part in cutlass.range_constexpr(4):
-                        vector_values[vector_part] = Float32(
-                            raw_v[vector_row, vector_col + vector_part]
-                        )
-                else:
-                    vector_base = (
-                        Int64(batch) * vs[0]
-                        + vector_row * vs[1]
-                        + hv * vs[2]
-                        + (col_base + vector_col) * vs[3]
-                    )
-                    vector_address = v.iterator.toint() + vector_base * 2
-                    if (vs[3] == 1) & ((vector_address & 7) == 0):
-                        vector_values.store(
-                            _load_four(
-                                vector_address, v.element_type == cutlass.BFloat16
-                            )
-                        )
-                    else:
+        if cutlass.const_expr(self.replay or not self.reuse_tma_value):
+            for vector_step in cutlass.range_constexpr(
+                (8 if self.token_bound <= 8 else 16) * self.value_tile // (128 * 4)
+            ):
+                vector_offset = (tid + vector_step * 128) * 4
+                vector_row, vector_col = (
+                    vector_offset // self.value_tile,
+                    vector_offset % self.value_tile,
+                )
+                vector_values = cute.make_rmem_tensor(4, Float32)
+                vector_values.fill(0.0)
+                if vector_row < tokens:
+                    if cutlass.const_expr(self.use_tma_qkv):
                         for vector_part in cutlass.range_constexpr(4):
                             vector_values[vector_part] = Float32(
-                                v[vector_base + vector_part * vs[3]]
+                                raw_v[
+                                    vector_row % self.token_chunk,
+                                    vector_col + vector_part,
+                                    vector_row // self.token_chunk,
+                                ]
                             )
-            for vector_part in cutlass.range_constexpr(4):
-                sV[vector_row, vector_col + vector_part] = vector_values[vector_part]
-                if cutlass.const_expr(self.replay):
-                    if vector_row < tokens:
-                        replay[
-                            (Int64(batch) * tokens + vector_row) * width
-                            + self.heads * 128
-                            + hv * 128
-                            + col_base
-                            + vector_col
-                            + vector_part
-                        ] = replay.element_type(vector_values[vector_part])
+                    else:
+                        vector_base = (
+                            Int64(batch) * vs[0]
+                            + vector_row * vs[1]
+                            + hv * vs[2]
+                            + (col_base + vector_col) * vs[3]
+                        )
+                        vector_address = v.iterator.toint() + vector_base * 2
+                        if (vs[3] == 1) & ((vector_address & 7) == 0):
+                            vector_values.store(
+                                _load_four(
+                                    vector_address, v.element_type == cutlass.BFloat16
+                                )
+                            )
+                        else:
+                            for vector_part in cutlass.range_constexpr(4):
+                                vector_values[vector_part] = Float32(
+                                    v[vector_base + vector_part * vs[3]]
+                                )
+                for vector_part in cutlass.range_constexpr(4):
+                    if cutlass.const_expr(not self.reuse_tma_value):
+                        sV[vector_row, vector_col + vector_part] = vector_values[
+                            vector_part
+                        ]
+                    if cutlass.const_expr(self.replay):
+                        if vector_row < tokens:
+                            replay[
+                                (Int64(batch) * tokens + vector_row) * width
+                                + self.heads * 128
+                                + hv * 128
+                                + col_base
+                                + vector_col
+                                + vector_part
+                            ] = replay.element_type(vector_values[vector_part])
         cute.arch.sync_threads()
         if cutlass.const_expr(self.token_bound == 4):
             # Back-propagate each output query through its ancestor updates.
@@ -992,17 +1154,26 @@ class GdnWYKernel:
                 value_values = cute.make_rmem_tensor((4, buffered), Float32)
                 for key_stage in cutlass.range_constexpr(128 // self.key_chunk):
                     if cutlass.const_expr(key_stage != 0):
-                        if cutlass.const_expr(self.use_tma_state):
+                        # Each buffer toggles phase when it is refilled two chunks later.
+                        if cutlass.const_expr(self.pipeline_stages == 2):
+                            cute.arch.mbarrier_wait(
+                                state_barrier.iterator + key_stage % 2,
+                                (key_stage // 2) % 2,
+                            )
+                        elif cutlass.const_expr(self.use_tma_state):
                             cute.arch.mbarrier_wait(
                                 state_barrier.iterator, key_stage % 2
                             )
                         else:
                             cute.arch.cp_async_wait_group(0)
                         cute.arch.sync_threads()
+                    stage_h = sH
+                    if cutlass.const_expr(self.pipeline_stages == 2):
+                        stage_h = state_buffers[None, None, key_stage % 2]
                     for fragment in cutlass.range_constexpr(buffered):
                         value_base = (warp + (group * buffered + fragment) * 4) * 16
                         h_rows = cute.make_tensor(
-                            sH.iterator + value_base * h_stride,
+                            stage_h.iterator + value_base * h_stride,
                             cute.make_layout(
                                 (16, self.key_chunk), stride=(h_stride, 1)
                             ),
@@ -1024,9 +1195,19 @@ class GdnWYKernel:
                             initial,
                         )
                         state_values[None, fragment].store(result)
-                    if cutlass.const_expr(key_stage + 1 < 128 // self.key_chunk):
-                        # Every reader releases the single state buffer before reuse.
+                    if cutlass.const_expr(
+                        key_stage + self.pipeline_stages < 128 // self.key_chunk
+                    ):
+                        # All warps must finish reading before TMA reuses this buffer.
                         cute.arch.sync_threads()
+                        next_h = sH
+                        next_barrier = state_barrier
+                        if cutlass.const_expr(self.pipeline_stages == 2):
+                            next_h = state_buffers[None, None, key_stage % 2]
+                            next_barrier = cute.make_tensor(
+                                state_barrier.iterator + key_stage % 2,
+                                cute.make_layout(1),
+                            )
                         self.load_state(
                             pool,
                             ps,
@@ -1035,11 +1216,11 @@ class GdnWYKernel:
                             tile,
                             tid,
                             warp,
-                            sH,
-                            state_barrier,
+                            next_h,
+                            next_barrier,
                             state_atom,
                             state_source,
-                            (key_stage + 1) * self.key_chunk,
+                            (key_stage + self.pipeline_stages) * self.key_chunk,
                             False,
                         )
                     if cutlass.const_expr(key_stage == 0):
@@ -1076,48 +1257,107 @@ class GdnWYKernel:
                         value = value_base + row + (j // 2) * 8
                         if token < tokens:
                             out[
-                                ((Int64(batch) * tokens + token) * self.vheads + hv)
-                                * 128
+                                ((output_start + token) * self.vheads + hv) * 128
                                 + col_base
                                 + value
                             ] = out.element_type(output_values[j])
         else:
-            for tile_v in cutlass.range_constexpr(self.value_tile // 32):
-                column = tile_v * 32 + warp * 8
-                c = _dot_tf32(sQ, sH, lane, column, 128, False, self.accumulators, None)
-                d = _dot_tf32(
-                    sQK,
-                    sV,
-                    lane,
-                    column,
-                    self.reduction_bound,
-                    True,
-                    self.accumulators,
-                    None,
-                )
-                output_values = cute.make_rmem_tensor(4, Float32)
-                output_values.store(c + d)
-                row, col = lane // 4, column + (lane % 4) * 2
-                for j in cutlass.range_constexpr(4):
-                    r = row + (j // 2) * 8
-                    vc = col + (j % 2)
-                    if r < tokens:
-                        out[
-                            ((Int64(batch) * tokens + r) * self.vheads + hv) * 128
-                            + col_base
-                            + vc
-                        ] = out.element_type(output_values[j])
+            fragments = self.value_tile // 32
+            buffered = fragments if self.key_chunk < 128 else 1
+            for group in cutlass.range_constexpr(fragments // buffered):
+                state_values = cute.make_rmem_tensor((4, buffered), Float32)
+                value_values = cute.make_rmem_tensor((4, buffered), Float32)
+                for key_stage in cutlass.range_constexpr(128 // self.key_chunk):
+                    if cutlass.const_expr(key_stage != 0):
+                        # Each reader acquires the completed TMA transfer.
+                        cute.arch.mbarrier_wait(state_barrier.iterator, key_stage % 2)
+                    q_rows = cute.local_tile(sQ, (16, self.key_chunk), (0, key_stage))
+                    for fragment in cutlass.range_constexpr(buffered):
+                        column = (group * buffered + fragment) * 32 + warp * 8
+                        initial = None
+                        if cutlass.const_expr(key_stage != 0):
+                            initial = state_values[None, fragment].load()
+                        result = _dot_tf32(
+                            q_rows,
+                            sH,
+                            lane,
+                            column,
+                            self.key_chunk,
+                            False,
+                            self.accumulators,
+                            initial,
+                        )
+                        state_values[None, fragment].store(result)
+                    if cutlass.const_expr(key_stage + 1 < 128 // self.key_chunk):
+                        # All warps must finish reading before TMA reuses this buffer.
+                        cute.arch.sync_threads()
+                        self.load_state(
+                            pool,
+                            ps,
+                            idx,
+                            hv,
+                            tile,
+                            tid,
+                            warp,
+                            sH,
+                            state_barrier,
+                            state_atom,
+                            state_source,
+                            (key_stage + 1) * self.key_chunk,
+                            False,
+                        )
+                    if cutlass.const_expr(key_stage == 0):
+                        for fragment in cutlass.range_constexpr(buffered):
+                            column = (group * buffered + fragment) * 32 + warp * 8
+                            result = _dot_tf32(
+                                sQK,
+                                sV,
+                                lane,
+                                column,
+                                self.reduction_bound,
+                                True,
+                                self.accumulators,
+                                None,
+                            )
+                            value_values[None, fragment].store(result)
+                for fragment in cutlass.range_constexpr(buffered):
+                    column = (group * buffered + fragment) * 32 + warp * 8
+                    output_values = cute.make_rmem_tensor(4, Float32)
+                    output_values.store(
+                        state_values[None, fragment].load()
+                        + value_values[None, fragment].load()
+                    )
+                    row, col = lane // 4, column + (lane % 4) * 2
+                    for j in cutlass.range_constexpr(4):
+                        r = row + (j // 2) * 8
+                        vc = col + (j % 2)
+                        if r < tokens:
+                            out[
+                                ((output_start + r) * self.vheads + hv) * 128
+                                + col_base
+                                + vc
+                            ] = out.element_type(output_values[j])
 
 
 _COMPILED = {}
 _DUAL_ACCUMULATORS_MAX_HEADS = 64
 _WIDE_VALUES_MIN_HEADS = 256
 _STREAM_STATE_MAX_HEADS = 1024
+# The full-K V128 FP32 T16 kernel uses just under 100 KiB per CTA.
+_T16_WIDE_FP32_SMEM_BYTES = 100 * 1024
 
 
 def gdn_wy_launch_config(
-    batch: int, vheads: int, token_bound: int, state_dtype: torch.dtype
-) -> tuple[int, int, int, int]:
+    batch: int,
+    vheads: int,
+    token_bound: int,
+    state_dtype: torch.dtype,
+    sm_count: int,
+    wide_fp32_t16: bool,
+    *,
+    use_tma_qkv: bool,
+    use_tma_state: bool,
+) -> tuple[int, int, int, int, int]:
     """Return bounded launch choices for the serving geometry.
 
     Args:
@@ -1125,39 +1365,82 @@ def gdn_wy_launch_config(
         vheads: Value heads on this rank.
         token_bound: The 4/8/16-token bucket.
         state_dtype: Recurrent-state pool dtype.
+        sm_count: Number of SMs available to the launch.
+        wide_fp32_t16: Whether the GPU can fit the full V128 FP32 tile.
+        use_tma_qkv: Whether the input projections can use TMA.
+        use_tma_state: Whether the state pool can use TMA.
 
     Returns:
-        Value tile, accumulator count, Gram rows and checkpoint key chunk.
+        Value tile, accumulator count, Gram rows, checkpoint key chunk and
+        number of transfer buffers.
     """
-    value_tile = 128 if batch * vheads >= _WIDE_VALUES_MIN_HEADS else 64
-    if token_bound == 16 and state_dtype == torch.float32:
-        value_tile = 64
+    request_heads = batch * vheads
+    use_tma = use_tma_qkv and use_tma_state
+    value_tile = 128 if request_heads >= _WIDE_VALUES_MIN_HEADS else 64
     accumulators = (
-        2 if token_bound == 8 and batch * vheads <= _DUAL_ACCUMULATORS_MAX_HEADS else 1
+        2 if token_bound == 8 and request_heads <= _DUAL_ACCUMULATORS_MAX_HEADS else 1
     )
     gram_rows = 8 if token_bound == 8 else 16
-    key_chunk = (
-        64
-        if token_bound == 4
-        and _WIDE_VALUES_MIN_HEADS <= batch * vheads <= _STREAM_STATE_MAX_HEADS
+    key_chunk, pipeline_stages = 128, 1
+    if (
+        token_bound == 4
+        and _WIDE_VALUES_MIN_HEADS <= request_heads <= _STREAM_STATE_MAX_HEADS
         and state_dtype == torch.bfloat16
-        else 128
-    )
-    return value_tile, accumulators, gram_rows, key_chunk
+    ):
+        key_chunk = 64
+    if (
+        token_bound == 8
+        and use_tma
+        and value_tile == 128
+        and state_dtype == torch.float32
+        and request_heads > 2 * sm_count
+    ):
+        key_chunk, pipeline_stages = 32, 2
+    if token_bound == 16:
+        if use_tma:
+            # A full value tile saves a second CTA once there is work for every SM.
+            value_tile = 128 if request_heads >= sm_count else 64
+        if state_dtype == torch.float32:
+            if not use_tma or not wide_fp32_t16:
+                value_tile = 64
+            elif value_tile == 128 and request_heads > 2 * sm_count:
+                # Above two waves, streaming state lets more wide CTAs reside.
+                key_chunk = 64
+    return value_tile, accumulators, gram_rows, key_chunk, pipeline_stages
 
 
 def _warmup_launch_configs(
-    vheads: int, token_bound: int, state_dtype: torch.dtype
-) -> tuple[tuple[int, int, int, int], ...]:
+    vheads: int,
+    token_bound: int,
+    state_dtype: torch.dtype,
+    sm_count: int,
+    wide_fp32_t16: bool,
+    *,
+    use_tma_qkv: bool,
+    use_tma_state: bool,
+) -> tuple[tuple[int, int, int, int, int], ...]:
     batches = {
         1,
         _DUAL_ACCUMULATORS_MAX_HEADS // vheads + 1,
         (_WIDE_VALUES_MIN_HEADS + vheads - 1) // vheads,
         _STREAM_STATE_MAX_HEADS // vheads + 1,
     }
+    if token_bound >= 8:
+        batches.add(2 * sm_count // vheads + 1)
+    if token_bound == 16:
+        batches.add((sm_count + vheads - 1) // vheads)
     return tuple(
         dict.fromkeys(
-            gdn_wy_launch_config(batch, vheads, token_bound, state_dtype)
+            gdn_wy_launch_config(
+                batch,
+                vheads,
+                token_bound,
+                state_dtype,
+                sm_count,
+                wide_fp32_t16,
+                use_tma_qkv=use_tma_qkv,
+                use_tma_state=use_tma_state,
+            )
             for batch in sorted(batches)
         )
     )
@@ -1189,6 +1472,8 @@ def launch_gdn_wy(
     ``_COMPILED`` caches one kernel per device, operand dtypes, model geometry,
     execution flags and bounded launch/transport choices. Token bounds use
     4/8/16 buckets; value tiles and accumulators follow batch/head thresholds.
+    Wide FP32 T8 can use two buffers for K32 checkpoint chunks and half-window
+    QKV chunks. Wide FP32 T16 can stream two K64 chunks through one buffer.
     Actual batch/token counts, strides and scale remain runtime inputs. A cache
     miss compiles all Q/K/V and state transport combinations; ``kernel_warmup``
     also prepares reachable launch tiers for the selected token bucket.
@@ -1259,13 +1544,25 @@ def launch_gdn_wy(
         else None
     )
     token_bound = 4 if T <= 4 else 8 if T <= 8 else 16
-    value_tile, accumulators, gram_rows, key_chunk = gdn_wy_launch_config(
-        B, HV, token_bound, initial_state.dtype
+    sm_count, wide_fp32_t16 = 0, False
+    if token_bound >= 8:
+        properties = torch.cuda.get_device_properties(q.device)
+        sm_count = properties.multi_processor_count
+        wide_fp32_t16 = (
+            properties.shared_memory_per_block_optin >= _T16_WIDE_FP32_SMEM_BYTES
+        )
+    state_dtype = initial_state.dtype
+    config = gdn_wy_launch_config(
+        B,
+        HV,
+        token_bound,
+        state_dtype,
+        sm_count,
+        wide_fp32_t16,
+        use_tma_qkv=use_tma_qkv,
+        use_tma_state=use_tma_state,
     )
-    configs = ((value_tile, accumulators, gram_rows, key_chunk),)
-    if is_warming_up():
-        configs = _warmup_launch_configs(HV, token_bound, initial_state.dtype)
-    key = (
+    signature = (
         q.device.index,
         tuple(x.dtype for x in tensors),
         H,
@@ -1274,14 +1571,9 @@ def launch_gdn_wy(
         tree_ancestors is not None,
         replay_payload is not None,
         pdl,
-        use_tma_qkv,
-        use_tma_state,
-        accumulators,
-        value_tile,
         token_bound,
-        gram_rows,
-        key_chunk,
     )
+    key = (*signature, use_tma_qkv, use_tma_state, *config)
     with torch.cuda.device(q.device):
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         args = (
@@ -1294,33 +1586,42 @@ def launch_gdn_wy(
             state_tensor,
             stream,
         )
-        for value_tile, accumulators, gram_rows, key_chunk in configs:
-            config_key = (
-                *key[:10],
-                accumulators,
-                value_tile,
-                token_bound,
-                gram_rows,
-                key_chunk,
-            )
-            compiled = _COMPILED.get(config_key)
-            if compiled is None:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "GDN WY must be warmed before CUDA Graph capture"
-                    )
-                # Graph replay may refresh from a contiguous input to a strided view.
-                # Warm both transport variants together before any graph capture.
-                for qkv_variant in (False, True):
-                    for state_variant in (False, True):
-                        variant_key = (
-                            *config_key[:8],
-                            qkv_variant,
-                            state_variant,
-                            *config_key[10:],
+        warming_up = is_warming_up()
+        if warming_up or key not in _COMPILED:
+            # Graph replay can change both the alignment and the launch tier.
+            for qkv_variant in (False, True):
+                for state_variant in (False, True):
+                    if warming_up:
+                        configs = _warmup_launch_configs(
+                            HV,
+                            token_bound,
+                            state_dtype,
+                            sm_count,
+                            wide_fp32_t16,
+                            use_tma_qkv=qkv_variant,
+                            use_tma_state=state_variant,
                         )
+                    else:
+                        configs = (
+                            gdn_wy_launch_config(
+                                B,
+                                HV,
+                                token_bound,
+                                state_dtype,
+                                sm_count,
+                                wide_fp32_t16,
+                                use_tma_qkv=qkv_variant,
+                                use_tma_state=state_variant,
+                            ),
+                        )
+                    for variant in configs:
+                        variant_key = (*signature, qkv_variant, state_variant, *variant)
                         if variant_key in _COMPILED:
                             continue
+                        if torch.cuda.is_current_stream_capturing():
+                            raise RuntimeError(
+                                "GDN WY must be warmed before CUDA Graph capture"
+                            )
                         variant_qkv, variant_state = None, None
                         if qkv_variant:
                             if use_tma_qkv:
@@ -1347,12 +1648,13 @@ def launch_gdn_wy(
                                 warm_state = torch.empty(
                                     (1, HV, 128, 128),
                                     device=initial_state.device,
-                                    dtype=initial_state.dtype,
+                                    dtype=state_dtype,
                                 )
                                 variant_state = from_dlpack(
                                     warm_state, assumed_align=16
                                 ).mark_layout_dynamic(leading_dim=3)
                         variant_args = (*args[:5], variant_qkv, variant_state, stream)
+                        value_tile, accumulators, gram_rows, key_chunk, stages = variant
                         _COMPILED[variant_key] = cute.compile(
                             GdnWYKernel(
                                 H,
@@ -1368,6 +1670,7 @@ def launch_gdn_wy(
                                 state_variant,
                                 gram_rows,
                                 key_chunk,
+                                stages,
                             ),
                             *variant_args,
                         )

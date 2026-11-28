@@ -94,11 +94,38 @@ Normalization and raw payload stores reuse the loaded values. Four-token
 
 Checkpoint tiles retain their source dtype and padded K-last shared layout.
 Aligned pools with a 16-byte-aligned physical row stride use TMA. The transfer
-box includes the row padding beyond K=128, which TMA zero-fills without
-reading past a global row. Odd pool strides and unaligned bases retain the
+box includes row padding. Intermediate chunks can reread keys within the row,
+and TMA zero-fills beyond K=128. Odd pool strides and unaligned bases retain the
 per-row 16-byte asynchronous or scalar copies. Negative indices zero-fill
 the tile in either transport. Checkpoint completion is independent of Q/K/V
 completion, so coefficient preparation overlaps the state transfer.
+
+Eight-token buckets with V128 and FP32 state use two transfer buffers when
+both Q/K/V and the checkpoint support TMA and there are more than two
+request/head pairs per SM. The smaller shared-memory footprint allows more
+wide FP32 CTAs to reside on an SM. Q/K/V transfers split the token bucket in
+half, and checkpoint transfers split K=128 into four K32 chunks. The first
+two chunks are prefetched before normalization. After every state product,
+all warps finish reading the current buffer before TMA refills that buffer two
+chunks ahead. The next state product and the value product overlap these
+transfers. Each buffer has an independent completion barrier whose phase
+changes on reuse. Output fragments
+stay in registers across the four chunks, so no checkpoint chunk is reread
+for a second value fragment. Q/K/V storage stays the same size, while the
+checkpoint buffers together hold roughly half the original full-K tile.
+Stage count and K chunk size are bounded compilation choices, warmed for every
+transport. Request lengths, offsets and tensor strides remain runtime values.
+
+In sixteen-token buckets TMA copies each Q/K/V tile in one transfer. The
+output MMA reads the padded V tile directly from shared memory in its input
+dtype, eliminating the separate FP32 copy. With aligned state and projection
+tiles, V128 handles an entire value head per CTA once the batch has at least one
+request/head pair per SM. A wide FP32 tile reads all 128 keys at up to two
+pairs per SM. Beyond that threshold it streams two K64 chunks through one
+buffer to improve SM residency. After the first state product, the value
+product overlaps the second state load. The CTA synchronizes before the
+buffer is reused, and each reader waits on the TMA completion barrier.
+Launches with less shared memory use V64 for FP32 state.
 
 BF16 four-token windows with 256–1024 request/head pairs stream the checkpoint
 through one shared buffer in two 64-key stages. This reduces shared-memory
