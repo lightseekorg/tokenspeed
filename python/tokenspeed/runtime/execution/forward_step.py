@@ -1607,10 +1607,13 @@ class ForwardStepRunner:
                 if self.dp_local_graph:
                     # This graph's MoE input contains only its local rows.
                     # No peer physical query sizes are known or needed here.
-                    rows = self._expert_load_rows.rows(query_tokens)
-                    rows.fill_(True)
-                    if not packed:
-                        rows[bs * self.max_tokens_per_req :].fill_(False)
+                    for mask in (
+                        self._expert_load_rows.rows(query_tokens),
+                        self._expert_load_rows.local_rows(query_tokens),
+                    ):
+                        mask.fill_(True)
+                        if not packed:
+                            mask[bs * self.max_tokens_per_req :].fill_(False)
                 else:
                     self._expert_load_rows.mark_padded(
                         padded_global_num_tokens=[query_tokens] * self.world_size,

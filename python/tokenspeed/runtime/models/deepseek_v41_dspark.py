@@ -544,6 +544,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
 class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigurator):
     """Strict mtp-only adapter sharing embedding/head with its V4.1 target."""
 
+    # Draft execution does not participate in target EPLB placement or rebalance.
+    supports_expert_placement = False
     # Match the target-only blacklist: proposals stay unmasked; target verify
     # still rejects them through the target's masked distribution.
     logits_processor_cls = LogitsProcessor

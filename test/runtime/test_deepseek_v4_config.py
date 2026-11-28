@@ -320,6 +320,7 @@ class TestDeepseekV4Config:
             experts=routed_experts,
             topk=topk,
             _routing_inputs=routing_inputs,
+            expert_dispatch_info=None,
         )
         return self._bind_deepseek_v4_moe_methods(moe)
 
@@ -343,6 +344,7 @@ class TestDeepseekV4Config:
                 routed_scaling_factor=2.0,
                 hash_routing=False,
                 weights_dtype=torch.bfloat16,
+                ep_rank=0,
             )(hidden_states, router_logits)
 
         assert (output.topk_weights) is (topk_weights)
@@ -371,6 +373,7 @@ class TestDeepseekV4Config:
                 routed_scaling_factor=1.0,
                 hash_routing=False,
                 weights_dtype=torch.float32,
+                ep_rank=0,
             )(torch.ones((2, 3)), router_logits)
             expected = topk_module.simulated_router_logits(router_logits)
 
@@ -665,6 +668,7 @@ class TestDeepseekV4Config:
             experts=routed_experts,
             topk=topk,
             _routing_inputs=routing_inputs,
+            expert_dispatch_info=None,
         )
         return self._bind_deepseek_v4_moe_methods(moe)
 

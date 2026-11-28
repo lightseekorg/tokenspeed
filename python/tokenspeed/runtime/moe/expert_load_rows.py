@@ -43,10 +43,27 @@ from collections.abc import Sequence
 
 import torch
 
-from tokenspeed.runtime.distributed.comm_manager import moe_input_row_segments
+from tokenspeed.runtime.distributed.comm_manager import (
+    local_moe_input_row_segment,
+    moe_input_row_segments,
+)
 from tokenspeed.runtime.distributed.mapping import Mapping
 
 __all__ = ["ExpertLoadRowMask", "LayerExpertLoad"]
+
+
+class _LocalExpertLoadRowMask:
+    """Local-rank view of ``ExpertLoadRowMask`` for all-to-all EP routers."""
+
+    def __init__(self, parent: ExpertLoadRowMask) -> None:
+        self._parent = parent
+
+    @property
+    def mask(self) -> torch.Tensor | None:
+        return self._parent.local_mask
+
+    def rows(self, num_rows: int) -> torch.Tensor:
+        return self._parent.local_rows(num_rows)
 
 
 class ExpertLoadRowMask:
@@ -61,6 +78,9 @@ class ExpertLoadRowMask:
         self._mapping = mapping
         # [max_rows] bool on the placement's device; None until reserved.
         self.mask: torch.Tensor | None = None
+        # Local-rank [max_rows] bool for all-to-all EP routers that run before
+        # any peer row exchange.
+        self.local_mask: torch.Tensor | None = None
 
     @property
     def max_rows(self) -> int:
@@ -76,25 +96,38 @@ class ExpertLoadRowMask:
                 (the MoE TP-EP group size times the per-rank forward bound).
             device: Where the MoE layers run.
         """
-        if self.mask is not None:
+        if self.mask is not None or self.local_mask is not None:
             raise RuntimeError("the expert load row mask is already reserved")
         if max_rows <= 0:
             raise ValueError("max_rows must be positive")
         self.mask = torch.ones(max_rows, dtype=torch.bool, device=device)
+        self.local_mask = torch.ones(max_rows, dtype=torch.bool, device=device)
 
-    def rows(self, num_rows: int) -> torch.Tensor:
-        """The ``[num_rows]`` view the router reads for a forward of that many rows."""
-        if self.mask is None:
+    @staticmethod
+    def _slice_mask(mask: torch.Tensor | None, num_rows: int) -> torch.Tensor:
+        if mask is None:
             raise RuntimeError(
                 "the expert load row mask has not been reserved; "
                 "ModelRunner.prepare_communication_runtime reserves it"
             )
-        if num_rows > self.mask.shape[0]:
+        if num_rows > mask.shape[0]:
             raise ValueError(
                 f"a forward with {num_rows} MoE rows exceeds the reserved "
-                f"{self.mask.shape[0]}"
+                f"{mask.shape[0]}"
             )
-        return self.mask[:num_rows]
+        return mask[:num_rows]
+
+    def rows(self, num_rows: int) -> torch.Tensor:
+        """The ``[num_rows]`` view the router reads for a forward of that many rows."""
+        return self._slice_mask(self.mask, num_rows)
+
+    def local_rows(self, num_rows: int) -> torch.Tensor:
+        """The ``[num_rows]`` local-rank mask for routers running before all-to-all."""
+        return self._slice_mask(self.local_mask, num_rows)
+
+    def local_view(self) -> _LocalExpertLoadRowMask:
+        """Adapter exposing ``local_rows`` through ``.rows(num_rows)``."""
+        return _LocalExpertLoadRowMask(self)
 
     def mark_padded(
         self,
@@ -114,6 +147,18 @@ class ExpertLoadRowMask:
             padded_global_num_tokens=padded_global_num_tokens,
             live_global_num_tokens=live_global_num_tokens,
         )
+        local_rows, local_live = local_moe_input_row_segment(
+            self._mapping,
+            padded_global_num_tokens=padded_global_num_tokens,
+            live_global_num_tokens=live_global_num_tokens,
+        )
+        local_mask = self.local_rows(local_rows)
+        if local_live == local_rows:
+            local_mask.fill_(True)
+        else:
+            local_mask[:local_live].fill_(True)
+            local_mask[local_live:].fill_(False)
+
         total = sum(rows for rows, _ in segments)
         mask = self.rows(total)
         if all(live == rows for rows, live in segments):
@@ -130,9 +175,10 @@ class ExpertLoadRowMask:
 
     def clear(self) -> None:
         """Every row counts again: called right after a padded replay."""
-        if self.mask is None:
+        if self.mask is None or self.local_mask is None:
             raise RuntimeError("the expert load row mask has not been reserved")
         self.mask.fill_(True)
+        self.local_mask.fill_(True)
 
 
 class LayerExpertLoad:

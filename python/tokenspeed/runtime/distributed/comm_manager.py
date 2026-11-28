@@ -115,6 +115,41 @@ def scattered_moe_source_rows(
     return segments
 
 
+def local_moe_input_row_segment(
+    mapping: Mapping,
+    *,
+    padded_global_num_tokens: Sequence[int],
+    live_global_num_tokens: Sequence[int],
+) -> tuple[int, int]:
+    """``(rows, live_rows)`` of this rank's own local rows before all-to-all EP.
+
+    Under all-to-all EP (MegaMoE, DeepEP, Gluon Petit), the router sees only the
+    rows produced on this rank by ``post_attn_comm`` rather than the all-gather
+    across the MoE TP-EP group: either the whole attention-DP group when
+    attention TP equals MoE TPxEP, or this rank's scattered shard otherwise.
+    """
+    if (
+        len(padded_global_num_tokens) != mapping.world_size
+        or len(live_global_num_tokens) != mapping.world_size
+    ):
+        raise ValueError(
+            f"MoE row tables must have world_size={mapping.world_size} entries"
+        )
+    attn = mapping.attn
+    moe_all_reduce = attn.tp_size == mapping.moe.tp_ep_size
+    if not moe_all_reduce and (mapping.moe.has_tp_ep or mapping.has_attn_tp):
+        return scattered_moe_source_rows(
+            mapping,
+            padded_global_num_tokens,
+            live_global_num_tokens,
+            (mapping.rank,),
+        )[0]
+    padded, live, _ = _dp_group_rows(
+        attn, mapping.rank, padded_global_num_tokens, live_global_num_tokens
+    )
+    return (padded, live)
+
+
 def moe_input_row_segments(
     mapping: Mapping,
     *,
@@ -150,17 +185,13 @@ def moe_input_row_segments(
         return scattered_moe_source_rows(
             mapping, padded_global_num_tokens, live_global_num_tokens, ranks
         )
-    if (
-        len(padded_global_num_tokens) != mapping.world_size
-        or len(live_global_num_tokens) != mapping.world_size
-    ):
-        raise ValueError(
-            f"MoE row tables must have world_size={mapping.world_size} entries"
+    return [
+        local_moe_input_row_segment(
+            mapping,
+            padded_global_num_tokens=padded_global_num_tokens,
+            live_global_num_tokens=live_global_num_tokens,
         )
-    padded, live, _ = _dp_group_rows(
-        attn, mapping.rank, padded_global_num_tokens, live_global_num_tokens
-    )
-    return [(padded, live)]
+    ]
 
 
 def dp_group_row_counts(
