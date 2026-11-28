@@ -238,10 +238,12 @@ def torch_qwen4_exp_qsa_pool_compress(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Mean-pool each row's ``ratio`` logical positions ending at it.
 
-    A pooled position comes from the current batch when an earlier row of
-    the same request holds it, otherwise from the request's raw recent page
-    at slot ``position % ratio``. The pool's first position value likewise
-    comes from the batch or the page's position cache.
+    A pooled position ``k`` steps back comes from the current batch when the
+    row ``k`` rows earlier belongs to the same request and holds it (a
+    request's rows are contiguous with consecutive positions), otherwise from
+    the request's raw recent page at slot ``position % ratio``. The pool's
+    first position value likewise comes from the batch or the page's position
+    cache.
 
     Returns:
         ``(pooled [rows, ...] in raw's dtype, first position values)``.
