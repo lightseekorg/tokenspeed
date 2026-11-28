@@ -1007,6 +1007,7 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: str | None = None
     disaggregation_layerwise_interval: int = 1
+    disaggregation_max_remote_admissions_per_round: int = 1
     pdlb_url: str | None = None
 
     # For communication + norm fusion
@@ -1961,6 +1962,13 @@ class ServerArgs:
         if self.disaggregation_mode != "prefill":
             return 0
         return self.prefill_chunk_yield_tokens
+
+    @property
+    def scheduler_max_remote_admissions_per_round(self) -> int:
+        """The most waiting remote prefills a Decode round admits at once."""
+        if self.disaggregation_mode != "decode":
+            return 1
+        return self.disaggregation_max_remote_admissions_per_round
 
     @property
     def retraction_snapshot_pool_disabled(self) -> bool:
@@ -3128,6 +3136,23 @@ class ServerArgs:
                     f"--chunked-prefill-size ({self.chunked_prefill_size}); got "
                     f"{self.prefill_chunk_yield_tokens}"
                 )
+        if (
+            isinstance(self.disaggregation_max_remote_admissions_per_round, bool)
+            or self.disaggregation_max_remote_admissions_per_round < 1
+        ):
+            raise ValueError(
+                "--disaggregation-max-remote-admissions-per-round must be >= 1; got "
+                f"{self.disaggregation_max_remote_admissions_per_round}"
+            )
+        if (
+            self.disaggregation_max_remote_admissions_per_round > 1
+            and self.disaggregation_mode not in ("prefill", "decode")
+        ):
+            raise ValueError(
+                "--disaggregation-max-remote-admissions-per-round > 1 is only for "
+                "disaggregated servers (--disaggregation-mode decode; a prefill "
+                "server ignores it)"
+            )
 
     def validate_forward_reload(self):
         """A forward reload recaptures graphs, which tagged pools cannot, and spans one engine, which PD roles are not."""
@@ -6226,6 +6251,15 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_layerwise_interval,
             help="The interval of layerwise transfer for disaggregation. Default is 1.",
+        )
+        parser.add_argument(
+            "--disaggregation-max-remote-admissions-per-round",
+            type=int,
+            default=ServerArgs.disaggregation_max_remote_admissions_per_round,
+            metavar="N",
+            help="Decode servers: the most bootstrapped remote prefills "
+            "admitted in one scheduler round. Default is 1; a prefill server "
+            "ignores it.",
         )
         parser.add_argument(
             "--pdlb-url",

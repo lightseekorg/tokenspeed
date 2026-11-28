@@ -270,6 +270,25 @@ def test_contract_serializes_sink_retention() -> None:
         )
 
 
+def test_contract_omits_scheduler_local_boundary_only_flag_from_wire() -> None:
+    spec = CacheGroupSpec(
+        group_id="tail",
+        attn_kind="sliding_window",
+        rows_per_page=2,
+        entry_stride_tokens=1,
+        sliding_window_tokens=2,
+        transfer_policy="full_suffix",
+        replayable=True,
+        boundary_only_in_prefill=True,
+    )
+    contract = _contract((spec,), (_field("tail", "layer.0.tail"),))
+    payload = json.loads(contract.to_wire_bytes())
+    wire_spec = payload["group_specs"][0]
+    assert "boundary_only_in_prefill" not in wire_spec
+    assert wire_spec["replayable"] is True
+    assert CacheGroupSpec(**wire_spec).boundary_only_in_prefill is False
+
+
 def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
     plane_bytes = 512
     lcm_block_bytes = 1024

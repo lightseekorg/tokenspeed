@@ -53,10 +53,10 @@ class CacheContractError(ValueError):
     """A cache pool or its plan violated the runtime cache contract."""
 
 
-def _dump_wire_json(value: object, *, name: str, maximum: int) -> bytes:
+def _dump_wire_json(payload: object, *, name: str, maximum: int) -> bytes:
     try:
         result = json.dumps(
-            asdict(value),  # type: ignore[arg-type]
+            payload,
             separators=(",", ":"),
         ).encode()
     except (TypeError, ValueError, OverflowError) as exc:
@@ -107,8 +107,13 @@ class CacheTransferContract:
                 raise CacheContractError("field addresses must be nonzero uint64")
 
     def to_wire_bytes(self) -> bytes:
+        payload = asdict(self)
+        # boundary_only_in_prefill is a scheduler-local prefill retention hint;
+        # ts-pd's strict wire schema parses only the transfer contract fields.
+        for spec_dict in payload["group_specs"]:
+            spec_dict.pop("boundary_only_in_prefill", None)
         return _dump_wire_json(
-            self,
+            payload,
             name="cache transfer contract",
             maximum=MAX_CACHE_CONTRACT_WIRE_BYTES,
         )

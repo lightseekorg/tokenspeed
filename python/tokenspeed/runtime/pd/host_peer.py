@@ -42,8 +42,9 @@ import importlib.util
 import ipaddress
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from tokenspeed_kernel.platform import current_platform
 
@@ -205,12 +206,29 @@ class _HostPeer:
         self.role_settings = role_settings
         self._outbox = outbox
 
-    def execute(self, op) -> None:
-        """The plan's remote stream ``op`` may go out: the host plans and
-        sends it from the plan it staged. Runs on the forward thread, inside
-        the plan's execution."""
+    def execute(
+        self,
+        op,
+        *,
+        landing_fences: Sequence[Any] = (),
+        fence_device: tuple[str, int] | None = None,
+    ) -> None:
+        """The plan's remote stream ``op`` may go out once ``landing_fences`` finish.
+
+        The host takes ownership of the staged stream immediately on the forward
+        thread and, when landing fences are provided on Decode, synchronizes them
+        and dispatches manifests on an ordered worker thread so ``ts-forward``
+        never stalls behind device completion.
+        """
         del op  # The host reads the stream off the plan itself.
-        self._outbox.remote_stream_ready()
+        fences = list(landing_fences)
+        if not fences:
+            self._outbox.remote_stream_ready()
+            return
+        device_type, device_index = (
+            fence_device if fence_device is not None else (None, None)
+        )
+        self._outbox.remote_stream_ready(fences, device_type, device_index)
 
     def release_cache_registration(self) -> None:
         """A sleep releases the cache: the host deregisters it from its

@@ -62,7 +62,7 @@ pub use control::{
     BootstrapInfo, EmbeddingChunk, EmbeddingItem, EmbeddingReceiver, EmbeddingSender, LandedItem,
     LandedRequest, PdError, PdEvent, RemotePrefill, TransferPeer,
 };
-pub use decode::{DecodeConfig, DecodeOutbox, DecodePeer};
+pub use decode::{DecodeConfig, DecodeOutbox, DecodePeer, PendingRemotePrefill};
 pub use layout::{
     registration::{PrefillLayout, PrefillRoute},
     LayoutError,

@@ -239,6 +239,7 @@ class DeepseekV41Recipe(CacheRecipe):
                 entry_stride_tokens=stride,
                 sliding_window_tokens=windows[gid],
                 replayable=windows[gid] is not None,
+                boundary_only_in_prefill=gid == V41_COMPRESSOR_TAIL_GROUP_ID,
                 transfer_policy=None,
             )
             for gid, (rows, stride) in V41_GROUP_GEOMETRY.items()

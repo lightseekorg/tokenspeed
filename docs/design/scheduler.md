@@ -1752,16 +1752,17 @@ phase does not exist in its grammar; `Validate` refuses a snapshot pool on it.
    a cache op: no token budget, no batch slot, no forward.
 2. The decode batch (`scheduleDecodeBatch`) — every PrefillDone first decode
    and Decoding step; decodes consume no token budget on this role.
-3. At most **one** remote admission — the whole prompt at once (the peer
-   prefills it), riding `plan.remote_prefill` **beside** the decode batch: it
-   consumes no token budget and no batch slot, so there is nothing to defer
-   for. Capped at one per round because each reserves an entire prompt's
-   pages; a queue's worth in one round would drain the pool before any KV
-   arrives. Head-of-line (1.1) does not apply — there is no mid-way. A restore
-   that failed for capacity in phase 1 **seals** this phase: a newcomer taking
-   the pages it waits for would starve it. So does a lone-request compaction
-   in phase 2: evicting a block it moved, an admission would store bytes the
-   plan's copies have not written yet (§1.4).
+3. Bounded remote admissions (`SchedulerConfig::max_remote_admissions_per_round`,
+   default `1`, `--disaggregation-max-remote-admissions-per-round`) — whole
+   prompts at once (the peer prefills them), riding `plan.remote_prefill`
+   **beside** the decode batch: they consume no token budget and no batch
+   slots, so there is nothing to defer for. Capped per round because each
+   reserves an entire prompt's pages; an unbounded burst in one round would
+   drain the pool before any KV arrives. Head-of-line (1.1) does not apply
+   — there is no mid-way. A restore that failed for capacity in phase 1
+   **seals** this phase: a newcomer taking the pages it waits for would starve
+   it. So does a lone-request compaction in phase 2: evicting a block it moved,
+   an admission would store bytes the plan's copies have not written yet (§1.4).
    Remote admission therefore bypasses local prefill chunking and prefix
    promotion boundaries; the destination tables must cover the entire
    unmatched suffix and each replayable group's complete retained window

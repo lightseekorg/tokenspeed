@@ -4849,11 +4849,56 @@ def test_pd_prefill_to_sharded_decode_contract(dspark, prefill_kvp):
             elif name.endswith(".compressor_tail"):
                 assert field.group_id == TAIL
         assert any(".dspark_kv" in name for name in fields) == dspark
+        assert groups[TAIL].boundary_only_in_prefill is True
+        assert all(
+            not group.boundary_only_in_prefill
+            for group_id, group in groups.items()
+            if group_id != TAIL
+        )
         # This is the wire representation consumed by the Rust planner.
-        assert contract.to_wire_bytes()
+        wire_bytes = contract.to_wire_bytes()
+        assert wire_bytes
+        import json
+
+        wire_specs = json.loads(wire_bytes)["group_specs"]
+        assert all("boundary_only_in_prefill" not in item for item in wire_specs)
     assert {field.field_id for field in source.plan.fields} == {
         field.field_id for field in destination.plan.fields
     }
+    if not dspark and prefill_kvp == 1:
+        import urllib.request
+
+        from tokenspeed_engine import BootstrapServer
+
+        server = BootstrapServer(0, cache_layouts=True)
+        try:
+            wire_layout = replace(source, field_addresses=None).to_wire_bytes()
+            body = json.dumps(
+                {
+                    "role": "Prefill",
+                    "world_size": prefill_kvp,
+                    "dp_size": 1,
+                    "pp_size": 1,
+                    "cache_fields_by_stage": [
+                        [field.field_id for field in source.plan.fields]
+                    ],
+                    "rank_ip": "127.0.0.1",
+                    "engine_rank": 0,
+                    "rank_port": 7100,
+                    "cache_layout": wire_layout.decode("ascii"),
+                    "decode_allocation_policy": "early",
+                }
+            ).encode()
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{server.port}/route",
+                data=body,
+                method="PUT",
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                assert resp.status == 200
+        finally:
+            server.close()
 
 
 @pytest.mark.parametrize("size", [2, 4, 8])

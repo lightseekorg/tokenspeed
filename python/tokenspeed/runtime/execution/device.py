@@ -751,14 +751,20 @@ class DeviceHandle:
             # landed, so masking continues from the right state.
             result = self._launch_forward(planned)
 
-        # Both transfer triggers are CPU-issued and write outside CUDA
-        # streams. Wait after launching this plan's forward, so that forward
-        # can overlap the loads while the landing waits for every prerequisite.
-        for fence in landing_fences:
-            fence.synchronize()
+        # Wait for landing fences on the forward thread only for peer fetches;
+        # remote_prefill transfers hand their fences directly to the host outbox
+        # worker so ts-forward never blocks waiting on device completion.
         if remote_prefill is not None:
-            peer.execute(remote_prefill)
+            dev = torch.device(executor.device)
+            fence_device = (dev.type, dev.index) if dev.index is not None else None
+            peer.execute(
+                remote_prefill,
+                landing_fences=landing_fences,
+                fence_device=fence_device,
+            )
         if peer_fetches:
+            for fence in landing_fences:
+                fence.synchronize()
             self._peer_outbox.reads_ready()
         return result
 
@@ -2455,7 +2461,13 @@ class TransferPeer(Protocol):
 
     mode: str
 
-    def execute(self, op) -> None: ...
+    def execute(
+        self,
+        op,
+        *,
+        landing_fences: Sequence[Any] = (),
+        fence_device: tuple[str, int] | None = None,
+    ) -> None: ...
 
 
 def _only_aliases_inputs(func) -> bool:

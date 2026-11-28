@@ -405,5 +405,63 @@ def test_cache_factory_exposes_only_typed_arena() -> None:
     )
 
 
+def test_bootstrap_server_accepts_boundary_only_replayable_group_contract() -> None:
+    tail_layout = make_layout(
+        make_group(
+            "tail",
+            make_segment(
+                "layer.0.tail", dtype="bfloat16", shape=(8,), offset=0, stride=16
+            ),
+            attn_kind="sliding_window",
+            window=2,
+        ),
+        capacity=16,
+        page_bytes=16,
+    )
+    tail_spec = replace(
+        tail_layout.group_specs[0],
+        replayable=True,
+        boundary_only_in_prefill=True,
+    )
+    contract = replace(tail_layout, group_specs=(tail_spec,))
+    wire = contract.to_wire_bytes()
+    assert "boundary_only_in_prefill" not in json.loads(wire)["group_specs"][0]
+
+    server = BootstrapServer(0, cache_layouts=True)
+    try:
+        kv_args = KVArgs(
+            engine_rank=0,
+            kv_data_ptr=_SOURCE,
+            ib_device="",
+            gpu_id=0,
+            cache_layout=contract,
+            wire_cache_layout=replace(contract, field_addresses=None),
+            cache_fields_by_stage=(("layer.0.tail",),),
+            cache_producer_schedule=build_cache_fields_by_producer_step(
+                contract.plan, producer_fields_by_step=(("layer.0.tail",),)
+            ),
+        )
+        settings = _prefill_settings(
+            _server_args(server.port),
+            kv_args,
+            PDParallelTopology(
+                tp_size=1,
+                tp_rank=0,
+                dp_size=1,
+                dp_rank=0,
+                world_size=1,
+                global_rank=0,
+            ),
+            "127.0.0.1",
+        )
+        payload = json.loads(settings.bootstrap_payload)
+        status, body = _http(
+            settings.bootstrap_url, body={**payload, "rank_port": 7100}
+        )
+        assert status == 200, body
+    finally:
+        server.close()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

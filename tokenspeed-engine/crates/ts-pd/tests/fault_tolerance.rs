@@ -399,3 +399,84 @@ fn healthy_restarted_prefill_serves_a_surviving_decode() {
     ));
     assert!(landed(&old_dest, &source));
 }
+
+#[test]
+fn taking_staged_remote_prefill_clears_pending_and_drop_fails_room() {
+    let library = native::NativeLibrary::new();
+    let source = pattern();
+    let destination = vec![0u8; BYTES];
+    let mut pair = pair(
+        library.path().to_path_buf(),
+        &source,
+        &destination,
+        Duration::from_secs(60),
+    );
+    let (mut mesh, group) = single_rank();
+    let rid = "dropped-pending-remote-prefill";
+    let info = BootstrapInfo {
+        room: 201,
+        ..pair.bootstrap.clone()
+    };
+    pair.prefill.register(rid, &info).unwrap();
+    pair.decode.register(rid, &info).unwrap();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Bootstrapped(rid.into())
+    );
+
+    pair.decode_outbox
+        .stage_remote_prefill(admission(rid))
+        .unwrap();
+    assert!(pair.decode_outbox.remote_prefill_pending());
+    let pending = pair.decode_outbox.take_staged_remote_prefill().unwrap();
+    assert!(!pair.decode_outbox.remote_prefill_pending());
+    drop(pending);
+
+    expect_cancelled(&mut pair.decode, rid, &mut mesh, &group);
+}
+
+#[test]
+fn taking_staged_remote_prefill_and_handing_over_off_thread_lands() {
+    let library = native::NativeLibrary::new();
+    let source = pattern();
+    let destination = vec![0u8; BYTES];
+    let mut pair = pair(
+        library.path().to_path_buf(),
+        &source,
+        &destination,
+        Duration::from_secs(60),
+    );
+    let (mut mesh, group) = single_rank();
+    let rid = "async-handed-over-remote-prefill";
+    let info = BootstrapInfo {
+        room: 202,
+        ..pair.bootstrap.clone()
+    };
+    pair.prefill.register(rid, &info).unwrap();
+    pair.decode.register(rid, &info).unwrap();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Bootstrapped(rid.into())
+    );
+
+    pair.decode_outbox
+        .stage_remote_prefill(admission(rid))
+        .unwrap();
+    let pending = pair.decode_outbox.take_staged_remote_prefill().unwrap();
+    let handle = thread::spawn(move || pending.hand_over().unwrap());
+    assert_eq!(
+        next_event(&mut pair.prefill, &mut mesh, &group),
+        PdEvent::Bootstrapped(rid.into())
+    );
+    pair.send(rid, 777, Vec::new()).unwrap();
+    handle.join().unwrap();
+    assert_eq!(
+        next_event(&mut pair.prefill, &mut mesh, &group),
+        PdEvent::Succeeded(rid.into())
+    );
+    assert!(matches!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::RemotePrefillDone(_)
+    ));
+    assert!(landed(&destination, &source));
+}

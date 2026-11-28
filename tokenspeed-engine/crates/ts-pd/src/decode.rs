@@ -1134,14 +1134,48 @@ impl DecodeOutbox {
         self.staged.is_pending()
     }
 
+    /// Take the staged remote prefill out of the plan for deferred handover.
+    ///
+    /// Returning the guard marks the staged batch as handed over on the plan
+    /// immediately while letting the caller wait for device fences off the
+    /// forward thread before sending manifests.
+    pub fn take_staged_remote_prefill(&self) -> Result<PendingRemotePrefill, String> {
+        let rows = self.staged.take()?;
+        if rows.num_extends != rows.request_ids.len() {
+            let reason = "CachePD Decode admission does not support mixed batches";
+            fail_rooms(&self.shared, &rows.request_ids, reason);
+            return Err(reason.to_owned());
+        }
+        Ok(PendingRemotePrefill {
+            shared: Arc::clone(&self.shared),
+            rows: Some(rows),
+        })
+    }
+
     /// The staged remote prefill's pages are sanitized: send each admitted
     /// prompt's manifest to its Prefill ranks (`HostDecodePeer.execute`).
     /// Every row is planned before any goes out.
     pub fn hand_over_remote_prefill(&self) -> Result<(), String> {
-        let rows = self.staged.take()?;
-        if rows.num_extends != rows.request_ids.len() {
-            return Err("CachePD Decode admission does not support mixed batches".to_owned());
-        }
+        self.take_staged_remote_prefill()?.hand_over()
+    }
+}
+
+/// A staged remote prefill taken from [`DecodeOutbox`] awaiting device fences.
+///
+/// Dropping this handle without calling [`PendingRemotePrefill::hand_over`]
+/// fails every tracked room in the batch so requests never wait forever on an
+/// abandoned transfer.
+pub struct PendingRemotePrefill {
+    shared: Arc<Shared>,
+    rows: Option<BatchRows>,
+}
+
+impl PendingRemotePrefill {
+    /// Plan every row's manifest and send them to their Prefill ranks.
+    pub fn hand_over(mut self) -> Result<(), String> {
+        let Some(rows) = self.rows.take() else {
+            return Ok(());
+        };
         let layout = &self.shared.layout;
         let mut pending = Vec::new();
         for (index, rid) in rows.request_ids.iter().enumerate() {
@@ -1160,7 +1194,11 @@ impl DecodeOutbox {
                 validate_manifest(&manifest, layout, "destination")?;
                 manifest.to_wire()
             })
-            .map_err(|error| error.0)?;
+            .map_err(|error| {
+                let message = error.0;
+                fail_rooms(&self.shared, &rows.request_ids, &message);
+                message
+            })?;
             tracing::debug!(
                 rid,
                 room,
@@ -1172,63 +1210,101 @@ impl DecodeOutbox {
             pending.push((rid, room, rows.request_pool_indices[index], manifest));
         }
         for (rid, room, request_pool_index, manifest) in pending {
-            self.receive(rid, room, request_pool_index, &manifest);
+            receive_manifest(&self.shared, rid, room, request_pool_index, &manifest);
         }
         Ok(())
     }
 
-    /// A request's pages are admitted: send its manifest to its Prefill
-    /// ranks; its KV lands at `request_pool_index`.
-    fn receive(&self, rid: &str, room: u64, request_pool_index: i32, manifest: &[u8]) {
-        let mut state = self.shared.state();
-        if !state.tracked.contains(&room)
-            || state.cancellations.contains_key(&room)
-            || state.rooms.get(room) == Some(TransferPoll::Failed)
-        {
-            // The loop ended the request (its transfer failed) after it
-            // planned this admission: its pages go back, so no Prefill
-            // rank may write them.
-            tracing::debug!(rid, room, "not pre-allocating an ended request");
-            return;
+    /// Fail every tracked room in the pending batch (for fence-wait failures).
+    pub fn fail(mut self, reason: &str) {
+        if let Some(rows) = self.rows.take() {
+            fail_rooms(&self.shared, &rows.request_ids, reason);
         }
-        state.admissions.insert(room, request_pool_index);
-        state.waiting_since.insert(room, Instant::now());
-        state.rooms.update(room, TransferPoll::WaitingForInput);
-        let targets = state.targets.get(&room).cloned();
-        let Some(targets) = targets else {
-            tracing::warn!(
-                rid,
-                room,
-                "a request without a route reached its remote prefill"
+    }
+}
+
+impl Drop for PendingRemotePrefill {
+    fn drop(&mut self) {
+        if let Some(rows) = self.rows.take() {
+            fail_rooms(
+                &self.shared,
+                &rows.request_ids,
+                "remote prefill handover abandoned before device fences completed",
             );
-            return;
-        };
-        for target in targets.iter() {
-            if let Err(error) = self.shared.transport.sockets.send(
-                &target.host,
-                target.port,
-                wire::preallocation_frames(
-                    room,
-                    &state.cache_id,
-                    (!target.is_dummy).then_some(manifest),
-                ),
-            ) {
-                // Some targets may already have their manifest: keep the
-                // admission and let the usual cancellation fence retire it.
-                state.fail(room, error.to_string());
-                return;
-            }
         }
-        drop(state);
-        tracing::debug!(
+    }
+}
+
+fn fail_rooms(shared: &Shared, request_ids: &[String], reason: &str) {
+    // Drop-safe: recover even from a poisoned lock instead of aborting during unwind.
+    let mut state = shared
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for rid in request_ids {
+        if let Some(room) = state.rooms_by_rid.get(rid).copied() {
+            state.fail(room, reason);
+        }
+    }
+}
+
+/// A request's pages are admitted: send its manifest to its Prefill
+/// ranks; its KV lands at `request_pool_index`.
+fn receive_manifest(
+    shared: &Arc<Shared>,
+    rid: &str,
+    room: u64,
+    request_pool_index: i32,
+    manifest: &[u8],
+) {
+    let mut state = shared.state();
+    if !state.tracked.contains(&room)
+        || state.cancellations.contains_key(&room)
+        || state.rooms.get(room) == Some(TransferPoll::Failed)
+    {
+        // The loop ended the request (its transfer failed) after it
+        // planned this admission: its pages go back, so no Prefill
+        // rank may write them.
+        tracing::debug!(rid, room, "not pre-allocating an ended request");
+        return;
+    }
+    state.admissions.insert(room, request_pool_index);
+    state.waiting_since.insert(room, Instant::now());
+    state.rooms.update(room, TransferPoll::WaitingForInput);
+    let targets = state.targets.get(&room).cloned();
+    let Some(targets) = targets else {
+        tracing::warn!(
             rid,
             room,
-            request_pool_index,
-            targets = targets.len(),
-            manifest_bytes = manifest.len(),
-            "event=ts_decode_manifest_queued"
+            "a request without a route reached its remote prefill"
         );
+        return;
+    };
+    for target in targets.iter() {
+        if let Err(error) = shared.transport.sockets.send(
+            &target.host,
+            target.port,
+            wire::preallocation_frames(
+                room,
+                &state.cache_id,
+                (!target.is_dummy).then_some(manifest),
+            ),
+        ) {
+            // Some targets may already have their manifest: keep the
+            // admission and let the usual cancellation fence retire it.
+            state.fail(room, error.to_string());
+            return;
+        }
     }
+    drop(state);
+    tracing::debug!(
+        rid,
+        room,
+        request_pool_index,
+        targets = targets.len(),
+        manifest_bytes = manifest.len(),
+        "event=ts_decode_manifest_queued"
+    );
 }
 
 /// One request's transfer as the scheduling loop tracks it.
