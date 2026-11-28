@@ -178,6 +178,8 @@ fn loop_config(in_flight_depth: usize) -> LoopConfig {
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".into(),
+                blockwise_logprob_order: false,
+                full_vocab_top_k: 0,
                 pipeline_parallel: false,
                 disaggregated: false,
                 lm_head_tp_under_dp: false,

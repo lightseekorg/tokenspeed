@@ -127,6 +127,7 @@ struct Landed {
     bootstrap_token: Option<i32>,
     spec_candidate_ids: Option<Vec<i32>>,
     bootstrap_logprob: Option<f64>,
+    bootstrap_topk_row: Option<Vec<u8>>,
 }
 
 /// What a route's registered targets are kept by: the bootstrap address,
@@ -279,6 +280,9 @@ impl State {
                 }
                 if let Some(logprob) = message.bootstrap_logprob {
                     pending.bootstrap_logprob.get_or_insert(logprob);
+                }
+                if let Some(row) = message.bootstrap_topk_row {
+                    pending.bootstrap_topk_row.get_or_insert(row);
                 }
                 if arrived.len() < expected.len() {
                     return;
@@ -1679,6 +1683,7 @@ impl TransferPeer for DecodePeer {
                     bootstrap_token,
                     cached_tokens,
                     bootstrap_logprob: landed.bootstrap_logprob,
+                    bootstrap_topk_row: landed.bootstrap_topk_row,
                     spec_candidate_ids: landed.spec_candidate_ids,
                     request_pool_index,
                     kv_ready_at,
@@ -1709,7 +1714,14 @@ impl TransferPeer for DecodePeer {
         Ok(events)
     }
 
-    fn record_usage(&mut self, _rid: &str, _cached_tokens: i64, _bootstrap_logprob: Option<f64>) {}
+    fn record_usage(
+        &mut self,
+        _rid: &str,
+        _cached_tokens: i64,
+        _bootstrap_logprob: Option<f64>,
+        _bootstrap_topk_row: Option<Vec<u8>>,
+    ) {
+    }
 
     fn has_in_flight(&self) -> bool {
         !self.order.is_empty()
@@ -1743,6 +1755,7 @@ mod tests {
             spec_candidate_ids: None,
             cached_tokens: 0,
             bootstrap_logprob: None,
+            bootstrap_topk_row: None,
         }
     }
 

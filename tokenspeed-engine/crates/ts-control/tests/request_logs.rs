@@ -62,6 +62,7 @@ fn request_events_pair_admission_with_completion_and_transfer_failure() {
                 7,
                 1,
                 None,
+                None,
                 (std::time::SystemTime::now(), std::time::Instant::now()),
             );
             p.finish_remote_prefill_only("ok");
@@ -85,6 +86,7 @@ fn request_events_pair_admission_with_completion_and_transfer_failure() {
                 "duplicate",
                 12,
                 0,
+                None,
                 None,
                 (std::time::SystemTime::now(), std::time::Instant::now()),
             );

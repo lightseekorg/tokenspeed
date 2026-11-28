@@ -19,7 +19,7 @@
 // SOFTWARE.
 
 use super::interpreter;
-use crate::data_plane::result_buffers::{float_vector, top_logprobs};
+use crate::data_plane::result_buffers::{float_vector, full_vocab_topk, top_logprobs};
 use pyo3::{prelude::*, types::PyDict};
 
 #[test]
@@ -129,5 +129,51 @@ fn copying_or_rejecting_a_buffer_releases_its_export() {
                 assert_eq!(copied, [1.0, 2.0, 3.0]);
             }
         }
+    });
+}
+
+#[test]
+fn binary_rows_are_flat_owned_bytes_with_preserved_float_bits() {
+    interpreter();
+    Python::attach(|py| {
+        let scope = PyDict::new(py);
+        py.run(c"from array import array", Some(&scope), None)
+            .unwrap();
+        let values = py
+            .eval(c"array('f', [-0.0, -1.25])", Some(&scope), None)
+            .unwrap();
+        let rows = py
+            .eval(
+                c"memoryview(bytearray(range(48))).cast('B', [2, 24])",
+                Some(&scope),
+                None,
+            )
+            .unwrap();
+        let copied = full_vocab_topk(&values, &rows).unwrap();
+        assert_eq!(copied.row_bytes, 24);
+        assert!(copied.logprobs[0].is_sign_negative());
+        assert_eq!(copied.rows, (0u8..48).collect::<Vec<_>>());
+        drop(rows);
+        assert_eq!(
+            copied.row(1),
+            Some((-1.25, &(24u8..48).collect::<Vec<_>>()[..]))
+        );
+        let short = py.eval(c"array('f', [-0.5])", Some(&scope), None).unwrap();
+        let rows = py
+            .eval(
+                c"memoryview(bytearray(48)).cast('B', [2, 24])",
+                Some(&scope),
+                None,
+            )
+            .unwrap();
+        assert!(full_vocab_topk(&short, &rows).is_err());
+        let wrong = py
+            .eval(
+                c"memoryview(array('i', range(12))).cast('B').cast('i', [2, 6])",
+                Some(&scope),
+                None,
+            )
+            .unwrap();
+        assert!(full_vocab_topk(&values, &wrong).is_err());
     });
 }

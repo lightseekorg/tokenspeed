@@ -71,7 +71,17 @@ fn a_request_bootstraps_transfers_and_lands() {
         PdEvent::Bootstrapped(rid.to_owned())
     );
     // The prompt's last chunk commits, then its remote decode runs.
-    pair.prefill.record_usage(rid, 128, Some(-0.5));
+    let topk_row: Vec<u8> = [
+        777,
+        (-1.0_f32).to_bits() as i32,
+        777,
+        (-0.5_f32).to_bits() as i32,
+    ]
+    .into_iter()
+    .flat_map(i32::to_le_bytes)
+    .collect();
+    pair.prefill
+        .record_usage(rid, 128, Some(-0.5), Some(topk_row.clone()));
     pair.send(rid, 777, vec![1, 2, 3]).unwrap();
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),
@@ -92,6 +102,7 @@ fn a_request_bootstraps_transfers_and_lands() {
             bootstrap_token: 777,
             cached_tokens: 128,
             bootstrap_logprob: Some(-0.5),
+            bootstrap_topk_row: Some(topk_row),
             spec_candidate_ids: Some(vec![1, 2, 3]),
             request_pool_index: 3,
             kv_ready_at,
@@ -185,7 +196,7 @@ fn layerwise_chunks_follow_the_producer_steps() {
     // The room reports done only once its remote decode brings the payload.
     thread::sleep(Duration::from_millis(50));
     assert!(pair.prefill.poll(&mut mesh, &group).unwrap().is_empty());
-    pair.prefill.record_usage(rid, 0, None);
+    pair.prefill.record_usage(rid, 0, None, None);
     pair.send(rid, 99, Vec::new()).unwrap();
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),

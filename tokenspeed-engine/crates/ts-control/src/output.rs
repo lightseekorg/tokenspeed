@@ -52,6 +52,29 @@ pub const REQUEST_ENDED: i32 = 1;
 /// decode state it defers (`REQUEST_ENDED_INCOMPLETE`).
 pub const REQUEST_ENDED_INCOMPLETE: i32 = 2;
 
+/// Owned, flat binary output. A row is borrowed only while committing this result.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FullVocabOutput {
+    /// Shared-normalizer sampled logprobs in output-token order.
+    pub logprobs: Vec<f64>,
+    /// Little-endian binary rows, including unaccepted verify slots.
+    pub rows: Vec<u8>,
+    /// Fixed byte width of each binary row.
+    pub row_bytes: usize,
+}
+
+impl FullVocabOutput {
+    /// Borrow a sampled logprob and its matching row without per-row allocation.
+    pub fn row(&self, index: usize) -> Option<(f64, &[u8])> {
+        let logprob = *self.logprobs.get(index)?;
+        let start = index.checked_mul(self.row_bytes)?;
+        Some((
+            logprob,
+            self.rows.get(start..start.checked_add(self.row_bytes)?)?,
+        ))
+    }
+}
+
 /// One forward's results, read once its device-to-host copy landed.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ForwardResult {
@@ -93,6 +116,8 @@ pub struct ForwardResult {
     /// The top-k alternatives of each prefill row's sampled token, in
     /// prefill output order, when the forward asked for them.
     pub output_top_logprobs: Option<TopLogprobs>,
+    /// Binary rows and their shared-normalizer sampled logprobs, including verify padding.
+    pub full_vocab_topk: Option<FullVocabOutput>,
 }
 
 pub use ts_wire::output::TopLogprobs;
@@ -176,6 +201,7 @@ impl ForwardResult {
             // A pipeline computes no alternatives: the ingress refuses them.
             input_top_logprobs: None,
             output_top_logprobs: None,
+            full_vocab_topk: None,
         })
     }
 }
@@ -323,6 +349,8 @@ pub struct StreamedOutput {
     pub output_top_logprobs: Option<TopLogprobs>,
     /// Terminal request timing metadata; absent from intermediate outputs.
     pub request_timing: Option<ts_wire::RequestTiming>,
+    /// Validated rows for exactly output_ids.
+    pub output_full_vocab_topk: Vec<u8>,
 }
 
 /// What committing a forward produced.
@@ -1080,6 +1108,7 @@ impl OutputProcessor {
         bootstrap_token: i32,
         cached_tokens: i64,
         bootstrap_logprob: Option<f64>,
+        bootstrap_topk_row: Option<Vec<u8>>,
         kv_ready_at: (SystemTime, Instant),
     ) {
         let Some(state) = self.states.get_mut(rid) else {
@@ -1092,6 +1121,31 @@ impl OutputProcessor {
             trace.transfer_done_ms = Some(trace.ms());
         }
         state.cached_tokens = cached_tokens;
+        if state.full_vocab_top_k > 0 {
+            let packed =
+                bootstrap_topk_row
+                    .zip(bootstrap_logprob)
+                    .and_then(|(mut row, logprob)| {
+                        ts_wire::topk::validate_row(
+                            &mut row,
+                            bootstrap_token,
+                            logprob,
+                            state.full_vocab_top_k,
+                            state.full_vocab_topk_vocab_size,
+                        )
+                        .is_ok()
+                        .then_some(row)
+                    });
+            match packed {
+                Some(row) => state.output_full_vocab_topk.extend(row),
+                None => {
+                    state.finished_reason = Some(FinishReason::abort(
+                        "remote prefill omitted or corrupted its full-vocabulary row",
+                    ));
+                    return;
+                }
+            }
+        }
         state.output_ids.push(bootstrap_token);
         state.request_timing.kv_ready(
             EventStamp::at(kv_ready_at.0, kv_ready_at.1),
@@ -1386,7 +1440,7 @@ impl OutputProcessor {
             let chunk_len = i64::from(batch.input_lengths[i]);
             let mut row = (0, 0, 0);
             if let Some(state) = state {
-                if state.return_logprob {
+                if state.return_logprob && state.full_vocab_top_k == 0 {
                     plan.sampled_top_k = plan.sampled_top_k.max(state.top_logprobs_num);
                 }
                 let lo = chunk_start.max(state.logprob_start_len);
@@ -1546,6 +1600,18 @@ impl OutputProcessor {
             }
         }
 
+        if let Some(packed) = &result.full_vocab_topk {
+            if packed.logprobs.len() != result.output_tokens.len()
+                || packed.logprobs.len().checked_mul(packed.row_bytes) != Some(packed.rows.len())
+            {
+                return Err(CommitError::TokenColumn {
+                    tokens: result.output_tokens.len(),
+                    column: "full_vocab_topk",
+                    found: packed.logprobs.len(),
+                });
+            }
+        }
+
         // The request stats' clock: a decode step lasts from the previous
         // commit, and a round with prefill rows interrupts the decodes in it.
         let (stats_now, step, prefilling_others) =
@@ -1606,6 +1672,7 @@ impl OutputProcessor {
                 .output_token_cumulative_probs
                 .as_ref()
                 .map(|probs| window(probs, pt, output_length));
+            let full_vocab_start = pt;
             let is_decode = i >= batch.num_extends;
             // The prefill rows' sampled-token alternatives, in prefill output
             // order.
@@ -1742,7 +1809,42 @@ impl OutputProcessor {
                 _ => -1,
             };
             let before = state.output_ids.len();
+            let mut invalid_full_vocab = false;
             for (j, &token) in model_ids.iter().enumerate() {
+                let full_logprob = if state.full_vocab_top_k > 0 {
+                    match result
+                        .full_vocab_topk
+                        .as_ref()
+                        .and_then(|rows| rows.row(full_vocab_start + j))
+                    {
+                        Some((logprob, packed)) => {
+                            let start = state.output_full_vocab_topk.len();
+                            state.output_full_vocab_topk.extend_from_slice(packed);
+                            if let Err(error) = ts_wire::topk::validate_row(
+                                &mut state.output_full_vocab_topk[start..],
+                                token,
+                                logprob,
+                                state.full_vocab_top_k,
+                                state.full_vocab_topk_vocab_size,
+                            ) {
+                                state.output_full_vocab_topk.truncate(start);
+                                state
+                                    .finished_reason
+                                    .get_or_insert_with(|| FinishReason::abort(error.to_string()));
+                                invalid_full_vocab = true;
+                                break;
+                            }
+                            Some(logprob)
+                        }
+                        _ => {
+                            state.finished_reason.get_or_insert_with(|| FinishReason::abort("full-vocabulary export is missing or invalid for an accepted token"));
+                            invalid_full_vocab = true;
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
                 state.output_ids.push(token);
                 if let Some(tokens) = &mut state.reasoning_tokens {
                     tokens.push([token]);
@@ -1759,8 +1861,10 @@ impl OutputProcessor {
                     }
                 }
                 if state.return_logprob {
-                    if let Some(lp) = model_logprobs.as_ref().and_then(|lps| lps.get(j)) {
-                        state.output_logprobs.push(*lp);
+                    if let Some(lp) = full_logprob
+                        .or_else(|| model_logprobs.as_ref().and_then(|lps| lps.get(j)).copied())
+                    {
+                        state.output_logprobs.push(lp);
                     }
                     if let Some(prob) = model_cumulative_probs
                         .as_ref()
@@ -1844,7 +1948,11 @@ impl OutputProcessor {
             // P role: the final chunk's drafter candidates ride its result,
             // so the remote decode the scheduler emits is self-contained.
             let mut spec_candidate_ids = Vec::new();
-            if self.role == Role::Prefill && !model_ids.is_empty() && !nan_detected {
+            if self.role == Role::Prefill
+                && !model_ids.is_empty()
+                && !nan_detected
+                && !invalid_full_vocab
+            {
                 if let Some(candidates) =
                     result.next_input_ids.as_ref().and_then(|rows| rows.get(i))
                 {
@@ -1867,7 +1975,7 @@ impl OutputProcessor {
             extend.spec_candidate_ids = spec_candidate_ids;
             committed.events.push(extend);
 
-            if self.role == Role::Prefill && !nan_detected {
+            if self.role == Role::Prefill && !nan_detected && !invalid_full_vocab {
                 // A numerically corrupted prompt's KV must never transfer:
                 // it falls through to emit its terminal abort (unless the
                 // client already cancelled) and send Abort to stop the remote
@@ -2037,6 +2145,17 @@ impl OutputProcessor {
             spec: spec_num_tokens.map(|_| (state.spec_verify_ct, state.accept_draft_tokens)),
             input_logprobs,
             output_top_logprobs,
+            output_full_vocab_topk: if state.full_vocab_top_k > 0 {
+                let row_bytes = ts_wire::topk::row_bytes(state.full_vocab_top_k);
+                assert_eq!(
+                    state.output_full_vocab_topk.len(),
+                    n_new * row_bytes,
+                    "full-vocabulary rows must match committed tokens"
+                );
+                std::mem::take(&mut state.output_full_vocab_topk)
+            } else {
+                Vec::new()
+            },
         })
     }
 
@@ -2156,7 +2275,7 @@ mod tests {
         );
         register(&mut p, "one", 3, 1, &[]);
         let observed = (SystemTime::now(), Instant::now());
-        p.remote_prefill_done("one", 9, 0, None, observed);
+        p.remote_prefill_done("one", 9, 0, None, None, observed);
         let c = p.finish_remote_prefill_only("one");
         let timing = c.outputs[0].request_timing.as_ref().unwrap();
         assert_eq!(timing.kv_output_tokens, Some(1));
@@ -2298,6 +2417,7 @@ mod tests {
             input_token_logprobs: None,
             input_top_logprobs: None,
             output_top_logprobs: None,
+            full_vocab_topk: None,
         }
     }
 
@@ -2358,6 +2478,218 @@ mod tests {
             computes_prompt_logprobs,
         });
         register_state(p, rid.to_owned(), state);
+    }
+
+    fn register_full_vocab(p: &mut OutputProcessor, max_new: i64, stop: &[i32]) {
+        let mut state = RequestState::new(
+            vec![1, 2],
+            max_new,
+            stop.iter().copied().collect(),
+            false,
+            None,
+            true,
+        );
+        state.full_vocab_top_k = 2;
+        state.full_vocab_topk_vocab_size = 8;
+        register_state(p, "binary".into(), state);
+    }
+
+    fn full_vocab_row(token: i32) -> Vec<u8> {
+        [
+            token,
+            (-1f32).to_bits() as i32,
+            token,
+            (token + 1) % 8,
+            (-0.5f32).to_bits() as i32,
+            (-2f32).to_bits() as i32,
+        ]
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect()
+    }
+
+    fn full_vocab_result(tokens: &[i32], lengths: &[i32]) -> ForwardResult {
+        ForwardResult {
+            full_vocab_topk: Some(FullVocabOutput {
+                logprobs: vec![-0.5; tokens.len()],
+                rows: tokens
+                    .iter()
+                    .flat_map(|&token| full_vocab_row(token))
+                    .collect(),
+                row_bytes: ts_wire::topk::row_bytes(2),
+            }),
+            // Binary requests must use the original-distribution value above.
+            output_logprobs: Some(vec![-9.0; tokens.len()]),
+            ..result(tokens, lengths)
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "full-vocabulary rows must match committed tokens")]
+    fn binary_output_refuses_a_short_committed_buffer() {
+        let mut p = processor(None);
+        register_full_vocab(&mut p, 1, &[]);
+        let state = p.states.get_mut("binary").unwrap();
+        state.output_ids.push(3);
+        state.finished_reason = Some(FinishReason::Length(1));
+        p.stream(&["binary"], &mut Vec::new());
+    }
+
+    #[test]
+    fn binary_rows_follow_accepted_tokens_and_stop_trimming() {
+        let mut p = processor(Some(3));
+        register_full_vocab(&mut p, 10, &[5]);
+        let first = p
+            .commit(
+                &batch(&[("binary", 2, 0, 2)], 1),
+                None,
+                &full_vocab_result(&[3], &[1]),
+            )
+            .unwrap();
+        assert_eq!(first.outputs[0].output_ids, [3]);
+        assert_eq!(first.outputs[0].output_full_vocab_topk, full_vocab_row(3));
+        let mut step = full_vocab_result(&[4, 5, 6], &[3]);
+        // A row after the stop is not committed or validated.
+        step.full_vocab_topk.as_mut().unwrap().rows[2 * ts_wire::topk::row_bytes(2)..].fill(0);
+        let done = p
+            .commit(&batch(&[("binary", 3, 0, 2)], 0), None, &step)
+            .unwrap();
+        let output = &done.outputs[0];
+        assert_eq!(output.output_ids, [4, 5]);
+        assert_eq!(output.completion_tokens, 3);
+        assert_eq!(output.output_logprobs, [-0.5; 2]);
+        assert_eq!(
+            output.output_full_vocab_topk,
+            [full_vocab_row(4), full_vocab_row(5)].concat()
+        );
+        assert_eq!(output.finish_reason, Some("stop"));
+        assert_eq!(done.released, ["binary"]);
+    }
+
+    #[test]
+    fn streamed_binary_rows_move_out_of_request_storage_without_repeating_the_prefix() {
+        let mut p = processor(Some(3));
+        register_full_vocab(&mut p, 8, &[]);
+        p.states.get_mut("binary").unwrap().stream = true;
+        let first = p
+            .commit(
+                &batch(&[("binary", 2, 0, 2)], 1),
+                None,
+                &full_vocab_result(&[3], &[1]),
+            )
+            .unwrap();
+        assert_eq!(first.outputs[0].output_full_vocab_topk, full_vocab_row(3));
+        assert!(p.states["binary"].output_full_vocab_topk.is_empty());
+        let second = p
+            .commit(
+                &batch(&[("binary", 3, 0, 2)], 0),
+                None,
+                &full_vocab_result(&[4, 5, -1], &[2]),
+            )
+            .unwrap();
+        assert_eq!(second.outputs[0].output_ids, [4, 5]);
+        assert_eq!(
+            second.outputs[0].output_full_vocab_topk,
+            [full_vocab_row(4), full_vocab_row(5)].concat()
+        );
+        assert!(p.states["binary"].output_full_vocab_topk.is_empty());
+        // Moving the next payload does not mutate a previously delivered output.
+        assert_eq!(first.outputs[0].output_full_vocab_topk, full_vocab_row(3));
+    }
+
+    #[test]
+    fn binary_rows_skip_unaccepted_and_ordinary_rows_in_a_mixed_spec_window() {
+        let mut p = processor(Some(3));
+        register(&mut p, "plain", 2, 10, &[]);
+        register_full_vocab(&mut p, 2, &[]);
+        let step = full_vocab_result(&[6, -1, -1, 3, 4, -1], &[1, 2]);
+        let done = p
+            .commit(
+                &batch(&[("plain", 3, 0, 2), ("binary", 3, 0, 2)], 0),
+                None,
+                &step,
+            )
+            .unwrap();
+        let output = done.outputs.iter().find(|row| row.rid == "binary").unwrap();
+        assert_eq!(output.output_ids, [3, 4]);
+        assert_eq!(output.output_logprobs, [-0.5, -0.5]);
+        assert_eq!(
+            output.output_full_vocab_topk,
+            [full_vocab_row(3), full_vocab_row(4)].concat()
+        );
+    }
+
+    #[test]
+    fn missing_or_corrupt_binary_rows_abort_without_contaminating_the_prefix() {
+        for rows in [
+            None,
+            Some(FullVocabOutput {
+                logprobs: vec![-0.5],
+                rows: vec![0; ts_wire::topk::row_bytes(2)],
+                row_bytes: ts_wire::topk::row_bytes(2),
+            }),
+        ] {
+            let mut p = processor(None);
+            register_full_vocab(&mut p, 10, &[]);
+            p.commit(
+                &batch(&[("binary", 2, 0, 2)], 1),
+                None,
+                &full_vocab_result(&[3], &[1]),
+            )
+            .unwrap();
+            let step = ForwardResult {
+                full_vocab_topk: rows,
+                ..result(&[4], &[1])
+            };
+            let done = p
+                .commit(&batch(&[("binary", 1, 0, 2)], 0), None, &step)
+                .unwrap();
+            let output = &done.outputs[0];
+            assert_eq!(output.finish_reason, Some("abort"));
+            assert!(output.output_ids.is_empty());
+            assert_eq!(output.completion_tokens, 1);
+            assert!(output.output_logprobs.is_empty());
+            assert!(output.output_full_vocab_topk.is_empty());
+            assert_eq!(done.released, ["binary"]);
+        }
+    }
+
+    #[test]
+    fn binary_row_errors_preserve_the_nan_abort_reason() {
+        for rows in [
+            None,
+            Some(FullVocabOutput {
+                logprobs: vec![f64::NAN],
+                rows: vec![0; ts_wire::topk::row_bytes(2)],
+                row_bytes: ts_wire::topk::row_bytes(2),
+            }),
+        ] {
+            let mut p = processor(None);
+            register_full_vocab(&mut p, 10, &[]);
+            let step = ForwardResult {
+                full_vocab_topk: rows,
+                nan_flags: Some(vec![1]),
+                ..result(&[3], &[1])
+            };
+            let done = p
+                .commit(&batch(&[("binary", 2, 0, 2)], 1), None, &step)
+                .unwrap();
+            assert_eq!(done.stats.nan_aborts, 1);
+            assert_eq!(done.outputs[0].finish_reason, Some("abort"));
+            assert_eq!(
+                done.outputs[0].finish_details,
+                Some(
+                    FinishReason::Abort {
+                        message: NUMERICAL_ERROR.to_owned(),
+                        err_type: AbortCode::NumericalError,
+                        status_code: None,
+                    }
+                    .details()
+                )
+            );
+            assert!(done.outputs[0].output_ids.is_empty());
+            assert!(done.outputs[0].output_full_vocab_topk.is_empty());
+        }
     }
 
     /// The forward result of a plan's rows: each row's logprob is
@@ -2563,6 +2895,7 @@ mod tests {
                             10,
                             1,
                             None,
+                            None,
                             (SystemTime::now(), Instant::now()),
                         );
                         processor.finish_remote_prefill_only(rid);
@@ -2688,7 +3021,14 @@ mod tests {
             let remote_admitted = trace.remote_admitted_ms.unwrap();
             assert!(trace.planned_ms.is_none());
 
-            processor.remote_prefill_done("r", 10, 0, None, (SystemTime::now(), Instant::now()));
+            processor.remote_prefill_done(
+                "r",
+                10,
+                0,
+                None,
+                None,
+                (SystemTime::now(), Instant::now()),
+            );
             processor.mark_planned(&["r".into()], false);
             processor.mark_scheduled(&["r".into()]);
             let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
@@ -2815,7 +3155,7 @@ mod tests {
             None,
         );
         register(&mut p, "r", 4, 8, &[]);
-        p.remote_prefill_done("r", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("r", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         assert!(p.state("r").unwrap().stream_output_timing.is_none());
         assert_eq!(stream_at(&mut p, "r", 100.0).unwrap().output_ids, [7]);
         p.states.get_mut("r").unwrap().output_ids.extend([8, 9]);
@@ -2850,7 +3190,7 @@ mod tests {
             );
             register(&mut p, "r", 4, 3, &[]);
             p.states.get_mut("r").unwrap().created_time = wall_seconds() - 1.0;
-            p.remote_prefill_done("r", 7, 0, None, (SystemTime::now(), Instant::now()));
+            p.remote_prefill_done("r", 7, 0, None, None, (SystemTime::now(), Instant::now()));
             stream_at(&mut p, "r", wall_seconds()).unwrap();
             let second = p
                 .commit(&batch(&[("r", 1, 0, 4)], 0), None, &result(&[8], &[1]))
@@ -2979,11 +3319,11 @@ mod tests {
             None,
         );
         register(&mut p, "one", 4, 1, &[]);
-        p.remote_prefill_done("one", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("one", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         assert_eq!(p.finish_remote_prefill_only("one").released, ["one"]);
 
         register(&mut p, "two", 4, 2, &[]);
-        p.remote_prefill_done("two", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("two", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         let committed = p
             .commit(&batch(&[("two", 1, 0, 4)], 0), None, &result(&[8], &[1]))
             .unwrap();
@@ -3018,19 +3358,33 @@ mod tests {
         register(&mut p, "a", 4, 8, &[]);
         assert!(p.take_decode_ready_at("a").is_none());
         let before = Instant::now();
-        p.remote_prefill_done("a", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("a", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         let after = Instant::now();
         let ready = p.take_decode_ready_at("a").unwrap();
         assert!(before <= ready && ready <= after);
         assert!(p.take_decode_ready_at("a").is_none());
 
         register(&mut p, "cancelled", 4, 8, &[]);
-        p.remote_prefill_done("cancelled", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done(
+            "cancelled",
+            7,
+            0,
+            None,
+            None,
+            (SystemTime::now(), Instant::now()),
+        );
         p.states.get_mut("cancelled").unwrap().to_abort = true;
         assert!(p.take_decode_ready_at("cancelled").is_none());
 
         register(&mut p, "finished", 4, 1, &[]);
-        p.remote_prefill_done("finished", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done(
+            "finished",
+            7,
+            0,
+            None,
+            None,
+            (SystemTime::now(), Instant::now()),
+        );
         p.finish_remote_prefill_only("finished");
         assert!(p.take_decode_ready_at("finished").is_none());
     }
@@ -3048,7 +3402,7 @@ mod tests {
             None,
         );
         register(&mut p, "a", 4, 8, &[]);
-        p.remote_prefill_done("a", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("a", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         assert!(p.take_decode_ready_at("a").is_none());
     }
 
@@ -3078,7 +3432,7 @@ mod tests {
             &grammar,
             &state.prompt_ids,
         ));
-        p.remote_prefill_done("a", 7, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("a", 7, 0, None, None, (SystemTime::now(), Instant::now()));
         let state = p.state("a").expect("still registered");
         assert_eq!(state.first_token_time, 0.0);
         assert_eq!(state.output_ids, vec![7]);
@@ -3102,7 +3456,7 @@ mod tests {
             None,
         );
         register(&mut p, "r", 3, 8, &[]);
-        p.remote_prefill_done("r", 9, 0, None, (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done("r", 9, 0, None, None, (SystemTime::now(), Instant::now()));
         assert_eq!(p.state("r").unwrap().first_token_time, 0.0);
         p.commit(&batch(&[("r", 1, 0, 3)], 0), None, &result(&[10], &[1]))
             .unwrap();
@@ -3553,7 +3907,14 @@ mod tests {
         );
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         assert!(!p.state("r").unwrap().wants_input_logprobs());
-        p.remote_prefill_done("r", 9, 0, Some(-0.25), (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done(
+            "r",
+            9,
+            0,
+            Some(-0.25),
+            None,
+            (SystemTime::now(), Instant::now()),
+        );
         let decode = ForwardResult {
             output_logprobs: Some(vec![-0.5]),
             ..result(&[10], &[1])
@@ -3583,7 +3944,14 @@ mod tests {
         register_scored(&mut p, "r", vec![5, 6, 7], 0, 0, false);
         // The prefill node sends the first token's logprob, but no cumulative
         // probability.
-        p.remote_prefill_done("r", 9, 0, Some(-0.25), (SystemTime::now(), Instant::now()));
+        p.remote_prefill_done(
+            "r",
+            9,
+            0,
+            Some(-0.25),
+            None,
+            (SystemTime::now(), Instant::now()),
+        );
         let decode = ForwardResult {
             output_logprobs: Some(vec![-0.5]),
             output_token_cumulative_probs: Some(vec![0.375]),
@@ -3986,7 +4354,7 @@ mod tests {
             );
             register(&mut p, "r", 4, max_new, &[]);
             p.states.get_mut("r").unwrap().created_time = wall_seconds();
-            p.remote_prefill_done("r", 7, 2, None, (SystemTime::now(), Instant::now()));
+            p.remote_prefill_done("r", 7, 2, None, None, (SystemTime::now(), Instant::now()));
             let (_, prefill_done, first_token, _, _) = p
                 .state("r")
                 .unwrap()

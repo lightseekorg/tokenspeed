@@ -89,6 +89,9 @@ pub struct OutputChunk {
     pub output_top_logprobs: Option<TopLogprobs>,
     /// Request boundaries returned once on the terminal chunk.
     pub request_timing: Option<ts_wire::RequestTiming>,
+    /// Packed full-vocabulary rows aligned with output_ids.
+    /// A tokenless synthetic abort chunk has no rows.
+    pub output_full_vocab_topk: Vec<u8>,
 }
 
 impl OutputChunk {
@@ -123,6 +126,7 @@ impl OutputChunk {
             let reason = take(&mut batch.finished_reasons, i);
             let chunk = Self {
                 request_timing: take(&mut batch.request_timing, i),
+                output_full_vocab_topk: take(&mut batch.output_full_vocab_topk, i).to_vec(),
                 output_ids: take(&mut batch.output_ids, i),
                 finish_reason: (!reason.is_empty()).then_some(reason),
                 prompt_tokens: batch.prompt_tokens[i],
@@ -179,6 +183,7 @@ impl From<&RequestOutput<'_>> for OutputChunk {
             input_token_logprobs: owned(row.input_token_logprobs),
             input_top_logprobs: owned(row.input_top_logprobs),
             output_top_logprobs: owned(row.output_top_logprobs),
+            output_full_vocab_topk: row.output_full_vocab_topk.to_vec(),
         }
     }
 }
@@ -242,6 +247,7 @@ impl Pending {
             input_top_logprobs: None,
             output_top_logprobs: None,
             request_timing: None,
+            output_full_vocab_topk: Vec::new(),
         }
     }
 }

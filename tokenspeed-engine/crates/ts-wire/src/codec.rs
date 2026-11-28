@@ -122,6 +122,15 @@ impl Wire for f64 {
     }
 }
 
+impl Wire for Bytes {
+    fn encode(&self, encoder: &mut Encoder) {
+        encoder.bin(self);
+    }
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self> {
+        decoder.bin()
+    }
+}
+
 impl Wire for String {
     fn encode(&self, encoder: &mut Encoder) {
         encoder.str(self);

@@ -322,6 +322,8 @@ pub struct StatusMessage {
     pub cached_tokens: i64,
     /// The first token's logprob, if the request returns logprobs.
     pub bootstrap_logprob: Option<f64>,
+    /// The first token's packed full-vocabulary Top-K row, copied before reuse.
+    pub bootstrap_topk_row: Option<Vec<u8>>,
 }
 
 impl StatusMessage {
@@ -335,6 +337,7 @@ impl StatusMessage {
             spec_candidate_ids: None,
             cached_tokens: 0,
             bootstrap_logprob: None,
+            bootstrap_topk_row: None,
         }
     }
 
@@ -360,11 +363,14 @@ impl StatusMessage {
             candidates,
             ascii(self.cached_tokens),
             logprob,
+            self.bootstrap_topk_row
+                .as_deref()
+                .map_or_else(Bytes::new, Bytes::copy_from_slice),
         ]
     }
 
-    /// Parse a status message; the last
-    /// three frames are optional, as older senders omit them.
+    /// Parse a status message; frames after the rank are optional because
+    /// older senders omit bootstrap metadata and score payloads.
     pub fn from_frames(frames: &[Bytes]) -> Result<Self, WireError> {
         fn int(frame: &[u8], name: &str) -> Result<i64, WireError> {
             std::str::from_utf8(frame)
@@ -411,6 +417,18 @@ impl StatusMessage {
             )),
             _ => None,
         };
+        let bootstrap_topk_row = match frames.get(7) {
+            Some(frame) if !frame.is_empty() => {
+                // Packed int32 rows hold a sampled ID, tail bits and K ID/logq pairs.
+                if frame.len() < 16 || frame.len() % 8 != 0 {
+                    return Err(error(
+                        "the full-vocabulary Top-K row has invalid byte length",
+                    ));
+                }
+                Some(frame.to_vec())
+            }
+            _ => None,
+        };
         Ok(Self {
             room,
             status,
@@ -419,6 +437,7 @@ impl StatusMessage {
             spec_candidate_ids,
             cached_tokens,
             bootstrap_logprob,
+            bootstrap_topk_row,
         })
     }
 }
@@ -464,6 +483,7 @@ mod tests {
             spec_candidate_ids: Some(vec![5, -1, 7]),
             cached_tokens: 64,
             bootstrap_logprob: Some(-0.25),
+            bootstrap_topk_row: Some(vec![0; 16]),
         };
         assert_eq!(
             StatusMessage::from_frames(&message.to_frames()),
@@ -476,6 +496,7 @@ mod tests {
         let parsed = StatusMessage::from_frames(&short).unwrap();
         assert_eq!(parsed.bootstrap_token, -1);
         assert_eq!(parsed.cached_tokens, 0);
+        assert_eq!(parsed.bootstrap_topk_row, None);
     }
 
     #[test]

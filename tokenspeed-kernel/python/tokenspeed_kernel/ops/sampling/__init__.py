@@ -28,6 +28,7 @@ from __future__ import annotations
 import functools
 
 import torch as _torch
+from tokenspeed_kernel.ops.sampling.full_vocab import FullVocabTopK
 from tokenspeed_kernel.ops.sampling.logprob import blockwise_logprobs
 from tokenspeed_kernel.ops.sampling.positions import prepare_sampling_offsets
 from tokenspeed_kernel.ops.sampling.synthetic import write_synthetic_verify_outputs
@@ -43,6 +44,7 @@ __all__ = [
     "eagle4_shard_topk",
     "blockwise_logprobs",
     "chain_verify_coins",
+    "FullVocabTopK",
     "prepare_sampling_offsets",
     "VOCAB_SHARD_DRAFT_BLOCK",
     "VOCAB_SHARD_DRAFT_FIELDS",
@@ -717,11 +719,14 @@ def vocab_shard_logprobs(
     kernel(partials, rows, tokens, row_max, shard_columns, vocab_size, out)
 
 
-# Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.sampling.cuda  # noqa: E402,F401
+
+# Backend registration (side-effect imports).
+import tokenspeed_kernel.ops.sampling.cuda_full_vocab  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.full_vocab  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.verify_coins  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_logprobs  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_shard_draft  # noqa: E402,F401

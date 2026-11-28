@@ -70,6 +70,7 @@ fn batch(rows: &[(&str, i32, i32, i32)], num_extends: usize) -> ForwardBatchView
 
 fn result(tokens: &[i32], lengths: &[i32]) -> ForwardResult {
     ForwardResult {
+        full_vocab_topk: None,
         output_tokens: tokens.to_vec(),
         output_lengths: lengths.to_vec(),
         output_logprobs: None,
@@ -434,8 +435,10 @@ fn round_loop_config(shape: &RoundShape, pages: usize) -> LoopConfig {
             reasoning: None,
             reasoning_usage: None,
             logprobs: LogprobServability {
+                full_vocab_top_k: 0,
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
+                blockwise_logprob_order: false,
                 pipeline_parallel: false,
                 disaggregated: false,
                 lm_head_tp_under_dp: false,

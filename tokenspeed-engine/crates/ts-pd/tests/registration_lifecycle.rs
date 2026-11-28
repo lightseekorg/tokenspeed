@@ -233,7 +233,7 @@ fn duplicate_active_room_is_rejected_without_disturbing_the_original_transfer() 
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Bootstrapped("original".to_owned())
     );
-    pair.prefill.record_usage("original", 128, Some(-0.5));
+    pair.prefill.record_usage("original", 128, Some(-0.5), None);
     pair.send("original", 777, vec![1, 2, 3]).unwrap();
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),
@@ -250,6 +250,7 @@ fn duplicate_active_room_is_rejected_without_disturbing_the_original_transfer() 
     assert_eq!(
         event,
         PdEvent::RemotePrefillDone(RemotePrefill {
+            bootstrap_topk_row: None,
             rid: "original".to_owned(),
             bootstrap_token: 777,
             cached_tokens: 128,
@@ -314,6 +315,7 @@ fn abort_room_ignores_a_room_owned_by_an_active_prefill_request() {
     assert_eq!(
         event,
         PdEvent::RemotePrefillDone(RemotePrefill {
+            bootstrap_topk_row: None,
             rid: "original".to_owned(),
             bootstrap_token: 555,
             cached_tokens: 0,

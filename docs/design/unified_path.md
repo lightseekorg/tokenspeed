@@ -1492,6 +1492,11 @@ These are sampler tests with constructed logits, not full-model acceptance tests
 
 ### Outputs are persistent-buffer slices on both paths
 
+The forward's fifth output slot may carry fixed-width binary full-vocabulary
+rows and their sampled logprobs. Eager and graph decode use the same live-row
+slice; prompt and JSON Top-K lists remain eager-only. See
+[full-vocabulary-output.md](full-vocabulary-output.md) for the row contract and cost.
+
 Optional sampled-token cumulative probabilities (`--enable-output-cumulative-probs`)
 follow the sampled logprobs' rows and lifetime: the forward returns them beside
 `output_logprobs`, a decode graph captures them with the same forward, and

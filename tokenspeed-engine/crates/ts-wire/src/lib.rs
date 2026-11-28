@@ -44,6 +44,7 @@ pub mod request;
 pub mod request_timing;
 pub mod sampling;
 pub mod tensor;
+pub mod topk;
 pub mod value;
 
 pub use codec::{decode_bytes, decode_frames, encode_frames, Dict, StrOrList, Wire};

@@ -28,7 +28,7 @@ use pyo3::{
     exceptions::{PyBufferError, PyOverflowError, PyValueError},
     prelude::*,
 };
-use ts_control::output::TopLogprobs;
+use ts_control::output::{FullVocabOutput, TopLogprobs};
 
 fn require_rank(buffer: &PyUntypedBuffer, rank: usize) -> PyResult<()> {
     if buffer.dimensions() != rank {
@@ -122,4 +122,29 @@ pub(super) fn top_logprobs(
         split(float_values(&values_buffer, values.py())?, rows, columns),
         split(token_ids(&ids_buffer, ids.py())?, rows, columns),
     ))
+}
+
+/// Copy one flat byte matrix while the Python export retains the landed storage.
+pub(super) fn full_vocab_topk(
+    values: &Bound<'_, PyAny>,
+    rows: &Bound<'_, PyAny>,
+) -> PyResult<FullVocabOutput> {
+    let values_buffer = PyUntypedBuffer::get(values)?;
+    let rows_buffer = PyUntypedBuffer::get(rows)?;
+    require_rank(&values_buffer, 1)?;
+    require_rank(&rows_buffer, 2)?;
+    if values_buffer.shape()[0] != rows_buffer.shape()[0] {
+        return Err(PyValueError::new_err(
+            "binary rows and sampled logprobs have different lengths",
+        ));
+    }
+    let row_bytes = rows_buffer.shape()[1];
+    if row_bytes < 16 || row_bytes > ts_wire::topk::row_bytes(128) || (row_bytes - 8) % 8 != 0 {
+        return Err(PyValueError::new_err("invalid binary row width"));
+    }
+    Ok(FullVocabOutput {
+        logprobs: float_values(&values_buffer, values.py())?,
+        rows: copy::<u8>(&rows_buffer, rows.py())?,
+        row_bytes,
+    })
 }

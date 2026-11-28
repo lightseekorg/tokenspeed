@@ -105,6 +105,8 @@ class LogprobConfig:
     enable_output_logprobs: bool = False
     supports_prompt_logprobs: bool = False
     logprob_order: str = 'torch'
+    blockwise_logprob_order: bool = False
+    full_vocab_top_k: int = 0
     pipeline_parallel: bool = False
     disaggregated: bool = False
 

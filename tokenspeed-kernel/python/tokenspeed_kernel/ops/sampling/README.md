@@ -156,3 +156,51 @@ and `L - 1` accepted drafts. The target token is either given per row or read
 from the row's target predictions at column `L - 1`, and `L` past the verify
 width counts as the width. One Triton program writes one row, so a captured
 step pays one launch for the override; the CPU path is the torch reference.
+
+
+## Full-vocabulary binary scores
+
+`full_vocab_sum` folds `[rows, blocks]` FP32 partials in block order, starting
+from block zero. Its Triton leaf parallelizes rows only. The block-sum-exp leaf,
+Torch logarithm and tail logsumexp retain their existing arithmetic.
+`full_vocab_head` combines the head gather and its explicit FP32 subtraction
+form in one launch, including negative cross-entropy's sign-bit flip for
+non-NaN results. Head and pack share that arithmetic, preserving Torch's NaN
+representation as well as signed zero.
+`full_vocab_pack` gathers the prediction row and writes the sampled ID, tail
+bits, head IDs, head bits and private sampled-score bits in one launch. Both
+helpers have Torch reference leaves; GPU dispatch uses the kernel registry.
+The fused head and pack leaves are selected on NVIDIA. AMD keeps the Torch
+leaves because its fused subtraction does not preserve Torch's exceptional
+NaN payload/sign bits. The full-vocabulary output contract is unchanged.
+
+Row counts and strides are runtime inputs; only vocabulary geometry, K and
+subtraction form specialize the helpers. No helper keeps persistent buffers.
+The full output/ownership contract is in
+[full-vocabulary output](../../../../../docs/design/full-vocabulary-output.md).
+
+
+### Selected full-vocabulary rows
+
+Optional SM90/Torch 2.9.0 leaves defer exact head/tail scoring until GPU acceptance
+and stop trimming are known. A fixed-size source-row mask preserves graph shapes;
+blocks skip inactive rows without downloading a row count. The normalizer remains
+available before sampling for scalar-logprob reuse. Raw logits are copied before
+the sampler can overwrite them.
+
+The CUDA Top-K keeps the matching Torch radix/gather/sort semantics. Tail head IDs
+are a bitset loaded by the matching ATen max and sum reduction trees; the exp
+transform is fused into sum loads. The final sum write applies CUDA `logf`, then
+separately rounded addition and subtraction, without changing the reduction tree.
+Its inputs are original logits; the full normalizer's `(row_max + log_z)`
+addition also runs in this write, preserving the reference expression's rounding.
+Head-bitset clearing and marking share a CTA. There is no probability-complement
+tail and no row compaction that changes the reduction's launch geometry. Full-row scoring can
+reuse Top-K's maximum, with a GPU first-index fallback for zero/non-finite values.
+The copied PyTorch selection code and its license live under `thirdparty/cuda`.
+See `docs/design/full-vocabulary-output.md` for the build command and bounds.
+
+`full_vocab_pack` also accepts an absent materialized head and computes its
+selected scores in the packing kernel. `FullVocabScores.logprobs` materializes
+a head for inspection; normal packing avoids that launch and allocation.
+Explicitly supplied head values still retain their original bits.

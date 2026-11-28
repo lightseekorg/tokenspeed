@@ -111,6 +111,7 @@ def test_completed_result_exports_every_column_after_the_copy_lands():
     assert exported[7][1][1].tolist() == [[70000, 1], [70001, 2]]
     assert exported[7][2][0].tolist() == [[-0.5, -2.0]]
     assert exported[7][2][1].tolist() == [[7, 8]]
+    assert exported[7][3] is None
     del result
     gc.collect()
     assert exported[8].tolist() == [0.875]
@@ -127,3 +128,66 @@ def test_completed_result_keeps_absent_columns_absent():
         result, serving_compiles=None, grammar_terminated_at=None
     )
     assert exported == ([7], [1], None, None, None, None, None, None, None, None)
+
+
+def test_completed_result_exports_owned_binary_rows_with_their_sampled_scores():
+    packed = torch.arange(12, dtype=torch.int32).reshape(2, 6)
+    sampled = torch.tensor([-0.5, -1.25], dtype=torch.float32)
+    result = ModelExecutionResult(
+        output_tokens=torch.tensor([3, 4], dtype=torch.int32),
+        output_lengths=torch.tensor([1, 1], dtype=torch.int32),
+        full_vocab_topk=packed,
+        full_vocab_logprobs=sampled,
+    )
+    exported = completed_result(
+        result, serving_compiles=None, grammar_terminated_at=None
+    )[7][3]
+    assert exported[0].tolist() == sampled.tolist()
+    assert exported[1].tobytes() == packed.numpy().astype("<i4", copy=False).tobytes()
+    del result, packed, sampled
+    gc.collect()
+    assert exported[0].tolist() == [-0.5, -1.25]
+
+
+@pytest.mark.parametrize("score_rows,packed_rows", [(1, 2), (2, 1)])
+def test_completed_result_rejects_mismatched_binary_columns(score_rows, packed_rows):
+    result = ModelExecutionResult(
+        output_tokens=torch.tensor([3, 4], dtype=torch.int32),
+        output_lengths=torch.tensor([1, 1], dtype=torch.int32),
+        full_vocab_topk=torch.zeros((packed_rows, 6), dtype=torch.int32),
+        full_vocab_logprobs=torch.zeros(score_rows, dtype=torch.float32),
+    )
+    with pytest.raises(ValueError, match="different lengths"):
+        completed_result(result, serving_compiles=None, grammar_terminated_at=None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA for D2H")
+def test_packed_device_results_land_once_and_keep_independent_host_storage():
+    from tokenspeed_kernel.ops.sampling import FullVocabTopK
+
+    from tokenspeed.runtime.execution.types import ForwardLogprobs
+
+    scorer = FullVocabTopK(k=2, vocab_block=8, form="direct", solution="torch")
+    for count in (0, 2):
+        logits = torch.arange(count * 8, dtype=torch.float32, device="cuda").reshape(
+            count, 8
+        )
+        tokens = torch.zeros(count, dtype=torch.int64, device="cuda")
+        rows, scores = scorer.prepare(logits).pack(tokens, prediction_rows=None)
+        landed = ForwardLogprobs(
+            full_vocab_topk=rows, full_vocab_logprobs=scores
+        ).to_host()
+        event = torch.cuda.Event()
+        event.record()
+        event.synchronize()
+        expected_rows, expected_scores = rows.cpu(), scores.cpu()
+        rows.zero_()
+        scores.zero_()
+        if count:
+            assert landed.full_vocab_topk.is_pinned()
+            assert landed.full_vocab_logprobs.is_pinned()
+        assert torch.equal(landed.full_vocab_topk, expected_rows)
+        assert torch.equal(
+            landed.full_vocab_logprobs.view(torch.int32),
+            expected_scores.view(torch.int32),
+        )

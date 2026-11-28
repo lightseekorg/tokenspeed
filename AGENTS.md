@@ -143,6 +143,8 @@ change.
 * `docs/design/unified_path.md` — the unified decode path: one
   refresh-in-place metadata contract for eager and CUDA-graph decode, the
   padding contract, buffer sizing, and what stays graph-only.
+* `docs/design/full-vocabulary-output.md` — opt-in binary head/tail rows,
+  accepted-token alignment, decode graph slices, and P/D first-token ownership.
 * `docs/design/attention-prologue.md` — the one entry between projections
   and core attention: QK norm, RoPE, quantization, and the KV write, the
   numerics contract every solution meets, and who writes the cache.

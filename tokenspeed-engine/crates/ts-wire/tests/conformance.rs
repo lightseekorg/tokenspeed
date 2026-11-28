@@ -160,6 +160,7 @@ fn generate_text() {
     check_add(
         "generate_text",
         TokenizedGenerateReqInput {
+            return_full_vocab_topk: false,
             rid: Some(StrOrList::One(s("r-text"))),
             http_worker_ipc: Some(s("ipc:///tmp/worker")),
             input_text: Some(s("héllo wörld")),
@@ -523,6 +524,7 @@ fn output_from_an_older_producer_defaults_the_load_tail() {
 /// A batch whose required columns are empty and whose tail is the default.
 fn no_tail() -> BatchTokenIDOutSlim {
     BatchTokenIDOutSlim {
+        output_full_vocab_topk: Vec::new(),
         rids: None,
         output_ids: vec![],
         finished_reasons: vec![],
@@ -737,6 +739,7 @@ fn handshake_ready_response() {
             spatial_merge_size: Some(2),
             image_token_id: Some(248056),
             video_token_id: Some(248057),
+            output_vocab_size: Some(248000),
         },
     );
 }
@@ -795,6 +798,7 @@ fn generate_from_an_older_client_preserves_session_and_tokens() {
     let Value::Array(mut fields) = decode_frames::<Value>(&frames[1..]).unwrap() else {
         panic!("generate messages must be arrays");
     };
+    assert_eq!(fields.pop(), Some(Value::from(false)));
     assert_eq!(fields.pop(), Some(Value::from(128)));
     expected.peer_expected_tokens = None;
     assert_eq!(fields.pop(), Some(Value::from("10.0.0.2:7100")));
@@ -851,6 +855,7 @@ fn output_without_request_timing_preserves_the_existing_load_tail() {
         panic!("output messages must be arrays");
     };
     assert_eq!(fields.pop(), Some(Value::Array(vec![])));
+    assert_eq!(fields.pop(), Some(Value::Array(vec![])));
     assert_eq!(fields.last(), Some(&Value::from(3_000_000_000_i64)));
     let legacy_frames = encode_frames(&Value::Array(fields));
     let decoded: BatchTokenIDOutSlim = decode_frames(&legacy_frames).unwrap();
@@ -858,6 +863,7 @@ fn output_without_request_timing_preserves_the_existing_load_tail() {
     assert_eq!(decoded.num_resident_tokens, Some(5_000_000_000));
     assert_eq!(decoded.num_waiting_uncached_tokens, Some(3_000_000_000));
     assert!(decoded.request_timing.is_empty());
+    assert!(decoded.output_full_vocab_topk.is_empty());
 }
 
 #[test]

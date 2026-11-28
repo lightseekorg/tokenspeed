@@ -276,7 +276,9 @@ class ForwardLogprobs:
     tokens': the planned prompt rows' (``ForwardContext.input_logprob_rows``),
     and the top-k alternatives of those rows and of the prefill rows' sampled
     tokens (``ForwardContext.sampled_top_k``). A forward that asked for none of
-    them -- every captured graph among them -- returns None in its place.
+    them returns None in its place. Captured decode graphs may carry fixed-width
+    full-vocabulary binary rows and their sampled logprobs; prompt/top-logprob
+    lists remain eager-only.
     """
 
     input_token_logprobs: torch.Tensor | None = None
@@ -284,6 +286,8 @@ class ForwardLogprobs:
     input_top_logprobs_idx: torch.Tensor | None = None
     output_top_logprobs_val: torch.Tensor | None = None
     output_top_logprobs_idx: torch.Tensor | None = None
+    full_vocab_topk: torch.Tensor | None = None
+    full_vocab_logprobs: torch.Tensor | None = None
 
     @classmethod
     def of(cls, logits_output: Any) -> ForwardLogprobs | None:
@@ -294,6 +298,8 @@ class ForwardLogprobs:
             input_top_logprobs_idx=logits_output.input_top_logprobs_idx,
             output_top_logprobs_val=logits_output.sampled_top_logprobs_val,
             output_top_logprobs_idx=logits_output.sampled_top_logprobs_idx,
+            full_vocab_topk=logits_output.full_vocab_topk,
+            full_vocab_logprobs=logits_output.full_vocab_logprobs,
         )
         return None if logprobs.is_empty() else logprobs
 
@@ -302,12 +308,44 @@ class ForwardLogprobs:
 
     def to_host(self) -> ForwardLogprobs:
         """Non-blocking D2H copies, landed by the result's copy event."""
-        return ForwardLogprobs(
-            **{
-                name: None if value is None else value.to("cpu", non_blocking=True)
-                for name, value in vars(self).items()
-            }
-        )
+        fields = dict(vars(self))
+        rows, sampled = fields.pop("full_vocab_topk"), fields.pop("full_vocab_logprobs")
+        landed = {}
+        for name, value in fields.items():
+            if value is None:
+                landed[name] = None
+            else:
+                host = torch.empty(
+                    value.shape, dtype=value.dtype, device="cpu", pin_memory=True
+                )
+                host.copy_(value, non_blocking=True)
+                landed[name] = host
+        if rows is not None:
+            if sampled is None or sampled.shape != rows.shape[:1]:
+                raise ValueError("binary rows must have one sampled logprob per row")
+            n, width = rows.shape
+            if (
+                rows.stride() != (width + 1, 1)
+                or sampled.stride() != (width + 1,)
+                or (
+                    n > 0
+                    and sampled.data_ptr()
+                    != rows.data_ptr() + width * rows.element_size()
+                )
+            ):
+                raise ValueError(
+                    "binary rows and sampled scores must share the packed output"
+                )
+            packed = rows.as_strided((n, width + 1), (width + 1, 1))
+            host = torch.empty(
+                packed.shape, dtype=torch.int32, device="cpu", pin_memory=True
+            )
+            host.copy_(packed, non_blocking=True)
+            landed["full_vocab_topk"] = host[:, :-1]
+            landed["full_vocab_logprobs"] = host[:, -1].view(torch.float32)
+        elif sampled is not None:
+            raise ValueError("sampled full-vocabulary scores require binary rows")
+        return ForwardLogprobs(**landed)
 
 
 @dataclass
@@ -363,6 +401,8 @@ class ModelExecutionResult:
     input_top_logprobs_idx: torch.Tensor | None = None
     output_top_logprobs_val: torch.Tensor | None = None
     output_top_logprobs_idx: torch.Tensor | None = None
+    full_vocab_topk: torch.Tensor | None = None
+    full_vocab_logprobs: torch.Tensor | None = None
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:

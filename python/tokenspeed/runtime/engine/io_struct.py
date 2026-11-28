@@ -155,6 +155,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     peer_holder: str | None = None
     # Router estimate of additional usable peer tokens beyond the local prefix.
     peer_expected_tokens: int | None = None
+    return_full_vocab_topk: bool = False
     # array_like declaration order is the wire contract; append new fields here.
 
 
@@ -231,6 +232,7 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     num_waiting_uncached_tokens: int | None = None
     # Request timing metadata: only terminal rows carry a map. Older producers omit it.
     request_timing: list[RequestTiming | None] = []
+    output_full_vocab_topk: list[bytes] = []
 
 
 class GetAdmissionReqInput(BaseReq, kw_only=True):

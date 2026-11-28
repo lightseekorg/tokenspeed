@@ -147,7 +147,7 @@ from tokenspeed.runtime.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     request_vocab_mask,
 )
-from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch, accepted_path_rows
 from tokenspeed.runtime.sampling.utils import top_token_logprobs
 from tokenspeed.runtime.utils import get_colorful_logger, is_pin_memory_available
 from tokenspeed.runtime.utils.common import maybe_inference_mode
@@ -458,6 +458,9 @@ class ModelExecutorConfig:
     # ``[rows, vocab]`` logits; log-softmax is row-local so the value never
     # changes a result.
     input_logprob_chunk_tokens: int
+    # --full-vocab-top-k width and the explicitly selected normalizer solution.
+    full_vocab_top_k: int
+    full_vocab_top_k_solution: str | None
     # Draft-prob rejection sampling: the drafter records its per-step
     # proposal distributions in RuntimeStates.draft_probs and verify accepts
     # with coin * q(x) < p(x) (see --enable-speculative-sampling). Selects
@@ -589,6 +592,8 @@ class ModelExecutorConfig:
             state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
             model_is_mrope=model_is_mrope,
             prefill_only=server_args.disaggregation_mode == "prefill",
+            full_vocab_top_k=server_args.full_vocab_top_k,
+            full_vocab_top_k_solution=server_args.full_vocab_top_k_solution,
             input_logprob_chunk_tokens=server_args.input_logprob_chunk_tokens,
             decode_only_attention=server_args.disaggregation_mode == "decode",
             query_shard_size=server_args.mapping.attn.qcp_size,
@@ -651,6 +656,21 @@ class ModelExecutor:
         register_hc_workspace_region(self.memory_saver_adapter)
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
+        from tokenspeed_kernel.ops.sampling import FullVocabTopK
+
+        from tokenspeed.runtime.configs.numerics import BLOCKWISE_LOGPROB_ORDERS
+
+        self.full_vocab_topk: FullVocabTopK | None = None
+        if config.full_vocab_top_k:
+            vocab_block, form = BLOCKWISE_LOGPROB_ORDERS[
+                sampling_backend.config.logprob_order
+            ]
+            self.full_vocab_topk = FullVocabTopK(
+                k=config.full_vocab_top_k,
+                vocab_block=vocab_block,
+                form=form,
+                solution=config.full_vocab_top_k_solution,
+            )
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
         # Every pool runs on the shared cache arena and publishes a runtime
@@ -788,6 +808,7 @@ class ModelExecutor:
             self.drafter = None
         if (
             self._pp_is_last_stage
+            and self.full_vocab_topk is None
             and self.sampling_backend.reads_only_argmax()
             and config.grammar_backend == "none"
         ):
@@ -797,6 +818,7 @@ class ModelExecutor:
         shard_top_k = self.sampling_backend.vocab_shard_top_k()
         self._samples_from_vocab_shard: bool = (
             self._pp_is_last_stage
+            and self.full_vocab_topk is None
             and shard_top_k is not None
             and self.model_runner.model.logits_processor.keep_sampled_logits_vocab_sharded(
                 self.model_runner.model.lm_head,
@@ -1833,6 +1855,31 @@ class ModelExecutor:
         token limit before anything reads it (the state commit, the accepted
         frontier, the drafter, the reported tokens)."""
         drafter = self.drafter
+        full_scores = None
+        if self.full_vocab_topk is not None:
+            if (
+                logits_output.vocab_shard is not None
+                or logits_output.logits_layout_plan is not None
+            ):
+                raise ValueError(
+                    "full-vocabulary top-k requires gathered target logits"
+                )
+            if (
+                logits_output.next_token_logits.shape[0]
+                != ctx.output_layout.num_output_tokens
+            ):
+                raise ValueError(
+                    "full-vocabulary logits must match the forward output layout"
+                )
+            full_scores = self.full_vocab_topk.begin(
+                logits_output.next_token_logits,
+                defer_head=(
+                    ctx.output_layout.num_decodes > 0
+                    and ctx.output_layout.decode_width > 1
+                ),
+            )
+            if sampling_info.vocab_mask is None:
+                logits_output.logprob_scores = full_scores
         output_tokens, accept_lengths = sample_with_diagnostics(
             logits_output,
             sampling_info,
@@ -1865,6 +1912,28 @@ class ModelExecutor:
             decode_width=ctx.output_layout.decode_width,
             padding_index=ib.state_write_padding_pool_index,
         )
+        if full_scores is not None:
+            prediction_rows = None
+            if self.tree_spec is not None and ctx.num_extends == 0:
+                prediction_rows = accepted_path_rows(
+                    self.sampling_backend.accepted_path(
+                        ctx.bs, self.tree_spec.num_nodes
+                    )
+                )
+            full_scores = full_scores.complete_accepted(
+                accept_lengths,
+                ib.state_write_req_pool_indices_buf[: ctx.bs],
+                num_prefill_outputs=ctx.output_layout.num_prefill_outputs,
+                num_extends=ctx.num_extends,
+                decode_width=ctx.output_layout.decode_width,
+                padding_index=ib.state_write_padding_pool_index,
+                prediction_rows=prediction_rows,
+            )
+            packed, sampled = full_scores.pack(
+                output_tokens, prediction_rows=prediction_rows
+            )
+            logits_output.full_vocab_topk = packed
+            logits_output.full_vocab_logprobs = sampled
         return output_tokens, accept_lengths
 
     def _sample_and_verify(
@@ -1945,6 +2014,11 @@ class ModelExecutor:
                 next_token_logits=None if logits is None else logits[prefill],
                 next_token_ids=None if token_ids is None else token_ids[prefill],
                 vocab_shard=None if shard is None else shard.rows(prefill),
+                logprob_scores=(
+                    None
+                    if logits_output.logprob_scores is None
+                    else logits_output.logprob_scores.rows(prefill)
+                ),
             )
             tokens, lengths = self.sampling_backend.sample(
                 prefill_out,
@@ -1981,6 +2055,11 @@ class ModelExecutor:
                     None if token_ids is None else token_ids[decode_outputs]
                 ),
                 vocab_shard=None if shard is None else shard.rows(decode_outputs),
+                logprob_scores=(
+                    None
+                    if logits_output.logprob_scores is None
+                    else logits_output.logprob_scores.rows(decode_outputs)
+                ),
             )
             tokens, lengths = self.sampling_backend.verify(
                 decode_out,
@@ -3204,6 +3283,8 @@ class ModelExecutor:
             input_top_logprobs_idx=forward_logprobs.input_top_logprobs_idx,
             output_top_logprobs_val=forward_logprobs.output_top_logprobs_val,
             output_top_logprobs_idx=forward_logprobs.output_top_logprobs_idx,
+            full_vocab_topk=forward_logprobs.full_vocab_topk,
+            full_vocab_logprobs=forward_logprobs.full_vocab_logprobs,
             output_token_cumulative_probs=output_cumulative_probs,
         )
 

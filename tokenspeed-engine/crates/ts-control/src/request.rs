@@ -295,6 +295,12 @@ pub struct RequestState {
     pub output_token_cumulative_probs: Vec<f64>,
     /// Their top-k alternatives' logprobs and ids, when requested.
     pub output_top_logprobs: Option<TopLogprobs>,
+    /// Unsent binary full-vocabulary rows, moved into each streamed output.
+    pub output_full_vocab_topk: Vec<u8>,
+    /// Zero for ordinary requests; otherwise the launch-time head width.
+    pub full_vocab_top_k: usize,
+    /// Vocabulary bound used when validating the binary rows.
+    pub full_vocab_topk_vocab_size: i64,
     /// The prompt positions' logprobs as the chunks deliver them, over
     /// `[logprob_start_len, prompt_len - 1)`; `None` when none is wanted.
     pub input_logprob_rows: Option<Vec<Option<f64>>>,
@@ -409,6 +415,9 @@ impl RequestState {
             output_logprobs: Vec::new(),
             output_token_cumulative_probs: Vec::new(),
             output_top_logprobs: None,
+            output_full_vocab_topk: Vec::new(),
+            full_vocab_top_k: 0,
+            full_vocab_topk_vocab_size: 0,
             input_logprob_rows: None,
             input_top_logprob_rows: None,
             input_logprobs: None,
