@@ -348,8 +348,10 @@ class _Backend:
         fused_decode_groups,
         out_rope_cache,
         key_rows=None,
+        fp8_out=None,
     ):
         assert key_rows is None
+        assert fp8_out is None
         self.calls.append(
             (
                 layer_id,

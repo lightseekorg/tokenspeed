@@ -304,10 +304,10 @@ def test_decode_swa_written_early_is_the_attention_write(monkeypatch, rope):
     )
     attended = []
 
-    def fused_attention(q, cache, *args):
+    def fused_attention(q, cache, *args, out=None):
         # Read the SWA field the way attention would: after the write.
         attended.append((cache.clone(), args[0], args[1]))
-        return q, q
+        return (q, q) if out is None else out
 
     def attention(q, cache, *args, lse):
         attended.append((cache.clone(), args[0], args[1]))
@@ -2398,44 +2398,56 @@ def test_gpu_swa_prefill_cross_chunk_matches_full_and_null_is_untouched():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_mixed_swa_matches_separate_extend_and_decode():
-    """A mixed batch attends and writes exactly as its extend and decode
-    halves run as separate forwards."""
-    backend = _backend("cuda", 2)
-    backend.init_cuda_graph_state(2, max_tokens_per_req=1, overlap_schedule_depth=1)
-    tables = _tables("cuda")
+@pytest.mark.parametrize("canonical", [False, True])
+def test_gpu_mixed_swa_matches_separate_extend_and_decode(canonical):
+    _check_mixed_swa_matches_separate(
+        _backend("cuda", 2), _tables("cuda"), layer=0, rope=None, canonical=canonical
+    )
+
+
+def _check_mixed_swa_matches_separate(backend, tables, *, layer, rope, canonical):
+    """Compare mixed attention and cache writes with separate extend and decode."""
+    heads = backend.spec.num_attention_heads
     torch.manual_seed(9)
-    sink = torch.zeros(2, device="cuda", dtype=torch.float32)
+    sink = torch.zeros(heads, device="cuda", dtype=torch.float32)
 
     def attend(q, swa, meta, mode):
         return backend.forward_v41(
             q,
             swa,
-            layer_id=0,
-            positions=meta.positions,
-            request_indices=meta.request_indices,
+            layer_id=layer,
+            positions=(
+                meta.positions.clone()
+                if mode.is_mixed() and not canonical
+                else meta.positions
+            ),
+            request_indices=(
+                meta.request_indices.clone()
+                if mode.is_mixed() and not canonical
+                else meta.request_indices
+            ),
             forward_mode=mode,
             index_q=None,
             index_weights=None,
             attn_sink=sink,
             softmax_scale=512**-0.5,
             index_process_group=None,
-            swa_rope_cache=None,
+            swa_rope_cache=rope,
             swa_norm_weight=None,
             swa_norm_eps=0.0,
-            fused_decode_groups=None,
+            fused_decode_groups=heads // 8 if rope is not None else None,
             key_rows=None,
         )
 
     # Request 0 has two prompt rows cached; request 1 a 129-row history.
     meta = _extend(backend, tables, [2, 129], [0, 0], [0, 0], [5, 200])
     attend(
-        torch.randn(131, 2, 512, device="cuda", dtype=torch.bfloat16),
+        torch.randn(131, heads, 512, device="cuda", dtype=torch.bfloat16),
         torch.randn(131, 512, device="cuda", dtype=torch.bfloat16),
         meta,
         ForwardMode.EXTEND,
     )
-    q = torch.randn(4, 2, 512, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(4, heads, 512, device="cuda", dtype=torch.bfloat16)
     swa = torch.randn(4, 512, device="cuda", dtype=torch.bfloat16)
     before = backend.cache_pool.arena.buffer.clone()
     backend.init_forward_metadata(
@@ -2472,7 +2484,18 @@ def test_gpu_mixed_swa_matches_separate_extend_and_decode():
     decode = attend(
         q[3:], swa[3:], backend.query_metadata(ForwardMode.DECODE), ForwardMode.DECODE
     )
-    torch.testing.assert_close(mixed, torch.cat((extend, decode)), rtol=0, atol=0)
+    if rope is not None:
+        torch.testing.assert_close(
+            mixed[0].view(torch.uint8),
+            torch.cat((extend[0].view(torch.uint8), decode[0].view(torch.uint8))),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            mixed[1], torch.cat((extend[1], decode[1])), rtol=0, atol=0
+        )
+    else:
+        torch.testing.assert_close(mixed, torch.cat((extend, decode)), rtol=0, atol=0)
     torch.testing.assert_close(
         backend.cache_pool.arena.buffer, mixed_cache, rtol=0, atol=0
     )

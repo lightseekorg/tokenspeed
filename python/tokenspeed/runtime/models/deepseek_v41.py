@@ -80,6 +80,7 @@ import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.dsv41 import (
     IndexKeyInput,
     IndexQueryInput,
+    allocate_fp8_output,
     index_query_rope_weights,
     prepare_fused_decode_weights,
     rope_inplace,
@@ -137,6 +138,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
     is_breakable_capture_active,
+    scrub_padding_tail,
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import (
@@ -1218,8 +1220,8 @@ class DeepseekV41Attention(nn.Module):
     def prepare_fused_decode(self) -> None:
         """Prepare, or refresh in place, the fused attention weight copies.
 
-        Decode and pure prefill both read these; the canonical weights stay for
-        every other mode and for the indexer.
+        Decode, prefill and mixed attention read these when supported; canonical
+        weights remain available for distributed attention and the indexer.
 
         Refresh existing buffers in place after weight updates: captured graphs
         retain them. Q's latent norm and the indexer's projections stay canonical.
@@ -1363,7 +1365,21 @@ class DeepseekV41Attention(nn.Module):
             return "packed"
         return "swizzled" if "swizzled" in layouts else "canonical"
 
-    @break_point
+    def _uses_fused_attention(self, ctx: ForwardContext) -> bool:
+        mode = ctx.forward_mode
+        return (
+            self.fused_q_weight is not None
+            and ctx.query_shard is None
+            and mode is not None
+            and (
+                (mode.is_decode() and ctx.attn_backend.supports_fused_attention)
+                or (
+                    mode.is_extend_or_mixed()
+                    and ctx.attn_backend.supports_fused_prefill
+                )
+            )
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1378,9 +1394,67 @@ class DeepseekV41Attention(nn.Module):
         hidden_codes/hidden_scales optionally carry hidden_states already
         quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales).
         """
+        # The CED narrowing layer has request-dependent output rows and runs
+        # eagerly between the encoder and decoder graphs. The other layers
+        # project the same token bucket that their input occupies.
+        handoff_codes = handoff_scales = None
+        if (
+            is_breakable_capture_active()
+            and self.layer_id != self.ced_decoder_start
+            and self._uses_fused_attention(ctx)
+            and ctx.forward_mode.is_extend_or_mixed()
+        ):
+            handoff_codes, handoff_scales = allocate_fp8_output(
+                hidden_states.device,
+                self.n_local_groups,
+                hidden_states.shape[0],
+                zeroed=False,
+            )
+        # Separate tensor arguments let the break borrow their graph storage.
+        out = self._attention(
+            positions,
+            hidden_states,
+            ctx,
+            reduce_output,
+            hidden_codes,
+            hidden_scales,
+            handoff_codes=handoff_codes,
+            handoff_scales=handoff_scales,
+        )
+        if out is not None:
+            return out
+        # Prepared fused weights serve local heads, so this projection has no
+        # tensor-parallel reduction or collective target.
+        return self._project_fp8(
+            handoff_codes,
+            handoff_scales,
+            self.fused_wo_a_weight,
+            self.fused_wo_a_scales,
+            None,
+        )
+
+    @break_point
+    def _attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        reduce_output: bool,
+        hidden_codes: torch.Tensor | None,
+        hidden_scales: torch.Tensor | None,
+        *,
+        handoff_codes: torch.Tensor | None,
+        handoff_scales: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """Write the FP8 graph inputs when supplied, otherwise finish the projection."""
         backend, mode = ctx.attn_backend, ctx.forward_mode
         if mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
+        if handoff_codes is not None and mode.is_idle():
+            # The following graph segment projects the entire bucket, including
+            # on a rank whose live forward contributes no attention rows.
+            scrub_padding_tail(0, handoff_codes, handoff_scales)
+            return None
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         meta = rows.source
         source_gather = (
@@ -1393,20 +1467,11 @@ class DeepseekV41Attention(nn.Module):
             if rows.query_shard is not None
             else None
         )
-        # The prepared weights serve decode and pure prefill alike. A mixed
-        # batch keeps the step-by-step path, as its extend and decode halves
-        # must agree on the output format. So does a query shard: the fused
-        # kernel rotates Q from the positions the backend holds, and under
-        # model QCP those are the shard's query rows rather than the source
-        # rows this layer rotates itself.
-        fused_decode = (
-            self.fused_q_weight is not None
-            and query_gather is None
-            and (
-                (mode.is_decode() and backend.supports_fused_attention)
-                or (mode.is_extend() and backend.supports_fused_prefill)
-            )
-        )
+        # Prefill and decode slices share the prepared Q/O layouts and one
+        # output projection. A query shard keeps the canonical path: fused Q
+        # RoPE would use the backend's query positions instead of this layer's
+        # source positions.
+        fused_decode = self._uses_fused_attention(ctx)
         if source_gather is not None and (
             source_gather.plan.size != len(source_gather.group)
             or self.mapping.attn.head_tp_size != 1
@@ -1733,6 +1798,12 @@ class DeepseekV41Attention(nn.Module):
             and (current_platform().is_cdna4 or current_platform().is_cdna5)
             else None
         )
+        fp8_out = None
+        if handoff_codes is not None:
+            assert fused_decode and handoff_scales is not None
+            live = q.shape[0]
+            scrub_padding_tail(live, handoff_codes, handoff_scales)
+            fp8_out = handoff_codes[:live], handoff_scales[:live]
         out = backend.forward_v41(
             q,
             swa,
@@ -1753,7 +1824,10 @@ class DeepseekV41Attention(nn.Module):
             out_rope_cache=out_rope_cache,
             fused_decode_groups=self.n_local_groups if fused_decode else None,
             key_rows=query_gather,
+            fp8_out=fp8_out,
         )
+        if fp8_out is not None:
+            return None
         if fused_decode:
             codes, scales = out
             weight, weight_scales = self.fused_wo_a_weight, self.fused_wo_a_scales
@@ -1781,17 +1855,7 @@ class DeepseekV41Attention(nn.Module):
                 codes, scales = self.rotary_emb.inverse_quantize_grouped(
                     out, positions, self.n_local_groups
                 )
-            if self.wo_b_fp8:
-                # wo_a writes wo_b's FP8 input and scales; nothing quantizes between.
-                codes, scales = grouped_fp8_projection_quantize_fp8(
-                    codes, scales, weight, weight_scales
-                )
-                out = fp8_projection(
-                    codes, scales, self.wo_b.weight, self.wo_b_scales, target
-                )
-            else:
-                out = grouped_fp8_projection(codes, scales, weight, weight_scales, None)
-                out, _ = self.wo_b(out.flatten(1), scale=None, out=target)
+            out = self._project_fp8(codes, scales, weight, weight_scales, target)
         else:
             if out_rope_cache is None:
                 out = self.rotary_emb.apply_owned(out, positions, True)
@@ -1817,6 +1881,19 @@ class DeepseekV41Attention(nn.Module):
             )
         return out
 
+    def _project_fp8(self, codes, scales, weight, weight_scales, target):
+        if self.wo_b_fp8:
+            # wo_a writes wo_b's FP8 input and scales.
+            codes, scales = grouped_fp8_projection_quantize_fp8(
+                codes, scales, weight, weight_scales
+            )
+            return fp8_projection(
+                codes, scales, self.wo_b.weight, self.wo_b_scales, target
+            )
+        out = grouped_fp8_projection(codes, scales, weight, weight_scales, None)
+        out, _ = self.wo_b(out.flatten(1), scale=None, out=target)
+        return out
+
 
 def _warmup_query_projections(
     attentions: Iterable[DeepseekV41Attention], max_tokens: int
@@ -1828,7 +1905,7 @@ def _warmup_query_projections(
         if attn.fused_q_projection_scales is not None:
             projections.append((attn.fused_q_weight, attn.fused_q_projection_scales))
         # The first layers have no indexer. Canonical Q also runs on DeepGEMM
-        # in mixed/distributed batches and when fused attention is unavailable.
+        # in distributed batches and when fused attention is unavailable.
         layers = [attn.wq_a_wkv, attn.wq_b]
         if attn.indexer is not None:
             layers.append(attn.indexer.wq_b)

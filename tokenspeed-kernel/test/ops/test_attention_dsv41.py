@@ -96,7 +96,11 @@ def test_public_argument_defaults():
             continue
         assert fn.__doc__, name
         for parameter in inspect.signature(fn).parameters.values():
-            if name == "index_topk" and parameter.name in ("index_metadata", "slots"):
+            if (name, parameter.name) in {
+                ("index_topk", "index_metadata"),
+                ("index_topk", "slots"),
+                ("selected_attention_fp8", "out"),
+            }:
                 assert parameter.default is None
                 continue
             assert (
@@ -858,7 +862,58 @@ def test_reject_unbounded_candidate_input(device):
         )
 
 
+def test_allocate_fp8_output_zeroed_layout():
+    rows, groups = 5, 8
+    codes, scales = dsv41.allocate_fp8_output(
+        torch.device("cpu"), groups, rows, zeroed=True
+    )
+    assert codes.dtype == torch.float8_e4m3fn
+    assert codes.shape == (rows, groups, 64 * 512 // groups)
+    assert codes.is_contiguous()
+    assert scales.dtype == torch.int32
+    assert scales.shape == (rows, groups, 64 * 512 // groups // 128)
+    # Rows are the fastest dimension, over storage padded to four rows.
+    assert scales.stride(0) == 1
+    assert scales.stride(1) == (rows + 3) // 4 * 4 * scales.shape[2]
+    assert not codes.view(torch.uint8).any()
+    assert not scales.any()
+
+
+@pytest.mark.parametrize(
+    "zeroed,selector,expected",
+    [
+        (True, [2, 0], [0, 3, 0, 2, 0]),
+        (False, [True, False, True, False], [1, 2, 1, 3, 1]),
+    ],
+    ids=["reordered-indices", "boolean-mask"],
+)
+def test_fp8_attention_output_scatter_to_row_view(zeroed, selector, expected):
+    device = torch.device("cpu")
+    codes, scales = dsv41.allocate_fp8_output(device, 16, 5, zeroed=zeroed)
+    if not zeroed:
+        codes.view(torch.uint8).fill_(1)
+        scales.fill_(10)
+    result = dsv41.allocate_fp8_output(device, 16, 2, zeroed=False)
+    markers = torch.tensor([2, 3], dtype=torch.uint8)[:, None, None]
+    result[0].view(torch.uint8).copy_(markers)
+    result[1].copy_(10 * markers)
+
+    # The four-row destination starts at row one of an eight-row scale allocation.
+    dsv41.scatter_attention_output_fp8(
+        (codes[1:], scales[1:]), torch.tensor(selector), result
+    )
+    expected = torch.tensor(expected, dtype=torch.uint8)[:, None, None]
+    assert torch.all(codes.view(torch.uint8) == expected)
+    assert torch.all(scales == 10 * expected)
+    assert scales.stride() == (1, 32 * 8, 8)
+    physical_scales = scales.as_strided((8, 16, 32), scales.stride())
+    assert not physical_scales[5:].count_nonzero()
+
+
 def test_empty_cache_and_zero_width_attention(device):
+    codes, scales = dsv41.allocate_fp8_output(device, 8, 0, zeroed=True)
+    assert codes.shape == (0, 8, 4096)
+    assert scales.shape == (0, 8, 32)
     for fmt, (dim, _, _, width) in _LAYOUTS.items():
         cache = torch.empty((0, 64, width), dtype=torch.uint8, device=device)
         slots = torch.tensor([[-1, 0, 64]], device=device)

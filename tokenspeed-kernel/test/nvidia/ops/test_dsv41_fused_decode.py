@@ -180,8 +180,9 @@ def _assert_quantized_projection(bf16, codes, scales):
 @pytest.mark.parametrize(
     "layout,heads", [("swa", 64), ("global", 128), ("workspace", 64)]
 )
+@pytest.mark.parametrize("use_output", [False, True])
 def test_fused_decode_projection_and_graph(
-    device, projection_dependencies, layout, heads
+    device, projection_dependencies, layout, heads, use_output
 ):
     torch.manual_seed(316)
     groups = heads // 8
@@ -238,8 +239,20 @@ def test_fused_decode_projection_and_graph(
             prepacked_scales=True,
         ).view(tokens, heads, 512)
 
+    parent = destination = None
+    live_rows = slice(None)
+    if use_output:
+        parent = dsv41.allocate_fp8_output(
+            rows.device, groups, tokens + 4, zeroed=False
+        )
+        # Fill neighboring rows with FP8 ones and unit scales to detect stray writes.
+        parent[0].view(torch.uint8).fill_(0x38)
+        parent[1].fill_(0x7F7F7F7F)
+        live_rows = slice(1, tokens + 1)
+        destination = parent[0][live_rows], parent[1][live_rows]
+
     def run_fused():
-        codes, scales = dsv41.selected_attention_fp8(
+        result = dsv41.selected_attention_fp8(
             project_q(permuted),
             *swa_args,
             *global_args,
@@ -250,7 +263,13 @@ def test_fused_decode_projection_and_graph(
             groups,
             workspace,
             workspace_slots,
+            out=destination,
         )
+        if parent is not None:
+            assert result is destination
+            # Attention writes a slice. Both forms of wo_a consume the whole batch.
+            result = parent
+        codes, scales = result
         projected = grouped_fp8_projection(
             codes, scales, permuted[2], permuted[3], None
         )
@@ -260,6 +279,7 @@ def test_fused_decode_projection_and_graph(
         return codes, scales, projected, *projected_fp8
 
     def check_reference(got):
+        got = tuple(tensor[live_rows] for tensor in got)
         q = _rotate(project_q(original), positions, cos_sin)
         if workspace is not None:
             valid = (slots >= 0) & (slots < workspace.shape[0])
@@ -335,14 +355,22 @@ def test_fused_decode_projection_and_graph(
         global_slots[0, 0] = 30
         global_lens[2] = 0
 
-    refreshed = run_fused()
+    refreshed = tuple(tensor.clone() for tensor in run_fused())
     check_reference(refreshed)
+    if destination is not None:
+        # Replay must refill the live rows before the captured projections read them.
+        destination[0].zero_()
+        destination[1].zero_()
     graph.replay()
     assert not torch.equal(refreshed[2], initial[2])
     for got, want in zip(replayed, refreshed, strict=True):
         if got.dtype == _FP8:
             got, want = got.view(torch.uint8), want.view(torch.uint8)
         torch.testing.assert_close(got, want, atol=0, rtol=0)
+    if parent is not None:
+        for outside in (slice(0, live_rows.start), slice(live_rows.stop, None)):
+            assert torch.all(parent[0].view(torch.uint8)[outside] == 0x38)
+            assert torch.all(parent[1][outside] == 0x7F7F7F7F)
 
 
 @pytest.mark.parametrize("layout", ["swa", "workspace"])
