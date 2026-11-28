@@ -295,33 +295,93 @@ def test_channel_down_graph_refreshes_live_expert_populations(intermediate):
         assert torch.all(partials[population:] == float(2 * intermediate))
 
 
+def _fp8_channel_weights(experts, hidden, intermediate, generator):
+    """Seeded FP8 expert weights with one FP32 scale per output channel.
+
+    Each expert's gate/up and down projections are drawn in FP32 (std 0.02)
+    one at a time and quantized to E4M3 with ``amax / 448`` scales, so the
+    multi-GiB FP8 layer never has a full FP32 copy.
+    """
+    from types import SimpleNamespace
+
+    shapes = {
+        "w13": (experts, 2 * intermediate, hidden),
+        "w13_scale": (experts, 2 * intermediate),
+        "w2": (experts, hidden, intermediate),
+        "w2_scale": (experts, hidden),
+    }
+    tensors = {
+        name: torch.empty(
+            shape,
+            device=generator.device,
+            dtype=torch.float32 if name.endswith("scale") else torch.float8_e4m3fn,
+        )
+        for name, shape in shapes.items()
+    }
+    for expert in range(experts):
+        for name in ("w13", "w2"):
+            weight = (
+                torch.randn(
+                    shapes[name][1:],
+                    device=generator.device,
+                    dtype=torch.float32,
+                    generator=generator,
+                )
+                * 0.02
+            )
+            scale = (weight.abs().amax(dim=-1) / 448.0).clamp(min=2.0**-126)
+            tensors[name][expert].copy_(
+                (weight / scale[:, None]).to(torch.float8_e4m3fn)
+            )
+            tensors[f"{name}_scale"][expert].copy_(scale)
+            del weight, scale
+    return SimpleNamespace(
+        w13_weight=tensors["w13"],
+        w13_weight_scale=tensors["w13_scale"],
+        w2_weight=tensors["w2"],
+        w2_weight_scale=tensors["w2_scale"],
+        activation="silu",
+        swiglu_arg=None,
+        swiglu_beta=None,
+        w13_input_layout="concatenated",
+        ep_rank=0,
+        ep_size=1,
+        num_local_experts=experts,
+    )
+
+
 @pytest.fixture(scope="module")
 def tp8_channel_fixture():
     _require_device()
-    from tokenspeed_kernel.benchmark.generators.moe import _prepare_routed_weights
-    from tokenspeed_kernel.ops.moe import moe_plan
+    from tokenspeed_kernel.ops.moe import moe_plan, moe_process_weights
 
-    candidate, weights = _prepare_routed_weights(
-        weight_dtype_name="fp8_channel",
-        weight_dtype=torch.float8_e4m3fn,
+    candidate = moe_plan(
+        weight_dtype="fp8_channel",
         input_dtype=torch.bfloat16,
         activation="silu",
+        requires_deferred_finalize=False,
         routing_mode="precomputed_topk",
+        a2a_backend="none",
         ep_size=1,
-        hidden_size=5120,
-        intermediate_size_per_partition=320,
+        ispp=320,
+        hidden=5120,
         num_experts=256,
-        num_local_experts=256,
         top_k=8,
-        ep_rank=0,
-        swiglu_limit=None,
-        situ_beta=None,
-        situ_linear_beta=None,
-        block_shape=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fp8_scale_block_shape=None,
         internal_activation_dtype="input",
+        with_bias=False,
         fast_math=False,
-        weight_seed=1861433681,
+        combine_order="rank",
+        features=frozenset(),
+        solution=None,
     )
+    weights = _fp8_channel_weights(
+        256, 5120, 320, torch.Generator(device="cuda").manual_seed(1861433681)
+    )
+    moe_process_weights(candidate, weights)
     candidate["precision_policy"] = "default"
     native = moe_plan(
         weight_dtype="fp8_channel",
