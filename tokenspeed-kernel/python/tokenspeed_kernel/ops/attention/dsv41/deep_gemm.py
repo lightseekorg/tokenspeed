@@ -299,20 +299,50 @@ def _pack_index_keys(cache, page_table, history_rows):
     history_rows gives the consecutive query rows sharing one history. Returns
     (keys, scales) for all histories back to back, the flattened history page
     list they came from, and each row's int32 start.
-    Host ints only drive slicing and fills, so no host-device copy or sync.
+    Uses pinned async uploads outside capture so no host-device sync occurs.
     """
     page_size = 64
     span = page_table.shape[1] * page_size
-    starts = torch.empty(
-        page_table.shape[0], dtype=torch.int32, device=page_table.device
-    )
-    rows = []
+    device = page_table.device
+    if len(history_rows) == 1:
+        pages = page_table[0]
+        starts = torch.zeros(page_table.shape[0], dtype=torch.int32, device=device)
+        return gather_index_pages(cache, pages, page_size), pages, starts
+    if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+        starts = torch.empty(page_table.shape[0], dtype=torch.int32, device=device)
+        rows = []
+        first = 0
+        for run, count in enumerate(history_rows):
+            rows.append(page_table[first : first + 1])
+            starts[first : first + count].fill_(run * span)
+            first += count
+        pages = torch.cat(rows).reshape(-1)
+        return gather_index_pages(cache, pages, page_size), pages, starts
+    first_rows = []
+    run_starts = []
     first = 0
     for run, count in enumerate(history_rows):
-        rows.append(page_table[first : first + 1])
-        starts[first : first + count].fill_(run * span)
+        first_rows.append(first)
+        run_starts.append(run * span)
         first += count
-    pages = rows[0][0] if len(rows) == 1 else torch.cat(rows).reshape(-1)
+    if device.type == "cuda":
+        first_t = torch.tensor(first_rows, dtype=torch.int64, pin_memory=True).to(
+            device, non_blocking=True
+        )
+        starts_t = torch.tensor(run_starts, dtype=torch.int32, pin_memory=True).to(
+            device, non_blocking=True
+        )
+        counts_t = torch.tensor(history_rows, dtype=torch.int64, pin_memory=True).to(
+            device, non_blocking=True
+        )
+    else:
+        first_t = torch.tensor(first_rows, dtype=torch.int64, device=device)
+        starts_t = torch.tensor(run_starts, dtype=torch.int32, device=device)
+        counts_t = torch.tensor(history_rows, dtype=torch.int64, device=device)
+    pages = page_table.index_select(0, first_t).reshape(-1)
+    starts = torch.repeat_interleave(
+        starts_t, counts_t, output_size=page_table.shape[0]
+    )
     return gather_index_pages(cache, pages, page_size), pages, starts
 
 

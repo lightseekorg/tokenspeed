@@ -363,6 +363,18 @@ def autotune(
     with cache, candidates, gemms, _autotuner.autotune(
         tune_mode, tuning_buckets=tuning_buckets, round_up=round_up
     ):
+        if not tune_mode:
+            # FlashInfer's autotune(False) leaves an enclosing tuning scope's
+            # is_tuning_mode=True intact; clear it explicitly for lookup-only
+            # sub-blocks and restore on exit.
+            tuner = _autotuner.AutoTuner.get()
+            previous = tuner.is_tuning_mode
+            tuner.is_tuning_mode = False
+            try:
+                yield
+            finally:
+                tuner.is_tuning_mode = previous
+            return
         yield
 
 

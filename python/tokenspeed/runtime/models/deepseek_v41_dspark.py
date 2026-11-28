@@ -218,6 +218,7 @@ class _WindowAttention:
                 fused_decode_groups,
                 kv.view(-1, 1, kv.shape[-1]),
                 self.selection.indices,
+                positions_nonnegative=False,
             )
         if q.is_cuda and q.shape[-1] == 512:
             out = self._kernel_forward(q, kv, attn_sink, softmax_scale)

@@ -28,7 +28,12 @@ from dataclasses import dataclass
 from typing import NamedTuple, get_args
 
 import torch
-from tokenspeed_kernel.ops.tuning import is_autotuning, is_warming_up
+from tokenspeed_kernel.ops.tuning import (
+    autotune,
+    get_autotune_max_num_tokens,
+    is_autotuning,
+    is_warming_up,
+)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -219,9 +224,13 @@ if gemm_fp8_nt_groupwise is not error_fn:
 
 
 mm_mxfp8 = error_fn
+mxfp8_warmup_buckets = error_fn
 
 if platform.is_nvidia and platform.is_blackwell:
-    from tokenspeed_kernel.thirdparty.flashinfer.mxfp8 import mm_mxfp8
+    from tokenspeed_kernel.thirdparty.flashinfer.mxfp8 import (
+        mm_mxfp8,
+        mxfp8_warmup_buckets,
+    )
 
 _MXFP8_UE8M0_1X32_SCALE = ScaleFormat(
     storage_dtype=torch.uint8,
@@ -258,6 +267,76 @@ def swizzle_mxfp8_scale(sf: torch.Tensor, m: int, k: int) -> torch.Tensor:
     padded = torch.zeros((m_tiles * 128, k_tiles * 4), dtype=sf.dtype, device=sf.device)
     padded[:m, : k // 32] = sf
     return padded.view(m_tiles, 4, 32, k_tiles, 4).transpose(1, 3).contiguous().view(-1)
+
+
+_WARMED_MXFP8_SHAPES: set[tuple[int | None, int, int, torch.dtype, torch.dtype]] = set()
+
+
+def _warm_mxfp8_buckets(
+    A: torch.Tensor,
+    b: torch.Tensor,
+    A_scales: torch.Tensor,
+    B_scales: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> None:
+    """Compile cached or default MXFP8 tactics across M buckets during startup.
+
+    When a persisted FlashInfer autotune cache hits (or autotuning is off),
+    startup only executes the warmup batch's row counts, leaving tactics for
+    other M buckets (and their CuTe DSL ``HardwareInfo`` cluster probes)
+    uncompiled until live serving traffic lands in them. Running the hybrid M
+    buckets with ``autotune(tune_mode=False, ...)`` compiles the exact serving
+    tactics before serving starts without re-profiling, invoking tuning
+    collectives, or retaining GPU memory.
+    """
+    if not is_warming_up():
+        return
+    if A.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+    k, n = b.shape
+    key = (A.device.index, n, k, A.dtype, out_dtype)
+    if key in _WARMED_MXFP8_SHAPES:
+        return
+    max_m = max(int(A.shape[0]), get_autotune_max_num_tokens())
+    buckets = [m for m in mxfp8_warmup_buckets(max_m) if m != A.shape[0]]
+    if not buckets:
+        _WARMED_MXFP8_SHAPES.add(key)
+        return
+    largest = max(buckets)
+    k_tiles = (k + 127) // 128
+    a_buf: torch.Tensor | None = None
+    scale_buf: torch.Tensor | None = None
+    with torch.no_grad(), autotune(tune_mode=False, tuning_buckets=None, round_up=None):
+        if largest > A.shape[0]:
+            max_m_tiles = (largest + 127) // 128
+            a_buf = torch.zeros((largest, k), dtype=A.dtype, device=A.device)
+            scale_buf = torch.full(
+                (max_m_tiles * 128 * k_tiles * 4,),
+                127,
+                dtype=torch.uint8,
+                device=A.device,
+            )
+        for bucket_m in buckets:
+            m_tiles = (bucket_m + 127) // 128
+            scale_len = m_tiles * 128 * k_tiles * 4
+            if bucket_m <= A.shape[0]:
+                a_in = A[:bucket_m]
+                scale_in = A_scales[:scale_len]
+            else:
+                assert a_buf is not None and scale_buf is not None
+                a_in = a_buf[:bucket_m]
+                scale_in = scale_buf[:scale_len]
+            out_tmp = mm_mxfp8(
+                a_in,
+                b,
+                scale_in,
+                B_scales,
+                out_dtype=out_dtype,
+                backend="cute-dsl",
+            )
+            del out_tmp
+        del a_buf, scale_buf
+    _WARMED_MXFP8_SHAPES.add(key)
 
 
 if mm_mxfp8 is not error_fn:
@@ -347,6 +426,7 @@ if mm_mxfp8 is not error_fn:
             out_dtype=out_dtype,
             backend="cute-dsl",
         )
+        _warm_mxfp8_buckets(A, b, A_scales, B_scales, out_dtype)
         if out is not None:
             out.copy_(output)
             return out

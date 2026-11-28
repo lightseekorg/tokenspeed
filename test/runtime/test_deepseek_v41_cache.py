@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 import os
+import random
 import sys
 from dataclasses import replace
 from types import SimpleNamespace
@@ -304,7 +305,8 @@ def test_decode_swa_written_early_is_the_attention_write(monkeypatch, rope):
     )
     attended = []
 
-    def fused_attention(q, cache, *args):
+    def fused_attention(q, cache, *args, positions_nonnegative):
+        assert positions_nonnegative is False
         # Read the SWA field the way attention would: after the write.
         attended.append((cache.clone(), args[0], args[1]))
         return q, q
@@ -4954,3 +4956,754 @@ def test_prefill_indexer_native_architecture(monkeypatch, major, minor, expected
         assert not dsv41.prefill_indexer_batching_supported(132)
     finally:
         deep_gemm.is_native_indexer_available.cache_clear()
+
+
+def _reference_swa_plan_sort(backend, positions, spans, forward_mode):
+    """Exact sort/searchsorted reference for canonical SWA query plans."""
+    plans = []
+    for span in spans:
+        if not span.count:
+            continue
+        rows = slice(span.offset, span.offset + span.count)
+        current_positions = positions[rows]
+        prefix_positions = torch.arange(
+            span.swa_prefix_begin, span.prefix, device=backend.device
+        )
+        prefix_slots = backend.cache_slots(
+            SWA,
+            prefix_positions,
+            torch.full_like(prefix_positions, span.request),
+            forward_mode,
+        )
+        workspace_positions = torch.cat((prefix_positions, current_positions))
+        keys, order = workspace_positions.sort()
+        wanted = current_positions[:, None] - torch.arange(
+            127, -1, -1, device=backend.device
+        )
+        lookup = torch.searchsorted(keys, wanted.contiguous()).clamp_max(
+            keys.numel() - 1
+        )
+        indices = (
+            order[lookup]
+            .masked_fill((wanted < 0) | (keys[lookup] != wanted), -1)
+            .to(torch.int32)
+        )
+        plans.append(
+            (
+                span.request,
+                rows,
+                span.prefix + span.count - 1,
+                prefix_slots,
+                indices,
+            )
+        )
+    return plans
+
+
+def _reference_prefill_batches(backend, ref_plans, owner, forward_mode):
+    """Exact per-request arange reference for _prefill_layout and _prefill_batch."""
+    ratio = backend.spec.compress_ratios[owner] if owner >= 0 else 0
+    groups, pending, used_rows = [], [], 0
+    prefix_offset = 0
+    for req_id, rows, last_pos, prefix_slots, local_swa in ref_plans:
+        prefix_count = prefix_slots.numel()
+        current = torch.arange(rows.start, rows.stop, device=backend.device)
+        history = (last_pos + 1) // ratio if owner >= 0 else 0
+        need = history + prefix_count + current.numel()
+        if pending and used_rows + need > backend._prefill_kv_rows:
+            groups.append(pending)
+            pending, used_rows = [], 0
+        pending.append(
+            (
+                req_id,
+                rows,
+                last_pos,
+                prefix_slots,
+                local_swa,
+                prefix_offset,
+                current,
+                history,
+            )
+        )
+        used_rows += need
+        prefix_offset += prefix_count
+    if pending:
+        groups.append(pending)
+
+    ref_batches = []
+    ref_history_slots = []
+    empty = torch.empty(0, dtype=torch.int64, device=backend.device)
+    for entries in groups:
+        history_rows = sum(e[7] for e in entries)
+        history_start, swa_start = 0, history_rows
+        prefix_src, prefix_dst = [], []
+        current_src, current_dst = [], []
+        query_parts, swa_parts, base_parts = [], [], []
+        batch_hist_slots = []
+        for (
+            req_id,
+            rows,
+            last_pos,
+            prefix_slots,
+            local_swa,
+            p_offset,
+            current,
+            history,
+        ) in entries:
+            if owner >= 0:
+                h_pos = (
+                    torch.arange((last_pos + 1) // ratio, device=backend.device) * ratio
+                )
+                batch_hist_slots.append(
+                    backend.cache_slots(
+                        backend._owner_group(owner),
+                        h_pos,
+                        torch.full_like(h_pos, req_id),
+                        forward_mode,
+                    )
+                )
+            prefix_count = prefix_slots.numel()
+            swa_count = prefix_count + current.numel()
+            queries = current.numel()
+            if queries:
+                prefix_src.append(torch.arange(p_offset, p_offset + prefix_count))
+                prefix_dst.append(torch.arange(swa_start, swa_start + prefix_count))
+                current_src.append(current)
+                current_dst.append(
+                    torch.arange(swa_start + prefix_count, swa_start + swa_count)
+                )
+                query_parts.append(current)
+                swa_parts.append(
+                    torch.where(local_swa >= 0, local_swa + swa_start, local_swa)
+                )
+                base_parts.append(
+                    torch.full((queries,), history_start, dtype=torch.int32)
+                )
+                swa_start += swa_count
+            history_start += history
+        ref_batches.append(
+            (
+                swa_start,
+                history_rows,
+                torch.cat(query_parts) if query_parts else empty,
+                torch.cat(prefix_src) if prefix_src else empty,
+                torch.cat(prefix_dst) if prefix_dst else empty,
+                torch.cat(current_src) if current_src else empty,
+                torch.cat(current_dst) if current_dst else empty,
+                (
+                    torch.cat(swa_parts)
+                    if swa_parts
+                    else torch.empty((0, 128), dtype=torch.int32)
+                ),
+                (
+                    torch.cat(base_parts)
+                    if base_parts
+                    else torch.empty(0, dtype=torch.int32)
+                ),
+            )
+        )
+        ref_history_slots.append(
+            torch.cat(batch_hist_slots) if owner >= 0 and batch_hist_slots else None
+        )
+    ref_prefix_slots = torch.cat([p[3] for p in ref_plans]) if ref_plans else empty
+    return ref_prefix_slots, ref_batches, ref_history_slots
+
+
+def _materialize_workspace_rows(
+    kv_rows, prefix_total, current_total, p_src, p_dst, c_src, c_dst
+):
+    """Apply prefix and current copy maps onto distinct sentinel row values."""
+    workspace = torch.full((kv_rows,), -1, dtype=torch.int64)
+    prefixes = torch.arange(10_000, 10_000 + prefix_total, dtype=torch.int64)
+    current = torch.arange(20_000, 20_000 + current_total, dtype=torch.int64)
+    if p_src is not None and p_dst is not None:
+        workspace[p_dst] = prefixes[p_src]
+    if c_src is not None and c_dst is not None:
+        workspace[c_dst] = current[c_src]
+    return workspace
+
+
+def _multi_request_tables(device, num_reqs: int):
+    """Page tables with globally unique positive page IDs per (group, request, col)."""
+    widths = v41_table_widths(512, 0)
+    tables = {}
+    for g_idx, (gid, width) in enumerate(widths.items()):
+        base = 1 + g_idx * 1000
+        rows = torch.arange(
+            base, base + num_reqs * width, dtype=torch.int32, device=device
+        ).view(num_reqs, width)
+        tables[gid] = rows
+    return tables
+
+
+def test_canonical_swa_plan_and_prefill_batch_match_sort_reference():
+    """Randomized equivalence of _swa_query_plan + _prefill_layout/_prefill_batch
+    against the sort/searchsorted and per-request arange reference across replay
+    spans (begin == prefix), partial prefixes (pcount < 127), full prefixes,
+    EXTEND/MIXED modes, decoder views, and single/multi-batch workspace budgets."""
+    backend = _verify_backend("cpu", 6, 1)
+    tables = _multi_request_tables("cpu", 6)
+    saved_kv_rows = backend._prefill_kv_rows
+
+    try:
+        for seed in range(24):
+            rng = random.Random(2026 + seed)
+            num_extends = rng.randint(1, 4)
+            num_decodes = rng.randint(1, 2) if seed % 3 == 0 else 0
+            bs = num_extends + num_decodes
+            mode = ForwardMode.MIXED if num_decodes else ForwardMode.EXTEND
+
+            lengths = []
+            prefixes = []
+            replays = []
+            prompt_lens = []
+            budget = 512 - num_decodes
+            for idx in range(num_extends):
+                remaining_reqs = num_extends - idx - 1
+                max_len = min(140, budget - remaining_reqs)
+                kind = (seed + idx) % 5
+                if kind == 0:
+                    # Fresh prompt: prefix == 0, pcount == 0.
+                    prefix = 0
+                    count = rng.randint(1, max(1, max_len))
+                    replay = 0
+                elif kind == 1:
+                    # Replay span: replay > 0 -> swa_prefix_begin == prefix (pcount == 0).
+                    prefix = rng.choice([1, 37, 64, 127, 128, 192])
+                    count = rng.randint(1, max(1, min(max_len, 512 - prefix)))
+                    replay = rng.randint(1, count)
+                elif kind == 2:
+                    # Partial prefix: 0 < pcount < 127.
+                    prefix = rng.randint(1, 126)
+                    count = rng.randint(1, max(1, min(max_len, 512 - prefix)))
+                    replay = 0
+                elif kind == 3:
+                    # Exact/over-window prefix: pcount == 127.
+                    prefix = rng.randint(127, 360)
+                    count = rng.randint(1, max(1, min(max_len, 512 - prefix)))
+                    replay = 0
+                else:
+                    # Boundary prefix/length mix.
+                    prefix = rng.choice([0, 1, 63, 64, 126, 127, 128, 129, 255])
+                    count = rng.randint(1, max(1, min(max_len, 512 - prefix)))
+                    replay = rng.choice([0, min(count, 64)])
+                budget -= count
+                completes = rng.random() < 0.6
+                prompt_len = (
+                    prefix + count
+                    if completes
+                    else min(512, prefix + count + rng.randint(1, 64))
+                )
+                lengths.append(count)
+                prefixes.append(prefix)
+                replays.append(replay)
+                prompt_lens.append(prompt_len)
+
+            decode_seq_lens = [rng.randint(2, 200) for _ in range(num_decodes)]
+            req_pool = list(range(bs))
+            rng.shuffle(req_pool)
+            req_indices = torch.tensor(req_pool, dtype=torch.int64)
+            seq_lens = torch.tensor(
+                [p + c for p, c in zip(prefixes, lengths, strict=True)]
+                + decode_seq_lens,
+                dtype=torch.int32,
+            )
+            counts_t = torch.tensor(lengths, dtype=torch.int32)
+            prefixes_t = torch.tensor(prefixes, dtype=torch.int32)
+
+            backend._prefill_kv_rows = saved_kv_rows
+            backend.init_forward_metadata(
+                bs,
+                num_extends,
+                req_indices,
+                seq_lens,
+                mode,
+                block_tables=tables,
+                block_tables_cpu=tables,
+                extend_seq_lens=counts_t,
+                extend_seq_lens_cpu=counts_t,
+                extend_prefix_lens=prefixes_t,
+                extend_prefix_lens_cpu=prefixes_t,
+                extend_replay_lens_cpu=torch.tensor(replays, dtype=torch.int32),
+                extend_prompt_lens_cpu=torch.tensor(prompt_lens, dtype=torch.int32),
+                extend_with_prefix=any(prefixes),
+                query_shard=None,
+            )
+            meta = backend.query_metadata(mode)
+            views = [
+                (meta.positions, meta.request_indices, mode, backend._prefill_spans)
+            ]
+            dec_view = backend.decoder_view()
+            if dec_view.prefill is not None and dec_view.prefill.positions.numel():
+                views.append(
+                    (
+                        dec_view.prefill.positions,
+                        dec_view.prefill.request_indices,
+                        ForwardMode.EXTEND,
+                        dec_view.spans,
+                    )
+                )
+
+            for positions, requests, view_mode, spans in views:
+                plan = backend._swa_query_plan(
+                    positions, requests, view_mode, query_shard=None
+                )
+                ref_plans = _reference_swa_plan_sort(
+                    backend, positions, spans, view_mode
+                )
+                assert len(plan.requests) == len(ref_plans)
+                for actual, (
+                    ref_req,
+                    ref_rows,
+                    ref_last,
+                    ref_prefix,
+                    ref_swa,
+                ) in zip(plan.requests, ref_plans, strict=True):
+                    assert actual.request == ref_req
+                    assert actual.rows == ref_rows
+                    assert actual.last_position == ref_last
+                    assert torch.equal(actual.prefix_slots, ref_prefix)
+                    assert torch.equal(actual.swa_indices, ref_swa)
+
+                for owner in (-1, 2, 20):
+                    ratio = backend.spec.compress_ratios[owner] if owner >= 0 else 0
+                    max_single_need = max(
+                        (
+                            ((p[2] + 1) // ratio if owner >= 0 else 0)
+                            + p[3].numel()
+                            + (p[1].stop - p[1].start)
+                        )
+                        for p in ref_plans
+                    )
+                    budgets = [saved_kv_rows]
+                    if len(ref_plans) > 1:
+                        budgets.append(max_single_need)
+                    for kv_budget in budgets:
+                        backend._prefill_kv_rows = kv_budget
+                        backend._prefill_layouts.clear()
+                        layout = backend._prefill_layout(plan, owner, view_mode)
+                        ref_prefix_slots, ref_batches, ref_hist_slots = (
+                            _reference_prefill_batches(
+                                backend, ref_plans, owner, view_mode
+                            )
+                        )
+                        assert torch.equal(layout.prefix_slots, ref_prefix_slots)
+                        assert len(layout.batches) == len(ref_batches)
+                        for b_idx, (batch, ref_b, h_actual, h_ref) in enumerate(
+                            zip(
+                                layout.batches,
+                                ref_batches,
+                                layout.history_slots,
+                                ref_hist_slots,
+                                strict=True,
+                            )
+                        ):
+                            (
+                                ref_kv_rows,
+                                ref_hist_rows,
+                                ref_q_rows,
+                                ref_p_src,
+                                ref_p_dst,
+                                ref_c_src,
+                                ref_c_dst,
+                                ref_swa,
+                                ref_base,
+                            ) = ref_b
+                            assert batch.kv_rows == ref_kv_rows, (seed, owner, b_idx)
+                            assert batch.history_rows == ref_hist_rows
+                            assert torch.equal(batch.swa_indices, ref_swa)
+                            assert torch.equal(batch.history_base, ref_base)
+                            actual_q = (
+                                backend._prefill_rows(batch.query_rows)
+                                if batch.query_rows is not None
+                                else torch.empty(0, dtype=torch.int64)
+                            )
+                            assert torch.equal(actual_q, ref_q_rows)
+                            if h_ref is None:
+                                assert h_actual is None
+                            else:
+                                assert h_actual is not None
+                                assert torch.equal(h_actual, h_ref)
+                            actual_ws = _materialize_workspace_rows(
+                                batch.kv_rows,
+                                ref_prefix_slots.numel(),
+                                positions.numel(),
+                                batch.prefix_source,
+                                batch.prefix_target,
+                                batch.current_source,
+                                batch.current_target,
+                            )
+                            ref_ws = _materialize_workspace_rows(
+                                ref_kv_rows,
+                                ref_prefix_slots.numel(),
+                                positions.numel(),
+                                ref_p_src,
+                                ref_p_dst,
+                                ref_c_src,
+                                ref_c_dst,
+                            )
+                            assert torch.equal(actual_ws, ref_ws)
+    finally:
+        backend._prefill_kv_rows = saved_kv_rows
+        backend._prefill_layouts.clear()
+
+
+def _install_cpu_v41_prefill_kernels(monkeypatch):
+    """Deterministic CPU stand-ins for GPU-only V4.1 prefill Triton kernels."""
+
+    def cpu_pack(rows, fmt, out):
+        dst = (
+            torch.empty((rows.shape[0], 1024), dtype=torch.uint8)
+            if out is None
+            else out
+        )
+        dst.copy_(rows.contiguous().view(torch.uint8))
+        return dst
+
+    def cpu_unpack(packed, fmt, out):
+        vals = packed.contiguous().view(torch.bfloat16)
+        if out is None:
+            return vals.clone()
+        out.copy_(vals)
+        return out
+
+    def cpu_scatter(rows, cache, slots, fmt):
+        live = slots >= 0
+        idx = slots[live].long()
+        # Encode first 16 bf16 values into cache bytes (fits 288/528 byte rows).
+        cache[idx // 64, idx % 64, :32] = rows[live, :16].contiguous().view(torch.uint8)
+
+    def cpu_gather(cache, slots, fmt, out):
+        dst = (
+            torch.zeros((*slots.shape, 512), dtype=torch.bfloat16)
+            if out is None
+            else out
+        )
+        dst.zero_()
+        live = slots >= 0
+        if live.any():
+            idx = slots[live].long()
+            raw = cache[idx // 64, idx % 64, :32].contiguous().view(torch.bfloat16)
+            dst[live, :16] = raw
+        return dst
+
+    def cpu_prefill_indices(
+        swa_indices, logical_rows, global_slots, rows, history_base
+    ):
+        sel = logical_rows[rows]
+        valid = global_slots[rows] >= 0
+        shifted = torch.where(valid, sel + history_base[:, None], -1).to(torch.int32)
+        return torch.cat((swa_indices, shifted), dim=1)
+
+    def cpu_selected_attention(
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        out,
+        query_chunk,
+        schedule,
+        prefill_kv,
+        prefill_indices,
+        *,
+        lse,
+    ):
+        kv = prefill_kv[:, 0, :]
+        res = torch.zeros_like(q) if out is None else out
+        for row_i in range(q.shape[0]):
+            idx = prefill_indices[row_i]
+            valid = idx[idx >= 0].long()
+            if valid.numel():
+                # Deterministic reduction of gathered workspace KV rows.
+                res[row_i] = kv[valid].float().mean(dim=0).to(q.dtype)[None, :]
+            else:
+                res[row_i].zero_()
+        return res
+
+    monkeypatch.setattr(dsv41, "cache_pack", cpu_pack)
+    monkeypatch.setattr(dsv41, "cache_unpack", cpu_unpack)
+    monkeypatch.setattr(dsv41, "cache_scatter", cpu_scatter)
+    monkeypatch.setattr(dsv41, "cache_gather", cpu_gather)
+    monkeypatch.setattr(dsv41, "prefill_indices", cpu_prefill_indices)
+    monkeypatch.setattr(dsv41, "selected_attention", cpu_selected_attention)
+    return cpu_gather, cpu_prefill_indices
+
+
+def test_prefill_layout_shares_ratio_isolates_owner_workspace_and_caches_indices(
+    monkeypatch,
+):
+    """Owners with the same compression ratio share one prefill layout, never
+    cross-reuse each other's workspace histories, and reuse prefill_indices on
+    Reuse layers until a new index source runs or the forward ends."""
+    cpu_gather, cpu_prefill_indices = _install_cpu_v41_prefill_kernels(monkeypatch)
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [72, 70], [64, 64], [64, 64], [136, 134])
+    n = meta.positions.numel()
+
+    # Populate distinct global KV contents in owners 2 and 8 (both ratio 2).
+    g2 = torch.full((70, 512), 1.5, dtype=torch.bfloat16)
+    g8 = torch.full((70, 512), -2.5, dtype=torch.bfloat16)
+    for owner, values in ((2, g2), (8, g8)):
+        for req in range(2):
+            pos = torch.arange(0, 140, 2, dtype=torch.int64)
+            req_t = torch.full_like(pos, req)
+            slots = backend.cache_slots(R2, pos, req_t, ForwardMode.EXTEND)
+            dsv41.cache_scatter(
+                values,
+                backend.cache_pool.global_kv(owner),
+                slots,
+                backend.global_format,
+            )
+
+    gather_calls = []
+
+    def track_gather(cache, slots, fmt, out):
+        gather_calls.append((cache.data_ptr(), slots.numel(), fmt))
+        return cpu_gather(cache, slots, fmt, out)
+
+    indices_calls = []
+
+    def track_indices(*args):
+        indices_calls.append(1)
+        return cpu_prefill_indices(*args)
+
+    def fake_topk(
+        q,
+        weights,
+        cache,
+        table,
+        lengths,
+        cb,
+        topk,
+        cand_cap,
+        cand_bs,
+        q_chunk,
+        k_chunk,
+        pg,
+        outputs,
+        *rest,
+    ):
+        rows_out, lens_out, blocks_out, block_lens_out = outputs
+        rows_out.fill_(-1)
+        rows_out[:, 0] = 0
+        rows_out[:, 1] = 1
+        lens_out.fill_(2)
+        if blocks_out is not None:
+            blocks_out.fill_(-1)
+            block_lens_out.zero_()
+
+    monkeypatch.setattr(dsv41, "cache_gather", track_gather)
+    monkeypatch.setattr(dsv41, "prefill_indices", track_indices)
+    monkeypatch.setattr(dsv41, "index_topk", fake_topk)
+
+    q = torch.ones((n, 2, 512), dtype=torch.bfloat16)
+    swa = torch.zeros((n, 512), dtype=torch.bfloat16)
+    iq = torch.ones((n, 2, 128), dtype=torch.bfloat16)
+    iw = torch.ones((n, 2), dtype=torch.bfloat16)
+    sink = torch.full((2,), -100.0, dtype=torch.float32)
+
+    def run_layer(layer_id: int, is_source: bool):
+        return backend.forward_v41(
+            q,
+            swa,
+            layer_id=layer_id,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=iq if is_source else None,
+            index_weights=iw if is_source else None,
+            attn_sink=sink,
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=None,
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            fused_decode_groups=None,
+            key_rows=None,
+        )
+
+    backend.begin_indexer_forward()
+    out_l2 = run_layer(2, True)
+    # Zero old SWA prefix: no SWA prefix gather, only owner 2's global gather.
+    assert len(gather_calls) == 1
+    assert gather_calls[0][0] == backend.cache_pool.global_kv(2).data_ptr()
+    assert len(indices_calls) == 1
+
+    # Layer 3 reuses owner 2's workspace histories AND prefill_indices.
+    out_l3 = run_layer(3, False)
+    assert len(gather_calls) == 1
+    assert len(indices_calls) == 1
+    torch.testing.assert_close(out_l3, out_l2, rtol=0, atol=0)
+
+    # Layer 8 has the same ratio (2) as layer 2, so it shares the layout object,
+    # but MUST gather owner 8's own global KV and compute fresh prefill_indices.
+    plan = backend._swa_query_plan(
+        meta.positions, meta.request_indices, ForwardMode.EXTEND, query_shard=None
+    )
+    layout_r2 = backend._prefill_layouts[(id(plan), 2)]
+    out_l8 = run_layer(8, True)
+    assert backend._prefill_layouts[(id(plan), 2)] is layout_r2
+    assert len(backend._prefill_layouts) == 1
+    assert len(gather_calls) == 2
+    assert gather_calls[1][0] == backend.cache_pool.global_kv(8).data_ptr()
+    assert len(indices_calls) == 2
+    assert (out_l2[..., :16].mean() > 0) and (out_l8[..., :16].mean() < 0)
+
+    # Layer 9 reuses owner 8's workspace histories AND prefill_indices.
+    out_l9 = run_layer(9, False)
+    assert len(gather_calls) == 2
+    assert len(indices_calls) == 2
+    torch.testing.assert_close(out_l9, out_l8, rtol=0, atol=0)
+
+    # Ending the forward releases cached prefill_indices tensors.
+    assert layout_r2.indices_cache
+    backend.end_indexer_forward()
+    assert not layout_r2.indices_cache
+
+
+def test_direct_swa_prefill_matches_copied_workspace(monkeypatch):
+    """Writing single-batch SWA directly into _prefill_kv matches copying it."""
+    _install_cpu_v41_prefill_kernels(monkeypatch)
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [6, 5], [0, 0], [0, 0], [6, 5])
+    n = meta.positions.numel()
+    torch.manual_seed(17)
+    q = torch.randn((n, 2, 512), dtype=torch.bfloat16)
+    swa = torch.randn((n, 512), dtype=torch.bfloat16)
+    sink = torch.zeros(2, dtype=torch.float32)
+
+    def run_layer0():
+        return backend.forward_v41(
+            q,
+            swa,
+            layer_id=0,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=None,
+            index_weights=None,
+            attn_sink=sink,
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=None,
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            fused_decode_groups=None,
+            key_rows=None,
+        )
+
+    direct = run_layer0()
+    # Force multi-batch so direct_swa is disabled and copy_rows executes.
+    backend._prefill_layouts.clear()
+    saved_rows = backend._prefill_kv_rows
+    backend._prefill_kv_rows = 7
+    try:
+        copied = run_layer0()
+    finally:
+        backend._prefill_kv_rows = saved_rows
+        backend._prefill_layouts.clear()
+    torch.testing.assert_close(direct, copied, rtol=0, atol=0)
+
+
+def test_selection_geometry_multi_member_matches_per_member():
+    """Vectorized multi-member _selection_geometry matches per-member expansion."""
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [5, 7], [128, 64], [0, 0], [133, 71])
+    source_table = meta.block_tables[R2]
+    table = source_table[:, :4]
+    spans = backend._prefill_spans
+    merged = ((spans[0], 5), (spans[0], 0), (spans[1], 7))
+    geom = backend._selection_geometry(
+        meta.positions,
+        meta.request_indices,
+        source_table,
+        table,
+        2,
+        0,
+        12,
+        merged,
+        ForwardMode.EXTEND,
+    )
+    assert geom.kernel_metadata.history_rows == (5, 7)
+    width = max(1, max((s.prefix + s.count) // 2 + 63 for s in spans) // 64)
+    r0 = table[0:1, :width].masked_fill(table[0:1, :width] <= 0, -1).expand(5, -1)
+    r1 = table[1:2, :width].masked_fill(table[1:2, :width] <= 0, -1).expand(7, -1)
+    assert torch.equal(geom.table, torch.cat((r0, r1), dim=0))
+
+
+def test_fused_prefill_caches_nonnegative_positions(monkeypatch):
+    """Fused prefill caches contiguous nonnegative int32 positions once per plan."""
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [4, 3], [0, 0], [0, 0], [4, 3])
+    n = meta.positions.numel()
+    seen = []
+
+    def fake_swa_rope_scatter(values, pos, rope, cache, slots, fmt, out, weight, eps):
+        out.copy_(values)
+
+    def fake_fused(
+        q,
+        swa_cache,
+        swa_slots,
+        swa_lens,
+        global_cache,
+        global_slots,
+        global_lens,
+        attn_sink,
+        softmax_scale,
+        positions,
+        cos_sin_cache,
+        num_groups,
+        prefill_kv,
+        prefill_indices,
+        *,
+        positions_nonnegative,
+    ):
+        seen.append((positions, positions_nonnegative))
+        width = q.shape[1] * q.shape[2] // num_groups
+        return (
+            torch.zeros((q.shape[0], num_groups, width), dtype=torch.float8_e4m3fn),
+            torch.zeros((q.shape[0], num_groups, width // 128), dtype=torch.int32),
+        )
+
+    monkeypatch.setattr(dsv41, "swa_rope_scatter", fake_swa_rope_scatter)
+    monkeypatch.setattr(dsv41, "selected_attention_fp8", fake_fused)
+    q = torch.zeros((n, 64, 512), dtype=torch.bfloat16)
+    swa = torch.zeros((n, 512), dtype=torch.bfloat16)
+    rope = torch.zeros((256, 64), dtype=torch.float32)
+    sink = torch.zeros(64, dtype=torch.float32)
+
+    for layer_id in (0, 1):
+        backend.forward_v41(
+            q,
+            swa,
+            layer_id=layer_id,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.EXTEND,
+            index_q=None,
+            index_weights=None,
+            attn_sink=sink,
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=rope,
+            swa_norm_weight=None,
+            swa_norm_eps=0.0,
+            fused_decode_groups=8,
+            key_rows=None,
+        )
+
+    assert len(seen) == 2
+    assert seen[0][1] is True and seen[1][1] is True
+    assert seen[0][0] is seen[1][0]
+    assert seen[0][0].dtype == torch.int32 and seen[0][0].is_contiguous()
+    assert torch.equal(seen[0][0], meta.positions.clamp_min(0).to(torch.int32))

@@ -271,6 +271,8 @@ def flashmla_selected_attention_fp8(
     num_groups: int,
     prefill_kv: torch.Tensor | None,
     prefill_indices: torch.Tensor | None,
+    *,
+    positions_nonnegative: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate permuted BF16 Q [T,H,512], attend selected cache rows, and inverse-RoPE O.
 
@@ -370,13 +372,26 @@ def flashmla_selected_attention_fp8(
             q.new_empty((0, num_groups, width // 128), dtype=torch.int32),
         )
 
+    if positions_nonnegative:
+        if positions.dtype != torch.int32 or not positions.is_contiguous():
+            raise ValueError(
+                "positions_nonnegative=True requires contiguous int32 positions"
+            )
+        token_positions = positions
+    else:
+        token_positions = positions.clamp_min(0).to(torch.int32).contiguous()
+
     common = dict(
         enable_q_norm=False,
         rms_norm_eps=0.0,
-        token_positions=positions.clamp_min(0).to(torch.int32).contiguous(),
+        token_positions=token_positions,
         is_rope_neox_style=False,
         rope_dim=64,
-        cos_sin_cache=cos_sin_cache.contiguous(),
+        cos_sin_cache=(
+            cos_sin_cache
+            if cos_sin_cache.is_contiguous()
+            else cos_sin_cache.contiguous()
+        ),
         n_wv_group=num_groups,
         num_per_channels=32,
         use_tma_aligned_col_major_sf=True,
@@ -388,13 +403,19 @@ def flashmla_selected_attention_fp8(
         attn_sink=attn_sink,
     )
     if prefill_kv is not None:
-        indices = prefill_indices.to(torch.int32)
+        indices = (
+            prefill_indices
+            if prefill_indices.dtype == torch.int32
+            else prefill_indices.to(torch.int32)
+        )
         width = max(64, (indices.shape[1] + 63) // 64 * 64)
         if width != indices.shape[1]:
             indices = F.pad(indices, (0, width - indices.shape[1]), value=-1)
+        if not indices.is_contiguous():
+            indices = indices.contiguous()
         codes, scales, _, _ = _FUSED_FLASH_MLA_API.prefill(
-            kv=prefill_kv.contiguous(),
-            indices=indices.contiguous().unsqueeze(1),
+            kv=prefill_kv if prefill_kv.is_contiguous() else prefill_kv.contiguous(),
+            indices=indices.unsqueeze(1),
             topk_length=None,
             **common,
         )
@@ -489,7 +510,11 @@ def selected_attention(
             raise ValueError("prefill_indices must have shape [tokens, capacity]")
         if prefill_indices.dtype not in (torch.int32, torch.int64):
             raise ValueError("prefill_indices must be integer")
-        indices = prefill_indices.to(torch.int32)
+        indices = (
+            prefill_indices
+            if prefill_indices.dtype == torch.int32
+            else prefill_indices.to(torch.int32)
+        )
         # The sm90 sparse prefill kernel tiles the selection two blocks at a
         # time and asserts the padded width divides evenly: it rejects 192 and
         # 320 while accepting 128, 256 and 384. Later archs take any 64-multiple.
