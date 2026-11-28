@@ -335,7 +335,8 @@ def _peer(trace=None):
     class _Peer:
         mode = "prefill"
 
-        def execute(self, op) -> None:
+        def execute(self, op, *, landing_fences=(), fence_device=None) -> None:
+            del landing_fences, fence_device
             if trace is not None:
                 trace.append(("send", op))
 
@@ -1176,23 +1177,29 @@ def test_the_remote_decode_keeps_the_forward_order():
     assert trace == ["forward", ("send", remote_decode)]
 
 
-def _decode_peer(trace):
+def _decode_peer(trace, *, captured_fences=None, captured_devices=None):
     """A D-role transfer peer the handle recognizes by type; records its
-    pulls."""
+    pulls and any landing fences passed for off-thread completion."""
 
     class _Peer:
         mode = "decode"
 
-        def execute(self, op) -> None:
+        def execute(self, op, *, landing_fences=(), fence_device=None) -> None:
+            if captured_fences is not None:
+                captured_fences.extend(landing_fences)
+            if captured_devices is not None:
+                captured_devices.append(fence_device)
             trace.append(("pull", op))
 
     return _Peer()
 
 
-def _receiving_handle(trace, *, prepare=None, host_cache_executor=None):
+def _receiving_handle(
+    trace, *, prepare=None, host_cache_executor=None, kv_transfer=None
+):
     handle = _handle(
         trace,
-        kv_transfer=_decode_peer(trace),
+        kv_transfer=kv_transfer if kv_transfer is not None else _decode_peer(trace),
         host_cache_executor=host_cache_executor,
     )
     executor = handle._executor
@@ -1236,10 +1243,13 @@ def _remote_prefill():
 def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards, zeroes):
     """The landing fence the pull waits on is recorded on the default stream
     behind the zeroing and the forwards in flight, whether or not the plan
-    zeroes anything; the round's forward is launched first so that wait never
-    delays its launch. A round without a batch still pulls."""
+    zeroes anything; the round's forward is launched first and the forward
+    thread hands fences to the peer without blocking on them."""
     trace: list = []
-    handle = _receiving_handle(trace)
+    fences: list = []
+    handle = _receiving_handle(
+        trace, kv_transfer=_decode_peer(trace, captured_fences=fences)
+    )
     remote_prefill = _remote_prefill()
 
     _execute(
@@ -1255,20 +1265,28 @@ def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards, zeroes):
         ("prepare", [3]),
         "reset",
         *(["forward"] if forwards else []),
-        "wait_fence",
         ("pull", remote_prefill),
     ]
+    assert len(fences) == 1
+    for fence in fences:
+        fence.synchronize()
+    assert trace[-1] == "wait_fence"
 
 
 def test_a_remote_prefill_pulls_behind_the_loads_of_its_host_hit(wire_ops):
     """A D admission's Host hit loads below its landing. The landed request's
     first forward runs in a later plan, whose layerwise load waits name only
     that plan's loads, so the pull -- whose end releases the request -- waits
-    for this plan's loads, and for the stores reading the victims it
+    off-thread for this plan's loads, and for the stores reading the victims it
     regranted."""
     trace: list = []
+    fences: list = []
     store, load = _WriteBackOp("store"), _LoadBackOp("load")
-    handle = _receiving_handle(trace, host_cache_executor=_l2_with_load_stream(trace))
+    handle = _receiving_handle(
+        trace,
+        host_cache_executor=_l2_with_load_stream(trace),
+        kv_transfer=_decode_peer(trace, captured_fences=fences),
+    )
     remote_prefill = _remote_prefill()
 
     _execute(
@@ -1287,10 +1305,12 @@ def test_a_remote_prefill_pulls_behind_the_loads_of_its_host_hit(wire_ops):
         ("record", "load-stream"),
         ("prepare", [3]),
         "reset",
-        "wait_fence",
-        "wait_fence",
         ("pull", remote_prefill),
     ]
+    assert len(fences) == 2
+    for fence in fences:
+        fence.synchronize()
+    assert trace[-2:] == ["wait_fence", "wait_fence"]
 
 
 class _PendingDeviceWork:
@@ -1390,7 +1410,10 @@ class _LandingFenceDevice:
     def reset_remote_prefill_cache_lengths(self, op):
         self.execution_stream.wait_stream(self.default_stream)
 
-    def execute(self, op):
+    def execute(self, op, *, landing_fences=(), fence_device=None):
+        del op, fence_device
+        for fence in landing_fences:
+            fence.synchronize()
         self.landing_saw_load = self.loaded
 
     def reads_ready(self):
@@ -1442,6 +1465,41 @@ def test_a_failed_slot_preparation_never_triggers_the_pull():
 
     assert "forward" not in trace
     assert not any(isinstance(entry, tuple) and entry[0] == "pull" for entry in trace)
+
+
+def test_remote_prefill_handoff_passes_device_tuple_without_forward_thread_sync():
+    """Real HostDecodePeer.execute receives (fences, (type, index)) without blocking
+    the forward thread inside fence.synchronize()."""
+    trace: list = []
+    fences: list = []
+    devices: list = []
+    handle = _receiving_handle(
+        trace,
+        kv_transfer=_decode_peer(
+            trace, captured_fences=fences, captured_devices=devices
+        ),
+    )
+    handle._executor.device = torch.device("cuda:3")
+    remote_prefill = _remote_prefill()
+
+    def forbidden_sync():
+        raise AssertionError("forward thread must not synchronize landing fences")
+
+    for cls_event in [handle._executor.device_module.Event]:
+        orig_sync = cls_event.synchronize
+        cls_event.synchronize = lambda self: forbidden_sync()
+        try:
+            _execute(
+                handle,
+                _plan(pages_to_zero=[5], remote_prefill=remote_prefill),
+                _planned(num_extends=0),
+            )
+        finally:
+            cls_event.synchronize = orig_sync
+
+    assert devices == [("cuda", 3)]
+    assert len(fences) == 1
+    assert "wait_fence" not in trace
 
 
 # ----------------------------------------------------------------------
@@ -1965,7 +2023,8 @@ class _RegisteringDecodePeer:
     def __init__(self, trace) -> None:
         self._trace = trace
 
-    def execute(self, op) -> None:
+    def execute(self, op, *, landing_fences=(), fence_device=None) -> None:
+        del landing_fences, fence_device
         self._trace.append(("receive", op))
 
     def release_cache_registration(self) -> None:

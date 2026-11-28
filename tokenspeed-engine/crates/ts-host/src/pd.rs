@@ -28,8 +28,15 @@
 //! rank), and the peer plans and sends it. Nothing in the peer calls into
 //! Python.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{mpsc, Arc},
+    thread,
+    time::Duration,
+};
 
+use parking_lot::Mutex;
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyBytes};
 use ts_control::output::Role;
 use ts_pd::{
@@ -39,7 +46,7 @@ use ts_pd::{
         manifest::{BlockTable, BlockTables},
     },
     BatchRows, DecodeConfig, DecodeOutbox, DecodePeer, EmbeddingReceiver, Layerwise, PeerConfig,
-    PrefillConfig, PrefillLayout, PrefillOutbox, PrefillPeer, TransferPeer,
+    PendingRemotePrefill, PrefillConfig, PrefillLayout, PrefillOutbox, PrefillPeer, TransferPeer,
 };
 use ts_scheduler::{ExecutionPlan, TransferBatchView};
 
@@ -132,11 +139,93 @@ impl Streams {
     }
 }
 
+enum HandoffJob {
+    RemotePrefill {
+        pending: Box<PendingRemotePrefill>,
+        fences: Vec<Py<PyAny>>,
+        device: Option<(String, usize)>,
+    },
+    Flush(mpsc::Sender<()>),
+}
+
+struct HandoffWorker {
+    tx: mpsc::Sender<HandoffJob>,
+}
+
+impl HandoffWorker {
+    fn start() -> Result<Self, String> {
+        let (tx, rx) = mpsc::channel::<HandoffJob>();
+        thread::Builder::new()
+            .name("ts-pd-handoff".to_owned())
+            .spawn(move || run_handoff_worker(rx))
+            .map_err(|error| format!("failed to spawn PD handoff worker thread: {error}"))?;
+        Ok(Self { tx })
+    }
+}
+
+fn sync_and_drop_fences(
+    fences: Vec<Py<PyAny>>,
+    device: &Option<(String, usize)>,
+    bound_device: &mut Option<(String, usize)>,
+) -> Result<(), String> {
+    Python::attach(|py| {
+        let result = (|| -> PyResult<()> {
+            if let Some((dev_type, dev_index)) = device.as_ref() {
+                match bound_device {
+                    Some((k, i)) if k == dev_type && *i == *dev_index => {}
+                    _ => {
+                        let module = py
+                            .import("torch")?
+                            .call_method1("get_device_module", (dev_type.as_str(),))?;
+                        module.call_method1("set_device", (*dev_index,))?;
+                        *bound_device = Some((dev_type.clone(), *dev_index));
+                    }
+                }
+            }
+            for fence in &fences {
+                fence.call_method0(py, "synchronize")?;
+            }
+            Ok(())
+        })();
+        // Release Python fence handles while the GIL is held rather than queuing deferred decrefs.
+        drop(fences);
+        result.map_err(|error| format!("PD landing fence synchronization failed: {error}"))
+    })
+}
+
+fn run_handoff_worker(rx: mpsc::Receiver<HandoffJob>) {
+    let mut bound_device: Option<(String, usize)> = None;
+    while let Ok(job) = rx.recv() {
+        match job {
+            HandoffJob::Flush(done) => {
+                let _ = done.send(());
+            }
+            HandoffJob::RemotePrefill {
+                pending,
+                fences,
+                device,
+            } => {
+                if !fences.is_empty() {
+                    if let Err(message) = sync_and_drop_fences(fences, &device, &mut bound_device) {
+                        tracing::error!(detail = %message, "event=ts_pd_handoff_fence_failed");
+                        pending.fail(&message);
+                        continue;
+                    }
+                }
+                if let Err(error) = pending.hand_over() {
+                    tracing::error!(detail = %error, "event=ts_pd_handoff_send_failed");
+                }
+            }
+        }
+    }
+}
+
 /// Where the data plane's peer hands the host its work (see
 /// `pd/host_peer.py`).
 #[pyclass(frozen, name = "PdOutbox")]
 pub struct Outbox {
     streams: std::sync::OnceLock<Streams>,
+    handoff: Mutex<Option<HandoffWorker>>,
 }
 
 impl Outbox {
@@ -144,6 +233,7 @@ impl Outbox {
     pub fn new() -> Self {
         Self {
             streams: std::sync::OnceLock::new(),
+            handoff: Mutex::new(None),
         }
     }
 
@@ -152,27 +242,89 @@ impl Outbox {
             .get()
             .ok_or_else(|| PyRuntimeError::new_err("the host's PD peer has not started"))
     }
+
+    fn handoff_sender(&self) -> Result<mpsc::Sender<HandoffJob>, String> {
+        let mut guard = self.handoff.lock();
+        if guard.is_none() {
+            *guard = Some(HandoffWorker::start()?);
+        }
+        Ok(guard.as_ref().expect("worker initialized").tx.clone())
+    }
+
+    fn flush_handoff(&self) {
+        let tx = {
+            let guard = self.handoff.lock();
+            guard.as_ref().map(|worker| worker.tx.clone())
+        };
+        let Some(tx) = tx else {
+            return;
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        if tx.send(HandoffJob::Flush(done_tx)).is_ok() {
+            let _ = done_rx.recv();
+        }
+    }
 }
 
 #[pymethods]
 impl Outbox {
-    /// The plan's remote stream may go out: its device prerequisites are
-    /// met. The forward thread runs this, inside the plan's execution.
-    fn remote_stream_ready(&self) -> PyResult<()> {
+    /// The plan's remote stream may go out once its device prerequisites (`fences`)
+    /// complete. When `fences` is non-empty on a Decode rank, the forward thread
+    /// queues fence synchronization and manifest handover to an ordered worker
+    /// thread so it never stalls `ts-forward`.
+    #[pyo3(signature = (fences=None, device_type=None, device_index=None))]
+    fn remote_stream_ready(
+        &self,
+        py: Python<'_>,
+        fences: Option<Vec<Py<PyAny>>>,
+        device_type: Option<String>,
+        device_index: Option<usize>,
+    ) -> PyResult<()> {
+        let fences = fences.unwrap_or_default();
         match self.streams()? {
-            Streams::Prefill(outbox) => outbox.hand_over_remote_decode(),
-            Streams::Decode(outbox) => outbox.hand_over_remote_prefill(),
+            Streams::Prefill(outbox) => {
+                if !fences.is_empty() {
+                    return Err(PyRuntimeError::new_err(
+                        "Prefill remote_decode does not accept landing fences",
+                    ));
+                }
+                py.detach(|| outbox.hand_over_remote_decode())
+                    .map_err(PyRuntimeError::new_err)
+            }
+            Streams::Decode(outbox) => {
+                let pending = outbox
+                    .take_staged_remote_prefill()
+                    .map_err(PyRuntimeError::new_err)?;
+                if fences.is_empty() {
+                    return py
+                        .detach(|| pending.hand_over())
+                        .map_err(PyRuntimeError::new_err);
+                }
+                let device = match (device_type, device_index) {
+                    (Some(kind), Some(index)) => Some((kind, index)),
+                    _ => None,
+                };
+                let tx = self.handoff_sender().map_err(PyRuntimeError::new_err)?;
+                tx.send(HandoffJob::RemotePrefill {
+                    pending: Box::new(pending),
+                    fences,
+                    device,
+                })
+                .map_err(|_| PyRuntimeError::new_err("PD handoff worker thread stopped"))
+            }
         }
-        .map_err(PyRuntimeError::new_err)
     }
 
     /// A sleep releases the cache: deregister it from the transfer engine
     /// (refused while transfers are in flight). Blocks without the GIL.
     fn release_registration(&self, py: Python<'_>) -> PyResult<()> {
         let streams = self.streams()?;
-        py.detach(|| match streams {
-            Streams::Prefill(outbox) => outbox.release_registration(),
-            Streams::Decode(outbox) => outbox.release_registration(),
+        py.detach(|| {
+            self.flush_handoff();
+            match streams {
+                Streams::Prefill(outbox) => outbox.release_registration(),
+                Streams::Decode(outbox) => outbox.release_registration(),
+            }
         })
         .map_err(PyRuntimeError::new_err)
     }
@@ -391,5 +543,63 @@ pub fn start(
         other => Err(PyRuntimeError::new_err(format!(
             "no PD peer for mode {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::ffi::c_str;
+
+    #[test]
+    fn handoff_worker_processes_flush_barriers_in_order() {
+        let outbox = Outbox::new();
+        outbox.flush_handoff();
+        let tx = outbox.handoff_sender().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        tx.send(HandoffJob::Flush(done_tx)).unwrap();
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        outbox.flush_handoff();
+    }
+
+    #[test]
+    fn sync_and_drop_fences_runs_synchronize_and_propagates_errors() {
+        Python::initialize();
+        let (ok_fence, ok_called, bad_fence) = Python::attach(|py| -> PyResult<_> {
+            let locals = pyo3::types::PyDict::new(py);
+            py.run(
+                c_str!(
+                    "
+class OkFence:
+    def __init__(self):
+        self.synced = False
+    def synchronize(self):
+        self.synced = True
+
+class BadFence:
+    def synchronize(self):
+        raise RuntimeError('fence boom')
+
+ok = OkFence()
+bad = BadFence()
+"
+                ),
+                None,
+                Some(&locals),
+            )?;
+            let ok = locals.get_item("ok")?.unwrap();
+            let bad = locals.get_item("bad")?.unwrap();
+            Ok((ok.clone().unbind(), ok.unbind(), bad.unbind()))
+        })
+        .unwrap();
+
+        let mut bound = None;
+        sync_and_drop_fences(vec![ok_fence], &None, &mut bound).unwrap();
+        let synced: bool =
+            Python::attach(|py| ok_called.bind(py).getattr("synced")?.extract()).unwrap();
+        assert!(synced);
+
+        let err = sync_and_drop_fences(vec![bad_fence], &None, &mut bound).unwrap_err();
+        assert!(err.contains("fence boom"), "{err}");
     }
 }

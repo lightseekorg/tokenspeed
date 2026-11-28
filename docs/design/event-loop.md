@@ -1635,9 +1635,10 @@ For orientation, one `EventLoop::round`:
    the ACK -- then the plan's remote streams to the transfer peer (a D-node
    remote prefill submits only its stream-ordered slot preparation here),
    then the plan's batch to the model, then the D-node remote prefill's
-   pull, which waits on the zeroing fence before its CPU-issued RDMA
-   trigger. The zeroing orders behind the step in flight, so a pull queued
-   ahead of the batch would hold the batch's launch until that step ends. A
+   pull, which hands the staged batch and zeroing/load landing fences to the
+   host outbox's ordered worker thread (`ts-pd-handoff`) so `ts-forward` does
+   not stall behind the step in flight while manifest dispatch still waits on
+   those fences before issuing CPU-side RDMA work. A
    store names the victim's request-pool slot, which the scheduler
    freed in the same plan build: its next owner first writes it in a
    forward, and every forward is enqueued behind the store fence, so the

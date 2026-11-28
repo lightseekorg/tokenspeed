@@ -132,6 +132,15 @@ def cache_group_config(
                 "SWA sink retention requires tokenspeed-scheduler with sink_tokens "
                 "support; rebuild tokenspeed-scheduler from the matching source."
             ) from error
+    if spec.boundary_only_in_prefill:
+        try:
+            config.boundary_only_in_prefill = True
+        except AttributeError as error:
+            raise RuntimeError(
+                "boundary_only_in_prefill requires tokenspeed-scheduler with "
+                "boundary_only_in_prefill support; rebuild tokenspeed-scheduler "
+                "from the matching source."
+            ) from error
     return config
 
 

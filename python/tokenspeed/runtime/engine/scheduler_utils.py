@@ -157,6 +157,7 @@ def make_config(
     checkpoint_retention_requests: int | None = None,
     checkpoint_retention_leaf_distance: int | None = None,
     prefill_chunk_yield_tokens: int = 0,
+    max_remote_admissions_per_round: int = 1,
     shared_l2_config: SharedL2Config | None = None,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
@@ -285,6 +286,10 @@ def make_config(
             (``SchedulerConfig::Validate`` refuses it elsewhere). The prefill
             role fills the budget a chunk leaves on its own whatever this
             value (docs/design/scheduler.md section 1.1).
+        max_remote_admissions_per_round:
+            ``--disaggregation-max-remote-admissions-per-round``: the most
+            bootstrapped remote prefills admitted in one Decode scheduler round.
+            Must be >= 1; values > 1 require ``role == "decode"``.
         shared_l2_config: With a shared L2 pool as the Host tier
             (``--shared-l2-config``), the scheduler's limits on its writes, a
             ``SharedL2Config``: the Host pages are then the pool's proxy and
@@ -312,6 +317,14 @@ def make_config(
         raise ValueError(
             "prefill_chunk_yield_tokens must be non-negative; "
             f"got {prefill_chunk_yield_tokens}."
+        )
+    if (
+        isinstance(max_remote_admissions_per_round, bool)
+        or max_remote_admissions_per_round < 1
+    ):
+        raise ValueError(
+            "max_remote_admissions_per_round must be >= 1; "
+            f"got {max_remote_admissions_per_round}."
         )
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
@@ -368,6 +381,15 @@ def make_config(
     if prefill_chunk_yield_tokens:
         # Set only when on, for the same reason.
         cfg.prefill_chunk_yield_tokens = prefill_chunk_yield_tokens
+    if max_remote_admissions_per_round != 1:
+        try:
+            cfg.max_remote_admissions_per_round = max_remote_admissions_per_round
+        except AttributeError as error:
+            raise RuntimeError(
+                "max_remote_admissions_per_round > 1 requires "
+                "tokenspeed-scheduler with max_remote_admissions_per_round "
+                "support; rebuild tokenspeed-scheduler from the matching source."
+            ) from error
     if shared_l2_config is not None:
         # Likewise set only with a pool.
         cfg.shared_l2_config = shared_l2_config

@@ -103,5 +103,75 @@ class TestValidateSchedulerConfigTest:
             )
 
 
+class TestBoundaryOnlySpecGuard:
+    def test_boundary_only_requires_sinkless_replayable_sliding_window(self):
+        spec = _pcs.CacheGroupSpec(
+            group_id="tail",
+            attn_kind="sliding_window",
+            rows_per_page=2,
+            entry_stride_tokens=1,
+            sliding_window_tokens=2,
+            replayable=True,
+            boundary_only_in_prefill=True,
+        )
+        assert spec.boundary_only_in_prefill is True
+
+        for bad_kwargs in (
+            dict(attn_kind="full_history", replayable=False),
+            dict(attn_kind="sliding_window", replayable=False),
+            dict(attn_kind="sliding_window", replayable=False, sink_tokens=2),
+        ):
+            with pytest.raises(ValueError, match="boundary_only_in_prefill"):
+                _pcs.CacheGroupSpec(
+                    group_id="bad",
+                    rows_per_page=2,
+                    entry_stride_tokens=1,
+                    sliding_window_tokens=(
+                        2 if bad_kwargs["attn_kind"] == "sliding_window" else None
+                    ),
+                    boundary_only_in_prefill=True,
+                    **bad_kwargs,
+                )
+
+
+class TestMaxRemoteAdmissionsArgs:
+    def test_server_args_max_remote_admissions_per_round(self):
+        from tokenspeed.runtime.utils.server_args import ServerArgs
+
+        args = ServerArgs(model="m", disaggregation_mode="decode")
+        assert args.disaggregation_max_remote_admissions_per_round == 1
+        assert args.scheduler_max_remote_admissions_per_round == 1
+
+        args_batched = ServerArgs(
+            model="m",
+            disaggregation_mode="decode",
+            disaggregation_max_remote_admissions_per_round=8,
+        )
+        args_batched.validate_cache_options()
+        assert args_batched.scheduler_max_remote_admissions_per_round == 8
+
+        prefill_args = ServerArgs(
+            model="m",
+            disaggregation_mode="prefill",
+            disaggregation_max_remote_admissions_per_round=8,
+        )
+        prefill_args.validate_cache_options()
+        assert prefill_args.scheduler_max_remote_admissions_per_round == 1
+
+        with pytest.raises(ValueError, match="disaggregation-max-remote-admissions"):
+            ServerArgs(
+                model="m",
+                disaggregation_mode="decode",
+                disaggregation_max_remote_admissions_per_round=0,
+            ).validate_cache_options()
+
+        with pytest.raises(ValueError, match="disaggregation-max-remote-admissions"):
+            ServerArgs(
+                model="m",
+                disaggregation_mode="null",
+                disaggregation_max_remote_admissions_per_round=4,
+            ).validate_cache_options()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
