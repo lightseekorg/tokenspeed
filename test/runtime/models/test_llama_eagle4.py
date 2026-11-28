@@ -214,6 +214,59 @@ def test_eagle4_candidate_head_scores_the_low_rank_top_candidates_exactly(
     torch.testing.assert_close(scores.exp(), probs, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_eagle4_full_head_candidates_are_the_top_full_vocab_logits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a low-rank head the candidates are the top tokens of the full LM
+    head, with their exact logits; the best of them is the full-vocab argmax."""
+    model = _build_model(
+        monkeypatch, _qwen38_draft_config(efficient_lm_head_config=None)
+    )
+    torch.manual_seed(0)
+    model.lm_head.weight.data.normal_()
+    heads = CandidateHeads(
+        lm_head=model.lm_head,
+        scores_head=model.efficient_lm_head,
+        down_proj=model.efficient_lm_head_down_proj,
+        num_candidates=model.num_candidates,
+    )
+    processor = model.logits_processor
+    processor.draft_top_k = 4
+    hidden = torch.randn(5, _MOE_HIDDEN, dtype=torch.bfloat16, device="cuda")
+
+    output = processor(
+        None,
+        hidden,
+        heads,
+        LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None),
+    )
+    logits, ids = output.next_token_logits, output.candidate_ids
+
+    # The candidates are picked from the bf16 full-vocab logits.
+    full = hidden @ model.lm_head.weight.T
+    assert ids.shape == (hidden.shape[0], model.num_candidates)
+    for row in range(hidden.shape[0]):
+        want = set(torch.topk(full[row], model.num_candidates).indices.tolist())
+        assert set(ids[row].tolist()) == want
+    exact = hidden.float() @ model.lm_head.weight.float().T
+    torch.testing.assert_close(
+        logits, exact.gather(-1, ids).bfloat16().float(), rtol=0, atol=0.13
+    )
+    best = output.next_token_ids
+    assert torch.equal(best, ids.gather(-1, logits.argmax(-1, keepdim=True)).view(-1))
+    torch.testing.assert_close(
+        exact.gather(-1, best.unsqueeze(-1)).squeeze(-1),
+        exact.max(-1).values,
+        rtol=0,
+        atol=0.13,
+    )
+    top = torch.topk(torch.softmax(logits, -1), 4, dim=-1)
+    probs, tokens = output.draft_topk
+    torch.testing.assert_close(probs, top.values, rtol=0, atol=0)
+    assert torch.equal(tokens, ids.gather(-1, top.indices))
+
+
 # Toy sizes; the MoE's are the smallest the BF16 squared-ReLU expert kernels plan for.
 _MOE_HIDDEN, _LATENT, _EXPERT_INTER, _EXPERTS, _TOP_K, _SHARED_INTER = (
     256,
@@ -398,6 +451,79 @@ def test_eagle4_draft_attends_without_rope_only_when_the_config_says_so(
         model = _build_model(monkeypatch, config, "meta")
         (attention,) = (m for m in model.modules() if isinstance(m, PagedAttention))
         assert (attention.rotary_emb is not None) == rotary
+
+
+def test_eagle4_builds_without_a_low_rank_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A draft that ships only the full LM head has no low-rank parameters and
+    keeps 128 candidates per row."""
+    config = _qwen38_draft_config(efficient_lm_head_config=None)
+    validate_draft_config(config)
+
+    model = _build_model(monkeypatch, config, "meta")
+
+    assert model.efficient_lm_head is None
+    assert model.efficient_lm_head_down_proj is None
+    assert model.num_candidates == 128
+    assert not any(n.startswith("efficient") for n, _ in model.named_parameters())
+
+
+def _qwen38_draft_checkpoint(device: str) -> dict[str, torch.Tensor]:
+    """The Qwen3.8 EAGLE-4 draft's tensors at toy size (empty), without the
+    low-rank head."""
+    h, v = _MOE_HIDDEN, _MOE_VOCAB
+
+    def empty(*shape: int) -> torch.Tensor:
+        return torch.empty(*shape, dtype=torch.bfloat16, device=device)
+
+    weights = {
+        "embed_tokens.weight": empty(v, h),
+        "lm_head.weight": empty(v, h),
+        "fc.weight": empty(h, 3 * h),
+        "norm.weight": empty(h),
+        **{f"fc_norm.{i}.weight": empty(h) for i in range(3)},
+    }
+    layer = {
+        "hidden_norm.weight": empty(h),
+        "input_layernorm.weight": empty(h),
+        "self_attn.q_proj.weight": empty(h, 2 * h),
+        "self_attn.k_proj.weight": empty(h, 2 * h),
+        "self_attn.v_proj.weight": empty(h, 2 * h),
+        "self_attn.o_proj.weight": empty(h, h),
+        "post_attention_layernorm.weight": empty(h),
+        "mlp.gate_proj.weight": empty(512, h),
+        "mlp.up_proj.weight": empty(512, h),
+        "mlp.down_proj.weight": empty(h, 512),
+    }
+    weights.update({f"layers.0.{name}": w for name, w in layer.items()})
+    return weights
+
+
+def test_eagle4_loads_a_checkpoint_without_a_low_rank_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _build_model(
+        monkeypatch, _qwen38_draft_config(efficient_lm_head_config=None), "meta"
+    )
+
+    model.load_weights(_qwen38_draft_checkpoint("meta").items())
+
+
+def test_eagle4_refuses_low_rank_tensors_its_config_does_not_declare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The config, not the tensors, selects the candidate head."""
+    model = _build_model(
+        monkeypatch, _qwen38_draft_config(efficient_lm_head_config=None), "meta"
+    )
+    weights = _qwen38_draft_checkpoint("meta")
+    weights["efficient_lm_head.weight"] = torch.empty(
+        _MOE_VOCAB, _RANK, dtype=torch.bfloat16, device="meta"
+    )
+
+    with pytest.raises(KeyError, match="efficient_lm_head"):
+        model.load_weights(weights.items())
 
 
 def _nemotron_draft_checkpoint(

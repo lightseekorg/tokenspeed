@@ -20,7 +20,8 @@
 
 """EAGLE-4 draft: an EAGLE-3 draft with per-aux fc norms, a normed output fed
 back as the next hidden, a sliding-window draft layer (all config-driven in
-the EAGLE-3 model) and a low-rank candidate LM head. Its layer may also merge
+the EAGLE-3 model) and a candidate LM head: low-rank, or the full LM head when
+the draft ships no low-rank head. Its layer may also merge
 its two inputs through ``eh_proj`` (``attn_norm``), attend without rotary
 embeddings (``use_rope`` false) and route a latent squared-ReLU MoE, the
 Nemotron-H block (``moe_architecture`` ``nemotron_latent_relu2``)."""
@@ -146,6 +147,9 @@ _NON_STRUCTURAL_KEYS = frozenset(
 # The draft attention uses head_dim for q, k and v; a config may carry these only at that value.
 _DERIVED_HEAD_DIM_KEYS = frozenset({"v_head_dim", "swa_head_dim", "swa_v_head_dim"})
 _EFFICIENT_LM_HEAD_KEYS = frozenset({"type", "rank", "num_candidates", "smooth_factor"})
+# Candidates per row of a draft without a low-rank head, which the full LM head picks:
+# the count the released low-rank heads keep, and one the candidate kernels take.
+_FULL_HEAD_NUM_CANDIDATES = 128
 # The sizes and routing of a latent MoE, which its config must state.
 _LATENT_MOE_KEYS = (
     "moe_latent_size",
@@ -264,8 +268,9 @@ def validate_draft_config(config: LlamaConfig) -> None:
         )
 
     # The type names how the shipped head weights were factored; the loader requires those weights.
+    # Without the config the draft ships no low-rank head and the full LM head picks the candidates.
     head = getattr(config, "efficient_lm_head_config", None)
-    if (
+    if head is not None and (
         not isinstance(head, dict)
         or head.get("type") not in ("low_rank", "weighted_low_rank")
         or set(head) - _EFFICIENT_LM_HEAD_KEYS
@@ -477,11 +482,12 @@ class Eagle4LlamaModel(Eagle3LlamaModel):
 
 @dataclasses.dataclass(frozen=True)
 class CandidateHeads:
-    """The three weights of the low-rank candidate head."""
+    """The candidate head's weights: the LM head, and the low-rank head that
+    picks the candidates (``None`` both: the LM head picks them)."""
 
     lm_head: ParallelLMHead  # exact logits of the candidates
-    scores_head: ParallelLMHead  # rank-r token embeddings that pick them
-    down_proj: ReplicatedLinear  # hidden -> rank r
+    scores_head: ParallelLMHead | None  # rank-r token embeddings that pick them
+    down_proj: ReplicatedLinear | None  # hidden -> rank r
     num_candidates: int
 
 
@@ -499,8 +505,9 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
     """Each sampled row's logits over its ``num_candidates`` best tokens.
 
     EAGLE-4's candidate head: rank-r scores over this rank's vocab shard
-    (bf16), the shard's top ``num_candidates`` (unsorted), their exact logits
-    from the draft LM head (bf16), then under TP the top ``num_candidates`` of
+    (bf16; the full LM head's logits when the draft has no low-rank head),
+    the shard's top ``num_candidates`` (unsorted), their exact logits from
+    the draft LM head (bf16), then under TP the top ``num_candidates`` of
     the rank-major gathered pools; logits widen to fp32. Output column ``j``
     of a row is the token ``candidate_ids[row, j]``. With ``draft_top_k`` the
     output also carries each row's best ``draft_top_k`` softmax probabilities
@@ -543,8 +550,11 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
         nc = lm_head.num_candidates
         weight = lm_head.lm_head.weight
         hidden = hidden_states.to(weight.dtype)
-        low_rank, _ = lm_head.down_proj(hidden)
-        scores = torch.matmul(low_rank, lm_head.scores_head.weight.T)
+        if lm_head.down_proj is None:
+            scores = torch.matmul(hidden, weight.T)
+        else:
+            low_rank, _ = lm_head.down_proj(hidden)
+            scores = torch.matmul(low_rank, lm_head.scores_head.weight.T)
         rows = hidden.shape[0]
         vocab_start = lm_head.lm_head.shard_indices.org_vocab_start_index
         # Per rank: nc bf16 logits, then nc int64 ids as raw bytes, so one all-gather moves both.
@@ -606,7 +616,8 @@ class Eagle4CandidateLogitsProcessor(LogitsProcessor):
 
 
 class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
-    """The EAGLE-4 draft: an EAGLE-3 draft with the low-rank candidate head."""
+    """The EAGLE-4 draft: an EAGLE-3 draft with the candidate head (low-rank,
+    or the full LM head when the config has no ``efficient_lm_head_config``)."""
 
     model_cls = Eagle4LlamaModel
 
@@ -619,27 +630,34 @@ class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
     ) -> None:
         validate_draft_config(config)
         super().__init__(config, mapping, quant_config, prefix)
-        head = config.efficient_lm_head_config
-        self.efficient_lm_head_down_proj = ReplicatedLinear(
-            config.hidden_size,
-            head["rank"],
-            bias=False,
-            prefix=add_prefix("efficient_lm_head_down_proj", prefix),
-        )
-        self.efficient_lm_head = ParallelLMHead(
-            config.vocab_size,
-            head["rank"],
-            tp_rank=mapping.lm_head.tp_rank,
-            tp_size=mapping.lm_head.tp_size,
-            tp_group=mapping.lm_head.tp_group,
-            prefix=add_prefix("efficient_lm_head", prefix),
-        )
-        self.num_candidates = head["num_candidates"]
+        head = getattr(config, "efficient_lm_head_config", None)
+        if head is None:
+            # No low-rank head: the candidates are the top tokens of the full LM head.
+            self.efficient_lm_head_down_proj = None
+            self.efficient_lm_head = None
+            self.num_candidates = _FULL_HEAD_NUM_CANDIDATES
+        else:
+            self.efficient_lm_head_down_proj = ReplicatedLinear(
+                config.hidden_size,
+                head["rank"],
+                bias=False,
+                prefix=add_prefix("efficient_lm_head_down_proj", prefix),
+            )
+            self.efficient_lm_head = ParallelLMHead(
+                config.vocab_size,
+                head["rank"],
+                tp_rank=mapping.lm_head.tp_rank,
+                tp_size=mapping.lm_head.tp_size,
+                tp_group=mapping.lm_head.tp_group,
+                prefix=add_prefix("efficient_lm_head", prefix),
+            )
+            self.num_candidates = head["num_candidates"]
         # A padded shard's zero rows could outscore every real token's.
         shard_vocab = config.vocab_size // mapping.lm_head.tp_size
         if any(
             h.weight.shape[0] * mapping.lm_head.tp_size != config.vocab_size
             for h in (self.lm_head, self.efficient_lm_head)
+            if h is not None
         ):
             raise ValueError(
                 "the candidate head scores unpadded vocab shards: vocab_size "
