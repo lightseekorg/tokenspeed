@@ -1629,6 +1629,8 @@ def _check_dspark_adaptive_budget_buffers_on_cuda():
     drafter.confidence_scores[2:5] = -8.0
     drafter.finish_round(ctx, graph_bs=4)
     torch.cuda.synchronize()
+    # finish_round retires step-level request state before the next prepare.
+    drafter.prepare_request_state([101, 102, 103, 104], [1, 2, 3, 4], num_extends=0)
     assert (
         drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4) == 12
     )
