@@ -102,7 +102,7 @@ from tokenspeed_kernel.ops.gemm import (
     warmup_fp8_projection,
     warmup_fp8_projections,
 )
-from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.moe import mega_gate_warmup_token_counts, moe_topk
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
@@ -755,12 +755,19 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
 def _max_forward_tokens() -> int:
     """The most tokens one forward carries, as execution/device.py sizes it."""
     args = global_server_args_dict
-    chunk = int(args["chunked_prefill_size"])
-    tokens = (
-        chunk
-        if chunk > 0
-        else int(args["max_prefill_tokens"]) + int(args["max_model_len"])
-    )
+    chunk_raw = args["chunked_prefill_size"]
+    chunk = 0 if chunk_raw is None else int(chunk_raw)
+    if chunk > 0:
+        tokens = chunk
+    else:
+        max_prefill = args["max_prefill_tokens"]
+        max_model_len = args["max_model_len"]
+        if max_prefill is None or max_model_len is None:
+            raise ValueError(
+                "V4.1 warmup requires chunked_prefill_size or both "
+                "max_prefill_tokens and max_model_len to be configured"
+            )
+        tokens = int(max_prefill) + int(max_model_len)
     decode_rows = max(
         int(args["max_cudagraph_capture_size"] or 0), int(args["max_num_seqs"] or 0)
     )
@@ -1901,15 +1908,40 @@ class DeepseekV41MoE(DeepseekV4MoE):
         logits = F.linear(hidden_states.float(), self.gate.weight.float())
         return logits, bias, None, None
 
-    def _compute_topk_output(self, hidden_states, image_mask):
+    def _fused_router_call_kwargs(self, image_mask):
         gate, config = self.gate, self.topk.topk_config
         if (
-            hidden_states.is_cuda
-            and (gate.bias_vl is None or image_mask is None)
-            and gate.tid2eid is None
-            and not self.topk.simulate_routing
-            and self.experts.supports_precomputed_topk
+            not gate.weight.is_cuda
+            or config.router_topk != "fused"
+            or gate.tid2eid is not None
+            or self.topk.simulate_routing
+            or not self.experts.supports_precomputed_topk
         ):
+            return None
+        image_bias = gate.bias_vl if image_mask is not None else None
+        kwargs = {
+            "correction_bias": gate.e_score_correction_bias,
+            "topk_weights_dtype": self.topk.weights_dtype,
+            "hidden_states": None,
+            "gate_weight": gate.weight,
+        }
+        if image_bias is not None:
+            kwargs["image_bias"] = image_bias
+            kwargs["image_token_mask"] = image_mask
+        return kwargs
+
+    def _compute_topk_output(self, hidden_states, image_mask, routing_out=None):
+        config = self.topk.topk_config
+        kwargs = (
+            self._fused_router_call_kwargs(image_mask)
+            if hidden_states.is_cuda and hidden_states.shape[0] <= 65536
+            else None
+        )
+        if kwargs is not None:
+            kwargs["hidden_states"] = hidden_states
+            if routing_out is not None:
+                kwargs["out"] = routing_out
+                kwargs["topk_indices_dtype"] = routing_out[1].dtype
             # moe_topk fuses the router GEMM when a kernel supports it.
             try:
                 topk_weights, topk_ids = moe_topk(
@@ -1919,16 +1951,50 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     "topk",
                     config.renormalize,
                     config.routed_scaling_factor,
-                    correction_bias=gate.e_score_correction_bias,
-                    topk_weights_dtype=self.topk.weights_dtype,
-                    hidden_states=hidden_states,
-                    gate_weight=gate.weight,
+                    **kwargs,
                 )
             except NoKernelFoundError:
                 pass
             else:
                 return StandardTopKOutput(topk_weights, topk_ids, None)
         return super()._compute_topk_output(hidden_states, image_mask)
+
+    def warmup_router(self, max_tokens: int) -> None:
+        """Warm up SM100 fused router variants before CUDA graph capture."""
+        if max_tokens <= 0 or self._fused_router_call_kwargs(None) is None:
+            return
+        gate_weight = self.gate.weight
+        device = gate_weight.device
+        token_counts = mega_gate_warmup_token_counts(min(max_tokens, 65536))
+        image_modes = (False,) if self.gate.bias_vl is None else (False, True)
+        for include_image_bias in image_modes:
+            for tokens in token_counts:
+                hidden = torch.zeros(
+                    (tokens, gate_weight.shape[1]),
+                    dtype=gate_weight.dtype,
+                    device=device,
+                )
+                image_mask = (
+                    torch.zeros(tokens, dtype=torch.bool, device=device)
+                    if include_image_bias
+                    else None
+                )
+                kwargs = self._fused_router_call_kwargs(image_mask)
+                if kwargs is None:
+                    return
+                kwargs["hidden_states"] = hidden
+                try:
+                    moe_topk(
+                        None,
+                        self.topk.topk_config.top_k,
+                        "sqrt_softplus",
+                        "topk",
+                        self.topk.topk_config.renormalize,
+                        self.topk.topk_config.routed_scaling_factor,
+                        **kwargs,
+                    )
+                except NoKernelFoundError:
+                    return
 
 
 @dataclass(frozen=True)
@@ -1966,6 +2032,7 @@ def _v41_hc_post_pre(
     sinkhorn_iters: int,
     prefer_overlap: bool,
     quantize_fp8: bool,
+    fp8_staging=None,
 ):
     """Prepare a consumer with its own weights at either sublayer boundary.
 
@@ -1991,28 +2058,70 @@ def _v41_hc_post_pre(
         return residual, x, None, None
     # DeepGEMM mega_mhc split barriers race under CUDA graph replay: a replay can
     # read the previous replay's partials, so keep it out of captured segments.
+    # Direct MegaMoE symm_buffer staging is likewise restricted to uncaptured
+    # forwards where mega_mhc runs (not PrefillGraph or decode graphs).
     if not prefer_overlap and not is_breakable_capture_active():
-        join = (
-            try_mhc_shifted_post_pre_norm_quantize_fp8
-            if quantize_fp8
-            else try_mhc_shifted_post_pre_norm
-        )
-        shifted = join(
-            pending.x,
-            residual,
-            pre_mix,
-            pending.post,
-            pending.comb,
-            *hc_weights,
-            hc_norm_eps,
-            hc_eps,
-            sinkhorn_iters,
-            norm.weight,
-            norm.variance_epsilon,
-        )
-        if shifted is not None:
-            residual, x, pre, post, comb, *quantized = shifted
-            return residual, x, (pre, post, comb), tuple(quantized) or None
+        capturing = residual.is_cuda and torch.cuda.is_current_stream_capturing()
+        if quantize_fp8 and fp8_staging is not None and not capturing:
+            x_fp8, x_sf, shared_x_sf = fp8_staging.x_quantized
+            shifted = try_mhc_shifted_post_pre_norm_quantize_fp8(
+                pending.x,
+                residual,
+                pre_mix,
+                pending.post,
+                pending.comb,
+                *hc_weights,
+                hc_norm_eps,
+                hc_eps,
+                sinkhorn_iters,
+                norm.weight,
+                norm.variance_epsilon,
+                y_fp8_out=x_fp8,
+                y_routed_sf_out=x_sf,
+                y_shared_sf_out=shared_x_sf,
+                shared_sf_block_m=fp8_staging.shared_block_m,
+            )
+            if shifted is not None:
+                residual, x, pre, post, comb, *_ = shifted
+                return residual, x, (pre, post, comb), fp8_staging.x_quantized
+            shifted = try_mhc_shifted_post_pre_norm(
+                pending.x,
+                residual,
+                pre_mix,
+                pending.post,
+                pending.comb,
+                *hc_weights,
+                hc_norm_eps,
+                hc_eps,
+                sinkhorn_iters,
+                norm.weight,
+                norm.variance_epsilon,
+            )
+            if shifted is not None:
+                residual, x, pre, post, comb = shifted
+                return residual, x, (pre, post, comb), None
+        else:
+            join = (
+                try_mhc_shifted_post_pre_norm_quantize_fp8
+                if quantize_fp8 and fp8_staging is None
+                else try_mhc_shifted_post_pre_norm
+            )
+            shifted = join(
+                pending.x,
+                residual,
+                pre_mix,
+                pending.post,
+                pending.comb,
+                *hc_weights,
+                hc_norm_eps,
+                hc_eps,
+                sinkhorn_iters,
+                norm.weight,
+                norm.variance_epsilon,
+            )
+            if shifted is not None:
+                residual, x, pre, post, comb, *quantized = shifted
+                return residual, x, (pre, post, comb), tuple(quantized) or None
     return pending.finish(residual), None, None, None
 
 
@@ -2247,7 +2356,17 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-        residual, x, ffn_mixes, _ = _v41_hc_post_pre(
+        can_mega_mhc_ffn = (
+            not (decode_hc and can_overlap)
+            and not is_breakable_capture_active()
+            and not (residual.is_cuda and torch.cuda.is_current_stream_capturing())
+        )
+        ffn_staging = (
+            self.ffn.mega_moe_staging_buffers(residual.shape[0])
+            if can_mega_mhc_ffn and isinstance(self.ffn, DeepseekV4MoE)
+            else None
+        )
+        residual, x, ffn_mixes, ffn_quantized = _v41_hc_post_pre(
             residual,
             attn_pre,
             V41HCPost(
@@ -2262,7 +2381,8 @@ class DeepseekV41DecoderLayer(nn.Module):
             hc_eps=self.hc_eps,
             sinkhorn_iters=self.hc_sinkhorn_iters,
             prefer_overlap=decode_hc and can_overlap,
-            quantize_fp8=False,
+            quantize_fp8=ffn_staging is not None,
+            fp8_staging=ffn_staging,
         )
         if x is None:
             x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
@@ -2300,7 +2420,13 @@ class DeepseekV41DecoderLayer(nn.Module):
                         self.hc_eps,
                         self.hc_sinkhorn_iters,
                     )
-            x = self._forward_ffn(x, image_mask, ctx, defer_reduce=defer_moe)
+            x = self._forward_ffn(
+                x,
+                image_mask,
+                ctx,
+                defer_reduce=defer_moe,
+                staging=ffn_staging if ffn_quantized is not None else None,
+            )
             ffn_pre, post, comb = ffn_mixes
             if ffn_overlap:
                 for tensor in (ffn_pre, post, comb):
@@ -2330,7 +2456,9 @@ class DeepseekV41DecoderLayer(nn.Module):
             collective_global_num_tokens=None,
         )
 
-    def _forward_ffn(self, x, image_mask, ctx, *, defer_reduce: bool):
+    def _forward_ffn(
+        self, x, image_mask, ctx, *, defer_reduce: bool, staging: object | None = None
+    ):
         """MoE output after its communication.
 
         With defer_reduce, the pending plain all-reduce over the MoE TPxEP
@@ -2345,6 +2473,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                     "Expert-owned communication cannot defer its reduction"
                 )
             counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
+            extra = {"staging": staging} if staging is not None else {}
             return self.ffn(
                 x,
                 image_mask,
@@ -2352,7 +2481,10 @@ class DeepseekV41DecoderLayer(nn.Module):
                 max(counts),
                 ctx=ctx if self.ffn.use_mega_moe else None,
                 comm_manager=self.comm_manager if self.ffn.use_mega_moe else None,
+                **extra,
             )
+        if staging is not None:
+            raise ValueError("Pre-staged MoE inputs require owns_ep_communication")
         # DP ranks may mix image and text rows. Carry the routing mask in
         # the same gather as the activations; keep the wire width 16B aligned.
         gather_mask = (
@@ -3759,11 +3891,26 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             for module in self.modules()
             if isinstance(module, DeepseekV41Attention)
         ]
+        max_tokens: int | None = None
         if attentions:
-            _warmup_query_projections(attentions, _max_forward_tokens())
+            max_tokens = _max_forward_tokens()
+            _warmup_query_projections(attentions, max_tokens)
+        warmed_routers = set()
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()
+                if isinstance(module, DeepseekV41MoE) and module.gate.weight.is_cuda:
+                    router_key = (
+                        module.gate.weight.device,
+                        tuple(module.gate.weight.shape),
+                        module.gate.e_score_correction_bias is not None,
+                        module.gate.bias_vl is not None,
+                    )
+                    if router_key not in warmed_routers:
+                        if max_tokens is None:
+                            max_tokens = _max_forward_tokens()
+                        module.warmup_router(max_tokens)
+                        warmed_routers.add(router_key)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens

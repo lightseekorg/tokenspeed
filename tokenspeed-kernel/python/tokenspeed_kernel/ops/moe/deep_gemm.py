@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 # DeepGEMM implementation of the DeepSeek V4/V4.1 MegaMoE boundary.
 
 _HAS_DEEP_GEMM = platform.is_blackwell and has_optional_package("deep_gemm")
+_HAS_MEGA_GATE = False
 
 if _HAS_DEEP_GEMM:
     prepare_cuda_toolkit_env()
@@ -60,8 +61,15 @@ if _HAS_DEEP_GEMM:
         set_pdl,
     )
     from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (
+        stage_mega_moe_routing_inputs,
         stage_mxfp4_mega_moe_inputs,
     )
+    from tokenspeed_kernel.thirdparty.cuda.mega_gate import (
+        bf16_mega_gate,
+        is_bf16_mega_gate_available,
+    )
+
+    _HAS_MEGA_GATE = is_bf16_mega_gate_available()
 
 
 _MXFP4_BLOCK_SIZE = 32
@@ -73,6 +81,26 @@ _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, int], object] 
 _warmed_configs: set[
     tuple[int, torch.device, int, int, int, int, int, int, float | None, bool]
 ] = set()
+
+
+@dataclass(frozen=True)
+class DeepGemmMegaMoeBuffers:
+    """Symmetric-buffer input views populated directly ahead of MegaMoE."""
+
+    x: torch.Tensor
+    x_sf: torch.Tensor
+    shared_x_sf: torch.Tensor
+    shared_block_m: int
+    topk_idx: torch.Tensor
+    topk_weights: torch.Tensor
+
+    @property
+    def x_quantized(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (self.x, self.x_sf, self.shared_x_sf)
+
+    @property
+    def routing_out(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (self.topk_weights, self.topk_idx)
 
 
 @dataclass(frozen=True)
@@ -370,6 +398,75 @@ def _warmup_m_values(max_tokens: int) -> list[int]:
     return sorted(values)
 
 
+def _validate_symm_activations(
+    symm_buffer: object,
+    state: _DeepGemmMegaMoEState,
+    num_tokens: int,
+    hidden_size: int,
+    x_quantized: object,
+) -> None:
+    if state.num_shared_experts == 0:
+        raise ValueError("Pre-staged MegaMoE activations require a fused shared expert")
+    if not isinstance(x_quantized, tuple) or len(x_quantized) != 3:
+        raise ValueError(
+            "x_quantized for DeepGEMM MegaMoE must be (x_fp8, x_sf, shared_x_sf)"
+        )
+    x_fp8, x_sf, shared_x_sf = x_quantized
+    expected_fp8 = symm_buffer.x[:num_tokens]
+    expected_sf = symm_buffer.x_sf[:num_tokens]
+    expected_shared_sf = symm_buffer.shared_l1_acts_sf[:num_tokens]
+    if (
+        x_fp8.data_ptr() != expected_fp8.data_ptr()
+        or x_fp8.shape != (num_tokens, hidden_size)
+        or x_fp8.dtype != torch.float8_e4m3fn
+        or not x_fp8.is_contiguous()
+    ):
+        raise ValueError("x_quantized activation view must match symm_buffer.x")
+    if (
+        x_sf.data_ptr() != expected_sf.data_ptr()
+        or x_sf.shape != (num_tokens, hidden_size // 128)
+        or x_sf.dtype != torch.int32
+        or not x_sf.is_contiguous()
+    ):
+        raise ValueError("x_quantized routed scale view must match symm_buffer.x_sf")
+    if (
+        shared_x_sf.data_ptr() != expected_shared_sf.data_ptr()
+        or shared_x_sf.shape != (num_tokens, hidden_size // 128)
+        or shared_x_sf.stride() != expected_shared_sf.stride()
+        or shared_x_sf.dtype != torch.int32
+    ):
+        raise ValueError(
+            "x_quantized shared scale view must match symm_buffer.shared_l1_acts_sf"
+        )
+
+
+def _validate_symm_routing(
+    symm_buffer: object,
+    num_tokens: int,
+    top_k: int,
+    routing_prepared: object,
+) -> None:
+    if not isinstance(routing_prepared, tuple) or len(routing_prepared) != 2:
+        raise ValueError(
+            "routing_prepared for DeepGEMM MegaMoE must be (topk_weights, topk_ids)"
+        )
+    prepared_weights, prepared_ids = routing_prepared
+    if (
+        prepared_weights.data_ptr() != symm_buffer.topk_weights.data_ptr()
+        or prepared_weights.shape != (num_tokens, top_k)
+        or prepared_weights.dtype != torch.float32
+        or not prepared_weights.is_contiguous()
+    ):
+        raise ValueError("routing_prepared weights must match symm_buffer.topk_weights")
+    if (
+        prepared_ids.data_ptr() != symm_buffer.topk_idx.data_ptr()
+        or prepared_ids.shape != (num_tokens, top_k)
+        or prepared_ids.dtype != torch.int64
+        or not prepared_ids.is_contiguous()
+    ):
+        raise ValueError("routing_prepared ids must match symm_buffer.topk_idx")
+
+
 def _run_mega_moe(
     state: _DeepGemmMegaMoEState,
     symm_buffer: object,
@@ -379,6 +476,9 @@ def _run_mega_moe(
     output: torch.Tensor,
     activation_clamp: float | None,
     fast_math: bool,
+    *,
+    x_quantized: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    routing_prepared: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
     """Stage ``x`` and its routing into the symmetric buffer and launch."""
     num_tokens = x.shape[0]
@@ -400,20 +500,37 @@ def _run_mega_moe(
             "shared_l1_weights": state.shared_l1_weights,
             "shared_l2_weights": state.shared_l2_weights,
         }
-    stage_mxfp4_mega_moe_inputs(
-        x,
-        topk_weights,
-        topk_ids,
-        symm_buffer.x[:num_tokens],
-        symm_buffer.x_sf[:num_tokens],
-        symm_buffer.topk_idx[:num_tokens],
-        symm_buffer.topk_weights[:num_tokens],
-        shared_x_sf,
-        shared_block_m,
-        # Every launch reads the pair, so warmup compiles the variant that
-        # captured graphs replay.
-        mega_moe_live_requests(x.device),
-    )
+    if x_quantized is not None:
+        _validate_symm_activations(
+            symm_buffer, state, num_tokens, x.shape[1], x_quantized
+        )
+    if routing_prepared is not None:
+        _validate_symm_routing(
+            symm_buffer, num_tokens, topk_ids.shape[1], routing_prepared
+        )
+    if x_quantized is None:
+        stage_mxfp4_mega_moe_inputs(
+            x,
+            topk_weights,
+            topk_ids.to(torch.int32),
+            symm_buffer.x[:num_tokens],
+            symm_buffer.x_sf[:num_tokens],
+            symm_buffer.topk_idx[:num_tokens],
+            symm_buffer.topk_weights[:num_tokens],
+            shared_x_sf,
+            shared_block_m,
+            # Every launch reads the pair, so warmup compiles the variant that
+            # captured graphs replay.
+            mega_moe_live_requests(x.device),
+        )
+    elif routing_prepared is None:
+        stage_mega_moe_routing_inputs(
+            topk_weights,
+            topk_ids.to(torch.int32),
+            symm_buffer.topk_idx[:num_tokens],
+            symm_buffer.topk_weights[:num_tokens],
+            mega_moe_live_requests(x.device),
+        )
     fp8_fp4_mega_moe(
         output,
         state.l1_weights,
@@ -583,6 +700,8 @@ if _HAS_DEEP_GEMM:
         max_num_tokens_per_gpu: int | None,
         do_finalize: bool,
         enable_pdl: bool,
+        x_quantized: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        routing_prepared: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if not do_finalize:
             raise ValueError("DeepGEMM MegaMoE requires complete finalization")
@@ -619,8 +738,6 @@ if _HAS_DEEP_GEMM:
             intermediate_size=w.intermediate_size,
             max_num_tokens=max_num_tokens,
         )
-        # Staging widens ids to the buffer's int64; one input dtype keeps one compile.
-        topk_ids = topk_ids.to(torch.int32)
         output = torch.empty_like(x, dtype=torch.bfloat16)
         _run_mega_moe(
             state,
@@ -631,12 +748,159 @@ if _HAS_DEEP_GEMM:
             output,
             None if w.swiglu_arg is None else w.swiglu_arg.limit,
             plan["fast_math"],
+            x_quantized=x_quantized,
+            routing_prepared=routing_prepared,
         )
         return output
 
+    def _prepare_deep_gemm_mega_moe_input_buffers(plan: dict, w: torch.nn.Module):
+        state = w._moe_backend_state
+        if not isinstance(state, _DeepGemmMegaMoEState):
+            raise TypeError("invalid DeepGEMM MegaMoE state")
+        max_num_tokens = plan["persistent_max_num_tokens_per_gpu"]
+        symm_buffer = _get_symm_buffer(
+            state=state,
+            process_group=plan.get("process_group"),
+            num_experts=w.num_experts,
+            top_k=w.top_k,
+            hidden_size=w.hidden_size,
+            intermediate_size=w.intermediate_size,
+            max_num_tokens=max_num_tokens,
+        )
+
+        def views(
+            num_tokens: int, max_tokens: int
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            if max_tokens > max_num_tokens or num_tokens < 0 or num_tokens > max_tokens:
+                raise ValueError(
+                    f"MegaMoE input buffer capacity exceeded: tokens={num_tokens}, "
+                    f"max_tokens={max_tokens}, capacity={max_num_tokens}"
+                )
+            return (
+                symm_buffer.x[:num_tokens],
+                symm_buffer.x_sf[:num_tokens],
+                symm_buffer.topk_idx[:num_tokens],
+                symm_buffer.topk_weights[:num_tokens],
+            )
+
+        return views
+
+    def _prepare_deep_gemm_mega_moe_buffers(
+        plan: dict, w: torch.nn.Module, num_tokens: int
+    ) -> DeepGemmMegaMoeBuffers | None:
+        state = w._moe_backend_state
+        if not isinstance(state, _DeepGemmMegaMoEState):
+            raise TypeError("invalid DeepGEMM MegaMoE state")
+        if state.num_shared_experts == 0:
+            return None
+        max_num_tokens = plan["persistent_max_num_tokens_per_gpu"]
+        if num_tokens <= 0 or num_tokens > max_num_tokens:
+            return None
+        symm_buffer = _get_symm_buffer(
+            state=state,
+            process_group=plan.get("process_group"),
+            num_experts=w.num_experts,
+            top_k=w.top_k,
+            hidden_size=w.hidden_size,
+            intermediate_size=w.intermediate_size,
+            max_num_tokens=max_num_tokens,
+        )
+        shared_block_m = get_block_m_for_mega_moe(
+            symm_buffer.group.size(),
+            symm_buffer.num_experts,
+            symm_buffer.num_max_tokens_per_rank,
+            num_tokens,
+            symm_buffer.num_topk,
+            symm_buffer.mma_type,
+        )
+        return DeepGemmMegaMoeBuffers(
+            x=symm_buffer.x[:num_tokens],
+            x_sf=symm_buffer.x_sf[:num_tokens],
+            shared_x_sf=symm_buffer.shared_l1_acts_sf[:num_tokens],
+            shared_block_m=shared_block_m,
+            topk_idx=symm_buffer.topk_idx[:num_tokens],
+            topk_weights=symm_buffer.topk_weights[:num_tokens],
+        )
+
+    deep_gemm_mxfp4_mega_moe_apply._tokenspeed_prepare_input_buffers = (  # type: ignore[attr-defined]
+        _prepare_deep_gemm_mega_moe_input_buffers
+    )
+    deep_gemm_mxfp4_mega_moe_apply._tokenspeed_prepare_mega_moe_buffers = (  # type: ignore[attr-defined]
+        _prepare_deep_gemm_mega_moe_buffers
+    )
     deep_gemm_mxfp4_mega_moe_apply._tokenspeed_warmup = (  # type: ignore[attr-defined]
         warmup_deep_gemm_mxfp4_mega_moe
     )
     deep_gemm_mxfp4_mega_moe_apply._tokenspeed_fuse_shared_expert = (  # type: ignore[attr-defined]
         fuse_deep_gemm_mxfp4_mega_moe_shared_expert
     )
+
+
+if _HAS_MEGA_GATE:
+
+    @register_kernel(
+        "moe",
+        "router_topk",
+        name="deep_gemm_bf16_mega_gate",
+        solution="deep_gemm",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"nvidia"}),
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 9),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    gate_weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        traits={
+            "experts": frozenset(range(4, 513, 4)),
+            "hidden_alignment": frozenset({256}),
+            "top_k": frozenset(range(1, 33)),
+            "renormalize": frozenset({True}),
+            "max_tokens_within_1m": frozenset({True}),
+            "supports_out": frozenset({False, True}),
+            "supports_image_bias": frozenset({False, True}),
+            "supports_expert_placement": frozenset({False, True}),
+            "supports_valid_token_mask": frozenset({False, True}),
+            "routing_kind": frozenset({"plain", "bias"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def deep_gemm_bf16_mega_gate(
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        correction_bias: torch.Tensor | None,
+        hash_indices_table: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+        routed_scaling_factor: float,
+        *,
+        ep_rank: int | None = None,
+        image_bias: torch.Tensor | None = None,
+        image_token_mask: torch.Tensor | None = None,
+        to_physical_map: torch.Tensor | None = None,
+        logical_count: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
+        out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del hash_indices_table, input_ids
+        return bf16_mega_gate(
+            hidden_states,
+            gate_weight,
+            top_k,
+            renormalize=renormalize,
+            routed_scaling_factor=routed_scaling_factor,
+            ep_rank=ep_rank,
+            correction_bias=correction_bias,
+            image_bias=image_bias,
+            image_token_mask=image_token_mask,
+            to_physical_map=to_physical_map,
+            logical_count=logical_count,
+            mask=mask,
+            out=out,
+        )

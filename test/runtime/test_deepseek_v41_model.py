@@ -5069,3 +5069,178 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         shared.down_proj.weight_scale_inv,
     )
     assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))
+
+
+def test_v41_moe_fused_router_and_capture_guard(monkeypatch):
+    from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
+
+    class _FakeCudaTensor(torch.Tensor):
+        @property
+        def is_cuda(self) -> bool:
+            return True
+
+    class _FakeGate(nn.Module):
+        def __init__(self, weight: torch.Tensor):
+            super().__init__()
+            self.weight = weight
+            self.e_score_correction_bias = torch.zeros(4)
+            self.bias_vl = torch.ones(4)
+            self.tid2eid = None
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return torch.matmul(hidden_states, self.weight.t())
+
+    def _make_moe(router_topk: str):
+        moe = v41.DeepseekV41MoE.__new__(v41.DeepseekV41MoE)
+        nn.Module.__init__(moe)
+        gate_w = torch.randn(4, 256, dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
+        moe.gate = _FakeGate(gate_w)
+        moe.experts = SimpleNamespace(supports_precomputed_topk=True)
+        moe.topk = v4.DeepseekV4TopK(
+            top_k=2,
+            renormalize=True,
+            correction_bias=moe.gate.e_score_correction_bias,
+            routed_scaling_factor=1.0,
+            hash_routing=False,
+            weights_dtype=torch.float32,
+        )
+        moe.topk.topk_config.router_topk = router_topk
+        moe.config = SimpleNamespace(
+            num_experts_per_tok=2, norm_topk_prob=True, n_routed_experts=4
+        )
+        return moe
+
+    calls = []
+
+    def fake_moe_topk(logits, *args, **kwargs):
+        calls.append((logits, kwargs))
+        out = kwargs.get("out")
+        if out is not None:
+            out[0].fill_(0.5)
+            out[1].copy_(torch.tensor([[0, 2], [1, 3]], dtype=torch.int64))
+            return out[0], out[1]
+        return torch.full((2, 2), 0.5), torch.tensor(
+            [[0, 1], [1, 0]], dtype=torch.int32
+        )
+
+    monkeypatch.setattr(v41, "moe_topk", fake_moe_topk)
+    monkeypatch.setattr(v4, "moe_topk", fake_moe_topk)
+
+    x = torch.randn(2, 256, dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
+    img_mask = torch.tensor([False, True])
+    out_bufs = (
+        torch.empty(2, 2, dtype=torch.float32),
+        torch.empty(2, 2, dtype=torch.int64),
+    )
+
+    res = _make_moe("fused")._compute_topk_output(x, img_mask, routing_out=out_bufs)
+    assert isinstance(res, StandardTopKOutput)
+    assert res.topk_ids is out_bufs[1]
+    assert calls[-1][0] is None
+    assert calls[-1][1]["out"] is out_bufs
+    assert calls[-1][1]["image_bias"] is not None
+    assert calls[-1][1]["image_token_mask"] is img_mask
+    assert calls[-1][1]["topk_indices_dtype"] == torch.int64
+
+    calls.clear()
+    _make_moe("torch")._compute_topk_output(x, None)
+    assert calls and all(c[0] is not None for c in calls)
+
+    # During CUDA stream capture, direct symm_buffer staging must be skipped while
+    # preserving ordinary non-breakable mega_mhc eligibility.
+    mega_calls = []
+    monkeypatch.setattr(
+        v41,
+        "try_mhc_shifted_post_pre_norm",
+        lambda *a, **k: mega_calls.append("plain") and None,
+    )
+    monkeypatch.setattr(
+        v41,
+        "try_mhc_shifted_post_pre_norm_quantize_fp8",
+        lambda *a, **k: mega_calls.append("quant") and None,
+    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    pending = v41.V41HCPost(x, torch.ones(2, 4), torch.ones(2, 4, 4), None)
+    residual = torch.zeros(2, 4, 256, dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
+    monkeypatch.setattr(v41, "v41_hc_post", lambda px, r, p, c: r + 1)
+    out_r, out_x, mixes, quant = v41._v41_hc_post_pre(
+        residual,
+        torch.ones(2, 4),
+        pending,
+        hc_weights=(torch.zeros(1), torch.zeros(1), torch.zeros(1)),
+        norm=SimpleNamespace(weight=torch.ones(256), variance_epsilon=1e-5),
+        hc_norm_eps=1e-20,
+        hc_eps=1e-6,
+        sinkhorn_iters=1,
+        prefer_overlap=False,
+        quantize_fp8=True,
+        fp8_staging=SimpleNamespace(x_quantized=(x, x, x), shared_block_m=64),
+    )
+    assert mega_calls == ["plain"]
+    assert out_x is None and mixes is None and quant is None
+    torch.testing.assert_close(torch.Tensor(out_r), torch.Tensor(residual) + 1)
+
+
+def test_v41_moe_fused_router_parity(monkeypatch):
+    from tokenspeed_kernel.thirdparty.cuda.mega_gate import is_bf16_mega_gate_available
+
+    if (
+        not torch.cuda.is_available()
+        or not current_platform().is_nvidia
+        or current_platform().arch_version.major != 10
+        or not is_bf16_mega_gate_available()
+    ):
+        pytest.skip("requires SM100-family GPU and deep_gemm.bf16_mega_gate")
+
+    config = _loader_config()
+    config.hidden_size = 512
+    config.n_routed_experts = 8
+    config.num_experts_per_tok = 2
+    config.moe_intermediate_size = 128
+    torch.manual_seed(29)
+    tokens, experts = 12, config.n_routed_experts
+    hidden = (torch.randn(tokens, config.hidden_size, device="cuda") * 0.05).bfloat16()
+    gate_weight = (
+        torch.randn(experts, config.hidden_size, device="cuda") * 0.05
+    ).bfloat16()
+    gate_weight[:, :experts] += (
+        torch.eye(experts, device="cuda", dtype=torch.bfloat16) * 1.5
+    )
+    for row in range(tokens):
+        primary = row % experts
+        hidden[row, primary] = 2.0
+        hidden[row, (primary + 3) % experts] = 1.6
+    bias = torch.randn(experts, device="cuda", dtype=torch.float32) * 0.02
+    bias_vl = torch.randn(experts, device="cuda", dtype=torch.float32) * 0.02
+    img_mask = torch.tensor(
+        [i % 3 == 0 for i in range(tokens)], device="cuda", dtype=torch.bool
+    )
+
+    monkeypatch.setitem(global_server_args_dict, "moe_runner_backend", "triton")
+    with torch.device("cuda"):
+        moe = v41.DeepseekV41MoE(config, _mapping(0, 1, 1), _quant(), 0, "ffn", None)
+    with torch.no_grad():
+        moe.gate.weight.copy_(gate_weight)
+        moe.gate.e_score_correction_bias.copy_(bias)
+        moe.gate.bias_vl = nn.Parameter(bias_vl, requires_grad=False)
+
+    for mask in (None, img_mask):
+        moe.topk.topk_config.router_topk = "fused"
+        fused = moe._compute_topk_output(hidden, mask)
+        moe.topk.topk_config.router_topk = "torch"
+        unfused = moe._compute_topk_output(hidden, mask)
+
+        fused_order = torch.argsort(fused.topk_ids, dim=-1)
+        unfused_order = torch.argsort(unfused.topk_ids, dim=-1)
+        torch.testing.assert_close(
+            fused.topk_ids.gather(1, fused_order),
+            unfused.topk_ids.gather(1, unfused_order),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            fused.topk_weights.gather(1, fused_order),
+            unfused.topk_weights.gather(1, unfused_order),
+            atol=2e-3,
+            rtol=2e-3,
+        )

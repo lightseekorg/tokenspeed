@@ -1240,6 +1240,11 @@ def moe_topk(
     hidden_states: torch.Tensor | None = None,
     gate_weight: torch.Tensor | None = None,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    image_bias: torch.Tensor | None = None,
+    image_token_mask: torch.Tensor | None = None,
+    logical_replica_counts: torch.Tensor | None = None,
+    ep_rank: int | None = None,
+    valid_token_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce expert weights and ids using a registered MoE TopK kernel.
 
@@ -1262,7 +1267,8 @@ def moe_topk(
             [tokens, experts].
         hash_indices_table: Optional token-id to expert-id table.
         input_ids: Token ids used with hash_indices_table.
-        logical_to_physical_map: Optional expert-id map for sigmoid routing.
+        logical_to_physical_map: Optional expert-id map for sigmoid or fused
+            sqrt-softplus routing.
         topk_indices_dtype: Integer dtype for returned expert ids.
         topk_weights_dtype: Floating-point dtype for returned routing weights.
             Sqrt-softplus scoring, normalization and scaling use FP32; CUDA
@@ -1271,10 +1277,21 @@ def moe_topk(
         solution: Optional registered solution name.
         hidden_states: Optional activations shaped [tokens, hidden].
         gate_weight: Optional router weight shaped [experts, hidden].
-        out: Optional (weights, ids) output buffers for biased sigmoid routing.
-            IDs must use topk_indices_dtype. Weights use the supplied buffer's
-            precision; FP32 storage is also accepted for BF16 requests.
-            Omission allocates the outputs in the selected kernel.
+        out: Optional (weights, ids) output buffers for biased sigmoid or fused
+            sqrt-softplus top-k. IDs must use topk_indices_dtype. Weights use the
+            supplied buffer's precision; FP32 storage is also accepted for BF16
+            requests on sigmoid routing. Omission allocates the outputs in the
+            selected kernel.
+        image_bias: Optional multimodal per-expert selection bias [experts]
+            for fused sqrt-softplus routing.
+        image_token_mask: Optional boolean token mask [tokens] paired with
+            `image_bias`.
+        logical_replica_counts: Optional [logical_experts] valid replica counts
+            paired with `logical_to_physical_map` for fused sqrt-softplus routing.
+        ep_rank: EP rank index used to distribute replicated routes in fused
+            sqrt-softplus routing.
+        valid_token_mask: Optional boolean mask [tokens] forcing inactive rows to
+            expert -1 and weight 0 in fused sqrt-softplus routing.
     Returns:
         Weights and expert ids shaped [tokens, top_k], using the requested
         output dtypes, or the supplied out buffers.
@@ -1292,10 +1309,26 @@ def moe_topk(
         raise ValueError("topk_indices_dtype must be torch.int32 or torch.int64")
     if not topk_weights_dtype.is_floating_point:
         raise ValueError("topk_weights_dtype must be a floating-point dtype")
+    if (image_bias is None) != (image_token_mask is None):
+        raise ValueError("image_bias and image_token_mask must be supplied together")
+    if (image_bias is not None or valid_token_mask is not None) and (
+        router_logits is not None or score_function != "sqrt_softplus"
+    ):
+        raise ValueError(
+            "image_bias and valid_token_mask require fused sqrt_softplus routing"
+        )
+    if logical_replica_counts is not None and (
+        logical_to_physical_map is None or router_logits is not None
+    ):
+        raise ValueError(
+            "logical_replica_counts requires fused routing with logical_to_physical_map"
+        )
     if out is not None:
-        if score_function != "sigmoid":
+        if score_function not in ("sigmoid", "sqrt_softplus") or (
+            score_function == "sqrt_softplus" and router_logits is not None
+        ):
             raise ValueError(
-                "Routing output buffers currently support biased sigmoid top-k"
+                "Routing output buffers support biased sigmoid top-k and fused sqrt-softplus top-k"
             )
         if out[1].dtype != topk_indices_dtype:
             raise ValueError("Routing expert-ID output must match topk_indices_dtype")
@@ -1349,9 +1382,24 @@ def moe_topk(
 
     if score_function != "sqrt_softplus":
         raise ValueError(f"unsupported MoE score function: {score_function!r}")
-    if logical_to_physical_map is not None:
-        raise ValueError("sqrt_softplus routing does not accept an expert-id map")
     fused = router_logits is None
+    if logical_to_physical_map is not None and not fused:
+        raise ValueError(
+            "sqrt_softplus routing with logits does not accept an expert-id map"
+        )
+    if fused and (logical_to_physical_map is None) != (logical_replica_counts is None):
+        raise ValueError(
+            "fused sqrt_softplus expert placement requires both "
+            "logical_to_physical_map and logical_replica_counts"
+        )
+    if fused and logical_to_physical_map is not None and ep_rank is None:
+        raise ValueError(
+            "ep_rank is required when logical_to_physical_map is supplied for fused routing"
+        )
+    if ep_rank is not None and (not fused or logical_to_physical_map is None):
+        raise ValueError(
+            "ep_rank requires fused sqrt_softplus routing with logical_to_physical_map"
+        )
     if fused:
         router_like = hidden_states
         tokens, experts = hidden_states.shape[0], gate_weight.shape[0]
@@ -1402,12 +1450,38 @@ def moe_topk(
     if fused:
         if per_token_bias:
             raise ValueError("fused router top-k does not accept per-token bias")
+        has_image_bias = image_bias is not None
+        has_placement = logical_to_physical_map is not None
+        has_out = out is not None
+        has_mask = valid_token_mask is not None
         kernel, fused_traits = _router_topk_kernel(
-            hidden_states, gate_weight, top_k, routing_kind, override, solution
+            hidden_states,
+            gate_weight,
+            top_k,
+            renormalize,
+            routing_kind,
+            has_out=has_out,
+            has_image_bias=has_image_bias,
+            has_expert_placement=has_placement,
+            has_valid_token_mask=has_mask,
+            override=override,
+            solution=solution,
         )
         ShapeCapture.get().record(
             "moe", "router_topk", kernel.name, hidden_states.dtype, fused_traits
         )
+        extra_kwargs = {}
+        if has_image_bias:
+            extra_kwargs["image_bias"] = image_bias
+            extra_kwargs["image_token_mask"] = image_token_mask
+        if has_placement:
+            extra_kwargs["to_physical_map"] = logical_to_physical_map
+            extra_kwargs["logical_count"] = logical_replica_counts
+            extra_kwargs["ep_rank"] = ep_rank
+        if has_mask:
+            extra_kwargs["mask"] = valid_token_mask
+        if has_out:
+            extra_kwargs["out"] = out
         with kernel_scope(
             "moe",
             "router_topk",
@@ -1424,6 +1498,7 @@ def moe_topk(
                 hash_indices_table,
                 input_ids,
                 scaling_factor,
+                **extra_kwargs,
             )
             return topk_weights.to(topk_weights_dtype), topk_ids.to(topk_indices_dtype)
     traits = {
@@ -1509,7 +1584,13 @@ def _router_topk_kernel(
     hidden_states: torch.Tensor,
     gate_weight: torch.Tensor,
     top_k: int,
+    renormalize: bool,
     routing_kind: str,
+    *,
+    has_out: bool,
+    has_image_bias: bool,
+    has_expert_placement: bool,
+    has_valid_token_mask: bool,
     override: str | None = None,
     solution: str | None = None,
 ):
@@ -1518,7 +1599,13 @@ def _router_topk_kernel(
         "experts": int(gate_weight.shape[0]),
         "hidden": int(hidden_states.shape[1]),
         "top_k": int(top_k),
+        "renormalize": bool(renormalize),
         "routing_kind": routing_kind,
+        "max_tokens_within_1m": hidden_states.shape[0] <= (1 << 20),
+        "supports_out": bool(has_out),
+        "supports_image_bias": bool(has_image_bias),
+        "supports_expert_placement": bool(has_expert_placement),
+        "supports_valid_token_mask": bool(has_valid_token_mask),
     }
     kernel = select_kernel(
         "moe",
@@ -2298,6 +2385,9 @@ def moe_plan(
         "prepare_input_buffers": getattr(
             kernel.impl, "_tokenspeed_prepare_input_buffers", None
         ),
+        "prepare_mega_moe_buffers": getattr(
+            kernel.impl, "_tokenspeed_prepare_mega_moe_buffers", None
+        ),
         "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
         "fuse_shared_expert": getattr(
             kernel.impl, "_tokenspeed_fuse_shared_expert", None
@@ -2402,6 +2492,34 @@ def moe_prepare_input_buffers(
         Call collectively before capture, in the runtime's workspace region.
     """
     return plan["prepare_input_buffers"](plan, w)
+
+
+def moe_prepare_mega_moe_staging_buffers(
+    plan: dict, w: torch.nn.Module, num_tokens: int
+) -> object | None:
+    """Return pre-staging symmetric-buffer views for ``num_tokens``, or None."""
+    hook = plan.get("prepare_mega_moe_buffers")
+    if hook is None:
+        return None
+    return hook(plan, w, num_tokens)
+
+
+def set_mega_gate_workspace_region(region) -> None:
+    """Scope per-stream MegaGate barrier allocation inside the runtime workspace region."""
+    from tokenspeed_kernel.thirdparty.cuda.mega_gate import (
+        set_mega_gate_workspace_region as _set_region,
+    )
+
+    _set_region(region)
+
+
+def mega_gate_warmup_token_counts(max_tokens: int) -> list[int]:
+    """Return canonical warmed token counts for SM100 MegaGate up to ``max_tokens``."""
+    from tokenspeed_kernel.thirdparty.cuda.mega_gate import (
+        mega_gate_warmup_token_counts as _warmup_counts,
+    )
+
+    return _warmup_counts(max_tokens)
 
 
 def moe_warmup(plan: dict, w: torch.nn.Module, *, max_num_tokens: int) -> None:

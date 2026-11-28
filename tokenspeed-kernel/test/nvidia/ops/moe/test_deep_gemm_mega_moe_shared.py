@@ -269,3 +269,226 @@ def test_filler_rows_get_no_routed_output(fused):
         assert torch.equal(got[rows:], unrouted[rows:])
         if not fused:
             assert not got[rows:].any()
+
+
+@pytest.mark.usefixtures("process_group")
+def test_direct_mega_mhc_and_router_staging_skips_stage_kernel(monkeypatch):
+    from tokenspeed_kernel.ops.moe import _deep_gemm as dg_pkg  # noqa: F401
+    from tokenspeed_kernel.ops.moe import moe_prepare_mega_moe_staging_buffers, moe_topk
+    from tokenspeed_kernel.ops.moe._deep_gemm import mega_moe_stage
+    from tokenspeed_kernel.ops.residual import (
+        try_mhc_shifted_post_pre_norm,
+        try_mhc_shifted_post_pre_norm_quantize_fp8,
+    )
+    from tokenspeed_kernel.thirdparty.cuda.mega_gate import is_bf16_mega_gate_available
+    from tokenspeed_kernel.thirdparty.cuda.mega_mhc import (
+        is_mega_mhc_direct_staging_available,
+    )
+    from utils import assert_no_triton_compile
+
+    plan = {
+        "persistent_max_num_tokens_per_gpu": 256,
+        "process_group": None,
+        "fast_math": True,
+    }
+    w = _Experts()
+    mega_moe.deep_gemm_mxfp4_mega_moe_process_weights(plan, w)
+    assert mega_moe.fuse_deep_gemm_mxfp4_mega_moe_shared_expert(
+        plan, w, *_shared_weights(8)
+    )
+    # Build full MegaMoE plan carrying prepare_mega_moe_buffers.
+    plan["prepare_mega_moe_buffers"] = (
+        mega_moe.deep_gemm_mxfp4_mega_moe_apply._tokenspeed_prepare_mega_moe_buffers
+    )
+    assert is_bf16_mega_gate_available()
+    assert is_mega_mhc_direct_staging_available()
+
+    g = torch.Generator(device="cuda").manual_seed(9)
+    tokens = 48
+    x_in = torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16, generator=g)
+    residual = torch.randn(
+        tokens, 4, HIDDEN, device="cuda", dtype=torch.bfloat16, generator=g
+    )
+    pre = torch.rand(tokens, 4, device="cuda", generator=g)
+    post = torch.rand(tokens, 4, device="cuda", generator=g) * 2
+    comb = torch.rand(tokens, 4, 4, device="cuda", generator=g).softmax(-2)
+    weight = (
+        torch.randn(24, 4 * HIDDEN, device="cuda", dtype=torch.float32, generator=g)
+        * 0.03
+    )
+    scale = torch.tensor([0.7, 1.1, 0.5], device="cuda")
+    base = torch.randn(24, device="cuda", dtype=torch.float32, generator=g) * 0.1
+    norm_weight = (
+        torch.randn(HIDDEN, device="cuda", dtype=torch.bfloat16, generator=g) * 0.1 + 1
+    )
+    gate_weight = (
+        torch.randn(EXPERTS, HIDDEN, device="cuda", generator=g) * 0.05
+    ).bfloat16()
+    bias = torch.randn(EXPERTS, device="cuda", generator=g) * 0.02
+
+    ref_res, ref_x, *_ = try_mhc_shifted_post_pre_norm(
+        x_in,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        1e-20,
+        1e-6,
+        20,
+        norm_weight,
+        1e-5,
+    )
+    ref_weights, ref_ids = moe_topk(
+        None,
+        TOP_K,
+        "sqrt_softplus",
+        "topk",
+        True,
+        1.0,
+        correction_bias=bias,
+        hidden_states=ref_x,
+        gate_weight=gate_weight,
+        topk_weights_dtype=torch.float32,
+        topk_indices_dtype=torch.int32,
+        override="deep_gemm_bf16_mega_gate",
+    )
+    ref_out = _apply(plan, w, ref_x, ref_weights, ref_ids)
+
+    stage_calls = {"full": 0, "routing": 0}
+    orig_full = mega_moe.stage_mxfp4_mega_moe_inputs
+    orig_routing = mega_moe.stage_mega_moe_routing_inputs
+
+    def track_full(*args, **kwargs):
+        stage_calls["full"] += 1
+        return orig_full(*args, **kwargs)
+
+    def track_routing(*args, **kwargs):
+        stage_calls["routing"] += 1
+        return orig_routing(*args, **kwargs)
+
+    monkeypatch.setattr(mega_moe, "stage_mxfp4_mega_moe_inputs", track_full)
+    monkeypatch.setattr(mega_moe, "stage_mega_moe_routing_inputs", track_routing)
+
+    # First exercise routing-only warmup before compile check.
+    warm_buf = moe_prepare_mega_moe_staging_buffers(plan, w, 17)
+    assert warm_buf is not None
+    warm_res, warm_x, *_, warm_fp8, warm_sf = (
+        try_mhc_shifted_post_pre_norm_quantize_fp8(
+            x_in[:17],
+            residual[:17],
+            pre[:17],
+            post[:17],
+            comb[:17],
+            weight,
+            scale,
+            base,
+            1e-20,
+            1e-6,
+            20,
+            norm_weight,
+            1e-5,
+            y_fp8_out=warm_buf.x,
+            y_routed_sf_out=warm_buf.x_sf,
+            y_shared_sf_out=warm_buf.shared_x_sf,
+            shared_sf_block_m=warm_buf.shared_block_m,
+        )
+    )
+    assert warm_fp8.data_ptr() == warm_buf.x.data_ptr()
+    assert warm_sf.data_ptr() == warm_buf.x_sf.data_ptr()
+    mega_moe.deep_gemm_mxfp4_mega_moe_apply(
+        plan,
+        warm_x,
+        w,
+        None,
+        ref_weights[:17],
+        ref_ids[:17],
+        None,
+        None,
+        True,
+        False,
+        x_quantized=warm_buf.x_quantized,
+        routing_prepared=None,
+    )
+
+    stage_calls["full"] = 0
+    stage_calls["routing"] = 0
+    buf = moe_prepare_mega_moe_staging_buffers(plan, w, tokens)
+    assert buf is not None
+    res, x_out, *_, out_fp8, out_sf = try_mhc_shifted_post_pre_norm_quantize_fp8(
+        x_in,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        1e-20,
+        1e-6,
+        20,
+        norm_weight,
+        1e-5,
+        y_fp8_out=buf.x,
+        y_routed_sf_out=buf.x_sf,
+        y_shared_sf_out=buf.shared_x_sf,
+        shared_sf_block_m=buf.shared_block_m,
+    )
+    assert out_fp8.data_ptr() == buf.x.data_ptr()
+    assert out_sf.data_ptr() == buf.x_sf.data_ptr()
+    torch.testing.assert_close(res, ref_res, atol=1e-3, rtol=1e-3)
+    got_weights, got_ids = moe_topk(
+        None,
+        TOP_K,
+        "sqrt_softplus",
+        "topk",
+        True,
+        1.0,
+        correction_bias=bias,
+        hidden_states=x_out,
+        gate_weight=gate_weight,
+        out=buf.routing_out,
+        topk_weights_dtype=torch.float32,
+        topk_indices_dtype=torch.int64,
+        override="deep_gemm_bf16_mega_gate",
+    )
+    assert got_weights.data_ptr() == buf.topk_weights.data_ptr()
+    assert got_ids.data_ptr() == buf.topk_idx.data_ptr()
+    direct_out = mega_moe.deep_gemm_mxfp4_mega_moe_apply(
+        plan,
+        x_out,
+        w,
+        None,
+        got_weights,
+        got_ids,
+        None,
+        None,
+        True,
+        False,
+        x_quantized=buf.x_quantized,
+        routing_prepared=buf.routing_out,
+    )
+    assert stage_calls == {"full": 0, "routing": 0}
+    assert (direct_out.float() - ref_out.float()).norm() / ref_out.float().norm() < 0.02
+
+    # When activations are pre-staged but routing was not written to symm_buffer,
+    # only routing staging runs (without recompiling for a new token count).
+    with assert_no_triton_compile(mega_moe_stage._stage_mxfp4_mega_moe_inputs_kernel):
+        routing_fallback_out = mega_moe.deep_gemm_mxfp4_mega_moe_apply(
+            plan,
+            x_out,
+            w,
+            None,
+            got_weights.clone(),
+            got_ids.to(torch.int32),
+            None,
+            None,
+            True,
+            False,
+            x_quantized=buf.x_quantized,
+            routing_prepared=None,
+        )
+    assert stage_calls == {"full": 0, "routing": 1}
+    torch.testing.assert_close(routing_fallback_out, direct_out, atol=0, rtol=0)

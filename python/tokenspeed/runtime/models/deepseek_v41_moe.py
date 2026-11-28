@@ -425,11 +425,20 @@ class DeepseekV4MoE(nn.Module):
     def _renormalize_routing_weights(self) -> bool:
         return self.config.norm_topk_prob
 
+    def mega_moe_staging_buffers(self, num_tokens: int):
+        """Return direct symmetric-buffer targets when MegaMoE fuses the shared expert."""
+        if not self.use_mega_moe or not self.shared_expert_fused or num_tokens <= 0:
+            return None
+        return self.experts.mega_moe_staging_buffers(num_tokens)
+
     def _compute_topk_output(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor | None,
+        routing_out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> TopKOutput:
+        # Base routing computes logits separately and stages topk outputs afterwards.
+        del routing_out
         router_logits, correction_bias, hash_indices_table, routing_input_ids = (
             self._routing_inputs(hidden_states, input_ids)
         )
@@ -448,13 +457,22 @@ class DeepseekV4MoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         do_finalize: bool,
+        *,
+        x_quantized: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        routing_prepared: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        extra = {}
+        if x_quantized is not None:
+            extra["x_quantized"] = x_quantized
+        if routing_prepared is not None:
+            extra["routing_prepared"] = routing_prepared
         return self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             do_finalize=do_finalize,
+            **extra,
         )
 
     def _forward_shared_experts(
@@ -483,9 +501,30 @@ class DeepseekV4MoE(nn.Module):
         max_num_tokens_per_gpu: int,
         ctx: ForwardContext,
         comm_manager: CommManager,
+        staging: object | None = None,
     ) -> torch.Tensor:
+        if staging is not None and not self.shared_expert_fused:
+            raise ValueError("Pre-staged MegaMoE inputs require a fused shared expert")
+        routing_out = staging.routing_out if staging is not None else None
+        x_quantized = staging.x_quantized if staging is not None else None
         with nvtx_range("moe_select_experts"):
-            topk_output = self._compute_topk_output(hidden_states, input_ids)
+            if routing_out is not None:
+                topk_output = self._compute_topk_output(
+                    hidden_states,
+                    input_ids,
+                    routing_out=routing_out,
+                )
+            else:
+                topk_output = self._compute_topk_output(hidden_states, input_ids)
+        routing_prepared = (
+            routing_out
+            if (
+                routing_out is not None
+                and topk_output.topk_ids.data_ptr() == routing_out[1].data_ptr()
+                and topk_output.topk_weights.data_ptr() == routing_out[0].data_ptr()
+            )
+            else None
+        )
         if self.shared_expert_fused:
             # The routed output already includes the shared expert.
             with nvtx_range("moe_mega_experts"):
@@ -495,6 +534,8 @@ class DeepseekV4MoE(nn.Module):
                     num_global_tokens,
                     max_num_tokens_per_gpu,
                     do_finalize=True,
+                    x_quantized=x_quantized,
+                    routing_prepared=routing_prepared,
                 )
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
@@ -572,6 +613,7 @@ class DeepseekV4MoE(nn.Module):
         ctx: ForwardContext | None = None,
         comm_manager: CommManager | None = None,
         out: torch.Tensor | None = None,
+        staging: object | None = None,
     ) -> torch.Tensor:
         if self.use_mega_moe:
             if out is not None:
@@ -583,7 +625,10 @@ class DeepseekV4MoE(nn.Module):
                 max_num_tokens_per_gpu,
                 ctx,
                 comm_manager,
+                staging=staging,
             )
+        if staging is not None:
+            raise ValueError("Pre-staged MoE inputs require MegaMoE")
         return self.forward_normal(
             hidden_states, input_ids, num_global_tokens, max_num_tokens_per_gpu, out
         )

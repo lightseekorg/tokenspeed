@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.gemm.hipblaslt import (
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
 from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
+from tokenspeed_kernel.ops.moe import set_mega_gate_workspace_region
 from tokenspeed_kernel.ops.tuning import (
     autotune,
     autotune_cache_path,
@@ -649,6 +650,9 @@ class ModelExecutor:
             enable=config.enable_memory_saver, device=config.device
         )
         register_hc_workspace_region(self.memory_saver_adapter)
+        set_mega_gate_workspace_region(
+            partial(self.memory_saver_adapter.named_region, "workspace")
+        )
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend

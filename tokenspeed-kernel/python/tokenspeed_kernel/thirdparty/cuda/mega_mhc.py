@@ -20,6 +20,8 @@
 
 """Optional DeepGEMM shifted mHC adapter, with caller-owned BF16 outputs."""
 
+import inspect
+import re
 from functools import lru_cache
 
 import torch
@@ -45,6 +47,33 @@ def is_mega_mhc_available() -> bool:
     return True
 
 
+@lru_cache(maxsize=1)
+def is_mega_mhc_direct_staging_available() -> bool:
+    """Return whether installed DeepGEMM accepts direct MegaMoE staging targets."""
+    if not is_mega_mhc_available():
+        return False
+    fn = _api().mega_mhc
+    required = ("y_routed_sf", "y_shared_sf", "shared_sf_block_m")
+    try:
+        params = inspect.signature(fn, follow_wrapped=True).parameters
+        if all(name in params for name in required):
+            return True
+        if not any(
+            param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()
+        ):
+            return False
+    except (TypeError, ValueError):
+        pass
+    # Python wrappers around nanobind/pybind11 bindings may expose *args/**kwargs
+    # in inspect.signature while listing the real keyword names in __doc__.
+    docs = [getattr(fn, "__doc__", None) or ""]
+    wrapped = getattr(fn, "__wrapped__", None)
+    if wrapped is not None:
+        docs.append(getattr(wrapped, "__doc__", None) or "")
+    combined_doc = "\n".join(docs)
+    return all(re.search(rf"\b{name}\b", combined_doc) is not None for name in required)
+
+
 def _launch(
     x,
     residual,
@@ -60,6 +89,10 @@ def _launch(
     norm_weight,
     norm_eps,
     quantize_fp8,
+    y_fp8_out=None,
+    y_routed_sf_out=None,
+    y_shared_sf_out=None,
+    shared_sf_block_m=0,
 ):
     api = _api()
     if api.get_pdl() != pdl_enabled():
@@ -69,12 +102,39 @@ def _launch(
         torch.empty_like(tensor) for tensor in (pre, post, comb)
     )
     tokens, hidden = x.shape
-    y_fp8 = y_sf = None
-    if quantize_fp8:
+    y_fp8 = y_gemm_sf = None
+    has_direct_targets = (
+        y_fp8_out is not None
+        or y_routed_sf_out is not None
+        or y_shared_sf_out is not None
+    )
+    extra_kwargs: dict[str, object] = {}
+    if has_direct_targets:
+        if not is_mega_mhc_direct_staging_available():
+            raise RuntimeError(
+                "Installed DeepGEMM mega_mhc does not support direct MegaMoE FP8 staging"
+            )
+        if (
+            y_fp8_out is None
+            or y_routed_sf_out is None
+            or y_shared_sf_out is None
+            or shared_sf_block_m <= 0
+        ):
+            raise ValueError(
+                "Direct MegaMoE FP8 staging requires y_fp8_out, y_routed_sf_out, "
+                "y_shared_sf_out, and positive shared_sf_block_m"
+            )
+        y_fp8 = y_fp8_out
+        extra_kwargs = {
+            "y_routed_sf": y_routed_sf_out,
+            "y_shared_sf": y_shared_sf_out,
+            "shared_sf_block_m": int(shared_sf_block_m),
+        }
+    elif quantize_fp8:
         # Packed group-32 scales, MN-major with the token count padded to four
         # so every column starts 16-byte aligned for TMA.
         y_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-        y_sf = torch.empty(
+        y_gemm_sf = torch.empty(
             hidden // 128, (tokens + 3) // 4 * 4, dtype=torch.int32, device=x.device
         ).mT[:tokens]
     api.mega_mhc(
@@ -101,9 +161,10 @@ def _launch(
         new_comb_res_mix=new_comb,
         y_bf16=y,
         y_fp8=y_fp8,
-        y_gemm_sf=y_sf,
+        y_gemm_sf=y_gemm_sf,
+        **extra_kwargs,
     )
-    return new_residual, y, new_pre, new_post, new_comb, y_fp8, y_sf
+    return new_residual, y, new_pre, new_post, new_comb, y_fp8, y_gemm_sf
 
 
 def shifted_post_pre_norm(
@@ -160,14 +221,20 @@ def shifted_post_pre_norm_quantize_fp8(
     sinkhorn_iters,
     norm_weight,
     norm_eps,
+    y_fp8_out=None,
+    y_routed_sf_out=None,
+    y_shared_sf_out=None,
+    shared_sf_block_m=0,
 ):
-    """``shifted_post_pre_norm`` that also returns the input's FP8 codes and scales.
+    """``shifted_post_pre_norm`` that also writes FP8 codes and scales.
 
-    The extra outputs are E4M3 ``[T,H]`` codes and int32 ``[T,H/128]`` packed
-    group-32 UE8M0 scales, strided ``(1, T padded to 4)``: the layout
-    ``fp8_projection`` reads. The BF16 input is returned as well.
+    By default allocates E4M3 ``[T,H]`` codes and int32 ``[T,H/128]`` packed
+    group-32 UE8M0 scales, strided ``(1, T padded to 4)`` for ``fp8_projection``.
+    When ``y_fp8_out``, ``y_routed_sf_out``, ``y_shared_sf_out``, and positive
+    ``shared_sf_block_m`` are supplied, writes MegaMoE's symmetric-buffer routed
+    and shared scales in place instead.
     """
-    new_residual, y, new_pre, new_post, new_comb, y_fp8, y_sf = _launch(
+    new_residual, y, new_pre, new_post, new_comb, y_fp8, y_gemm_sf = _launch(
         x,
         residual,
         pre,
@@ -182,5 +249,17 @@ def shifted_post_pre_norm_quantize_fp8(
         norm_weight,
         norm_eps,
         True,
+        y_fp8_out=y_fp8_out,
+        y_routed_sf_out=y_routed_sf_out,
+        y_shared_sf_out=y_shared_sf_out,
+        shared_sf_block_m=shared_sf_block_m,
     )
-    return new_residual, y, new_pre, new_post, new_comb, y_fp8, y_sf
+    return (
+        new_residual,
+        y,
+        new_pre,
+        new_post,
+        new_comb,
+        y_fp8,
+        y_routed_sf_out if y_routed_sf_out is not None else y_gemm_sf,
+    )

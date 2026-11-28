@@ -80,6 +80,17 @@ def mega_mhc_eligible(
     return is_mega_mhc_available()
 
 
+def mega_mhc_direct_staging_eligible() -> bool:
+    """Return whether direct MegaMoE FP8 staging is supported cleanly."""
+    if not (platform.is_nvidia and platform.arch_version.major == 10):
+        return False
+    from tokenspeed_kernel.thirdparty.cuda.mega_mhc import (
+        is_mega_mhc_direct_staging_available,
+    )
+
+    return is_mega_mhc_direct_staging_available()
+
+
 @register_kernel(
     "residual",
     "mhc_shifted_post_pre_norm",
@@ -158,6 +169,10 @@ def deep_gemm_mhc_shifted_post_pre_norm_quantize_fp8(
     sinkhorn_iters,
     norm_weight,
     norm_eps,
+    y_fp8_out=None,
+    y_routed_sf_out=None,
+    y_shared_sf_out=None,
+    shared_sf_block_m=0,
 ):
     from tokenspeed_kernel.thirdparty.cuda.mega_mhc import (
         shifted_post_pre_norm_quantize_fp8,
@@ -177,6 +192,10 @@ def deep_gemm_mhc_shifted_post_pre_norm_quantize_fp8(
         sinkhorn_iters,
         norm_weight,
         norm_eps,
+        y_fp8_out=y_fp8_out,
+        y_routed_sf_out=y_routed_sf_out,
+        y_shared_sf_out=y_shared_sf_out,
+        shared_sf_block_m=shared_sf_block_m,
     )
 
 
