@@ -156,6 +156,29 @@ _UNSET = object()
 # layout than a long extend's.
 _SHORT_CONTEXT_PROJECTION_ROWS = 8
 
+
+def _block_warmup_batch_sizes(max_bs: int) -> list[int]:
+    """Batch sizes covering the draft's split-KV, reducer-band, and GEMM regimes.
+
+    Covers small request counts through ``EXTEND_DECODE_MAX_REQUESTS + 1``
+    (including single-request ``reducer_d_tiles`` transitions and the first
+    eager step past the extend-graph ceiling), powers of two with their
+    successor step above that for wave-aware split-KV drops, and ``max_bs``.
+    """
+    if max_bs < 1:
+        return []
+    ceiling = min(max_bs, EXTEND_DECODE_MAX_REQUESTS + 1)
+    sizes = set(range(1, ceiling + 1))
+    power = 1
+    while power <= max_bs:
+        sizes.add(power)
+        if power + 1 <= max_bs:
+            sizes.add(power + 1)
+        power *= 2
+    sizes.add(max_bs)
+    return sorted(sizes)
+
+
 # Dtypes a replicated draft head can carry over from the target's shards.
 # A whitelist, not a blacklist: the draft matmuls the gathered rows directly,
 # so a dtype belongs here only once its raw bytes ARE the vocabulary's values.
@@ -1028,6 +1051,42 @@ class DFlash(BaseDrafter):
         if num_tokens > _SHORT_CONTEXT_PROJECTION_ROWS:
             rows = _SHORT_CONTEXT_PROJECTION_ROWS
             self._write_native_cache(taps[:rows], positions[:rows], slots[:rows])
+
+    @override
+    def warmup_extend_draft(
+        self,
+        *,
+        prepare_batch: Callable[[int, int], None],
+        max_bs: int,
+    ) -> None:
+        """Warm the block draft across extend batch sizes inside ``kernel_warmup``.
+
+        Context writes only cover target-tap projection; extend rounds also run
+        the draft block forward, including on ``prefill_only`` workers and
+        batches past ``EXTEND_DECODE_MAX_REQUESTS``.
+        """
+        if self.target_model is None:
+            raise RuntimeError("DFLASH drafter is not bound to a target model.")
+        most = min(
+            max_bs,
+            self.input_buffers.max_bs,
+            self.input_buffers.input_ids_buf.numel(),
+        )
+        if most < 1:
+            return
+        try:
+            for bs in _block_warmup_batch_sizes(most):
+                prepare_batch(bs, bs)
+                self.input_buffers.req_pool_indices_buf[:bs].zero_()
+                if self.draft_sampler is not None:
+                    self.draft_sampler.prepare_round(
+                        self.draft_seq_lens_buf.new_zeros(bs),
+                        num_extends=bs,
+                    )
+                self._draft_native(self.block_ids_buf[:bs, 0])
+        finally:
+            self.draft_seq_lens_buf[:most].zero_()
+            self.input_buffers.req_pool_indices_buf[:most].zero_()
 
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """The stacked KV views and their raw pointers name the old arena."""

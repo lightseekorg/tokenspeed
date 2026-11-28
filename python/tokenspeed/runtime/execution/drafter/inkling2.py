@@ -79,7 +79,7 @@ class Inkling2DSpark(DFlash):
                 f"Set --max-model-len <= {limit - padding}."
             )
         super()._init_native_buffers()
-        self._proposal_features_buf = torch.empty(
+        self._proposal_features_buf = torch.zeros(
             (self.input_buffers.max_bs, self.hidden_size),
             dtype=torch.bfloat16,
             device=self.device,

@@ -94,8 +94,10 @@ def _drafter(
     drafter.draft_model_runner = SimpleNamespace(
         mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=dp_size), pp_size=pp_size)
     )
+    drafter.target_model = object()
     drafter.input_buffers = SimpleNamespace(
         max_bs=max_bs,
+        input_ids_buf=torch.ones(max_bs * WIDTH, dtype=torch.int32, device=device),
         req_pool_indices_buf=torch.arange(max_bs, device=device),
     )
     drafter.spec_num_tokens = WIDTH
@@ -335,6 +337,71 @@ def test_a_replay_drafts_from_the_rounds_staged_inputs(monkeypatch) -> None:
     assert torch.equal(refresh["seq_lens"], lens + WIDTH)
     assert refresh["num_extends"] == 0 and refresh["for_graph_replay"]
     assert refresh["forward_mode"] == ForwardMode.DECODE
+
+
+def test_warmup_extend_draft_covers_single_and_multi_request_batches(
+    monkeypatch,
+) -> None:
+    drafter = _drafter(max_bs=40)
+    prepared: list[tuple[int, int]] = []
+    seen_slots: list[tuple[int, list[int]]] = []
+
+    def prepare_batch(tokens: int, bs: int) -> None:
+        prepared.append((tokens, bs))
+        drafter.input_buffers.req_pool_indices_buf[:bs].copy_(torch.arange(bs))
+        drafter.draft_seq_lens_buf[:bs].fill_(1)
+
+    def record_draft(self, current_tokens, prepared=False):
+        bs = current_tokens.shape[0]
+        seen_slots.append((bs, self.input_buffers.req_pool_indices_buf[:bs].tolist()))
+        return self.next_tokens_buf[:bs]
+
+    monkeypatch.setattr(DSpark, "_draft_native", record_draft)
+
+    drafter.warmup_extend_draft(prepare_batch=prepare_batch, max_bs=64)
+
+    expected_batches = [*range(1, 18), 32, 33, 40]
+    assert prepared == [(bs, bs) for bs in expected_batches]
+    assert seen_slots == [(bs, [0] * bs) for bs in expected_batches]
+    assert torch.equal(drafter.draft_seq_lens_buf, torch.zeros(40, dtype=torch.int32))
+    assert torch.equal(
+        drafter.input_buffers.req_pool_indices_buf, torch.zeros(40, dtype=torch.int64)
+    )
+
+
+def test_warmup_extend_draft_requires_bound_target() -> None:
+    drafter = _drafter(max_bs=4)
+    drafter.target_model = None
+    with pytest.raises(RuntimeError, match="bound to a target model"):
+        drafter.warmup_extend_draft(prepare_batch=lambda *_: None, max_bs=4)
+
+
+def test_warmup_extend_draft_prepares_sampler_rounds(monkeypatch) -> None:
+    drafter = _drafter(max_bs=4)
+    events: list[tuple[str, int, int | list[int]]] = []
+
+    class _Sampler:
+        def prepare_round(self, prefix_lens: torch.Tensor, *, num_extends: int) -> None:
+            events.append(("sampler", num_extends, prefix_lens.tolist()))
+
+    drafter.draft_sampler = _Sampler()
+    monkeypatch.setattr(
+        DSpark,
+        "_draft_native",
+        lambda self, current_tokens, prepared=False: (
+            events.append(("draft", int(current_tokens.shape[0]), []))
+            or self.next_tokens_buf[: current_tokens.shape[0]]
+        ),
+    )
+
+    drafter.warmup_extend_draft(prepare_batch=lambda _t, _b: None, max_bs=2)
+
+    assert events == [
+        ("sampler", 1, [0]),
+        ("draft", 1, []),
+        ("sampler", 2, [0, 0]),
+        ("draft", 2, []),
+    ]
 
 
 if __name__ == "__main__":

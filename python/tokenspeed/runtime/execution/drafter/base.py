@@ -175,6 +175,20 @@ class BaseDrafter:
         inside ``kernel_warmup``. The default has none.
         """
 
+    def warmup_extend_draft(
+        self,
+        *,
+        prepare_batch: Callable[[int, int], None],
+        max_bs: int,
+    ) -> None:
+        """Compile the drafter's per-extend draft forward inside ``kernel_warmup``.
+
+        Block drafters run their block decode on extend rounds as well as
+        decode rounds; on ``prefill_only`` roles and eager batches decode-path
+        warmup and extend-graph capture do not reach those forwards. The
+        default has none.
+        """
+
     def bind_sampling_backend(self, sampling_backend: SamplingBackend) -> None:
         """Take the verifier's per-request sampling pools for sampled drafting.
 
