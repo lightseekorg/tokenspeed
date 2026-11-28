@@ -36,6 +36,9 @@ def _api():
     return deep_gemm
 
 
+_MIN_CAPTURE_SAFE_DEEPGEMM_VERSION = "2.8.3"
+
+
 @lru_cache(maxsize=1)
 def is_mega_mhc_available() -> bool:
     try:
@@ -43,6 +46,29 @@ def is_mega_mhc_available() -> bool:
     except (ImportError, OSError):
         return False
     return True
+
+
+def is_mega_mhc_capture_safe() -> bool:
+    """Return True when DeepGEMM supports CUDA graph capture (>= 2.8.3).
+
+    DeepGEMM 2.8.2.post20261115 still asserts ``CaptureStatus::None`` in
+    ``mega_mhc.hpp``, so only 2.8.3+ may run MegaMHC inside captured graphs.
+    """
+    if not is_mega_mhc_available():
+        return False
+    try:
+        mod = _api()
+    except (ImportError, OSError):
+        return False
+    raw = getattr(mod, "__version__", None)
+    if not raw:
+        return False
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        return Version(str(raw)) >= Version(_MIN_CAPTURE_SAFE_DEEPGEMM_VERSION)
+    except InvalidVersion:
+        return False
 
 
 def _launch(
@@ -123,9 +149,9 @@ def shifted_post_pre_norm(
 ):
     """Return new residual, normalized input and next pre/post/comb coefficients.
 
-    Inputs follow ``try_mhc_shifted_post_pre_norm``. Do not capture or replay
-    this call in a CUDA graph: DeepGEMM split barriers can read the previous
-    replay's partials.
+    Inputs follow ``try_mhc_shifted_post_pre_norm``. Call at least once eagerly on
+    a stream before CUDA graph capture on that stream so DeepGEMM initializes
+    per-stream split barriers outside capture mode.
     No input is mutated, and no output is retained outside this invocation.
     """
     return _launch(

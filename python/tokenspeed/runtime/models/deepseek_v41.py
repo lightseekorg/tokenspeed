@@ -109,9 +109,14 @@ from tokenspeed_kernel.ops.quantization import (
     silu_and_mul_quantize_fp8_group32,
 )
 from tokenspeed_kernel.ops.residual import (
+    is_mega_mhc_capture_safe,
     mhc_apply_pre_quantize_fp8,
+    mhc_boundary_max_decode_tokens,
+    prepare_mhc_boundary_weight,
+    try_mhc_shifted_post_pre_boundary,
     try_mhc_shifted_post_pre_norm,
     try_mhc_shifted_post_pre_norm_quantize_fp8,
+    warmup_mhc_boundary,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError
@@ -1954,12 +1959,31 @@ class V41HCPost:
         return v41_hc_post(self.x, residual, self.post, self.comb)
 
 
+def _refresh_boundary_weight(
+    existing: torch.Tensor | None, fn: torch.Tensor
+) -> torch.Tensor | None:
+    """Pack mHC boundary weights and copy in place when refreshing reloads."""
+    prepared = prepare_mhc_boundary_weight(fn)
+    if existing is None:
+        return prepared
+    if (
+        prepared is None
+        or prepared.shape != existing.shape
+        or prepared.dtype != existing.dtype
+        or prepared.device != existing.device
+    ):
+        raise ValueError("Prepared mHC boundary weight changed layout")
+    existing.copy_(prepared)
+    return existing
+
+
 def _v41_hc_post_pre(
     residual,
     pre_mix,
     pending: V41HCPost | None,
     *,
     hc_weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    boundary_weight: torch.Tensor | None,
     norm: RMSNorm,
     hc_norm_eps: float,
     hc_eps: float,
@@ -1989,9 +2013,13 @@ def _v41_hc_post_pre(
             pending.reduce_group,
         )
         return residual, x, None, None
-    # DeepGEMM mega_mhc split barriers race under CUDA graph replay: a replay can
-    # read the previous replay's partials, so keep it out of captured segments.
-    if not prefer_overlap and not is_breakable_capture_active():
+    if not prefer_overlap and (
+        is_mega_mhc_capture_safe() or not is_breakable_capture_active()
+    ):
+        # Prefill / PrefillGraph (when DeepGEMM >= 2.8.3):
+        # prefer MegaMHC here since it emits quantized wq_a_wkv inputs too;
+        # DeepGEMM builds through 2.8.2.post20261115 assert CaptureStatus::None
+        # under capture and stay excluded under breakable capture.
         join = (
             try_mhc_shifted_post_pre_norm_quantize_fp8
             if quantize_fp8
@@ -2013,6 +2041,31 @@ def _v41_hc_post_pre(
         if shifted is not None:
             residual, x, pre, post, comb, *quantized = shifted
             return residual, x, (pre, post, comb), tuple(quantized) or None
+    if boundary_weight is not None and (
+        (not prefer_overlap and not quantize_fp8)
+        or (
+            prefer_overlap
+            and 0 < residual.shape[0] <= mhc_boundary_max_decode_tokens(residual.device)
+        )
+    ):
+        shifted = try_mhc_shifted_post_pre_boundary(
+            pending.x,
+            residual,
+            pre_mix,
+            pending.post,
+            pending.comb,
+            boundary_weight,
+            hc_weights[1],
+            hc_weights[2],
+            hc_norm_eps,
+            hc_eps,
+            sinkhorn_iters,
+            norm.weight,
+            norm.variance_epsilon,
+        )
+        if shifted is not None:
+            residual, x, pre, post, comb = shifted
+            return residual, x, (pre, post, comb), None
     return pending.finish(residual), None, None, None
 
 
@@ -2103,6 +2156,17 @@ class DeepseekV41DecoderLayer(nn.Module):
                 )
                 param.weight_loader = default_weight_loader
                 self.register_parameter(f"hc_{name}_{suffix}", param)
+        self.hc_attn_boundary_weight: torch.Tensor | None = None
+        self.hc_ffn_boundary_weight: torch.Tensor | None = None
+
+    def prepare_boundary_weights(self) -> None:
+        """Prepare or refresh packed CuTe DSL boundary weights in place."""
+        self.hc_attn_boundary_weight = _refresh_boundary_weight(
+            self.hc_attn_boundary_weight, self.hc_attn_fn
+        )
+        self.hc_ffn_boundary_weight = _refresh_boundary_weight(
+            self.hc_ffn_boundary_weight, self.hc_ffn_fn
+        )
 
     def forward(
         self,
@@ -2172,6 +2236,7 @@ class DeepseekV41DecoderLayer(nn.Module):
             pre_mix,
             pending_post,
             hc_weights=(self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base),
+            boundary_weight=self.hc_attn_boundary_weight,
             norm=self.attn_norm,
             hc_norm_eps=self.norm_eps,
             hc_eps=self.hc_eps,
@@ -2257,6 +2322,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 self.attn.mapping.attn.head_tp_group if defer_attn else None,
             ),
             hc_weights=(self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base),
+            boundary_weight=self.hc_ffn_boundary_weight,
             norm=self.ffn_norm,
             hc_norm_eps=self.norm_eps,
             hc_eps=self.hc_eps,
@@ -3737,6 +3803,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             elif isinstance(module, DeepseekV41Attention):
                 module.prepare_output_projections()
                 module.prepare_fused_decode()
+            elif isinstance(module, DeepseekV41DecoderLayer):
+                module.prepare_boundary_weights()
 
     def post_quant_warmup(self) -> None:
         # Every loader calls this once the loaded state is final. The sharded
@@ -3764,6 +3832,24 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()
+        warmed_boundaries: set[tuple[torch.device, int, int]] = set()
+        for module in self.modules():
+            if not isinstance(module, DeepseekV41DecoderLayer):
+                continue
+            for norm, boundary_weight in (
+                (module.attn_norm, module.hc_attn_boundary_weight),
+                (module.ffn_norm, module.hc_ffn_boundary_weight),
+            ):
+                if boundary_weight is None:
+                    continue
+                key = (
+                    boundary_weight.device,
+                    norm.weight.numel(),
+                    module.hc_sinkhorn_iters,
+                )
+                if key not in warmed_boundaries:
+                    warmup_mhc_boundary(key[1], key[2], device=key[0])
+                    warmed_boundaries.add(key)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens

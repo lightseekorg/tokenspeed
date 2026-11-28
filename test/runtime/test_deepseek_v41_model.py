@@ -1589,9 +1589,11 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
         hc_attn_fn=weight(),
         hc_attn_scale=torch.ones(3, device="cuda"),
         hc_attn_base=torch.zeros(24, device="cuda"),
+        hc_attn_boundary_weight=None,
         hc_ffn_fn=weight(),
         hc_ffn_scale=torch.ones(3, device="cuda"),
         hc_ffn_base=torch.zeros(24, device="cuda"),
+        hc_ffn_boundary_weight=None,
         comm_manager=SimpleNamespace(
             mapping=mapping,
             moe_tp_ep_group_scattered_num_tokens=lambda ctx: [
@@ -1675,8 +1677,8 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
             scopes.clear()
             with cap:
                 captured = _complete_layer(*args)
-            # Attention cannot fork across the eager break, and the FFN fork
-            # is also kept out of captured segments: MegaMHC is never captured.
+            # Attention cannot fork across the eager break, and MegaMHC serves
+            # the FFN boundary directly inside BreakableCapture under warmup.
             assert scopes == [False, False]
             for _ in range(3):
                 residual.normal_()
@@ -5069,3 +5071,387 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         shared.down_proj.weight_scale_inv,
     )
     assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not current_platform().is_nvidia
+    or current_platform().arch_version.major != 10,
+    reason="requires an SM100-family GPU",
+)
+@pytest.mark.parametrize(
+    "mode,tokens",
+    [
+        (ForwardMode.DECODE, 17),
+        (ForwardMode.DECODE, 128),
+        (ForwardMode.DECODE, None),
+        (ForwardMode.EXTEND, 128),
+    ],
+)
+def test_mhc_boundary_gpu_layer_and_prefill_graph_matches_fallback(
+    monkeypatch, mode, tokens
+):
+    """Prepared layers use mhc_boundary for single-wave Decode and MegaMHC
+    inside BreakableCapture when DeepGEMM is capture-safe, falling back
+    outside the single-wave limit or on older DeepGEMM versions."""
+    pytest.importorskip("cutlass")
+    from contextlib import contextmanager
+    from unittest.mock import Mock
+
+    from tokenspeed_kernel.ops.residual import (
+        is_mega_mhc_capture_safe,
+        mhc_boundary_max_decode_tokens,
+        prepare_mhc_boundary_weight,
+        warmup_mhc_boundary,
+    )
+
+    from tokenspeed.runtime.execution.breakable_cuda_graph import (
+        BreakableCapture,
+        active_forward,
+    )
+
+    if prepare_mhc_boundary_weight(torch.empty(24, 4 * 5120, device="cuda")) is None:
+        pytest.skip("requires Blackwell SM100-109 CuTe DSL mhc_boundary support")
+
+    decode_wave_limit = mhc_boundary_max_decode_tokens("cuda")
+    if tokens is None:
+        tokens = decode_wave_limit + 64
+
+    torch.manual_seed(43)
+    hidden, iters = 5120, 20
+    warmup_mhc_boundary(hidden, iters, device="cuda")
+    mapping = _mapping(0, 1, 1)
+    positions = torch.arange(tokens, device="cuda")
+    backend = _Backend(positions, torch.zeros_like(positions))
+    ctx = _ctx(backend, tokens, mode)
+    backend.view = V41DecoderView(backend.meta, None, (), None, None)
+
+    class Attention:
+        def __init__(self):
+            self.mapping = mapping
+            self.wq_a_wkv = SimpleNamespace(quant_method=None)
+
+        @v41.break_point
+        def __call__(
+            self,
+            positions,
+            x,
+            ctx,
+            reduce_output,
+            hidden_codes=None,
+            hidden_scales=None,
+        ):
+            assert reduce_output and hidden_codes is None and hidden_scales is None
+            return x.sin()
+
+    class FFN:
+        use_mega_moe = True
+        owns_ep_communication = True
+        use_gluon_petit = False
+
+        def __call__(self, x, *args, **kwargs):
+            return x.tanh()
+
+    def norm():
+        return SimpleNamespace(
+            weight=torch.ones(hidden, device="cuda", dtype=torch.bfloat16),
+            variance_epsilon=1e-20,
+        )
+
+    def weight():
+        return torch.randn(24, 4 * hidden, device="cuda") * 0.03
+
+    class Layer(SimpleNamespace):
+        _forward_ffn = DeepseekV41DecoderLayer._forward_ffn
+        _ffn_context = DeepseekV41DecoderLayer._ffn_context
+        prepare_boundary_weights = DeepseekV41DecoderLayer.prepare_boundary_weights
+
+    layer = Layer(
+        layer_id=0,
+        ced_decoder_start=20,
+        norm_eps=1e-20,
+        hc_eps=1e-6,
+        hc_sinkhorn_iters=iters,
+        hc_stream_fork=v41.StreamFork(torch.cuda.Stream()),
+        attn=Attention(),
+        ffn=FFN(),
+        attn_norm=norm(),
+        ffn_norm=norm(),
+        hc_attn_fn=weight(),
+        hc_attn_scale=torch.ones(3, device="cuda"),
+        hc_attn_base=torch.zeros(24, device="cuda"),
+        hc_attn_boundary_weight=None,
+        hc_ffn_fn=weight(),
+        hc_ffn_scale=torch.ones(3, device="cuda"),
+        hc_ffn_base=torch.zeros(24, device="cuda"),
+        hc_ffn_boundary_weight=None,
+        comm_manager=SimpleNamespace(
+            mapping=mapping,
+            moe_tp_ep_group_scattered_num_tokens=lambda ctx: [tokens],
+            pre_mlp_comm=lambda x, ctx: x,
+            get_num_tokens=lambda ctx: (tokens, tokens),
+            moe_output_all_reduced=lambda ctx: False,
+            post_mlp_comm=lambda x, r, ctx: (x, r),
+        ),
+    )
+    layer.prepare_boundary_weights()
+    assert layer.hc_attn_boundary_weight is not None
+    assert layer.hc_ffn_boundary_weight is not None
+
+    residual = torch.randn(tokens, 4, hidden, device="cuda", dtype=torch.bfloat16)
+    pre = torch.rand(tokens, 4, device="cuda")
+    args = (layer, residual, pre, positions, None, ctx)
+
+    real_boundary = v41.try_mhc_shifted_post_pre_boundary
+    real_mega = v41.try_mhc_shifted_post_pre_norm
+    boundary_calls = Mock(side_effect=real_boundary)
+    mega_calls = Mock(side_effect=real_mega)
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_boundary", boundary_calls)
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", mega_calls)
+
+    scopes = []
+    real_scope = layer.hc_stream_fork.scope
+
+    @contextmanager
+    def record_scope(*, enable, overlap):
+        scopes.append(enable)
+        with real_scope(enable=enable, overlap=overlap) as fork:
+            yield fork
+
+    monkeypatch.setattr(layer.hc_stream_fork, "scope", record_scope)
+    actual = _complete_layer(*args)
+
+    # _complete_layer enters with pending_post=None, so only the post-attention
+    # (FFN) boundary runs _v41_hc_post_pre; attention keeps StreamFork overlap in decode.
+    if mode == ForwardMode.DECODE and tokens <= decode_wave_limit:
+        assert boundary_calls.call_count == 1
+        assert mega_calls.call_count == 0
+        assert scopes == [True, False]
+    elif mode == ForwardMode.DECODE:
+        assert boundary_calls.call_count == 0
+        assert mega_calls.call_count == 0
+        assert scopes == [True, True]
+    else:
+        assert mega_calls.call_count == 1
+        assert boundary_calls.call_count == 0
+        assert scopes == [False, False]
+
+    # Compare against the fallback StreamFork / unfused HC path.
+    saved_bw = (layer.hc_attn_boundary_weight, layer.hc_ffn_boundary_weight)
+    layer.hc_attn_boundary_weight = None
+    layer.hc_ffn_boundary_weight = None
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", lambda *a: None)
+    scopes.clear()
+    expected = _complete_layer(*args)
+    assert scopes == [mode == ForwardMode.DECODE, True]
+    for got, ref in zip(actual[:2], expected[:2], strict=True):
+        torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
+
+    # Restore prepared weights and verify CUDAGraph (Decode) & BreakableCapture (Extend).
+    layer.hc_attn_boundary_weight, layer.hc_ffn_boundary_weight = saved_bw
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", mega_calls)
+    if mode == ForwardMode.DECODE and tokens == 128:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                _complete_layer(*args)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        boundary_calls.reset_mock()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = _complete_layer(*args)
+        assert boundary_calls.call_count == 1
+        for _ in range(3):
+            residual.normal_()
+            pre.uniform_()
+            graph.replay()
+            eager = _complete_layer(*args)
+            for got, ref in zip(captured[:2], eager[:2], strict=True):
+                torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
+    elif mode == ForwardMode.EXTEND and tokens == 128:
+        with monkeypatch.context() as mp:
+            mp.setattr(v41, "is_mega_mhc_capture_safe", lambda: False)
+            guarded_cap = BreakableCapture()
+            with active_forward(ctx):
+                guarded_cap.stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(guarded_cap.stream):
+                    for _ in range(2):
+                        _complete_layer(*args)
+                guarded_cap.stream.synchronize()
+                mega_calls.reset_mock()
+                boundary_calls.reset_mock()
+                with guarded_cap:
+                    guarded_out = _complete_layer(*args)
+                assert mega_calls.call_count == 0
+                assert boundary_calls.call_count == 1
+                saved_residual, saved_pre = residual.clone(), pre.clone()
+                for _ in range(2):
+                    residual.normal_()
+                    pre.uniform_()
+                    guarded_cap.replay()
+                    eager = _complete_layer(*args)
+                    for got, ref in zip(guarded_out[:2], eager[:2], strict=True):
+                        torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
+                residual.copy_(saved_residual)
+                pre.copy_(saved_pre)
+                guarded_cap.replay()
+                for got, ref in zip(guarded_out[:2], expected[:2], strict=True):
+                    torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
+
+        if not is_mega_mhc_capture_safe():
+            return
+        cap = BreakableCapture()
+        with active_forward(ctx):
+            cap.stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(cap.stream):
+                for _ in range(2):
+                    _complete_layer(*args)
+            cap.stream.synchronize()
+            mega_calls.reset_mock()
+            scopes.clear()
+            with cap:
+                captured = _complete_layer(*args)
+            assert mega_calls.call_count == 1
+            assert scopes == [False, False]
+            for _ in range(3):
+                residual.normal_()
+                pre.uniform_()
+                cap.replay()
+                eager = _complete_layer(*args)
+                for got, ref in zip(captured[:2], eager[:2], strict=True):
+                    torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
+
+
+def _check_mhc_boundary_weight_refresh_and_release() -> None:
+    """Allocate prepared mHC boundary weights inside the weights region,
+    verify 0 ordinary (0, 0) CUDA bytes across 2 pause/resume cycles, and
+    verify in-place reload preserves addresses and updates computation."""
+    from tokenspeed_kernel.ops.residual import (
+        prepare_mhc_boundary_weight,
+        try_mhc_shifted_post_pre_boundary,
+        warmup_mhc_boundary,
+    )
+
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    def _ordinary_bytes() -> int:
+        return sum(
+            segment["total_size"]
+            for segment in torch.cuda.memory_snapshot()
+            if segment["device"] == torch.cuda.current_device()
+            and tuple(segment["segment_pool_id"]) == (0, 0)
+        )
+
+    hidden, tokens, iters = 2560, 16, 20
+    warmup_mhc_boundary(hidden, iters, device="cuda")
+    global_server_args_dict["enable_memory_saver"] = True
+    saver = TorchMemorySaverAdapter.create(enable=True, device="cuda")
+
+    with saver.region(tag="weights", enable_cpu_backup=True):
+        gen = torch.Generator(device="cuda").manual_seed(71)
+        fn = torch.randn(24, 4 * hidden, device="cuda", generator=gen) * 0.03
+        scale = torch.tensor([0.7, 1.1, 0.5], device="cuda")
+        base = torch.randn(24, device="cuda", generator=gen) * 0.1
+        norm_w = (
+            torch.randn(hidden, dtype=torch.bfloat16, device="cuda", generator=gen)
+            * 0.1
+            + 1
+        )
+        existing = prepare_mhc_boundary_weight(fn)
+        assert existing is not None
+        refreshed = v41._refresh_boundary_weight(existing, fn)
+        assert refreshed is existing
+        # Verify shape mismatch raises rather than allocating a new buffer.
+        with pytest.raises(ValueError, match="changed layout"):
+            v41._refresh_boundary_weight(existing, fn[:-1])
+
+    with saver.named_region("executor_inputs"):
+        x = torch.randn(
+            tokens, hidden, dtype=torch.bfloat16, device="cuda", generator=gen
+        )
+        residual = torch.randn(
+            tokens, 4, hidden, dtype=torch.bfloat16, device="cuda", generator=gen
+        )
+        pre = torch.rand(tokens, 4, device="cuda", generator=gen)
+        post = torch.rand(tokens, 4, device="cuda", generator=gen) * 2
+        comb = torch.rand(tokens, 4, 4, device="cuda", generator=gen).softmax(-2)
+
+    saved_ptr = existing.data_ptr()
+
+    @torch.inference_mode()
+    def run_cpu():
+        out = try_mhc_shifted_post_pre_boundary(
+            x,
+            residual,
+            pre,
+            post,
+            comb,
+            existing,
+            scale,
+            base,
+            1e-20,
+            1e-6,
+            iters,
+            norm_w,
+            1e-5,
+        )
+        assert out is not None
+        res = tuple(t.cpu() for t in out)
+        del out
+        return res
+
+    expected = run_cpu()
+    for _ in range(2):
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        saver.pause()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        assert _ordinary_bytes() == 0
+        saver.resume()
+        assert existing.data_ptr() == saved_ptr
+        for got, ref in zip(run_cpu(), expected, strict=True):
+            torch.testing.assert_close(got, ref, rtol=0, atol=0)
+
+    # In-place weight reload preserves pointer and matches a freshly packed buffer.
+    with saver.region(tag="weights", enable_cpu_backup=True):
+        new_fn = torch.randn(24, 4 * hidden, device="cuda", generator=gen) * 0.04
+        fresh = prepare_mhc_boundary_weight(new_fn)
+        assert fresh is not None
+        updated = v41._refresh_boundary_weight(existing, new_fn)
+        assert updated is existing and existing.data_ptr() == saved_ptr
+        assert torch.equal(existing, fresh)
+
+
+def test_mhc_boundary_weight_refresh_and_memory_release():
+    import importlib.util
+    import subprocess
+    from pathlib import Path
+
+    if not (
+        torch.cuda.is_available()
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability()[0] == 10
+        and importlib.util.find_spec("cutlass") is not None
+    ):
+        pytest.skip("requires SM100 CUDA GPU with cutlass")
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from test.runtime.test_deepseek_v41_model import "
+                    "_check_mhc_boundary_weight_refresh_and_release; "
+                    "_check_mhc_boundary_weight_refresh_and_release()"
+                ),
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=300,
+        )

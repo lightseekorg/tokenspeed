@@ -1018,8 +1018,19 @@ same uniform padded decode counts as their target batches.
 
 V4.1 completes deferred HC posts and reductions before stage handoffs or
 Engram updates. The fixed graph input state contains only completed residuals.
-Prefill warmup runs on the eventual capture stream because MegaMHC initializes
-per-stream barriers. Allocation observers wrap capture alone, leaving eager
+Decode replaces its 80 stream-forked sublayer boundaries with the single-wave
+Blackwell DSMEM cluster kernel (`try_mhc_shifted_post_pre_boundary`, up to
+`mhc_boundary_max_decode_tokens(device)` = `24 * (2 * SM // 16)` tokens, e.g.
+336 on 112 SMs) using weights prepacked in place inside the `weights`
+memory-saver region and pre-warmed per `(hidden, sinkhorn_iters, device)`
+(1.8-3.2x speedup at T=1..32 and 1.38x at T=336 vs unfused decode).
+Prefill warmup runs on the eventual capture stream because MegaMHC (gated on
+`is_mega_mhc_capture_safe()`, i.e. `deep_gemm >= 2.8.3`; builds through
+`2.8.2.post20261115` assert `CaptureStatus::None` in `mega_mhc.hpp`) initializes
+per-stream barriers on first call, allowing captured FFN boundaries and eager
+prefill boundaries (including FP8 quantization for `wq_a_wkv`) to use fused
+kernels while capture-unsafe DeepGEMM builds fall back to `mhc_boundary` for
+unquantized FFN boundaries and unfused HC for quantized attention boundaries. Allocation observers wrap capture alone, leaving eager
 warmup allocations in utilization headroom. Fused HC all-reduce admission
 respects both deterministic and batch-invariant collective settings. Empty
 consumer rows carry no deferred post. Cache-only narrowing completes the incoming

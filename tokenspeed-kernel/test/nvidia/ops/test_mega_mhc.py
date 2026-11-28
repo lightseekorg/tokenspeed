@@ -213,3 +213,143 @@ def test_shifted_mhc_unsupported_returns_none(monkeypatch, case):
             SimpleNamespace(is_nvidia=True, arch_version=SimpleNamespace(major=9)),
         )
     assert try_mhc_shifted_post_pre_norm(**args) is None
+
+
+@pytest.mark.parametrize("quantize_fp8", [False, True])
+@pytest.mark.parametrize("tokens", [48, 1024])
+def test_shifted_mhc_cudagraph_replay_after_stream_warmup(tokens, quantize_fp8):
+    from tokenspeed_kernel.ops.residual import is_mega_mhc_capture_safe
+
+    if not is_mega_mhc_capture_safe():
+        pytest.skip("requires DeepGEMM >= 2.8.3 capture-safe MegaMHC")
+    args = _inputs(tokens, 5120, 20)
+    call = (
+        try_mhc_shifted_post_pre_norm_quantize_fp8
+        if quantize_fp8
+        else try_mhc_shifted_post_pre_norm
+    )
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # First eager call on ``stream`` initializes DeepGEMM per-stream barriers.
+        for _ in range(2):
+            assert call(**args) is not None
+    stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = call(**args)
+    assert captured is not None
+
+    for _ in range(3):
+        args["x"].normal_()
+        args["residual"].normal_()
+        args["pre"].uniform_()
+        args["post"].uniform_()
+        args["comb"].copy_(torch.rand_like(args["comb"]).softmax(-2))
+        graph.replay()
+        torch.cuda.synchronize(stream)
+        for got, ref in zip(captured[:5], _reference(args), strict=True):
+            torch.testing.assert_close(got, ref, atol=0.02, rtol=0.01)
+        if quantize_fp8:
+            exp_sf, exp_codes = _group32_reference(captured[1])
+            packed = captured[6]
+            shifts = torch.arange(4, device=packed.device) * 8
+            got_sf = ((packed[..., None] >> shifts) & 255).flatten(-2).to(torch.int32)
+            torch.testing.assert_close(got_sf, exp_sf, atol=0, rtol=0)
+            torch.testing.assert_close(
+                captured[5].view(torch.uint8),
+                exp_codes.view(torch.uint8),
+                atol=0,
+                rtol=0,
+            )
+
+
+def test_is_mega_mhc_capture_safe_version_gate(monkeypatch):
+    from tokenspeed_kernel.ops.residual import is_mega_mhc_capture_safe
+    from tokenspeed_kernel.thirdparty.cuda import mega_mhc as native
+
+    monkeypatch.setattr(native, "_api", lambda: SimpleNamespace(__version__="2.8.1"))
+    assert not is_mega_mhc_capture_safe()
+    monkeypatch.setattr(native, "_api", lambda: SimpleNamespace(__version__="2.8.2"))
+    assert not is_mega_mhc_capture_safe()
+    monkeypatch.setattr(
+        native, "_api", lambda: SimpleNamespace(__version__="2.8.2.post20261115")
+    )
+    assert not is_mega_mhc_capture_safe()
+    monkeypatch.setattr(native, "_api", lambda: SimpleNamespace(__version__="2.8.3"))
+    assert is_mega_mhc_capture_safe()
+    monkeypatch.setattr(native, "_api", lambda: SimpleNamespace(__version__=None))
+    assert not is_mega_mhc_capture_safe()
+    monkeypatch.setattr(
+        native, "_api", lambda: SimpleNamespace(__version__="not-semver")
+    )
+    assert not is_mega_mhc_capture_safe()
+
+    def _missing():
+        raise ImportError("no deep_gemm")
+
+    monkeypatch.setattr(native, "is_mega_mhc_available", lambda: True)
+    monkeypatch.setattr(native, "_api", _missing)
+    assert not is_mega_mhc_capture_safe()
+    monkeypatch.setattr(native, "is_mega_mhc_available", lambda: False)
+    monkeypatch.setattr(native, "_api", lambda: SimpleNamespace(__version__="2.8.2"))
+    assert not is_mega_mhc_capture_safe()
+
+
+@pytest.mark.parametrize("quantize_fp8", [False, True])
+def test_shifted_mhc_two_graphs_on_same_stream_replay(quantize_fp8):
+    from tokenspeed_kernel.ops.residual import is_mega_mhc_capture_safe
+
+    if not is_mega_mhc_capture_safe():
+        pytest.skip("requires DeepGEMM >= 2.8.3 capture-safe MegaMHC")
+    call = (
+        try_mhc_shifted_post_pre_norm_quantize_fp8
+        if quantize_fp8
+        else try_mhc_shifted_post_pre_norm
+    )
+    args_a = _inputs(1024, 5120, 20)
+    args_b = _inputs(4096, 5120, 20)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            assert call(**args_a) is not None
+            assert call(**args_b) is not None
+    stream.synchronize()
+
+    graph_a = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph_a, stream=stream):
+        cap_a = call(**args_a)
+    assert cap_a is not None
+
+    graph_b = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph_b, stream=stream):
+        cap_b = call(**args_b)
+    assert cap_b is not None
+
+    for tag in ("A", "B", "A", "B"):
+        graph, args, cap = (
+            (graph_a, args_a, cap_a) if tag == "A" else (graph_b, args_b, cap_b)
+        )
+        args["x"].normal_()
+        args["residual"].normal_()
+        args["pre"].uniform_()
+        args["post"].uniform_()
+        args["comb"].copy_(torch.rand_like(args["comb"]).softmax(-2))
+        graph.replay()
+        torch.cuda.synchronize(stream)
+        for got, ref in zip(cap[:5], _reference(args), strict=True):
+            torch.testing.assert_close(got, ref, atol=0.02, rtol=0.01)
+        if quantize_fp8:
+            exp_sf, exp_codes = _group32_reference(cap[1])
+            packed = cap[6]
+            shifts = torch.arange(4, device=packed.device) * 8
+            got_sf = ((packed[..., None] >> shifts) & 255).flatten(-2).to(torch.int32)
+            torch.testing.assert_close(got_sf, exp_sf, atol=0, rtol=0)
+            torch.testing.assert_close(
+                cap[5].view(torch.uint8),
+                exp_codes.view(torch.uint8),
+                atol=0,
+                rtol=0,
+            )

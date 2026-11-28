@@ -99,6 +99,7 @@ import tokenspeed_kernel.ops.quantization.flashinfer as _quantization_flashinfer
 import tokenspeed_kernel.ops.quantization.triton as _quantization_triton
 import tokenspeed_kernel.ops.quantization.trtllm as _quantization_trtllm
 import tokenspeed_kernel.ops.residual as _residual_pkg
+import tokenspeed_kernel.ops.residual._cute_dsl.mhc_boundary as _residual_cute_dsl_mhc_boundary
 import tokenspeed_kernel.ops.residual.cuda as _residual_cuda
 import tokenspeed_kernel.ops.residual.cute_fused as _residual_cute_fused
 import tokenspeed_kernel.ops.residual.deep_gemm as _residual_deep_gemm
@@ -204,6 +205,7 @@ _RELOAD_MODULES = [
     _gemm_pkg,
     # Residual registration modules.
     _residual_cuda,
+    _residual_cute_dsl_mhc_boundary,
     _residual_cute_fused,
     _residual_deep_gemm,
     _residual_gluon,
@@ -312,8 +314,10 @@ def test_residual_family_exports_and_modes():
         "boundary_gathers_mailbox",
         "gated_residual_combine",
         "gated_residual_mix",
+        "is_mega_mhc_capture_safe",
         "mhc_apply_pre",
         "mhc_apply_pre_quantize_fp8",
+        "mhc_boundary_max_decode_tokens",
         "mhc_fused_hc",
         "mhc_init",
         "mhc_mixes",
@@ -323,10 +327,13 @@ def test_residual_family_exports_and_modes():
         "post_norm_residual_pre_norm",
         "post_norm_residual_pre_norm_bf16",
         "post_norm_residual_pre_norm_bf16_fp8",
+        "prepare_mhc_boundary_weight",
         "residual_gate_coefficients",
         "set_gated_residual_workspace_region",
+        "try_mhc_shifted_post_pre_boundary",
         "try_mhc_shifted_post_pre_norm",
         "try_mhc_shifted_post_pre_norm_quantize_fp8",
+        "warmup_mhc_boundary",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     residual_modes = {
@@ -344,6 +351,7 @@ def test_residual_family_exports_and_modes():
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
+        "mhc_shifted_post_pre_boundary",
         "mhc_shifted_post_pre_norm",
         "mhc_shifted_post_pre_norm_quantize_fp8",
         "normalized_dot_gate",
