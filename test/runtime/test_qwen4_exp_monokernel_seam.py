@@ -105,20 +105,21 @@ def _decode_ctx(bs: int, rows: int, narrowing) -> ForwardContext:
 
 
 def test_draft_steps_take_the_kernels() -> None:
-    """Every draft step of up to 4 rows takes the kernels: the first step of
-    one request (its verified rows, a chain) and the one-row steps after it.
-    The draft backend has no recurrent state, and the rule never asks for it.
-    A first step of several requests keeps the regular path: a launch
-    narrows to the live row of one request only."""
+    """Every draft step of up to 8 rows takes the kernels: the first step
+    (the requests' verified rows, chains; a prefix launch, then the live
+    rows' decode launch) and the one-row steps after it. The draft backend
+    has no recurrent state, and the rule never asks for it."""
     backend = _DraftBackend()
     first = AcceptedPrefixPublisher(backend, torch.tensor([7]))
     assert forward_chain(4, _decode_ctx(1, 4, first)) == 4
     assert forward_chain(1, _decode_ctx(1, 1, None)) == 1
     assert forward_chain(4, _decode_ctx(4, 4, None)) == 1
     two = AcceptedPrefixPublisher(backend, torch.tensor([7, 9]))
-    assert forward_chain(4, _decode_ctx(2, 4, two)) is None
-    assert forward_chain(8, _decode_ctx(2, 8, two)) is None
-    assert forward_chain(5, _decode_ctx(5, 5, None)) is None
+    assert forward_chain(4, _decode_ctx(2, 4, two)) == 2
+    assert forward_chain(8, _decode_ctx(2, 8, two)) == 4
+    assert forward_chain(12, _decode_ctx(3, 12, two)) is None
+    assert forward_chain(8, _decode_ctx(8, 8, None)) == 1
+    assert forward_chain(9, _decode_ctx(9, 9, None)) is None
 
 
 def test_a_target_verify_without_gated_deltanet_keeps_the_regular_path() -> None:
@@ -183,7 +184,7 @@ def test_every_fused_draft_layer_reads_the_lengths_from_before_the_publish() -> 
             seq_lens.copy_(lengths)
 
     narrowing = AcceptedPrefixPublisher(_PublishingBackend(), torch.tensor([10, 11]))
-    state = Qwen4ExpMonokernelState(torch.device("cpu"), scratch_pairs=1)
+    state = Qwen4ExpMonokernelState(torch.device("cpu"), scratch_pairs=1, layers=1)
     state.start_step()
     first = state.draft_lengths(seq_lens, narrowing)
     assert seq_lens.tolist() == [10, 11]
@@ -260,6 +261,8 @@ def test_packing_shares_one_state_and_folds_the_final_mixer(last) -> None:
     enable_decode_monokernels(model)
     state = model.monokernel_state
     assert state is not None and state.scratch.numel() == 7
+    # A draft first step's prefix launch tags as layer len(layers) + i.
+    assert state.layers == 4
     assert all(layer.monokernel_state is state for layer in layers)
     assert [layer.warm.tolist() for layer in layers[:3]] == [[1], [2], [3]]
     assert layers[3].warm is None
@@ -285,15 +288,15 @@ def test_packing_fails_and_names_every_unserved_layer() -> None:
 
 
 def test_a_monokernel_layer_runs_other_forwards_with_its_regular_code() -> None:
-    """A forward that the kernels do not serve (here 5 rows, past the
+    """A forward that the kernels do not serve (here 9 rows, past the
     kernels' plans) runs the regular layer's code."""
     layer = _MonokernelLayer()
-    rows = torch.zeros(5, 2)
+    rows = torch.zeros(9, 2)
     out = layer(
         positions=None,
         hidden_states=rows,
         residual=None,
-        ctx=_decode_ctx(5, 5, None),
+        ctx=_decode_ctx(9, 9, None),
         input_ids=None,
     )
     assert out[0] is rows and layer.forwards == 1
@@ -304,7 +307,7 @@ def test_a_launch_refuses_a_pending_residual() -> None:
     gets a pending residual. If one does, it fails instead of combining it."""
     layer = _MonokernelLayer()
     layer.monokernel_state = Qwen4ExpMonokernelState(
-        torch.device("cpu"), scratch_pairs=1
+        torch.device("cpu"), scratch_pairs=1, layers=1
     )
     rows = torch.zeros(1, 2)
     with pytest.raises(RuntimeError, match="pending residual"):
