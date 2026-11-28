@@ -1044,23 +1044,32 @@ class TestPrefillGraphMaxTokensResolution:
 class TestWeakRefTensor:
     """The non-owning-view op behind break-closure weak refs."""
 
-    def test_alias_without_ownership(self):
+    @pytest.mark.parametrize("without_extension", [False, True])
+    def test_alias_without_ownership(self, monkeypatch, without_extension):
+        from tokenspeed_kernel.ops.transform import weak_ref
+        from torch.multiprocessing.reductions import StorageWeakRef
+
         from tokenspeed.runtime.execution.breakable_cuda_graph import weak_ref_tensor
 
+        if without_extension:
+            monkeypatch.setattr(weak_ref, "_load", lambda: None)
         x = torch.arange(12, device="cuda", dtype=torch.float32).view(3, 4)[:, 1:]
         w = weak_ref_tensor(x)
-        if w is x:  # identity fallback (no C++ toolchain) -- still correct
-            pytest.skip("weak_ref extension unavailable; identity fallback")
+        owner = StorageWeakRef(x.untyped_storage())
         # Aliases the same memory (incl. strides), sees writes, owns nothing.
         assert (w.data_ptr()) == (x.data_ptr())
         assert (w.stride()) == (x.stride())
         x.fill_(3.0)
         torch.cuda.synchronize()
         assert bool((w == 3.0).all())
+        del x
+        assert owner.expired()
         # Non-tensor / CPU passthrough.
         assert (weak_ref_tensor(None)) is None
         cpu = torch.ones(2)
         assert (weak_ref_tensor(cpu)) is (cpu)
+        with pytest.raises(RuntimeError, match="weak_ref_tensor expects a CUDA tensor"):
+            weak_ref.weak_ref_tensor(cpu)
 
 
 @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
@@ -1138,8 +1147,6 @@ class TestPoolReuseAcrossCaptures:
         sum of the buckets."""
         from tokenspeed_kernel.ops.attention.prologue import MLAPrologueOutput
 
-        from tokenspeed.runtime.execution.breakable_cuda_graph import weak_ref_tensor
-
         @dataclasses.dataclass(frozen=True)
         class ScaledKey:
             query: torch.Tensor
@@ -1152,9 +1159,6 @@ class TestPoolReuseAcrossCaptures:
             # The scalar is frozen at capture, like a loose scalar arg.
             return ScaledKey(query=q, key=q * 2.0, scale=1.0)
 
-        probe = torch.empty(1, device="cuda")
-        if weak_ref_tensor(probe) is probe:
-            pytest.skip("weak_ref extension unavailable; identity fallback")
         torch.manual_seed(3)
         d, d2, depth = 512, 2048, 4
         w1 = torch.randn(d, d2, device="cuda") * 0.02

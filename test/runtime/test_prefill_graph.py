@@ -15,9 +15,12 @@ import contextlib
 import io
 import os
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1407,6 +1410,100 @@ class TestNarrowingPrefillGraphTest:
         pg = self._bare(model, State, [192], calls)
         with pytest.raises((RuntimeError), match=("narrowing yielded 100 rows")):
             pg._replay_narrowed(256, self._ctx(200), 200, noted_waits_done=False)
+
+
+def _v41_graph_state(rows, device, *, optional=False):
+    from tokenspeed.runtime.models.deepseek_v41 import V41RowState
+
+    positions = torch.arange(rows, device=device)
+    hidden = torch.arange(rows * 32, device=device).view(rows, 4, 8).bfloat16()
+    mask = positions.remainder(2).bool() if optional else None
+    return V41RowState(
+        hidden=hidden,
+        pre_mix=hidden[..., 0].float(),
+        positions=positions,
+        image_mask=mask,
+        hashes=(positions + 1)[:, None, None] if optional else None,
+        engram_token_mask=~mask if optional else None,
+        captured=[hidden[:, 0].clone()] if optional else [],
+    )
+
+
+@pytest.mark.parametrize("optional", [False, True])
+@torch.inference_mode()
+def test_encoder_replay_reads_producers_and_releases_their_storage(optional):
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA graphs")
+
+    def encode(state):
+        hidden = state.hidden * 2
+        # One tap has an offset and non-unit stride. The other aliases hidden.
+        taps = []
+        if state.captured:
+            taps = [(state.captured[0] + 1)[:, 1::2], hidden[:, 1]]
+        return replace(state, hidden=hidden, pre_mix=state.pre_mix + 3, captured=taps)
+
+    class Encoder(PrefillGraph):
+        def __init__(self, source):
+            self._pool = None
+            self._encoder_handoff_storage = {}
+            self.num_warmup = 1
+            self.source = source
+            self.producers = []
+
+        def _run_encoder(self, rows):
+            state = encode(self.source.leading(rows))
+            self.producers = [
+                (t.data_ptr(), StorageWeakRef(t.untyped_storage()))
+                for t in (state.hidden, state.pre_mix, *state.captured)
+            ]
+            return state
+
+    sources = [_v41_graph_state(n, "cuda", optional=optional) for n in (8, 4, 8)]
+    runner = Encoder(sources[0])
+    encoders = []
+    for source in sources:
+        runner.source = source
+        encoder = runner._capture_encoder(source.rows, None, contextlib.nullcontext())
+        state = encoder.state
+        activations = (state.hidden, state.pre_mix, *state.captured)
+        for t, (address, storage) in zip(activations, runner.producers, strict=True):
+            assert t.data_ptr() == address
+            assert storage.expired()
+        assert state.positions.data_ptr() == source.positions.data_ptr()
+        encoders.append(encoder)
+    torch.cuda.empty_cache()
+
+    for shift, index in enumerate((0, 2, 1, 0, 1, 2), start=1):
+        source, encoder = sources[index], encoders[index]
+        for t in source._tensors():
+            if t is not None:
+                t.copy_(t.roll(shift, 0))
+        encoder.capture.replay()
+        torch.testing.assert_close(
+            encoder.state._tensors(),
+            encode(source)._tensors(),
+            rtol=0,
+            atol=0,
+            check_stride=True,
+        )
+
+
+def test_decoder_buckets_reuse_owning_storage():
+    from tokenspeed.runtime.execution.prefill_graph import DecoderStateBuffers
+
+    buffers = DecoderStateBuffers(lambda rows: _v41_graph_state(rows, "cpu"))
+    wide, small = buffers.for_rows(8), buffers.for_rows(3)
+    assert small.rows == 3
+    assert small.hidden.data_ptr() == wide.hidden.data_ptr()
+    old_storage = StorageWeakRef(wide.hidden.untyped_storage())
+    del wide
+    assert buffers.for_rows(16).hidden.data_ptr() != small.hidden.data_ptr()
+    assert not old_storage.expired()
+    del small
+    assert old_storage.expired()
 
 
 class TestTrtllmPrefillGraphSeamsTest:

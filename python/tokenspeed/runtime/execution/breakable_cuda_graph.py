@@ -139,17 +139,15 @@ def _set_replay_valid_rows(valid_rows: int | None) -> None:
 
 
 def weak_ref_tensor(t: Any) -> Any:
-    """Reference a break-point tensor without pinning its graph-pool block.
+    """Reference a replayed tensor without pinning its graph-pool block.
 
     CUDA tensors are wrapped in a non-owning view (``tokenspeed_kernel``
-    ``ops.transform.weak_ref``, an ``at::from_blob`` alias -- the vLLM/sglang
-    approach), so break closures do not pin pool blocks and graph capture
+    ``ops.transform.weak_ref``) so captures can release their pool blocks and graph
     memory stays ~peak-live instead of scaling with the bucket sum. Safe when
     the aliased memory is owned elsewhere for the graph's lifetime (static
     input buffers, weights) or is rewritten by the captured segment before the
-    break reads it on every replay (replay is stream-ordered). Non-tensors and CPU tensors
-    pass through; if the kernel extension is unavailable this degrades to
-    the identity (strong ref -- correct, more memory).
+    consumer reads it on every replay (replay is stream-ordered). Non-tensors
+    and CPU tensors pass through.
     """
     if isinstance(t, torch.Tensor) and t.is_cuda:
         return _kernel_weak_ref(t)
