@@ -767,6 +767,16 @@ class MoELayer(torch.nn.Module):
         return self.plan["supports_deferred_finalize"]
 
     @property
+    def deferred_finalize_is_slot_sum(self) -> bool:
+        """Whether a deferred call's routes finalize to the kernel's own result
+        under ``moe_finalize_gate_add``'s arithmetic (FP32 slot-order sum of
+        BF16 route rows times weights, one BF16 rounding)."""
+        return (
+            self.supports_deferred_finalize
+            and self.plan["deferred_finalize_is_slot_sum"]
+        )
+
+    @property
     def deferred_output_is_token_order(self) -> bool:
         """Whether deferred row ``token * topk + slot`` holds that route.
 

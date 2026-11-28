@@ -631,6 +631,15 @@ returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
 
+Qwen3.5-style shared experts with a sigmoid gate fold the routed finalize into
+the gate add (`moe_finalize_gate_add`, portable Triton) when the selected
+kernel declares `deferred_finalize_is_slot_sum`: its own finalize is the FP32
+top-k slot-order sum, one FMA per route, rounded to BF16 once, so the fold is
+bit-identical to the kernel's finalize followed by the gate add. The TRT-LLM
+NVFP4 kernels and the gfx950 A4W4 kernel declare it; the A4W4 kernel defers
+with token-order rows (zero for experts outside `[0, E)`) and no row map,
+which `moe_finalize_gate_add` takes as `None`.
+
 ## Kimi-K3 router
 
 On NVIDIA SM90 and newer, batches from 2,560 tokens use a vendored CUDA top-16 router

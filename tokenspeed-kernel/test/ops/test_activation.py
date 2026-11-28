@@ -534,9 +534,27 @@ def test_moe_finalize_gate_add_matches_finalize_then_gate(
     )
 
     assert out.shape == (num_tokens, hidden_dim) and out.dtype == torch.bfloat16
-    # The kernel contracts each weighted add into an FMA; the reference rounds
-    # the product first, so a bf16 result may move by one ulp.
+    # The kernel issues each weighted add as an FMA; the reference rounds the
+    # product first, so a bf16 result may move by one ulp.
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 17, 600])
+def test_moe_finalize_gate_add_token_order_matches_identity_map(
+    num_tokens: int, device: str
+) -> None:
+    gemm2_out, _, weights, hidden, gate_weight, shared = _moe_finalize_inputs(
+        num_tokens, 2560, 10, 0, torch.float32, device
+    )
+    identity = torch.arange(num_tokens * 10, device=device, dtype=torch.int32)
+    mapped = moe_finalize_gate_add(
+        gemm2_out, identity, weights, hidden, gate_weight, shared
+    )
+    # None: row token * top_k + k holds route k of the token.
+    token_order = moe_finalize_gate_add(
+        gemm2_out, None, weights, hidden, gate_weight, shared
+    )
+    torch.testing.assert_close(token_order, mapped, atol=0, rtol=0)
 
 
 def test_moe_finalize_gate_add_empty(device: str) -> None:
