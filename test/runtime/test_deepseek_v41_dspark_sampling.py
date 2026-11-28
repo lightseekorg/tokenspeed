@@ -106,7 +106,7 @@ def test_direct_proposals_graph_replay_then_eager():
         torch.testing.assert_close(captured, eager, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("vocab", [32, 129280])
+@pytest.mark.parametrize("vocab", [64, 129280])
 @pytest.mark.parametrize("block", [1, 5])
 def test_fused_sampled_markov_matches_reference_with_filters_and_graph_replay(
     monkeypatch, vocab: int, block: int
