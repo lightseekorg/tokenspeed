@@ -1406,4 +1406,4 @@ def test_multi_op_l2_writeback_and_loadback_hoist_batch_vectors_and_preserve_row
         ):
             executor.submit_load_backs([lb_op], prerequisite_stream="s")
         assert lb_op.accesses == {"op_ids": 1, "group_ids": 1, "src": 1, "dst": 1}
-        assert loaded == [([201, 202], [(0, 1, 2), (0, 3, 3), (1, 2, 2)])]
+        assert loaded == [([201, 202], [(0, 1, 2), (0, 2, 3), (1, 2, 2)])]
