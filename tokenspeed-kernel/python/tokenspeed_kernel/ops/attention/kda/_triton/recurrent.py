@@ -177,6 +177,7 @@ def fused_kda_verify_conv_update(
     out: torch.Tensor | None = None,
     block_c: int = 512,
     num_warps: int = 4,
+    _validated: bool = False,
 ) -> torch.Tensor:
     """Compute verify conv1d(+silu) rows from the pre-convolution ring.
 
@@ -205,6 +206,12 @@ def fused_kda_verify_conv_update(
         out: Optional ``[N*T, 3*P]`` output tensor in the input dtype.
         block_c: Number of feature channels handled by each program.
         num_warps: Number of warps used by each program.
+        _validated: Internal. Set by a split verify that already ran
+            ``check_kda_split_verify_extents`` with this producer's operands
+            and ``KdaPreconvRing.check_verify_storage`` on them (whose
+            device, bias and storage checks cover the ones below); a
+            supplied ``out`` is still checked here. Other callers leave it
+            False.
 
     Returns:
         out: ``[N*T, 3*P]`` convolved and SiLU-activated q|k|v rows.
@@ -261,13 +268,53 @@ def fused_kda_verify_conv_update(
         raise ValueError("page_count must be a positive page-pool size")
     if block_c <= 0 or block_c & (block_c - 1):
         raise ValueError(f"block_c={block_c} must be a positive power of two")
+    supplied_out = out is not None
     if out is None:
         out = torch.empty_like(qkv_raw, memory_format=torch.contiguous_format)
     elif out.shape != (total, C) or out.stride(-1) != 1:
         raise ValueError(f"out must have shape [{total}, {C}] and last stride 1")
     elif out.dtype != qkv_raw.dtype:
         raise ValueError(f"out must have dtype {qkv_raw.dtype}, got {out.dtype}")
-    preconv.check_separate_storage(qkv_raw, conv_w, bias, out)
+    if _validated:
+        # The caller's checks covered every operand but an output it did not
+        # see; one allocated above is fresh storage on the input's device.
+        if supplied_out:
+            if out.device != qkv_raw.device:
+                raise ValueError(
+                    "the verify convolution's operands must share one device"
+                )
+            preconv.check_separate_storage(out)
+    else:
+        # A supplied bias is added to all C channels (HAS_BIAS), so it must
+        # hold them, even when an empty view would otherwise pass as present.
+        if bias is not None and (
+            bias.shape != (C,)
+            or bias.stride(0) != 1
+            or not bias.is_floating_point()
+            or bias.device != qkv_raw.device
+        ):
+            raise ValueError(f"bias must be a unit-stride floating [{C}] vector")
+        # The launch passes bare pointers: every operand must be on the
+        # input's device (the ring's heads share the ring's, checked above).
+        device = qkv_raw.device
+        for operand in (conv_w, out, read_indices, live_indices, record_slots):
+            if operand.device != device:
+                raise ValueError(
+                    "the verify convolution's operands must share one device"
+                )
+        # The producer writes ring rows while it reads every other operand.
+        # The split verify after it also reads the checkpoint and records;
+        # callers that run both check those too (see kda_verify_conv_update).
+        preconv.check_verify_storage(
+            qkv_raw,
+            conv_w,
+            bias,
+            out,
+            read_indices,
+            live_indices,
+            record_slots,
+            query_start_loc,
+        )
     # 16-byte row vectors need the slot base 16-byte aligned.
     vector = 16 // ring.element_size()
     # Cap BLOCK_T so BLOCK_T * block_c stays well below Triton's per-program

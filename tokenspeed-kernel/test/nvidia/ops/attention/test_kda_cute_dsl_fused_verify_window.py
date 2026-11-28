@@ -995,3 +995,447 @@ def test_a_ring_sharing_the_projection_storage_is_rejected():
         )
     torch.cuda.synchronize()
     assert torch.equal(arena, before)
+
+
+@pytest.mark.parametrize("route", ["fused", "split fallback", "triton split"])
+def test_a_ring_viewing_the_checkpoint_is_rejected_before_any_launch(
+    route, monkeypatch
+):
+    """Every verify route rejects a ring inside a live checkpoint page.
+
+    The ring is a differently shaped view of a BF16 page the verify reads,
+    so its candidate stores would overwrite that checkpoint. The fused route
+    must reject it itself rather than fall back; with a raw gate the CuTe
+    entry runs the split producers, and the Triton split verify runs its own
+    producer. Each raises before any launch, and the pool keeps its bits.
+    """
+    from tokenspeed_kernel.ops.attention.kda import cute_dsl
+    from tokenspeed_kernel.ops.attention.kda.triton import (
+        triton_nvidia_kda_fused_paged_verify_split,
+    )
+
+    window = 4
+    x = _inputs(3, window, seed=251)
+    x["state_pool"] = x["state_pool"].bfloat16()
+    records, _ = _records(x, capacity=9)
+    rows = records.preconv.rows
+    page = int(x["state_indices"][0])
+    inside = x["state_pool"][page].flatten()[: rows.numel()].view(rows.shape)
+    records = dataclasses.replace(
+        records, preconv=KdaPreconvRing(inside, records.preconv.heads)
+    )
+    before = x["state_pool"].clone()
+    producers = {}
+    if route == "fused":
+
+        def fallback(*args, **kwargs):
+            raise AssertionError("the fused route fell back to the split producers")
+
+        monkeypatch.setattr(cute_dsl, "_split_producer_verify", fallback)
+    else:
+        producers["g_raw"] = F.linear(x["f_a_out"], x["f_b_weight"])
+    with pytest.raises(ValueError, match="storage separate"):
+        if route == "triton split":
+            triton_nvidia_kda_fused_paged_verify_split(
+                x["mixed_qkv"],
+                x["conv_weights"],
+                x["f_a_out"],
+                x["f_b_weight"],
+                x["beta_logits"],
+                x["A_log"],
+                x["dt_bias"],
+                state_pool=x["state_pool"],
+                read_indices=x["state_indices"],
+                num_heads=HEADS,
+                head_dim=DIM,
+                draft_token_num=window,
+                lower_bound=x["lower_bound"],
+                retained_records=records,
+                output_norm=None,
+                **producers,
+            )
+        else:
+            _verify(
+                x,
+                records,
+                None,
+                override="cute_dsl_kda_fused_paged_verify_window",
+                prepare=False,
+                **producers,
+            )
+    torch.cuda.synchronize()
+    assert torch.equal(x["state_pool"], before)
+
+
+@pytest.mark.parametrize("backing", ["ring", "own"])
+@pytest.mark.parametrize("case", ["raw gate", "gate input"])
+def test_an_empty_gate_is_rejected_before_any_producer(case, backing):
+    """An active window verify rejects an empty raw gate or gate input first.
+
+    Request 0 reads a live page, so its convolution would store its
+    candidates in the ring. A zero-element raw gate makes the CuTe entry
+    run the split producers; a zero-element gate projection input is one
+    the fused kernel cannot address, so the entry falls back to them. With
+    either, viewing the ring's allocation or its own, the verify raises
+    ValueError before the convolution producer starts, and the whole ring
+    allocation, the checkpoint and the records keep their bits.
+    """
+    window = 4
+    x = _inputs(3, window, seed=271)
+    records, buffers = _records(x, capacity=9)
+    _prepare(x, records)
+    ring = buffers[3]
+    if backing == "ring":
+        empty = ring.flatten()[:0]
+    else:
+        empty = torch.empty(0, device="cuda", dtype=torch.bfloat16)
+    watched = (ring, x["state_pool"], *buffers[:3])
+    torch.cuda.synchronize()
+    before = [value.clone() for value in watched]
+    producers = {}
+    if case == "raw gate":
+        producers["g_raw"] = empty.view(0, WIDTH)
+    else:
+        x = dict(x, f_a_out=empty.view(0, RANK))
+    with pytest.raises(ValueError):
+        _verify(
+            x,
+            records,
+            None,
+            override="cute_dsl_kda_fused_paged_verify_window",
+            prepare=False,
+            **producers,
+        )
+    torch.cuda.synchronize()
+    for value, original in zip(watched, before):
+        assert torch.equal(value, original)
+
+
+@pytest.mark.parametrize("operand", ["beta", "A_log", "dt_bias"])
+def test_a_malformed_beta_or_gate_parameter_is_rejected_before_the_convolution(
+    operand, monkeypatch
+):
+    """The window entry's split fallback checks beta and the gate parameters first.
+
+    With a raw gate the CuTe window entry runs the split producers. Request
+    0 reads a live page, so the convolution would store its candidates in
+    the ring before the recurrent verify read beta, A_log and dt_bias. A
+    beta whose rows do not view as [1, tokens, heads], or an empty A_log or
+    dt_bias, each in its own allocation, raises ValueError without a
+    convolution call; the whole ring allocation, the checkpoint, the
+    records and the stamps keep their bits.
+    """
+    from tokenspeed_kernel.ops.attention.kda._triton import recurrent
+
+    window = 4
+    x = _inputs(3, window, seed=281)
+    records, buffers = _records(x, capacity=9)
+    _prepare(x, records)
+    if operand == "beta":
+        rows = x["beta_logits"].shape[0]
+        malformed = torch.zeros(rows, HEADS + 1, device="cuda").bfloat16()
+        y = dict(x, beta_logits=malformed)
+    else:
+        y = dict(x, **{operand: torch.empty(0, device="cuda")})
+    calls = []
+    producer = recurrent.fused_kda_verify_conv_update
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs.get("record_slots"))
+        return producer(*args, **kwargs)
+
+    monkeypatch.setattr(recurrent, "fused_kda_verify_conv_update", counted)
+    watched = (buffers[3], x["state_pool"], *buffers[:3])
+    torch.cuda.synchronize()
+    before = [value.clone() for value in watched]
+    with pytest.raises(ValueError, match="beta|gate parameters"):
+        _verify(
+            y,
+            records,
+            None,
+            override="cute_dsl_kda_fused_paged_verify_window",
+            prepare=False,
+            g_raw=F.linear(x["f_a_out"], x["f_b_weight"]),
+        )
+    torch.cuda.synchronize()
+    assert not calls
+    for value, original in zip(watched, before):
+        assert torch.equal(value, original)
+
+
+def _direct_window(x, records, **changes):
+    """Call the fused window directly with ``changes`` to its operands."""
+    y = dict(x, record_metadata=records.metadata, record_stamps=records.stamps)
+    y.update(changes)
+    tokens = y["mixed_qkv"].shape[0]
+    out = y.get("out")
+    if out is None:
+        out = torch.empty(tokens, WIDTH, device="cuda", dtype=torch.bfloat16)
+    result = window_kernel.fused_verify_window(
+        y["mixed_qkv"],
+        y["conv_weights"],
+        records.preconv,
+        y["f_a_out"],
+        y["f_b_weight"],
+        y["beta_logits"],
+        y["A_log"],
+        y["dt_bias"],
+        y["lower_bound"],
+        y["state_pool"][:, :HEADS],
+        records.history,
+        y["query_start_loc"],
+        y["state_indices"],
+        HEADS,
+        DIM,
+        y["window"],
+        out,
+        y["record_metadata"],
+        y["record_stamps"],
+        None,
+    )
+    return result, out
+
+
+def _forbid_compile(monkeypatch):
+    def compile_(*args, **kwargs):
+        raise AssertionError("the fused verify compiled for inputs it rejects")
+
+    monkeypatch.setattr(window_kernel, "_compile", compile_)
+
+
+@pytest.mark.parametrize(
+    "operand", ["A_log", "dt_bias", "query_start_loc", "record_stamps"]
+)
+def test_an_empty_gate_parameter_boundary_or_stamp_table_is_rejected(
+    operand, monkeypatch
+):
+    """The fused window rejects each empty operand it would address before compiling.
+
+    Request 0 is live with metadata enabled. Its gate loads A_log[head] and
+    dt_bias[head * 128 + k], it reads boundaries 0 and 1, and it stores
+    stamp pairs in the slot its metadata names. An empty FP32 A_log or
+    dt_bias, an empty INT32 query_start_loc or an empty [0, capacity, 2]
+    stamp table, each in its own allocation, makes the support predicate
+    (where it takes the operand) refuse and the direct entry raise
+    ValueError without compiling; the ring, checkpoint, records and stamps
+    keep their bits.
+    """
+    window = 4
+    x = _inputs(3, window, seed=283)
+    records, buffers = _records(x, capacity=9)
+    _prepare(x, records)
+    capacity = records.stamps.shape[1]
+    empty = {
+        "A_log": torch.empty(0, device="cuda"),
+        "dt_bias": torch.empty(0, device="cuda"),
+        "query_start_loc": torch.empty(0, device="cuda", dtype=torch.int32),
+        "record_stamps": torch.empty(0, capacity, 2, device="cuda", dtype=torch.int64),
+    }[operand]
+
+    def supported(y):
+        return window_kernel.fused_verify_window_supported(
+            y["mixed_qkv"],
+            y["conv_weights"],
+            records.preconv,
+            y["f_a_out"],
+            y["f_b_weight"],
+            y["beta_logits"],
+            y["A_log"],
+            y["dt_bias"],
+            y["state_pool"][:, :HEADS],
+            records.history,
+            y["query_start_loc"],
+            y["state_indices"],
+            HEADS,
+            DIM,
+            window,
+            y["lower_bound"],
+        )
+
+    if operand != "record_stamps":
+        assert supported(x)
+        assert not supported(dict(x, **{operand: empty}))
+    _forbid_compile(monkeypatch)
+    watched = (buffers[3], x["state_pool"], *buffers[:3])
+    torch.cuda.synchronize()
+    before = [value.clone() for value in watched]
+    with pytest.raises(ValueError):
+        _direct_window(x, records, **{operand: empty})
+    torch.cuda.synchronize()
+    for value, original in zip(watched, before):
+        assert torch.equal(value, original)
+
+
+def test_a_zero_token_window_returns_its_output_without_compiling(monkeypatch):
+    """With no tokens the fused window returns its output before any check or launch."""
+    x = _inputs(3, 4, seed=287)
+    records, _ = _records(x, capacity=9)
+    _forbid_compile(monkeypatch)
+    empty = dict(
+        mixed_qkv=x["mixed_qkv"][:0],
+        f_a_out=x["f_a_out"][:0],
+        beta_logits=x["beta_logits"][:0],
+    )
+    result, out = _direct_window(x, records, **empty)
+    assert result is out and out.shape == (0, WIDTH)
+
+
+@pytest.mark.parametrize("operand", ["conv weights", "ring"])
+def test_a_producer_operand_on_another_device_is_rejected_before_either_producer(
+    operand, monkeypatch
+):
+    """The window entry checks the convolution operands' device before a producer.
+
+    A host copy of the convolution weights, or a ring whose rows and heads
+    are host copies, keeps the fused window from addressing the inputs, so
+    the CuTe window entry runs the split producers. They raise ValueError
+    before the gate projection and before the convolution producer, and
+    the device ring, checkpoint and records keep their bits.
+    """
+    from tokenspeed_kernel.ops.attention.kda._triton import recurrent
+
+    window = 4
+    x = _inputs(3, window, seed=307)
+    records, buffers = _records(x, capacity=9)
+    _prepare(x, records)
+    y = dict(x)
+    if operand == "conv weights":
+        y["conv_weights"] = x["conv_weights"].cpu()
+    else:
+        records = dataclasses.replace(
+            records,
+            preconv=KdaPreconvRing(
+                records.preconv.rows.cpu(), records.preconv.heads.cpu()
+            ),
+        )
+    watched = (buffers[3], x["state_pool"], *buffers[:3])
+    torch.cuda.synchronize()
+    before = [value.clone() for value in watched]
+    convolutions, projections = [], []
+    producer, linear = recurrent.fused_kda_verify_conv_update, F.linear
+
+    def counted_convolution(*args, **kwargs):
+        convolutions.append(args)
+        return producer(*args, **kwargs)
+
+    def counted_projection(*args, **kwargs):
+        projections.append(args)
+        return linear(*args, **kwargs)
+
+    monkeypatch.setattr(recurrent, "fused_kda_verify_conv_update", counted_convolution)
+    monkeypatch.setattr(torch.nn.functional, "linear", counted_projection)
+    with pytest.raises(ValueError, match="share one device"):
+        _verify(
+            y,
+            records,
+            None,
+            override="cute_dsl_kda_fused_paged_verify_window",
+            prepare=False,
+        )
+    torch.cuda.synchronize()
+    assert not projections
+    assert not convolutions
+    for value, original in zip(watched, before):
+        assert torch.equal(value, original)
+
+
+@pytest.mark.parametrize(
+    "stamp_slots", [(0, 1), (-1, 0)], ids=["short table", "padding slot"]
+)
+def test_a_stamp_slot_outside_the_table_stores_no_stamp(stamp_slots):
+    """The fused window stamps only slot rows its stamp table holds.
+
+    Two live four-token requests name stamp slots 0 and 1, or -1 (padding)
+    and 0, of a one-row [1, 4, 2] stamp table cut from the middle of a
+    three-row sentinel allocation. The verify completes without a fault,
+    the request naming slot 0 stamps each of its four positions and its
+    generation at the position's row modulo 4, and the sentinel rows on
+    either side keep their bits.
+    """
+    window = 4
+    x = _inputs(2, window, seed=311)
+    x["record_metadata"] = torch.tensor(
+        [[stamp_slots[0], 5, 10], [stamp_slots[1], 6, 11]],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    records, _ = _records(x, capacity=9)
+    _prepare(x, records)
+    backing = torch.full((3, window, 2), STAMP_FILL, device="cuda", dtype=torch.int64)
+    _direct_window(x, records, record_stamps=backing[1:2])
+    torch.cuda.synchronize()
+    expected = torch.full_like(backing, STAMP_FILL)
+    for slot, generation, start in x["record_metadata"].tolist():
+        if slot == 0:
+            for position in range(start, start + window):
+                expected[1, position % window] = torch.tensor([position, generation])
+    assert torch.equal(backing, expected)
+
+
+@pytest.mark.parametrize(
+    "layout", ["expanded", "overlapping", "strided channels", "fp32"]
+)
+def test_an_output_whose_token_rows_share_elements_is_rejected(layout, monkeypatch):
+    """The fused window rejects an output it cannot store every token's row to.
+
+    Three four-token requests store a row of 12 * 128 BF16 channels per
+    token at ``out + token * stride(0) + channel``. An expanded output (row
+    pitch 0), rows overlapping at half a row's pitch, a channel stride of 2
+    or FP32 elements raise ValueError without compiling, and the ring,
+    checkpoint, records and stamps keep their bits.
+    """
+    x = _inputs(3, 4, seed=313)
+    records, buffers = _records(x, capacity=9)
+    _prepare(x, records)
+    tokens = x["mixed_qkv"].shape[0]
+    bf16 = dict(device="cuda", dtype=torch.bfloat16)
+    if layout == "expanded":
+        out = torch.empty(1, WIDTH, **bf16).expand(tokens, WIDTH)
+    elif layout == "overlapping":
+        out = torch.empty(tokens * WIDTH, **bf16).as_strided(
+            (tokens, WIDTH), (WIDTH // 2, 1)
+        )
+    elif layout == "strided channels":
+        out = torch.empty(tokens, 2 * WIDTH, **bf16)[:, ::2]
+    else:
+        out = torch.empty(tokens, WIDTH, device="cuda")
+    _forbid_compile(monkeypatch)
+    watched = (buffers[3], x["state_pool"], *buffers[:3])
+    torch.cuda.synchronize()
+    before = [value.clone() for value in watched]
+    with pytest.raises(ValueError, match="no two tokens sharing"):
+        _direct_window(x, records, out=out)
+    torch.cuda.synchronize()
+    for value, original in zip(watched, before):
+        assert torch.equal(value, original)
+
+
+def test_a_pitched_output_gives_the_same_bits_as_a_dense_one():
+    """Output rows with a pitch past their width hold the dense output's bits.
+
+    The same three four-token requests verify into a dense [12, 12 * 128]
+    output and into the leading columns of a [12, 12 * 128 + 64] sentinel
+    buffer. The rows match bit for bit, the pitch padding keeps its
+    sentinel, and the ring, records and stamps of the two runs are equal.
+    """
+    x = _inputs(3, 4, seed=317)
+    tokens = x["mixed_qkv"].shape[0]
+    runs = []
+    for pad in (0, 64):
+        y = dict(x, state_pool=x["state_pool"].clone())
+        records, buffers = _records(y, capacity=9)
+        _prepare(y, records)
+        backing = torch.full(
+            (tokens, WIDTH + pad), 7.0, device="cuda", dtype=torch.bfloat16
+        )
+        out = backing[:, :WIDTH]
+        assert out.stride() == (WIDTH + pad, 1)
+        result, _ = _direct_window(y, records, out=out)
+        assert result is out
+        runs.append((backing, buffers))
+    torch.cuda.synchronize()
+    (dense, dense_buffers), (pitched, pitched_buffers) = runs
+    assert torch.equal(pitched[:, :WIDTH], dense)
+    assert bool((pitched[:, WIDTH:] == 7.0).all())
+    for value, pitched_value in zip(dense_buffers, pitched_buffers):
+        assert torch.equal(value, pitched_value)

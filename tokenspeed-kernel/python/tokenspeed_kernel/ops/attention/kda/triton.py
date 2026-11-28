@@ -19,7 +19,10 @@ from tokenspeed_kernel.ops.attention.kda import (
     KdaPreconvRing,
     KdaPrefillResult,
     KdaRetainedRecords,
+    _opt_in_validated,
+    _split_verify_beta,
     apply_kda_output_norm,
+    check_kda_split_verify_extents,
 )
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
@@ -44,6 +47,7 @@ _DENSE_HALF_SIGNATURES = format_signatures(
         "split_producers": frozenset({True}),
     },
 )
+@_opt_in_validated
 def triton_kda_verify_conv_update(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
@@ -58,8 +62,12 @@ def triton_kda_verify_conv_update(
     draft_token_num: int,
     query_start_loc: torch.Tensor,
     bias: torch.Tensor | None = None,
+    _validated: bool = False,
 ) -> torch.Tensor:
-    """Materialize the shared split-verify convolution producer."""
+    """Materialize the shared split-verify convolution producer.
+
+    ``_validated`` is internal (see ``kda_verify_conv_update``).
+    """
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_kda_verify_conv_update,
     )
@@ -77,6 +85,7 @@ def triton_kda_verify_conv_update(
         draft_token_num=draft_token_num,
         query_start_loc=query_start_loc,
         bias=bias,
+        _validated=_validated,
     )
 
 
@@ -96,6 +105,7 @@ def triton_kda_verify_conv_update(
         "retained_history": frozenset({True}),
     },
 )
+@_opt_in_validated
 def triton_nvidia_kda_fused_paged_verify_split(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
@@ -115,12 +125,23 @@ def triton_nvidia_kda_fused_paged_verify_split(
     output_norm: KdaOutputNorm | None,
     g_raw: torch.Tensor | None = None,
     conv_qkv: torch.Tensor | None = None,
+    _validated: bool = False,
 ) -> torch.Tensor:
     """Run target verify with split convolution and gate producers.
 
     Without conv_qkv, the convolution producer runs here on
-    retained_records.preconv; with it, the producer that made it already
-    read and wrote the ring, and retained_records.preconv is None.
+    retained_records.preconv, which must not share storage with any other
+    operand (ValueError before any launch); with it, the producer that made
+    it already read and wrote the ring, and retained_records.preconv is None.
+    Either way every operand the verify and the output norm read must fit
+    the convolved tokens (check_kda_split_verify_extents), checked before
+    any launch. A ``[rows, num_heads]`` beta padded past those tokens
+    contributes its first rows.
+
+    ``_validated`` is internal: a caller that already ran both checks on
+    these operands, with the producer's when it ran one (the runtime's and
+    CuTe's split routes), sets it so they do not run twice. Direct callers
+    leave it False and get every check.
     """
     records = retained_records
     from tokenspeed_kernel.ops.attention.kda import _attention_format_signature
@@ -131,6 +152,52 @@ def triton_nvidia_kda_fused_paged_verify_split(
             "split KDA verify takes the pre-convolution ring exactly when it "
             "runs the convolution producer"
         )
+    tokens = mixed_qkv.shape[0] if conv_qkv is None else conv_qkv.shape[0]
+    if not _validated:
+        check_kda_split_verify_extents(
+            tokens,
+            num_heads,
+            head_dim,
+            g_raw=g_raw,
+            f_a_out=f_a_out,
+            f_b_weight=f_b_weight,
+            beta_logits=beta_logits,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            state_pool=state_pool,
+            read_indices=read_indices,
+            history=records.history,
+            query_start_loc=records.query_start_loc,
+            record_metadata=records.metadata,
+            record_stamps=records.stamps,
+            draft_token_num=draft_token_num,
+            device=(mixed_qkv if conv_qkv is None else conv_qkv).device,
+            output_norm=output_norm,
+            # The convolution producer's operands, when it runs here.
+            mixed_qkv=mixed_qkv if conv_qkv is None else None,
+            conv_weights=conv_weights if conv_qkv is None else None,
+            preconv=records.preconv,
+        )
+        if conv_qkv is None:
+            # The producer writes the ring before this verify reads the
+            # checkpoint and records, which its own check cannot see.
+            records.preconv.check_verify_storage(
+                mixed_qkv,
+                conv_weights,
+                f_a_out,
+                f_b_weight,
+                beta_logits,
+                A_log,
+                dt_bias,
+                g_raw,
+                state_pool,
+                read_indices,
+                records.metadata,
+                records.stamps,
+                records.query_start_loc,
+                history=records.history,
+                output_norm=output_norm,
+            )
     if g_raw is None:
         g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
     if conv_qkv is None:
@@ -147,6 +214,8 @@ def triton_nvidia_kda_fused_paged_verify_split(
             draft_token_num=draft_token_num,
             query_start_loc=records.query_start_loc,
             bias=None,
+            # Checked above (or by the caller) with the producer's operands.
+            _validated=True,
         )
     q, k, v = (
         part.view(1, -1, num_heads, head_dim) for part in conv_qkv.chunk(3, dim=-1)
@@ -168,7 +237,7 @@ def triton_nvidia_kda_fused_paged_verify_split(
         k,
         v,
         g_raw.view_as(q),
-        beta_logits.view(1, -1, num_heads),
+        _split_verify_beta(beta_logits, tokens, num_heads),
         A_log,
         dt_bias,
         checkpoint_state=state_pool[:, :num_heads],

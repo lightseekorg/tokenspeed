@@ -1913,3 +1913,1047 @@ def test_invalid_ring_verify_raises_without_mutation():
         )
     for actual, expected in zip(mutable, before):
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def _amd_verify_operands():
+    """One slot, one head and a one-token window of AMD verify operands, on the CPU.
+
+    The AMD launchers validate on the host before any launch, so CPU tensors
+    exercise their checks on every platform. A BF16 [1, 4, 384] ring has as
+    many elements as the [384, 4] convolution weights; a checkpoint page
+    holds more.
+    """
+    channels, dim = 384, 128
+    return dict(
+        mixed_qkv=torch.randn(1, channels).bfloat16(),
+        ring_heads=torch.full((1,), 3, dtype=torch.int32),
+        conv_weights=torch.randn(channels, 4).bfloat16(),
+        raw_g=None,
+        f_a_out=torch.randn(1, dim).bfloat16(),
+        f_b_weight=torch.randn(dim, dim).bfloat16(),
+        beta_logits=torch.randn(1, 1).bfloat16(),
+        A_log=torch.zeros(1),
+        dt_bias=torch.zeros(dim),
+        state_pool=torch.randn(3, 1, dim, dim).bfloat16(),
+        read_indices=torch.tensor([1], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        correction=torch.zeros(1, 1, 1, dim),
+        retained_key=torch.zeros(1, 1, 1, dim),
+        retained_decay=torch.ones(1, 1, 1, dim),
+        retained_length=torch.zeros(1, 1, dtype=torch.int32),
+        live_indices=torch.tensor([2], dtype=torch.int32),
+        record_slots=torch.tensor([0], dtype=torch.int32),
+        record_metadata=torch.tensor([[0, 1, 0]], dtype=torch.int64),
+        record_stamps=torch.full((1, 1, 2), -1, dtype=torch.int64),
+        num_heads=1,
+        head_dim=dim,
+        draft_token_num=1,
+        lower_bound=-5.0,
+    )
+
+
+def _amd_validate(**kwargs):
+    records = pytest.importorskip("tokenspeed_kernel_amd.ops._kda_records")
+    records.validate_kda_retained_verify(
+        *(
+            kwargs[name]
+            for name in (
+                "mixed_qkv",
+                "ring",
+                "ring_heads",
+                "conv_weights",
+                "raw_g",
+                "f_a_out",
+                "f_b_weight",
+                "beta_logits",
+                "A_log",
+                "dt_bias",
+                "state_pool",
+                "read_indices",
+                "query_start_loc",
+                "correction",
+                "retained_key",
+                "retained_decay",
+                "retained_length",
+                "live_indices",
+                "record_slots",
+                "record_metadata",
+                "record_stamps",
+                "num_heads",
+                "head_dim",
+                "draft_token_num",
+            )
+        )
+    )
+
+
+def _amd_launcher(arch):
+    decode = pytest.importorskip(
+        f"tokenspeed_kernel_amd.ops.{arch}.attention.kda.decode"
+    )
+    return getattr(decode, f"launch_gluon_kda_retained_verify_{arch}")
+
+
+@pytest.mark.parametrize("entry", ["validator", "gfx950", "gfx1250"])
+@pytest.mark.parametrize("alias", ["conv weights", "checkpoint", "records"])
+def test_amd_verify_rejects_a_ring_viewing_another_operand(entry, alias):
+    """The AMD verify rejects a ring that views another operand's storage.
+
+    The views take the ring's shape but not the operand's: the weights
+    reshaped, the first elements of live checkpoint page 1, or the bytes of
+    the key records' allocation as BF16. Both launchers validate through the shared
+    check before any launch, and every operand keeps its bits.
+    """
+    args = _amd_verify_operands()
+    ring_shape = (1, 4, 384)
+    # The shared allocations, compared whole: a candidate row stored past
+    # the operand's own elements must show too.
+    shared = {}
+    if alias == "conv weights":
+        ring = args["conv_weights"].view(ring_shape)
+    elif alias == "checkpoint":
+        ring = args["state_pool"][1].flatten()[:1536].view(ring_shape)
+    else:
+        # One record of a six-record allocation, whose bytes hold the ring.
+        key = torch.zeros(1, 1, 6, 128)
+        args["retained_key"] = key[:, :, :1]
+        ring = key.flatten().view(torch.bfloat16).view(ring_shape)
+        shared["key records"] = key
+    shared["ring"] = ring
+    tensors = {k: v for k, v in args.items() if isinstance(v, torch.Tensor)}
+    tensors.update(shared)
+    before = {k: v.clone() for k, v in tensors.items()}
+    with pytest.raises(ValueError, match="must not overlap another verify operand"):
+        if entry == "validator":
+            _amd_validate(ring=ring, **args)
+        else:
+            _amd_launcher(entry)(ring=ring, **args)
+    for name, value in tensors.items():
+        assert torch.equal(value, before[name]), name
+
+
+def test_amd_verify_accepts_a_ring_of_its_own():
+    """A ring in its own allocation passes the AMD check."""
+    args = _amd_verify_operands()
+    _amd_validate(ring=torch.zeros(1, 4, 384).bfloat16(), **args)
+
+
+@pytest.mark.parametrize("entry", ["validator", "gfx950", "gfx1250"])
+@pytest.mark.parametrize(
+    ("operand", "match"),
+    [
+        ("retained_length", "length must be INT32"),
+        ("retained_key", "must not overlap another verify operand"),
+    ],
+)
+def test_amd_verify_rejects_another_argument_bound_to_the_ring(entry, operand, match):
+    """An operand bound to the ring object itself is checked like any view.
+
+    The check skips the ring's own argument position, not the ring object:
+    the length (whose count the launchers read at each slot's base) fails
+    its INT32 [record slots, 1] geometry, and the key records (whose
+    geometry the launchers take from the correction's) fail the overlap
+    check. Nothing changes.
+    """
+    args = _amd_verify_operands()
+    ring = torch.zeros(1, 4, 384).bfloat16()
+    args[operand] = ring
+    tensors = {k: v for k, v in args.items() if isinstance(v, torch.Tensor)}
+    before = {k: v.clone() for k, v in tensors.items()}
+    with pytest.raises(ValueError, match=match):
+        if entry == "validator":
+            _amd_validate(ring=ring, **args)
+        else:
+            _amd_launcher(entry)(ring=ring, **args)
+    for name, value in tensors.items():
+        assert torch.equal(value, before[name]), name
+
+
+def _overlap_replay_case(launch):
+    """A launch's arguments with the live tensors it must leave unchanged."""
+    if launch == "commit":
+        args, pages, _ = _single_layer_commit(2, (1,))
+        return args, _resolve_commit(), (*pages, args["request_ends"])
+    args, states, _, seeding = _prepare_case(1)
+    return args, _resolve_prepare(), (*states, *seeding[0], *seeding[3])
+
+
+@pytest.mark.parametrize("launch", ["prepare", "commit"])
+def test_a_snapshot_sharing_replay_state_bytes_is_rejected_before_launch(launch):
+    """replay_state and replay_snapshot that share a row fail before any launch.
+
+    With replay_state = backing[:slots] and replay_snapshot =
+    backing[slots - 1:], both pass their own layout checks, but the prepare
+    would write snapshot rows the same launch reads as counts, and the
+    commit's publish would clear a row its end programs read as a snapshot.
+    Nothing changes, the shared rows included.
+    """
+    args, run, live = _overlap_replay_case(launch)
+    slots, batch = args["replay_state"].shape[0], args["replay_snapshot"].shape[0]
+    backing = torch.zeros(slots + batch - 1, 2, device="cuda", dtype=torch.int32)
+    backing[:slots] = args["replay_state"]
+    backing[slots:, 1] = 2
+    args["replay_state"] = backing[:slots]
+    args["replay_snapshot"] = backing[slots - 1 :]
+    before = [value.clone() for value in (backing, *live)]
+    with pytest.raises(ValueError, match="must not share memory"):
+        run(**args)
+    torch.cuda.synchronize()
+    for value, original in zip((backing, *live), before):
+        assert torch.equal(value, original)
+
+
+@pytest.mark.parametrize("launch", ["prepare", "commit", "reset"])
+@pytest.mark.parametrize("row_pitch", [0, 1])
+def test_replay_state_rows_that_share_elements_are_rejected(launch, row_pitch):
+    """Expanded (pitch 0) or overlapping (pitch 1) replay_state rows fail before launch."""
+    args, run, live = _overlap_replay_case("commit" if launch == "reset" else launch)
+    slots = args["replay_state"].shape[0]
+    backing = torch.arange(slots + 1, device="cuda", dtype=torch.int32)
+    replay = backing.as_strided((slots, 2), (row_pitch, 1))
+    before = [value.clone() for value in (backing, *live)]
+    with pytest.raises(ValueError, match="disjoint rows"):
+        if launch == "reset":
+            kda.kda_reset_retained_length(
+                replay,
+                write_indices=args["write_indices"][0],
+                record_slots=args["record_slots"],
+                page_count=4,
+            )
+        else:
+            run(**dict(args, replay_state=replay))
+    torch.cuda.synchronize()
+    for value, original in zip((backing, *live), before):
+        assert torch.equal(value, original)
+
+
+@pytest.mark.parametrize(
+    ("state", "snapshot", "shared"),
+    [
+        # Rows {0, 1} and {8, 9}; the snapshot 2..5 lies between them.
+        ((2, 2, 8, 0), (2, 6), False),
+        # The snapshot 2..9 reaches row 1, or 1..4 row 0's second element.
+        ((2, 2, 8, 0), (2, 10), True),
+        ((2, 2, 8, 0), (1, 5), True),
+        # Past the last row, or before the first.
+        ((2, 2, 8, 0), (10, 14), False),
+        ((2, 2, 8, 4), (0, 4), False),
+        # Dense rows shifted by one row: backing[:2] against backing[1:3].
+        ((2, 2, 2, 0), (2, 6), True),
+        # One row, adjacent to or overlapping the snapshot.
+        ((1, 2, 0, 0), (2, 4), False),
+        ((1, 2, 0, 1), (2, 4), True),
+    ],
+)
+def test_replay_overlap_is_exact_for_strided_replay_rows(state, snapshot, shared):
+    """The replay overlap check finds shared elements, not shared spans.
+
+    replay_state is backing.as_strided((rows, 2), (pitch, 1), offset) and
+    the contiguous snapshot backing[begin:end]: a snapshot in the padding
+    between strided rows passes, and one that meets a row's element fails.
+    """
+    from tokenspeed_kernel.ops.attention.kda._retained import _check_separate_replay
+
+    backing = torch.arange(32, dtype=torch.int32)
+    rows, width, pitch, offset = state
+    begin, end = snapshot
+    replay_state = backing.as_strided((rows, width), (pitch, 1), offset)
+    replay_snapshot = backing[begin:end].view(-1, 2)
+    if shared:
+        with pytest.raises(ValueError, match="must not share memory"):
+            _check_separate_replay(replay_state, replay_snapshot)
+    else:
+        _check_separate_replay(replay_state, replay_snapshot)
+
+
+@pytest.mark.parametrize("launch", ["prepare", "commit"])
+def test_a_snapshot_between_strided_replay_rows_runs_like_separate_buffers(launch):
+    """A snapshot in the padding between replay_state rows is accepted.
+
+    The rows sit 2 * batch + 4 elements apart and the snapshot fills the
+    padding after row 0; for the commit's two slots and two rows that is
+    rows {0, 1} and {8, 9} with the snapshot at elements 2..5. The launch
+    leaves the bits of the same launch with separate buffers, in every
+    output, the replay rows and the snapshot, and the padding unchanged.
+    """
+    args, run, live = _overlap_replay_case(launch)
+    state, snapshot = args["replay_state"], args["replay_snapshot"]
+    slots, batch = state.shape[0], snapshot.shape[0]
+    others = [
+        *live,
+        *(
+            value
+            for value in args.values()
+            if isinstance(value, torch.Tensor)
+            and value is not state
+            and value is not snapshot
+        ),
+    ]
+    original = [value.clone() for value in (state, snapshot, *others)]
+    run(**args)
+    torch.cuda.synchronize()
+    expected = [value.clone() for value in (state, snapshot, *others)]
+    for value, before in zip((state, snapshot, *others), original):
+        value.copy_(before)
+
+    pitch = 2 * batch + 4
+    backing = torch.full((slots * pitch,), -7, device="cuda", dtype=torch.int32)
+    strided = backing.as_strided((slots, 2), (pitch, 1))
+    inside = backing[2 : 2 + 2 * batch].view(batch, 2)
+    strided.copy_(original[0])
+    inside.copy_(original[1])
+    padding = torch.ones_like(backing, dtype=torch.bool)
+    padding[2 : 2 + 2 * batch] = False
+    for row in range(slots):
+        padding[row * pitch : row * pitch + 2] = False
+    run(**dict(args, replay_state=strided, replay_snapshot=inside))
+    torch.cuda.synchronize()
+    assert torch.equal(strided, expected[0])
+    assert torch.equal(inside, expected[1])
+    assert bool((backing[padding] == -7).all())
+    for value, want in zip(others, expected[2:]):
+        assert torch.equal(value, want)
+
+
+def _count_amd_dispatches(arch, monkeypatch):
+    """Calls reaching ``arch``'s device dispatch behind its exported launcher."""
+    decode = pytest.importorskip(
+        f"tokenspeed_kernel_amd.ops.{arch}.attention.kda.decode"
+    )
+    calls = []
+
+    def dispatch(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(decode, f"_launch_kda_verify_{arch}", dispatch)
+    return calls
+
+
+@pytest.mark.parametrize("entry", ["validator", "gfx950", "gfx1250"])
+@pytest.mark.parametrize(
+    ("operand", "empty"),
+    [
+        ("retained_key", lambda: torch.zeros(1, 1, 1, 0)),
+        ("retained_decay", lambda: torch.zeros(1, 1, 1, 0)),
+        ("record_stamps", lambda: torch.full((0, 1, 2), -1, dtype=torch.int64)),
+    ],
+    ids=["key", "decay", "stamps"],
+)
+def test_amd_verify_rejects_empty_record_storage_before_dispatch(
+    entry, operand, empty, monkeypatch
+):
+    """Both AMD launchers check every record extent their kernels address.
+
+    The launchers take the record capacity and slot count from the
+    correction and only strides from the key and decay, and store a head of
+    key and decay values and a stamp pair for the live one-token request.
+    A separately allocated [1, 1, 1, 0] key or decay, or a [0, 1, 2] stamp
+    table with metadata, raises ValueError in the shared validator and in
+    both exported launchers before the device dispatch, and every operand
+    keeps its bits.
+    """
+    args = _amd_verify_operands()
+    args[operand] = empty()
+    ring = torch.zeros(1, 4, 384).bfloat16()
+    calls = [] if entry == "validator" else _count_amd_dispatches(entry, monkeypatch)
+    tensors = {k: v for k, v in args.items() if isinstance(v, torch.Tensor)}
+    tensors["ring"] = ring
+    before = {k: v.clone() for k, v in tensors.items()}
+    with pytest.raises(ValueError, match="key and decay|stamps must cover"):
+        if entry == "validator":
+            _amd_validate(ring=ring, **args)
+        else:
+            _amd_launcher(entry)(ring=ring, **args)
+    assert not calls
+    for name, value in tensors.items():
+        assert torch.equal(value, before[name]), name
+
+
+@pytest.mark.parametrize("entry", ["validator", "gfx950", "gfx1250"])
+@pytest.mark.parametrize(
+    ("backing", "match"),
+    [
+        ("ring", "must not overlap another verify operand"),
+        ("own", "stamps must cover"),
+    ],
+)
+def test_amd_empty_stamps_report_a_shared_ring_before_their_geometry(
+    entry, backing, match, monkeypatch
+):
+    """An empty stamp table viewing the ring reports the overlap first.
+
+    With metadata, the live one-token request needs a stamp slot row. A
+    [0, 1, 2] INT64 view of the ring's own allocation raises the storage
+    overlap error, as the other record operands do; a separately allocated
+    empty table raises the stamp geometry error. Both reject in the shared
+    validator and in both exported launchers before the device dispatch.
+    """
+    args = _amd_verify_operands()
+    ring = torch.zeros(1, 4, 384).bfloat16()
+    if backing == "ring":
+        args["record_stamps"] = ring.view(torch.int64).flatten()[:0].view(0, 1, 2)
+    else:
+        args["record_stamps"] = torch.full((0, 1, 2), -1, dtype=torch.int64)
+    calls = [] if entry == "validator" else _count_amd_dispatches(entry, monkeypatch)
+    with pytest.raises(ValueError, match=match):
+        if entry == "validator":
+            _amd_validate(ring=ring, **args)
+        else:
+            _amd_launcher(entry)(ring=ring, **args)
+    assert not calls
+
+
+@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
+def test_amd_launchers_dispatch_valid_records_once(arch, monkeypatch):
+    """The same operands with whole records pass the checks and dispatch once."""
+    args = _amd_verify_operands()
+    calls = _count_amd_dispatches(arch, monkeypatch)
+    _amd_launcher(arch)(ring=torch.zeros(1, 4, 384).bfloat16(), **args)
+    assert len(calls) == 1
+
+
+def _amd_fused_verify(arch, monkeypatch):
+    """``arch``'s registered fused verify wrapper with a stand-in device verify.
+
+    Where the AMD kernels are registered the registered entry is used; it
+    delegates to the module-level wrapper used elsewhere. The stand-in
+    records each call and returns a zero ``[1, tokens, heads, dim]`` result,
+    and the norm returns its input, so only the wrapper's own checks run.
+    """
+    from tokenspeed_kernel.ops.attention.kda import gluon
+
+    calls = []
+
+    def verify(**kwargs):
+        calls.append(kwargs)
+        tokens = kwargs["mixed_qkv"].shape[0]
+        return torch.zeros(1, tokens, kwargs["num_heads"], kwargs["head_dim"])
+
+    monkeypatch.setattr(gluon, f"gluon_kda_retained_verify_{arch}", verify)
+    monkeypatch.setattr(gluon, "apply_kda_output_norm", lambda out, norm: out)
+    wrapper = getattr(
+        gluon,
+        f"gluon_kda_fused_paged_verify_nostore_vmajor_{arch}",
+        getattr(gluon, f"_gluon_kda_fused_paged_verify_vmajor_{arch}"),
+    )
+    return wrapper, calls
+
+
+@pytest.mark.parametrize("arch", ["gfx950", "gfx1250"])
+@pytest.mark.parametrize("norm", ["whole", "empty gate rows", "empty weight"])
+def test_amd_fused_verify_checks_its_output_norm_before_the_verify(
+    arch, norm, monkeypatch
+):
+    """Both registered AMD wrappers check the norm's geometry before verifying.
+
+    The norm reshapes the verify's [1, tokens, heads, dim] output to its
+    gate's rows after the verify wrote ring rows and records. With one
+    token and two heads of width 128, a separate gate shaped [0, 256] or
+    an empty weight raises ValueError before the verify is called; a whole
+    [1, 256] gate and [128] weight reach it once.
+    """
+    args = _amd_verify_operands()
+    wrapper, calls = _amd_fused_verify(arch, monkeypatch)
+    heads, dim = 2, 128
+    gate = torch.zeros(1, heads * dim).bfloat16()
+    weight = torch.ones(dim).bfloat16()
+    if norm == "empty gate rows":
+        gate = torch.zeros(0, heads * dim).bfloat16()
+    elif norm == "empty weight":
+        weight = torch.ones(0).bfloat16()
+    history = kda.KdaRetainedHistory(
+        args["correction"],
+        args["retained_key"],
+        args["retained_decay"],
+        args["retained_length"],
+        args["live_indices"],
+        args["record_slots"],
+    )
+    records = kda.KdaRetainedRecords(
+        preconv=kda.KdaPreconvRing(
+            torch.zeros(1, 4, 384).bfloat16(), args["ring_heads"]
+        ),
+        history=history,
+        metadata=args["record_metadata"],
+        stamps=args["record_stamps"],
+        query_start_loc=args["query_start_loc"],
+    )
+
+    def run():
+        return wrapper(
+            args["mixed_qkv"],
+            args["conv_weights"],
+            args["f_a_out"],
+            args["f_b_weight"],
+            args["beta_logits"],
+            args["A_log"],
+            args["dt_bias"],
+            state_pool=args["state_pool"],
+            read_indices=args["read_indices"],
+            num_heads=heads,
+            head_dim=dim,
+            draft_token_num=1,
+            lower_bound=-5.0,
+            retained_records=records,
+            output_norm=kda.KdaOutputNorm(gate, weight, 1e-5),
+        )
+
+    if norm == "whole":
+        run()
+        assert len(calls) == 1
+    else:
+        with pytest.raises(ValueError, match="output norm"):
+            run()
+        assert not calls
+
+
+@pytest.fixture
+def _kernel_registry():
+    """The live kernel registry, restored with its selection policy afterwards."""
+    from tokenspeed_kernel import selection
+    from tokenspeed_kernel.registry import KernelRegistry
+
+    registry = KernelRegistry.get()
+    saved, policy = registry.snapshot(), selection._policy
+    yield registry
+    selection.set_selection_policy(policy)
+    registry.restore(saved)
+
+
+_FUSES_GEOMETRY = dict(
+    recurrent_layout="v_major",
+    num_heads=2,
+    head_dim=128,
+    draft_token_num=1,
+    batch_size=1,
+)
+
+
+def _register_route_stand_ins(dtype):
+    """Register one stand-in record verify per producer arrangement.
+
+    They lose every ordinary selection (lowest priority) and are reached by
+    name through an override.
+    """
+    from tokenspeed_kernel.registry import register_kernel
+    from tokenspeed_kernel.signature import format_signatures
+
+    def stand_in(*args, **kwargs):
+        raise AssertionError("a producer probe never runs a kernel")
+
+    for route, split in (("fused", False), ("split", True)):
+        register_kernel(
+            "attention",
+            "kda_fused_paged_verify",
+            name=f"stand_in_{route}_route",
+            solution=f"stand_in_{route}_route",
+            signatures=format_signatures(("q", "k", "v"), "dense", {dtype}),
+            priority=0,
+            traits={
+                "retained_history": frozenset({True}),
+                "split_producers": frozenset({split}),
+            },
+        )(stand_in)
+
+
+def test_the_producer_probe_memo_answers_like_a_fresh_probe(
+    _kernel_registry, monkeypatch
+):
+    """One memo answers like a fresh probe across overrides and registry changes.
+
+    The memo is warmed at one geometry, then a scoped override and the
+    environment override select each producer arrangement and are left
+    again; the selected kernel is re-registered with the other arrangement,
+    removed, and the registry restored; the selection policy is replaced.
+    After each change the memo gives the fresh probe's answer, and it asks
+    the selector again only where the selector's own cache was dropped.
+    """
+    from tokenspeed_kernel import selection
+    from tokenspeed_kernel.selection import kernel_override
+
+    registry = _kernel_registry
+    dtype = torch.bfloat16
+    _register_route_stand_ins(dtype)
+    memo = kda.KdaFusesProducersMemo()
+
+    def fresh():
+        return kda.kda_fused_paged_verify_fuses_producers(dtype, **_FUSES_GEOMETRY)
+
+    def check():
+        answer = memo(dtype, **_FUSES_GEOMETRY)
+        assert answer == fresh()
+        return answer
+
+    signature, traits = kda._fuses_producers_query(dtype, *_FUSES_GEOMETRY.values())
+    try:
+        selected = kda.select_kernel(
+            "attention", "kda_fused_paged_verify", signature, traits=traits
+        )
+    except kda.NoKernelFoundError:
+        pytest.skip("no record verify serves this geometry here")
+    base = check()
+    selections = []
+    select = kda.select_kernel
+
+    def counted(*args, **kwargs):
+        selections.append(args[1])
+        return select(*args, **kwargs)
+
+    monkeypatch.setattr(kda, "select_kernel", counted)
+    assert memo(dtype, **_FUSES_GEOMETRY) == base
+    assert not selections  # warmed: the selector's cached kernel still stands
+    for _ in range(2):
+        for route, fuses in (("split", False), ("fused", True)):
+            with kernel_override(
+                "attention", "kda_fused_paged_verify", f"stand_in_{route}_route"
+            ):
+                assert check() is fuses
+        assert check() == base
+    env = "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_KDA_FUSED_PAGED_VERIFY"
+    monkeypatch.setenv(
+        env, "stand_in_fused_route" if not base else "stand_in_split_route"
+    )
+    assert check() is not base
+    monkeypatch.delenv(env)
+    assert check() == base
+
+    # The same kernel, re-registered with the other producer arrangement.
+    saved = registry.snapshot()
+    spec = registry.get_by_name(selected.name)
+    registry.register(
+        replace(spec, traits={**spec.traits, "split_producers": frozenset({base})}),
+        registry.get_impl(selected.name),
+    )
+    assert check() is not base
+    registry.unregister(selected.name)
+    check()
+    registry.restore(saved)
+    assert check() == base
+
+    selections.clear()
+    assert memo(dtype, **_FUSES_GEOMETRY) == base
+    assert not selections
+    # A new policy drops the selector's cache: the memo selects again, once.
+    selection.set_selection_policy(selection.SelectionPolicy())
+    assert memo(dtype, **_FUSES_GEOMETRY) == base
+    assert memo(dtype, **_FUSES_GEOMETRY) == base
+    assert selections == ["kda_fused_paged_verify"]
+
+
+def _cpu_split_operands():
+    """CPU operands a dispatcher accepts for one one-token request, 2 x 128 heads."""
+    shape = (2, 2, 4, 128)
+    history = kda.KdaRetainedHistory(
+        torch.zeros(shape),
+        torch.zeros(shape),
+        torch.ones(shape),
+        torch.zeros(2, 1, dtype=torch.int32),
+        torch.tensor([3], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+    )
+    return dict(
+        mixed=torch.zeros(1, 768, dtype=torch.bfloat16),
+        weights=torch.zeros(768, 4, dtype=torch.bfloat16),
+        reads=torch.tensor([1], dtype=torch.int32),
+        ring=kda.KdaPreconvRing(
+            torch.zeros(2, 4, 768, dtype=torch.bfloat16),
+            torch.tensor([3], dtype=torch.int32),
+        ),
+        history=history,
+        starts=torch.tensor([0, 1], dtype=torch.int32),
+    )
+
+
+def _dispatch_split(operands, validated):
+    """Run both split dispatchers on ``operands`` with ``_validated`` given."""
+    conv = kda.kda_verify_conv_update(
+        operands["mixed"],
+        operands["weights"],
+        operands["reads"],
+        live_indices=operands["history"].live_state_indices,
+        preconv=operands["ring"],
+        record_slots=operands["history"].record_slots,
+        page_count=4,
+        num_heads=2,
+        head_dim=128,
+        draft_token_num=1,
+        query_start_loc=operands["starts"],
+        recurrent_layout="v_major",
+        _validated=validated,
+    )
+    out = kda.kda_fused_paged_verify(
+        operands["mixed"],
+        operands["weights"],
+        None,
+        None,
+        torch.zeros(1, 2, dtype=torch.bfloat16),
+        torch.zeros(2),
+        torch.zeros(256),
+        state_pool=torch.zeros(4, 2, 128, 128),
+        read_indices=operands["reads"],
+        num_heads=2,
+        head_dim=128,
+        draft_token_num=1,
+        retained_records=kda.KdaRetainedRecords(
+            preconv=None,
+            history=operands["history"],
+            metadata=torch.zeros(1, 3, dtype=torch.int64),
+            stamps=torch.zeros(2, 4, 2, dtype=torch.int64),
+            query_start_loc=operands["starts"],
+        ),
+        output_norm=None,
+        recurrent_layout="v_major",
+        lower_bound=None,
+        override=None,
+        solution=None,
+        g_raw=torch.zeros(1, 256, dtype=torch.bfloat16),
+        conv_qkv=conv,
+        _validated=validated,
+    )
+    return conv, out
+
+
+@pytest.mark.parametrize("validated", [False, True])
+def test_the_split_dispatchers_call_a_replacement_kernel_by_its_own_signature(
+    _kernel_registry, validated
+):
+    """A kernel registered with the operators' signatures runs under either flag.
+
+    Stand-ins with exactly the convolution producer's and split verify's
+    signatures before ``_validated`` existed, selected by name, receive the
+    ordinary arguments from both dispatchers whether or not the caller set
+    ``_validated``; a stand-in marked ``_opt_in_validated`` receives it
+    exactly when the caller set it. The registered Triton producer and split
+    verify carry the mark.
+    """
+    from tokenspeed_kernel.ops.attention.kda import triton as kda_triton
+    from tokenspeed_kernel.registry import register_kernel
+    from tokenspeed_kernel.selection import kernel_override
+    from tokenspeed_kernel.signature import format_signatures
+
+    for builtin in (
+        kda_triton.triton_kda_verify_conv_update,
+        kda_triton.triton_nvidia_kda_fused_paged_verify_split,
+    ):
+        assert kda._takes_validated(builtin)
+    signatures = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
+    calls = []
+
+    def legacy_conv_update(
+        mixed_qkv,
+        conv_weights,
+        read_indices,
+        *,
+        live_indices,
+        preconv,
+        record_slots,
+        page_count,
+        num_heads,
+        head_dim,
+        draft_token_num,
+        query_start_loc,
+        bias=None,
+    ):
+        calls.append("legacy producer")
+        return torch.ones_like(mixed_qkv)
+
+    def legacy_split_verify(
+        mixed_qkv,
+        conv_weights,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        *,
+        state_pool,
+        read_indices,
+        num_heads,
+        head_dim,
+        draft_token_num,
+        lower_bound,
+        retained_records,
+        output_norm,
+        g_raw=None,
+        conv_qkv=None,
+    ):
+        calls.append("legacy verify")
+        return conv_qkv
+
+    @kda._opt_in_validated
+    def marked_conv_update(mixed_qkv, *args, **kwargs):
+        calls.append(("marked producer", kwargs.get("_validated")))
+        return torch.ones_like(mixed_qkv)
+
+    @kda._opt_in_validated
+    def marked_split_verify(*args, conv_qkv, **kwargs):
+        calls.append(("marked verify", kwargs.get("_validated")))
+        return conv_qkv
+
+    producer_traits = {
+        "paged_state": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+        "split_producers": frozenset({True}),
+    }
+    verify_traits = {**producer_traits, "retained_history": frozenset({True})}
+    for name, mode, traits, impl in (
+        (
+            "legacy_producer",
+            "kda_verify_conv_update",
+            producer_traits,
+            legacy_conv_update,
+        ),
+        ("legacy_verify", "kda_fused_paged_verify", verify_traits, legacy_split_verify),
+        (
+            "marked_producer",
+            "kda_verify_conv_update",
+            producer_traits,
+            marked_conv_update,
+        ),
+        ("marked_verify", "kda_fused_paged_verify", verify_traits, marked_split_verify),
+    ):
+        register_kernel(
+            "attention",
+            mode,
+            name=name,
+            solution="stand_in",
+            signatures=signatures,
+            priority=0,
+            traits=traits,
+        )(impl)
+    operands = _cpu_split_operands()
+    for kind in ("legacy", "marked"):
+        with kernel_override(
+            "attention", "kda_verify_conv_update", f"{kind}_producer"
+        ), kernel_override("attention", "kda_fused_paged_verify", f"{kind}_verify"):
+            conv, out = _dispatch_split(operands, validated)
+        assert torch.equal(conv, torch.ones(1, 768, dtype=torch.bfloat16))
+        assert out is conv
+    flag = True if validated else None
+    assert calls == [
+        "legacy producer",
+        "legacy verify",
+        ("marked producer", flag),
+        ("marked verify", flag),
+    ]
+
+
+@pytest.mark.parametrize("opted_in", [False, True], ids=["legacy", "opted_in"])
+def test_a_wrapper_of_a_builtin_split_kernel_takes_validated_only_by_its_own_mark(
+    _kernel_registry, opted_in
+):
+    """A wrapper does not inherit the opt-in of the built-in kernel it wraps.
+
+    ``functools.wraps`` copies the wrapped function's attributes, its opt-in
+    mark included. Wrappers of the registered Triton producer and split
+    verify with those operators' signatures from before ``_validated``
+    existed, selected by name, run under both dispatchers when the caller
+    sets ``_validated`` and receive only the ordinary arguments. The same
+    wrappers marked ``_opt_in_validated`` themselves receive it.
+    """
+    import functools
+
+    from tokenspeed_kernel.ops.attention.kda import triton as kda_triton
+    from tokenspeed_kernel.registry import register_kernel
+    from tokenspeed_kernel.selection import kernel_override
+    from tokenspeed_kernel.signature import format_signatures
+
+    builtin_conv = kda_triton.triton_kda_verify_conv_update
+    builtin_verify = kda_triton.triton_nvidia_kda_fused_paged_verify_split
+    calls = []
+
+    if opted_in:
+
+        @kda._opt_in_validated
+        @functools.wraps(builtin_conv)
+        def conv_update(mixed_qkv, *args, **kwargs):
+            calls.append(("producer", kwargs.get("_validated")))
+            return torch.ones_like(mixed_qkv)
+
+        @kda._opt_in_validated
+        @functools.wraps(builtin_verify)
+        def split_verify(*args, conv_qkv, **kwargs):
+            calls.append(("verify", kwargs.get("_validated")))
+            return conv_qkv
+
+    else:
+
+        @functools.wraps(builtin_conv)
+        def conv_update(
+            mixed_qkv,
+            conv_weights,
+            read_indices,
+            *,
+            live_indices,
+            preconv,
+            record_slots,
+            page_count,
+            num_heads,
+            head_dim,
+            draft_token_num,
+            query_start_loc,
+            bias=None,
+        ):
+            calls.append(("producer", None))
+            return torch.ones_like(mixed_qkv)
+
+        @functools.wraps(builtin_verify)
+        def split_verify(
+            mixed_qkv,
+            conv_weights,
+            f_a_out,
+            f_b_weight,
+            beta_logits,
+            A_log,
+            dt_bias,
+            *,
+            state_pool,
+            read_indices,
+            num_heads,
+            head_dim,
+            draft_token_num,
+            lower_bound,
+            retained_records,
+            output_norm,
+            g_raw=None,
+            conv_qkv=None,
+        ):
+            calls.append(("verify", None))
+            return conv_qkv
+
+    # The copied mark names the built-in; an own mark names the wrapper.
+    assert conv_update._accepts_validated is (conv_update if opted_in else builtin_conv)
+    assert split_verify._accepts_validated is (
+        split_verify if opted_in else builtin_verify
+    )
+    assert kda._takes_validated(conv_update) is opted_in
+    assert kda._takes_validated(split_verify) is opted_in
+    producer_traits = {
+        "paged_state": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+        "split_producers": frozenset({True}),
+    }
+    verify_traits = {**producer_traits, "retained_history": frozenset({True})}
+    signatures = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
+    for name, mode, traits, impl in (
+        ("wrapped_producer", "kda_verify_conv_update", producer_traits, conv_update),
+        ("wrapped_verify", "kda_fused_paged_verify", verify_traits, split_verify),
+    ):
+        register_kernel(
+            "attention",
+            mode,
+            name=name,
+            solution="stand_in",
+            signatures=signatures,
+            priority=0,
+            traits=traits,
+        )(impl)
+    with kernel_override(
+        "attention", "kda_verify_conv_update", "wrapped_producer"
+    ), kernel_override("attention", "kda_fused_paged_verify", "wrapped_verify"):
+        conv, out = _dispatch_split(_cpu_split_operands(), True)
+    assert torch.equal(conv, torch.ones(1, 768, dtype=torch.bfloat16))
+    assert out is conv
+    flag = True if opted_in else None
+    assert calls == [("producer", flag), ("verify", flag)]
+
+
+def test_the_producer_probe_memo_reads_traits_edited_in_place(_kernel_registry):
+    """The memo reads a selected kernel's traits as they are when it is asked.
+
+    ``register_kernel`` keeps the caller's traits dictionary. A stand-in
+    record verify that wins selection is registered with an ordinary
+    dictionary naming split producers, and the memo is warmed. Editing that
+    dictionary in place leaves the selector's cache entry standing; the
+    memo's answer follows the edit, like a fresh probe, each way.
+    """
+    from tokenspeed_kernel.registry import KernelRegistry, register_kernel
+    from tokenspeed_kernel.signature import format_signatures
+
+    dtype = torch.bfloat16
+
+    def stand_in(*args, **kwargs):
+        raise AssertionError("a producer probe never runs a kernel")
+
+    traits = {
+        "retained_history": frozenset({True}),
+        "split_producers": frozenset({True}),
+    }
+    register_kernel(
+        "attention",
+        "kda_fused_paged_verify",
+        name="stand_in_edited_route",
+        solution="stand_in_edited_route",
+        signatures=format_signatures(("q", "k", "v"), "dense", {dtype}),
+        priority=19,
+        traits=traits,
+    )(stand_in)
+    assert KernelRegistry.get().get_by_name("stand_in_edited_route").traits is traits
+    memo = kda.KdaFusesProducersMemo()
+
+    def fresh():
+        return kda.kda_fused_paged_verify_fuses_producers(dtype, **_FUSES_GEOMETRY)
+
+    signature, query = kda._fuses_producers_query(dtype, *_FUSES_GEOMETRY.values())
+    selected = kda.select_kernel(
+        "attention", "kda_fused_paged_verify", signature, traits=query
+    )
+    assert selected.name == "stand_in_edited_route"
+    assert memo(dtype, **_FUSES_GEOMETRY) is False
+    for split in (False, True, False):
+        traits["split_producers"] = frozenset({split})
+        assert memo(dtype, **_FUSES_GEOMETRY) is (not split)
+        assert fresh() is (not split)
+    # The selector's cached kernel stood throughout.
+    assert (
+        kda.select_kernel(
+            "attention", "kda_fused_paged_verify", signature, traits=query
+        )
+        is selected
+    )
+
+
+def test_a_ring_pickled_before_its_storage_facts_existed_restores_them(monkeypatch):
+    """A ring pickled as its two fields alone unpickles with its storage facts.
+
+    Rings pickled before ``KdaPreconvRing.__reduce__`` existed carry only
+    ``rows`` and ``heads`` in their state. Loading one rebuilds the storage
+    range, the heads-overlap fact and an empty history memo from them, so its
+    storage checks reject a view of its rows and accept separate storage,
+    exactly as the ring it was pickled from.
+    """
+    import pickle
+
+    rows = torch.zeros(2, 4, 768, dtype=torch.bfloat16)
+    heads = torch.tensor([3, 3], dtype=torch.int32)
+    # The earlier class pickled through object's default reduction: the
+    # class, then its instance dictionary, which held just the two fields.
+    earlier = object.__new__(kda.KdaPreconvRing)
+    earlier.__dict__.update(rows=rows, heads=heads)
+    with monkeypatch.context() as patch:
+        patch.delattr(kda.KdaPreconvRing, "__reduce__")
+        payloads = [
+            pickle.dumps(earlier, protocol=protocol)
+            for protocol in (2, pickle.HIGHEST_PROTOCOL)
+        ]
+    current = kda.KdaPreconvRing(rows, heads)
+    for payload in payloads:
+        restored = pickle.loads(payload)
+        assert isinstance(restored, kda.KdaPreconvRing)
+        assert restored._storage_bounds is not None
+        assert restored._heads_overlap is False
+        assert restored._separate_history is None
+        assert restored.window == current.window == 1
+        with pytest.raises(ValueError, match="storage separate"):
+            restored.check_verify_storage(restored.rows[0, 1])
+        with pytest.raises(ValueError, match="storage separate"):
+            restored.check_separate_storage(restored.rows.flatten()[:0])
+        restored.check_verify_storage(torch.zeros(4), torch.empty(0))
+    # The same state handed to __setstate__ directly, as pickle does.
+    legacy = object.__new__(kda.KdaPreconvRing)
+    ring_heads = rows.flatten()[:2].view(torch.int32)
+    legacy.__setstate__({"rows": rows, "heads": ring_heads})
+    assert legacy._storage_bounds == current._storage_bounds
+    assert legacy._heads_overlap is True
+    with pytest.raises(ValueError, match="storage separate"):
+        legacy.check_verify_storage()

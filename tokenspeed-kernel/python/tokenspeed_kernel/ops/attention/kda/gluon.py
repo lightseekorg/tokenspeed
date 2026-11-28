@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     KdaRetainedHistory,
     KdaRetainedRecords,
     apply_kda_output_norm,
+    check_kda_output_norm,
 )
 from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
@@ -98,51 +99,6 @@ if current_platform().is_amd:
         output, final_state = _kda_prefill_gfx1250_impl(**kwargs)
         return KdaPrefillResult(out=output, final_state=final_state)
 
-    def _gluon_kda_fused_paged_verify_vmajor_gfx950(
-        mixed_qkv: torch.Tensor,
-        conv_weights: torch.Tensor,
-        f_a_out: torch.Tensor,
-        f_b_weight: torch.Tensor,
-        beta_logits: torch.Tensor,
-        A_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        *,
-        state_pool: torch.Tensor,
-        read_indices: torch.Tensor,
-        num_heads: int,
-        head_dim: int,
-        draft_token_num: int,
-        lower_bound: float | None,
-        retained_records: KdaRetainedRecords,
-        output_norm: KdaOutputNorm | None,
-        g_raw: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Fuse gate, convolution and verify; a supplied raw gate takes precedence."""
-        if retained_records.preconv is None:
-            raise ValueError("fused KDA verify requires a pre-convolution ring")
-        result = gluon_kda_retained_verify_gfx950(
-            mixed_qkv=mixed_qkv,
-            preconv=retained_records.preconv,
-            conv_weights=conv_weights,
-            raw_g=g_raw,
-            f_a_out=f_a_out if g_raw is None else None,
-            f_b_weight=f_b_weight if g_raw is None else None,
-            beta_logits=beta_logits,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            state_pool=state_pool[:, :num_heads],
-            read_indices=read_indices,
-            query_start_loc=retained_records.query_start_loc,
-            retained_history=retained_records.history,
-            record_metadata=retained_records.metadata,
-            record_stamps=retained_records.stamps,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            draft_token_num=draft_token_num,
-            lower_bound=lower_bound,
-        )
-        return apply_kda_output_norm(result, output_norm)
-
     @register_kernel(
         "attention",
         "kda_fused_paged_verify",
@@ -165,51 +121,6 @@ if current_platform().is_amd:
     )
     def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(*args, **kwargs):
         return _gluon_kda_fused_paged_verify_vmajor_gfx950(*args, **kwargs)
-
-    def _gluon_kda_fused_paged_verify_vmajor_gfx1250(
-        mixed_qkv: torch.Tensor,
-        conv_weights: torch.Tensor,
-        f_a_out: torch.Tensor,
-        f_b_weight: torch.Tensor,
-        beta_logits: torch.Tensor,
-        A_log: torch.Tensor,
-        dt_bias: torch.Tensor,
-        *,
-        state_pool: torch.Tensor,
-        read_indices: torch.Tensor,
-        num_heads: int,
-        head_dim: int,
-        draft_token_num: int,
-        lower_bound: float | None,
-        retained_records: KdaRetainedRecords,
-        output_norm: KdaOutputNorm | None,
-        g_raw: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Fuse gate, convolution and verify; a supplied raw gate takes precedence."""
-        if retained_records.preconv is None:
-            raise ValueError("fused KDA verify requires a pre-convolution ring")
-        result = gluon_kda_retained_verify_gfx1250(
-            mixed_qkv=mixed_qkv,
-            preconv=retained_records.preconv,
-            conv_weights=conv_weights,
-            raw_g=g_raw,
-            f_a_out=f_a_out if g_raw is None else None,
-            f_b_weight=f_b_weight if g_raw is None else None,
-            beta_logits=beta_logits,
-            A_log=A_log,
-            dt_bias=dt_bias,
-            state_pool=state_pool[:, :num_heads],
-            read_indices=read_indices,
-            query_start_loc=retained_records.query_start_loc,
-            retained_history=retained_records.history,
-            record_metadata=retained_records.metadata,
-            record_stamps=retained_records.stamps,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            draft_token_num=draft_token_num,
-            lower_bound=lower_bound,
-        )
-        return apply_kda_output_norm(result, output_norm)
 
     @register_kernel(
         "attention",
@@ -451,6 +362,85 @@ def gluon_kda_retained_verify_gfx1250(
         head_dim=head_dim,
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
+    )
+
+
+def _gluon_kda_fused_paged_verify(
+    verify,
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    f_a_out: torch.Tensor,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+    retained_records: KdaRetainedRecords,
+    output_norm: KdaOutputNorm | None,
+    g_raw: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fuse gate, convolution and ``verify``; a supplied raw gate takes precedence.
+
+    ``verify`` is the architecture's retained verify, which checks its own
+    operands. The output norm runs after it has written candidate ring rows
+    and records, so the norm's geometry (``check_kda_output_norm`` on the
+    verify's ``[tokens, num_heads, head_dim]`` output) and its storage are
+    checked before the verify.
+    """
+    if retained_records.preconv is None:
+        raise ValueError("fused KDA verify requires a pre-convolution ring")
+    if output_norm is not None:
+        check_kda_output_norm(
+            output_norm,
+            mixed_qkv.shape[0],
+            num_heads,
+            head_dim,
+            device=mixed_qkv.device,
+        )
+        retained_records.preconv.check_separate_storage(
+            output_norm.gate, output_norm.weight
+        )
+    result = verify(
+        mixed_qkv=mixed_qkv,
+        preconv=retained_records.preconv,
+        conv_weights=conv_weights,
+        raw_g=g_raw,
+        f_a_out=f_a_out if g_raw is None else None,
+        f_b_weight=f_b_weight if g_raw is None else None,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool[:, :num_heads],
+        read_indices=read_indices,
+        query_start_loc=retained_records.query_start_loc,
+        retained_history=retained_records.history,
+        record_metadata=retained_records.metadata,
+        record_stamps=retained_records.stamps,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+    )
+    return apply_kda_output_norm(result, output_norm)
+
+
+def _gluon_kda_fused_paged_verify_vmajor_gfx950(*args, **kwargs) -> torch.Tensor:
+    """The gfx950 registered fused verify (``_gluon_kda_fused_paged_verify``)."""
+    return _gluon_kda_fused_paged_verify(
+        gluon_kda_retained_verify_gfx950, *args, **kwargs
+    )
+
+
+def _gluon_kda_fused_paged_verify_vmajor_gfx1250(*args, **kwargs) -> torch.Tensor:
+    """The gfx1250 registered fused verify (``_gluon_kda_fused_paged_verify``)."""
+    return _gluon_kda_fused_paged_verify(
+        gluon_kda_retained_verify_gfx1250, *args, **kwargs
     )
 
 

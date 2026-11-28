@@ -300,6 +300,7 @@ class FusedVerifyStep:
         state: cute.Tensor,
         retained: tuple,
         ring_capacity: Int64,
+        stamp_slots: Int64,
         correction: cute.Tensor,
         out: cute.Tensor,
         query_start_loc: cute.Tensor,
@@ -337,6 +338,7 @@ class FusedVerifyStep:
             state.iterator,
             retained,
             ring_capacity,
+            stamp_slots,
             correction.iterator,
             out.iterator,
             query_start_loc.iterator,
@@ -384,6 +386,7 @@ class FusedVerifyStep:
         state,
         retained: tuple,
         ring_capacity: Int64,
+        stamp_slots: Int64,
         correction,
         out,
         query_start_loc,
@@ -734,17 +737,26 @@ class FusedVerifyStep:
                         stamp_slot = Int64(_load(meta, 0))
                         generation = Int64(_load(meta, 1))
                         start = Int64(_load(meta, 2))
-                        position = Int64(0)
-                        if ring_capacity == self.capacity:
-                            position = start % Int64(self.capacity)
-                        else:
-                            position = start % ring_capacity
-                        tag = cute.make_tensor(
-                            stamps + (stamp_slot * ring_capacity + position) * 2,
-                            cute.make_layout((2,)),
-                        )
-                        tag[0] = start
-                        tag[1] = generation
+                        # Stamp only a slot row the table holds, as the
+                        # Triton and AMD verifies do: padding (slot -1) and
+                        # slots past a short table store nothing.
+                        if (
+                            (stamp_slot >= Int64(0))
+                            & (stamp_slot < stamp_slots)
+                            & (generation >= Int64(0))
+                            & (start >= Int64(0))
+                        ):
+                            position = Int64(0)
+                            if ring_capacity == self.capacity:
+                                position = start % Int64(self.capacity)
+                            else:
+                                position = start % ring_capacity
+                            tag = cute.make_tensor(
+                                stamps + (stamp_slot * ring_capacity + position) * 2,
+                                cute.make_layout((2,)),
+                            )
+                            tag[0] = start
+                            tag[1] = generation
                 projected_history = (accepted > 0) & (
                     accepted <= _MAX_PROJECTED_HISTORY
                 )
@@ -1196,6 +1208,7 @@ def _compile(
         state,
         retained,
         Int64(0),
+        Int64(0),
         correction,
         out,
         query_start_loc,
@@ -1209,6 +1222,9 @@ def _compile(
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
+
+
+_INDEX_DTYPES = (torch.int32, torch.int64)
 
 
 def fused_verify_step_supported(
@@ -1255,12 +1271,22 @@ def fused_verify_step_supported(
     Returns:
         True when the shapes, dtypes, strides and base alignments fit the
         kernel: head width and gate rank 128, BF16 activations, 16-byte aligned
-        projection rows, dense request vectors and unit-stride correction channels.
+        projection rows, dense request vectors and unit-stride correction
+        channels, with a gate input and beta logit row for every token, the
+        ``[num_heads]`` A_log and ``num_heads * head_dim`` dt_bias values the
+        gate loads, a boundary at ``request`` and ``request + 1`` for every
+        request, and every operand on the projection's device.
     """
     width = num_heads * head_dim
+    tokens = mixed_qkv.shape[0]
     rank = f_a_out.shape[-1]
     return (
         head_dim == THREADS
+        # The kernel reads a gate input and num_heads beta logits per token.
+        and mixed_qkv.ndim == f_a_out.ndim == beta_logits.ndim == 2
+        and f_a_out.shape[0] == tokens
+        and beta_logits.shape[0] == tokens
+        and beta_logits.shape[1] >= num_heads
         and mixed_qkv.dtype == torch.bfloat16
         and conv_weights.dtype == torch.bfloat16
         and preconv.rows.dtype == torch.bfloat16
@@ -1285,7 +1311,10 @@ def fused_verify_step_supported(
         and f_a_out.data_ptr() % 16 == 0
         and f_b_weight.data_ptr() % 16 == 0
         and beta_logits.stride(-1) == 1
+        # The kernel loads A_log[head] and dt_bias[head * head_dim + k].
+        and A_log.shape == (num_heads,)
         and A_log.stride(0) == 1
+        and dt_bias.numel() == width
         and dt_bias.is_contiguous()
         and checkpoint_state.shape[1:] == (num_heads, head_dim, head_dim)
         and retained_history.correction.shape[1] == num_heads
@@ -1298,15 +1327,39 @@ def fused_verify_step_supported(
         and checkpoint_state.stride(1) % 4 == 0
         and checkpoint_state.data_ptr() % 16 == 0
         and retained_history.correction.stride(-1) == 1
-        and all(
-            x.ndim == 1 and x.dtype in (torch.int32, torch.int64) and x.stride(0) == 1
-            for x in (
-                query_start_loc,
-                state_indices,
-                retained_history.live_state_indices,
-            )
+        and _dense_index_vector(query_start_loc)
+        and _dense_index_vector(state_indices)
+        and _dense_index_vector(retained_history.live_state_indices)
+        # Request r reads boundaries r and r + 1.
+        and query_start_loc.shape[0] >= state_indices.shape[0] + 1
+        and _on_device(
+            mixed_qkv.device,
+            conv_weights,
+            preconv.rows,
+            f_a_out,
+            f_b_weight,
+            beta_logits,
+            A_log,
+            dt_bias,
+            checkpoint_state,
+            retained_history.correction,
+            query_start_loc,
+            state_indices,
         )
     )
+
+
+def _dense_index_vector(x: torch.Tensor) -> bool:
+    """Whether ``x`` is a unit-stride INT32 or INT64 vector."""
+    return x.ndim == 1 and x.dtype in _INDEX_DTYPES and x.stride(0) == 1
+
+
+def _on_device(device: torch.device, *tensors: torch.Tensor) -> bool:
+    """Whether every one of ``tensors`` is on ``device``."""
+    for tensor in tensors:
+        if tensor.device != device:
+            return False
+    return True
 
 
 def _check_records(
@@ -1314,11 +1367,15 @@ def _check_records(
     record_stamps: torch.Tensor | None,
     batch: int,
     correction_cache: torch.Tensor,
+    window: int = 1,
 ) -> None:
     """Raise ValueError unless the replay records are laid out as the kernel reads them.
 
     The metadata must be dense INT64 ``[batch, 3]`` and the stamps dense INT64
-    ``[slots, capacity, 2]``, both on the cache's device.
+    ``[slots, capacity, 2]``, both on the cache's device. A live request
+    stores its stamp pairs in the slot row its metadata names, at positions
+    modulo the stamp capacity, so a non-empty batch needs a slot row and
+    the capacity must hold the ``window``.
     """
     if (record_metadata is None) != (record_stamps is None):
         raise ValueError("record metadata and stamps must be supplied together")
@@ -1328,6 +1385,8 @@ def _check_records(
         record_metadata.shape != (batch, 3)
         or record_stamps.ndim != 3
         or record_stamps.shape[-1] != 2
+        or (batch > 0 and record_stamps.shape[0] == 0)
+        or record_stamps.shape[1] < window
     ):
         raise ValueError(
             "retained metadata needs [batch,3] and stamps [slots,capacity,2]"
@@ -1340,6 +1399,37 @@ def _check_records(
     ):
         raise ValueError(
             "replay metadata and stamps must be contiguous INT64 on the input device"
+        )
+
+
+def _check_output(
+    out: torch.Tensor, tokens: int, width: int, device: torch.device
+) -> None:
+    """Raise ValueError unless ``out`` has a row of its own of ``width`` channels per token.
+
+    The kernels store token t's channel c at ``out + t * stride(0) + c`` in
+    BF16, so an active output needs unit channel stride on the input
+    ``device`` and, past one token, a row pitch of at least ``width``: an
+    expanded (pitch 0) or overlapping (pitch below ``width``) output would
+    let distinct tokens overwrite one another. Pitched rows (pitch above
+    ``width``) pass. With zero tokens nothing is stored, so only the rank
+    and width are checked.
+    """
+    if out.ndim != 2 or out.shape[0] < tokens or out.shape[1] != width:
+        raise ValueError(
+            "the verify output needs a [tokens, num_heads * head_dim] row per token"
+        )
+    if tokens == 0:
+        return
+    if (
+        out.dtype != torch.bfloat16
+        or out.device != device
+        or out.stride(1) != 1
+        or (tokens > 1 and out.stride(0) < width)
+    ):
+        raise ValueError(
+            "the verify output needs BF16 rows on the input device with unit "
+            "channel stride, no two tokens sharing an element"
         )
 
 
@@ -1391,6 +1481,8 @@ def fused_verify_step(
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
     output_norm: KdaOutputNorm | None,
+    *,
+    _validated: bool = False,
 ) -> torch.Tensor:
     """Run one-token record verify with the gate and convolution producers fused.
 
@@ -1428,6 +1520,11 @@ def fused_verify_step(
             each record position, written with ``record_metadata``; else None.
         output_norm: The layer's gated output RMSNorm to apply before the
             store, or None to store the verify output.
+        _validated: Internal. The registered wrapper, which has just found
+            ``fused_verify_step_supported`` true for these operands (with the
+            whole state pool and boundary vector this entry gets slices
+            of), sets it so the predicate is not evaluated twice. Every
+            other check here still runs. Direct callers leave it False.
 
     Returns:
         ``out``.
@@ -1435,12 +1532,14 @@ def fused_verify_step(
     Raises:
         ValueError: If ``fused_verify_step_supported`` rejects the inputs, the
             record metadata and stamps are not dense INT64 views of the record
-            layout, or the output norm's gate or weight are laid out otherwise.
+            layout (with a slot row), the output norm's gate or weight are
+            laid out otherwise, or the ring shares storage with another
+            operand.
     """
     correction_cache = retained_history.correction
     if mixed_qkv.shape[0] == 0:
         return out
-    if not fused_verify_step_supported(
+    if not _validated and not fused_verify_step_supported(
         mixed_qkv,
         conv_weights,
         preconv,
@@ -1465,7 +1564,27 @@ def fused_verify_step(
     _check_records(
         record_metadata, record_stamps, state_indices.shape[0], correction_cache
     )
+    _check_output(out, mixed_qkv.shape[0], num_heads * head_dim, mixed_qkv.device)
     _check_output_norm(output_norm, out, head_dim)
+    # The kernel stores candidate rows into the ring while it reads every
+    # other operand and writes out.
+    preconv.check_verify_storage(
+        mixed_qkv,
+        conv_weights,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        checkpoint_state,
+        query_start_loc,
+        state_indices,
+        out,
+        record_metadata,
+        record_stamps,
+        history=retained_history,
+        output_norm=output_norm,
+    )
     bounded = lower_bound is not None
     kernel = _compile(
         num_heads,
@@ -1501,6 +1620,7 @@ def fused_verify_step(
             if record_stamps is not None
             else correction_cache.shape[2]
         ),
+        0 if record_stamps is None else record_stamps.shape[0],
         correction_cache,
         out,
         query_start_loc,

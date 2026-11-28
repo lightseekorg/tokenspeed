@@ -1610,3 +1610,472 @@ def test_a_large_window_convolution_update_matches_the_reference_bit_for_bit():
                 query_start_loc=torch.arange(width + 1, dtype=torch.int32, device=DEV),
             ),
         )
+
+
+@pytest.mark.parametrize("gate", ["ring row", "empty ring view", "empty"])
+def test_the_backends_split_verify_checks_its_gate_before_either_producer(
+    gate, monkeypatch
+):
+    """The backend's own split verify checks every operand before a producer runs.
+
+    With a raw gate the backend forks the gate producer, runs the
+    convolution producer on the ring, then verifies their outputs with no
+    ring. One active one-token request supplies a gate that views the ring
+    row its convolution would store (row 3 of its freshly seeded slot), an
+    empty view of the ring's allocation, or an empty gate of its own. The
+    verify raises ValueError before the convolution producer is called; the
+    whole ring allocation, the gate, the replay state and the records keep
+    their bits.
+    """
+    from tokenspeed.runtime.layers.attention.backends.state import kda as kda_state
+
+    harness = _Harness(draft_tokens=1, seed=3301)
+    backend = harness.backend
+    if not backend._verify_split_producers:
+        pytest.skip("this platform's record verify runs no split producers")
+    rpis = [3]
+    pages = _pages(rpis)
+    _write_pages(harness, pages, _page_values(harness, pages, 3302))
+    harness.prepare_metadata(rpis, pages, [9])
+    slot = int(backend._record_slots[0])
+    first = harness.layer_ids[0]
+    inputs = harness.inputs(1, 3303)
+    if gate == "ring row":
+        row = backend._layer_preconv_ring(first)[slot, 3, : harness.key_dim]
+        inputs["g_raw"] = row.view(1, harness.key_dim)
+    elif gate == "empty ring view":
+        inputs["g_raw"] = backend._preconv_ring.flatten()[:0].view(0, harness.key_dim)
+    else:
+        inputs["g_raw"] = torch.empty(
+            0, harness.key_dim, device=DEV, dtype=torch.bfloat16
+        )
+    calls = []
+    producer = kda_state.kda_verify_conv_update
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs.get("record_slots"))
+        return producer(*args, **kwargs)
+
+    monkeypatch.setattr(kda_state, "kda_verify_conv_update", counted)
+    watched = (
+        backend._preconv_ring,
+        inputs["g_raw"],
+        backend._replay_state,
+        backend._retained_records,
+    )
+    torch.cuda.synchronize()
+    before = [value.clone() for value in watched]
+    with pytest.raises(ValueError, match="storage separate|gate must cover"):
+        harness.forward(inputs, 1)
+    torch.cuda.synchronize()
+    assert not calls
+    for value, original in zip(watched, before):
+        _assert_same_bits(value, original)
+
+
+@pytest.mark.parametrize("operand", ["conv bias", "beta", "A_log", "dt_bias"])
+def test_the_backends_split_verify_checks_every_operand_before_either_producer(
+    operand, monkeypatch
+):
+    """The backend's split verify rejects a malformed operand before both producers.
+
+    One active one-token request. An empty convolution bias of its own,
+    with the gate projected from f_a_out (g_raw None), or, with a raw gate
+    of its own, a beta whose rows do not view as [1, tokens, heads] or an
+    empty A_log or dt_bias: each raises ValueError before the gate
+    projection and before the convolution producer is called, and the
+    whole ring allocation, the replay state and the records keep their
+    bits.
+    """
+    from tokenspeed.runtime.layers.attention.backends.state import kda as kda_state
+
+    harness = _Harness(draft_tokens=1, seed=3311)
+    backend = harness.backend
+    if not backend._verify_split_producers:
+        pytest.skip("this platform's record verify runs no split producers")
+    rpis = [3]
+    pages = _pages(rpis)
+    _write_pages(harness, pages, _page_values(harness, pages, 3312))
+    harness.prepare_metadata(rpis, pages, [9])
+    inputs = harness.inputs(1, 3313)
+    params = harness.params[harness.layer_ids[0]]
+    if operand == "conv bias":
+        # A bias keeps the split producers even for a projected gate.
+        params["bias"] = torch.empty(0, device=DEV, dtype=torch.bfloat16)
+    else:
+        # A raw gate keeps the split producers.
+        inputs["g_raw"] = torch.zeros(
+            harness.width, harness.key_dim, device=DEV, dtype=torch.bfloat16
+        )
+        if operand == "beta":
+            inputs["beta_raw"] = torch.zeros(
+                harness.width, harness.H + 1, device=DEV, dtype=torch.bfloat16
+            )
+        else:
+            params[operand] = torch.empty(0, device=DEV, dtype=torch.float32)
+    gate_calls, conv_calls = [], []
+    gate = backend._kda_gate
+    producer = kda_state.kda_verify_conv_update
+
+    def counted_gate(*args, **kwargs):
+        gate_calls.append(args)
+        return gate(*args, **kwargs)
+
+    def counted_conv(*args, **kwargs):
+        conv_calls.append(kwargs.get("record_slots"))
+        return producer(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "_kda_gate", counted_gate)
+    monkeypatch.setattr(kda_state, "kda_verify_conv_update", counted_conv)
+    watched = (
+        backend._preconv_ring,
+        backend._replay_state,
+        backend._retained_records,
+    )
+    torch.cuda.synchronize()
+    before = [value.clone() for value in watched]
+    with pytest.raises(ValueError, match="convolution bias|beta|gate parameters"):
+        harness.forward(inputs, 1)
+    torch.cuda.synchronize()
+    assert not gate_calls
+    assert not conv_calls
+    for value, original in zip(watched, before):
+        _assert_same_bits(value, original)
+
+
+@pytest.mark.parametrize("operand", ["conv weights", "ring"])
+def test_the_backends_split_verify_checks_its_producers_device_before_either_producer(
+    operand, monkeypatch
+):
+    """The backend's split verify rejects producer operands on another device.
+
+    One active one-token request with a raw gate of its own, which keeps the
+    split producers. The convolution launch takes the weights and the ring
+    as bare pointers: a host copy of the layer's convolution weights, or a
+    ring whose rows and heads are host copies, raises ValueError before the
+    gate producer and before the convolution producer is called, and the
+    whole device ring allocation, the replay state and the records keep
+    their bits.
+    """
+    from tokenspeed.runtime.layers.attention.backends.state import kda as kda_state
+
+    harness = _Harness(draft_tokens=1, seed=3321)
+    backend = harness.backend
+    if not backend._verify_split_producers:
+        pytest.skip("this platform's record verify runs no split producers")
+    rpis = [3]
+    pages = _pages(rpis)
+    _write_pages(harness, pages, _page_values(harness, pages, 3322))
+    harness.prepare_metadata(rpis, pages, [9])
+    inputs = harness.inputs(1, 3323)
+    inputs["g_raw"] = torch.zeros(
+        harness.width, harness.key_dim, device=DEV, dtype=torch.bfloat16
+    )
+    params = harness.params[harness.layer_ids[0]]
+    if operand == "conv weights":
+        params["conv_weights"] = params["conv_weights"].cpu()
+    else:
+        rows = backend._preconv_ring_rows
+
+        def host_ring(layer_id, batch_size):
+            ring = rows(layer_id, batch_size)
+            return KdaPreconvRing(ring.rows.cpu(), ring.heads.cpu())
+
+        monkeypatch.setattr(backend, "_preconv_ring_rows", host_ring)
+    gate_calls, conv_calls = [], []
+    gate = backend._kda_gate
+    producer = kda_state.kda_verify_conv_update
+
+    def counted_gate(*args, **kwargs):
+        gate_calls.append(args)
+        return gate(*args, **kwargs)
+
+    def counted_conv(*args, **kwargs):
+        conv_calls.append(kwargs.get("record_slots"))
+        return producer(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "_kda_gate", counted_gate)
+    monkeypatch.setattr(kda_state, "kda_verify_conv_update", counted_conv)
+    watched = (
+        backend._preconv_ring,
+        backend._replay_state,
+        backend._retained_records,
+    )
+    torch.cuda.synchronize()
+    before = [value.clone() for value in watched]
+    with pytest.raises(ValueError, match="share one device"):
+        harness.forward(inputs, 1)
+    torch.cuda.synchronize()
+    assert not gate_calls
+    assert not conv_calls
+    for value, original in zip(watched, before):
+        _assert_same_bits(value, original)
+
+
+@pytest.mark.parametrize("shape", [(1,), (1, 1)], ids=["vector", "one_row"])
+def test_the_backends_split_verify_needs_a_token_axis_on_its_gate_activation(
+    shape, monkeypatch
+):
+    """A projected gate's activation needs a token axis before either producer.
+
+    One active one-token request whose gate the backend projects (g_raw
+    None) with a convolution bias, which keeps the split producers. The
+    activation feeds a one-column projection ``[num_heads * head_dim, 1]``.
+    As a vector ``[1]`` its single element is not a token row: taking the
+    projection's rows would take its channels. The verify raises ValueError
+    before the gate projection and before the convolution producer is
+    called, and the whole ring allocation, the replay state and the records
+    keep their bits. The same value as a ``[1, 1]`` row runs every layer's
+    two producers once.
+    """
+    from tokenspeed.runtime.layers.attention.backends.state import kda as kda_state
+
+    harness = _Harness(draft_tokens=1, seed=3341)
+    backend = harness.backend
+    if not backend._verify_split_producers:
+        pytest.skip("this platform's record verify runs no split producers")
+    rpis = [3]
+    pages = _pages(rpis)
+    _write_pages(harness, pages, _page_values(harness, pages, 3342))
+    harness.prepare_metadata(rpis, pages, [9])
+    inputs = harness.inputs(1, 3343)
+    inputs["f_a_out"] = torch.full(shape, 0.5, device=DEV, dtype=torch.bfloat16)
+    for layer in harness.layer_ids:
+        params = harness.params[layer]
+        params["f_b_weight"] = torch.full(
+            (harness.key_dim, 1), 0.25, device=DEV, dtype=torch.bfloat16
+        )
+        params["bias"] = torch.zeros(harness.conv_dim, device=DEV, dtype=torch.bfloat16)
+    gate_calls, conv_calls = [], []
+    gate = backend._kda_gate
+    producer = kda_state.kda_verify_conv_update
+
+    def counted_gate(*args, **kwargs):
+        gate_calls.append(args)
+        return gate(*args, **kwargs)
+
+    def counted_conv(*args, **kwargs):
+        conv_calls.append(kwargs.get("record_slots"))
+        return producer(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "_kda_gate", counted_gate)
+    monkeypatch.setattr(kda_state, "kda_verify_conv_update", counted_conv)
+    if len(shape) == 2:
+        outputs = harness.forward(inputs, 1)
+        torch.cuda.synchronize()
+        assert len(outputs) == len(harness.layer_ids)
+        assert len(gate_calls) == len(conv_calls) == len(harness.layer_ids)
+        return
+    watched = (
+        backend._preconv_ring,
+        backend._replay_state,
+        backend._retained_records,
+    )
+    torch.cuda.synchronize()
+    before = [value.clone() for value in watched]
+    with pytest.raises(ValueError, match="gate must cover"):
+        harness.forward(inputs, 1)
+    torch.cuda.synchronize()
+    assert not gate_calls
+    assert not conv_calls
+    for value, original in zip(watched, before):
+        _assert_same_bits(value, original)
+
+
+def test_one_backend_routes_its_producers_like_a_fresh_probe(monkeypatch):
+    """A warmed backend's producer routing follows overrides, the registry and patches.
+
+    One backend answers ``_fuses_producers`` at one geometry, then: a scoped
+    override selects each producer arrangement and is left again, twice;
+    the kernel selection had picked is re-registered with the other
+    arrangement, and the registry is restored; the module's probe is
+    replaced, and put back. Every answer is the one a fresh
+    ``kda_fused_paged_verify_fuses_producers`` (or the replacement) gives.
+    """
+    from dataclasses import replace
+
+    from tokenspeed_kernel import selection
+    from tokenspeed_kernel.ops.attention import kda as kda_ops
+    from tokenspeed_kernel.registry import KernelRegistry, register_kernel
+    from tokenspeed_kernel.signature import format_signatures
+
+    from tokenspeed.runtime.layers.attention.backends.state import kda as kda_state
+
+    harness = _Harness(draft_tokens=1, seed=3351)
+    backend = harness.backend
+    dtype, layout = backend.dtype, backend.kda_recurrent_layout
+    geometry = dict(
+        recurrent_layout=layout,
+        num_heads=harness.H,
+        head_dim=D,
+        draft_token_num=1,
+        batch_size=1,
+    )
+
+    def routed():
+        return backend._fuses_producers(harness.H, D, 1, 1)
+
+    def fresh():
+        return kda_ops.kda_fused_paged_verify_fuses_producers(dtype, **geometry)
+
+    registry = KernelRegistry.get()
+    saved = registry.snapshot()
+    try:
+
+        def stand_in(*args, **kwargs):
+            raise AssertionError("a producer probe never runs a kernel")
+
+        for route, split in (("fused", False), ("split", True)):
+            register_kernel(
+                "attention",
+                "kda_fused_paged_verify",
+                name=f"stand_in_{route}_route",
+                solution=f"stand_in_{route}_route",
+                signatures=format_signatures(("q", "k", "v"), "dense", {dtype}),
+                priority=0,
+                traits={
+                    "retained_history": frozenset({True}),
+                    "split_producers": frozenset({split}),
+                },
+            )(stand_in)
+        signature, traits = kda_ops._fuses_producers_query(dtype, *geometry.values())
+        try:
+            selected = selection.select_kernel(
+                "attention", "kda_fused_paged_verify", signature, traits=traits
+            )
+        except selection.NoKernelFoundError:
+            pytest.skip("no record verify serves this geometry here")
+        base = routed()
+        assert base == fresh()
+        for _ in range(2):
+            for route, fuses in (("split", False), ("fused", True)):
+                with selection.kernel_override(
+                    "attention", "kda_fused_paged_verify", f"stand_in_{route}_route"
+                ):
+                    assert routed() is fuses
+                    assert fresh() is fuses
+            assert routed() == base
+
+        restore_to = registry.snapshot()
+        spec = registry.get_by_name(selected.name)
+        registry.register(
+            replace(spec, traits={**spec.traits, "split_producers": frozenset({base})}),
+            registry.get_impl(selected.name),
+        )
+        assert routed() is not base
+        assert fresh() is not base
+        registry.restore(restore_to)
+        assert routed() == base
+
+        calls = []
+
+        def replacement(*args, **kwargs):
+            calls.append(kwargs["batch_size"])
+            return not base
+
+        monkeypatch.setattr(
+            kda_state, "kda_fused_paged_verify_fuses_producers", replacement
+        )
+        assert routed() is not base
+        assert routed() is not base
+        assert calls == [1, 1]
+        monkeypatch.undo()
+        assert routed() == base
+    finally:
+        registry.restore(saved)
+
+
+def test_one_backend_routes_by_traits_its_registrant_edits_in_place(monkeypatch):
+    """A warmed backend's producer routing follows traits edited in place.
+
+    ``register_kernel`` keeps the caller's traits dictionary. A stand-in
+    record verify that wins selection is registered with an ordinary
+    dictionary naming split producers. One backend's route probe answers
+    split, like a fresh probe, and its verify runs the convolution producer
+    and hands the stand-in the producers' outputs. The registrant then edits
+    the same dictionary in place to inline producers, which leaves the
+    selector's cache entry standing. The backend's route probe and its next
+    verify follow the edit, like a fresh probe: the stand-in is reached with
+    no convolution producer run and no producer outputs.
+    """
+    from tokenspeed_kernel.ops.attention import kda as kda_ops
+    from tokenspeed_kernel.registry import KernelRegistry, register_kernel
+    from tokenspeed_kernel.signature import format_signatures
+
+    from tokenspeed.runtime.layers.attention.backends.state import kda as kda_state
+
+    harness = _Harness(draft_tokens=1, seed=3361)
+    backend = harness.backend
+    if not backend._verify_split_producers:
+        pytest.skip("this platform's record verify runs no split producers")
+    dtype, layout = backend.dtype, backend.kda_recurrent_layout
+    geometry = dict(
+        recurrent_layout=layout,
+        num_heads=harness.H,
+        head_dim=D,
+        draft_token_num=1,
+        batch_size=1,
+    )
+
+    def routed():
+        return backend._fuses_producers(harness.H, D, 1, 1)
+
+    def fresh():
+        return kda_ops.kda_fused_paged_verify_fuses_producers(dtype, **geometry)
+
+    class Reached(Exception):
+        pass
+
+    reached, conv_calls = [], []
+
+    def stand_in(*args, conv_qkv=None, **kwargs):
+        reached.append(conv_qkv is not None)
+        raise Reached
+
+    producer = kda_state.kda_verify_conv_update
+
+    def counted_conv(*args, **kwargs):
+        conv_calls.append(kwargs.get("record_slots"))
+        return producer(*args, **kwargs)
+
+    monkeypatch.setattr(kda_state, "kda_verify_conv_update", counted_conv)
+    rpis = [3]
+    pages = _pages(rpis)
+    _write_pages(harness, pages, _page_values(harness, pages, 3362))
+    harness.prepare_metadata(rpis, pages, [9])
+    inputs = harness.inputs(1, 3363)
+    traits = {
+        "retained_history": frozenset({True}),
+        "split_producers": frozenset({True}),
+    }
+    registry = KernelRegistry.get()
+    saved = registry.snapshot()
+    try:
+        register_kernel(
+            "attention",
+            "kda_fused_paged_verify",
+            name="stand_in_edited_route",
+            solution="stand_in_edited_route",
+            signatures=format_signatures(("q", "k", "v"), "dense", {dtype}),
+            priority=19,
+            traits=traits,
+        )(stand_in)
+        assert registry.get_by_name("stand_in_edited_route").traits is traits
+        assert routed() is False
+        assert fresh() is False
+        with pytest.raises(Reached):
+            harness.forward(inputs, 1)
+        torch.cuda.synchronize()
+        assert reached == [True]
+        assert len(conv_calls) == 1
+
+        traits["split_producers"] = frozenset({False})
+        assert routed() is True
+        assert fresh() is True
+        with pytest.raises(Reached):
+            harness.forward(inputs, 1)
+        torch.cuda.synchronize()
+        assert reached == [True, False]
+        assert len(conv_calls) == 1
+    finally:
+        registry.restore(saved)

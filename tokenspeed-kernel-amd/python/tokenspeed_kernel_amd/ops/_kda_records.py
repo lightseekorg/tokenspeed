@@ -153,12 +153,38 @@ def validate_kda_retained_verify(
     dim,
     window,
 ):
-    """Validate producer/request correspondence for pointer-only AMD launchers."""
+    """Validate producer/request correspondence for pointer-only AMD launchers.
+
+    The launchers pass pointers and strides, so every extent the kernels
+    address is checked here: the per-token projection, gate and beta rows,
+    the gate parameters, the checkpoint heads, the request vectors and
+    boundaries, the ring, and FP32 correction, key and decay records of one
+    ``[record slots, heads, capacity, dim]`` geometry (the launchers take
+    the capacity and slot count from ``correction`` and the strides from
+    each).
+
+    Also rejects a ring whose storage overlaps any other operand: the
+    projection rows, convolution weights, gate inputs and parameters, the
+    checkpoint, indices and boundaries, ring heads, records, counts, record
+    metadata and stamps, each compared by argument position, so an operand
+    bound to the ring object itself is rejected too. The counts must be
+    INT32 [record slots, 1]. The launchers allocate the output themselves.
+    """
     import torch
 
     batch, tokens = reads.numel(), mixed.shape[0]
     if (
+        correction.ndim != 4
+        or correction.shape[1:] != (heads, correction.shape[2], dim)
+        or correction.dtype != torch.float32
+    ):
+        raise ValueError(
+            "retained KDA correction, key and decay must be FP32 "
+            "[record slots, heads, capacity, dim]"
+        )
+    if (
         dim != 128
+        or heads <= 0
         or window <= 0
         or window > correction.shape[2]
         or tokens > batch * window
@@ -186,10 +212,11 @@ def validate_kda_retained_verify(
         raise ValueError(
             "retained KDA producers require matching activation dtype and contiguous channels"
         )
-    if weights.shape != (3 * heads * dim, 4) or state.stride()[1:] != (
-        dim * dim,
-        dim,
-        1,
+    if (
+        weights.shape != (3 * heads * dim, 4)
+        or state.ndim != 4
+        or state.shape[1:] != (heads, dim, dim)
+        or state.stride()[1:] != (dim * dim, dim, 1)
     ):
         raise ValueError("retained KDA requires four-tap convolution and V-major state")
     if (
@@ -219,13 +246,24 @@ def validate_kda_retained_verify(
         or live.shape != (batch,)
         or record_slots.shape != (batch,)
         or starts.shape != (batch + 1,)
+        or any(
+            x.dtype not in (torch.int32, torch.int64)
+            for x in (reads, live, record_slots, starts)
+        )
     ):
         raise ValueError("retained KDA request indices must match query boundaries")
     if (metadata is None) != (stamps is None):
         raise ValueError("retained KDA metadata and stamps must be supplied together")
-    tensors = (
+    # The launchers read only the length's row stride; the count itself is
+    # read at each slot's base, so it must be the typed history's INT32
+    # [record slots, 1].
+    if length.shape != (correction.shape[0], 1) or length.dtype != torch.int32:
+        raise ValueError("retained KDA length must be INT32 [record slots, 1]")
+    # Every operand but the ring argument itself, by position: another
+    # argument bound to the ring object overlaps it like any other view.
+    operands = (
+        mixed,
         weights,
-        ring,
         ring_heads,
         *gate_inputs,
         beta,
@@ -254,14 +292,35 @@ def validate_kda_retained_verify(
             raise ValueError(
                 "retained KDA stamps must cover request slots and history capacity"
             )
-        tensors += (metadata, stamps)
+        operands += (metadata, stamps)
+    # The verify stores candidate rows into the ring while it reads every
+    # other operand, so none may share the ring's storage, whatever its
+    # shape; an empty view of it included. An empty ring stores nothing.
     destination = ring.untyped_storage()
     begin, end = destination.data_ptr(), destination.data_ptr() + destination.nbytes()
-    for producer in (mixed, beta, *gate_inputs):
-        storage = producer.untyped_storage()
+    for operand in operands if ring.numel() else ():
+        storage = operand.untyped_storage()
         if begin < storage.data_ptr() + storage.nbytes() and storage.data_ptr() < end:
-            raise ValueError("the pre-convolution ring must not overlap producers")
-    if any(x.device != mixed.device for x in tensors):
+            raise ValueError(
+                "the pre-convolution ring must not overlap another verify operand"
+            )
+    # A live request stores its stamps in the slot row its metadata names;
+    # the kernels skip slots past the table, so a non-empty batch needs one.
+    # Checked after the overlap so a ring-backed empty table reports overlap.
+    if metadata is not None and batch > 0 and stamps.shape[0] == 0:
+        raise ValueError(
+            "retained KDA stamps must cover request slots and history capacity"
+        )
+    # The kernels store a head of key and decay values per candidate at the
+    # correction's slot, head and position: both need its whole geometry.
+    if any(
+        x.shape != correction.shape or x.dtype != torch.float32 for x in (key, decay)
+    ):
+        raise ValueError(
+            "retained KDA correction, key and decay must be FP32 "
+            "[record slots, heads, capacity, dim]"
+        )
+    if any(x.device != mixed.device for x in (ring, *operands)):
         raise ValueError("retained KDA inputs must be on the same device")
 
 

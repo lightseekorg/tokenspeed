@@ -65,6 +65,7 @@ from tokenspeed_kernel.ops.attention.kda._cute_dsl.fused_verify_step import (
     _DTYPES,
     CONV_TAPS,
     _bf16,
+    _check_output,
     _check_output_norm,
     _check_records,
     _silu,
@@ -376,6 +377,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
         dt_bias: cute.Tensor,
         retained: tuple,
         ring_capacity: Int64,
+        stamp_slots: Int64,
         correction: cute.Tensor,
         out: cute.Tensor,
         query_start_loc: cute.Tensor,
@@ -412,6 +414,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
             dt_bias.iterator,
             retained,
             ring_capacity,
+            stamp_slots,
             correction.iterator,
             out.iterator,
             query_start_loc.iterator,
@@ -455,6 +458,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
         dt_bias,
         retained: tuple,
         ring_capacity: Int64,
+        stamp_slots: Int64,
         correction,
         out,
         query_start_loc,
@@ -736,12 +740,19 @@ class FusedVerifyWindow(RecoverSsmVerify):
                         Float32(1.0), Float32(1.0) + _exp(-raw_beta.to(Float32))
                     )
                 if const_expr(self.has_metadata):
-                    # One CTA per request stamps the positions this window records.
+                    # One CTA per request stamps the positions this window
+                    # records, only in a slot row the table holds, as the
+                    # Triton and AMD verifies do: padding (slot -1) and slots
+                    # past a short table store nothing.
                     if (
                         (value_tile == 0)
                         & (head == 0)
                         & (tidx < W)
                         & (tidx < valid_tokens)
+                        & (stamp_slot >= Int64(0))
+                        & (stamp_slot < stamp_slots)
+                        & (generation >= Int64(0))
+                        & (start >= Int64(0))
                     ):
                         self._stamp_position(
                             stamps, stamp_slot, ring_capacity, start, generation, tidx
@@ -1292,6 +1303,7 @@ def _compile(
         dt_bias,
         retained,
         Int64(0),
+        Int64(0),
         correction,
         out,
         query_start_loc,
@@ -1433,13 +1445,14 @@ def fused_verify_window_supported(
 
     Returns:
         True when the one-token kernel's layout conditions hold, the window
-        has 2 to 16 tokens, the ring keeps window + 3 rows and its rows
-        take 16-byte copies.
+        has 2 to 16 tokens and fits the record capacity, the ring keeps
+        window + 3 rows and its rows take 16-byte copies.
     """
     rows = preconv.rows
     return (
         2 <= window <= MAX_WINDOW
         and preconv.window == window
+        and retained_history.correction.shape[2] >= window
         and rows.stride(-1) == 1
         and rows.stride(0) % 8 == 0
         and rows.stride(1) % 8 == 0
@@ -1485,6 +1498,8 @@ def fused_verify_window(
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
     output_norm: KdaOutputNorm | None,
+    *,
+    _validated: bool = False,
 ) -> torch.Tensor:
     """Run multi-token record verify with the gate and convolution producers fused.
 
@@ -1524,6 +1539,11 @@ def fused_verify_window(
             each record position, written with ``record_metadata``; else None.
         output_norm: The layer's gated output RMSNorm to apply before the
             store, or None to store the verify output.
+        _validated: Internal. The registered wrapper, which has just found
+            ``fused_verify_window_supported`` true for these operands (with the
+            whole state pool and boundary vector this entry gets slices
+            of), sets it so the predicate is not evaluated twice. Every
+            other check here still runs. Direct callers leave it False.
 
     Returns:
         ``out``.
@@ -1531,13 +1551,14 @@ def fused_verify_window(
     Raises:
         ValueError: If ``fused_verify_window_supported`` rejects the inputs,
             the record metadata and stamps are not dense INT64 views of the
-            record layout, or the output norm's gate or weight are laid out
-            otherwise.
+            record layout (with a slot row and room for the window), the
+            output norm's gate or weight are laid out otherwise, or the ring
+            shares storage with another operand.
     """
     correction_cache = retained_history.correction
     if mixed_qkv.shape[0] == 0:
         return out
-    if not fused_verify_window_supported(
+    if not _validated and not fused_verify_window_supported(
         mixed_qkv,
         conv_weights,
         preconv,
@@ -1557,9 +1578,33 @@ def fused_verify_window(
     ):
         raise ValueError("CuTe DSL fused KDA verify window cannot address these inputs")
     _check_records(
-        record_metadata, record_stamps, state_indices.shape[0], correction_cache
+        record_metadata,
+        record_stamps,
+        state_indices.shape[0],
+        correction_cache,
+        window,
     )
+    _check_output(out, mixed_qkv.shape[0], num_heads * head_dim, mixed_qkv.device)
     _check_output_norm(output_norm, out, head_dim)
+    # The kernel stores candidate rows into the ring while it reads every
+    # other operand and writes out.
+    preconv.check_verify_storage(
+        mixed_qkv,
+        conv_weights,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        checkpoint_state,
+        query_start_loc,
+        state_indices,
+        out,
+        record_metadata,
+        record_stamps,
+        history=retained_history,
+        output_norm=output_norm,
+    )
     bounded = lower_bound is not None
     value_tile_rows = _value_tile_rows(
         state_indices.shape[0], num_heads, window, head_dim
@@ -1619,6 +1664,7 @@ def fused_verify_window(
             if record_stamps is not None
             else correction_cache.shape[2]
         ),
+        0 if record_stamps is None else record_stamps.shape[0],
         correction_cache,
         out,
         query_start_loc,

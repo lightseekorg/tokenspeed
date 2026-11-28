@@ -32,11 +32,11 @@ import torch
 from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.kda import (
     KdaOutputNorm,
-    KdaPreconvRing,
     KdaPrefillCapacity,
     KdaPrefillResult,
     KdaRetainedHistory,
     KdaRetainedRecords,
+    check_kda_split_verify_extents,
     kda_verify_conv_update,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import (
@@ -156,32 +156,6 @@ def cutedsl_kda_chunk_prefill(
     return out.view(batch, tokens, heads, dim), final_state
 
 
-def _check_ring_storage(
-    preconv: KdaPreconvRing,
-    mixed_qkv: torch.Tensor,
-    conv_weights: torch.Tensor,
-    f_a_out: torch.Tensor | None,
-    f_b_weight: torch.Tensor,
-    beta_logits: torch.Tensor,
-    g_raw: torch.Tensor | None,
-    output_norm: KdaOutputNorm | None,
-) -> None:
-    """Raise ValueError when the ring shares storage with a verify input.
-
-    Checked before either route runs, as the Triton producer and the AMD
-    launchers do: the fused kernel writes the ring while it reads these.
-    """
-    preconv.check_separate_storage(
-        mixed_qkv,
-        conv_weights,
-        f_a_out,
-        f_b_weight,
-        beta_logits,
-        g_raw,
-        None if output_norm is None else output_norm.gate,
-    )
-
-
 def _split_producer_verify(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
@@ -204,8 +178,54 @@ def _split_producer_verify(
     """Run the split gate and convolution producers, then the split verify.
 
     The convolution producer reads and writes the pre-convolution ring, so
-    the verify that follows takes the records without it.
+    the verify that follows takes the records without it. The ring is
+    checked against every operand of both launches first, and every
+    operand the verify and the norm read against the producer's tokens
+    (check_kda_split_verify_extents): the producer's own check cannot see
+    the checkpoint, records, gate, beta, gate parameters or norm its
+    consumer reads.
     """
+    records = retained_records
+    check_kda_split_verify_extents(
+        mixed_qkv.shape[0],
+        num_heads,
+        head_dim,
+        g_raw=g_raw,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        history=records.history,
+        query_start_loc=records.query_start_loc,
+        record_metadata=records.metadata,
+        record_stamps=records.stamps,
+        draft_token_num=draft_token_num,
+        device=mixed_qkv.device,
+        output_norm=output_norm,
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        preconv=records.preconv,
+    )
+    retained_records.preconv.check_verify_storage(
+        mixed_qkv,
+        conv_weights,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        g_raw,
+        state_pool,
+        read_indices,
+        retained_records.metadata,
+        retained_records.stamps,
+        retained_records.query_start_loc,
+        history=retained_records.history,
+        output_norm=output_norm,
+    )
     if g_raw is None:
         g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
     conv_qkv = kda_verify_conv_update(
@@ -221,6 +241,8 @@ def _split_producer_verify(
         draft_token_num=draft_token_num,
         recurrent_layout="v_major",
         query_start_loc=retained_records.query_start_loc,
+        # Both checks above covered the producer's operands.
+        _validated=True,
     )
     return triton_nvidia_kda_fused_paged_verify_split(
         mixed_qkv,
@@ -240,6 +262,8 @@ def _split_producer_verify(
         output_norm=output_norm,
         g_raw=g_raw,
         conv_qkv=conv_qkv,
+        # Its operands are the ones checked above, the gate from them.
+        _validated=True,
     )
 
 
@@ -418,7 +442,8 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         whose rows before each request's head give the convolution history.
         The recurrent state is read only. Inputs the CuTe DSL kernel cannot
         address run those split producers instead. ``output_norm`` is
-        applied before the store.
+        applied before the store. Either route raises ValueError before
+        any launch when the ring shares storage with another operand.
 
         Returns the verify output as ``[1, tokens, num_heads, head_dim]``, or
         with ``output_norm`` the normed ``[tokens, num_heads * head_dim]``.
@@ -436,16 +461,6 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             raise ValueError(
                 f"fused verify step takes one-token windows, got {draft_token_num}"
             )
-        _check_ring_storage(
-            retained_records.preconv,
-            mixed_qkv,
-            conv_weights,
-            f_a_out,
-            f_b_weight,
-            beta_logits,
-            g_raw,
-            output_norm,
-        )
         batch = read_indices.shape[0]
         rows = batch * draft_token_num
         mixed_qkv = mixed_qkv[:rows]
@@ -510,6 +525,8 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             retained_records.metadata,
             retained_records.stamps,
             output_norm,
+            # fused_verify_step_supported held above for these operands.
+            _validated=True,
         )
         return out if output_norm is None else out.view(rows, num_heads * head_dim)
 
@@ -567,7 +584,9 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         ``retained_records.preconv``, whose rows before each request's head
         give the convolution history. The recurrent state is read only.
         Inputs the CuTe DSL kernel cannot address run those split producers
-        instead. ``output_norm`` is applied before the store.
+        instead. ``output_norm`` is applied before the store. Either route
+        raises ValueError before any launch when the ring shares storage
+        with another operand.
 
         Returns the verify output as ``[1, tokens, num_heads, head_dim]``, or
         with ``output_norm`` the normed ``[tokens, num_heads * head_dim]``.
@@ -581,16 +600,6 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             raise ValueError(
                 "fused verify window requires records with a pre-convolution ring"
             )
-        _check_ring_storage(
-            retained_records.preconv,
-            mixed_qkv,
-            conv_weights,
-            f_a_out,
-            f_b_weight,
-            beta_logits,
-            g_raw,
-            output_norm,
-        )
         batch = read_indices.shape[0]
         rows = batch * draft_token_num
         mixed_qkv = mixed_qkv[:rows]
@@ -659,5 +668,7 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             retained_records.metadata,
             retained_records.stamps,
             output_norm,
+            # fused_verify_window_supported held above for these operands.
+            _validated=True,
         )
         return out if output_norm is None else out.view(rows, num_heads * head_dim)

@@ -292,7 +292,9 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     )
     slot = gl.load(record_slots + sequence_idx.to(gl.int64) * slot_stride).to(gl.int64)
     # The prepare's snapshot: the ring row of this request's first candidate.
-    ring_head = gl.load(ring_heads + sequence_idx * RING_HEAD_STRIDE).to(gl.int64)
+    ring_head = gl.load(ring_heads + sequence_idx.to(gl.int64) * RING_HEAD_STRIDE).to(
+        gl.int64
+    )
     # Candidates append after the request slot's accepted records. Every
     # layer shares the slot's count; one outside
     # [0, CAPACITY - TOKENS_PER_SEQUENCE] overflowed, and the prepare folded

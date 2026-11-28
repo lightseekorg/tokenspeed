@@ -49,16 +49,60 @@ def _kernels():
 
 
 def _check_replay_state(replay_state, *, slots, device):
+    # Launches write each slot's row independently, so rows must not share
+    # elements: a row pitch of at least the two columns (no expanded or
+    # overlapping rows).
     if (
         replay_state.shape != (slots, 2)
         or replay_state.stride(1) != 1
+        or (slots > 1 and replay_state.stride(0) < 2)
         or replay_state.dtype != torch.int32
         or replay_state.device != device
     ):
         raise ValueError(
             "replay_state must be INT32 [record slots, 2] (count, ring state) "
-            "with adjacent columns"
+            "with adjacent columns and disjoint rows"
         )
+
+
+def _byte_span(tensor):
+    """The [first, last) addresses a non-empty tensor's elements lie within."""
+    first = tensor.data_ptr()
+    reach = sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    return first, first + (reach + 1) * tensor.element_size()
+
+
+def _check_separate_replay(replay_state, snapshot):
+    """Reject a snapshot that shares an element with the replay state.
+
+    The prepare reads replay_state while it writes the snapshot; the
+    commit's publish programs write replay_state while its end programs
+    read the snapshot. Disjoint views of one allocation are allowed,
+    including a snapshot in the padding between strided replay rows.
+    Callers check both layouts first (_check_replay_state,
+    _check_snapshot): the snapshot is contiguous, so its bytes are one
+    interval, and replay_state's are its rows, each of adjacent elements,
+    at a pitch of at least a row when there are several.
+    """
+    if replay_state.numel() == 0 or snapshot.numel() == 0:
+        return
+    state_first, state_last = _byte_span(replay_state)
+    snapshot_first, snapshot_last = _byte_span(snapshot)
+    if snapshot_last <= state_first or state_last <= snapshot_first:
+        return
+    # The spans meet. Row i holds [state_first + i * pitch, + row), and it
+    # meets the snapshot exactly when first <= i <= last below.
+    rows = replay_state.shape[0]
+    row = replay_state.shape[1] * replay_state.element_size()
+    pitch = replay_state.stride(0) * replay_state.element_size()
+    if rows > 1 and pitch >= row:
+        first = max(0, (snapshot_first - state_first - row + pitch) // pitch)
+        last = min(rows - 1, (snapshot_last - state_first - 1) // pitch)
+        if first > last:
+            return
+    raise ValueError("replay_state and replay_snapshot must not share memory")
 
 
 def _check_snapshot(snapshot, *, batch, device):
@@ -266,7 +310,8 @@ def batched_commit(
     contiguous INT32 [requests, 2] the round's prepare wrote: the count its
     verify applied (H within [0, history_capacity - draft_token_num], else
     0: the prepare folded the records) and the ring row of its first
-    candidate.
+    candidate. The two must not share memory, and replay_state's rows must
+    be disjoint; either violation raises ValueError before the launch.
 
     The launch's publish programs write each carried request's count once
     -- carried rows are those paged in a group a launched layer lists --
@@ -378,6 +423,7 @@ def batched_commit(
         replay_state, slots=record_slot_count, device=descriptors.device
     )
     _check_snapshot(replay_snapshot, batch=batch, device=descriptors.device)
+    _check_separate_replay(replay_state, replay_snapshot)
     if request_stopped.ndim != 1 or request_stopped.dtype != torch.bool:
         raise ValueError("request stop flags must be a bool vector")
     if (
@@ -509,7 +555,8 @@ def batched_prepare(
     replay_snapshot (contiguous INT32 [requests, 2]) receives each row's
     applied count (H, or 0 when it overflows) and the ring row of its first
     candidate (3 for a ring seeded here, else the ring state minus one): the
-    verify and the commit of the round read these.
+    verify and the commit of the round read these. It must not share memory
+    with replay_state, whose rows must be disjoint (ValueError otherwise).
     """
     if num_heads <= 0 or head_dim <= 0 or history_capacity <= 0:
         raise ValueError(
@@ -570,6 +617,7 @@ def batched_prepare(
         replay_state, slots=record_slot_count, device=descriptors.device
     )
     _check_snapshot(replay_snapshot, batch=batch, device=descriptors.device)
+    _check_separate_replay(replay_state, replay_snapshot)
     if any(x.device != descriptors.device for x in (*routing, record_slots, *records)):
         raise ValueError("retained preparation tensors must share a device")
     if not layers or not batch:
