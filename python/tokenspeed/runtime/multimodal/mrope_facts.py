@@ -59,6 +59,17 @@ def _rope_is_mrope(hf_config) -> bool | None:
             kind = _config_section(rope, "rope_type") or _config_section(rope, "type")
             if isinstance(kind, str) and "mrope" in kind:
                 return True
+            if isinstance(rope, dict):
+                for sub in rope.values():
+                    if not isinstance(sub, dict):
+                        continue
+                    if _config_section(sub, "mrope_section") is not None:
+                        return True
+                    sub_kind = _config_section(sub, "rope_type") or _config_section(
+                        sub, "type"
+                    )
+                    if isinstance(sub_kind, str) and "mrope" in sub_kind:
+                        return True
     return False if found else None
 
 

@@ -81,6 +81,7 @@ _MLA_ARCHITECTURES = frozenset(
         # The K3 DSpark draft is MLA-native (DeepSeek-V3 layout, RoPE + YaRN),
         # so it must resolve to the MLA family rather than defaulting to MHA.
         "K3DSparkModel",
+        "HYV4FlashForCausalLMDFly",
     }
 )
 _DSA_ARCHITECTURES = frozenset(
@@ -92,6 +93,8 @@ _DSA_ARCHITECTURES = frozenset(
         "DeepseekV32ForCausalLM",
         "DeepseekV32ForCausalLMNextN",
         "Glm53FlashForConditionalGeneration",
+        "HYV4FlashForConditionalGeneration",
+        "HYV4FlashForCausalLM",
         "Glm53FlashForConditionalGenerationNextN",
     }
 )
@@ -1157,12 +1160,34 @@ class ModelConfig:
     @property
     def requires_request_token_history(self) -> bool:
         """Whether the model reads each request's committed token history."""
-        return (
-            self.model_profile is not None and self.model_profile.request_token_history
-        )
+        if self.model_profile is not None and self.model_profile.request_token_history:
+            return True
+        if resolve_architecture(self.hf_config) in (
+            "HYV4FlashForConditionalGeneration",
+            "HYV4FlashForCausalLM",
+        ):
+            return bool(getattr(self.hf_text_config, "engram_layer_ids", None))
+        return False
+
+    @property
+    def request_token_history_lookback(self) -> int | None:
+        """Bound committed-token history seeds behind the write frontier, if known."""
+        if self.model_profile is not None and self.model_profile.request_token_history:
+            return self.model_profile.request_token_history_lookback
+        if self.requires_request_token_history and resolve_architecture(
+            self.hf_config
+        ) in (
+            "HYV4FlashForConditionalGeneration",
+            "HYV4FlashForCausalLM",
+        ):
+            max_ngram = int(getattr(self.hf_text_config, "engram_max_ngram_size", 3))
+            return max(0, max_ngram - 1)
+        return None
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is None and self.hf_text_config is not None:
+            quant_cfg = getattr(self.hf_text_config, "quantization_config", None)
         if (
             quant_cfg == {}
             and resolve_architecture(self.hf_config)
@@ -1419,6 +1444,7 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "KimiK3ForConditionalGeneration",
         "KimiK31ForConditionalGeneration",
         "Glm53FlashForConditionalGeneration",
+        "HYV4FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
         "Inkling2ForConditionalGeneration",
         "Inkling2LoopForConditionalGeneration",

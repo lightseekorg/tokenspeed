@@ -97,7 +97,7 @@ def triton_mla_prefill(
     signatures=format_signatures(("q", "kv_cache"), "dense", _PORTABLE_DTYPES),
     priority=Priority.PORTABLE,
     traits={
-        "q_len": frozenset({1}),
+        "q_len": frozenset(range(1, 17)),
         "logit_cap": frozenset({False, True}),
         "return_lse": frozenset({False, True}),
         "sliding_window": frozenset({False, True}),

@@ -25,6 +25,12 @@ from tokenspeed.runtime.configs.deepseek_v41_config import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
 )
+from tokenspeed.runtime.configs.hy4_flash_config import (
+    HYV4FlashConfig,
+    HYV4FlashDFlyConfig,
+    HYV4FlashTextConfig,
+    HYV4FlashVisionConfig,
+)
 from tokenspeed.runtime.configs.inkling2 import (
     Inkling2LoopMMConfig,
     Inkling2MMConfig,
@@ -71,6 +77,10 @@ __all__ = [
     "BeamConfig",
     "DeepseekV41Config",
     "DeepseekV41TextConfig",
+    "HYV4FlashConfig",
+    "HYV4FlashDFlyConfig",
+    "HYV4FlashTextConfig",
+    "HYV4FlashVisionConfig",
     "Qwen3Config",
     "Qwen3MoeConfig",
     "Qwen3_5Config",

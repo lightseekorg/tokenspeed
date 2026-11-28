@@ -1236,6 +1236,11 @@ from tokenspeed_kernel.ops.residual.gated_boundary import (  # noqa: E402
     post_norm_residual_pre_norm_bf16_fp8,
     residual_gate_coefficients,
 )
+from tokenspeed_kernel.ops.residual.ihc import (  # noqa: E402
+    ihc_head,
+    ihc_post,
+    ihc_pre,
+)
 
 # isort: on
 
@@ -1246,6 +1251,9 @@ __all__ = [
     "boundary_gathers_mailbox",
     "gated_residual_combine",
     "gated_residual_mix",
+    "ihc_head",
+    "ihc_post",
+    "ihc_pre",
     "mhc_apply_pre",
     "mhc_apply_pre_quantize_fp8",
     "mhc_fused_hc",

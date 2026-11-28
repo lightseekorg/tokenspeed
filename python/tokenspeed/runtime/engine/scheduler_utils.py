@@ -81,6 +81,10 @@ def engram_context_len(text_config) -> int:
     """Select caller-owned Engram inputs, not Qwen4's LCM-owned PLE state."""
     if not getattr(text_config, "engram_layer_ids", ()):
         return 0
+    # Hy4-flash carries 3-gram Engram via ModelProfile.request_token_history
+    # (lookback=2) rather than V4.1's fixed 4-gram ngram_context_len=3 buffers.
+    if getattr(text_config, "model_type", None) == "hy_v4_flash_text":
+        return 0
     if getattr(text_config, "ngram_context_len", None) != 3:
         raise ValueError("Engram requires hf_text_config.ngram_context_len = 3")
     return text_config.ngram_context_len

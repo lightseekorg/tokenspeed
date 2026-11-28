@@ -723,7 +723,6 @@ if _HAS_DEEP_GEMM:
         local_tokens: int = 0,
         batch_invariant: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         q = q.contiguous()
         row_starts = row_starts.to(device=q.device, dtype=torch.int32).contiguous()
         row_ends = row_ends.to(device=q.device, dtype=torch.int32).contiguous()
@@ -804,6 +803,7 @@ if _HAS_DEEP_GEMM:
                 scaled_weights[start:end].contiguous(),
                 row_starts[start:end],
                 row_ends[start:end],
+                clean_logits=False,
                 max_seqlen_k=max(tile_max_seqlen_k, 1),
             )
             # The padded rows as one contiguous matrix: the scrub stays

@@ -144,7 +144,7 @@ STEP_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4", "MTP")
 EXTEND_GRAPH_SPEC_ALGORITHMS = (*STEP_SPEC_ALGORITHMS, "DFLASH", "DSPARK")
 # Drafters whose topk=1 chain can record sampled proposals for block
 # verification (flashinfer or triton) or synthetic rejection (flashinfer).
-BLOCK_REJECTION_ALGORITHMS = ("DSPARK", "EAGLE3")
+BLOCK_REJECTION_ALGORITHMS = ("DSPARK", "DFLY", "EAGLE3")
 # Verify rules, named as vLLM's rejection_sample_method.
 REJECTION_SAMPLE_METHODS = ("standard", "block", "synthetic")
 # Draft sampling, named as vLLM's draft_sample_method; "probabilistic" is
@@ -1463,7 +1463,7 @@ class ServerArgs:
             if num_speculative_tokens is not None:
                 num_speculative_tokens = int(num_speculative_tokens)
                 self._speculative_widths_explicit = True
-                if self.speculative_algorithm == "DFLASH" or (
+                if self.speculative_algorithm in ("DFLASH", "DFLY") or (
                     self.speculative_algorithm == "DSPARK"
                     and not dspark_uses_base_model
                 ):
@@ -2259,7 +2259,7 @@ class ServerArgs:
             self.drafter_attention_backend = self.attention_backend
 
         if (
-            self.speculative_algorithm in ("MTP", "DSPARK")
+            self.speculative_algorithm in ("MTP", "DSPARK", "DFLY")
             and self.speculative_draft_model_path is None
         ):
             self.draft_model_path_use_base = True
@@ -5316,7 +5316,7 @@ class ServerArgs:
             "--speculative-algorithm",
             type=str,
             help="Speculative algorithm. In-tree: EAGLE3, EAGLE4, MTP, DFLASH, "
-            "DSPARK, DUMMY; plugins may register more (validated after plugin "
+            "DSPARK, DFLY, DUMMY; plugins may register more (validated after plugin "
             "discovery).",
         )
         parser.add_argument(

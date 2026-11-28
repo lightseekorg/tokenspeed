@@ -46,6 +46,10 @@ from transformers import (
 from tokenspeed.runtime.configs import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
+    HYV4FlashConfig,
+    HYV4FlashDFlyConfig,
+    HYV4FlashTextConfig,
+    HYV4FlashVisionConfig,
     Inkling2LoopMMConfig,
     Inkling2MMConfig,
     Inkling2ModelConfig,
@@ -89,6 +93,10 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     Qwen3ASRConfig.model_type: Qwen3ASRConfig,
     DeepseekV41Config.model_type: DeepseekV41Config,
     DeepseekV41TextConfig.model_type: DeepseekV41TextConfig,
+    HYV4FlashConfig.model_type: HYV4FlashConfig,
+    HYV4FlashTextConfig.model_type: HYV4FlashTextConfig,
+    HYV4FlashVisionConfig.model_type: HYV4FlashVisionConfig,
+    HYV4FlashDFlyConfig.model_type: HYV4FlashDFlyConfig,
     Qwen3_5Config.model_type: Qwen3_5Config,
     Qwen3_5MoeConfig.model_type: Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig.model_type: Qwen3_5MoeTextConfig,
@@ -571,6 +579,17 @@ def get_config(
         config._name_or_path = model
         text_config = config
 
+    if is_draft_worker and isinstance(config, (HYV4FlashConfig, HYV4FlashDFlyConfig)):
+        if speculative_algorithm not in (None, "DFLY"):
+            raise NotImplementedError(
+                f"HYV4Flash embedded drafter requires speculative_algorithm='DFLY', "
+                f"got {speculative_algorithm!r}"
+            )
+        if isinstance(config, HYV4FlashConfig):
+            config = HYV4FlashDFlyConfig.from_target(config)
+        config._name_or_path = model
+        text_config = config
+
     # If the draft head ships in the same checkpoint as the base model,
     # rewrite the architecture in place so the model loader dispatches
     # to the *NextN / *Eagle3 entry class instead of the base one.
@@ -604,6 +623,7 @@ def get_config(
         and "Eagle" not in config.architectures[0]
         and "DFlash" not in config.architectures[0]
         and "DSpark" not in config.architectures[0]
+        and "DFly" not in config.architectures[0]
     ):
         if (
             speculative_algorithm == "DSPARK"
@@ -635,6 +655,10 @@ def get_config(
         "Glm53FlashForConditionalGeneration",
         "Glm53FlashForConditionalGenerationNextN",
         "Glm53FlashConfig",
+        "HYV4FlashForConditionalGeneration",
+        "HYV4FlashForCausalLM",
+        "HYV4FlashForCausalLMDFly",
+        "HYV4FlashConfig",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeForConditionalGenerationNextN",
         "Qwen3_5MoeConfig",

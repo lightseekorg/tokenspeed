@@ -1741,6 +1741,8 @@ class HostBootstrap:
                             else None
                         ),
                     )
+                    if model_config.model_profile is not None
+                    else model_config.request_token_history_lookback
                 ),
                 physical_context_len=(
                     model_config.context_len + server_args.spec_context_pad

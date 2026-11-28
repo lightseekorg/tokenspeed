@@ -35,3 +35,8 @@ Token counts are runtime scalars of the kernels.
 Source count, hidden width, query count, and normalization policy are model properties.
 CPU tests cover equations, boundary transitions, and rounding against an FP64 host reference.
 Shared GPU tests compare the kernels with the CPU equations.
+
+`ihc.py` implements Hy4-flash's Identity Hyper-Connections (`ihc_pre`, `ihc_post`,
+`ihc_head`) over `hc_mult` parallel residual streams without Sinkhorn mixing,
+keeping RMS normalization and stream weighting in FP32 and token counts as
+runtime `int64` scalars.
