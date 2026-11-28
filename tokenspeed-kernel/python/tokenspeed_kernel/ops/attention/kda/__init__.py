@@ -112,7 +112,8 @@ class KdaPrefillResult:
 
 @dataclass(frozen=True)
 class KdaOutputNorm:
-    """The gated RMSNorm a KDA layer applies to its attention output.
+    """The gated RMSNorm a KDA (or sigmoid-gated GDN) layer applies to its
+    attention output.
 
     ``out = rmsnorm(core) * weight * sigmoid(gate)`` per head over ``head_dim``,
     in FP32 on the BF16 core output, rounded once to the output dtype.
