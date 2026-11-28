@@ -5111,6 +5111,7 @@ def test_post_quant_warmup_compiles_compressor_and_mhc_layers(monkeypatch):
 
     from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
 
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
     monkeypatch.setattr(v41, "_max_forward_tokens", lambda: 64)
     config = _config()
