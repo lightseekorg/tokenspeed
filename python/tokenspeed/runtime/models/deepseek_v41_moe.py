@@ -25,7 +25,7 @@ import logging
 
 import torch
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
-from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.moe import EplbDispatch, moe_topk
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
@@ -38,14 +38,19 @@ from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo,
     StandardTopKOutput,
     TopK,
     TopKOutput,
+    record_expert_load,
     simulated_router_logits,
+    topk_ids_logical_to_physical,
 )
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
+from tokenspeed.runtime.moe.expert_location import get_global_expert_location_metadata
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -220,39 +225,54 @@ class DeepseekV4MoE(nn.Module):
         # Petit's VMM-backed collective and auxiliary-stream shared experts do
         # not replay safely together. Keep both branches on the main stream.
         self.stream_fork = StreamFork(None if self.use_gluon_petit else aux_stream)
-        if mapping.moe.ep_size > 1:
-            if global_server_args_dict.get("enable_eplb", False):
-                raise ValueError(
-                    "DeepSeek V4 EP does not support EPLB with precomputed routing."
-                )
-            if global_server_args_dict.get("init_expert_location", "trivial") not in (
-                None,
-                "trivial",
+        placement = get_global_expert_location_metadata()
+        self.eplb_routing: tuple[EplbDispatch, ExpertLoadRowMask] | None = None
+        self.static_dispatch: ExpertLocationDispatchInfo | None = None
+        physical_experts = config.n_routed_experts
+        if placement is not None:
+            if (
+                not self.use_mega_moe
+                or mapping.attn.tp_size != 1
+                or global_server_args_dict["ep_dispatch_algorithm"] != "static"
             ):
                 raise ValueError(
-                    "DeepSeek V4 EP requires trivial expert placement with "
-                    "precomputed routing."
+                    "V4.1 expert placement requires MegaMoE, attention TP1 and static replica dispatch"
+                )
+            if (
+                placement.num_logical_experts != config.n_routed_experts
+                or placement.ep_size != mapping.moe.ep_size
+            ):
+                raise ValueError(
+                    "V4.1 expert placement does not match the routed expert geometry"
+                )
+            physical_experts = placement.num_physical_experts
+            if global_server_args_dict["enable_eplb"]:
+                row_mask = placement.load_rows
+                assert row_mask is not None and placement.physical_load is not None
+                dispatch = EplbDispatch(
+                    placement.logical_to_all_physical_map[layer_index],
+                    placement.logical_to_all_physical_map_num_valid[layer_index],
+                    placement.physical_load[layer_index],
+                    row_mask.recording_enabled,
+                )
+                self.eplb_routing = dispatch, row_mask
+            else:
+                self.static_dispatch = ExpertLocationDispatchInfo.init_new(
+                    layer_id=layer_index,
+                    ep_dispatch_algorithm="static",
+                    expert_location_metadata=placement,
+                    all_to_all_ep=True,
                 )
         if self.use_mega_moe:
             if mapping.moe.ep_size <= 1:
                 raise ValueError("DeepSeek V4 MegaMoE requires expert parallelism.")
             if mapping.moe.tp_size != 1:
                 raise ValueError("DeepSeek V4 MegaMoE does not support mixed TP/EP.")
-            if global_server_args_dict.get("ep_num_redundant_experts", 0):
+            if physical_experts % mapping.moe.ep_size != 0:
                 raise ValueError(
-                    "DeepSeek V4 MegaMoE does not support redundant EP experts."
-                )
-            if config.n_routed_experts % mapping.moe.ep_size != 0:
-                raise ValueError(
-                    "DeepSeek V4 MegaMoE requires n_routed_experts divisible by "
-                    "EP size."
+                    "DeepSeek V4 MegaMoE requires its expert slots divisible by EP size."
                 )
         elif mapping.moe.ep_size > 1:
-            if global_server_args_dict.get("ep_num_redundant_experts", 0):
-                raise ValueError(
-                    "DeepSeek V4 normal EP does not support redundant experts "
-                    "with precomputed routing."
-                )
             if mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires attention TP size 1 or "
@@ -309,7 +329,7 @@ class DeepseekV4MoE(nn.Module):
         )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=config.n_routed_experts,
+            num_experts=physical_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=routed_quant_config,
@@ -396,7 +416,11 @@ class DeepseekV4MoE(nn.Module):
         if warmup is not None:
             if not self.experts._weights_processed:
                 raise RuntimeError("MoE weights must be processed before warmup")
-            warmup(self.experts.plan, self.experts)
+            if self.eplb_routing is None:
+                warmup(self.experts.plan, self.experts)
+            else:
+                dispatch, _ = self.eplb_routing
+                warmup(self.experts.plan, self.experts, eplb_dispatch=dispatch)
 
     def _routing_inputs(
         self,
@@ -449,12 +473,23 @@ class DeepseekV4MoE(nn.Module):
         max_num_tokens_per_gpu: int,
         do_finalize: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        routing_prepared = None
+        if self.eplb_routing is not None:
+            dispatch, row_mask = self.eplb_routing
+            routing_prepared = dispatch, row_mask.rows(topk_output.topk_ids.shape[0])
+        elif self.static_dispatch is not None:
+            ids = topk_ids_logical_to_physical(
+                topk_output.topk_ids, self.static_dispatch
+            )
+            record_expert_load(self.static_dispatch.load, ids)
+            topk_output = topk_output._replace(topk_ids=ids)
         return self.experts(
             hidden_states=hidden_states,
             topk_output=topk_output,
             num_global_tokens=num_global_tokens,
             max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             do_finalize=do_finalize,
+            routing_prepared=routing_prepared,
         )
 
     def _forward_shared_experts(

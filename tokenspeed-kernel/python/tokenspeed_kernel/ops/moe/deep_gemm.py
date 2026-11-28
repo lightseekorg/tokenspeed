@@ -27,6 +27,7 @@ from dataclasses import dataclass, replace
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel._optional import has_optional_package
+from tokenspeed_kernel.ops.moe import EplbDispatch
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -71,7 +72,19 @@ _DISABLE_WARMUP_ENV = "TOKENSPEED_DISABLE_MEGA_MOE_WARMUP"
 _live_requests: torch.Tensor | None = None
 _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, int], object] = {}
 _warmed_configs: set[
-    tuple[int, torch.device, int, int, int, int, int, int, float | None, bool]
+    tuple[
+        int,
+        torch.device,
+        int,
+        int,
+        int,
+        int,
+        int,
+        int,
+        float | None,
+        bool,
+        tuple[int, int, bool] | None,
+    ]
 ] = set()
 
 
@@ -379,6 +392,7 @@ def _run_mega_moe(
     output: torch.Tensor,
     activation_clamp: float | None,
     fast_math: bool,
+    routing_prepared: tuple[EplbDispatch, torch.Tensor] | None,
 ) -> None:
     """Stage ``x`` and its routing into the symmetric buffer and launch."""
     num_tokens = x.shape[0]
@@ -413,6 +427,7 @@ def _run_mega_moe(
         # Every launch reads the pair, so warmup compiles the variant that
         # captured graphs replay.
         mega_moe_live_requests(x.device),
+        routing_prepared,
     )
     fp8_fp4_mega_moe(
         output,
@@ -428,13 +443,14 @@ def _run_mega_moe(
 def _warmup_mega_moe_jit(
     *,
     state: _DeepGemmMegaMoEState,
-    num_experts: int,
+    num_routing_experts: int,
     max_num_tokens: int,
     top_k: int,
     hidden_size: int,
     symm_buffer: object,
     activation_clamp: float | None,
     fast_math: bool,
+    routing_prepared: tuple[EplbDispatch, torch.Tensor] | None,
 ) -> None:
     """Pre-compile MegaMoE kernel tiles using the initialized model state."""
     token_counts = _warmup_m_values(max_num_tokens)
@@ -452,7 +468,7 @@ def _warmup_mega_moe_jit(
         )
         topk_ids = torch.randint(
             0,
-            num_experts,
+            num_routing_experts,
             (num_tokens, top_k),
             dtype=torch.int32,
             device=state.device,
@@ -474,12 +490,15 @@ def _warmup_mega_moe_jit(
             torch.empty_like(hidden_states),
             activation_clamp,
             fast_math,
+            routing_prepared,
         )
 
     torch.cuda.synchronize()
 
 
-def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
+def warmup_deep_gemm_mxfp4_mega_moe(
+    plan: dict, w: torch.nn.Module, *, eplb_dispatch: EplbDispatch | None = None
+) -> None:
     if get_pdl() != pdl_enabled():
         set_pdl(pdl_enabled())
     if os.environ.get(_DISABLE_WARMUP_ENV) == "1":
@@ -496,6 +515,15 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
     activation_clamp = None if w.swiglu_arg is None else w.swiglu_arg.limit
     fast_math = plan["fast_math"]
     group = _resolve_process_group(process_group)
+    num_routing_experts = num_experts
+    eplb_key = None
+    if eplb_dispatch is not None:
+        num_routing_experts = eplb_dispatch.replicas.shape[0]
+        eplb_key = (
+            num_routing_experts,
+            eplb_dispatch.replicas.stride(0),
+            eplb_dispatch.recording_enabled is not None,
+        )
     warmup_key = (
         id(group),
         state.device,
@@ -507,6 +535,7 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
         state.num_shared_experts,
         activation_clamp,
         fast_math,
+        eplb_key,
     )
     if warmup_key in _warmed_configs:
         return
@@ -521,15 +550,21 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
         intermediate_size=intermediate_size,
         max_num_tokens=max_num_tokens,
     )
+    routing_prepared = None
+    if eplb_dispatch is not None:
+        # The serving mask is reserved later. Exclude synthetic routes from the sample.
+        record_rows = torch.zeros(max_num_tokens, dtype=torch.bool, device=state.device)
+        routing_prepared = (eplb_dispatch, record_rows)
     _warmup_mega_moe_jit(
         state=state,
-        num_experts=num_experts,
+        num_routing_experts=num_routing_experts,
         max_num_tokens=max_num_tokens,
         top_k=top_k,
         hidden_size=hidden_size,
         symm_buffer=symm_buffer,
         activation_clamp=activation_clamp,
         fast_math=fast_math,
+        routing_prepared=routing_prepared,
     )
     _warmed_configs.add(warmup_key)
 
@@ -583,6 +618,7 @@ if _HAS_DEEP_GEMM:
         max_num_tokens_per_gpu: int | None,
         do_finalize: bool,
         enable_pdl: bool,
+        routing_prepared: tuple[EplbDispatch, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if not do_finalize:
             raise ValueError("DeepGEMM MegaMoE requires complete finalization")
@@ -619,8 +655,10 @@ if _HAS_DEEP_GEMM:
             intermediate_size=w.intermediate_size,
             max_num_tokens=max_num_tokens,
         )
-        # Staging widens ids to the buffer's int64; one input dtype keeps one compile.
-        topk_ids = topk_ids.to(torch.int32)
+        # Physical-ID callers share the warmed int32 input. EPLB staging reads
+        # the router's logical IDs directly and widens the mapped slots on store.
+        if routing_prepared is None:
+            topk_ids = topk_ids.to(torch.int32)
         output = torch.empty_like(x, dtype=torch.bfloat16)
         _run_mega_moe(
             state,
@@ -631,6 +669,7 @@ if _HAS_DEEP_GEMM:
             output,
             None if w.swiglu_arg is None else w.swiglu_arg.limit,
             plan["fast_math"],
+            routing_prepared,
         )
         return output
 

@@ -465,6 +465,11 @@ impl Controls {
         !self.released.is_empty()
     }
 
+    /// Whether the device has released this memory region.
+    pub fn region_released(&self, tag: &str) -> bool {
+        self.released.iter().any(|released| released == tag)
+    }
+
     /// A release is draining or memory is released; a disaggregated engine
     /// refuses new requests then, as their transfers would name memory that
     /// is about to go away.
@@ -665,7 +670,7 @@ impl Controls {
     fn refuse_weight_load(&self) -> Option<String> {
         let released: Vec<&str> = ["weights", "nccl"]
             .into_iter()
-            .filter(|tag| self.released.iter().any(|released| released == tag))
+            .filter(|tag| self.region_released(tag))
             .collect();
         (!released.is_empty()).then(|| {
             format!(

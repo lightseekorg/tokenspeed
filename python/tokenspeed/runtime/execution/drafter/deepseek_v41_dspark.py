@@ -396,6 +396,12 @@ class DeepseekV41DSpark(BaseDrafter):
             num_tokens if self.confidence_scores is not None else None
         )
 
+    def mark_packed_verify_rows(self, mask: torch.Tensor, *, bs: int) -> None:
+        # The selected graph may have spare query rows even on an active rank.
+        assert self._verify_indptr is not None
+        rows = torch.arange(mask.numel(), device=mask.device)
+        torch.lt(rows, self._verify_indptr[bs], out=mask)
+
     def prepare_verify_layout(
         self, counts: tuple[int, ...], *, num_tokens: int
     ) -> None:
@@ -1058,6 +1064,16 @@ class DeepseekV41DSpark(BaseDrafter):
                 self.verify_feedback.publish(
                     pending.snapshot, pending.scores.tolist(), context_lengths=lengths
                 )
+
+    def replay_decode_graph(self, graph, *, bs: int, graph_bs: int) -> None:
+        # The draft proposes a full block even when the target packs its queries.
+        placement = self.draft_model_runner.expert_placement
+        if placement is None or placement.load_rows is None:
+            return super().replay_decode_graph(graph, bs=bs, graph_bs=graph_bs)
+        with placement.load_rows.local_replay(
+            graph_bs * self.block_size, bs * self.block_size
+        ):
+            super().replay_decode_graph(graph, bs=bs, graph_bs=graph_bs)
 
     def finish_round(self, ctx: ForwardContext, graph_bs: int | None) -> None:
         # Runs on the forward thread, outside capture, after draft writes.

@@ -80,7 +80,7 @@ def _assert_slots_hold(weights, placement, new_map):
         ]
 
 
-def _placement(old_map, ep_rank, ep_rank_nodes):
+def _placement(old_map, ep_rank, ep_rank_nodes, *, local_rows=False, windowed=False):
     placement = ExpertLocationMetadata.from_physical_to_logical_map(
         old_map,
         int(old_map.max()) + 1,
@@ -91,9 +91,24 @@ def _placement(old_map, ep_rank, ep_rank_nodes):
     placement.enable_load_recording(
         Mapping(
             rank=ep_rank, world_size=len(ep_rank_nodes), moe_ep_size=len(ep_rank_nodes)
-        )
+        ),
+        local_rows=local_rows,
+        windowed=windowed,
     )
     return placement
+
+
+def _single_layer_updater(placement, tensors, group=None):
+    return ExpertLocationUpdater(
+        placement,
+        {0: tensors},
+        process_group=group,
+        peer_ranks=range(placement.ep_size),
+        ep_rank=placement.ep_rank,
+        all_to_all_ep=True,
+        num_groups=None,
+        num_nodes=1,
+    )
 
 
 def _moves(old_map, new_map, placement):

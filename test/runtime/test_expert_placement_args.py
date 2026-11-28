@@ -114,7 +114,7 @@ class TestServerArgsPlacementValidation:
         with pytest.raises(ValueError, match="has no effect"):
             ServerArgs(model="x", ep_dispatch_algorithm="static")
 
-    def test_online_rebalancing_spells_out_every_choice(self):
+    def test_online_rebalancing_validates_required_options_and_chunk_size(self):
         ep = dict(attn_tp_size=2, ep_size=2)
         full = dict(
             enable_eplb=True,
@@ -127,11 +127,32 @@ class TestServerArgsPlacementValidation:
         args = ServerArgs(model="x", **full)
         assert args.enable_eplb and expert_placement_requested(args)
         assert args.ep_num_redundant_experts == 0  # pure permutation is allowed
-        # Nothing is auto-set: each missing or wrong choice is named.
+        assert args.effective_eplb_layers_per_chunk(40) == 4
+        defaults = ServerArgs(
+            model="x", **{**full, "eplb_rebalance_layers_per_chunk": None}
+        )
+        assert defaults.eplb_window_size is None and defaults.eplb_balance_draft
+        assert [defaults.effective_eplb_layers_per_chunk(n) for n in (3, 40)] == [3, 8]
+        for window in (0, 10001):
+            with pytest.raises(ValueError, match="window-size"):
+                ServerArgs(model="x", eplb_window_size=window, **full)
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        opts = parser.parse_args(
+            ["--model", "x", "--eplb-window-size", "2", "--no-eplb-balance-draft"]
+        )
+        assert opts.eplb_window_size == 2 and not opts.eplb_balance_draft
+        from tokenspeed.runtime.moe.expert_location import build_expert_placement
+
+        assert (
+            build_expert_placement(
+                dataclasses.replace(args, eplb_balance_draft=False), None, draft=True
+            )
+            is None
+        )
         for drop, match in (
             ("expert_distribution_recorder_mode", "recorder-mode stat"),
             ("eplb_rebalance_num_iterations", "num-iterations"),
-            ("eplb_rebalance_layers_per_chunk", "layers-per-chunk"),
         ):
             with pytest.raises(ValueError, match=match):
                 ServerArgs(model="x", **{**full, drop: None})

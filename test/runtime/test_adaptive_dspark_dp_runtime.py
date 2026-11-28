@@ -350,6 +350,15 @@ def test_budget_without_forward_thread_sync(topology):
     assert selected == 12
     counts = drafter._verify_indptr.diff().cpu().tolist()
     assert counts[favored] == 6 and sum(counts) == 12
+    mask = torch.empty(selected, device="cuda", dtype=torch.bool)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        counted = mask.sum()
+    for bs in (0, 2, 4):
+        with _strict_serving_sync():
+            drafter.mark_packed_verify_rows(mask, bs=bs)
+        graph.replay()
+        assert counted.item() == sum(counts[:bs])
     torch.testing.assert_close(
         drafter._verify_budget_buffers[4].scores.cpu(),
         torch.tensor(scores),

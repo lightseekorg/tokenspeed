@@ -193,7 +193,10 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
-from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
+from tokenspeed.runtime.moe.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
@@ -2564,6 +2567,7 @@ class DeepseekV41Model(nn.Module):
         ):
             raise ValueError("V4.1 layer count and compression ratios disagree")
         self.config, self.mapping = config, mapping
+        self.expert_placement = get_global_expert_location_metadata()
         self.pp_start_layer, self.pp_end_layer = 0, config.num_hidden_layers
         self.engram_hash = None
         self.dspark_capture_layers = ()
@@ -3184,6 +3188,24 @@ class _DeepseekV41LogitsProcessor(LogitsProcessor):
 class DeepseekV41ForCausalLM(BaseCausalLM):
     """V4.1 language and vision model with strict checkpoint coverage."""
 
+    supports_expert_placement = True
+    # MegaMoE dispatches rank-local attention rows itself.
+    expert_placement_local_rows = True
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        # The kernel interleaves MXFP4 and packs UE8M0 in place. These contiguous
+        # slot views own the bytes of the strided tensors held by captured kernels.
+        return {
+            layer.ffn.layer_index: (
+                layer.ffn.experts.w13_weight.data,
+                layer.ffn.experts.w13_weight_scale.data,
+                layer.ffn.experts.w2_weight.data,
+                layer.ffn.experts.w2_weight_scale.data,
+            )
+            for layer in self.model.layers
+        }
+
     model_cls = DeepseekV41Model
     logits_processor_cls = _DeepseekV41LogitsProcessor
 
@@ -3379,11 +3401,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     "weight_scale",
                 ):
                     raise ValueError(f"Unsupported V4.1 expert parameter: {name}")
+                rank = self.mapping.moe.ep_rank
                 count = self.model.config.n_routed_experts // self.mapping.moe.ep_size
-                for expert in range(
-                    self.mapping.moe.ep_rank * count,
-                    (self.mapping.moe.ep_rank + 1) * count,
-                ):
+                local = range(rank * count, (rank + 1) * count)
+                if self.model.expert_placement is not None:
+                    local = self.model.expert_placement.local_slot_logical_experts(
+                        int(prefix.split(".")[1]), rank
+                    )
+                for expert in local:
                     for shard in ("w1", "w3") if projection == "w13" else ("w2",):
                         field = "scale" if suffix == "weight_scale" else "weight"
                         targets[f"{prefix}.experts.{expert}.{shard}.{field}"] = (
@@ -3519,6 +3544,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         params = dict(self.named_parameters())
         targets = self._checkpoint_targets()
         config = self.model.config
+        placement = self.model.expert_placement
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params,
             expert_schema=ExpertCheckpointSchema(
@@ -3529,7 +3555,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 extra_names={},
             ),
             fused_schema=None,
-            num_experts=config.n_routed_experts,
+            num_experts=(
+                config.n_routed_experts
+                if placement is None
+                else placement.num_physical_experts
+            ),
+            expert_placement=placement,
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             fused_gate_up_as_w13=False,
@@ -3578,11 +3609,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     raise TypeError(
                         f"{raw_name}: expected packed FP4/E8M0, got {tensor.dtype}"
                     )
-                local_count = config.n_routed_experts // self.mapping.moe.ep_size
-                if expert_id // local_count != self.mapping.moe.ep_rank:
+                # Use numeric IDs for ownership and require the original local key to match exactly.
+                canonical = (
+                    f"layers.{layer_id}.ffn.experts.{expert_id}.{expert[3]}.{expert[4]}"
+                )
+                if canonical not in targets:
                     skipped["remote_expert"] += 1
                     continue
-                if name not in targets:
+                if name != canonical:
                     raise ValueError(f"Unexpected V4.1 expert tensor: {raw_name}")
                 tensor = tensor.view(torch.uint8)
                 ffn = self.model.layers[layer_id].ffn

@@ -293,7 +293,7 @@ def build_expert_location_updater(
         process_group=pg_manager.get_device_process_group(mapping.moe.ep_group),
         peer_ranks=mapping.moe.ep_group,
         ep_rank=mapping.moe.ep_rank,
-        all_to_all_ep=_all_to_all_ep(model),
+        all_to_all_ep=placement.load_rows.local_rows or _all_to_all_ep(model),
         num_groups=ModelConfigForExpertLocation.from_model_config(
             model_config
         ).num_groups,

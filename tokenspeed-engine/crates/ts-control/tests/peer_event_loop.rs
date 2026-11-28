@@ -443,8 +443,11 @@ impl DataPlane for HookedDevice {
     fn epd_released(&mut self) -> Result<Vec<usize>, DataPlaneError> {
         Ok(Vec::new())
     }
-    fn snapshot_expert_load(&mut self) -> Result<(Vec<Vec<i64>>, Vec<Vec<i32>>), DataPlaneError> {
-        Ok((Vec::new(), Vec::new()))
+    fn snapshot_expert_load(&mut self) -> Result<ts_control::eplb::ExpertLoad, DataPlaneError> {
+        Ok((Vec::new(), Vec::new(), Vec::new()))
+    }
+    fn set_expert_recording(&mut self, _: bool) -> Result<(), DataPlaneError> {
+        Ok(())
     }
     fn apply_expert_placement(
         &mut self,

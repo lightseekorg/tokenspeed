@@ -18,14 +18,28 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
 
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe import EplbDispatch
+
 _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE = 128
 
 
-@triton.jit(do_not_specialize=["num_tokens", "shared_block_m"])
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "shared_block_m",
+        "topk_ids_stride_m",
+        "topk_ids_stride_k",
+    ]
+)
 def _stage_mxfp4_mega_moe_inputs_kernel(
     hidden_states,
     x_fp8,
@@ -36,6 +50,13 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
     topk_idx_out,
     topk_weights_out,
     live_requests,
+    replicas,
+    num_replicas,
+    record_rows,
+    physical_load,
+    recording_enabled,
+    NUM_EXPERTS: tl.constexpr,
+    REPLICA_STRIDE: tl.constexpr,
     num_tokens,
     shared_block_m,
     hidden_stride_m: tl.constexpr,
@@ -46,8 +67,8 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
     x_sf_stride_k: tl.constexpr,
     shared_x_sf_stride_m: tl.constexpr,
     shared_x_sf_stride_k: tl.constexpr,
-    topk_ids_stride_m: tl.constexpr,
-    topk_ids_stride_k: tl.constexpr,
+    topk_ids_stride_m,
+    topk_ids_stride_k,
     topk_weights_stride_m: tl.constexpr,
     topk_weights_stride_k: tl.constexpr,
     topk_idx_stride_m: tl.constexpr,
@@ -137,10 +158,18 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
         ids = tl.load(
             topk_ids
             + token_ids[:, None] * topk_ids_stride_m
-            + topk_offsets[None, :] * topk_ids_stride_k,
+            + topk_offsets[None, :].to(tl.int64) * topk_ids_stride_k,
             mask=topk_mask,
             other=0,
-        ).to(tl.int64)
+        )
+        # Fetch weights and padding independently of the replica-table gathers.
+        weights = tl.load(
+            topk_weights
+            + token_ids[:, None] * topk_weights_stride_m
+            + topk_offsets[None, :] * topk_weights_stride_k,
+            mask=topk_mask,
+            other=0.0,
+        )
         if HAS_LIVE:
             # A padded graph replay stages the rank's whole batch, request-major
             # with the filler requests last: route no row past the live
@@ -152,7 +181,35 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
                 // tl.load(live_requests + 1)
             )
             filler = token_ids >= live_rows
+        if replicas is not None:
+            # Match tensor indexing for negative logical IDs.
+            expert = tl.where(ids < 0, ids + NUM_EXPERTS, ids)
+            valid = topk_mask & (expert >= 0) & (expert < NUM_EXPERTS)
+            tl.device_assert(~topk_mask | valid, "logical expert out of range")
+            copies = tl.load(num_replicas + expert, valid, other=1).to(tl.uint32)
+            row_hash = (token_ids * 2654435769).to(tl.uint32)
+            column = (row_hash[:, None] % copies).to(tl.int32)
+            ids = tl.load(
+                replicas + expert.to(tl.int64) * REPLICA_STRIDE + column,
+                valid,
+                other=-1,
+            )
+            enabled = True
+            if recording_enabled is not None:
+                enabled = tl.load(recording_enabled)
+            if enabled:
+                # Packed verification can exclude rows that still need dispatch.
+                live = tl.load(record_rows + token_ids, token_mask, other=False)
+                tl.atomic_add(
+                    physical_load + tl.maximum(ids, 0),
+                    1,
+                    mask=valid & live[:, None] & (ids >= 0),
+                    sem="relaxed",
+                )
+        ids = ids.to(tl.int64)
+        if HAS_LIVE:
             ids = tl.where(filler[:, None], -1, ids)
+            weights = tl.where(filler[:, None], 0.0, weights)
         tl.store(
             topk_idx_out
             + token_ids[:, None] * topk_idx_stride_m
@@ -161,15 +218,6 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
             mask=topk_mask,
         )
 
-        weights = tl.load(
-            topk_weights
-            + token_ids[:, None] * topk_weights_stride_m
-            + topk_offsets[None, :] * topk_weights_stride_k,
-            mask=topk_mask,
-            other=0.0,
-        )
-        if HAS_LIVE:
-            weights = tl.where(filler[:, None], 0.0, weights)
         tl.store(
             topk_weights_out
             + token_ids[:, None] * topk_weights_out_stride_m
@@ -195,6 +243,7 @@ def stage_mxfp4_mega_moe_inputs(
     shared_x_sf: torch.Tensor | None,
     shared_block_m: int | None,
     live_requests: torch.Tensor | None,
+    routing_prepared: tuple[EplbDispatch, torch.Tensor] | None = None,
 ) -> None:
     """Write MegaMoE's FP8 inputs and routing into its symmetric buffer.
 
@@ -207,7 +256,10 @@ def stage_mxfp4_mega_moe_inputs(
     needs ``hidden_states`` to be the rank's whole padded batch, request-major
     with the same rows per request and the filler requests last, not a TP
     shard of it (see ``mega_moe_live_requests``). Codes and scales are staged
-    for every row. None routes every row.
+    for every row. Optional ``routing_prepared`` supplies an EPLB layer and
+    a boolean recording mask covering these rows. Staging maps logical IDs
+    into physical slots and counts the sampled routes before masking dispatch
+    padding with ``live_requests``.
     """
     num_tokens, hidden_size = hidden_states.shape
     if (shared_x_sf is None) != (shared_block_m is None):
@@ -229,6 +281,31 @@ def stage_mxfp4_mega_moe_inputs(
     ):
         raise ValueError("live_requests must be an int32 (live, padded) pair")
 
+    if routing_prepared is None:
+        eplb_args = (None, None, None, None, None, 0, 0)
+    else:
+        dispatch, record_rows = routing_prepared
+        if (
+            record_rows.ndim != 1
+            or record_rows.shape[0] < num_tokens
+            or record_rows.dtype != torch.bool
+            or not record_rows.is_contiguous()
+            or record_rows.device != hidden_states.device
+            or dispatch.replicas.device != hidden_states.device
+        ):
+            raise ValueError(
+                "EPLB staging needs local replica tables and a contiguous boolean "
+                "recording mask covering the input rows"
+            )
+        eplb_args = (
+            dispatch.replicas,
+            dispatch.num_replicas,
+            record_rows,
+            dispatch.physical_load,
+            dispatch.recording_enabled,
+            dispatch.replicas.shape[0],
+            dispatch.replicas.stride(0),
+        )
     block_k = _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE
     block_m = _stage_block_m(num_tokens)
     grid = (triton.cdiv(num_tokens, block_m), triton.cdiv(hidden_size, block_k))
@@ -244,6 +321,7 @@ def stage_mxfp4_mega_moe_inputs(
         topk_idx_out,
         topk_weights_out,
         live_requests,
+        *eplb_args,
         num_tokens,
         shared_block_m or 1,
         hidden_states.stride(0),

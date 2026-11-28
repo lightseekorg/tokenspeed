@@ -40,6 +40,7 @@ reserved once before the first forward, so captured graphs hold its address.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from contextlib import contextmanager
 
 import torch
 
@@ -53,14 +54,18 @@ class ExpertLoadRowMask:
     """The live-row mask of the MoE input, shared by every MoE layer.
 
     Args:
+        local_rows: This model routes only its own rank's token rows.
         mapping: The parallel layout; it decides how the ranks' rows are laid
             out in the MoE input (``moe_input_row_segments``).
     """
 
-    def __init__(self, mapping: Mapping) -> None:
+    def __init__(self, mapping: Mapping, *, local_rows: bool = False) -> None:
         self._mapping = mapping
+        self.local_rows = local_rows
         # [max_rows] bool on the placement's device; None until reserved.
         self.mask: torch.Tensor | None = None
+        # Optional device scalar shared by every captured layer of this bank.
+        self.recording_enabled: torch.Tensor | None = None
 
     @property
     def max_rows(self) -> int:
@@ -96,6 +101,23 @@ class ExpertLoadRowMask:
             )
         return self.mask[:num_rows]
 
+    def mark_local(self, capacity: int, live: int) -> None:
+        """Mark the real prefix of a rank-local routed batch before graph replay."""
+        if not 0 <= live <= capacity:
+            raise ValueError(f"{live} live expert-load rows exceed capacity {capacity}")
+        rows = self.rows(capacity)
+        rows[:live].fill_(True)
+        rows[live:].fill_(False)
+
+    @contextmanager
+    def local_replay(self, capacity: int, live: int):
+        """Expose this graph's live prefix to its captured routing counters."""
+        self.mark_local(capacity, live)
+        try:
+            yield
+        finally:
+            self.clear()
+
     def mark_padded(
         self,
         *,
@@ -109,6 +131,12 @@ class ExpertLoadRowMask:
                 global rank (uniform under a graph replay).
             live_global_num_tokens: Real token rows per global rank.
         """
+        if self.local_rows:
+            rank = self._mapping.rank
+            self.mark_local(
+                padded_global_num_tokens[rank], live_global_num_tokens[rank]
+            )
+            return
         segments = moe_input_row_segments(
             self._mapping,
             padded_global_num_tokens=padded_global_num_tokens,
@@ -160,6 +188,8 @@ class LayerExpertLoad:
             topk_ids: ``[rows, top_k]`` physical ids of this layer's routing.
         """
         valid = (topk_ids >= 0) & self.rows.rows(topk_ids.shape[0]).unsqueeze(1)
+        if self.rows.recording_enabled is not None:
+            valid = valid & self.rows.recording_enabled
         self.physical_load.scatter_add_(
             0,
             topk_ids.masked_fill(~valid, 0).reshape(-1).long(),

@@ -442,15 +442,19 @@ class EplbSettings:
         specs: The placement geometry the device side reports.
         algorithm: ``--eplb-algorithm``.
         rebalance_num_iterations: Forwards between snapshots.
+        window_size: Forwards sampled for a periodic snapshot.
         layers_per_chunk: Layers moved per round.
         ep_ranks: This rank's EP group, in EP-rank order.
+        draft_specs: The independently balanced draft in the same EP group, if present.
     """
 
     specs: ExpertRebalanceSpecs
     algorithm: str
     rebalance_num_iterations: int
+    window_size: int
     layers_per_chunk: int
     ep_ranks: tuple[int, ...]
+    draft_specs: ExpertRebalanceSpecs | None = None
 
 
 def dp_coordination_ranks(
@@ -721,6 +725,7 @@ class HostDataPlane:
         epd_publisher,
         starting: bool,
         record_cache_observations: bool = False,
+        draft_layer_offset: int | None = None,
         *,
         defer_recurrent_state: bool,
         replica_memory_transitions: bool,
@@ -728,6 +733,7 @@ class HostDataPlane:
         self._device = handle
         self._defer_recurrent_state = defer_recurrent_state
         self._record_cache_observations = record_cache_observations
+        self._draft_layer_offset = draft_layer_offset
         # The engine serves its own startup requests (``HostConfig``'s
         # ``startup_requests``) until ``finish_startup``.
         self._starting = starting
@@ -1210,14 +1216,23 @@ class HostDataPlane:
         out; a completion query, on the control thread."""
         return self._epd.released()
 
-    def snapshot_expert_load(self) -> tuple[list[list[int]], list[list[int]]]:
-        """This rank's route counters since the previous snapshot and the
-        placement they were counted under, as ``[layers, physical]`` rows."""
+    def set_expert_recording(self, enabled: bool) -> None:
+        self._device.set_expert_recording(enabled)
+
+    def snapshot_expert_load(
+        self,
+    ) -> tuple[list[list[int]], list[list[int]], list[list[int]]]:
+        """Return each bank's physical counts, current slot map and logical load."""
         snapshot = self._device.snapshot_expert_load()
-        return (
-            snapshot.physical_count.tolist(),
-            snapshot.physical_to_logical_map.tolist(),
-        )
+        counts = snapshot.physical_count.tolist()
+        placement = snapshot.physical_to_logical_map.tolist()
+        logical = snapshot.logical_count.tolist()
+        if self._draft_layer_offset is not None:
+            draft = self._device.snapshot_expert_load(draft=True)
+            counts.extend(draft.physical_count.tolist())
+            placement.extend(draft.physical_to_logical_map.tolist())
+            logical.extend(draft.logical_count.tolist())
+        return counts, placement, logical
 
     def apply_expert_placement(
         self,
@@ -1227,6 +1242,11 @@ class HostDataPlane:
     ) -> None:
         """Move one chunk of layers' experts: their new placement rows and
         this rank's ``(recv, send, local_copy, free_rider)`` per layer."""
+        # The controller schedules one model per chunk, target layers first.
+        offset = self._draft_layer_offset
+        draft = offset is not None and layer_ids[0] >= offset
+        if draft:
+            layer_ids = [layer - offset for layer in layer_ids]
         self._device.apply_expert_placement(
             layer_ids,
             torch.tensor(rows, dtype=torch.int32),
@@ -1241,6 +1261,7 @@ class HostDataPlane:
                     layer_ids, moves
                 )
             },
+            draft=draft,
         )
 
 
@@ -1852,9 +1873,14 @@ class HostBootstrap:
                 eplb=(
                     EplbSettings(
                         specs=specs.expert_rebalance,
+                        draft_specs=specs.draft_expert_rebalance,
                         algorithm=server_args.eplb_algorithm,
                         rebalance_num_iterations=server_args.eplb_rebalance_num_iterations,
-                        layers_per_chunk=server_args.eplb_rebalance_layers_per_chunk,
+                        window_size=server_args.eplb_window_size
+                        or server_args.eplb_rebalance_num_iterations,
+                        layers_per_chunk=server_args.effective_eplb_layers_per_chunk(
+                            specs.expert_rebalance.num_layers
+                        ),
                         ep_ranks=tuple(mapping.moe.ep_group),
                     )
                     if server_args.enable_eplb
@@ -1914,6 +1940,11 @@ class HostBootstrap:
                 starting=server_args.enable_startup_requests,
                 record_cache_observations=device.specs.cache_observation_capacity > 0,
                 defer_recurrent_state=server_args.enable_deferred_gdn_state,
+                draft_layer_offset=(
+                    specs.expert_rebalance.num_layers
+                    if specs.draft_expert_rebalance is not None
+                    else None
+                ),
             )
             self._device = device.handle
             on_startup_failure.pop_all()

@@ -1697,7 +1697,8 @@ def test_expert_load_reset_and_dump_ride_the_execution_stream(tmp_path):
         handle.dump_expert_load(str(tmp_path / "none.pt"))
 
 
-def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards():
+@pytest.mark.parametrize("windowed", [False, True])
+def test_first_expert_load_window_excludes_startup_routes(windowed):
     """Autotune, warm-up and capture route tokens through the MoE layers; the
     builder zeroes the counters after capture (device drained, reset on the
     execution stream) and before the handle exists, so the first window a
@@ -1706,12 +1707,19 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
 
     from tokenspeed.runtime.execution.device import start_expert_load_window
     from tokenspeed.runtime.moe import expert_location
+    from tokenspeed.runtime.moe.expert_load_rows import LayerExpertLoad
 
+    mapping = Mapping(rank=0, world_size=2, moe_ep_size=2)
     placement = expert_location.ExpertLocationMetadata.from_physical_to_logical_map(
         torch.tensor([[0, 1, 2, 0]]), 3, ep_size=2, ep_rank=0, ep_rank_nodes=(0, 0)
     )
-    placement.enable_load_recording(Mapping(rank=0, world_size=2, moe_ep_size=2))
+    placement.enable_load_recording(mapping, windowed=windowed)
     placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5]]))  # startup routes
+    draft = expert_location.ExpertLocationMetadata.from_physical_to_logical_map(
+        torch.tensor([[1, 0]]), 2, ep_size=2, ep_rank=0, ep_rank_nodes=(0, 0)
+    )
+    draft.enable_load_recording(mapping, windowed=windowed)
+    draft.physical_load.fill_(3)
     trace: list = []
 
     class _DeviceModule:
@@ -1725,7 +1733,9 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
             return contextlib.nullcontext()
 
     executor = SimpleNamespace(
-        device_module=_DeviceModule(), execution_stream="execution-stream"
+        device_module=_DeviceModule(),
+        execution_stream="execution-stream",
+        draft_model_runner=SimpleNamespace(expert_placement=draft),
     )
     expert_location.set_global_expert_location_metadata(placement)
     try:
@@ -1733,7 +1743,12 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
     finally:
         expert_location.set_global_expert_location_metadata(None)
     assert trace == ["synchronize", ("stream", "execution-stream")]
-    assert not placement.physical_load.any()
+    for bank in (placement, draft):
+        assert not bank.physical_load.any()
+        bank.reserve_load_rows(1)
+        load = LayerExpertLoad(bank.physical_load[0], bank.load_rows)
+        load.record(torch.tensor([[0]]))
+        assert bank.physical_load[0, 0].item() == 1
     # Without load recording there is nothing to reset and nothing is touched.
     start_expert_load_window(SimpleNamespace())
 

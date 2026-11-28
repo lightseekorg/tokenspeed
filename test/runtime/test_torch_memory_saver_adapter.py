@@ -681,6 +681,91 @@ def test_managed_metadata_survives_sleep_and_growth_with_zero_ordinary_bytes():
     _run_with_cuda_memory_saver(_check_managed_metadata_on_cuda)
 
 
+def _check_eplb_storage_on_cuda():
+    from test.runtime.moe.test_expert_location_updater import (
+        _moves,
+        _placement,
+        _single_layer_updater,
+    )
+
+    from tokenspeed_kernel.ops.moe import EplbDispatch
+    from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (
+        stage_mxfp4_mega_moe_inputs,
+    )
+
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
+    banks = []
+    with saver.named_region("runtime_states"):
+        hidden = torch.zeros((2, 128), device="cuda", dtype=torch.bfloat16)
+        logical = torch.zeros((2, 1), device="cuda", dtype=torch.int32)
+        scores = torch.ones_like(logical, dtype=torch.float32)
+        ids = torch.empty_like(logical, dtype=torch.int64)
+        outputs = (
+            torch.empty_like(hidden, dtype=torch.float8_e4m3fn),
+            torch.empty_like(logical),
+            ids,
+            torch.empty_like(scores),
+        )
+        for n in (6, 3):
+            slots = torch.tensor([*range(n), 0], device="cuda")
+            p = _placement(slots[None, :], 0, (0,), local_rows=True, windowed=True)
+            p.reserve_load_rows(2)
+            p.load_rows.mark_local(2, 1)
+            p.load_rows.recording_enabled.fill_(True)
+            weights = slots.to(torch.uint8)[:, None]
+            dispatch = EplbDispatch(
+                p.logical_to_all_physical_map[0],
+                p.logical_to_all_physical_map_num_valid[0],
+                p.physical_load[0],
+                p.load_rows.recording_enabled,
+            )
+            banks.append(
+                (
+                    p,
+                    _single_layer_updater(p, [weights]),
+                    weights,
+                    (dispatch, p.load_rows.rows(2)),
+                )
+            )
+        addresses = [
+            (p.rank_dispatch_map().data_ptr(), w.data_ptr()) for p, _, w, _ in banks
+        ]
+
+    for _ in range(2):
+        for p, updater, _, _ in banks:
+            old = p.physical_to_logical_map_cpu
+            new = old.flip((1,))
+            p.physical_load[0, 1] += 5
+            updater.apply([0], new, _moves(old, new, p))
+        torch.cuda.synchronize()
+        saver.pause(tag="weights")
+        torch.cuda.empty_cache()
+        assert _ordinary_cuda_bytes() == 0
+        saver.resume(tag="weights")
+        for (p, _, weights, routing), pointers in zip(banks, addresses, strict=True):
+            row = p.physical_to_logical_map_cpu[0]
+            assert (p.rank_dispatch_map().data_ptr(), weights.data_ptr()) == pointers
+            assert torch.equal(weights.flatten().cpu(), row)
+            stage_mxfp4_mega_moe_inputs(
+                hidden, scores, logical, *outputs, None, None, None, routing
+            )
+            assert weights[ids].count_nonzero().item() == 0
+            snap = p.snapshot_load()
+            expected = torch.zeros(p.num_logical_experts, dtype=torch.int64)
+            expected[row[-2]] = 5  # Slot 1 before the reversal.
+            expected[0] += 1  # Only the first replay row was live.
+            assert snap.physical_count[0, 1] >= 5
+            assert torch.equal(snap.logical_count[0], expected)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires CUDA VMM",
+)
+def test_two_eplb_banks_survive_repeated_memory_release():
+    _run_with_cuda_memory_saver(_check_eplb_storage_on_cuda)
+
+
 @torch.inference_mode()
 def _check_gated_residual_workspace_on_cuda():
     from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix

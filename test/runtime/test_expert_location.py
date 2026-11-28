@@ -36,6 +36,7 @@ from tokenspeed.runtime.moe.expert_location import (
     build_expert_placement,
     compute_logical_to_rank_dispatch_physical_map,
     merge_expert_load_records,
+    preserve_expert_load_for_warmup,
 )
 
 
@@ -43,10 +44,12 @@ def _mapping(ep_rank: int = 0, ep_size: int = 2) -> Mapping:
     return Mapping(rank=ep_rank, world_size=ep_size, moe_ep_size=ep_size)
 
 
-def _placement(ep_rank: int):
+def _placement(ep_rank: int, *, device: str = "cpu"):
     # Two layers, four logical experts on six slots over two ranks. Layer 1
     # gives expert 1 three replicas, two of them on rank 1.
-    physical_to_logical = torch.tensor([[0, 1, 2, 3, 0, 2], [3, 2, 1, 0, 1, 1]])
+    physical_to_logical = torch.tensor(
+        [[0, 1, 2, 3, 0, 2], [3, 2, 1, 0, 1, 1]], device=device
+    )
     return ExpertLocationMetadata.from_physical_to_logical_map(
         physical_to_logical, 4, ep_size=2, ep_rank=ep_rank, ep_rank_nodes=(0, 0)
     )
@@ -219,6 +222,9 @@ def test_load_record_is_per_rank_and_merges_across_ranks(tmp_path):
             [0, 3 * (ep_rank + 1), 0, 0],
         ]
         path = tmp_path / f"load-TP{ep_rank}.expert-load.pt"
+        if ep_rank == 1:  # A legacy record with only slot counts.
+            del record["logical_count"]
+            record["physical_count"] = record["physical_count"].int()
         torch.save(record, path)
         records.append(path)
         placement.reset_load()
@@ -239,15 +245,21 @@ def test_load_record_is_per_rank_and_merges_across_ranks(tmp_path):
         merge_expert_load_records(records + [tmp_path / "x.expert-load.pt"])
 
 
-def test_init_expert_location_merges_a_directory_of_records(tmp_path):
+@pytest.mark.parametrize("windows", [(0, 0), (2, 2), (2, 0), (0, 2), (2, 3)])
+def test_init_expert_location_merges_a_directory_of_records(tmp_path, windows):
     placement = _placement(0)
     placement.enable_load_recording(_mapping())
     for ep_rank in (0, 1):
         placement.physical_load.fill_(ep_rank + 1)
-        torch.save(
-            placement.load_record(placement.physical_load) | {"ep_rank": ep_rank},
-            tmp_path / f"p-TP{ep_rank}.expert-load.pt",
-        )
+        record = placement.load_record(placement.physical_load) | {"ep_rank": ep_rank}
+        # Credit an earlier placement so recomputing from the final map gives a different answer.
+        logical = record["logical_count"].roll(1, dims=1)
+        if windows[ep_rank]:
+            by_window = logical.new_zeros((windows[ep_rank], *logical.shape))
+            by_window[ep_rank] = logical
+            logical = by_window
+        record["logical_count"] = logical
+        torch.save(record, tmp_path / f"p-TP{ep_rank}.expert-load.pt")
     (tmp_path / "p-TP0.trace.json.gz").write_bytes(b"")  # other profile outputs
     seen = {}
 
@@ -262,8 +274,9 @@ def test_init_expert_location_merges_a_directory_of_records(tmp_path):
             SimpleNamespace(init_expert_location=str(tmp_path)), None
         )
     assert result == "placement"
-    # 3 routes per slot summed over the ranks: expert 0 has 2 slots in layer 0.
-    assert seen["logical_count"].tolist() == [[6, 3, 6, 3], [3, 9, 3, 3]]
+    rank0 = torch.tensor([[1, 2, 1, 2], [1, 1, 3, 1]])
+    expected = torch.stack((rank0, 2 * rank0)) if windows == (2, 2) else 3 * rank0
+    assert torch.equal(seen["logical_count"], expected)
     (tmp_path / "empty").mkdir()
     with pytest.raises(ValueError, match="holds no"):
         expert_location.compute_initial_expert_location_metadata(
@@ -602,6 +615,39 @@ def test_snapshot_load_reads_then_zeroes_the_counters_with_their_map():
     ).tolist() == pytest.approx([1.0, 0.75])
     with pytest.raises(RuntimeError, match="not enabled"):
         _placement(ep_rank=0).snapshot_load()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_logical_counts_survive_table_switches_and_failed_warmup(tmp_path, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA streams")
+    target, draft = (_placement(0, device=device) for _ in range(2))
+    for p in (target, draft):
+        p.enable_load_recording(_mapping(), local_rows=True, windowed=True)
+    target.physical_load[0, 0] += 7  # Expert 0, then 2, then 3 owns this slot.
+    target.update_layers([0], torch.tensor([[2, 1, 0, 3, 0, 2]]))
+    target.physical_load[0, 0] += 11
+    target.update_layers([0], torch.tensor([[3, 1, 0, 2, 0, 2]]))
+    draft.physical_load[1, 0] = 2
+    module = torch.get_device_module(device)
+    with pytest.raises(ValueError, match="warmup"):
+        with preserve_expert_load_for_warmup((target, draft), module.current_stream()):
+            with module.stream(module.Stream()):
+                target.reset_load()
+                draft.reset_load()
+                target.physical_load.fill_(40)
+            raise ValueError("warmup failed")
+    target.physical_load[0, 0] += 5
+    path = tmp_path / "load.pt"
+    torch.save(target.load_record(target.physical_load), path)
+    expected = [7, 0, 11, 5]
+    assert merge_expert_load_records([path])["logical_count"][0].tolist() == expected
+    snap = target.snapshot_load()
+    assert (
+        snap.physical_count[0, 0] == 23 and snap.logical_count[0].tolist() == expected
+    )
+    assert not target.snapshot_load().logical_count.any()
+    assert draft.snapshot_load().logical_count[1].tolist() == [0, 0, 0, 2]
 
 
 def test_compute_placement_maps_is_host_only_and_init_by_eplb_wraps_it():

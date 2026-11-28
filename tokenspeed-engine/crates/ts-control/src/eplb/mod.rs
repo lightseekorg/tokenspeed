@@ -25,9 +25,8 @@
 //! through the same-round gate the weight operations use, so every rank runs
 //! each step in the same round:
 //!
-//! 1. Snapshot: read the route counters since the previous snapshot, reduce
-//!    them over the EP group, and start deriving a new placement (EP rank 0,
-//!    on a worker thread).
+//! 1. Read the route counters for the sampled forwards, reduce them over the
+//!    EP group, and start deriving a new placement on EP rank 0's solver thread.
 //! 2. Commit, a fixed number of forwards later: rank 0's placement is
 //!    broadcast over the EP group and every rank plans the same slot moves.
 //! 3. One chunk of layers per round: the weights move and the layers'
@@ -36,13 +35,16 @@
 mod algorithm;
 mod moves;
 
-use std::{collections::VecDeque, thread};
+use std::{collections::VecDeque, ops::Range, sync::Arc, thread};
 
 pub use algorithm::{rebalance_experts, Algorithm};
 pub use moves::{plan_slot_moves, SlotMoves};
 
 /// Forwards between a snapshot and its commit (`COMMIT_DELAY_FORWARDS`).
 pub const COMMIT_DELAY_FORWARDS: u64 = 200;
+
+/// Physical counts, current slot map and version-correct logical counts per layer.
+pub type ExpertLoad = (Vec<Vec<i64>>, Vec<Vec<i32>>, Vec<Vec<i64>>);
 
 /// The placement geometry and this rank's place in it
 /// (`ExpertRebalanceSpecs`).
@@ -80,16 +82,32 @@ impl EplbSpecs {
 /// The controller's settings.
 #[derive(Debug, Clone)]
 pub struct EplbConfig {
-    /// The geometry.
+    /// The target's geometry.
     pub specs: EplbSpecs,
+    /// An independently balanced draft in the same EP group.
+    pub draft_specs: Option<EplbSpecs>,
     /// Forwards between snapshots (`--eplb-rebalance-num-iterations`).
     pub rebalance_num_iterations: u64,
+    /// Number of actual forwards sampled immediately before a periodic snapshot.
+    pub window_size: u64,
     /// Layers switched per round (`--eplb-rebalance-layers-per-chunk`).
     pub layers_per_chunk: usize,
     /// The solver variant.
     pub algorithm: Algorithm,
     /// Forwards between a snapshot and its commit.
     pub commit_delay_forwards: u64,
+}
+
+impl EplbConfig {
+    fn models(&self) -> impl Iterator<Item = (&'static str, &EplbSpecs, Range<usize>)> {
+        let target = &self.specs;
+        let offset = target.num_layers;
+        let draft = self
+            .draft_specs
+            .iter()
+            .map(move |specs| ("draft", specs, offset..offset + specs.num_layers));
+        std::iter::once(("target", target, 0..offset)).chain(draft)
+    }
 }
 
 /// One step of a rebalance, completed through the same-round gate.
@@ -173,8 +191,8 @@ fn summary(values: &[f64]) -> (f64, f64) {
 
 /// The solver's work: the placement for a logical load.
 fn solve(
-    logical_count: Vec<Vec<i64>>,
-    specs: EplbSpecs,
+    logical_count: &[Vec<i64>],
+    specs: &EplbSpecs,
     algorithm: Algorithm,
 ) -> Result<Vec<Vec<i32>>, String> {
     let weight: Vec<Vec<f64>> = logical_count
@@ -195,9 +213,14 @@ fn solve(
         .collect())
 }
 
-/// Decides when a rebalance starts and what each step carries. It never
-/// touches the device or the
-/// collectives; the loop completes the steps and feeds the results back.
+/// The solver and the commit both read the placement and load at snapshot time.
+struct Snapshot {
+    placement: Vec<Vec<i32>>,
+    logical_count: Vec<Vec<i64>>,
+}
+
+/// Decides when a rebalance starts and what each step carries.
+/// The loop runs the device operations and collectives and feeds the results back.
 pub struct Controller {
     config: EplbConfig,
     chunks: Vec<Vec<usize>>,
@@ -205,35 +228,58 @@ pub struct Controller {
     /// Forwards this rank ran (real or idle), rank-identical.
     forwards: u64,
     next_snapshot_at: u64,
+    recording: bool,
     commit_at: Option<u64>,
     /// EP rank 0's solver.
     solver: Option<thread::JoinHandle<Result<Vec<Vec<i32>>, String>>>,
-    old_map: Option<Vec<Vec<i32>>>,
+    snapshot: Option<Arc<Snapshot>>,
     new_map: Option<Vec<Vec<i32>>>,
-    logical_count: Option<Vec<Vec<i64>>>,
     moves_by_layer: Vec<SlotMoves>,
     pending_chunks: VecDeque<Vec<usize>>,
     rebalances_completed: u64,
 }
 
 impl Controller {
-    /// A controller with `config`.
+    /// Balance the target and optional draft independently in the same gated cycle.
+    /// Draft layers follow the target layers on the wire; a chunk belongs to one model.
     pub fn new(config: EplbConfig) -> Result<Self, String> {
         if config.rebalance_num_iterations == 0 {
             return Err("rebalance_num_iterations must be positive".to_owned());
         }
-        let chunks = chunk_layer_ids(config.specs.num_layers, config.layers_per_chunk)?;
+        if config.window_size == 0 || config.window_size > config.rebalance_num_iterations {
+            return Err("window_size must be in 1..=rebalance_num_iterations".to_owned());
+        }
+        let mut chunks = chunk_layer_ids(config.specs.num_layers, config.layers_per_chunk)?;
+        if let Some(specs) = &config.draft_specs {
+            if specs.ep_rank_nodes != config.specs.ep_rank_nodes
+                || specs.ep_size != config.specs.ep_size
+                || specs.ep_rank != config.specs.ep_rank
+                || specs.all_to_all_ep != config.specs.all_to_all_ep
+            {
+                return Err(
+                    "target and draft EPLB must share the EP group and input distribution".into(),
+                );
+            }
+            let mut draft_chunks = chunk_layer_ids(
+                specs.num_layers,
+                config.layers_per_chunk.min(specs.num_layers),
+            )?;
+            for layer in draft_chunks.iter_mut().flatten() {
+                *layer += config.specs.num_layers;
+            }
+            chunks.extend(draft_chunks);
+        }
         Ok(Self {
-            next_snapshot_at: config.rebalance_num_iterations,
+            next_snapshot_at: config.window_size,
+            recording: true,
             config,
             chunks,
             phase: Phase::Idle,
             forwards: 0,
             commit_at: None,
             solver: None,
-            old_map: None,
+            snapshot: None,
             new_map: None,
-            logical_count: None,
             moves_by_layer: Vec::new(),
             pending_chunks: VecDeque::new(),
             rebalances_completed: 0,
@@ -243,6 +289,26 @@ impl Controller {
     /// The geometry.
     pub fn specs(&self) -> &EplbSpecs {
         &self.config.specs
+    }
+
+    /// Whether the next forward contributes to the sampling window.
+    pub fn recording(&self) -> bool {
+        self.recording
+    }
+
+    /// A manual request outside a short recording window opens it immediately.
+    /// If already sampling, finish the same window instead of resetting it.
+    pub fn request_window(&mut self) -> Option<u64> {
+        if self.phase != Phase::Idle
+            || self.config.window_size == self.config.rebalance_num_iterations
+        {
+            return None;
+        }
+        if !self.recording {
+            self.recording = true;
+            self.next_snapshot_at = self.forwards + self.config.window_size;
+        }
+        Some(self.next_snapshot_at.saturating_sub(self.forwards))
     }
 
     /// Where the rebalance stands.
@@ -260,8 +326,28 @@ impl Controller {
         if forwarded {
             self.forwards += 1;
         }
+        if self.config.window_size < self.config.rebalance_num_iterations {
+            // A window may span publication of the preceding placement. If a
+            // transfer actually overruns the next deadline, discard that sample
+            // and start a fresh W-forward window once a snapshot can be taken.
+            if self.recording && self.forwards >= self.next_snapshot_at && self.phase != Phase::Idle
+            {
+                self.recording = false;
+            }
+            let snapshot_consumed = self.phase != Phase::Computing || self.snapshot.is_some();
+            if !self.recording
+                && snapshot_consumed
+                && self.forwards >= self.next_snapshot_at - self.config.window_size
+                && (self.forwards < self.next_snapshot_at || self.phase == Phase::Idle)
+            {
+                self.recording = true;
+                self.next_snapshot_at = self.forwards + self.config.window_size;
+            }
+        }
         match self.phase {
-            Phase::Idle if self.forwards >= self.next_snapshot_at => vec![self.begin_snapshot()],
+            Phase::Idle if self.recording && self.forwards >= self.next_snapshot_at => {
+                vec![self.begin_snapshot()]
+            }
             Phase::Computing if self.commit_at.is_some_and(|at| self.forwards >= at) => {
                 self.commit_at = None;
                 std::iter::once(InternalOp::Commit)
@@ -280,64 +366,99 @@ impl Controller {
 
     fn begin_snapshot(&mut self) -> InternalOp {
         self.phase = Phase::Computing;
+        tracing::info!(
+            forward = self.forwards,
+            sampled_forwards = self
+                .forwards
+                .saturating_sub(self.next_snapshot_at - self.config.window_size),
+            "EPLB recording window closed"
+        );
+        self.recording = self.config.window_size == self.config.rebalance_num_iterations;
         self.next_snapshot_at = self.forwards + self.config.rebalance_num_iterations;
         InternalOp::Snapshot
     }
 
-    /// Take the EP group's load `[layers, physical]`, counted under the
-    /// placement `old_map`; rank 0 starts the solver; the commit is due
-    /// after the delay.
+    /// Consume the physical and version-correct logical load. The current
+    /// placement seeds move planning. Rank 0 starts the solver.
     pub fn on_snapshot(
         &mut self,
         physical_count: Vec<Vec<i64>>,
-        old_map: Vec<Vec<i32>>,
+        placement: Vec<Vec<i32>>,
+        logical_count: Vec<Vec<i64>>,
     ) -> Result<(), String> {
-        if self.phase != Phase::Computing || self.commit_at.is_some() {
+        if self.phase != Phase::Computing || self.snapshot.is_some() {
             return Err(format!(
                 "unexpected expert load snapshot in phase {}",
                 self.phase.name()
             ));
         }
-        let specs = &self.config.specs;
-        let shape_ok = physical_count.len() == specs.num_layers
-            && physical_count
-                .iter()
-                .all(|row| row.len() == specs.num_physical_experts);
-        if !shape_ok || old_map.len() != specs.num_layers {
-            return Err(format!(
-                "expert load has the wrong shape, expected [{}, {}]",
-                specs.num_layers, specs.num_physical_experts
-            ));
+        let layers: usize = self
+            .config
+            .models()
+            .map(|(_, specs, _)| specs.num_layers)
+            .sum();
+        if physical_count.len() != layers
+            || placement.len() != layers
+            || logical_count.len() != layers
+        {
+            return Err("expert load has the wrong shape (layer count)".into());
         }
-        let mut logical = vec![vec![0i64; specs.num_logical_experts]; specs.num_layers];
-        for (layer, (counts, map)) in physical_count.iter().zip(&old_map).enumerate() {
-            for (&count, &expert) in counts.iter().zip(map) {
-                logical[layer][expert as usize] += count;
+        for (model, specs, range) in self.config.models() {
+            for i in range.clone() {
+                let (counts, map, credits) = (&physical_count[i], &placement[i], &logical_count[i]);
+                if counts.len() != specs.num_physical_experts
+                    || map.len() != counts.len()
+                    || credits.len() != specs.num_logical_experts
+                {
+                    return Err(format!("{model} expert load has the wrong shape"));
+                }
+                if map
+                    .iter()
+                    .any(|&id| id < 0 || id as usize >= specs.num_logical_experts)
+                    || counts.iter().chain(credits).any(|&count| count < 0)
+                    || credits.iter().sum::<i64>() != counts.iter().sum::<i64>()
+                {
+                    return Err(format!("{model} invalid expert load or placement"));
+                }
             }
+            let routes: i64 = physical_count[range.clone()].iter().flatten().sum();
+            let loads: Vec<Vec<f64>> = physical_count[range]
+                .iter()
+                .map(|row| row.iter().map(|&count| count as f64).collect())
+                .collect();
+            let (min, mean) = summary(&balancedness(&loads, specs.ep_size));
+            tracing::info!("Expert rebalance {model}: snapshot of {routes} routes over {} layers; balancedness min {min:.3} mean {mean:.3}", specs.num_layers);
         }
-        let routes: i64 = physical_count.iter().flatten().sum();
-        let loads: Vec<Vec<f64>> = physical_count
-            .iter()
-            .map(|row| row.iter().map(|&count| count as f64).collect())
-            .collect();
-        let (min, mean) = summary(&balancedness(&loads, specs.ep_size));
-        tracing::info!(
-            "Expert rebalance: snapshot of {routes} routes over {} layers; balancedness min \
-             {min:.3} mean {mean:.3}; commit in {} forwards",
-            specs.num_layers,
-            self.config.commit_delay_forwards
-        );
-        if specs.ep_rank == 0 {
-            let (count, specs, algorithm) = (logical.clone(), specs.clone(), self.config.algorithm);
+        let snapshot = Arc::new(Snapshot {
+            placement,
+            logical_count,
+        });
+        if self.config.specs.ep_rank == 0 {
+            let snapshot = Arc::clone(&snapshot);
+            let config = self.config.clone();
             self.solver = Some(
                 thread::Builder::new()
                     .name("ts-eplb-solver".to_owned())
-                    .spawn(move || solve(count, specs, algorithm))
+                    .spawn(move || {
+                        let mut placement = Vec::with_capacity(layers);
+                        let counts = &snapshot.logical_count;
+                        for (_, specs, range) in config.models() {
+                            let mut rows = solve(&counts[range.clone()], specs, config.algorithm)?;
+                            // Idle draft stages (e.g. a prefill-only interval) have no
+                            // observations from which to improve their live placement.
+                            for (row, layer) in rows.iter_mut().zip(range) {
+                                if counts[layer].iter().all(|&traffic| traffic == 0) {
+                                    row.clone_from(&snapshot.placement[layer]);
+                                }
+                            }
+                            placement.extend(rows);
+                        }
+                        Ok(placement)
+                    })
                     .map_err(|error| error.to_string())?,
             );
         }
-        self.old_map = Some(old_map);
-        self.logical_count = Some(logical);
+        self.snapshot = Some(snapshot);
         self.commit_at = Some(self.forwards + self.config.commit_delay_forwards);
         Ok(())
     }
@@ -345,7 +466,7 @@ impl Controller {
     /// EP rank 0's placement to broadcast, once its solver finished; `None`
     /// on the other ranks, which take the broadcast.
     pub fn placement_for_commit(&mut self) -> Result<Option<Vec<Vec<i32>>>, String> {
-        if self.phase != Phase::Computing || self.old_map.is_none() {
+        if self.snapshot.is_none() {
             return Err(format!(
                 "unexpected expert placement commit in phase {}",
                 self.phase.name()
@@ -362,21 +483,19 @@ impl Controller {
 
     /// Plan every layer's moves from the agreed placement; the chunks follow.
     pub fn on_commit(&mut self, new_map: Vec<Vec<i32>>) -> Result<(), String> {
-        let Some(old_map) = self
-            .old_map
-            .as_ref()
-            .filter(|_| self.phase == Phase::Computing)
-        else {
+        let Some(snapshot) = &self.snapshot else {
             return Err(format!(
                 "unexpected expert placement commit in phase {}",
                 self.phase.name()
             ));
         };
         let specs = &self.config.specs;
+        let old_map = &snapshot.placement;
         if new_map.len() != old_map.len()
             || new_map
                 .iter()
-                .any(|row| row.len() != specs.num_physical_experts)
+                .zip(&snapshot.logical_count)
+                .any(|(row, counts)| row.iter().any(|&e| e < 0 || e as usize >= counts.len()))
         {
             return Err("the committed placement has the wrong shape".to_owned());
         }
@@ -389,15 +508,15 @@ impl Controller {
                     new,
                     specs.ep_rank,
                     &specs.ep_rank_nodes,
-                    specs.num_local(),
+                    old.len() / specs.ep_size,
                 )
             })
             .collect::<Result<_, _>>()?;
-        if let Some(logical) = &self.logical_count {
+        for (model, specs, layers) in self.config.models() {
             // Each expert's load split evenly over its replicas.
-            let per_slot: Vec<Vec<f64>> = new_map
+            let per_slot: Vec<Vec<f64>> = new_map[layers.clone()]
                 .iter()
-                .zip(logical)
+                .zip(&snapshot.logical_count[layers.clone()])
                 .map(|(row, counts)| {
                     let mut replicas = vec![0i64; counts.len()];
                     for &e in row {
@@ -409,16 +528,16 @@ impl Controller {
                 })
                 .collect();
             let (min, mean) = summary(&balancedness(&per_slot, specs.ep_size));
-            let moved: usize = self
-                .moves_by_layer
+            let moved: usize = self.moves_by_layer[layers]
                 .iter()
                 .map(SlotMoves::num_changed_slots)
                 .sum();
             tracing::info!(
-                "Expert rebalance: committed placement moves {moved} local slots; expected \
+                "Expert rebalance {model}: committed placement moves {moved} local slots; expected \
                  balancedness min {min:.3} mean {mean:.3}"
             );
         }
+        self.snapshot = None;
         self.new_map = Some(new_map);
         self.pending_chunks = self.chunks.iter().cloned().collect();
         self.phase = Phase::Applying;
@@ -469,9 +588,7 @@ impl Controller {
             return Ok(());
         }
         self.phase = Phase::Idle;
-        self.old_map = None;
         self.new_map = None;
-        self.logical_count = None;
         self.moves_by_layer.clear();
         self.rebalances_completed += 1;
         tracing::info!("Expert rebalance {} applied", self.rebalances_completed);
@@ -499,7 +616,9 @@ mod tests {
                 num_groups: None,
                 num_nodes: 1,
             },
+            draft_specs: None,
             rebalance_num_iterations: 5,
+            window_size: 5,
             layers_per_chunk: 2,
             algorithm: Algorithm::Deepseek,
             commit_delay_forwards: 3,
@@ -520,7 +639,7 @@ mod tests {
     /// A load under the trivial placement whose expert 3, in one slot, is hot.
     fn snapshot(controller: &mut Controller) -> Result<(), String> {
         let load = vec![vec![1, 1, 1, 40, 1, 1]; 3];
-        controller.on_snapshot(load, trivial_map())
+        controller.on_snapshot(load, trivial_map(), vec![vec![2, 2, 1, 40]; 3])
     }
 
     fn apply_all(controller: &mut Controller) {
@@ -528,6 +647,41 @@ mod tests {
             controller.chunk_payload(&ids).unwrap();
             controller.on_chunk_applied(&ids).unwrap();
         }
+    }
+
+    #[test]
+    fn target_and_draft_balance_their_own_experts_and_apply_separate_chunks() {
+        let config = controller(0).config;
+        let draft = EplbSpecs {
+            num_layers: 2,
+            num_logical_experts: 2,
+            num_physical_experts: 4,
+            ..config.specs.clone()
+        };
+        let mut controller = Controller::new(EplbConfig {
+            draft_specs: Some(draft),
+            ..config
+        })
+        .unwrap();
+        let mut old = trivial_map();
+        old.extend([vec![0, 0, 1, 1], vec![0, 1, 0, 1]]);
+        let mut load = vec![vec![1, 1, 1, 40, 1, 1]; 3];
+        load.extend([vec![40, 40, 0, 1], vec![0; 4]]);
+        controller.request_snapshot().unwrap();
+        let mut logical = vec![vec![2, 40, 1, 2]; 3];
+        logical.extend([vec![80, 1], vec![0, 0]]);
+        controller.on_snapshot(load, old.clone(), logical).unwrap();
+        let ops = rounds(&mut controller, 3, true);
+        let new_map = controller.placement_for_commit().unwrap().unwrap();
+        assert_eq!(new_map[0].iter().filter(|&&id| id == 1).count(), 3);
+        assert_eq!(new_map[3].iter().filter(|&&id| id == 0).count(), 3);
+        assert_eq!(new_map[4], old[4]); // Unobserved draft layer keeps its layout.
+        controller.on_commit(new_map.clone()).unwrap();
+        assert_eq!(ops.last(), Some(&InternalOp::ApplyChunk(vec![3, 4])));
+        apply_all(&mut controller); // Target chunks precede the draft.
+        assert_eq!(controller.chunk_payload(&[3, 4]).unwrap().0, new_map[3..]);
+        controller.on_chunk_applied(&[3, 4]).unwrap();
+        assert_eq!(controller.phase(), Phase::Idle);
     }
 
     #[test]
@@ -553,6 +707,7 @@ mod tests {
         // Computing until the commit lands; nothing is due twice.
         assert_eq!(controller.phase(), Phase::Computing);
         assert_eq!(rounds(&mut controller, 3, true), []);
+        assert!(snapshot(&mut controller).is_err());
     }
 
     #[test]
@@ -592,6 +747,9 @@ mod tests {
         snapshot(&mut controller).unwrap();
         assert_eq!(controller.placement_for_commit().unwrap(), None);
         let agreed = vec![vec![3, 1, 2, 3, 0, 1]; 3];
+        let mut malformed = agreed.clone();
+        malformed[0].pop();
+        assert!(controller.on_commit(malformed).is_err());
         controller.on_commit(agreed.clone()).unwrap();
         let (rows, moves) = controller.chunk_payload(&[0, 1]).unwrap();
         assert_eq!(rows, agreed[..2]);
@@ -609,7 +767,7 @@ mod tests {
         assert!(controller.placement_for_commit().is_err());
         assert!(controller.chunk_payload(&[0, 1]).is_err());
         let wrong_shape = controller
-            .on_snapshot(vec![vec![1; 6]; 2], trivial_map()[..2].to_vec())
+            .on_snapshot(vec![vec![1; 6]; 2], trivial_map()[..2].to_vec(), vec![])
             .unwrap_err();
         assert!(wrong_shape.contains("shape"), "{wrong_shape}");
         snapshot(&mut controller).unwrap();
@@ -635,6 +793,39 @@ mod tests {
         assert_eq!(chunk_layer_ids(3, 3).unwrap(), [vec![0, 1, 2]]);
         assert!(chunk_layer_ids(3, 4).is_err());
         assert!(chunk_layer_ids(3, 0).is_err());
+    }
+
+    #[test]
+    fn short_windows_count_forwards_across_an_on_time_or_late_publication() {
+        for late in [false, true] {
+            let mut cfg = controller(0).config;
+            cfg.rebalance_num_iterations = 10;
+            cfg.window_size = 7;
+            cfg.commit_delay_forwards = 4;
+            let mut c = Controller::new(cfg).unwrap();
+            assert!(c.recording());
+            assert!(rounds(&mut c, 16, false).is_empty());
+            c.note_round(true);
+            assert_eq!(c.request_window(), Some(6)); // Keep the sample already in progress.
+            assert!(rounds(&mut c, 5, true).is_empty());
+            assert_eq!(c.note_round(true), [InternalOp::Snapshot]);
+            assert!(!c.recording());
+            snapshot(&mut c).unwrap();
+            assert!(matches!(rounds(&mut c, 4, true)[0], InternalOp::Commit));
+            let new = c.placement_for_commit().unwrap().unwrap();
+            c.on_commit(new).unwrap();
+            assert!(c.recording()); // The next sample has already opened.
+            if late {
+                assert!(rounds(&mut c, 6, true).is_empty());
+                assert!(!c.recording());
+            }
+            apply_all(&mut c);
+            c.note_round(false);
+            assert!(c.recording());
+            let remaining = if late { 7 } else { 6 };
+            assert!(rounds(&mut c, remaining - 1, true).is_empty());
+            assert_eq!(c.note_round(true), [InternalOp::Snapshot]);
+        }
     }
 
     #[test]

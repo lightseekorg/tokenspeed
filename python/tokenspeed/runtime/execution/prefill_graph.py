@@ -1535,9 +1535,7 @@ class PrefillGraph:
         so its breaks scrub the static state's padded tail; a row count above
         the largest decoder bucket runs the decoder stage eager.
 
-        The expert load counters are not told about this path's filler rows:
-        the encoder bucket and the narrowed decoder bucket pad differently,
-        and no model that opts into expert placement narrows.
+        V4.1 expert placement requires attention DP, which disables these graphs.
         """
         model = self._narrowing
         encoder = self._encoders[bucket]
