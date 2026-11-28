@@ -76,3 +76,17 @@ MXFP4 indexer with DeepGEMM and DeepSelect. Hopper and portable scorers retain
 per-request windows and reserve one packed index history; their internal query
 tiling remains responsible for bounding score memory. Cache planning uses the
 same capability check as window merging.
+
+# Device verification budget selector (`select_verify_budget`)
+
+`dsv41.select_verify_budget` evaluates `VerifyBudgetPolicy` directly on GPU for a
+decode batch (`request_slots`, `seq_lens`, `latest_scores`) against the bucket's
+installed `VerifyCalibration` regions (`profile_ranges`, `profile_native_ms`,
+`profile_capacities` descending, `profile_step_ms` pre-offset by `policy_ms`).
+The single-CTA Triton kernel checks context bounds at
+`max(seq_lens) + context_advance`, rejects non-finite slot scores or non-positive
+contexts back to `padded_bs * verify_width`, computes sorted survival rewards in
+FP32, and writes `(selected_q, min_ctx, max_ctx)` as three `int32` scalars without
+per-step host score transfers. Runtime batch size, context advance, and profile
+dimensions stay unspecialized (`do_not_specialize`), while `latest_scores` slot
+indexing uses 64-bit offsets.

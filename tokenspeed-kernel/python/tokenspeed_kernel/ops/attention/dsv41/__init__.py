@@ -107,6 +107,7 @@ __all__ = [
     "rope_pad_query",
     "rope_quantize_fp8_grouped",
     "verify_layout",
+    "select_verify_budget",
     "dspark_rows",
     "dspark_anchors",
     "dspark_block",
@@ -2053,4 +2054,113 @@ def verify_layout(
         latest_scores=latest_scores,
         request_slots=request_slots,
         active_count=active_count,
+    )
+
+
+def select_verify_budget(
+    latest_scores: torch.Tensor,
+    *,
+    request_slots: torch.Tensor,
+    seq_lens: torch.Tensor,
+    profile_ranges: torch.Tensor,
+    profile_native_ms: torch.Tensor,
+    profile_capacities: torch.Tensor,
+    profile_step_ms: torch.Tensor,
+    selected_out: torch.Tensor,
+    padded_bs: int,
+    context_advance: int,
+    min_batch_size: int,
+    min_gain: float,
+) -> None:
+    """Select the optimal verify query budget directly on device without host transfers.
+
+    Reads slot-indexed FP32 confidence logits ``latest_scores`` [slots, D] and
+    live context lengths ``seq_lens`` [bs] for active requests ``request_slots``
+    [bs], matches ``max(seq_lens) + context_advance`` against calibration buckets
+    ``profile_ranges`` [P, 2], and writes int32 ``[selected_q, min_ctx, max_ctx]``
+    to ``selected_out``. Missing profiles, non-finite slots, zero context lengths,
+    or small batches keep ``padded_bs * (D + 1)``.
+    """
+    if latest_scores.ndim != 2 or latest_scores.dtype != torch.float32:
+        raise ValueError("latest verification scores must be FP32 [slots, draft width]")
+    if not latest_scores.is_cuda:
+        raise ValueError("device budget selection requires a CUDA or ROCm GPU")
+    if latest_scores.stride(1) != 1:
+        raise ValueError("latest verification scores require unit column stride")
+    draft_width = latest_scores.shape[1]
+    if draft_width < 1 or type(padded_bs) is not int or padded_bs < 1:
+        raise ValueError("invalid draft width or padded batch size")
+    if padded_bs * (draft_width + 1) > VERIFY_LAYOUT_MAX_TOKENS:
+        raise ValueError(
+            "device budget selection requires batch * (draft width + 1) "
+            f"<= {VERIFY_LAYOUT_MAX_TOKENS}"
+        )
+    if (
+        type(context_advance) is not int
+        or context_advance < 0
+        or type(min_batch_size) is not int
+        or min_batch_size < 1
+        or type(min_gain) not in (int, float)
+        or not 0 <= float(min_gain) < 1
+    ):
+        raise ValueError("invalid adaptive verify policy threshold")
+    bs = int(request_slots.shape[0])
+    if (
+        request_slots.ndim != 1
+        or bs > padded_bs
+        or request_slots.dtype not in (torch.int32, torch.int64)
+        or request_slots.device != latest_scores.device
+        or not request_slots.is_contiguous()
+    ):
+        raise ValueError("request_slots must match [<= padded_bs] on device")
+    if (
+        seq_lens.shape != (bs,)
+        or seq_lens.dtype not in (torch.int32, torch.int64)
+        or seq_lens.device != latest_scores.device
+        or not seq_lens.is_contiguous()
+    ):
+        raise ValueError("seq_lens must match request_slots on device")
+    profiles = int(profile_ranges.shape[0])
+    candidates = int(profile_capacities.shape[0])
+    if (
+        profile_ranges.shape != (profiles, 2)
+        or profile_ranges.dtype != torch.int32
+        or profile_native_ms.shape != (profiles,)
+        or profile_native_ms.dtype != torch.float32
+        or profile_capacities.shape != (candidates,)
+        or profile_capacities.dtype != torch.int32
+        or profile_step_ms.shape != (profiles, candidates)
+        or profile_step_ms.dtype != torch.float32
+        or any(
+            t.device != latest_scores.device or not t.is_contiguous()
+            for t in (
+                profile_ranges,
+                profile_native_ms,
+                profile_capacities,
+                profile_step_ms,
+            )
+        )
+    ):
+        raise ValueError("calibration tables must be contiguous device tensors")
+    if (
+        selected_out.shape != (3,)
+        or selected_out.dtype != torch.int32
+        or selected_out.device != latest_scores.device
+        or not selected_out.is_contiguous()
+    ):
+        raise ValueError("selected_out must be contiguous int32 [3] on device")
+    implementation = _kernel("select_verify_budget", latest_scores)
+    implementation(
+        latest_scores,
+        request_slots,
+        seq_lens,
+        profile_ranges,
+        profile_native_ms,
+        profile_capacities,
+        profile_step_ms,
+        selected_out,
+        padded_bs,
+        context_advance,
+        min_batch_size,
+        float(min_gain),
     )

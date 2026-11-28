@@ -41,6 +41,9 @@ from tokenspeed_kernel._triton import tl, triton  # noqa.
 jit = triton.jit
 
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import fast_expf, gdc_wait
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.multistep import (
+    resolve_indices as resolve_multistep_indices,
+)
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
     exact_candidates,
     whole_normalizer,
@@ -155,6 +158,10 @@ def shard_candidates_kernel(
     stride_d=None,  # Slot Stride of Draft Probabilities.
     stride_dg: tl.constexpr = None,  # Step Stride of Draft Probabilities.
     whole: tl.constexpr = False,  # Whole-Vocabulary Rows Flag (``whole_block``).
+    q_ptr=None,  # Cumulative Lengths -> [ B + 1 ].
+    batch_size: tl.int32 = 0,  # Total Sequences -> B.
+    varlen: tl.constexpr = False,  # Variable-Length Lookahead Flag.
+    block_q: tl.constexpr = None,  # Block Size of Cumulative Length(s).
 ) -> None:
     """
     Writes each row's best ``max_k`` candidates over this rank's vocab shard, as
@@ -176,136 +183,173 @@ def shard_candidates_kernel(
           and exp-sum in slot 1 and their draft's value and perturbed value
           in slot 2, as raw fp32 in both blocks (``merged_whole``).
 
-        • Rows are request-major, ``lookahead + 1`` per request.
+        • Rows are request-major, ``lookahead + 1`` per request (or CSR-packed when ``varlen``).
 
     """
     timesteps: tl.constexpr = lookahead + 1
 
     row_id = tl.program_id(axis=0)
-    request = row_id // timesteps
-    step_id = row_id % timesteps
-    margin = request * timesteps
+    if varlen:
 
-    batch_id = tl.load(f_ptr + request)
-    indicator = tl.load(z_ptr + batch_id)
-
-    span = tl.arange(0, max_k)
-    pairs = (row_id * stride_o) + span
-
-    if whole_row(indicator, whole, lookahead == 0):
-
-        value, column = first_maximum(
-            s_ptr, row_id, vocab_blocks, True, enable_pdl, stride_s, block_n, block_v
-        )
-
-        values = tl.where(span == 0, value, -float("inf"))
-        indices = tl.where(span == 0, column, 0)
-        ids = (indices + shard_offset).to(tl.float32)
-
-        if lookahead > 0:
-
-            maximum, total, draft_value, draft_score = whole_normalizer(
-                s_ptr, row_id, vocab_blocks, stride_s, block_v
+        batch_id, _, draft_margin, step_id, req_timesteps, row_valid = (
+            resolve_multistep_indices(
+                q_ptr,
+                f_ptr,
+                row_id,
+                lookahead,
+                batch_size,
+                True,
+                True,
+                block_q,
             )
-
-            values = tl.where(span == 1, maximum, values)
-            values = tl.where(span == 2, draft_value, values)
-            ids = tl.where(span == 1, total, ids)
-            ids = tl.where(span == 2, draft_score, ids)
-
-    elif (indicator & 0x40) > 0:
-
-        value, column = first_maximum(
-            s_ptr, row_id, vocab_blocks, exact, enable_pdl, stride_s, block_n, block_v
         )
-
-        values = tl.where(span == 0, value, -float("inf"))
-        indices = tl.where(span == 0, column, 0)
-        ids = (indices + shard_offset).to(tl.float32)
 
     else:
 
-        values, indices = unpack_top_k(
-            s_ptr,
-            row_id,
-            vocab_blocks,
-            1,
-            vocab_size,
-            max_k,
-            None,
-            block_v,
-            total_cols,
-            False,
-            False,
-            is_alternating,
-            enable_pdl,
-            None,
-            None,
-            stride_s,
-            block_n,
-            block_v,
-        )
+        request = row_id // timesteps
+        step_id = row_id % timesteps
+        draft_margin = request * timesteps
+        req_timesteps = timesteps
+        row_valid = True
+        batch_id = tl.load(f_ptr + request)
 
-        if exact:
+    if row_valid:
 
-            # Re-read the candidates' exact values: bf16 keys only chose them.
+        indicator = tl.load(z_ptr + batch_id)
 
-            values, indices = exact_candidates(
-                x_ptr,
+        span = tl.arange(0, max_k)
+        pairs = (row_id * stride_o) + span
+
+        if whole_row(indicator, whole, lookahead == 0):
+
+            value, column = first_maximum(
+                s_ptr,
                 row_id,
-                indices,
-                indicator,
-                None,
-                gr_ptr,
-                cr_ptr,
-                dr_ptr,
-                tr_ptr,
-                rr_ptr,
-                fr_ptr,
-                pr_ptr,
-                br_ptr,
-                er_ptr,
-                batch_id,
-                step_id,
-                margin,
-                timesteps,
+                vocab_blocks,
+                True,
+                enable_pdl,
+                stride_s,
+                block_n,
+                block_v,
+            )
+
+            values = tl.where(span == 0, value, -float("inf"))
+            indices = tl.where(span == 0, column, 0)
+            ids = (indices + shard_offset).to(tl.float32)
+
+            if lookahead > 0:
+
+                maximum, total, draft_value, draft_score = whole_normalizer(
+                    s_ptr, row_id, vocab_blocks, stride_s, block_v
+                )
+
+                values = tl.where(span == 1, maximum, values)
+                values = tl.where(span == 2, draft_value, values)
+                ids = tl.where(span == 1, total, ids)
+                ids = tl.where(span == 2, draft_score, ids)
+
+        elif (indicator & 0x40) > 0:
+
+            value, column = first_maximum(
+                s_ptr,
+                row_id,
+                vocab_blocks,
+                exact,
+                enable_pdl,
+                stride_s,
+                block_n,
+                block_v,
+            )
+
+            values = tl.where(span == 0, value, -float("inf"))
+            indices = tl.where(span == 0, column, 0)
+            ids = (indices + shard_offset).to(tl.float32)
+
+        else:
+
+            values, indices = unpack_top_k(
+                s_ptr,
+                row_id,
+                vocab_blocks,
+                1,
                 vocab_size,
-                shard_offset,
-                lookahead,
-                False,
-                lookahead > 0,
-                lookahead == 0,
-                stride_x,
-                stride_gr,
-                stride_cr,
-                None,
-                block_t,
                 max_k,
-                logit_scale,
-                softcap,
+                None,
+                block_v,
+                total_cols,
+                False,
+                False,
+                is_alternating,
+                enable_pdl,
+                None,
+                None,
+                stride_s,
+                block_n,
+                block_v,
             )
 
-        # The greedy branch's types: fp32 values, int32 columns.
-        values = values.to(tl.float32)
-        indices = indices.to(tl.int32)
-        ids = (indices + shard_offset).to(tl.float32)
+            if exact:
 
-    tl.store(o_ptr + pairs, values)
-    tl.store(o_ptr + pairs + max_k, ids)
+                # Re-read the candidates' exact values: bf16 keys only chose them.
 
-    if d_ptr is not None:
+                values, indices = exact_candidates(
+                    x_ptr,
+                    row_id,
+                    indices,
+                    indicator,
+                    None,
+                    gr_ptr,
+                    cr_ptr,
+                    dr_ptr,
+                    tr_ptr,
+                    rr_ptr,
+                    fr_ptr,
+                    pr_ptr,
+                    br_ptr,
+                    er_ptr,
+                    batch_id,
+                    step_id,
+                    draft_margin,
+                    timesteps,
+                    vocab_size,
+                    shard_offset,
+                    lookahead,
+                    False,
+                    lookahead > 0,
+                    lookahead == 0,
+                    stride_x,
+                    stride_gr,
+                    stride_cr,
+                    None,
+                    block_t,
+                    max_k,
+                    logit_scale,
+                    softcap,
+                )
 
-        # Only this rank holds q over its columns, so its candidates carry q to the merge.
-        drafts = tl.zeros((max_k,), dtype=tl.float32)
+            # The greedy branch's types: fp32 values, int32 columns.
+            values = values.to(tl.float32)
+            indices = indices.to(tl.int32)
+            ids = (indices + shard_offset).to(tl.float32)
 
-        if ((indicator & 0x40) == 0) & (step_id < lookahead):
+        tl.store(o_ptr + pairs, values)
+        tl.store(o_ptr + pairs + max_k, ids)
 
-            positions = (batch_id * stride_d) + (step_id * stride_dg) + indices
-            drafts = tl.load(
-                d_ptr + positions, mask=(indices >= 0) & (indices < vocab_size), other=0
-            )
+        if d_ptr is not None:
 
-        tl.store(o_ptr + pairs + 2 * max_k, drafts)
+            # Only this rank holds q over its columns, so its candidates carry q to the merge.
+            drafts = tl.zeros((max_k,), dtype=tl.float32)
+
+            if ((indicator & 0x40) == 0) & (step_id < req_timesteps - 1):
+
+                positions = (batch_id * stride_d) + (step_id * stride_dg) + indices
+                drafts = tl.load(
+                    d_ptr + positions,
+                    mask=(indices >= 0) & (indices < vocab_size),
+                    other=0,
+                )
+
+            tl.store(o_ptr + pairs + 2 * max_k, drafts)
 
 
 @jit

@@ -58,9 +58,11 @@ def resolve_indices(
     block_q: tl.constexpr,
 ):
     """
-    Compute the batch id, step id, and margin given the row id of the current tile.
+    Compute the batch id, logits margin, draft margin, step id, request length, and validity.
 
     """
+    timesteps: tl.constexpr = lookahead + 1
+
     if varlen:
 
         row_ids = tl.arange(0, block_q)
@@ -69,25 +71,32 @@ def resolve_indices(
         lengths = tl.load(q_ptr + row_ids, mask=row_mask, other=0, cache_modifier=".cv")
         marked = ((lengths <= row_id) & row_mask).to(tl.uint32)
 
-        batch_id = tl.sum(marked, axis=0) - 1
-        margin = tl.load(q_ptr + batch_id)
+        raw_batch = tl.sum(marked, axis=0).to(tl.int32) - 1
+        row_valid = (raw_batch >= 0) & (raw_batch < batch_size)
+        safe_batch = tl.maximum(tl.minimum(raw_batch, batch_size - 1), 0)
+        margin = tl.load(q_ptr + safe_batch, mask=row_valid, other=0).to(tl.int32)
+        upper = tl.load(q_ptr + safe_batch + 1, mask=row_valid, other=0).to(tl.int32)
 
         step_id = row_id - margin
+        req_timesteps = upper - margin
+        draft_margin = safe_batch * timesteps
+        batch_id = safe_batch
 
     else:
-
-        timesteps = lookahead + 1
 
         batch_id = row_id // timesteps
         step_id = row_id % timesteps
 
         margin = batch_id * timesteps
+        draft_margin = margin
+        req_timesteps = timesteps
+        row_valid = True
 
     if slotted:
 
-        batch_id = tl.load(f_ptr + batch_id)
+        batch_id = tl.load(f_ptr + batch_id, mask=row_valid, other=0)
 
-    return batch_id, margin, step_id
+    return batch_id, margin, draft_margin, step_id, req_timesteps, row_valid
 
 
 @jit
@@ -104,7 +113,7 @@ def whole_targets(
     total,
     draft_value,
     draft_score,
-    lookahead: tl.constexpr,
+    req_timesteps,
     max_k: tl.constexpr,
 ):
     """
@@ -122,7 +131,7 @@ def whole_targets(
     offsets = tl.arange(0, max_k)
     positions = (row_id * max_k) + offsets
 
-    if step_id < lookahead:
+    if step_id < req_timesteps - 1:
 
         draft = tl.load(t_ptr + margin + step_id)
         target = tl.where(
@@ -217,7 +226,7 @@ def cumulative_unpack_kernel(
 
         gdc_wait()
 
-    batch_id, margin, step_id = resolve_indices(
+    batch_id, margin, draft_margin, step_id, req_timesteps, row_valid = resolve_indices(
         q_ptr,
         f_ptr,
         row_id,
@@ -228,206 +237,228 @@ def cumulative_unpack_kernel(
         block_q,
     )
 
-    indicator = tl.load(z_ptr + batch_id)
-
-    if whole_row(indicator, whole, False):
-
-        # Whole-vocabulary Gumbel-max, and the draft's probability over the whole vocabulary.
-
-        if cand_ptr is not None:
-
-            score, winner, maximum, total, draft_value, draft_score = merged_whole(
-                cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
-            )
-
-        else:
-
-            score, winner = exact_first(
-                s_ptr, row_id, vocab_blocks, enable_pdl, stride_s, block_v
-            )
-            maximum, total, draft_value, draft_score = whole_normalizer(
-                s_ptr, row_id, vocab_blocks, stride_s, block_v
-            )
+    if not row_valid:
 
         if enable_pdl:
 
             gdc_launch_dependents()
-
-        whole_targets(
-            v_ptr,
-            j_ptr,
-            tr_ptr,
-            row_id,
-            margin,
-            step_id,
-            score,
-            winner,
-            maximum,
-            total,
-            draft_value,
-            draft_score,
-            lookahead,
-            max_k,
-        )
-
-    elif (indicator & 0x40) > 0:
-
-        # Load, reduce, and unpack greedy i.e. top-1 maximum.
-
-        if cand_ptr is not None:
-
-            selection = merged_first(
-                cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
-            )
-
-        elif exact:
-
-            selection = exact_greedy(
-                s_ptr, row_id, vocab_blocks, enable_pdl, stride_s, block_v
-            )
-
-        else:
-
-            target, shift = greedy_maximum(
-                s_ptr,
-                row_id,
-                max_k,
-                vocab_blocks,
-                world_size,
-                shard_size,
-                sharded,
-                enable_pdl,
-                stride_s,
-                block_n,
-                block_v,
-            )
-
-            # Unpack the selected token id from the target index.
-
-            selection = shift + ((block_n - 1) ^ (target & 0xFFFF))
-
-        if enable_pdl:
-
-            gdc_launch_dependents()
-
-        # Store at margin boundary for later contiguous read-out.
-
-        tl.store(j_ptr + (margin * max_k) + step_id, selection)
 
     else:
 
-        # Load, reduce, and unpack top-k stochastic subset.
+        indicator = tl.load(z_ptr + batch_id)
 
-        if m_ptr is not None:
+        if whole_row(indicator, whole, False):
 
-            values, indices, proposals = merged_candidates_with_drafts(
-                cand_ptr, row_id, ranks, stride_mr, stride_mb, exact, enable_pdl, max_k
+            # Whole-vocabulary Gumbel-max, and the draft's probability over the whole vocabulary.
+
+            if cand_ptr is not None:
+
+                score, winner, maximum, total, draft_value, draft_score = merged_whole(
+                    cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
+                )
+
+            else:
+
+                score, winner = exact_first(
+                    s_ptr, row_id, vocab_blocks, enable_pdl, stride_s, block_v
+                )
+                maximum, total, draft_value, draft_score = whole_normalizer(
+                    s_ptr, row_id, vocab_blocks, stride_s, block_v
+                )
+
+            if enable_pdl:
+
+                gdc_launch_dependents()
+
+            whole_targets(
+                v_ptr,
+                j_ptr,
+                tr_ptr,
+                row_id,
+                draft_margin,
+                step_id,
+                score,
+                winner,
+                maximum,
+                total,
+                draft_value,
+                draft_score,
+                req_timesteps,
+                max_k,
             )
 
-        elif cand_ptr is not None:
+        elif (indicator & 0x40) > 0:
 
-            values, indices = merged_candidates(
-                cand_ptr, row_id, ranks, stride_mr, stride_mb, exact, enable_pdl, max_k
-            )
+            # Load, reduce, and unpack greedy i.e. top-1 maximum.
+
+            if cand_ptr is not None:
+
+                selection = merged_first(
+                    cand_ptr, row_id, ranks, stride_mr, stride_mb, enable_pdl, max_k
+                )
+
+            elif exact:
+
+                selection = exact_greedy(
+                    s_ptr, row_id, vocab_blocks, enable_pdl, stride_s, block_v
+                )
+
+            else:
+
+                target, shift = greedy_maximum(
+                    s_ptr,
+                    row_id,
+                    max_k,
+                    vocab_blocks,
+                    world_size,
+                    shard_size,
+                    sharded,
+                    enable_pdl,
+                    stride_s,
+                    block_n,
+                    block_v,
+                )
+
+                # Unpack the selected token id from the target index.
+
+                selection = shift + ((block_n - 1) ^ (target & 0xFFFF))
+
+            if enable_pdl:
+
+                gdc_launch_dependents()
+
+            # Store at margin boundary for later contiguous read-out.
+
+            tl.store(j_ptr + (margin * max_k) + step_id, selection)
 
         else:
 
-            values, indices = unpack_top_k(
-                s_ptr,
-                row_id,
-                vocab_blocks,
-                world_size,
-                shard_size,
-                max_k,
-                scale,
-                total_rows,
-                total_cols,
-                sharded,
-                is_adaptive,
-                is_alternating,
-                enable_pdl,
-                stride_r,
-                stride_b,
-                stride_s,
-                block_n,
-                block_v,
-            )
+            # Load, reduce, and unpack top-k stochastic subset.
 
-        if exact and cand_ptr is None:
+            if m_ptr is not None:
 
-            # Re-read the candidates' exact values: bf16 keys only chose them.
+                values, indices, proposals = merged_candidates_with_drafts(
+                    cand_ptr,
+                    row_id,
+                    ranks,
+                    stride_mr,
+                    stride_mb,
+                    exact,
+                    enable_pdl,
+                    max_k,
+                )
 
-            values, indices = exact_candidates(
-                x_ptr,
-                row_id,
-                indices,
-                indicator,
-                None,
-                gr_ptr,
-                cr_ptr,
-                dr_ptr,
-                tr_ptr,
-                rr_ptr,
-                fr_ptr,
-                pr_ptr,
-                br_ptr,
-                er_ptr,
-                batch_id,
-                step_id,
-                margin,
-                lookahead + 1,
-                vocab_size,
-                shard_offset,
-                lookahead,
-                False,
-                True,
-                False,
-                stride_x,
-                stride_gr,
-                stride_cr,
-                None,
-                block_t,
-                max_k,
-                None,
-                None,
-            )
+            elif cand_ptr is not None:
 
-        # Prepare for later softmax computation and write-out offset(s).
+                values, indices = merged_candidates(
+                    cand_ptr,
+                    row_id,
+                    ranks,
+                    stride_mr,
+                    stride_mb,
+                    exact,
+                    enable_pdl,
+                    max_k,
+                )
 
-        maximum = tl.gather(values, tl.full((1,), 0, dtype=tl.int32), axis=0)
-        offsets = tl.arange(0, max_k)
+            else:
 
-        if (indicator & 0x380) > 0:
+                values, indices = unpack_top_k(
+                    s_ptr,
+                    row_id,
+                    vocab_blocks,
+                    world_size,
+                    shard_size,
+                    max_k,
+                    scale,
+                    total_rows,
+                    total_cols,
+                    sharded,
+                    is_adaptive,
+                    is_alternating,
+                    enable_pdl,
+                    stride_r,
+                    stride_b,
+                    stride_s,
+                    block_n,
+                    block_v,
+                )
 
-            # Apply top-k, top-p, and / or min-p subset masking.
+            if exact and cand_ptr is None:
 
-            values = cumulative_masking(
-                k_ptr,
-                p_ptr,
-                n_ptr,
-                batch_id,
-                indicator,
-                values,
-                maximum,
-                offsets,
-                max_k,
-            )
+                # Re-read the candidates' exact values: bf16 keys only chose them.
 
-        # Compute softmax from values with potentially masked subset.
+                values, indices = exact_candidates(
+                    x_ptr,
+                    row_id,
+                    indices,
+                    indicator,
+                    None,
+                    gr_ptr,
+                    cr_ptr,
+                    dr_ptr,
+                    tr_ptr,
+                    rr_ptr,
+                    fr_ptr,
+                    pr_ptr,
+                    br_ptr,
+                    er_ptr,
+                    batch_id,
+                    step_id,
+                    draft_margin,
+                    lookahead + 1,
+                    vocab_size,
+                    shard_offset,
+                    lookahead,
+                    False,
+                    True,
+                    False,
+                    stride_x,
+                    stride_gr,
+                    stride_cr,
+                    None,
+                    block_t,
+                    max_k,
+                    None,
+                    None,
+                )
 
-        values = fast_expf(log_softmax(values, maximum))
+            # Prepare for later softmax computation and write-out offset(s).
 
-        if enable_pdl:
+            maximum = tl.gather(values, tl.full((1,), 0, dtype=tl.int32), axis=0)
+            offsets = tl.arange(0, max_k)
 
-            gdc_launch_dependents()
+            if (indicator & 0x380) > 0:
 
-        # Write-out the target values and top-k indices.
+                # Apply top-k, top-p, and / or min-p subset masking.
 
-        positions = (row_id * max_k) + offsets
+                values = cumulative_masking(
+                    k_ptr,
+                    p_ptr,
+                    n_ptr,
+                    batch_id,
+                    indicator,
+                    values,
+                    maximum,
+                    offsets,
+                    max_k,
+                )
 
-        tl.store(v_ptr + positions, values)
-        tl.store(j_ptr + positions, indices)
+            # Compute softmax from values with potentially masked subset.
 
-        if m_ptr is not None:
+            values = fast_expf(log_softmax(values, maximum))
 
-            tl.store(m_ptr + positions, proposals)
+            if enable_pdl:
+
+                gdc_launch_dependents()
+
+            # Write-out the target values and top-k indices.
+
+            positions = (row_id * max_k) + offsets
+
+            tl.store(v_ptr + positions, values)
+            tl.store(j_ptr + positions, indices)
+
+            if m_ptr is not None:
+
+                tl.store(m_ptr + positions, proposals)

@@ -5760,3 +5760,200 @@ def triton_dsv41_verify_layout(
         HAS_ACTIVE_COUNT=active_count is not None,
         num_warps=4,
     )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "BS",
+        "PADDED_BS",
+        "CONTEXT_ADVANCE",
+        "MIN_BATCH_SIZE",
+        "MIN_GAIN",
+        "NUM_PROFILES",
+        "NUM_CANDIDATES",
+        "LATEST_ROWS",
+        "LATEST_STRIDE",
+        "PROF_STRIDE",
+    ]
+)
+def _select_verify_budget_kernel(
+    Latest,
+    Slots,
+    SeqLens,
+    ProfRanges,
+    ProfNativeMs,
+    ProfCapacities,
+    ProfStepMs,
+    Out,
+    BS,
+    PADDED_BS,
+    CONTEXT_ADVANCE,
+    MIN_BATCH_SIZE,
+    MIN_GAIN,
+    NUM_PROFILES,
+    NUM_CANDIDATES,
+    LATEST_ROWS,
+    LATEST_STRIDE,
+    PROF_STRIDE,
+    DRAFT: tl.constexpr,
+    BLOCK: tl.constexpr,
+    REQ_BLOCK: tl.constexpr,
+    PROF_BLOCK: tl.constexpr,
+    CAP_BLOCK: tl.constexpr,
+):
+    full = (PADDED_BS * (DRAFT + 1)).to(tl.int32)
+    req = tl.arange(0, REQ_BLOCK)
+    req_ok = req < BS
+    seq_len = tl.load(SeqLens + req, mask=req_ok, other=0).to(tl.int32)
+    has_zero_ctx = tl.sum((req_ok & (seq_len <= 0)).to(tl.int32), axis=0) > 0
+    min_ctx = tl.where(
+        BS > 0, tl.min(tl.where(req_ok, seq_len, 0x7FFFFFFF), axis=0), 0
+    ).to(tl.int32)
+    max_ctx = tl.where(BS > 0, tl.max(tl.where(req_ok, seq_len, 0), axis=0), 0).to(
+        tl.int32
+    )
+    upper_ctx = max_ctx + CONTEXT_ADVANCE
+
+    index = tl.arange(0, BLOCK).to(tl.int64)
+    request = index // DRAFT
+    column = index % DRAFT
+    live = request < BS
+    slot = tl.load(Slots + request, mask=live, other=0).to(tl.int64)
+    slot_ok = live & (slot >= 0) & (slot < LATEST_ROWS)
+
+    finite = slot_ok
+    survival = tl.full((BLOCK,), 1.0, tl.float32)
+    for j in tl.static_range(DRAFT):
+        value = tl.load(Latest + slot * LATEST_STRIDE + j, mask=slot_ok, other=0.0)
+        finite = finite & (tl.abs(value) < float("inf"))
+        clamped = tl.minimum(tl.maximum(value, -60.0), 60.0)
+        prob = tl.div_rn(1.0, 1.0 + libdevice.exp(-clamped))
+        survival = survival * tl.where(j <= column, prob, 1.0)
+    invalid_slots = tl.sum((live & ~finite).to(tl.int32), axis=0)
+
+    masked_gain = tl.where(live, survival, -1.0)
+    sorted_gains = tl.sort(masked_gain, descending=True)
+    positive_gains = tl.where(sorted_gains >= 0.0, sorted_gains, 0.0)
+    cum_gains = tl.cumsum(positive_gains, axis=0)
+
+    prof_idx = tl.arange(0, PROF_BLOCK)
+    prof_ok = prof_idx < NUM_PROFILES
+    p_min = tl.load(ProfRanges + prof_idx * 2, mask=prof_ok, other=0).to(tl.int32)
+    p_max = tl.load(ProfRanges + prof_idx * 2 + 1, mask=prof_ok, other=0).to(tl.int32)
+    prof_match = prof_ok & (upper_ctx >= p_min) & (upper_ctx <= p_max)
+    best_prof = tl.min(tl.where(prof_match, prof_idx, PROF_BLOCK), axis=0)
+    has_profile = best_prof < NUM_PROFILES
+
+    native_vals = tl.load(ProfNativeMs + prof_idx, mask=prof_ok, other=1.0).to(
+        tl.float32
+    )
+    native_ms = tl.sum(tl.where(prof_idx == best_prof, native_vals, 0.0), axis=0)
+    safe_prof = tl.minimum(best_prof, tl.maximum(NUM_PROFILES - 1, 0)).to(tl.int64)
+
+    cap_idx = tl.arange(0, CAP_BLOCK)
+    cap_ok = cap_idx < NUM_CANDIDATES
+    caps = tl.load(ProfCapacities + cap_idx, mask=cap_ok, other=full).to(tl.int32)
+    step_vals = tl.load(
+        ProfStepMs + safe_prof * PROF_STRIDE + cap_idx, mask=cap_ok, other=-1.0
+    ).to(tl.float32)
+
+    extra_k = tl.minimum(tl.maximum(caps - PADDED_BS, 0), BS * DRAFT)
+    pos_k = tl.maximum(extra_k - 1, 0)
+    prefix_k = tl.gather(cum_gains, pos_k, axis=0)
+    prefix_k = tl.where(extra_k > 0, prefix_k, 0.0)
+    reward_k = BS.to(tl.float32) + prefix_k
+
+    full_k = BS * DRAFT
+    full_pos = tl.maximum(full_k - 1, 0)
+    full_prefix = tl.sum(tl.where(index == full_pos, cum_gains, 0.0), axis=0)
+    full_reward = tl.where(
+        full_k > 0, BS.to(tl.float32) + full_prefix, BS.to(tl.float32)
+    )
+    threshold = (full_reward / tl.maximum(native_ms, 1e-30)) * (1.0 + MIN_GAIN)
+
+    cand_ok = (
+        cap_ok
+        & (caps >= PADDED_BS)
+        & (caps < full)
+        & (step_vals > 0.0)
+        & (step_vals < float("inf"))
+    )
+    rates = tl.where(cand_ok, reward_k / step_vals, -1.0)
+    best_rate = tl.max(rates, axis=0)
+    improved = (
+        (BS >= MIN_BATCH_SIZE)
+        & (BS > 0)
+        & (~has_zero_ctx)
+        & (invalid_slots == 0)
+        & has_profile
+        & (native_ms > 0.0)
+        & (native_ms < float("inf"))
+        & (best_rate > threshold)
+    )
+    winner_idx = tl.min(
+        tl.where(cand_ok & (rates == best_rate), cap_idx, CAP_BLOCK), axis=0
+    )
+    winner_q = tl.sum(tl.where(cap_idx == winner_idx, caps, 0), axis=0).to(tl.int32)
+    selected_q = tl.where(improved, winner_q, full).to(tl.int32)
+
+    out_idx = tl.arange(0, 4)
+    out_vals = tl.where(
+        out_idx == 0, selected_q, tl.where(out_idx == 1, min_ctx, max_ctx)
+    )
+    tl.store(Out + out_idx, out_vals, mask=out_idx < 3)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_select_verify_budget",
+    name="triton_dsv41_select_verify_budget",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=[format_signature(x=dense_tensor_format(torch.float32))],
+    traits={},
+    priority=Priority.PORTABLE + 1,
+)
+def triton_dsv41_select_verify_budget(
+    latest_scores,
+    request_slots,
+    seq_lens,
+    profile_ranges,
+    profile_native_ms,
+    profile_capacities,
+    profile_step_ms,
+    selected_out,
+    padded_bs,
+    context_advance,
+    min_batch_size,
+    min_gain,
+):
+    bs = int(request_slots.shape[0])
+    draft = int(latest_scores.shape[1])
+    num_profiles = int(profile_ranges.shape[0])
+    num_candidates = int(profile_capacities.shape[0])
+    _select_verify_budget_kernel[(1,)](
+        latest_scores,
+        request_slots,
+        seq_lens,
+        profile_ranges,
+        profile_native_ms,
+        profile_capacities,
+        profile_step_ms,
+        selected_out,
+        bs,
+        padded_bs,
+        context_advance,
+        min_batch_size,
+        float(min_gain),
+        num_profiles,
+        num_candidates,
+        latest_scores.shape[0],
+        latest_scores.stride(0),
+        profile_step_ms.stride(0),
+        DRAFT=draft,
+        BLOCK=triton.next_power_of_2(max(padded_bs * draft, 1)),
+        REQ_BLOCK=triton.next_power_of_2(max(padded_bs, 1)),
+        PROF_BLOCK=triton.next_power_of_2(max(num_profiles, 1)),
+        CAP_BLOCK=triton.next_power_of_2(max(num_candidates, 1)),
+        num_warps=4,
+    )

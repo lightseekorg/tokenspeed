@@ -136,8 +136,14 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig | DecodeLadderArgs):
             stride = 32
         else:
             capture_bs = [1, 2, 4] + [i * 8 for i in range(1, 21)]
+            # Keep stride 8 across common high-concurrency buckets up to 448,
+            # then step by 16 above that bound.
+            dense_cap = min(effective_max, 448)
+            if dense_cap > capture_bs[-1]:
+                capture_bs += list(range(capture_bs[-1] + 8, dense_cap, 8))
+                capture_bs.append(dense_cap)
             stride = 16
-        # The default ladder ends at 160; carry it up to a larger capture cap.
+        # The default ladder ends at 160 (or 448 when padded); carry it to the cap.
         if effective_max > capture_bs[-1]:
             capture_bs += list(range(capture_bs[-1] + stride, effective_max, stride))
             capture_bs.append(effective_max)

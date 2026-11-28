@@ -573,3 +573,79 @@ def test_local_graph_budgets_allow_independent_fallback_and_padding():
         assert counts[-1] == 1
         assert sum(counts) == 12
     torch.distributed.barrier()
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) < 2,
+    reason="requires torchrun with multiple GPUs",
+)
+@torch.inference_mode()
+def test_local_graph_device_budget_runs_independently_per_rank():
+    world = int(os.environ["WORLD_SIZE"])
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    mapping = Mapping(
+        rank=rank,
+        world_size=world,
+        attn_tp_size=1,
+        attn_dp_size=world,
+        moe_ep_size=world,
+    )
+    process_group_manager.init_distributed(
+        mapping,
+        distributed_init_method="env://",
+        backend="nccl",
+        timeout=120,
+        device_id=torch.device("cuda", local_rank),
+    )
+    process_group_manager.init_process_group(tuple(range(world)), backend="nccl")
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+
+    drafter = _make_drafter(mapping)
+    drafter.dp_local_graph = True
+    drafter.adaptive_min_batch_size = 1
+    drafter.verify_budget_policy = VerifyBudgetPolicy(True, 1, 6, 0.02)
+    drafter.input_buffers = InputBuffers(4, 24, 0, device="cuda")
+    drafter.input_buffers.req_pool_indices_buf[:4].copy_(
+        torch.arange(4, dtype=torch.int32, device="cuda")
+    )
+    drafter._confidence_admission_ids = [None] * 4
+    stream = torch.cuda.Stream()
+    pool = torch.cuda.graph_pool_handle()
+    drafter.capture_round_graphs(4, stream=stream, pool=pool)
+    preferred = 12 if rank % 2 == 0 else 8
+    drafter.install_verify_calibration(
+        (VerifyCalibration(4, 1, 16384, 6, 100.0, ((preferred, 1.0),), 8),),
+        policy_ms=0.0,
+    )
+    ids, slots = [f"dev-{rank}-{i}" for i in range(4)], list(range(4))
+    drafter.prepare_request_state(ids, slots, num_extends=4)
+    drafter.confidence_scores.fill_(0.0)
+    drafter.input_buffers.seq_lens_buf[:4].fill_(120)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=4,
+        num_extends=0,
+        input_num_tokens=24,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, 4, 6),
+        global_bs=[4] * world,
+        global_num_decodes=[4] * world,
+        global_num_tokens=[24] * world,
+        all_decode_or_idle=True,
+    )
+    drafter.finish_round(ctx, graph_bs=4)
+    assert not drafter._pending_verify_feedback
+    torch.cuda.synchronize()
+    drafter.prepare_request_state(ids, slots, num_extends=0)
+    with _strict_serving_sync():
+        selected = drafter.prepare_decode_graph_token_layout(
+            ctx, actual_bs=4, padded_bs=4
+        )
+    assert selected == preferred
+    gathered = [None] * world
+    torch.distributed.all_gather_object(gathered, selected)
+    assert gathered == [12 if peer % 2 == 0 else 8 for peer in range(world)]
+    torch.distributed.barrier()

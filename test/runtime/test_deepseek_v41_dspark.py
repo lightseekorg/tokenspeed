@@ -1751,6 +1751,18 @@ def test_adaptive_v41_launch_contract(field, value):
     # With no opt-in, existing launch configurations incur no new restrictions.
     args.enable_dsv41_adaptive_dspark = False
     args.validate_dsv41_adaptive_dspark()
+    sonic_args = ServerArgs.__new__(ServerArgs)
+    sonic_args.enable_dsv41_adaptive_dspark = True
+    sonic_args.speculative_algorithm = "DSPARK"
+    sonic_args.sampling_backend = "sonic"
+    sonic_args.enforce_eager = False
+    sonic_args.disable_prefill_graph = True
+    sonic_args.grammar_backend = "none"
+    sonic_args.mapping = _mapping(0, 1, 1)
+    sonic_args.validate_dsv41_adaptive_dspark()
+    sonic_args.enable_speculative_sampling = True
+    with pytest.raises(ValueError):
+        sonic_args.validate_dsv41_adaptive_dspark()
 
 
 def _adaptive_dp_local_cli(sampling_backend: str) -> list[str]:
@@ -1781,7 +1793,7 @@ def _adaptive_dp_local_cli(sampling_backend: str) -> list[str]:
     return argv
 
 
-@pytest.mark.parametrize("sampling_backend", ["greedy", "flashinfer"])
+@pytest.mark.parametrize("sampling_backend", ["greedy", "sonic", "flashinfer"])
 def test_adaptive_dp_local_accepts_xgrammar_and_output_logprobs(sampling_backend):
     args = prepare_server_args(
         _adaptive_dp_local_cli(sampling_backend)
@@ -1793,7 +1805,7 @@ def test_adaptive_dp_local_accepts_xgrammar_and_output_logprobs(sampling_backend
     assert args.enable_output_logprobs
 
 
-@pytest.mark.parametrize("sampling_backend", ["greedy", "flashinfer"])
+@pytest.mark.parametrize("sampling_backend", ["greedy", "sonic", "flashinfer"])
 def test_adaptive_dp_local_still_rejects_cumulative_probs(sampling_backend):
     with pytest.raises(ValueError, match="adaptive verification does not support"):
         prepare_server_args(
@@ -2132,3 +2144,140 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
 
     if tp > 1:
         torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+@torch.inference_mode()
+def test_dp_local_device_budget_finish_round_replay_and_invalidation():
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
+    from tokenspeed.runtime.execution.drafter.verify_calibration import (
+        VerifyCalibration,
+    )
+    from tokenspeed.runtime.execution.drafter.verify_feedback import VerifyFeedback
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.model_runner import ModelRunner
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
+    drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = True
+    mapping = _mapping(0, 1, 1)
+    drafter.draft_model = Mock(spec=ModelRunner)
+    drafter.draft_model.mapping = mapping
+    drafter.tp_group = mapping.attn.tp_group
+    drafter.verify_feedback = VerifyFeedback(draft_width=5)
+    drafter._pending_verify_feedback = []
+    drafter._verify_cache_initialized = True
+    drafter._verify_cache = None
+    drafter._cached_verify_profiles = ()
+    drafter._verify_calibrations = ()
+    drafter._verify_policy_ms = None
+    drafter.device = "cuda"
+    drafter.spec_num_tokens = 6
+    drafter.block_size = 5
+    drafter.adaptive_min_batch_size = 2
+    drafter.verify_budget_policy = VerifyBudgetPolicy(True, 2, 6, 0.02)
+    drafter.confidence_scores = torch.full((8, 5), float("inf"), device="cuda")
+    drafter._confidence_admission_ids = [None] * 8
+    drafter.input_buffers = InputBuffers(4, 24, 0, device="cuda")
+    drafter.input_buffers.req_pool_indices_buf[:4].copy_(
+        torch.tensor([1, 3, 5, 7], dtype=torch.int32, device="cuda")
+    )
+    drafter.input_buffers.seq_lens_buf[:4].fill_(128)
+    drafter.verify_graph_token_step = 4
+    drafter._verify_rows = torch.empty(24, dtype=torch.int64, device="cuda")
+    drafter._verify_indptr = torch.empty(5, dtype=torch.int64, device="cuda")
+    drafter._verify_layout_counts = None
+    drafter._verify_budget_graphs = {}
+    drafter._verify_budget_buffers = {}
+    drafter._verify_budget_counts = {}
+    drafter._verify_budget_context_bounds = None
+
+    stream = torch.cuda.Stream()
+    pool = torch.cuda.graph_pool_handle()
+    drafter.capture_round_graphs(4, stream=stream, pool=pool)
+    drafter.install_verify_calibration(
+        (
+            VerifyCalibration(4, 1, 8192, 6, 100.0, ((12, 1.0),), 8),
+            VerifyCalibration(4, 8193, 32768, 6, 100.0, ((16, 1.0),), 8),
+        ),
+        policy_ms=0.0,
+    )
+
+    def _ctx(bs: int) -> ForwardContext:
+        return ForwardContext(
+            attn_backend=None,
+            token_to_kv_pool=None,
+            bs=bs,
+            num_extends=0,
+            input_num_tokens=bs * 6,
+            forward_mode=ForwardMode.DECODE,
+            output_layout=ForwardOutputLayout(0, 0, bs, 6),
+        )
+
+    drafter.prepare_request_state([101, 102, 103, 104], [1, 3, 5, 7], num_extends=4)
+    # Device selector sees live slot confidence without host VerifyFeedback copies.
+    drafter.confidence_scores[1] = torch.tensor(
+        [8.0, 8.0, 8.0, 8.0, 8.0], device="cuda"
+    )
+    drafter.confidence_scores[3] = -8.0
+    drafter.confidence_scores[5] = -8.0
+    drafter.confidence_scores[7] = -8.0
+    drafter.finish_round(_ctx(4), graph_bs=4)
+    assert not drafter._pending_verify_feedback
+    torch.cuda.synchronize()
+
+    drafter.prepare_request_state([101, 102, 103, 104], [1, 3, 5, 7], num_extends=0)
+    assert drafter.verify_feedback.scores() is None
+    previous_sync = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        selected = drafter.prepare_decode_graph_token_layout(
+            _ctx(4), actual_bs=4, padded_bs=4
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_sync)
+    assert selected == 12
+    assert drafter._verify_indptr.diff().cpu().tolist() == [6, 2, 2, 2]
+    assert drafter._verify_budget_buffers[4].scores.abs().sum().item() == 0.0
+
+    # Padded batch (`actual_bs=3 < padded_bs=4`) uses slot 0..2 and leaves tail row at 1.
+    drafter.input_buffers.req_pool_indices_buf[:3].copy_(
+        torch.tensor([1, 3, 5], dtype=torch.int32, device="cuda")
+    )
+    drafter.input_buffers.seq_lens_buf[:3].fill_(8181)
+    drafter.prepare_request_state([101, 102, 103], [1, 3, 5], num_extends=0)
+    drafter.finish_round(_ctx(3), graph_bs=4)
+    torch.cuda.synchronize()
+    drafter.prepare_request_state([101, 102, 103], [1, 3, 5], num_extends=0)
+    previous_sync = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        selected = drafter.prepare_decode_graph_token_layout(
+            _ctx(3), actual_bs=3, padded_bs=4
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_sync)
+    # 8181 + 12 = 8193 moves into the second calibration region (capacity 16).
+    assert selected == 16
+    counts = drafter._verify_indptr.diff().cpu().tolist()
+    assert counts[-1] == 1
+    assert sum(counts) == 16
+
+    # Re-admission / calibration update invalidates pending and completed device budgets.
+    drafter.prepare_request_state([201, 102, 103], [1, 3, 5], num_extends=1)
+    assert (
+        drafter.prepare_decode_graph_token_layout(_ctx(3), actual_bs=3, padded_bs=4)
+        == 24
+    )
+    drafter.install_verify_calibration(
+        (VerifyCalibration(4, 1, 8192, 6, 100.0, ((12, 1.0),), 8),),
+        policy_ms=0.0,
+    )
+    drafter.prepare_request_state([201, 102, 103], [1, 3, 5], num_extends=0)
+    assert (
+        drafter.prepare_decode_graph_token_layout(_ctx(3), actual_bs=3, padded_bs=4)
+        == 24
+    )
+    drafter.release_round_graphs()
+    assert not drafter._verify_budget_buffers
