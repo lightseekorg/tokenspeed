@@ -99,11 +99,17 @@ class Completion:
     input_token_logprobs: tuple[list[float | None], list[int]] | None = None
     # With speculative decoding: verify rounds, and accepted tokens per round.
     spec_verify_ct: int | None = None
+    execution_observations: dict | None = None
     accept_draft_tokens: float | None = None
     # Backend timing supplied by the terminal chunk, when supported.
     request_timing: RequestTiming | None = None
 
     def add(self, chunk: dict) -> None:
+        from tokenspeed.runtime.execution.observations import validate_snapshot
+
+        observation = chunk.get("execution_observations")
+        if observation is not None:
+            validate_snapshot(observation, self.execution_observations)
         cumulative_probs = chunk["output_token_cumulative_probs"]
         if cumulative_probs and (
             len(cumulative_probs) != len(chunk["output_ids"])
@@ -112,6 +118,8 @@ class Completion:
             raise ValueError(
                 "Cumulative probabilities must match the chunk's tokens and logprobs"
             )
+        if observation is not None:
+            self.execution_observations = observation
         self.output_ids.extend(chunk["output_ids"])
         self.output_token_logprobs.extend(chunk["output_token_logprobs"])
         self.output_token_cumulative_probs.extend(cumulative_probs)

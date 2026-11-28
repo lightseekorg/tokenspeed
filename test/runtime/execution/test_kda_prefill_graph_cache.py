@@ -1170,13 +1170,48 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
     mode, dp_size, use_graph, prepared
 ):
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.execution.model_executor import (
+        ModelExecutor,
+        ModelExecutorConfig,
+    )
 
     events = []
     mode = ForwardMode[mode]
     ctx = SimpleNamespace(forward_mode=mode, bs=2, input_num_tokens=7, query_shard=None)
     executor = object.__new__(ModelExecutor)
-    executor.config = SimpleNamespace(pp_size=1, data_parallel_size=dp_size)
+    executor.config = ModelExecutorConfig(
+        max_req_pool_size=4,
+        output_length=1,
+        enforce_eager=False,
+        enable_dp_local_cuda_graph=False,
+        prefix_granularity=16,
+        max_num_seqs=2,
+        chunked_prefill_size=8,
+        vocab_size=32,
+        input_vocab_size=32,
+        context_len=64,
+        physical_context_len=64,
+        device="cpu",
+        gpu_id=0,
+        global_rank=0,
+        cudagraph_capture_sizes=[1, 2],
+        disable_cuda_graph_padding=False,
+        spec_topk=1,
+        max_cudagraph_capture_size=2,
+        model_is_mrope=False,
+        autotune_cache_key=None,
+        prefill_only=False,
+        decode_only_attention=False,
+        prefill_graph_capture_batch_sizes=[1, 2],
+        input_logprob_chunk_tokens=8,
+        enable_speculative_sampling=False,
+        query_shard_size=1,
+        query_shard_rank=0,
+        enable_memory_saver=False,
+        pp_size=1,
+        data_parallel_size=dp_size,
+        execution_observations=False,
+    )
     executor._active_positions_override = torch.arange(7)
     executor._active_multimodal_context = None
     executor.runtime_states = SimpleNamespace(has_request_token_history=False)
@@ -1190,9 +1225,14 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
         return True
 
     executor.attn_backend = SimpleNamespace(prepare_prefill_metadata=prepare)
+
+    def replay(*_, request_token_history, observe_execution):
+        assert request_token_history is None
+        assert observe_execution is False
+        events.append("graph")
+
     executor.prefill_graph = SimpleNamespace(
-        can_run=lambda *_: use_graph,
-        replay=lambda *_, request_token_history: events.append("graph"),
+        can_run=lambda *_: use_graph, replay=replay
     )
     executor.model_runner = SimpleNamespace(
         forward=lambda *_, **__: events.append("eager")

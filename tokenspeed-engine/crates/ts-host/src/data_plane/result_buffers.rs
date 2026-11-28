@@ -98,6 +98,22 @@ pub(super) fn float_vector(value: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
     float_values(&buffer, value.py())
 }
 
+/// Own the landed int32 acceptance/mask rows before the result lease retires.
+pub(super) fn verification_observation(
+    value: &Bound<'_, PyAny>,
+    rows: usize,
+) -> PyResult<Vec<[i32; 2]>> {
+    let buffer = PyUntypedBuffer::get(value)?;
+    require_rank(&buffer, 2)?;
+    if buffer.shape() != [rows, 2] {
+        return Err(PyValueError::new_err(
+            "verification observations must have shape [live_requests, 2]",
+        ));
+    }
+    let values = copy::<i32>(&buffer, value.py())?;
+    Ok(values.chunks_exact(2).map(|row| [row[0], row[1]]).collect())
+}
+
 pub(super) fn top_logprobs(
     values: &Bound<'_, PyAny>,
     ids: &Bound<'_, PyAny>,

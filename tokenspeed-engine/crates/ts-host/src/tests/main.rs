@@ -36,6 +36,25 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
 // Signal listeners belong to the test process, not to a test thread.
 static SIGNAL_TEST: Mutex<()> = Mutex::new(());
 
+#[test]
+fn execution_protocol_probe_works_without_model_or_device_bootstrap() {
+    use pyo3::{prelude::*, types::PyModule};
+
+    crate::data_plane::tests::interpreter();
+    Python::attach(|py| {
+        let module = PyModule::new(py, "execution_protocol_test").unwrap();
+        super::_host(&module).unwrap();
+        let protocol: String = module
+            .getattr("execution_observation_protocol")
+            .unwrap()
+            .call0()
+            .unwrap()
+            .extract()
+            .unwrap();
+        assert_eq!(protocol, "tokenspeed-execution-observations-v1");
+    });
+}
+
 /// Kill and reap a test child on failure instead of leaving a stuck rank in CI.
 struct TestChild(Child);
 

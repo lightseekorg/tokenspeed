@@ -231,7 +231,7 @@ class TestPrefillCaptureStreamTest:
 
 class TestKdaPrefillFallbackTest:
     def test_outer_attention_break_does_not_capture_kda_graphs(self, subtests):
-        from unittest.mock import patch
+        from unittest.mock import Mock, patch
 
         import torch
 
@@ -247,7 +247,7 @@ class TestKdaPrefillFallbackTest:
         backend = object.__new__(KdaAttnBackend)
         backend._prefill_graph_enabled = True
         backend.kda_backend = "cutedsl_kda"
-        capture = object.__new__(BreakableCapture)
+        capture = BreakableCapture(stream=Mock(spec=torch.cuda.Stream))
         output = torch.ones(1)
         results = []
 
@@ -290,7 +290,7 @@ class TestKdaPrefillFallbackTest:
                 for iteration in range(3):
                     with subtests.test(bs=bs, bucket=bucket, iteration=iteration):
                         scan.reset_mock()
-                        capture.replay(valid_rows=bucket - 1)
+                        assert capture.replay(valid_rows=bucket - 1) == 0
                         scan.assert_called_once_with(
                             backend,
                             None,

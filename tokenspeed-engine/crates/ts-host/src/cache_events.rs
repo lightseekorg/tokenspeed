@@ -26,7 +26,7 @@
 use std::{
     io::{self, Write},
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Mutex, OnceLock, TryLockError,
     },
 };
@@ -119,6 +119,7 @@ struct Context {
     lost_observations: AtomicU64,
     reported_log_losses: AtomicUsize,
     native_losses: OnceLock<CacheObservationLosses>,
+    execution_enabled: AtomicBool,
 }
 
 /// One publisher assigns sequences and enqueues complete lines in that order.
@@ -127,6 +128,8 @@ struct Context {
 struct Publication {
     pending: mpsc::Receiver<Value>,
     next_sequence: u64,
+    execution_sequence: u64,
+    publication_order: u64,
 }
 
 impl CacheEvents {
@@ -160,11 +163,14 @@ impl CacheEvents {
             publication: Mutex::new(Publication {
                 pending: records,
                 next_sequence: 0,
+                execution_sequence: 0,
+                publication_order: 0,
             }),
             pending_losses: AtomicU64::new(0),
             lost_observations: AtomicU64::new(0),
             reported_log_losses: AtomicUsize::new(0),
             native_losses: OnceLock::new(),
+            execution_enabled: AtomicBool::new(false),
         }));
         let sink = context.clone();
         let (observer, losses) = CacheEventObserver::new(move |event, request_id| {
@@ -178,6 +184,13 @@ impl CacheEvents {
             .0
             .emit(json!({"event": "trace_started", "scope": "physical_rank"}));
         Ok(context)
+    }
+
+    /// Shares publication ordering and loss accounting with cache observations.
+    pub(crate) fn execution_sink(&self) -> Arc<dyn ts_control::execution_observation::Sink> {
+        assert!(!self.0.execution_enabled.swap(true, Ordering::Relaxed));
+        self.0.emit_execution(json!({"event": "trace_started"}));
+        Arc::new(ExecutionSink(self.clone()))
     }
 
     /// Called under the ordinary completion query's GIL, after its ACK poll.
@@ -210,7 +223,42 @@ impl CacheEvents {
     }
 }
 
+struct ExecutionSink(CacheEvents);
+
+impl std::fmt::Debug for ExecutionSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExecutionSink")
+    }
+}
+
+impl ts_control::execution_observation::Sink for ExecutionSink {
+    fn emit(&self, record: Value) {
+        if record["event"] == "observation_loss" {
+            self.0 .0.lost_observations.fetch_add(1, Ordering::Relaxed);
+        }
+        self.0 .0.emit_execution(record);
+    }
+    fn context(&self) -> ts_control::execution_observation::Context {
+        ts_control::execution_observation::Context {
+            instance_id: self.0 .0.instance.clone(),
+            role: self.0 .0.role.into(),
+            dp_rank: self.0 .0.dp_rank,
+            physical_rank: self.0 .0.physical_rank as u64,
+        }
+    }
+    fn valid(&self) -> bool {
+        self.0 .0.lost_observations.load(Ordering::Relaxed) == 0
+            && self.0 .0.writer.error_counter().dropped_lines() == 0
+    }
+}
+
 impl Context {
+    fn emit_execution(&self, mut record: Value) {
+        record["_execution"] = true.into();
+        record["scope"] = "local_physical".into();
+        self.emit(record);
+    }
+
     fn native(&self, event: &CacheObservation, request_id: &str) {
         if event.admission_id == 0 || event.slot < 0 || event.slot_generation == 0 {
             self.loss("invalid_native_identity", 1);
@@ -301,14 +349,33 @@ impl Context {
             let Ok(record) = publication.pending.try_recv() else {
                 break;
             };
-            let sequence = publication.next_sequence;
-            publication.next_sequence += 1;
-            self.write_record(record, sequence);
+            let execution = record["_execution"] == true;
+            let sequence = if execution {
+                let value = publication.execution_sequence;
+                publication.execution_sequence += 1;
+                value
+            } else {
+                let value = publication.next_sequence;
+                publication.next_sequence += 1;
+                value
+            };
+            let order = publication.publication_order;
+            publication.publication_order += 1;
+            self.write_record(record, sequence, order, execution);
         }
     }
 
-    fn write_record(&self, mut record: Value, sequence: u64) {
-        record["protocol"] = protocol().into();
+    fn write_record(&self, mut record: Value, sequence: u64, order: u64, execution: bool) {
+        record
+            .as_object_mut()
+            .expect("observation object")
+            .remove("_execution");
+        record["protocol"] = if execution {
+            ts_control::execution_observation::PROTOCOL.into()
+        } else {
+            protocol().into()
+        };
+        record["publication_order"] = order.into();
         record["instance_id"] = self.instance.as_str().into();
         record["role"] = self.role.into();
         record["dp_rank"] = self.dp_rank.into();
@@ -319,7 +386,11 @@ impl Context {
         // Only fixed scalar fields and bounded identity strings enter this
         // writer. Even a future schema mistake cannot emit a partial object.
         let encoded = buffer
-            .write_all(b"[cache-event] ")
+            .write_all(if execution {
+                b"[execution-event] "
+            } else {
+                b"[cache-event] "
+            })
             .and_then(|()| serde_json::to_writer(&mut buffer, &record).map_err(io::Error::other))
             .and_then(|()| buffer.write_all(b"\n"));
         if encoded.is_err() {
@@ -337,6 +408,12 @@ impl Context {
 impl Drop for Context {
     fn drop(&mut self) {
         self.report_losses();
+        if self.execution_enabled.load(Ordering::Relaxed) {
+            self.emit_execution(json!({"event": "trace_finished",
+                "lost_observations": self.lost_observations.load(Ordering::Relaxed),
+                "evidence_valid": self.lost_observations.load(Ordering::Relaxed) == 0
+                    && self.writer.error_counter().dropped_lines() == 0}));
+        }
         self.emit(json!({
             "event": "trace_finished", "scope": "physical_rank",
             "lost_observations": self.lost_observations.load(Ordering::Relaxed),

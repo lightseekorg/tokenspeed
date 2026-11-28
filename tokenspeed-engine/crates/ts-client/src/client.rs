@@ -76,6 +76,8 @@ pub struct OutputChunk {
     pub finish_details: Option<FinishDetails>,
     /// Verify rounds so far, with speculative decoding.
     pub spec_verify_ct: Option<i64>,
+    /// Optional cumulative native evidence; absence never denotes zero execution.
+    pub execution_observations: Option<ts_wire::output::ExecutionSnapshot>,
     /// Accepted tokens per verify round once finished, with speculative
     /// decoding.
     pub accept_draft_tokens: Option<f64>,
@@ -136,6 +138,7 @@ impl OutputChunk {
                 ),
                 finish_details: take(&mut batch.finish_reason_details, i),
                 spec_verify_ct: batch.spec_verify_ct.get(i).copied(),
+                execution_observations: take(&mut batch.execution_observations, i),
                 accept_draft_tokens: batch.accept_draft_tokens.get(i).copied().flatten(),
                 input_token_logprobs: pair(
                     &mut batch.input_token_logprobs_val,
@@ -175,6 +178,7 @@ impl From<&RequestOutput<'_>> for OutputChunk {
             output_token_cumulative_probs: row.output_token_cumulative_probs.to_vec(),
             finish_details: row.finish_details.cloned(),
             spec_verify_ct: row.spec_verify_ct,
+            execution_observations: row.execution_observations.cloned(),
             accept_draft_tokens: row.accept_draft_tokens,
             input_token_logprobs: owned(row.input_token_logprobs),
             input_top_logprobs: owned(row.input_top_logprobs),
@@ -242,6 +246,7 @@ impl Pending {
             input_top_logprobs: None,
             output_top_logprobs: None,
             request_timing: None,
+            execution_observations: None,
         }
     }
 }

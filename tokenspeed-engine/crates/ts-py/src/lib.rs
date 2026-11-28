@@ -482,6 +482,16 @@ fn chunk_dict<'py>(py: Python<'py>, chunk: OutputChunk) -> PyResult<Bound<'py, P
         chunk.output_token_cumulative_probs,
     )?;
     dict.set_item("spec_verify_ct", chunk.spec_verify_ct)?;
+    let observation = chunk
+        .execution_observations
+        .map(|snapshot| {
+            let frames = ts_wire::encode_frames(&snapshot);
+            ts_wire::decode_bytes::<Value>(&frames[0])
+                .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))
+                .and_then(|value| value_to_py(py, value))
+        })
+        .transpose()?;
+    dict.set_item("execution_observations", observation)?;
     dict.set_item("accept_draft_tokens", chunk.accept_draft_tokens)?;
     dict.set_item("input_token_logprobs", chunk.input_token_logprobs)?;
     dict.set_item("input_top_logprobs", chunk.input_top_logprobs)?;
@@ -576,4 +586,60 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.py().get_type::<RequestCancelled>(),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod execution_observation_tests {
+    use super::*;
+
+    #[test]
+    fn wire_snapshot_reaches_python_through_both_client_conversions() {
+        pyo3::Python::initialize();
+        let text = include_str!("../../ts-wire/tests/fixtures/output_execution.hex");
+        let frames: Vec<bytes::Bytes> = text
+            .lines()
+            .map(|line| {
+                (0..line.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap())
+                    .collect::<Vec<_>>()
+                    .into()
+            })
+            .collect();
+        let ts_wire::EngineOutput::Batch(batch) =
+            ts_wire::EngineOutput::from_frames(&frames).unwrap()
+        else {
+            panic!("batch")
+        };
+        let borrowed: Vec<_> = batch
+            .requests()
+            .unwrap()
+            .map(|row| ts_client::OutputChunk::from(&row))
+            .collect();
+        let consumed: Vec<_> = ts_client::OutputChunk::from_batch(*batch)
+            .unwrap()
+            .map(|(_, chunk)| chunk)
+            .collect();
+        assert_eq!(borrowed, consumed);
+        Python::attach(|py| {
+            let dict = chunk_dict(py, consumed.into_iter().next().unwrap()).unwrap();
+            let observation = dict.get_item("execution_observations").unwrap().unwrap();
+            assert_eq!(
+                observation
+                    .get_item("admission_id")
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                (1u64 << 63) + 13
+            );
+            assert_eq!(
+                observation
+                    .get_item("completed_rounds")
+                    .unwrap()
+                    .extract::<u64>()
+                    .unwrap(),
+                1
+            );
+        });
+    }
 }

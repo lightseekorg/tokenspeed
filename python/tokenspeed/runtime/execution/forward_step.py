@@ -308,10 +308,13 @@ def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tupl
     output_lengths, output_logprobs, output_cumulative_probs,
     forward_logprobs)`` for the padded batch. The sampled-token columns keep
     ``bs * max_tokens_per_req`` rows and the lengths ``bs``; a decode graph
-    never gathers prompt logprobs or top-k alternatives, so its last output is
-    None.
+    never gathers prompt logprobs or top-k alternatives, so that column is
+    None. With execution observations, two trailing columns carry the target
+    receipt and int32 acceptance/mask rows; slice those rows to the live batch.
     """
-    tokens, lengths, logprobs, cumulative_probs, forward_logprobs = outputs
+    if len(outputs) not in (5, 7):
+        raise ValueError("invalid captured forward observation layout")
+    tokens, lengths, logprobs, cumulative_probs, forward_logprobs = outputs[:5]
     if forward_logprobs is not None:
         raise RuntimeError("a captured decode graph returned prompt or top-k logprobs")
     rows = bs * max_tokens_per_req
@@ -321,6 +324,7 @@ def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tupl
         None if logprobs is None else logprobs[:rows],
         None if cumulative_probs is None else cumulative_probs[:rows],
         None,
+        *((outputs[5], outputs[6][:bs]) if len(outputs) == 7 else ()),
     )
 
 
@@ -1463,7 +1467,8 @@ class ForwardStepRunner:
         of ``ctx.input_logprob_rows`` and the top-k alternatives
         ``ctx.sampled_top_k`` asks for) and None otherwise. The sampled
         tokens' logprobs and cumulative probabilities (None when not enabled)
-        share the tokens' rows on both paths.
+        share the tokens' rows on both paths. Enabled execution observation adds
+        a target receipt and batch-indexed acceptance/mask scratch to the result.
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
@@ -1666,6 +1671,14 @@ class ForwardStepRunner:
             result = live_graph_outputs(
                 self.output_buffers[graph_key], bs, self.max_tokens_per_req
             )
+            if len(result) == 7:
+                result = (
+                    *result[:5],
+                    result[5].replayed(
+                        request_capacity=padded_bs, query_capacity=query_tokens
+                    ),
+                    result[6],
+                )
         else:
             result = self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 

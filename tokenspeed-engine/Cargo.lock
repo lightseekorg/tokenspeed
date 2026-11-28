@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-collective"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.21",
  "tracing",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-control"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -1505,7 +1505,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-disk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-grammar"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cmake",
  "cxx",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-host"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-l3"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pyo3",
  "sha2",
@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-metrics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror 2.0.21",
  "tokenspeed-wire",
@@ -1578,7 +1578,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-mooncake"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libloading",
  "thiserror 2.0.21",
@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-pd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "serde_json",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "pyo3",
@@ -1619,7 +1619,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-scheduler"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cmake",
  "cxx",
@@ -1630,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "tokenspeed-wire"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "thiserror 2.0.21",

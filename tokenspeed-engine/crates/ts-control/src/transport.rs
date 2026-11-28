@@ -399,6 +399,7 @@ pub fn output_batch(
         finish_reason_details: Vec::with_capacity(n),
         spec_verify_ct: Vec::new(),
         accept_draft_tokens: Vec::new(),
+        execution_observations: Vec::with_capacity(n),
         input_token_logprobs_val: Vec::with_capacity(n),
         input_token_logprobs_idx: Vec::with_capacity(n),
         input_top_logprobs_val: Vec::with_capacity(n),
@@ -407,6 +408,10 @@ pub fn output_batch(
         output_top_logprobs_idx: Vec::with_capacity(n),
     };
     for output in outputs {
+        batch
+            .execution_observations
+            .push(output.execution_observations);
+
         batch.request_timing.push(output.request_timing);
         batch.rids.as_mut().expect("set above").push(output.rid);
         // The logprob ids are the tokens the logprobs belong to.
@@ -445,6 +450,9 @@ pub fn output_batch(
         let (top_values, top_ids) = output.output_top_logprobs.unwrap_or_default();
         batch.output_top_logprobs_val.push(top_values);
         batch.output_top_logprobs_idx.push(top_ids);
+    }
+    if batch.execution_observations.iter().all(Option::is_none) {
+        batch.execution_observations.clear();
     }
     // Each optional column is per request only in a frame where some
     // request has an entry.
@@ -811,6 +819,7 @@ mod tests {
     fn a_round_s_outputs_go_out_with_the_engine_index_and_load() {
         let (mut transport, _requests, mut outputs) = transport(2);
         let output = StreamedOutput {
+            execution_observations: None,
             rid: "r0".to_owned(),
             request_timing: None,
             output_ids: vec![7, 8],

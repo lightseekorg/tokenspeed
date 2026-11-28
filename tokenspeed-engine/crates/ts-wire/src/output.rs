@@ -27,6 +27,84 @@ use crate::{
     value::Value,
 };
 
+/// Maximum encoded size of one execution snapshot, independent of log records.
+pub const MAX_EXECUTION_SNAPSHOT_BYTES: usize = 256 * 1024;
+
+wire_struct! {
+    /// A cumulative, rank-local histogram bin of actual target execution.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ExecutionBin: map {
+        /// Native row phase: prefill or decode.
+        pub phase: String,
+        /// Actual target call/replay route.
+        pub path: String,
+        /// Consumed candidate width for decode; zero for prefill.
+        pub verify_width: u64,
+        /// Prefix retained after device stop clipping.
+        pub kept_prefix: u64,
+        /// Cumulative completed rounds in this bin.
+        pub count: u64,
+    }
+}
+
+wire_struct! {
+    /// Effective decode acceptance before device stop clipping, including bonus.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct PreStopBin: map {
+        /// Actual target call/replay route.
+        pub path: String,
+        /// Consumed candidate width, including anchor.
+        pub verify_width: u64,
+        /// Accepted prefix after force/drafter finalization, before stop clipping.
+        pub accepted_before_stop: u64,
+        /// Whether this round actually applied the force-single mask.
+        pub force_single: bool,
+        /// Cumulative completed decode rounds in this bin.
+        pub count: u64,
+    }
+}
+
+wire_struct! {
+    /// Evidence through this output, not closure of outstanding forwards.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ExecutionSnapshot: map {
+        /// Observation schema version, currently one.
+        pub version: u64,
+        /// Caller-supplied engine instance, shared with native cache observations.
+        pub instance_id: String,
+        /// Engine role: fused, prefill, or decode.
+        pub role: String,
+        /// Logical data-parallel rank.
+        pub dp_rank: i64,
+        /// Physical target-execution rank.
+        pub physical_rank: u64,
+        /// Public request ID; may be reused by a different admission.
+        pub request_id: String,
+        /// Immutable native admission identity, preserved across restores.
+        pub admission_id: u64,
+        /// Admission origin: serving or native startup.
+        pub origin: String,
+        /// Number of frozen dispatch ordinals assigned so far.
+        pub assigned_rounds: u64,
+        /// Number of valid fenced rows observed through this output.
+        pub completed_rounds: u64,
+        /// Last completed admission-local ordinal.
+        pub through_round: u64,
+        /// Dispatched rows whose lease retired without valid evidence.
+        pub missing_rounds: u64,
+        /// Total tokens actually added by native commit for observed rows.
+        pub committed_tokens: u64,
+        /// Provisional validity; lifetime closure requires the native trace.
+        pub evidence_valid: bool,
+        /// Cumulative phase/route/width/kept-prefix histogram.
+        pub bins: Vec<ExecutionBin>,
+        /// Cumulative decode route/width/pre-stop/force-single histogram.
+        pub pre_stop_bins: Vec<PreStopBin>,
+        /// Histograms were explicitly omitted after exceeding their wire byte budget.
+        pub histograms_omitted: bool = false,
+    }
+}
+
 wire_struct! {
     /// One step's output for a frontend that detokenizes itself.
     ///
@@ -105,6 +183,8 @@ wire_struct! {
         pub num_waiting_uncached_tokens: Option<i64> = None,
         /// Request timing metadata only on terminal rows; absent on older producers.
         pub request_timing: Vec<Option<RequestTiming>> = Vec::new(),
+        /// Cumulative execution evidence, absent when observations are disabled.
+        pub execution_observations: Vec<Option<ExecutionSnapshot>> = Vec::new(),
     }
 }
 
@@ -155,6 +235,8 @@ pub struct RequestOutput<'a> {
     /// Accepted tokens per verify round, once finished with speculative
     /// decoding.
     pub accept_draft_tokens: Option<f64>,
+    /// Optional cumulative native evidence through this output.
+    pub execution_observations: Option<&'a ExecutionSnapshot>,
     /// Prompt logprobs and their tokens, in the frame that ships them.
     pub input_token_logprobs: Option<(&'a [Option<f64>], &'a [i32])>,
     /// The prompt positions' top-k alternatives, in the frame that ships
@@ -197,6 +279,7 @@ impl BatchTokenIDOutSlim {
         let optional = [
             ("finish_reason_details", self.finish_reason_details.len()),
             ("spec_verify_ct", self.spec_verify_ct.len()),
+            ("execution_observations", self.execution_observations.len()),
             ("accept_draft_tokens", self.accept_draft_tokens.len()),
             (
                 "input_token_logprobs_val",
@@ -268,6 +351,7 @@ impl BatchTokenIDOutSlim {
                 .map_or(&[], Vec::as_slice),
             finish_details: self.finish_reason_details.get(i).and_then(Option::as_ref),
             spec_verify_ct: self.spec_verify_ct.get(i).copied(),
+            execution_observations: self.execution_observations.get(i).and_then(Option::as_ref),
             accept_draft_tokens: self.accept_draft_tokens.get(i).copied().flatten(),
             input_token_logprobs: pair(
                 &self.input_token_logprobs_val,

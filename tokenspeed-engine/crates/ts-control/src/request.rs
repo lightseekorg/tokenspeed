@@ -355,6 +355,9 @@ pub struct RequestState {
     /// Which admission this is: unique per processor, so a client reusing a
     /// finished request's id is a different request.
     pub admission: u64,
+    /// Admission-owned evidence retained by outstanding forwards after termination.
+    pub execution_observation:
+        Option<std::sync::Arc<crate::execution_observation::RequestObservation>>,
     /// Generated tokens already sent.
     pub send_token_offset: usize,
     /// The final output was sent.
@@ -433,6 +436,7 @@ impl RequestState {
             ttft: None,
             grammar: None,
             admission: 0,
+            execution_observation: None,
             send_token_offset: 0,
             finished_output: false,
         }

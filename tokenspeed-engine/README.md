@@ -255,6 +255,21 @@ the internal dependency versions in `crates/*/Cargo.toml`, run
 `cargo update --workspace` to refresh `Cargo.lock`, and merge the version
 change. The workflow publishes the committed versions; it does not bump them.
 
+Rust `0.2.0` is the next coordinated workspace release. Adding public fields is
+a Rust source-breaking change even when their MessagePack columns are optional.
+This includes `OutputChunk`, `BatchTokenIDOutSlim`, `RequestOutput`, and the
+control-plane result/output structs. The shared minor bump and matching internal
+dependency requirements keep these types in one release family. The Python wheel
+version and the execution-observation protocol version are separate contracts.
+See [the 0.2 migration notes](../docs/guides/rust-engine-migration-0.2.md).
+
+Several unmerged or unreleased changes can share this pending `0.2.0` release.
+Before publication, combine and validate its final contents on `main`. Once a
+crate's `0.2.0` is published, further source-breaking changes require its next
+minor release (and compatible requirements in dependants), not `0.2.1` or another
+archive with the same version. The workflow's already-published skip is only a
+retry mechanism; it must not hide new source behind an occupied version.
+
 Publishing uses crates.io Trusted Publishing rather than a stored API token.
 Configure it once:
 

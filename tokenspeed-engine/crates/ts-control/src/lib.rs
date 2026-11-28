@@ -34,6 +34,7 @@ pub mod disk;
 pub mod encode;
 pub mod eplb;
 pub mod event_loop;
+pub mod execution_observation;
 pub mod grammar;
 pub mod ingress;
 pub mod json_framing;

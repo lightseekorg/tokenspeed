@@ -28,6 +28,8 @@
 //!
 //! Field order of the array-layout structs is the wire contract. To add a
 //! field, append it on both sides with a default and regenerate the fixtures.
+//! This preserves wire decoding, not Rust source compatibility: new public
+//! fields require a source-breaking release and downstream literal updates.
 
 #![forbid(unsafe_code)]
 

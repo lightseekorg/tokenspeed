@@ -79,6 +79,7 @@ fn result(tokens: &[i32], lengths: &[i32]) -> ForwardResult {
         next_input_ids: None,
         serving_compiles: None,
         grammar_terminated_at: None,
+        execution_observation: None,
         input_token_logprobs: None,
         input_top_logprobs: None,
         output_top_logprobs: None,

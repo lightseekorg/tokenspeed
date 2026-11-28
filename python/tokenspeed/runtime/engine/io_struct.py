@@ -231,6 +231,8 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     num_waiting_uncached_tokens: int | None = None
     # Request timing metadata: only terminal rows carry a map. Older producers omit it.
     request_timing: list[RequestTiming | None] = []
+    # Cumulative rank-local execution evidence; absent on older producers.
+    execution_observations: list[dict | None] = []
 
 
 class GetAdmissionReqInput(BaseReq, kw_only=True):

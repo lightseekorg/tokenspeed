@@ -127,3 +127,53 @@ def test_completed_result_keeps_absent_columns_absent():
         result, serving_compiles=None, grammar_terminated_at=None
     )
     assert exported == ([7], [1], None, None, None, None, None, None, None, None)
+
+
+def test_execution_observation_is_appended_after_the_same_fence():
+    from tokenspeed.runtime.execution.observations import TargetExecution
+
+    event = _CopyEvent()
+    receipt = TargetExecution("decode_graph", 8, 4, 32, 1).payload((27,))
+    result = ModelExecutionResult(
+        output_tokens=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8]),
+        output_lengths=torch.tensor([3]),
+        output_request_ends=torch.tensor([1], dtype=torch.int32),
+        copy_event=event,
+        execution_observation=receipt,
+        verification_observation=torch.tensor([[5, 0]], dtype=torch.int32),
+    )
+    result.sync()
+    exported = completed_result(
+        result, serving_compiles=None, grammar_terminated_at=None
+    )
+    assert event.waits == 1
+    assert exported[1] == [3]
+    assert exported[9] == [1]
+    assert exported[10][0] == ((27,), "decode_graph", 8, 1, 4, 32, 1)
+    assert exported[10][1].tolist() == [[5, 0]]
+    result.execution_observation = None
+    assert (
+        len(completed_result(result, serving_compiles=None, grammar_terminated_at=None))
+        == 10
+    )
+
+
+def test_no_work_has_explicit_host_sentinels_and_execution_cannot_omit_its_buffer():
+    from tokenspeed.runtime.execution.observations import TargetExecution
+
+    result = ModelExecutionResult(
+        output_tokens=torch.empty(0, dtype=torch.int32),
+        output_lengths=torch.zeros(2, dtype=torch.int32),
+        copy_event=_CopyEvent(),
+        execution_observation=TargetExecution("none", 0, 2, 0, 0).payload((11, 12)),
+    )
+    result.sync()
+    payload = completed_result(
+        result, serving_compiles=None, grammar_terminated_at=None
+    )
+    assert payload[10][1].tolist() == [[-1, 0], [-1, 0]]
+    result.execution_observation = TargetExecution("eager", 1, 2, 2, 0).payload(
+        (11, 12)
+    )
+    with pytest.raises(ValueError, match="fenced verification buffer"):
+        completed_result(result, serving_compiles=None, grammar_terminated_at=None)

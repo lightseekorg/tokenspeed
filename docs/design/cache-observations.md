@@ -102,6 +102,16 @@ that record does not establish successful request resume. Consumers must join
 the request's admission lifetime and successful output separately. Allocating a
 slot to another admission likewise establishes ownership, not a GPU overwrite.
 
+## Execution observation joins
+
+[Execution observations](execution-observations.md) reuse this bounded publisher.
+Records additionally carry `publication_order`, one native order shared between
+the two protocols; each retains its own `record_sequence`. Cache completion is
+published before its ACK returns to the loop. A completed execution qualifies
+as post-restore only when its frozen dispatch follows the matched restore
+completion in that shared order. Existing cache fields and C++ protocol remain
+unchanged. Publication order alone is not proof of execution.
+
 ## Complete, loss-free evidence
 
 `trace_started` begins each physical rank's stream at sequence zero.
