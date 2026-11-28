@@ -5632,15 +5632,43 @@ def _finish_write_selection_variants(args):
         else ({"SLOTS": (False,), "RATIO": (1,)},)
     )
     if args["S"].dtype == torch.bfloat16:
-        base = (
-            {
-                "BLOCK_SIZE": (8,),
-                "HAS_CANDIDATES": (True,),
-                "SHORT_ROWS_UNSCORED": (False, True),
-                "POOL": (False,),
-                "POOL_BLOCK": (1,),
-            },
-        )
+        if args["POOL"]:
+            # Blackwell Full scoring passes BF16 row logits alongside an FP32
+            # candidate pool (T.dtype == float32). Warm every candidate-pool
+            # block width plus POOL=False so runtime pools never JIT-compile.
+            base = (
+                {
+                    "BLOCK_SIZE": (1,),
+                    "HAS_CANDIDATES": (False,),
+                    "SHORT_ROWS_UNSCORED": (False,),
+                    "POOL": (False,),
+                    "POOL_BLOCK": (1,),
+                },
+                {
+                    "BLOCK_SIZE": (1,),
+                    "HAS_CANDIDATES": (False,),
+                    "SHORT_ROWS_UNSCORED": (False,),
+                    "POOL": (True,),
+                    "POOL_BLOCK": _SELECTION_BLOCKS,
+                },
+            )
+        else:
+            base = (
+                {
+                    "BLOCK_SIZE": (1,),
+                    "HAS_CANDIDATES": (False,),
+                    "SHORT_ROWS_UNSCORED": (False,),
+                    "POOL": (False,),
+                    "POOL_BLOCK": (1,),
+                },
+                {
+                    "BLOCK_SIZE": (8,),
+                    "HAS_CANDIDATES": (True,),
+                    "SHORT_ROWS_UNSCORED": (False, True),
+                    "POOL": (False,),
+                    "POOL_BLOCK": (1,),
+                },
+            )
     else:
         base = (
             {

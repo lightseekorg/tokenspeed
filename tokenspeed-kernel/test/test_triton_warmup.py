@@ -174,6 +174,13 @@ def test_finish_write_selection_warmup_compiles_sparse_reindex_and_full_variants
 
     # One BF16 sparse Reindex launch with slots warms both SHORT_ROWS_UNSCORED
     # and RATIO=(1, 2) variants (as well as SLOTS=False).
+    block_picks_warm = torch.randint(
+        -1, 70, (n, 2048), dtype=torch.int32, device=device
+    )
+    block_scores_warm = torch.randn(n, 64, device=device)
+    block_ends_warm = torch.tensor(
+        [0, 1, 7, 20, 33, 64, 64, 2], dtype=torch.int32, device=device
+    )
     with kernel_warmup(enabled=True):
         out_warm = make_outputs()
         slots_warm = make_slots(ratio=1)
@@ -184,6 +191,15 @@ def test_finish_write_selection_warmup_compiles_sparse_reindex_and_full_variants
             slots_warm,
             False,
         )
+        # Warm Blackwell BF16 Full with FP32 pool (Dense slots=None & Paged slots!=None).
+        for warm_slots in (None, slots_warm):
+            finish_write_selection(
+                (indices, scores_bf16, ends, None, width, 1),
+                (block_picks_warm, block_scores_warm, block_ends_warm),
+                make_outputs(pool_k=2048),
+                warm_slots,
+                False,
+            )
         # Warm FP32 Full (POOL=False/True across _SELECTION_BLOCKS) and Dense Reindex.
         finish_write_selection(
             (indices, scores_fp32, ends, None, width, 1),
@@ -207,7 +223,17 @@ def test_finish_write_selection_warmup_compiles_sparse_reindex_and_full_variants
                 )
                 assert (out_actual[1] >= 0).all()
                 assert (out_actual[3] == 0).all()
-        for pool_k in (8, 32):
+        for ratio in (1, 2):
+            out_full_bf16 = make_outputs()
+            finish_write_selection(
+                (indices, scores_bf16, ends, None, width, 1),
+                None,
+                out_full_bf16,
+                make_slots(ratio=ratio),
+                False,
+            )
+            assert (out_full_bf16[3] == 0).all()
+        for pool_k in (8, 32, 128, 256, 512, 1024, 2048):
             block_picks = torch.randint(
                 -1, 70, (n, pool_k), dtype=torch.int32, device=device
             )
@@ -215,12 +241,18 @@ def test_finish_write_selection_warmup_compiles_sparse_reindex_and_full_variants
             block_ends = torch.tensor(
                 [0, 1, 7, 20, 33, 64, 64, 2], dtype=torch.int32, device=device
             )
-            out_pool = make_outputs(pool_k=pool_k)
-            finish_write_selection(
-                (indices, scores_fp32, ends, None, width, 1),
-                (block_picks, block_scores, block_ends),
-                out_pool,
-                None,
-                False,
-            )
-            assert (out_pool[3] >= 0).all()
+            for scores, slots in (
+                (scores_fp32, None),
+                (scores_bf16, None),
+                (scores_bf16, make_slots(ratio=1)),
+                (scores_bf16, make_slots(ratio=2)),
+            ):
+                out_pool = make_outputs(pool_k=pool_k)
+                finish_write_selection(
+                    (indices, scores, ends, None, width, 1),
+                    (block_picks, block_scores, block_ends),
+                    out_pool,
+                    slots,
+                    False,
+                )
+                assert (out_pool[3] >= 0).all()
