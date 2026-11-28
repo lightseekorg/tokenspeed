@@ -386,6 +386,9 @@ allocated memory transfers succeeded; it also retires sources, without claiming
 the write succeeded. Any transfer, RPC or unknown error in the same status
 vector keeps retirement unproven for the complete batch. Top-level SDK errors,
 exceptions after native submission and malformed results do not prove retirement.
+A batch response that does not answer every requested key exactly once is
+malformed: surplus results are never truncated into apparent success, and a
+missing result leaves its key's state unknown, so the whole call fails instead.
 
 This PUT interpretation is tied to the audited
 [Mooncake b04 C ABI declaration](https://github.com/kvcache-ai/Mooncake/blob/b04c6a4b6a32e98cf17756a4dc747c950669c1ea/mooncake-store/include/store_c.h#L77-L82).
@@ -443,6 +446,12 @@ It is not an operation's success flag. Valid results carry their own `retired`
 fact, including safely retired misses. The in-process store guarantees retirement
 on failure; Mooncake does not infer it from a failed SDK call. QUERY
 accesses no supplied Host payload, so its failure does not retain payload buffers.
+The guarantee covers controlled error returns only. A Rust panic crossing the
+store callback boundary is contained by the executor and reported as a failed
+call, but a panicked GET or PUT never proves retirement — its Host access may
+have died mid-transfer — whatever the store advertises, while a panicked QUERY
+still retires. A contained panic leaves its worker serving; a process abort or
+a native exception is not a Rust panic and cannot be contained.
 
 Only confirmed missing or invalid GET objects enter C++'s bounded negative
 metadata. Health/queue/shutdown rejection, queued cancellation and backend
@@ -602,6 +611,29 @@ data plane's device-copy cleanup. L3 joins its workers with a deadline and then
 closes its store; if native retirement remains unknown it refuses store
 close/Host deregistration and keeps the store client for the process, as the
 data plane keeps the Host allocation.
+
+A failed close releases nothing and never
+becomes a silent success: every later call reports the same failure until
+worker retirement is actually observed. A failure caused only by the join
+deadline is retryable — a later call succeeds after workers retire and then
+closes the store exactly once. Historical quarantine permanently prevents
+store release; it does not block a safely isolated new cache generation.
+
+A failed close keeps the executor's ownership; if dropping it
+still cannot prove retirement, one shared reference is retained for the process.
+A successful retry releases the client normally, with no retained reference.
+Through the Python binding, a failed close keeps the executor
+attached so its quarantine gauges and counters remain readable and a retry is
+possible.
+
+Worker exit accounting is RAII: a worker that ends for any reason,
+including an unwinding panic, still releases its count, so a close never waits
+on a dead worker. An unwinding worker or poisoned state lock permanently marks
+retirement as unproven: a worker's exit alone never permits deregistration.
+The shutdown path takes its locks even when poisoned rather than risk a second
+panic inside a `Drop` during unwind. Python closes are serialized with the GIL
+released; nonfinite, negative or unrepresentable timeout values are rejected
+before changing the handle.
 
 ## Initial scope and validation
 

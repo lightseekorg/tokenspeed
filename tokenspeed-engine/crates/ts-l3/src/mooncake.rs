@@ -146,13 +146,40 @@ fn failed(error: ts_mooncake::Error) -> StoreError {
     StoreError(error.to_string())
 }
 
+/// An existence query's outcome: one flag, 0 or 1, per requested key. A
+/// response that answers a different number of keys is malformed: surplus
+/// results must never be truncated into apparent success, and a missing
+/// one leaves its key's state unknown.
+fn exists_outcome(results: Vec<i32>, keys: usize) -> Result<Vec<bool>, StoreError> {
+    if results.len() != keys {
+        return Err(StoreError(format!(
+            "Mooncake existence query returned {} results for {keys} keys",
+            results.len()
+        )));
+    }
+    if results.iter().any(|&flag| flag != 0 && flag != 1) {
+        return Err(StoreError(format!(
+            "Mooncake existence query failed: {results:?}"
+        )));
+    }
+    Ok(results.into_iter().map(|flag| flag == 1).collect())
+}
+
 /// A zero-copy GET's outcome from its per-key results: the bytes read or
 /// an error code. A miss precedes any transfer, so it retires as an object
 /// failure; a short read retires too, but the object is invalid. Another
-/// error may leave writes into the pool in flight.
-fn get_outcome(results: &[i64], sizes: &[usize]) -> IoResult {
+/// error may leave writes into the pool in flight. The response must
+/// answer every requested range exactly once, as in [`exists_outcome`].
+fn get_outcome(results: &[i64], sizes: &[usize]) -> Result<IoResult, StoreError> {
+    if results.len() != sizes.len() {
+        return Err(StoreError(format!(
+            "Mooncake get returned {} results for {} ranges",
+            results.len(),
+            sizes.len()
+        )));
+    }
     let full = |result: i64, size: usize| u64::try_from(result).is_ok_and(|n| n == size as u64);
-    IoResult {
+    Ok(IoResult {
         success: results
             .iter()
             .zip(sizes)
@@ -168,9 +195,16 @@ fn get_outcome(results: &[i64], sizes: &[usize]) -> IoResult {
                 result == OBJECT_NOT_FOUND || (result >= 0 && !full(result, size))
             })
             .collect(),
-    }
+    })
 }
 
+/// A PUT's outcome: the objects that already `exist` succeed without a
+/// write, and each `missing` key takes its write's result. An existing
+/// object (another writer's) is a success; an allocation rejection retires
+/// as a failure the scheduler offers again; other errors do not prove that
+/// the source bytes are no longer read. The response must answer every
+/// missing key exactly once, as in [`exists_outcome`].
+///
 /// Keep the SDK's accepted/existing PUT acknowledgment as a historical hint,
 /// not a promise that another writer's object is readable yet. Actual restore
 /// still needs full-length GET success independently of that acknowledgment.
@@ -183,12 +217,28 @@ fn get_outcome(results: &[i64], sizes: &[usize]) -> IoResult {
 /// capability validation. These retirement assumptions depend on the selected
 /// library preserving the audited default Host ABI's behavior and must not be
 /// generalized to arbitrary SDK builds.
-fn put_outcome(exists: Vec<bool>, missing: &[usize], results: &[i32]) -> IoResult {
+fn put_outcome(
+    exists: Vec<bool>,
+    missing: &[usize],
+    results: &[i32],
+) -> Result<IoResult, StoreError> {
+    if results.len() != missing.len() {
+        return Err(StoreError(format!(
+            "Mooncake put returned {} results for {} writes",
+            results.len(),
+            missing.len()
+        )));
+    }
+    if missing.iter().any(|&index| index >= exists.len()) {
+        return Err(StoreError(
+            "Mooncake put answered a key outside its batch".to_owned(),
+        ));
+    }
     let mut success = exists;
     for (&index, &result) in missing.iter().zip(results) {
         success[index] = result == 0 || result == OBJECT_ALREADY_EXISTS;
     }
-    IoResult {
+    Ok(IoResult {
         object_failures: vec![false; success.len()],
         success,
         retired: results.iter().all(|&result| {
@@ -200,7 +250,7 @@ fn put_outcome(exists: Vec<bool>, missing: &[usize], results: &[i32]) -> IoResul
             ]
             .contains(&result)
         }),
-    }
+    })
 }
 
 /// The objects of the namespace `prefix`, as the store's regular expression.
@@ -220,12 +270,7 @@ impl Store for MooncakeStore {
             return Ok(Vec::new());
         }
         let results = self.client.batch_is_exist(keys).map_err(failed)?;
-        if results.iter().any(|&flag| flag != 0 && flag != 1) {
-            return Err(StoreError(format!(
-                "Mooncake existence query failed: {results:?}"
-            )));
-        }
-        Ok(results.into_iter().map(|flag| flag == 1).collect())
+        exists_outcome(results, keys.len())
     }
 
     fn batch_get_into(
@@ -249,7 +294,7 @@ impl Store for MooncakeStore {
             .client
             .batch_get_into(keys, &addrs, &sizes)
             .map_err(failed)?;
-        Ok(get_outcome(&results, &sizes))
+        get_outcome(&results, &sizes)
     }
 
     fn batch_put_from(
@@ -278,7 +323,7 @@ impl Store for MooncakeStore {
         let mut claim = self.in_flight_puts.claim(keys, &candidates);
         let missing: Vec<usize> = claim.entries.iter().map(|(index, _)| *index).collect();
         if missing.is_empty() {
-            return Ok(put_outcome(exists, &missing, &[]));
+            return put_outcome(exists, &missing, &[]);
         }
         let put_keys: Vec<String> = missing.iter().map(|&i| keys[i].clone()).collect();
         let put_ranges: Vec<Range> = missing.iter().map(|&i| ranges[i]).collect();
@@ -288,7 +333,7 @@ impl Store for MooncakeStore {
             .client
             .batch_put_from(&put_keys, &addrs, &sizes)
             .map_err(failed)?;
-        let result = put_outcome(exists, &missing, &results);
+        let result = put_outcome(exists, &missing, &results)?;
         claim.native_finished(result.retired);
         Ok(result)
     }
@@ -328,6 +373,10 @@ mod tests {
     const RPC_FAIL: i32 = -900;
     const RPC_TIMEOUT: i32 = -901;
 
+    fn put_success(exists: Vec<bool>, missing: &[usize], results: &[i32]) -> IoResult {
+        put_outcome(exists, missing, results).expect("a full response")
+    }
+
     #[test]
     fn put_claims_filter_only_overlapping_objects_and_release_before_submission() {
         let registry = InFlightPuts::default();
@@ -363,7 +412,7 @@ mod tests {
             let keys = vec!["a".to_owned()];
             let mut claim = registry.claim(&keys, &[0]);
             claim.native_started();
-            let outcome = put_outcome(vec![false], &[0], &[result]);
+            let outcome = put_success(vec![false], &[0], &[result]);
             assert_eq!(outcome.retired, retired);
             claim.native_finished(outcome.retired);
             drop(claim);
@@ -379,7 +428,7 @@ mod tests {
             let keys = vec!["a".to_owned()];
             let mut claim = registry.claim(&keys, &[0]);
             claim.native_started();
-            let outcome = put_outcome(vec![false], &[0], &[result]);
+            let outcome = put_success(vec![false], &[0], &[result]);
             assert_eq!(outcome.success, [false]);
             assert!(!outcome.retired);
             claim.native_finished(outcome.retired);
@@ -433,12 +482,12 @@ mod tests {
     fn existing_objects_are_not_rewritten_and_rejections_retire() {
         // `existing` is stored; `saved` writes; `pressure` meets a full
         // store, a failure the scheduler offers again.
-        let outcome = put_outcome(vec![true, true, false], &[1, 2], &[0, NO_AVAILABLE_HANDLE]);
+        let outcome = put_success(vec![true, true, false], &[1, 2], &[0, NO_AVAILABLE_HANDLE]);
         assert_eq!(outcome.success, [true, true, false]);
         assert!(outcome.retired);
         assert_eq!(outcome.object_failures, [false, false, false]);
         // Another writer's accepted create keeps the SDK's best-effort ACK.
-        let outcome = put_outcome(vec![false], &[0], &[OBJECT_ALREADY_EXISTS]);
+        let outcome = put_success(vec![false], &[0], &[OBJECT_ALREADY_EXISTS]);
         assert_eq!(outcome.success, [true]);
         assert!(outcome.retired);
     }
@@ -446,7 +495,7 @@ mod tests {
     #[test]
     fn a_failed_put_does_not_retire() {
         for error in [-1, -800] {
-            let outcome = put_outcome(vec![true, true, false], &[1, 2], &[0, error]);
+            let outcome = put_success(vec![true, true, false], &[1, 2], &[0, error]);
             assert_eq!(outcome.success, [true, true, false]);
             assert!(!outcome.retired);
         }
@@ -455,7 +504,7 @@ mod tests {
     #[test]
     fn zero_and_duplicate_results_keep_the_existing_sdk_ack_semantics() {
         for result in [0, OBJECT_ALREADY_EXISTS] {
-            let outcome = put_outcome(vec![false], &[0], &[result]);
+            let outcome = put_success(vec![false], &[0], &[result]);
             assert_eq!(outcome.success, [true]);
             assert!(outcome.retired);
             assert_eq!(outcome.object_failures, [false]);
@@ -465,7 +514,7 @@ mod tests {
     #[test]
     fn a_put_ack_does_not_retire_another_keys_unknown_io() {
         for unknown in [-800, RPC_FAIL, RPC_TIMEOUT, -1] {
-            let outcome = put_outcome(vec![false, false], &[0, 1], &[0, unknown]);
+            let outcome = put_success(vec![false, false], &[0, 1], &[0, unknown]);
             assert_eq!(outcome.success, [true, false]);
             assert!(!outcome.retired);
             assert_eq!(outcome.object_failures, [false, false]);
@@ -475,11 +524,11 @@ mod tests {
     #[test]
     fn a_put_ack_does_not_override_a_later_get_miss_or_short_read() {
         for status in [0, OBJECT_ALREADY_EXISTS] {
-            let ack = put_outcome(vec![false], &[0], &[status]);
+            let ack = put_success(vec![false], &[0], &[status]);
             assert_eq!(ack.success, [true]);
             assert!(ack.retired);
             for result in [OBJECT_NOT_FOUND, 4] {
-                let read = get_outcome(&[result], &[8]);
+                let read = get_outcome(&[result], &[8]).expect("a full response");
                 assert_eq!(read.success, [false]);
                 assert!(read.retired);
                 assert_eq!(read.object_failures, [true]);
@@ -489,7 +538,7 @@ mod tests {
 
     #[test]
     fn an_owner_rejection_retires_default_host_sources_without_publication() {
-        let outcome = put_outcome(vec![true, true], &[0, 1], &[0, ILLEGAL_CLIENT]);
+        let outcome = put_success(vec![true, true], &[0, 1], &[0, ILLEGAL_CLIENT]);
         assert_eq!(outcome.success, [true, false]);
         assert!(outcome.retired);
         assert_eq!(outcome.object_failures, [false, false]);
@@ -503,7 +552,7 @@ mod tests {
                 let keys = vec!["a".to_owned(), "b".to_owned()];
                 let mut claim = registry.claim(&keys, &[0, 1]);
                 claim.native_started();
-                let outcome = put_outcome(vec![false, false], &[0, 1], &results);
+                let outcome = put_success(vec![false, false], &[0, 1], &results);
                 assert_eq!(outcome.success, [false, false]);
                 assert!(!outcome.retired);
                 assert_eq!(outcome.object_failures, [false, false]);
@@ -516,7 +565,7 @@ mod tests {
 
     #[test]
     fn default_host_statuses_keep_sdk_acks_separate_from_source_retirement() {
-        let outcome = put_outcome(
+        let outcome = put_success(
             vec![false; 4],
             &[0, 1, 2, 3],
             &[
@@ -534,26 +583,55 @@ mod tests {
     #[test]
     fn a_get_miss_retires_as_an_object_failure() {
         // The object was evicted after the existence query.
-        let outcome = get_outcome(&[OBJECT_NOT_FOUND, 8], &[8, 8]);
+        let outcome = get_outcome(&[OBJECT_NOT_FOUND, 8], &[8, 8]).expect("a full response");
         assert_eq!(outcome.success, [false, true]);
         assert!(outcome.retired);
         assert_eq!(outcome.object_failures, [true, false]);
         // An unknown error may still write into the pool.
-        let outcome = get_outcome(&[OBJECT_NOT_FOUND, -800], &[8, 8]);
+        let outcome = get_outcome(&[OBJECT_NOT_FOUND, -800], &[8, 8]).expect("a full response");
         assert!(!outcome.retired);
         assert_eq!(outcome.object_failures, [true, false]);
     }
 
     #[test]
     fn a_short_get_is_an_invalid_object() {
-        let outcome = get_outcome(&[4, 8], &[8, 8]);
+        let outcome = get_outcome(&[4, 8], &[8, 8]).expect("a full response");
         assert_eq!(outcome.success, [false, true]);
         assert!(outcome.retired);
         assert_eq!(outcome.object_failures, [true, false]);
-        let outcome = get_outcome(&[0, -1], &[8, 8]);
+        let outcome = get_outcome(&[0, -1], &[8, 8]).expect("a full response");
         assert_eq!(outcome.success, [false, false]);
         assert!(!outcome.retired);
         assert_eq!(outcome.object_failures, [true, false]);
+    }
+
+    #[test]
+    fn ragged_responses_are_errors_never_truncations() {
+        // A surplus result must not be truncated into apparent success,
+        // and a missing one leaves its key's state unknown.
+        assert!(get_outcome(&[8, 8, 8], &[8, 8]).is_err());
+        assert!(get_outcome(&[8], &[8, 8]).is_err());
+        assert!(put_outcome(vec![false, false], &[0, 1], &[0, 0, 0]).is_err());
+        assert!(put_outcome(vec![false, false], &[0, 1], &[0]).is_err());
+        // An answer for a key outside the batch cannot publish.
+        assert!(put_outcome(vec![false], &[1], &[0]).is_err());
+        assert!(exists_outcome(vec![0, 1, 0], 2).is_err());
+        assert!(exists_outcome(vec![1], 2).is_err());
+        assert!(exists_outcome(vec![-1, 1], 2).is_err());
+        assert_eq!(exists_outcome(vec![0, 1], 2).unwrap(), [false, true]);
+    }
+
+    #[test]
+    fn malformed_put_results_retain_their_claims() {
+        for results in [vec![0], vec![0, 0, 0]] {
+            let registry = InFlightPuts::default();
+            let keys = vec!["a".to_owned(), "b".to_owned()];
+            let mut claim = registry.claim(&keys, &[0, 1]);
+            claim.native_started();
+            assert!(put_outcome(vec![false, false], &[0, 1], &results).is_err());
+            drop(claim);
+            assert!(registry.claim(&keys, &[0, 1]).entries.is_empty());
+        }
     }
 
     #[test]
