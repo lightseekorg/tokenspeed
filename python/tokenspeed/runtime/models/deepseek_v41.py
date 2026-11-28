@@ -148,7 +148,10 @@ from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41RowPlan,
 )
-from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.fp8 import (
+    Fp8LinearMethod,
+    fp8_activation_scale_layouts,
+)
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -162,6 +165,7 @@ from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
+from tokenspeed.runtime.layers.moe.peer_weights import PeerStorageController
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
@@ -187,6 +191,12 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
     EngramHashState,
     EngramHostAlloc,
+    EngramPeerGpuAlloc,
+    EngramPeerGpuBinding,
+    EngramPeerWeightsController,
+    EngramPrefetchedRows,
+    EngramPrefetchTask,
+    bind_engram_peer_gpu,
     is_engram_embed_checkpoint_name,
     resolve_engram_host_alloc,
     resolve_engram_host_layout,
@@ -387,6 +397,12 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
             raise ValueError("DeepGEMM projection weight scales changed layout")
         cached.copy_(prepared)
 
+    def activation_scale_layouts(self) -> frozenset[str]:
+        layouts = set(super().activation_scale_layouts())
+        if self.projection_weight_scales is not None:
+            layouts.add("packed")
+        return frozenset(layouts)
+
     def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
         # Only row-parallel layers preallocate their output, and none of them
         # takes the packed scales, which DeepGEMM's projection writes itself.
@@ -496,21 +512,8 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
 
 
 def _scale_layouts(layer: nn.Module) -> frozenset[str]:
-    """The group-32 activation scale layouts this layer's GEMMs read as given.
-
-    Canonical is always among them: every path takes it, and it is the only one
-    a caller can select rows of. A prepared layer adds the layout of whichever
-    GEMM holds its weight scales.
-    """
-    method = layer.quant_method
-    if not isinstance(method, _ReferenceFp8LinearMethod):
-        return frozenset({"canonical"})
-    layouts = {"canonical"}
-    if method.prepared_weight_scales is not None:
-        layouts.add("swizzled")
-    if method.projection_weight_scales is not None:
-        layouts.add("packed")
-    return frozenset(layouts)
+    """The group-32 activation scale layouts this layer's GEMMs read as given."""
+    return fp8_activation_scale_layouts(layer)
 
 
 def _replicated(input_size, output_size, dtype, quant_config, prefix):
@@ -2038,7 +2041,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         hc_stream: torch.cuda.Stream | None,
         host_table: bool,
         host_layout: str,
-        host_alloc: EngramHostAlloc | None,
+        host_alloc: EngramHostAlloc | EngramPeerGpuAlloc | EngramPeerGpuBinding | None,
     ):
         super().__init__()
         self.layer_id = layer_id
@@ -2115,7 +2118,14 @@ class DeepseekV41DecoderLayer(nn.Module):
         pending_post: V41HCPost | None,
         allow_ffn_reduce_fusion: bool,
         capture_input: bool,
-    ):
+        engram_prefetch: EngramPrefetchTask | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        V41HCPost | None,
+        torch.Tensor | None,
+        EngramPrefetchedRows | None,
+    ]:
         if ctx.forward_mode is None:
             raise ValueError("V4.1 attention requires an explicit forward mode")
         if hidden_states.shape[0] == 0:
@@ -2125,12 +2135,12 @@ class DeepseekV41DecoderLayer(nn.Module):
                 self.attn(positions, hidden_states[:, 0, :], ctx, reduce_output=True)
                 if rows.query_shard.total_rows == 0:
                     captured = hidden_states[:, 0, :] if capture_input else None
-                    return hidden_states, pre_mix, None, captured
+                    return hidden_states, pre_mix, None, captured, None
             self._forward_ffn(
                 hidden_states[:, 0, :], image_mask, ctx, defer_reduce=False
             )
             captured = hidden_states[:, 0, :] if capture_input else None
-            return hidden_states, pre_mix, None, captured
+            return hidden_states, pre_mix, None, captured, None
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         if rows.keep_rows is not None and rows.keep_rows.numel() == 0:
             # Only the global cache producer runs for an open prefill chunk.
@@ -2155,7 +2165,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                     ctx,
                     defer_reduce=False,
                 )
-            return residual[:0], pre_mix[:0], None, captured
+            return residual[:0], pre_mix[:0], None, captured, None
         decode_hc = ctx.forward_mode.is_decode()
         can_overlap = (
             hidden_states.is_cuda
@@ -2247,64 +2257,90 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-        residual, x, ffn_mixes, _ = _v41_hc_post_pre(
-            residual,
-            attn_pre,
-            V41HCPost(
-                x,
-                post,
-                comb,
-                self.attn.mapping.attn.head_tp_group if defer_attn else None,
-            ),
-            hc_weights=(self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base),
-            norm=self.ffn_norm,
-            hc_norm_eps=self.norm_eps,
-            hc_eps=self.hc_eps,
-            sinkhorn_iters=self.hc_sinkhorn_iters,
-            prefer_overlap=decode_hc and can_overlap,
-            quantize_fp8=False,
-        )
-        if x is None:
-            x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
-        ffn_overlap = (
-            can_overlap
-            and ffn_mixes is None
-            and (decode_hc or not is_breakable_capture_active())
-        )
-        defer_moe = (
-            decode_hc
-            and allow_ffn_reduce_fusion
-            and not self.ffn.owns_ep_communication
-            and self.comm_manager.moe_output_all_reduced(ctx)
-            # All V4.1 norms share storage metadata. Admission only inspects
-            # the layout; execution uses the consumer's own weight and epsilon.
-            # This topology preserves rows and produces contiguous BF16.
-            and supports_all_reduce_mhc_norm(
-                x,
-                self.ffn_norm.weight,
-                self.comm_manager.mapping.moe.tp_ep_group,
+        # Launch the next layer's Engram MXFP8 row gather right after the
+        # attention break point so it overlaps this layer's FFN and joins in the
+        # same captured segment before the next layer's wkv projection.
+        prefetched_engram: EngramPrefetchedRows | None = None
+        prefetch_main: torch.cuda.Stream | None = None
+        if (
+            engram_prefetch is not None
+            and engram_prefetch.stream.device == hidden_states.device
+        ):
+            prefetch_main = torch.cuda.current_stream()
+            engram_prefetch.fork_event.record(prefetch_main)
+            with torch.cuda.stream(engram_prefetch.stream):
+                engram_prefetch.stream.wait_event(engram_prefetch.fork_event)
+                engram_prefetch.hash_ids.record_stream(engram_prefetch.stream)
+                prefetched_codes, prefetched_scales = (
+                    engram_prefetch.engram.prefetch_mxfp8_rows(engram_prefetch.hash_ids)
+                )
+                engram_prefetch.join_event.record(engram_prefetch.stream)
+            prefetched_engram = EngramPrefetchedRows(
+                prefetched_codes, prefetched_scales, engram_prefetch.join_event
             )
-        )
-        if ffn_overlap:
-            residual.record_stream(self.hc_stream_fork.aux_stream)
-        with self.hc_stream_fork.scope(enable=ffn_overlap, overlap=True) as fork:
-            # Submit independent coefficients before the sublayer, also in eager.
-            with fork.branch():
-                if ffn_mixes is None:
-                    ffn_mixes = v41_hc_mixes(
-                        residual,
-                        self.hc_ffn_fn,
-                        self.hc_ffn_scale,
-                        self.hc_ffn_base,
-                        self.norm_eps,
-                        self.hc_eps,
-                        self.hc_sinkhorn_iters,
-                    )
-            x = self._forward_ffn(x, image_mask, ctx, defer_reduce=defer_moe)
-            ffn_pre, post, comb = ffn_mixes
+        try:
+            residual, x, ffn_mixes, _ = _v41_hc_post_pre(
+                residual,
+                attn_pre,
+                V41HCPost(
+                    x,
+                    post,
+                    comb,
+                    self.attn.mapping.attn.head_tp_group if defer_attn else None,
+                ),
+                hc_weights=(self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base),
+                norm=self.ffn_norm,
+                hc_norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+                sinkhorn_iters=self.hc_sinkhorn_iters,
+                prefer_overlap=decode_hc and can_overlap,
+                quantize_fp8=False,
+            )
+            if x is None:
+                x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
+            ffn_overlap = (
+                can_overlap
+                and ffn_mixes is None
+                and (decode_hc or not is_breakable_capture_active())
+            )
+            defer_moe = (
+                decode_hc
+                and allow_ffn_reduce_fusion
+                and not self.ffn.owns_ep_communication
+                and self.comm_manager.moe_output_all_reduced(ctx)
+                # All V4.1 norms share storage metadata. Admission only inspects
+                # the layout; execution uses the consumer's own weight and epsilon.
+                # This topology preserves rows and produces contiguous BF16.
+                and supports_all_reduce_mhc_norm(
+                    x,
+                    self.ffn_norm.weight,
+                    self.comm_manager.mapping.moe.tp_ep_group,
+                )
+            )
             if ffn_overlap:
-                for tensor in (ffn_pre, post, comb):
-                    tensor.record_stream(consumer)
+                residual.record_stream(self.hc_stream_fork.aux_stream)
+            with self.hc_stream_fork.scope(enable=ffn_overlap, overlap=True) as fork:
+                # Submit independent coefficients before the sublayer, also in eager.
+                with fork.branch():
+                    if ffn_mixes is None:
+                        ffn_mixes = v41_hc_mixes(
+                            residual,
+                            self.hc_ffn_fn,
+                            self.hc_ffn_scale,
+                            self.hc_ffn_base,
+                            self.norm_eps,
+                            self.hc_eps,
+                            self.hc_sinkhorn_iters,
+                        )
+                x = self._forward_ffn(x, image_mask, ctx, defer_reduce=defer_moe)
+                ffn_pre, post, comb = ffn_mixes
+                if ffn_overlap:
+                    for tensor in (ffn_pre, post, comb):
+                        tensor.record_stream(consumer)
+        except BaseException:
+            if prefetched_engram is not None and prefetch_main is not None:
+                prefetch_main.wait_event(prefetched_engram.join_event)
+            raise
         return (
             residual,
             ffn_pre,
@@ -2315,6 +2351,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 self.comm_manager.mapping.moe.tp_ep_group if defer_moe else None,
             ),
             captured,
+            prefetched_engram,
         )
 
     def _ffn_context(self, ctx: ForwardContext) -> ForwardContext:
@@ -2510,7 +2547,7 @@ class DeepseekV41Model(nn.Module):
         prefix: str,
         host_table: bool,
         host_layout: str,
-        host_alloc: EngramHostAlloc | None,
+        host_alloc: EngramHostAlloc | EngramPeerGpuAlloc | None,
     ):
         super().__init__()
         if mapping.pp_size != 1:
@@ -2589,6 +2626,36 @@ class DeepseekV41Model(nn.Module):
         self.hc_stream = (
             torch.cuda.Stream(device=device) if device.type == "cuda" else None
         )
+        # Dedicated stream overlapping the next layer's Engram MXFP8 gather
+        # with the preceding layer's FFN.
+        self.engram_stream = (
+            torch.cuda.Stream(device=device)
+            if device.type == "cuda" and config.engram_layer_ids
+            else None
+        )
+        self._engram_fork_event = (
+            torch.cuda.Event() if self.engram_stream is not None else None
+        )
+        self._engram_join_event = (
+            torch.cuda.Event() if self.engram_stream is not None else None
+        )
+        self._engram_peer_binding: EngramPeerGpuBinding | None = None
+        layer_host_alloc: (
+            EngramHostAlloc | EngramPeerGpuAlloc | EngramPeerGpuBinding | None
+        ) = host_alloc
+        if (
+            host_layout == "peer_gpu"
+            and device.type != "meta"
+            and config.engram_layer_ids
+        ):
+            if not isinstance(host_alloc, EngramPeerGpuAlloc):
+                raise TypeError(
+                    "Peer-sharded GPU Engram tables require an EngramPeerGpuAlloc"
+                )
+            self._engram_peer_binding = bind_engram_peer_gpu(
+                host_alloc, mapping, device
+            )
+            layer_host_alloc = self._engram_peer_binding
         self.layers = nn.ModuleList(
             [
                 DeepseekV41DecoderLayer(
@@ -2602,7 +2669,7 @@ class DeepseekV41Model(nn.Module):
                     self.hc_stream,
                     host_table,
                     host_layout,
-                    host_alloc,
+                    layer_host_alloc,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -2669,7 +2736,7 @@ class DeepseekV41Model(nn.Module):
                     if index in (self.ced_decoder_start, self.ced_decoder_start + 1):
                         counts = self.decoder_collective_counts(ctx, 0)
                     with report_collective_sizing(ctx, 0, counts):
-                        hidden, pre_mix, _, _ = layer(
+                        hidden, pre_mix, _, _, _ = layer(
                             hidden,
                             pre_mix,
                             positions,
@@ -2760,14 +2827,27 @@ class DeepseekV41Model(nn.Module):
         ctx: ForwardContext,
         captured: list[torch.Tensor],
         pending_post: V41HCPost | None,
+        prefetched_engram: EngramPrefetchedRows | None,
         *,
         stage_end: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, V41HCPost | None]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        V41HCPost | None,
+        EngramPrefetchedRows | None,
+    ]:
         """Finish an incoming post before Engram; capture the input after it."""
         if layer.engram is not None:
             if pending_post is not None:
                 hidden = pending_post.finish(hidden)
                 pending_post = None
+            prefetched_pair: tuple[torch.Tensor, torch.Tensor] | None = None
+            if prefetched_engram is not None:
+                main_stream = torch.cuda.current_stream()
+                main_stream.wait_event(prefetched_engram.join_event)
+                prefetched_engram.codes.record_stream(main_stream)
+                prefetched_engram.scales.record_stream(main_stream)
+                prefetched_pair = (prefetched_engram.codes, prefetched_engram.scales)
             hidden = layer.engram(
                 hidden,
                 state.hashes[:, layer.engram.layer_hash_index],
@@ -2777,8 +2857,28 @@ class DeepseekV41Model(nn.Module):
                     if ctx.query_shard is not None
                     else None
                 ),
+                prefetched=prefetched_pair,
             )
-        hidden, pre_mix, pending_post, tap = layer(
+        engram_prefetch: EngramPrefetchTask | None = None
+        if (
+            self.engram_stream is not None
+            and layer.layer_id + 1 < stage_end
+            and state.hashes is not None
+        ):
+            next_engram = self.layers[layer.layer_id + 1].engram
+            if next_engram is not None:
+                next_hashes = state.hashes[:, next_engram.layer_hash_index]
+                if next_engram.can_prefetch_mxfp8(next_hashes):
+                    assert self._engram_fork_event is not None
+                    assert self._engram_join_event is not None
+                    engram_prefetch = EngramPrefetchTask(
+                        engram=next_engram,
+                        hash_ids=next_hashes,
+                        stream=self.engram_stream,
+                        fork_event=self._engram_fork_event,
+                        join_event=self._engram_join_event,
+                    )
+        hidden, pre_mix, pending_post, tap, next_prefetched = layer(
             hidden,
             pre_mix,
             state.positions,
@@ -2790,10 +2890,11 @@ class DeepseekV41Model(nn.Module):
             allow_ffn_reduce_fusion=layer.layer_id + 1 < stage_end
             and self.layers[layer.layer_id + 1].engram is None,
             capture_input=layer.layer_id in self.dspark_capture_layers,
+            engram_prefetch=engram_prefetch,
         )
         if tap is not None:
             captured.append(tap)
-        return hidden, pre_mix, pending_post
+        return hidden, pre_mix, pending_post, next_prefetched
 
     def encoder_forward(
         self,
@@ -2854,8 +2955,9 @@ class DeepseekV41Model(nn.Module):
             h, pre_mix, positions, image_mask, hashes, engram_token_mask, []
         )
         pending_post = None
+        prefetched_engram: EngramPrefetchedRows | None = None
         for layer in self.layers[: self.ced_decoder_start]:
-            h, pre_mix, pending_post = self._run_layer(
+            h, pre_mix, pending_post, prefetched_engram = self._run_layer(
                 layer,
                 h,
                 pre_mix,
@@ -2863,6 +2965,7 @@ class DeepseekV41Model(nn.Module):
                 ctx,
                 state.captured,
                 pending_post,
+                prefetched_engram,
                 stage_end=self.ced_decoder_start,
             )
         if pending_post is not None:
@@ -2919,13 +3022,14 @@ class DeepseekV41Model(nn.Module):
         captured = list(state.captured)
         # Ordinary EP needs the narrowed rows; fused EP exchanges counts itself.
         with report_collective_sizing(ctx, view.metadata.positions.numel(), counts):
-            hidden, pre_mix, pending_post = self._run_layer(
+            hidden, pre_mix, pending_post, _ = self._run_layer(
                 self.layers[start],
                 state.hidden,
                 state.pre_mix,
                 state,
                 ctx,
                 captured,
+                None,
                 None,
                 stage_end=start + 1,
             )
@@ -2980,12 +3084,13 @@ class DeepseekV41Model(nn.Module):
             return hidden, captured
         ctx.attn_backend.begin_indexer_stage()
         pending_post = None
+        prefetched_engram: EngramPrefetchedRows | None = None
         layers = self.layers[start + 1 :]
         if layers:
             counts = self.decoder_collective_counts(ctx, state.rows)
             with report_collective_sizing(ctx, state.rows, counts):
                 for layer in layers:
-                    h, pre_mix, pending_post = self._run_layer(
+                    h, pre_mix, pending_post, prefetched_engram = self._run_layer(
                         layer,
                         h,
                         pre_mix,
@@ -2993,6 +3098,7 @@ class DeepseekV41Model(nn.Module):
                         ctx,
                         captured,
                         pending_post,
+                        prefetched_engram,
                         stage_end=len(self.layers),
                     )
                 if pending_post is not None:
@@ -3259,7 +3365,10 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     def resolve_model(self, config, mapping, quant_config, prefix):
         host_table = global_server_args_dict["engram_host_table"]
-        host_layout = resolve_engram_host_layout(host_table, mapping.attn.tp_size)
+        gpu_peer_sharded = global_server_args_dict["engram_gpu_peer_sharded"]
+        host_layout = resolve_engram_host_layout(
+            host_table, mapping.attn.tp_size, gpu_peer_sharded=gpu_peer_sharded
+        )
         return self.model_cls(
             config.text_config,
             mapping,
@@ -3721,8 +3830,28 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             ) as tensor_slice:
                 embed.load_sharded(field, tensor_slice, 65536)
             loaded.add(raw)
-        if torch.distributed.is_initialized():
+        if self.model._engram_peer_binding is not None:
+            torch.cuda.synchronize(self.model.embed_tokens.weight.device)
+            self.model._engram_peer_binding.exchange.barrier("load-complete")
+        elif torch.distributed.is_initialized():
             torch.distributed.barrier()
+
+    def peer_storage_controllers(self) -> tuple[PeerStorageController, ...]:
+        """Return the active peer-sharded Engram controller, if any."""
+        if self.model is None or self.model._engram_peer_binding is None:
+            return ()
+        embeds = tuple(
+            layer.engram.embed
+            for layer in self.model.layers
+            if layer.engram is not None and layer.engram.embed.peer_memory is not None
+        )
+        if not embeds:
+            return ()
+        return (
+            EngramPeerWeightsController(
+                embeds, self.model._engram_peer_binding.exchange
+            ),
+        )
 
     def post_load_weights(self) -> None:
         for module in self.modules():
@@ -3761,6 +3890,24 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         ]
         if attentions:
             _warmup_query_projections(attentions, _max_forward_tokens())
+        engram_warmed: set[tuple[torch.device, tuple[int, ...]]] = set()
+        for module in self.modules():
+            if (
+                isinstance(module, DeepseekV41Engram)
+                and module.embed.serves_mxfp8_rows
+                and module.wkv_scale_layout() == "packed"
+            ):
+                method = module.wkv.quant_method
+                assert isinstance(method, Fp8LinearMethod)
+                assert method.projection_weight_scales is not None
+                key = (module.wkv.weight.device, tuple(module.wkv.weight.shape))
+                if key not in engram_warmed:
+                    warmup_fp8_projection(
+                        module.wkv.weight,
+                        method.projection_weight_scales,
+                        _max_forward_tokens(),
+                    )
+                    engram_warmed.add(key)
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()

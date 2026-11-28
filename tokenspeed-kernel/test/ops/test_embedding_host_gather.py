@@ -99,62 +99,105 @@ def _quantized_rows(table: torch.Tensor, indices: torch.Tensor):
     ).reshape(tokens, -1)
 
 
+def _pack_reference_scales(canonical_scales: torch.Tensor) -> torch.Tensor:
+    """Pack canonical uint8 [tokens, K/32] scales into MN-major int32 words."""
+    tokens, groups = canonical_scales.shape
+    assert groups % 4 == 0
+    words = groups // 4
+    scale_stride = (tokens + 3) // 4 * 4
+    grouped = canonical_scales.to(torch.int32).reshape(tokens, words, 4)
+    packed_words = (
+        grouped[..., 0]
+        | (grouped[..., 1] << 8)
+        | (grouped[..., 2] << 16)
+        | (grouped[..., 3] << 24)
+    )
+    storage = torch.zeros(words * scale_stride, dtype=torch.int32)
+    view = storage.as_strided((tokens, words), (1, scale_stride))
+    view.copy_(packed_words)
+    return view
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-def test_cuda_mxfp8_row_gather_matches_quantized_dequant(index_dtype):
+@pytest.mark.parametrize("scale_layout", ["canonical", "packed"])
+@pytest.mark.parametrize("dim", [64, 256])
+def test_cuda_mxfp8_row_gather_matches_quantized_dequant(
+    index_dtype, scale_layout, dim
+):
     generator = torch.Generator().manual_seed(0)
-    table = _mxfp8_table(40, 256, generator).pin_memory()
+    table = _mxfp8_table(40, dim, generator).pin_memory()
     ids = torch.randint(0, 40, (5, 3, 4), generator=generator)
     ids[0, 1, 0], ids[2, 1, 3], ids[4, 1, 1] = -1, 40, 0
     # Rows 1 and 2 hold exponent bytes 0 and 1; gather them whatever the draw.
     ids[1, 1, 0], ids[3, 1, 2] = 1, 2
     # A layer's slice of [tokens, layers, columns] ids: not contiguous.
     indices = ids.to(device="cuda:0", dtype=index_dtype)[:, 1]
-    codes, scales = host_gather.mxfp8_row_gather(table, indices, None, None)
+    codes, scales = host_gather.mxfp8_row_gather(
+        table, indices, None, None, scale_layout=scale_layout
+    )
     expected_codes, expected_scales = _quantized_rows(table, indices)
-    assert codes.shape == (5, 4 * 256) and codes.dtype == torch.float8_e4m3fn
+    assert codes.shape == (5, 4 * dim) and codes.dtype == torch.float8_e4m3fn
     assert torch.equal(codes.view(torch.uint8).cpu(), expected_codes)
-    assert torch.equal(scales.cpu(), expected_scales)
-    # Most rows are re-scaled, not copied: the same values, new codes.
-    assert not torch.equal(scales.cpu(), table[ids[:, 1].clamp(0, 39), 256:])
+    if scale_layout == "packed":
+        expected_packed = _pack_reference_scales(expected_scales)
+        assert scales.dtype == torch.int32
+        assert scales.shape == expected_packed.shape
+        assert scales.stride() == (1, 8)
+        assert torch.equal(scales.cpu(), expected_packed)
+    else:
+        assert torch.equal(scales.cpu(), expected_scales)
+        # Most rows are re-scaled, not copied: the same values, new codes.
+        assert not torch.equal(scales.cpu(), table[ids[:, 1].clamp(0, 39), dim:])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_mxfp8_row_gather_reads_rows_past_2gib():
+@pytest.mark.parametrize("scale_layout", ["canonical", "packed"])
+def test_cuda_mxfp8_row_gather_reads_rows_past_2gib(scale_layout):
     # Row offsets are bytes: the last rows of a 2.2 GB table lie past 2^31.
     rows = (1 << 31) // 264 + 2
     table = torch.zeros(rows, 264, dtype=torch.uint8, device="cuda:0")
     tail = _mxfp8_table(3, 256, torch.Generator().manual_seed(1))
     table[-2:] = tail[1:].cuda()
     indices = torch.tensor([[rows - 1, rows - 2]], device="cuda:0")
-    codes, scales = host_gather.mxfp8_row_gather(table, indices, None, None)
+    codes, scales = host_gather.mxfp8_row_gather(
+        table, indices, None, None, scale_layout=scale_layout
+    )
     expected_codes, expected_scales = _quantized_rows(tail, torch.tensor([[2, 1]]))
     assert torch.equal(codes.view(torch.uint8).cpu(), expected_codes)
-    assert torch.equal(scales.cpu(), expected_scales)
+    if scale_layout == "packed":
+        assert torch.equal(scales.cpu(), _pack_reference_scales(expected_scales))
+    else:
+        assert torch.equal(scales.cpu(), expected_scales)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_mxfp8_row_gather_does_not_recompile_per_batch():
+@pytest.mark.parametrize("scale_layout", ["canonical", "packed"])
+def test_cuda_mxfp8_row_gather_does_not_recompile_per_batch(scale_layout):
     table = _mxfp8_table(64, 256, torch.Generator().manual_seed(2)).pin_memory()
     ids = torch.randint(0, 64, (64, 2, 24), device="cuda:0")
-    codes = torch.empty(64, 24 * 256, dtype=torch.float8_e4m3fn, device="cuda:0")
-    scales = torch.empty(64, 24 * 8, dtype=torch.uint8, device="cuda:0")
-    host_gather.mxfp8_row_gather(table, ids[:3, 0], codes[:3], scales[:3])
+    host_gather.mxfp8_row_gather(
+        table, ids[:3, 0], None, None, scale_layout=scale_layout
+    )
     with assert_no_triton_compile(triton_host_gather._host_mxfp8_row_gather_kernel):
         for tokens in (1, 5, 16, 17, 64):
             host_gather.mxfp8_row_gather(
-                table, ids[:tokens, 1], codes[:tokens], scales[:tokens]
+                table, ids[:tokens, 1], None, None, scale_layout=scale_layout
             )
     torch.cuda.synchronize()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-def test_cuda_mxfp8_row_gather_sorted_path_matches_with_repeated_ids(index_dtype):
+@pytest.mark.parametrize("scale_layout", ["canonical", "packed"])
+@pytest.mark.parametrize("dim", [64, 256])
+def test_cuda_mxfp8_row_gather_sorted_path_matches_with_repeated_ids(
+    index_dtype, scale_layout, dim
+):
     # Enough entries to take the sorted path; few table rows so most ids
     # repeat and each run of equal ids is read once and copied to the rest.
     generator = torch.Generator().manual_seed(3)
-    table = _mxfp8_table(97, 256, generator).pin_memory()
+    table = _mxfp8_table(97, dim, generator).pin_memory()
     columns = 24
     tokens = triton_host_gather._SORT_MIN_ROWS // columns + 3
     ids = torch.randint(0, 97, (tokens, 2, columns), generator=generator)
@@ -163,14 +206,20 @@ def test_cuda_mxfp8_row_gather_sorted_path_matches_with_repeated_ids(index_dtype
     ids[1, 1, 0], ids[6, 1, 7], ids[tokens - 2, 1, columns - 1] = -1, 97, -5
     indices = ids.to(device="cuda:0", dtype=index_dtype)[:, 1]
     assert indices.numel() >= triton_host_gather._SORT_MIN_ROWS
-    codes, scales = host_gather.mxfp8_row_gather(table, indices, None, None)
+    codes, scales = host_gather.mxfp8_row_gather(
+        table, indices, None, None, scale_layout=scale_layout
+    )
     expected_codes, expected_scales = _quantized_rows(table, indices)
     assert torch.equal(codes.view(torch.uint8).cpu(), expected_codes)
-    assert torch.equal(scales.cpu(), expected_scales)
+    if scale_layout == "packed":
+        assert torch.equal(scales.cpu(), _pack_reference_scales(expected_scales))
+    else:
+        assert torch.equal(scales.cpu(), expected_scales)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_mxfp8_row_gather_sorted_path_reads_rows_past_2gib():
+@pytest.mark.parametrize("scale_layout", ["canonical", "packed"])
+def test_cuda_mxfp8_row_gather_sorted_path_reads_rows_past_2gib(scale_layout):
     # The sorted path widens its own id load, so it needs its own far-offset
     # case: enough entries to take it, all on the last two rows of a 2.2 GB
     # table. The duplicate-copy outputs here are small; their row offsets
@@ -190,30 +239,43 @@ def test_cuda_mxfp8_row_gather_sorted_path_reads_rows_past_2gib():
     )
     indices[::3, 0] = rows - 2
     assert indices.numel() >= triton_host_gather._SORT_MIN_ROWS
-    codes, scales = host_gather.mxfp8_row_gather(table, indices, None, None)
+    codes, scales = host_gather.mxfp8_row_gather(
+        table, indices, None, None, scale_layout=scale_layout
+    )
     # Table row rows - 1 holds tail row 2, and rows - 2 holds tail row 1.
     expected_codes, expected_scales = _quantized_rows(tail, indices - (rows - 3))
     assert torch.equal(codes.view(torch.uint8).cpu(), expected_codes)
-    assert torch.equal(scales.cpu(), expected_scales)
+    if scale_layout == "packed":
+        assert torch.equal(scales.cpu(), _pack_reference_scales(expected_scales))
+    else:
+        assert torch.equal(scales.cpu(), expected_scales)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_mxfp8_row_gather_sorted_path_does_not_recompile_per_batch():
+@pytest.mark.parametrize("scale_layout", ["canonical", "packed"])
+def test_cuda_mxfp8_row_gather_sorted_path_does_not_recompile_per_batch(scale_layout):
     table = _mxfp8_table(64, 256, torch.Generator().manual_seed(4)).pin_memory()
     columns = 24
     base = triton_host_gather._SORT_MIN_ROWS // columns + 1
     ids = torch.randint(0, 64, (base + 64, 2, columns), device="cuda:0")
-    codes = torch.empty(
-        base + 64, columns * 256, dtype=torch.float8_e4m3fn, device="cuda:0"
+    host_gather.mxfp8_row_gather(
+        table, ids[:base, 0], None, None, scale_layout=scale_layout
     )
-    scales = torch.empty(base + 64, columns * 8, dtype=torch.uint8, device="cuda:0")
-    host_gather.mxfp8_row_gather(table, ids[:base, 0], codes[:base], scales[:base])
     with assert_no_triton_compile(
         triton_host_gather._host_mxfp8_row_gather_kernel,
         triton_host_gather._copy_duplicate_rows_kernel,
     ):
         for tokens in (base + 2, base + 17, base + 33, base + 64):
             host_gather.mxfp8_row_gather(
-                table, ids[:tokens, 1], codes[:tokens], scales[:tokens]
+                table, ids[:tokens, 1], None, None, scale_layout=scale_layout
             )
     torch.cuda.synchronize()
+
+
+def test_mxfp8_row_gather_rejects_invalid_scale_layout():
+    table = torch.zeros(4, 33, dtype=torch.uint8)
+    indices = torch.zeros(2, 2, dtype=torch.int64)
+    with pytest.raises(ValueError, match="scale_layout"):
+        host_gather.mxfp8_row_gather(
+            table, indices, None, None, scale_layout="swizzled"
+        )

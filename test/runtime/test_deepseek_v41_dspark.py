@@ -33,6 +33,8 @@ from test.runtime.test_deepseek_v41_model import (
     _checkpoint,
     _config,
     _ctx,
+    _DenseFFN,
+    _initialize,
     _loader_model,
     _quant,
 )
@@ -101,8 +103,8 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.layer_hash_index = layer_id - 37
 
-        def forward(self, hidden, hashes, mask, *, query_shard=None):
-            assert query_shard is None
+        def forward(self, hidden, hashes, mask, *, query_shard=None, prefetched=None):
+            assert query_shard is None and prefetched is None
             events.append(("engram", self.layer_id))
             assert hashes.tolist() == [[self.layer_hash_index] * 3] * 2
             assert mask.tolist() == [True, True]
@@ -125,8 +127,10 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             pending_post,
             allow_ffn_reduce_fusion,
             capture_input,
+            engram_prefetch=None,
         ):
             events.append(("layer", self.layer_id))
+            assert engram_prefetch is None
             assert allow_ffn_reduce_fusion == (
                 self.layer_id not in (19, 20) and self.layer_id < 36
             )
@@ -138,6 +142,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
                 pre_mix,
                 SimpleNamespace(finish=lambda residual: residual),
                 hidden.mean(dim=1) if capture_input else None,
+                None,
             )
 
     target = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
@@ -155,6 +160,9 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     )
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
+    target.model.engram_stream = None
+    target.model._engram_fork_event = None
+    target.model._engram_join_event = None
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
     target.model.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-6)
     target.set_dspark_layers_to_capture([37, 38, 39])
@@ -247,6 +255,23 @@ def _draft_checkpoint(model):
         (1, h + config.dspark_markov_rank), dtype=torch.bfloat16
     )
     return weights
+
+
+def test_dspark_forward_backbone_runs_real_decoder_layers(monkeypatch):
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    config = _draft_config()
+    model = DeepseekV41DSparkModel(config, _mapping(0, 1, 1), None, "mtp")
+    _initialize(model)
+    assert all(type(layer) is v41.DeepseekV41DecoderLayer for layer in model.layers)
+    windows = torch.randn(3, 4, 16, config.head_dim, dtype=torch.bfloat16)
+    pool = SimpleNamespace(dspark_kv=lambda stage: windows[stage])
+    bonus = torch.tensor([3, 4], dtype=torch.int64)
+    starts = torch.tensor([4, 4], dtype=torch.int64)
+    history = _history_slots(starts, config.sliding_window, 16)
+    ctx = _ctx(None, bonus.numel() * config.dspark_block_size, ForwardMode.DECODE)
+    out = model.forward_backbone(bonus, starts, history, pool, ctx)
+    assert out.shape == (2, config.dspark_block_size, config.hidden_size)
+    assert torch.isfinite(out).all()
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])

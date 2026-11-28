@@ -1182,7 +1182,7 @@ class ModelExecutor:
 
         if self.device == "npu" and self.config.enable_memory_saver:
             from tokenspeed.runtime.layers.moe.peer_weights import (
-                peer_weights_controller_for,
+                peer_weight_controllers_for,
             )
 
             models = [("target", self.model_runner.model)]
@@ -1190,8 +1190,7 @@ class ModelExecutor:
                 models.append(("draft", self._draft_model_runner.model))
             peer_storages: set[tuple[int, int]] = set()
             for _, model in models:
-                controller = peer_weights_controller_for(model)
-                if controller is not None:
+                for controller in peer_weight_controllers_for(model):
                     peer_storages.update(controller.vmm_managed_storages())
             self.model_runner.memory_saver_adapter.validate_startup(
                 models=models,

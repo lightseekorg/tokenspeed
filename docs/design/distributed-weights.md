@@ -143,3 +143,32 @@ dummy`, eager `decode` and aggregated (`null`) roles (`--enforce-eager`),
 weight updates. All owners must remain available for the instance lifetime;
 deployment must terminate the instance on worker failure. Independent
 forwarding does not provide owner replacement or recovery after an owner fails.
+
+## Peer-sharded GPU Engram tables
+
+DeepSeek V4.1 Engram tables (`--engram-gpu-peer-sharded`) use the same CUDA VMM
+sharing model (`tokenspeed_kernel.peer_memory`) with an explicit handle type
+(`--engram-gpu-peer-handle-type fabric|posix_fd`). Each peer owns one
+granularity-aligned shard of each table in its own HBM and maps all peers'
+shards back-to-back into a single contiguous virtual address range so lookups
+gather MXFP8 rows directly over NVLink with no collective.
+
+Two peer topologies are supported:
+
+- **Intra-job (`WORLD`)**: all ranks of a single engine share the tables over
+  `DistributedPeerExchange`. The model exposes an `EngramPeerWeightsController`
+  on the shared `PeerStorageController` lifecycle (`release_storage`,
+  `resume_storage`, `managed_parameters`, `vmm_managed_storages`, `close`).
+- **Cross-process (`--engram-peer-rendezvous`)**: multiple independent engines
+  inside one NVLink fabric domain (for example co-located or multi-host DEP2
+  prefill workers) connect as clients to an externally hosted standalone
+  `TCPStore` (`python -m tokenspeed_kernel.peer_memory --serve host:port`) with
+  a per-launch `--engram-peer-rendezvous-id`, `--engram-peer-world-size`, and
+  `--engram-peer-rank-offset`. Every peer validates NVML fabric
+  `(clusterUuid, cliqueId)` compatibility before handle import so cross-domain
+  groups fail early. Because independent engines hold live VMM mappings to each
+  other's HBM, cross-process peer groups are immutable serving units: per-engine
+  `--enable-memory-saver` and online weight updates are refused, and restarting
+  or replacing any worker restarts the peer group with a fresh
+  `--engram-peer-rendezvous-id`. Teardown closes local mappings without cross-peer
+  barriers so shutdown never hangs if a peer has already exited.

@@ -92,6 +92,8 @@ def mxfp8_row_gather(
     indices: torch.Tensor,
     codes: torch.Tensor | None,
     scales: torch.Tensor | None,
+    *,
+    scale_layout: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather packed MXFP8 rows as group-32 E4M3 activations for a GEMM.
 
@@ -107,15 +109,24 @@ def mxfp8_row_gather(
         indices: CUDA int32/int64 ``[tokens, columns]`` row ids, any strides.
             Negative or out-of-range ids produce zero rows.
         codes: Optional contiguous E4M3 ``[tokens, columns * D]`` output.
-        scales: Optional contiguous uint8 ``[tokens, columns * D / 32]`` output
-            of canonical UE8M0 scales. Pass both outputs or neither.
+        scales: Optional output scale tensor matching ``scale_layout``. Pass
+            both ``codes`` and ``scales`` or neither.
+        scale_layout: ``"canonical"`` for contiguous uint8
+            ``[tokens, columns * D / 32]`` scales, or ``"packed"`` for
+            MN-major int32 ``[tokens, columns * D / 128]`` words strided
+            ``(1, pad4(tokens))`` consumed directly by ``fp8_projection``.
 
     Returns:
         ``(codes, scales)``, allocated on ``indices.device`` when omitted.
     """
+    if scale_layout not in ("canonical", "packed"):
+        raise ValueError(
+            f"MXFP8 row gather scale_layout must be 'canonical' or 'packed'; "
+            f"got {scale_layout!r}"
+        )
     if table.dtype != torch.uint8 or table.ndim != 2 or table.stride(1) != 1:
         raise TypeError("MXFP8 row gather requires a 2D uint8 table with unit stride")
-    if table.shape[1] % 33:
+    if table.shape[1] == 0 or table.shape[1] % 33:
         raise ValueError("MXFP8 table rows must be D codes and D/32 scales")
     if indices.ndim != 2 or indices.dtype not in (torch.int32, torch.int64):
         raise TypeError("MXFP8 row gather takes int32/int64 [tokens, columns] ids")
@@ -123,24 +134,57 @@ def mxfp8_row_gather(
         raise ValueError("MXFP8 row gather runs on CUDA ids")
     dim = table.shape[1] // 33 * 32
     tokens, columns = indices.shape
+    width = columns * dim
+    if scale_layout == "packed" and width % 128 != 0:
+        raise ValueError(
+            f"Packed MXFP8 row gather scales require columns * D divisible by 128; "
+            f"got {width}"
+        )
     if (codes is None) != (scales is None):
         raise ValueError("Pass both MXFP8 row gather outputs or neither")
     if codes is None:
         codes = torch.empty(
-            tokens, columns * dim, dtype=torch.float8_e4m3fn, device=indices.device
+            tokens, width, dtype=torch.float8_e4m3fn, device=indices.device
         )
-        scales = torch.empty(
-            tokens, columns * dim // 32, dtype=torch.uint8, device=indices.device
-        )
-    elif (
-        codes.shape != (tokens, columns * dim)
-        or codes.dtype != torch.float8_e4m3fn
-        or not codes.is_contiguous()
-        or scales.shape != (tokens, columns * dim // 32)
-        or scales.dtype != torch.uint8
-        or not scales.is_contiguous()
-    ):
-        raise ValueError("MXFP8 row gather outputs have the wrong shape or dtype")
+        if scale_layout == "packed":
+            scale_stride = (tokens + 3) // 4 * 4
+            scales = torch.empty(
+                (width // 128) * scale_stride,
+                dtype=torch.int32,
+                device=indices.device,
+            ).as_strided((tokens, width // 128), (1, scale_stride))
+        else:
+            scales = torch.empty(
+                tokens, width // 32, dtype=torch.uint8, device=indices.device
+            )
+    else:
+        if (
+            codes.shape != (tokens, width)
+            or codes.dtype != torch.float8_e4m3fn
+            or not codes.is_contiguous()
+        ):
+            raise ValueError(
+                "MXFP8 row gather codes output has the wrong shape or dtype"
+            )
+        if scale_layout == "packed":
+            expected_stride = (tokens + 3) // 4 * 4
+            if (
+                scales.shape != (tokens, width // 128)
+                or scales.dtype != torch.int32
+                or scales.stride(0) != 1
+                or scales.stride(1) < expected_stride
+                or scales.stride(1) % 4 != 0
+            ):
+                raise ValueError(
+                    "Packed MXFP8 row gather scales must be MN-major int32 "
+                    "[tokens, width / 128] with 4-aligned column stride"
+                )
+        elif (
+            scales.shape != (tokens, width // 32)
+            or scales.dtype != torch.uint8
+            or not scales.is_contiguous()
+        ):
+            raise ValueError("MXFP8 row gather outputs have the wrong shape or dtype")
     kernel = select_kernel(
         "embedding",
         "host_mxfp8_row_gather",
@@ -151,5 +195,5 @@ def mxfp8_row_gather(
         solution=None,
         override=None,
     )
-    kernel(table, indices, codes, scales)
+    kernel(table, indices, codes, scales, scale_layout=scale_layout)
     return codes, scales

@@ -869,11 +869,17 @@ class DeviceHandle:
         collectively. Called by the forward thread as its last task, after
         the last forward's readers: the release joins the other weight
         owners, who must all reach it."""
-        from tokenspeed.runtime.layers.moe.peer_weights import PeerWeightOwner
+        from tokenspeed.runtime.layers.moe.peer_weights import (
+            PeerStorageControllerOwner,
+            PeerWeightOwner,
+        )
 
         model = self._executor.model_runner.model
         if isinstance(model, PeerWeightOwner):
             model.close_peer_weights()
+        if isinstance(model, PeerStorageControllerOwner):
+            for controller in model.peer_storage_controllers():
+                controller.close()
 
     def shutdown_cache(self) -> None:
         """Close the Host cache (the L2 tier and the snapshot pool), once the
@@ -980,7 +986,7 @@ class DeviceHandle:
 
     def _peer_weight_controllers(self) -> list:
         from tokenspeed.runtime.layers.moe.peer_weights import (
-            peer_weights_controller_for,
+            peer_weight_controllers_for,
         )
 
         models = [self._executor.model_runner.model]
@@ -989,9 +995,7 @@ class DeviceHandle:
             models.append(draft_runner.model)
         controllers = []
         for model in models:
-            controller = peer_weights_controller_for(model)
-            if controller is not None:
-                controllers.append(controller)
+            controllers.extend(peer_weight_controllers_for(model))
         return controllers
 
     def release_weights(self, adapter) -> None:
