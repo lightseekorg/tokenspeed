@@ -22,13 +22,13 @@
 
 from __future__ import annotations
 
+import math
+import threading
+import weakref
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-import math
-import threading
 from typing import Any
-import weakref
 
 import numpy as np
 import torch
@@ -165,10 +165,14 @@ class PinnedHostRing:
                 slot_id=count,
                 storage=self._alloc_backing(cap),
                 capacity_bytes=cap,
-                event=self._event_factory() if self._event_factory is not None else None,
+                event=(
+                    self._event_factory() if self._event_factory is not None else None
+                ),
             )
             self._slots.append(slot)
-            self._cursor = 0 if len(self._slots) == self._max_slots else len(self._slots)
+            self._cursor = (
+                0 if len(self._slots) == self._max_slots else len(self._slots)
+            )
             return slot, slot.storage
 
         self.fallback_alloc_count += 1
@@ -267,7 +271,8 @@ class PinnedHostRing:
             flat_dst.copy_(src, non_blocking=True)
             views = tuple(
                 storage[
-                    elem_off * dtype.itemsize : (elem_off + self._numel(shape_or_numel))
+                    elem_off
+                    * dtype.itemsize : (elem_off + self._numel(shape_or_numel))
                     * dtype.itemsize
                 ]
                 .view(dtype)
@@ -285,9 +290,7 @@ class PinnedHostRing:
                     slot.event_armed = True
         return views
 
-    def copy_tensors_d2h(
-        self, *tensors: torch.Tensor
-    ) -> tuple[torch.Tensor, ...]:
+    def copy_tensors_d2h(self, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Copy arbitrary contiguous device tensors into one fenced pinned host slot."""
         specs = [(tensor.shape, tensor.dtype) for tensor in tensors]
         views = self.acquire_views(specs, align=8)

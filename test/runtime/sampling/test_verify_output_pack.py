@@ -184,7 +184,14 @@ def test_get_packed_outputs_and_ends_d2h_reuses_host_ring() -> None:
         del out
     assert backend._d2h_host_ring.alloc_count <= base_allocs + 1
 
-    # Unpacked request_ends (e.g. standalone buffer) still stages via the ring safely.
+    # Unpacked or non-contiguous / mismatched-dtype views decline the pack fast path cleanly.
+    assert backend.get_packed_output_d2h(backend._predict_buf[:4:2], lengths) is None
+    assert (
+        backend.get_packed_outputs_and_ends_d2h(
+            backend._predict_buf[:4:2], lengths, ends
+        )
+        is None
+    )
     standalone_ends = torch.tensor([7, 8], dtype=torch.int32, device=device)
     assert (
         backend.get_packed_outputs_and_ends_d2h(tokens, lengths, standalone_ends)

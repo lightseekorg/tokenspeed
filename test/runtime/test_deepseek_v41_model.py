@@ -5488,21 +5488,22 @@ def test_v41_decode_skips_mhc_boundary_when_cap_zero(monkeypatch):
             self.x = torch.zeros(8, 16)
             self.post = torch.zeros(8, 4)
             self.comb = torch.zeros(8, 16)
+            self.reduce_group = None
 
         def finish(self, residual):
             return residual + 1
 
     norm = SimpleNamespace(weight=torch.ones(16), variance_epsilon=1e-6)
     out = v41._v41_hc_post_pre(
-        _Pending(),
         torch.zeros(8, 4, 16),
         torch.zeros(8, 4),
-        (torch.zeros(2), torch.zeros(2), torch.zeros(2)),
-        1e-6,
-        1e-6,
-        4,
-        norm,
+        _Pending(),
+        hc_weights=(torch.zeros(2), torch.zeros(2), torch.zeros(2)),
         boundary_weight=torch.zeros(1),
+        norm=norm,
+        hc_norm_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=4,
         prefer_overlap=True,
         quantize_fp8=False,
     )

@@ -815,6 +815,14 @@ class SamplingBackend(ABC):
             # request's own SamplingParams, as it would have unretracted.
             self._last_admission_per_slot[slot] = None
 
+    @staticmethod
+    def _matches_pack_slice(tensor: torch.Tensor, expected: torch.Tensor) -> bool:
+        return (
+            tensor.data_ptr() == expected.data_ptr()
+            and tensor.dtype == expected.dtype
+            and tensor.is_contiguous()
+        )
+
     def get_packed_output_d2h(
         self,
         output_tokens: torch.Tensor,
@@ -826,9 +834,9 @@ class SamplingBackend(ABC):
         ``verify()`` lands them (and a backend's ``sample()`` may). Otherwise
         returns None and the caller falls back to two D2Hs.
         """
-        if (
-            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
-            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
+        if not (
+            self._matches_pack_slice(output_tokens, self._output_pack_buf)
+            and self._matches_pack_slice(output_lengths, self._accept_length_buf)
         ):
             return None
         n_t = output_tokens.numel()
@@ -860,10 +868,10 @@ class SamplingBackend(ABC):
         request_ends: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """One D2H of packed predict + accept_length + request_ends via host ring."""
-        if (
-            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
-            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
-            or request_ends.data_ptr() != self._request_ends_buf.data_ptr()
+        if not (
+            self._matches_pack_slice(output_tokens, self._output_pack_buf)
+            and self._matches_pack_slice(output_lengths, self._accept_length_buf)
+            and self._matches_pack_slice(request_ends, self._request_ends_buf)
         ):
             return None
         n_t = output_tokens.numel()

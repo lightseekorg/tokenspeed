@@ -35,8 +35,8 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
+from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import (  # noqa: E402
-    ForwardContext,
     ForwardMode,
     ForwardOutputLayout,
 )
@@ -218,9 +218,7 @@ def test_input_buffers_reuses_pinned_ring_and_forward_step_pads_in_place() -> No
 
         observed = {}
 
-        def _record_meta(
-            padded_bs, bs, req_pool_indices, seq_lens, **_kwargs
-        ) -> None:
+        def _record_meta(padded_bs, bs, req_pool_indices, seq_lens, **_kwargs) -> None:
             observed["req"] = req_pool_indices.tolist()
             observed["seq"] = seq_lens.tolist()
             observed["req_ptr"] = req_pool_indices.data_ptr()
@@ -233,6 +231,10 @@ def test_input_buffers_reuses_pinned_ring_and_forward_step_pads_in_place() -> No
             spec_draft_tree=False,
         )
         runner.input_buffers = ib
+        runner.runtime_states = None
+        runner.attn_backend = SimpleNamespace(
+            commit_state_after_acceptance=lambda *_a, **_kw: None
+        )
         runner.max_tokens_per_req = 1
         runner.device = "cpu"
         runner.drafter = None
@@ -245,7 +247,9 @@ def test_input_buffers_reuses_pinned_ring_and_forward_step_pads_in_place() -> No
         runner._mega_moe_live_requests = None
         runner._reported_query_graphs = set()
         runner._graph_debug = False
-        runner.graphs = {(CUDA_GRAPH_VARIANT_DEFAULT, 6): SimpleNamespace(replay=lambda: None)}
+        runner.graphs = {
+            (CUDA_GRAPH_VARIANT_DEFAULT, 6): SimpleNamespace(replay=lambda: None)
+        }
         runner.output_buffers = {
             (CUDA_GRAPH_VARIANT_DEFAULT, 6): (
                 torch.arange(6, dtype=torch.int32),
