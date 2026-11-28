@@ -688,11 +688,24 @@ def _check_eplb_storage_on_cuda():
         _single_layer_updater,
     )
 
-    from tokenspeed_kernel.ops.moe import dispatch_and_record_topk_ids
+    from tokenspeed_kernel.ops.moe import EplbDispatch
+    from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (
+        stage_mxfp4_mega_moe_inputs,
+    )
 
     saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     banks = []
     with saver.named_region("runtime_states"):
+        hidden = torch.zeros((2, 128), device="cuda", dtype=torch.bfloat16)
+        logical = torch.zeros((2, 1), device="cuda", dtype=torch.int32)
+        scores = torch.ones_like(logical, dtype=torch.float32)
+        ids = torch.empty_like(logical, dtype=torch.int64)
+        outputs = (
+            torch.empty_like(hidden, dtype=torch.float8_e4m3fn),
+            torch.empty_like(logical),
+            ids,
+            torch.empty_like(scores),
+        )
         for n in (6, 3):
             slots = torch.tensor([*range(n), 0], device="cuda")
             p = _placement(slots[None, :], 0, (0,), local_rows=True, windowed=True)
@@ -700,13 +713,26 @@ def _check_eplb_storage_on_cuda():
             p.load_rows.mark_local(2, 1)
             p.load_rows.recording_enabled.fill_(True)
             weights = slots.to(torch.uint8)[:, None]
-            banks.append((p, _single_layer_updater(p, [weights]), weights))
+            dispatch = EplbDispatch(
+                p.logical_to_all_physical_map[0],
+                p.logical_to_all_physical_map_num_valid[0],
+                p.physical_load[0],
+                p.load_rows.recording_enabled,
+            )
+            banks.append(
+                (
+                    p,
+                    _single_layer_updater(p, [weights]),
+                    weights,
+                    (dispatch, p.load_rows.rows(2)),
+                )
+            )
         addresses = [
-            (p.rank_dispatch_map().data_ptr(), w.data_ptr()) for p, _, w in banks
+            (p.rank_dispatch_map().data_ptr(), w.data_ptr()) for p, _, w, _ in banks
         ]
 
     for _ in range(2):
-        for p, updater, _ in banks:
+        for p, updater, _, _ in banks:
             old = p.physical_to_logical_map_cpu
             new = old.flip((1,))
             p.physical_load[0, 1] += 5
@@ -716,20 +742,14 @@ def _check_eplb_storage_on_cuda():
         torch.cuda.empty_cache()
         assert _ordinary_cuda_bytes() == 0
         saver.resume(tag="weights")
-        for (p, _, weights), pointers in zip(banks, addresses, strict=True):
+        for (p, _, weights, routing), pointers in zip(banks, addresses, strict=True):
             row = p.physical_to_logical_map_cpu[0]
             assert (p.rank_dispatch_map().data_ptr(), weights.data_ptr()) == pointers
             assert torch.equal(weights.flatten().cpu(), row)
-            ids = dispatch_and_record_topk_ids(
-                torch.zeros((2, 1), device="cuda", dtype=torch.int32),
-                p.logical_to_all_physical_map[0],
-                p.logical_to_all_physical_map_num_valid[0],
-                p.load_rows.rows(2),
-                p.physical_load[0],
-                p.load_rows.recording_enabled,
+            stage_mxfp4_mega_moe_inputs(
+                hidden, scores, logical, *outputs, None, None, None, routing
             )
-            assert weights[ids.long()].count_nonzero().item() == 0
-            del ids
+            assert weights[ids].count_nonzero().item() == 0
             snap = p.snapshot_load()
             expected = torch.zeros(p.num_logical_experts, dtype=torch.int64)
             expected[row[-2]] = 5  # Slot 1 before the reversal.

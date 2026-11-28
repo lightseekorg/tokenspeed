@@ -137,9 +137,12 @@ tensor ops, graph-capturable. Every id must be a real expert in
 `[0, num_logical)`; the runtime masks zero experts and padded slots around
 the call and counts the mapped ids into its load counters afterwards.
 
-V4.1 MegaMoE uses `dispatch_and_record_topk_ids` to hash each local row to a
-replica and count live routes in one launch. A device flag gates short windows
-across CUDA graph replays.
+With online EPLB, V4.1 MegaMoE stages logical top-k IDs directly into its
+symmetric buffer. The input staging kernel hashes the local token row to a
+replica and increments its physical slot counter for live recording rows.
+Only the first hidden-dimension tile handles routes. Short sampling windows
+use a device flag, and CUDA graph replay reads the current replica tables
+and row mask at stable addresses.
 
 `block_scaled_topk` takes the layer's `ExpertDispatch` and makes the same
 choice inside its own launch: the tables are constant within a forward, so it

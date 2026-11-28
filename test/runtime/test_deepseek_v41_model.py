@@ -5185,6 +5185,9 @@ def test_captured_target_and_draft_read_migrated_experts(monkeypatch):
         ).items():
             monkeypatch.setitem(global_server_args_dict, name, value)
         banks = [_native_eplb_layer(monkeypatch, mapping, n) for n in (8, 4)]
+        assert all(
+            not placement.physical_load.any().item() for _, placement, _ in banks
+        )
         expected = [forward().clone() for forward, _, _ in banks]
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):

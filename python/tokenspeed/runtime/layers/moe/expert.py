@@ -886,9 +886,8 @@ class MoELayer(torch.nn.Module):
                 activation format (for NVFP4: packed E2M1 rows and linear E4M3
                 block scales); the kernel then skips its own quantize.
                 Only kernels advertising the format accept it.
-            routing_prepared: Routing metadata already populated from the
-                precomputed top-k, so the kernel skips its routing launch.
-                Only kernels advertising prepared routing accept it.
+            routing_prepared: Routing metadata for the selected apply kernel,
+                such as MegaMoE's EPLB tables and live-row mask.
             deferred_out: Optional caller-owned route destination for
                 ``do_finalize=False``; requires ``supports_deferred_out``.
             valid_token_mask: Optional live-row mask for a kernel that declares

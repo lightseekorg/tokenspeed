@@ -27,99 +27,37 @@ from utils import is_nvidia
 if not is_nvidia():
     pytest.skip("NVIDIA GPU required", allow_module_level=True)
 
+from tokenspeed_kernel.ops.moe import EplbDispatch  # noqa: E402
 from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (  # noqa: E402
-    _dispatch_and_record_topk_ids_kernel,
     _stage_mxfp4_mega_moe_inputs_kernel,
     stage_mxfp4_mega_moe_inputs,
-    triton_dispatch_and_record_topk_ids,
 )
 from utils import assert_no_triton_compile  # noqa: E402
 
 
-@pytest.mark.parametrize("width", [1, 13])
-@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
-def test_captured_token_replica_dispatch_tracks_placement_and_live_rows(width, dtype):
-    rows = 97
-    ids = torch.tensor([0, 0, 1, 0, 2, 0], device="cuda", dtype=dtype).repeat(rows, 1)[
-        :, ::2
-    ]
-    replicas = torch.full((3, width), -1, device="cuda", dtype=torch.int32)
-    replicas[0] = torch.arange(width, device="cuda")
-    replicas[1, 0], replicas[2, 0] = width, width + 1
-    counts = torch.tensor([width, 1, 1], device="cuda", dtype=torch.int32)
-    row = torch.arange(rows, device="cuda")
-    live = row % 3 != 0
-    initial = 2**33
-    load = torch.full((width + 2,), initial, device="cuda", dtype=torch.int64)
-
-    enabled = torch.tensor(False, device="cuda")
-    triton_dispatch_and_record_topk_ids(ids, replicas, counts, live, load, enabled)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        mapped = triton_dispatch_and_record_topk_ids(
-            ids, replicas, counts, live, load, enabled
-        )
-
-    for hot_expert in (0, 2):
-        if hot_expert == 2:
-            replicas.copy_(replicas.flip([0]))
-            counts.copy_(counts.flip([0]))
-            live.logical_not_()
-        load.fill_(initial)
-        enabled.fill_(False)
-        graph.replay()
-        assert (load == initial).all()
-        disabled_ids = mapped.clone()
-        enabled.fill_(True)
-        graph.replay()
-        assert torch.equal(mapped, disabled_ids)
-        hashed = (row[:, None] * 2654435769) & 0xFFFFFFFF
-        logical = ids.long()
-        expected = replicas[logical, hashed % counts[logical]]
-        assert mapped.dtype == ids.dtype
-        assert torch.equal(mapped, expected.to(dtype))
-        assert mapped[:, hot_expert].unique().numel() == width
-        assert torch.equal(
-            load - initial,
-            torch.bincount(expected[live].long().flatten(), minlength=load.numel()),
-        )
+def test_staging_maps_strided_ids_past_int32_offsets():
+    stride = 2**30
+    storage = torch.empty(4 * stride + 1, device="cuda", dtype=torch.int32)
+    # If 2 * stride wraps to a negative int32, the load reads this guard.
+    storage[0] = 0
+    ids = storage.as_strided((3, 1), (stride, 1), storage_offset=2 * stride)
+    ids[:, 0].copy_(torch.arange(3, device="cuda", dtype=torch.int32))
+    replicas = torch.tensor([[2], [0], [1]], device="cuda", dtype=torch.int32)
+    counts = torch.ones(3, device="cuda", dtype=torch.int32)
+    load = torch.zeros(3, device="cuda", dtype=torch.int64)
+    dispatch = EplbDispatch(replicas, counts, load, None)
+    for logical_ids, expected in ((ids, [[2], [0], [1]]), (ids.T, [[2, 0, 1]])):
+        load.zero_()
+        rows = logical_ids.shape[0]
+        live = torch.ones(rows, dtype=torch.bool, device="cuda")
+        hidden = torch.zeros(rows, 128, dtype=torch.bfloat16, device="cuda")
+        weights = torch.ones(logical_ids.shape, device="cuda")
+        staged = _stage(hidden, weights, logical_ids, routing_prepared=(dispatch, live))
+        assert staged[2].tolist() == expected
+        assert load.tolist() == [1, 1, 1]
 
 
-def test_token_replica_dispatch_varies_row_count_without_recompile():
-    ids = torch.zeros((128, 6), device="cuda", dtype=torch.int32)
-    replicas = torch.tensor([[1], [0]], device="cuda", dtype=torch.int32)
-    counts = torch.ones(2, device="cuda", dtype=torch.int32)
-    live = torch.ones(128, device="cuda", dtype=torch.bool)
-    load = torch.zeros(2, device="cuda", dtype=torch.int64)
-    for rows in (1, 16, 33):
-        triton_dispatch_and_record_topk_ids(
-            ids[:rows], replicas, counts, live[:rows], load
-        )
-    load.zero_()
-    with assert_no_triton_compile(_dispatch_and_record_topk_ids_kernel):
-        for rows in (0, 2, 17, 32, 65):
-            mapped = triton_dispatch_and_record_topk_ids(
-                ids[:rows], replicas, counts, live[:rows], load
-            )
-            assert mapped.shape == (rows, 6) and (mapped == 1).all()
-    assert load.tolist() == [0, (2 + 17 + 32 + 65) * 6]
-
-
-def test_token_replica_dispatch_reads_strided_ids_past_int32_offsets():
-    stride = 2**31
-    storage = torch.empty(stride + 1, device="cuda", dtype=torch.int32)
-    ids = storage.as_strided((2, 1), (stride, 1))
-    ids[:, 0].copy_(torch.tensor([0, 1], device="cuda", dtype=torch.int32))
-    replicas = torch.tensor([[1], [0]], device="cuda", dtype=torch.int32)
-    counts = torch.ones(2, device="cuda", dtype=torch.int32)
-    live = torch.tensor([False, True], device="cuda")
-    load = torch.zeros(2, device="cuda", dtype=torch.int64)
-    mapped = triton_dispatch_and_record_topk_ids(ids, replicas, counts, live, load)
-    assert mapped.tolist() == [[1], [0]]
-    assert load.tolist() == [1, 0]
-
-
-def _stage(hidden, weights, ids):
+def _stage(hidden, weights, ids, *, live_requests=None, routing_prepared=None):
     tokens, size = hidden.shape
     out = (
         torch.empty(tokens, size, device="cuda", dtype=torch.float8_e4m3fn),
@@ -127,7 +65,9 @@ def _stage(hidden, weights, ids):
         torch.full((tokens, ids.shape[1]), -1, device="cuda", dtype=torch.int64),
         torch.empty(tokens, ids.shape[1], device="cuda", dtype=torch.float32),
     )
-    stage_mxfp4_mega_moe_inputs(hidden, weights, ids, *out, None, None, None)
+    stage_mxfp4_mega_moe_inputs(
+        hidden, weights, ids, *out, None, None, live_requests, routing_prepared
+    )
     return out
 
 
@@ -185,15 +125,82 @@ def test_stage_matches_reference(tokens, size):
         assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
 
 
-def test_stage_token_count_does_not_recompile():
+@pytest.mark.parametrize("windowed", [False, True])
+def test_staging_replays_with_current_replicas_and_recording_mask(windowed):
+    tokens = 72
+    hidden = torch.randn(tokens, 512, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(tokens, 3, device="cuda")
+    rows = torch.arange(tokens, device="cuda")
+    ids = ((torch.arange(3, device="cuda")[:, None] + rows) % 3 - 1).T
+    replicas = torch.tensor(
+        [[0, 3, 4], [1, 5, -1], [2, -1, -1]], dtype=torch.int32, device="cuda"
+    )
+    counts = torch.tensor([3, 2, 1], dtype=torch.int32, device="cuda")
+    load = torch.zeros(6, dtype=torch.int64, device="cuda")
+    enabled = torch.tensor(False, device="cuda") if windowed else None
+    record_rows = rows % 3 != 0
+    requests = torch.tensor([9, 9], dtype=torch.int32, device="cuda")
+    routing = EplbDispatch(replicas, counts, load, enabled), record_rows
+    _stage(hidden, weights, ids, live_requests=requests, routing_prepared=routing)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        staged = _stage(
+            hidden, weights, ids, live_requests=requests, routing_prepared=routing
+        )
+
+    for live, record in ((9, False), (5, True), (0, True)):
+        requests[0].fill_(live)
+        if enabled is not None:
+            enabled.fill_(record)
+        replicas.copy_(replicas.flip((0,)))
+        counts.copy_(counts.flip((0,)))
+        cutoff = tokens * live // 9
+        record_rows.copy_((rows < cutoff) & (rows % 3 != 0))
+        load.fill_(2**33)
+        graph.replay()
+
+        hashed = (rows[:, None] * 2654435769) & 0xFFFFFFFF
+        physical = replicas[ids, hashed % counts[ids]].long()
+        filler = rows[:, None] >= cutoff
+        expected = _reference(
+            hidden, weights.masked_fill(filler, 0), physical.masked_fill(filler, -1)
+        )
+        for got, want in zip(staged, expected, strict=True):
+            assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+        histogram = torch.bincount(
+            physical[record_rows].flatten(), minlength=load.numel()
+        )
+        assert torch.equal(load - 2**33, histogram * (not windowed or record))
+
+
+@pytest.mark.parametrize("eplb", [False, True])
+def test_stage_token_count_does_not_recompile(eplb):
     hidden = torch.randn(2048, 512, device="cuda", dtype=torch.bfloat16)
     weights = torch.rand(2048, 6, device="cuda", dtype=torch.float32)
     ids = torch.randint(0, 384, (2048, 6), device="cuda", dtype=torch.int32)
+    routing = None
+    if eplb:
+        replicas = torch.arange(384, dtype=torch.int32, device="cuda")[:, None]
+        dispatch = EplbDispatch(
+            replicas,
+            torch.ones_like(replicas[:, 0]),
+            torch.zeros(384, dtype=torch.int64, device="cuda"),
+            None,
+        )
+        routing = dispatch, torch.ones(2048, dtype=torch.bool, device="cuda")
+
+    def stage(tokens):
+        # A transposed router output has a column stride that follows the batch size.
+        logical_ids = ids[:tokens].reshape(6, tokens).T
+        return _stage(
+            hidden[:tokens], weights[:tokens], logical_ids, routing_prepared=routing
+        )
+
     for tokens in (1, 64, 1024):
-        _stage(hidden[:tokens], weights[:tokens], ids[:tokens])
+        stage(tokens)
     with assert_no_triton_compile(_stage_mxfp4_mega_moe_inputs_kernel):
         for tokens in (2, 17, 63, 65, 200, 1023, 1025, 2048):
-            _stage(hidden[:tokens], weights[:tokens], ids[:tokens])
+            stage(tokens)
 
 
 def test_stage_reads_rows_past_int32_offsets():

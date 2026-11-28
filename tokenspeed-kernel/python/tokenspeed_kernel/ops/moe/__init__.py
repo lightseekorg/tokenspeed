@@ -49,7 +49,7 @@ __all__ = [
     "gather_moe_routes",
     "COMBINE_ORDERS",
     "ExpertDispatch",
-    "dispatch_and_record_topk_ids",
+    "EplbDispatch",
     "dispatch_topk_ids",
     "native_latent_moe_available",
     "latent_moe_decode_pipeline_available",
@@ -298,6 +298,38 @@ class ExpertDispatch:
         return self.replicas.shape[1]
 
 
+@dataclass(frozen=True)
+class EplbDispatch(ExpertDispatch):
+    """Rank-local replica tables and counters for online MegaMoE routing.
+
+    physical_load holds one int64 count per physical slot. recording_enabled
+    is a device boolean for a short sampling window, or None to count every
+    forward. The caller supplies the live-row mask for each batch.
+    """
+
+    physical_load: torch.Tensor
+    recording_enabled: torch.Tensor | None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if (
+            self.physical_load.ndim != 1
+            or self.physical_load.dtype != torch.int64
+            or not self.physical_load.is_contiguous()
+            or self.physical_load.device != self.replicas.device
+            or self.num_replicas.device != self.replicas.device
+        ):
+            raise ValueError(
+                "EPLB needs contiguous int64 slot counters on the replica tables' device"
+            )
+        if self.recording_enabled is not None and (
+            self.recording_enabled.numel() != 1
+            or self.recording_enabled.dtype != torch.bool
+            or self.recording_enabled.device != self.physical_load.device
+        ):
+            raise ValueError("EPLB recording_enabled must be a device boolean scalar")
+
+
 def dispatch_topk_ids(topk_ids: torch.Tensor, dispatch: ExpertDispatch) -> torch.Tensor:
     """Map logical top-k ids onto physical replicas (the serving path).
 
@@ -321,28 +353,6 @@ def dispatch_topk_ids(topk_ids: torch.Tensor, dispatch: ExpertDispatch) -> torch
     count = dispatch.num_replicas.long()[logical]
     physical = dispatch.replicas.long()[logical, (rows + ranks) % count]
     return physical.to(topk_ids.dtype)
-
-
-def dispatch_and_record_topk_ids(
-    topk_ids: torch.Tensor,
-    replicas: torch.Tensor,
-    num_replicas: torch.Tensor,
-    live_rows: torch.Tensor,
-    physical_load: torch.Tensor,
-    recording_enabled: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Map [rows, top_k] logical IDs through the per-expert replica table.
-    Return physical IDs and increment their int64 counters for live rows while
-    recording is enabled. Omitting the device flag records every forward.
-    """
-    kernel = select_kernel(
-        "moe",
-        "dispatch_and_record_topk_ids",
-        dense_format_signature(("topk_ids",), (topk_ids.dtype,)),
-    )
-    return kernel(
-        topk_ids, replicas, num_replicas, live_rows, physical_load, recording_enabled
-    )
 
 
 # How a token's routed-expert contributions are combined across the MoE
@@ -2498,9 +2508,9 @@ def moe_apply(
         x_quantized: Optional ``x`` already quantized in the kernel's
             activation format, so the kernel skips its own quantize. Only
             forwarded when given; kernels that cannot consume it reject it.
-        routing_prepared: Routing metadata the top-k kernel filled ahead of
-            this call, so the kernel skips its routing launch. Only forwarded
-            when given; kernels that cannot consume it reject it.
+        routing_prepared: Routing metadata for the selected apply kernel.
+            MegaMoE accepts (EplbDispatch, live_rows) with logical top-k IDs.
+            The split NVFP4 kernel accepts metadata filled by top-k.
         deferred_out: Optional caller-owned route destination for
             ``do_finalize=False``; requires ``supports_deferred_out``.
 
