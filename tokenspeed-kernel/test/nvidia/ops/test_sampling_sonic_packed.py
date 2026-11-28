@@ -70,7 +70,7 @@ def _state(
     scalars = torch.tensor([[1.0, 1.0, 0.0, 1.0, 0.0, 0.0]] * SLOTS).T.contiguous()
     for slot, params in enumerate(PARAMS):
         state.indicators[slot] = int(
-            Indicator.from_params(point_drafts=point_drafts, **params)
+            Indicator.from_params(greedy_draft=point_drafts, **params)
         )
         state.top_k[slot] = params.get("top_k", MAX_K)
         scalars[:, slot] = torch.tensor(

@@ -664,7 +664,7 @@ def test_select_verify_budget_runtime_shapes_do_not_compile():
                         profile_ranges=ranges_full[:n_prof],
                         profile_native_ms=native_full[:n_prof],
                         profile_capacities=caps_full[:n_cap],
-                        profile_step_ms=step_full[:n_prof, :n_cap],
+                        profile_step_ms=step_full[:n_prof, :n_cap].contiguous(),
                         selected_out=out,
                         padded_bs=16,
                         context_advance=6,

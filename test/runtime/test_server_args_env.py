@@ -471,7 +471,7 @@ def test_gds_refuses_disabled_prefix_cache(flags):
 def test_dp_local_cuda_graph_accepts_sonic(adaptive):
     argv = _dp_local_graph_args() + ["--sampling-backend", "sonic"]
     if adaptive:
-        argv.append("--enable-dsv41-adaptive-dspark")
+        argv.extend(["--enable-dsv41-adaptive-dspark", "--disable-prefill-graph"])
     args = prepare_server_args(argv)
     assert args.enable_dp_local_cuda_graph is True
     assert args.sampling_backend == "sonic"

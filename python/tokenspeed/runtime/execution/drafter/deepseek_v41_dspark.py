@@ -998,13 +998,13 @@ class DeepseekV41DSpark(BaseDrafter):
             return
         if graph_bs in self._verify_budget_buffers:
             return
-        if len(self._verification_group) > 1:
+        if self._verification_group and len(self._verification_group) > 1:
             pg_manager.init_process_group(
                 self._verification_group,
                 backend="gloo",
                 name="dsv41_verify_metadata",
             )
-        if len(self.tp_group) > 1:
+        if self.tp_group and len(self.tp_group) > 1:
             pg_manager.init_process_group(
                 self.tp_group, backend="gloo", name="dsv41_verify_tp_metadata"
             )

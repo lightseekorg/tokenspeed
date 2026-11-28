@@ -196,6 +196,7 @@ def test_sonic_supports_packed_verify_and_config_from_server_args():
     assert (
         SamplingBackendConfig.from_server_args(
             fixed,
+            hf_config=None,
             vocab_size=1024,
             max_bs=4,
             max_draft_tokens_per_req=4,
@@ -211,6 +212,7 @@ def test_sonic_supports_packed_verify_and_config_from_server_args():
     assert (
         SamplingBackendConfig.from_server_args(
             adaptive,
+            hf_config=None,
             vocab_size=1024,
             max_bs=4,
             max_draft_tokens_per_req=4,

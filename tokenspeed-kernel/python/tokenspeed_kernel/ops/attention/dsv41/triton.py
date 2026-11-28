@@ -5927,6 +5927,8 @@ def triton_dsv41_select_verify_budget(
     min_batch_size,
     min_gain,
 ):
+    if not latest_scores.is_cuda:
+        raise ValueError("device budget selection requires a CUDA or ROCm GPU")
     bs = int(request_slots.shape[0])
     draft = int(latest_scores.shape[1])
     num_profiles = int(profile_ranges.shape[0])

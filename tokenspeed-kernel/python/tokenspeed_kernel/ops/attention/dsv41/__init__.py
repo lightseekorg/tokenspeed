@@ -2083,8 +2083,6 @@ def select_verify_budget(
     """
     if latest_scores.ndim != 2 or latest_scores.dtype != torch.float32:
         raise ValueError("latest verification scores must be FP32 [slots, draft width]")
-    if not latest_scores.is_cuda:
-        raise ValueError("device budget selection requires a CUDA or ROCm GPU")
     if latest_scores.stride(1) != 1:
         raise ValueError("latest verification scores require unit column stride")
     draft_width = latest_scores.shape[1]

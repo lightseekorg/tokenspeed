@@ -119,7 +119,7 @@ def test_the_default_ladder_reaches_a_capture_cap_above_160(
 ) -> None:
     config = _config(
         None,
-        max_num_seqs=256,
+        max_num_seqs=max(256, max_capture),
         max_capture=max_capture,
         disable_padding=disable_padding,
     )
