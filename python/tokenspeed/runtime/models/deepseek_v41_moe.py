@@ -449,7 +449,8 @@ class DeepseekV4MoE(nn.Module):
         return [
             param.data
             for name, param in self.experts.named_parameters()
-            if name not in ("correction_bias",) and "shared_experts" not in name
+            if name not in ("correction_bias", "_correction_bias")
+            and "shared_experts" not in name
         ]
 
     def _compute_topk_output(
