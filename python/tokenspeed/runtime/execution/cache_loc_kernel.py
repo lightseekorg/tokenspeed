@@ -32,7 +32,7 @@ from tokenspeed.runtime.utils.triton import tl, triton
 logger = get_colorful_logger(__name__)
 
 
-@triton.jit(do_not_specialize=["max_pages"])
+@triton.jit(do_not_specialize=["max_pages", "uniform_input_length"])
 def compute_out_cache_loc_kernel(
     # Input pointers
     input_lengths_ptr,  # [batch_size] or None for uniform mode
@@ -127,7 +127,7 @@ def compute_out_cache_loc_kernel(
         tl.store(output_ptrs, cache_locs, mask=mask)
 
 
-@triton.jit(do_not_specialize=["max_pages"])
+@triton.jit(do_not_specialize=["uniform_input_length"])
 def fused_decode_input_prep_kernel(
     # Inputs
     req_pool_indices_ptr,  # [batch_size]
@@ -197,7 +197,7 @@ def fused_decode_input_prep(
     )
 
 
-@triton.jit(do_not_specialize=["max_pages"])
+@triton.jit(do_not_specialize=["max_draft_prefix"])
 def dflash_prepare_decode_kernel(
     output_tokens_ptr,
     accept_lengths_ptr,

@@ -2043,7 +2043,9 @@ def _dspark_row_value(
     return restored
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["X0", "POS0", "CS0", "S0", "W0", "W1", "O0", "PAGES"],
+)
 def _dspark_rows_kernel(
     X,
     W,
@@ -2090,7 +2092,7 @@ def _dspark_rows_kernel(
         tl.store(OUT + token * O0 + d, restored)
     if HAS_WINDOW:
         slot = tl.load(SLOTS + token * S0).to(tl.int64)
-        live = (slot >= 0) & (slot < PAGES * P)
+        live = (slot >= 0) & (slot // P < PAGES)
         page = tl.maximum(slot, 0) // P
         row = tl.maximum(slot, 0) % P
         tl.store(WINDOW + page * W0 + row * W1 + d, restored, live)

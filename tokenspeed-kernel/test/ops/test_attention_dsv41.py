@@ -2794,3 +2794,124 @@ def test_prepare_index_topk_follows_the_selected_scorer(monkeypatch):
     other = dsv41.new_index_metadata(table.clone(), lengths, None, history_rows=None)
     with pytest.raises(ValueError, match="different table"):
         dsv41.prepare_index_topk(*args[:-1], other)
+
+
+def test_dspark_rows_reuses_compilation_across_strides_and_pools(device):
+    """Changing tensor strides and window pool sizes must not recompile dspark_rows."""
+    torch.manual_seed(41)
+    weight = (torch.rand(512, device=device) + 0.5).to(torch.bfloat16)
+    table = _rope_table(device)
+    values = torch.randn(4, 512, device=device, dtype=torch.bfloat16)
+    positions = torch.randint(0, 4000, (4,), device=device)
+    slots = torch.arange(4, device=device, dtype=torch.int32)
+    window = torch.zeros(4, 64, 512, device=device, dtype=torch.bfloat16)
+    warm_out = torch.empty(4, 512, device=device, dtype=torch.bfloat16)
+    dsv41.dspark_rows(values, weight, 1e-6, positions, table, window, slots, None)
+    dsv41.dspark_rows(values, weight, 1e-6, positions, table, window, slots, warm_out)
+
+    with assert_no_triton_compile(implementation._dspark_rows_kernel):
+        rows = 11
+        merged = torch.randn(rows, 3 * 512, device=device, dtype=torch.bfloat16)
+        strided_vals = merged[:, 512:1024]
+        strided_pos = torch.randint(0, 4000, (rows * 2,), device=device)[::2]
+        strided_slots = torch.arange(
+            64, 64 + rows * 3, 3, device=device, dtype=torch.int32
+        )
+        strided_slots[2] = -1
+        padded_window = torch.zeros(9, 64, 640, device=device, dtype=torch.bfloat16)
+        target_window = padded_window[:, :, :512]
+        dsv41.dspark_rows(
+            strided_vals,
+            weight,
+            1e-6,
+            strided_pos,
+            table,
+            target_window,
+            strided_slots,
+            None,
+        )
+        out = torch.empty(rows, 512, device=device, dtype=torch.bfloat16)
+        dsv41.dspark_rows(
+            strided_vals,
+            weight,
+            1e-6,
+            strided_pos,
+            table,
+            target_window,
+            strided_slots,
+            out,
+        )
+        live = (strided_slots >= 0) & (strided_slots < 9 * 64)
+        torch.testing.assert_close(
+            target_window[
+                strided_slots[live].long() // 64, strided_slots[live].long() % 64
+            ],
+            out[live],
+            rtol=0,
+            atol=0,
+        )
+
+    # Guard against i32 wrap of PAGES * P when slot capacity exceeds 2^31.
+    storage = torch.zeros(1, 64, 512, device=device, dtype=torch.bfloat16)
+    large_pages = (1 << 31) // 64 + 2
+    large_window = storage.as_strided((large_pages, 64, 512), (0, 512, 1))
+    large_vals = torch.randn(2, 512, device=device, dtype=torch.bfloat16)
+    large_pos = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    large_slots = torch.tensor([5, large_pages * 64], dtype=torch.int64, device=device)
+    large_out = torch.empty_like(large_vals)
+    dsv41.dspark_rows(
+        large_vals, weight, 1e-6, large_pos, table, large_window, large_slots, large_out
+    )
+    torch.testing.assert_close(storage[0, 5], large_out[0], rtol=0, atol=0)
+    assert storage[0, :5].count_nonzero() == 0 and storage[0, 6:].count_nonzero() == 0
+
+
+def test_normalize_candidate_blocks_warmup_covers_all_block_buckets(device):
+    """Startup warmup of _normalize_candidate_blocks covers all 1..2048 power-of-2 buckets."""
+    from tokenspeed_kernel._triton import triton
+    from tokenspeed_kernel.ops.attention.dsv41._deep_gemm import indexer
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel.warmup import kernel_launcher
+
+    def run_normalize(tokens, count, blocks, pages):
+        visible = torch.full((tokens,), count * 8, dtype=torch.int32, device=device)
+        page_table = torch.arange(
+            1, max(1, (count * 8 + 63) // 64) + 1, dtype=torch.int32, device=device
+        ).repeat(tokens, 1)
+        candidates = torch.arange(count - 1, -1, -1, dtype=torch.int32, device=device)
+        candidates = candidates.repeat(tokens, 1)
+        normalized = torch.empty((tokens, blocks), dtype=torch.int32, device=device)
+        sparse = torch.empty_like(normalized)
+        context = torch.empty(tokens, dtype=torch.int32, device=device)
+        ends = torch.empty_like(context)
+        kernel_launcher(indexer._normalize_candidate_blocks, (tokens,))(
+            candidates,
+            visible,
+            page_table,
+            normalized,
+            sparse,
+            context,
+            ends,
+            *candidates.stride(),
+            visible.stride(0),
+            *page_table.stride(),
+            pages,
+            count,
+            count * 8,
+            blocks,
+            0,
+            triton.next_power_of_2(blocks),
+            num_warps=4,
+        )
+        return normalized, ends
+
+    with kernel_warmup(enabled=True):
+        run_normalize(2, 64, 64, 16)
+
+    with assert_no_triton_compile(indexer._normalize_candidate_blocks):
+        for count, blocks in ((1, 1), (5, 8), (65, 128), (300, 512), (1200, 2048)):
+            normalized, ends = run_normalize(3, count, blocks, 512)
+            expected_row = torch.arange(count, dtype=torch.int32, device=device)
+            assert torch.equal(normalized[0, :count], expected_row)
+            assert torch.all(normalized[0, count:] == -1)
+            assert torch.all(ends == count * 8)

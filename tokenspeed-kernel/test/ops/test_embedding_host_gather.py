@@ -21,6 +21,7 @@
 import pytest
 import torch
 from tokenspeed_kernel.ops.embedding import host_gather, triton_host_gather
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from utils import assert_no_triton_compile
 
 
@@ -217,3 +218,56 @@ def test_cuda_mxfp8_row_gather_sorted_path_does_not_recompile_per_batch():
                 table, ids[:tokens, 1], codes[:tokens], scales[:tokens]
             )
     torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_host_uint8_row_gather_does_not_recompile_across_tables():
+    small = torch.arange(20 * 64, dtype=torch.uint8).reshape(20, 64).pin_memory()
+    padded = (
+        torch.arange(37 * 96, dtype=torch.uint8).reshape(37, 96).pin_memory()[:, :64]
+    )
+    idx = torch.tensor([0, 5, 19, -1, 36], device="cuda:0", dtype=torch.int64)
+    host_gather.uint8_row_gather(small, idx[:3], None)
+    with assert_no_triton_compile(triton_host_gather._host_uint8_row_gather_kernel):
+        out = host_gather.uint8_row_gather(padded, idx, None)
+    expected = torch.zeros(5, 64, dtype=torch.uint8, device="cuda:0")
+    for slot, row_id in enumerate((0, 5, 19, -1, 36)):
+        if 0 <= row_id < 37:
+            expected[slot] = padded[row_id]
+    torch.testing.assert_close(out.cpu(), expected.cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_mxfp8_row_gather_warmup_covers_sorted_threshold_and_strides():
+    generator = torch.Generator().manual_seed(7)
+    warm_table = _mxfp8_table(32, 256, generator).pin_memory()
+    warm_ids = torch.randint(0, 32, (2, 4), device="cuda:0", dtype=torch.int64)
+    with kernel_warmup(enabled=True):
+        host_gather.mxfp8_row_gather(warm_table, warm_ids, None, None)
+
+    small_table = _mxfp8_table(53, 256, generator).pin_memory()
+    strided_small = torch.randint(
+        0, 53, (5, 3, 6), generator=generator, dtype=torch.int64
+    ).to(device="cuda:0")[:, 1]
+    large_cols = 8
+    large_tokens = triton_host_gather._SORT_MIN_ROWS // large_cols + 2
+    large_ids = torch.randint(
+        0, 53, (large_tokens, 2, large_cols), generator=generator, dtype=torch.int64
+    ).to(device="cuda:0")[:, 0]
+
+    with assert_no_triton_compile(
+        triton_host_gather._host_mxfp8_row_gather_kernel,
+        triton_host_gather._copy_duplicate_rows_kernel,
+    ):
+        small_codes, small_scales = host_gather.mxfp8_row_gather(
+            small_table, strided_small, None, None
+        )
+        large_codes, large_scales = host_gather.mxfp8_row_gather(
+            small_table, large_ids, None, None
+        )
+    exp_small_c, exp_small_s = _quantized_rows(small_table, strided_small)
+    assert torch.equal(small_codes.view(torch.uint8).cpu(), exp_small_c)
+    assert torch.equal(small_scales.cpu(), exp_small_s)
+    exp_large_c, exp_large_s = _quantized_rows(small_table, large_ids)
+    assert torch.equal(large_codes.view(torch.uint8).cpu(), exp_large_c)
+    assert torch.equal(large_scales.cpu(), exp_large_s)

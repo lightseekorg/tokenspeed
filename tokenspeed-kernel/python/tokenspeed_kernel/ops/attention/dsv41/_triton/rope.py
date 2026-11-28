@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 
 @triton.jit
@@ -528,7 +529,9 @@ def triton_dsv41_index_query_rope_quant(
     return (data, scales), weights
 
 
-@triton.jit(do_not_specialize=["NP"])
+@triton.jit(
+    do_not_specialize=["NP", "X0", "POS0", "CS0", "C0", "C1", "S0"],
+)
 def _global_rope_scatter(
     X,
     POS,
@@ -536,15 +539,16 @@ def _global_rope_scatter(
     CACHE,
     SLOTS,
     NP,
-    X0: tl.constexpr,
+    X0,
     X1: tl.constexpr,
-    POS0: tl.constexpr,
-    CS0: tl.constexpr,
-    C0: tl.constexpr,
-    C1: tl.constexpr,
+    POS0,
+    CS0,
+    C0,
+    C1,
     C2: tl.constexpr,
-    S0: tl.constexpr,
+    S0,
     MAX_POS: tl.constexpr,
+    CONTIGUOUS_ROW: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     position = tl.maximum(tl.load(POS + token * POS0).to(tl.int64), 0)
@@ -553,7 +557,7 @@ def _global_rope_scatter(
         position_valid, "Global RoPE position is outside the cosine/sine table"
     )
     slot = tl.load(SLOTS + token * S0).to(tl.int64)
-    if slot >= 0 and slot < NP * 64:
+    if slot >= 0 and slot // 64 < NP:
         d = tl.arange(0, 512)
         x = tl.load(X + token * X0 + d * X1).to(tl.float32)
         partner = tl.gather(x, d ^ 1, axis=0)
@@ -576,9 +580,19 @@ def _global_rope_scatter(
         base = CACHE + (slot // 64) * C0
         page_row = slot % 64
         payload = page_row * 256 + tl.arange(0, 256)
-        tl.store(base + _planar_offset(payload, C1, C2, 288), lo | (hi << 4))
+        payload_offset = (
+            payload * C2
+            if CONTIGUOUS_ROW
+            else (payload // 288) * C1 + (payload % 288) * C2
+        )
+        tl.store(base + payload_offset, lo | (hi << 4))
         scales = 64 * 256 + page_row * 32 + tl.arange(0, 32)
-        tl.store(base + _planar_offset(scales, C1, C2, 288), scale_bytes)
+        scales_offset = (
+            scales * C2
+            if CONTIGUOUS_ROW
+            else (scales // 288) * C1 + (scales % 288) * C2
+        )
+        tl.store(base + scales_offset, scale_bytes)
 
 
 @register_kernel(
@@ -636,7 +650,7 @@ def triton_dsv41_global_rope_scatter(
     ):
         raise ValueError("Global cache must not have broadcast writes")
     if values.shape[0]:
-        _global_rope_scatter[(values.shape[0],)](
+        kernel_launcher(_global_rope_scatter, (values.shape[0],))(
             values,
             positions,
             cos_sin_cache,
@@ -649,7 +663,14 @@ def triton_dsv41_global_rope_scatter(
             *cache.stride(),
             slots.stride(0),
             cos_sin_cache.shape[0],
+            cache.stride(1) == 288 * cache.stride(2),
             num_warps=4 if values.shape[0] <= 512 else 1,
             enable_fp_fusion=False,
             debug=True,
         )
+
+
+register_triton_warmup(
+    _global_rope_scatter,
+    variants=({"num_warps": (1, 4), "CONTIGUOUS_ROW": (False, True)},),
+)
