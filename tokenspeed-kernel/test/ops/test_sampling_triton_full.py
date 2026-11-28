@@ -87,13 +87,10 @@ def test_verify_chain_target_sampled_prefix_compare(device: str) -> None:
         )
 
 
-def test_apply_penalties_logit_bias_inplace_matches_torch_reference(
-    device: str,
-) -> None:
+def _penalty_case(device: str, n: int):
     torch.manual_seed(1234)
-    bs, n, vocab_size, pool_rows = 2, 3, 257, 5
-    rows = bs * n
-    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device)
+    bs, vocab_size, pool_rows = 2, 257, 5
+    logits = torch.randn((bs * n, vocab_size), dtype=torch.float32, device=device)
     req_pool_indices = torch.tensor([1, 3], dtype=torch.int32, device=device)
     counts = torch.zeros((pool_rows, vocab_size), dtype=torch.int32, device=device)
     counts[1, torch.tensor([3, 17, 17, 88], device=device)] = torch.tensor(
@@ -114,35 +111,99 @@ def test_apply_penalties_logit_bias_inplace_matches_torch_reference(
     )
     pres = torch.tensor([0.0, 0.2, 0.0, 0.5, 0.0], dtype=torch.bfloat16, device=device)
     rep = torch.tensor([1.0, 1.2, 1.0, 1.5, 1.0], dtype=torch.bfloat16, device=device)
-
-    ref = logits.clone()
-    expanded_pool = torch.repeat_interleave(req_pool_indices.long(), n, dim=0)
-    counts_sel = counts.index_select(0, expanded_pool)
-    active = counts_sel > 0
-    counts_f = counts_sel.to(ref.dtype)
-    active_f = active.to(ref.dtype)
-    rep_sel = rep.index_select(0, expanded_pool).to(ref.dtype).unsqueeze(-1)
-    freq_sel = freq.index_select(0, expanded_pool).to(ref.dtype).unsqueeze(-1)
-    pres_sel = pres.index_select(0, expanded_pool).to(ref.dtype).unsqueeze(-1)
-    scales = torch.where(active, rep_sel.expand_as(ref), torch.ones_like(ref))
-    ref = torch.where(ref > 0, ref / scales, ref * scales)
-    ref = ref - freq_sel * counts_f - pres_sel * active_f
-    ref = ref + logit_bias.index_select(0, expanded_pool).to(ref.dtype)
-
-    out = logits.clone()
-    returned = apply_penalties_logit_bias_inplace(
-        out,
+    # Anchors in column zero; drafts repeat a token, reuse one already counted,
+    # and bring new ones.
+    chains = torch.tensor(
+        [[7, 40, 40, 17, 200], [9, 101, 6, 250, 6]], dtype=torch.int32, device=device
+    )
+    return (
+        logits,
         req_pool_indices,
         counts,
         logit_bias,
         freq,
         pres,
         rep,
+        chains[:, :n].contiguous(),
+    )
+
+
+def _penalty_reference(
+    logits, req_pool_indices, counts, logit_bias, freq, pres, rep, chains
+):
+    """Plain decoding's penalties at each verify row: the request's counts plus
+    the draft tokens before the row, one row at a time."""
+    n = chains.shape[1]
+    ref = logits.clone()
+    for row in range(ref.shape[0]):
+        req, depth = divmod(row, n)
+        pool = int(req_pool_indices[req])
+        row_counts = counts[pool].clone()
+        for token in chains[req, 1 : depth + 1].tolist():
+            row_counts[token] += 1
+        active = row_counts > 0
+        vals = ref[row]
+        scale = torch.where(active, rep[pool].float(), torch.ones_like(vals))
+        vals = torch.where(vals > 0, vals / scale, vals * scale)
+        vals = (
+            vals
+            - freq[pool].float() * row_counts.float()
+            - pres[pool].float() * active.float()
+        )
+        ref[row] = vals + logit_bias[pool].float()
+    return ref
+
+
+@pytest.mark.parametrize("n", [1, 2, 5])
+def test_each_verify_row_is_penalized_as_plain_decoding_at_its_position(
+    device: str, n: int
+) -> None:
+    logits, pool, counts, bias, freq, pres, rep, chains = _penalty_case(device, n)
+    ref = _penalty_reference(logits, pool, counts, bias, freq, pres, rep, chains)
+
+    out = logits.clone()
+    returned = apply_penalties_logit_bias_inplace(
+        out,
+        pool,
+        counts,
+        bias,
+        freq,
+        pres,
+        rep,
+        candidates=chains,
         num_tokens_per_req=n,
     )
 
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out, ref, rtol=0, atol=1e-5)
+
+
+def test_one_row_per_request_reads_only_the_decode_counts(device: str) -> None:
+    logits, pool, counts, bias, freq, pres, rep, chains = _penalty_case(device, 1)
+    ref = _penalty_reference(logits, pool, counts, bias, freq, pres, rep, chains)
+
+    out = logits.clone()
+    apply_penalties_logit_bias_inplace(
+        out, pool, counts, bias, freq, pres, rep, candidates=None, num_tokens_per_req=1
+    )
+
+    torch.testing.assert_close(out, ref, rtol=0, atol=1e-5)
+
+
+def test_a_chain_without_its_candidates_is_refused(device: str) -> None:
+    logits, pool, counts, bias, freq, pres, rep, _ = _penalty_case(device, 3)
+    with pytest.raises(ValueError, match="candidates are required"):
+        apply_penalties_logit_bias_inplace(
+            logits,
+            pool,
+            counts,
+            bias,
+            freq,
+            pres,
+            rep,
+            candidates=None,
+            num_tokens_per_req=3,
+        )
 
 
 def test_accumulate_counts_inplace_matches_index_put_reference(device: str) -> None:

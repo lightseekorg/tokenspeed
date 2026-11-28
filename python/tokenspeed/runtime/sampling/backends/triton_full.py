@@ -255,8 +255,15 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         self,
         logits: torch.Tensor,
         req_pool_indices: torch.Tensor,
-        num_tokens_per_req: int = 1,
+        *,
+        candidates: torch.Tensor | None,
     ) -> torch.Tensor:
+        """Penalize each row as plain decoding would at its position.
+
+        ``candidates`` is a chain verify's ``[bs, N]`` int32 draft chain: row
+        ``j`` of a request also counts its draft tokens ``1..j``. ``None`` for
+        ``sample``, one row per request.
+        """
         return apply_penalties_logit_bias_inplace(
             logits,
             req_pool_indices,
@@ -265,7 +272,8 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             self._freq_pen_pool,
             self._pres_pen_pool,
             self._rep_pen_pool,
-            num_tokens_per_req=num_tokens_per_req,
+            candidates=candidates,
+            num_tokens_per_req=1 if candidates is None else candidates.shape[1],
         )
 
     @nvtx_range("sampling:accum_counts", color="yellow")
@@ -475,7 +483,9 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         req_pool_indices = self._req_pool_indices_for_kernels(
             sampling_info.req_pool_indices, logits.shape[0]
         )
-        logits = self._apply_penalties_and_bias(logits, req_pool_indices)
+        logits = self._apply_penalties_and_bias(
+            logits, req_pool_indices, candidates=None
+        )
         offsets_pool = self._prepare_sampling_offsets(sampling_info)
         sampled = self._gumbel_sample_full_logits(
             logits,
@@ -542,10 +552,9 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
         req_pool_indices = self._req_pool_indices_for_kernels(
             sampling_info.req_pool_indices, bs
         )
+        chain = candidates.to(torch.int32)
         logits = self._apply_penalties_and_bias(
-            logits,
-            req_pool_indices,
-            num_tokens_per_req=num_tokens_per_req,
+            logits, req_pool_indices, candidates=chain
         )
 
         offsets_pool = self._prepare_sampling_offsets(sampling_info)
@@ -560,7 +569,7 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             predicts=predict,
             accept_index=accept_index,
             accept_token_num=accept_length,
-            candidates=candidates.to(torch.int32),
+            candidates=chain,
             target_sampled=target_sampled,
             write_rejected_targets=False,
         )

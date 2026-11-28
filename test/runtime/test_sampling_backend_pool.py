@@ -1135,6 +1135,95 @@ class TestTritonFullIndependentState:
             )
 
 
+class TestTritonFullVerifyPenalties:
+    """A chain verify must penalize each row as plain decoding would at that
+    position: the draft tokens before the row count as emitted."""
+
+    N = 4
+    A, B, C, D, ANCHOR, WRONG = 10, 20, 30, 40, 500, 99
+
+    def _params(self):
+        return [
+            _sp("presence", temperature=0.0, presence_penalty=1.0),
+            _sp("repetition", temperature=0.0, repetition_penalty=1.5),
+        ]
+
+    def _backend(self, num_tokens_per_req):
+        backend = TritonFullSamplingBackend(_make_config())
+        backend.prepare_step(
+            admission_ids=[1, 2],
+            request_pool_indices=[1, 2],
+            sampling_params_list=self._params(),
+            num_tokens_per_req=num_tokens_per_req,
+        )
+        return backend
+
+    def _info(self):
+        return SamplingBatchInfo(
+            req_pool_indices=torch.tensor([1, 2], dtype=torch.int32, device="cuda"),
+            valid_cache_lengths=torch.zeros(
+                (POOL + 1,), dtype=torch.int32, device="cuda"
+            ),
+            vocab_size=VOCAB,
+            device="cuda",
+        )
+
+    def _row_logits(self):
+        # Every position prefers A, then B, C, D by small margins, so a
+        # penalty on an emitted token changes the next pick.
+        row = torch.zeros((VOCAB,), dtype=torch.float32, device="cuda")
+        row[[self.A, self.B, self.C, self.D]] = torch.tensor(
+            [5.0, 4.6, 4.2, 3.8], device="cuda"
+        )
+        return row
+
+    def _plain_decode(self):
+        """One sample() per position; returns the picks and the counts after
+        each step."""
+        backend = self._backend(num_tokens_per_req=1)
+        picks, counts = [], []
+        for _ in range(self.N):
+            logits = self._row_logits().expand(2, VOCAB).clone()
+            tokens, _ = backend.sample(
+                LogitsProcessorOutput(next_token_logits=logits), self._info()
+            )
+            picks.append(tokens.tolist())
+            counts.append(backend._counts[[1, 2]].clone())
+        return [[step[r] for step in picks] for r in range(2)], counts
+
+    def test_verify_emits_what_plain_decoding_emits(self):
+        plain, plain_counts = self._plain_decode()
+        # The penalties matter here: a row scored with the round's starting
+        # counts would pick A again.
+        assert plain[0][1] != self.A and plain[1][1] != self.A
+
+        # Request 1 drafts plain decoding's own tokens and keeps them all;
+        # request 2's second draft is wrong, so its round ends there.
+        candidates = torch.tensor(
+            [
+                [self.ANCHOR, *plain[0][: self.N - 1]],
+                [self.ANCHOR, plain[1][0], self.WRONG, self.WRONG],
+            ],
+            dtype=torch.int64,
+            device="cuda",
+        )
+        backend = self._backend(num_tokens_per_req=self.N)
+        logits = self._row_logits().expand(2 * self.N, VOCAB).clone()
+        predict, accept_length = backend.verify(
+            LogitsProcessorOutput(next_token_logits=logits),
+            self._info(),
+            candidates,
+            tree=None,
+        )
+
+        assert accept_length.tolist() == [self.N, 2]
+        assert predict[: self.N].tolist() == plain[0]
+        assert predict[self.N : self.N + 2].tolist() == plain[1][:2]
+        # The emitted tokens join the counts exactly as plain decoding's did.
+        torch.testing.assert_close(backend._counts[1], plain_counts[-1][0])
+        torch.testing.assert_close(backend._counts[2], plain_counts[1][1])
+
+
 class TestPrepareStepGuardRails:
     """Cheap boundary asserts in base.prepare_step. Cost is negligible and
     these are exactly the kinds of mismatches that produce silent state
