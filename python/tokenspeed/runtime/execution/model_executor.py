@@ -29,9 +29,16 @@ from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
+from tokenspeed_kernel.ops.gemm.gluon_gemv_autotune import (
+    deferred_gemv_autotune,
+    gemv_autotune_enabled,
+    tune_deferred_gemv_routings,
+)
 from tokenspeed_kernel.ops.gemm.hipblaslt import (
     hipblaslt_autotune_enabled,
+    hipblaslt_online_cache_path,
     hipblaslt_online_tuning,
+    hipblaslt_online_tuning_cache,
     load_hipblaslt_tuned_solutions,
 )
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
@@ -1342,6 +1349,12 @@ class ModelExecutor:
             self.execution_stream.wait_stream(
                 self.device_module.current_stream(self.device)
             )
+        # Online kernel tuning (TOKENSPEED_KERNEL_AUTOTUNE=1 turns on both):
+        # BLAS solutions first, then the GEMV routing, timed against them.
+        blas_tune = (
+            tune and hipblaslt_autotune_enabled() and not self.config.prefill_only
+        )
+        gemv_tune = tune and gemv_autotune_enabled()
         set_autotune_process_group(cpu_group)
         try:
             # Capture later refreshes the metadata created here in place.
@@ -1354,6 +1367,19 @@ class ModelExecutor:
                 torch.no_grad(),
                 kernel_warmup(enabled=True),
                 autotune(tune_mode=tune_mode, tuning_buckets=None, round_up=None),
+                # Replays the BLAS picks of earlier starts; on exit the first
+                # rank saves those of the tuning blocks below with them.
+                (
+                    hipblaslt_online_tuning_cache(
+                        hipblaslt_online_cache_path(),
+                        write=self.config.global_rank == owner_rank,
+                    )
+                    if blas_tune
+                    else contextlib.nullcontext()
+                ),
+                # GEMV routing waits for BLAS tuning; until then mm keeps its
+                # default path, so BLAS tuning sees those GEMMs too.
+                deferred_gemv_autotune() if gemv_tune else contextlib.nullcontext(),
             ):
                 # Dummy forwards must not borrow live Engram history or masks.
                 ib.fill_dummy_decode_buffers(
@@ -1413,20 +1439,21 @@ class ModelExecutor:
                             ),
                             graph_phase=False,
                         )
-                if (
-                    tune
-                    and hipblaslt_autotune_enabled()
-                    and not self.config.prefill_only
-                ):
-                    # TOKENSPEED_HIPBLASLT_AUTOTUNE=1: one eager decode step per
-                    # captured batch size tunes the dense GEMMs the tuned file
-                    # does not list, so capture records the picks. Tuning ends
-                    # with the block, before any graph is captured.
+                if blas_tune:
+                    # One eager decode step per captured batch size tunes the
+                    # dense GEMMs the tuned files do not list, so capture
+                    # records the picks. Tuning ends with the block, before
+                    # any graph is captured.
                     with hipblaslt_online_tuning():
                         self.forward_step.warmup_decode_path(
                             batch_sizes=tuple(self.forward_step.capture_bs),
                             graph_phase=False,
                         )
+                if gemv_tune:
+                    # Each weight's GEMV routing races its tuned BLAS GEMMs.
+                    tune_deferred_gemv_routings(
+                        hipblaslt_online_tuning if blas_tune else None
+                    )
                 if self._samples_from_vocab_shard:
                     self._warmup_vocab_shard_sampling()
         finally:

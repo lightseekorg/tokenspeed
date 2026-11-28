@@ -2219,6 +2219,8 @@ def _use_mv(
     # declares an alignment trait (_mv_alignment).
     operands_aligned, out_aligned = _mv_alignment(x, weight, out)
     if platform.is_cdna4:
+        if gemv_autotune_enabled():
+            maybe_tune_gluon_bf16_gemv_gfx950(n, k, weight.device)
         impl = _select_mv(
             m,
             n,
@@ -3133,6 +3135,10 @@ def linear_attnres_partials(
 # it beats hipBLASLt.
 
 if _platform.is_amd:
+    from tokenspeed_kernel.ops.gemm.gluon_gemv_autotune import (
+        gemv_autotune_enabled,
+        maybe_tune_gluon_bf16_gemv_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
         prefers_gluon_rowcta_bf16_gemv_gfx950,
     )
@@ -3167,6 +3173,12 @@ else:
 
     def prefers_gluon_rowcta_bf16_gemv_gfx950(n: int, k: int) -> bool:
         return False
+
+    def gemv_autotune_enabled() -> bool:
+        return False
+
+    def maybe_tune_gluon_bf16_gemv_gfx950(n: int, k: int, device: torch.device) -> None:
+        return None
 
 
 # FP8 storage dtypes served by the w8a8 projection branch (matches the

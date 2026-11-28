@@ -26,10 +26,12 @@ for one GPU model), loading, the stack checks and the tuning tool live in
 ``tokenspeed_kernel.ops.gemm._hipblaslt.tuning``; this module makes the calls
 no-ops on non-ROCm builds.
 
-With ``TOKENSPEED_HIPBLASLT_AUTOTUNE=1`` (off by default), serving also tunes
-the GEMMs of its warmup decode steps that the loaded files do not list,
-before graph capture, and keeps the picks in the process
-(``hipblaslt_online_tuning``).
+With ``TOKENSPEED_HIPBLASLT_AUTOTUNE=1``, or ``TOKENSPEED_KERNEL_AUTOTUNE=1``
+while ``TOKENSPEED_HIPBLASLT_AUTOTUNE`` is unset (off by default), serving
+also tunes the GEMMs of its warmup decode steps that the loaded files do not
+list, before graph capture (``hipblaslt_online_tuning``), and saves the picks
+in ``hipblaslt_online_cache_path()`` for later starts on the same stack
+(``hipblaslt_online_tuning_cache``).
 """
 
 from __future__ import annotations
@@ -37,16 +39,18 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
-import os
 from typing import ContextManager
 
 import torch
 from tokenspeed_kernel.ops.gemm._hipblaslt import tuning
+from tokenspeed_kernel.selection import autotune_cache_file, autotune_switch
 
 __all__ = [
     "AUTOTUNE_ENV",
     "hipblaslt_autotune_enabled",
+    "hipblaslt_online_cache_path",
     "hipblaslt_online_tuning",
+    "hipblaslt_online_tuning_cache",
     "load_hipblaslt_tuned_solutions",
 ]
 
@@ -89,8 +93,22 @@ def _load_default() -> bool:
 
 
 def hipblaslt_autotune_enabled() -> bool:
-    """Whether ``TOKENSPEED_HIPBLASLT_AUTOTUNE=1`` on a ROCm build."""
-    return torch.version.hip is not None and os.environ.get(AUTOTUNE_ENV, "0") == "1"
+    """Whether online BLAS tuning is on: ROCm and ``autotune_switch(AUTOTUNE_ENV)``.
+
+    ``TOKENSPEED_HIPBLASLT_AUTOTUNE`` decides when set; unset, it follows
+    ``TOKENSPEED_KERNEL_AUTOTUNE``.
+    """
+    return torch.version.hip is not None and autotune_switch(AUTOTUNE_ENV)
+
+
+def hipblaslt_online_cache_path() -> str:
+    """Where online tuning keeps its picks between starts.
+
+    ``<hash>.hipblaslt.csv`` next to the kernel autotune cache (under
+    ``$TOKENSPEED_KERNEL_AUTOTUNE_CACHE_DIR``), named after the device and
+    toolchain; TunableOp's stamp in the file also covers the BLAS builds.
+    """
+    return str(autotune_cache_file(".hipblaslt.csv"))
 
 
 def hipblaslt_online_tuning() -> ContextManager[None]:
@@ -102,3 +120,19 @@ def hipblaslt_online_tuning() -> ContextManager[None]:
     if torch.version.hip is None:
         return contextlib.nullcontext()
     return tuning.hipblaslt_online_tuning()
+
+
+def hipblaslt_online_tuning_cache(path: str, *, write: bool) -> ContextManager[None]:
+    """Replay and save the picks of the online tuning blocks inside (ROCm only).
+
+    See
+    ``tokenspeed_kernel.ops.gemm._hipblaslt.tuning.hipblaslt_online_tuning_cache``.
+    A no-op context off ROCm.
+
+    Args:
+        path: The results file, such as ``hipblaslt_online_cache_path()``.
+        write: Write ``path`` on a normal exit (one process per shared file).
+    """
+    if torch.version.hip is None:
+        return contextlib.nullcontext()
+    return tuning.hipblaslt_online_tuning_cache(path, write=write)

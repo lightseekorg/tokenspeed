@@ -52,7 +52,11 @@ Serving loads the architecture file and then the device file, read-only:
 
 Opt-in online tuning, ``hipblaslt_online_tuning``, times the GEMMs no loaded
 file lists while a block runs (serving runs its warmup decode steps there,
-before graph capture) and keeps the picks in the process; it writes no file.
+before graph capture) and keeps the picks in the process. Around its blocks,
+``hipblaslt_online_tuning_cache`` replays the picks a previous run saved in a
+cache file outside the repository (when its stamp matches) and saves the
+blocks' picks there, so a later start times only the GEMMs it adds; the
+committed files are never written.
 
 Generate or extend the file with
 ``python -m tokenspeed_kernel.ops.gemm._hipblaslt.tuning`` (see ``--help``) on the
@@ -67,6 +71,7 @@ import glob
 import logging
 import math
 import os
+import tempfile
 import time
 from typing import Iterator
 
@@ -78,6 +83,7 @@ __all__ = [
     "find_hipblaslt_tuned_files",
     "hipblaslt_file_validators",
     "hipblaslt_online_tuning",
+    "hipblaslt_online_tuning_cache",
     "hipblaslt_tuned_file",
     "load_hipblaslt_tuned_solutions",
     "tune_hipblaslt_solutions",
@@ -282,6 +288,78 @@ def load_hipblaslt_tuned_solutions(path: str | None = None) -> bool:
     return True
 
 
+def _result_keys() -> set[tuple[str, str]]:
+    return {tuple(result[:2]) for result in torch.cuda.tunable.get_results()}
+
+
+def _read_online_cache(path: str, loaded: set[tuple[str, str]]) -> None:
+    # A missing, unreadable or stale cache is re-tuned and rewritten.
+    if not os.path.exists(path):
+        return
+    try:
+        stamp = hipblaslt_file_validators(path)
+        with open(path) as f:
+            keys = {
+                tuple(line.split(",")[:2])
+                for line in f
+                if not line.startswith("Validator")
+            }
+    except OSError as e:
+        logger.warning(f"Ignoring online-tuned BLAS solutions {path}: {e}")
+        return
+    current = _current_validators()
+    if stamp != current:
+        logger.warning(
+            f"Ignoring online-tuned BLAS solutions {path}: made for a different "
+            f"stack (file {stamp}, running {current}); re-tuning"
+        )
+        return
+    if keys & loaded:
+        # A committed file now lists some of its GEMMs; the committed rows win.
+        logger.warning(
+            f"Ignoring online-tuned BLAS solutions {path}: a loaded file lists "
+            "some of its GEMMs; re-tuning"
+        )
+        return
+    if not torch.cuda.tunable.read_file(path):
+        logger.warning(f"Could not load online-tuned BLAS solutions {path}")
+        return
+    logger.info(f"Loaded {len(keys)} online-tuned BLAS solutions from {path}")
+
+
+def _write_online_cache(path: str, loaded: set[tuple[str, str]]) -> None:
+    tunable = torch.cuda.tunable
+    lines = [f"Validator,{key},{value}\n" for key, value in tunable.get_validators()]
+    lines += [
+        f"{op},{params},{solution},{ms}\n"
+        for op, params, solution, ms in tunable.get_results()
+        if (op, params) not in loaded
+    ]
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    # Replaced atomically: other processes may be reading it.
+    with tempfile.NamedTemporaryFile(
+        "w", dir=directory, suffix=".tmp", delete=False
+    ) as tmp:
+        tmp.writelines(lines)
+    os.replace(tmp.name, path)
+
+
+def _enable_lookups() -> None:
+    tunable = torch.cuda.tunable
+    if tunable.is_enabled():
+        return
+    # No file loaded. Point TunableOp away from its default file in the
+    # working directory before its first lookup reads it. Tuning stays off
+    # until a tuning block: enable() turns it on, and a GEMM run before the
+    # block (checking a results file's stamp runs one) would be tuned and
+    # recorded.
+    tunable.tuning_enable(False)
+    tunable.set_filename(os.devnull, insert_device_ordinal=False)
+    tunable.record_untuned_enable(False)
+    tunable.enable(True)
+
+
 @contextlib.contextmanager
 def hipblaslt_online_tuning(cold_bytes: int = 512 * 2**20) -> Iterator[None]:
     """Tune, in this process, the GEMMs no loaded file lists.
@@ -289,12 +367,12 @@ def hipblaslt_online_tuning(cold_bytes: int = 512 * 2**20) -> Iterator[None]:
     Inside the block, the first ``torch.mm``-family GEMM of each new shape,
     layout and dtype times every hipBLASLt and rocBLAS solution TunableOp
     offers and keeps the fastest; GEMMs already loaded (such as from
-    ``load_hipblaslt_tuned_solutions``) are not re-timed. As in the offline
-    tool, operands rotate through ``cold_bytes`` of copies, so each timing
-    reads the weight from HBM. On exit tuning stops and TunableOp stays on,
-    so later GEMMs replay the loaded and the new solutions and other GEMMs
-    keep the default. The new solutions live in this process only: no file
-    is written, the committed one included. Use it outside graph capture.
+    ``load_hipblaslt_tuned_solutions`` or ``hipblaslt_online_tuning_cache``)
+    are not re-timed. As in the offline tool, operands rotate through
+    ``cold_bytes`` of copies, so each timing reads the weight from HBM. On
+    exit tuning stops and TunableOp stays on, so later GEMMs replay the loaded
+    and the new solutions and other GEMMs keep the default. The committed
+    files are never written. Use it outside graph capture.
 
     Args:
         cold_bytes: Rotating buffer size in bytes while tuning.
@@ -303,12 +381,7 @@ def hipblaslt_online_tuning(cold_bytes: int = 512 * 2**20) -> Iterator[None]:
         None.
     """
     tunable = torch.cuda.tunable
-    if not tunable.is_enabled():
-        # No file loaded. Point TunableOp away from its default file in the
-        # working directory before its first lookup reads it.
-        tunable.set_filename(os.devnull, insert_device_ordinal=False)
-        tunable.record_untuned_enable(False)
-        tunable.enable(True)
+    _enable_lookups()
     loaded = len(tunable.get_results())
     # TunableOp appends each new result to its file as it tunes; os.devnull
     # keeps them in memory and the loaded file unchanged. The loaded entries
@@ -328,6 +401,33 @@ def hipblaslt_online_tuning(cold_bytes: int = 512 * 2**20) -> Iterator[None]:
             f"Tuned {len(tunable.get_results()) - loaded} BLAS solutions "
             f"(TunableOp) online in {time.perf_counter() - tic:.1f}s"
         )
+
+
+@contextlib.contextmanager
+def hipblaslt_online_tuning_cache(path: str, *, write: bool) -> Iterator[None]:
+    """Keep the picks of the online tuning blocks inside across starts.
+
+    On entry, loads ``path``, a TunableOp results file of earlier online
+    tuning on this stack, so the ``hipblaslt_online_tuning`` blocks inside do
+    not re-time its GEMMs. The file is ignored (and its GEMMs re-tuned) when
+    its stamp differs from the running stack's or a loaded committed file
+    lists one of its GEMMs. Load the committed files before entering.
+
+    Args:
+        path: The results file, such as ``hipblaslt_online_cache_path()``.
+        write: On a normal exit, write ``path`` with every solution not loaded
+            before the block: those read from it and the newly tuned ones.
+            One process of a group sharing the file writes it.
+
+    Yields:
+        None.
+    """
+    _enable_lookups()
+    committed = _result_keys()
+    _read_online_cache(path, committed)
+    yield
+    if write:
+        _write_online_cache(path, committed)
 
 
 def tune_hipblaslt_solutions(

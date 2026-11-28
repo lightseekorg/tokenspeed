@@ -111,6 +111,18 @@ unless it runs a row count that selects them. The AMD ops README records the ker
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+On CDNA4, `mm` sends 1-16 BF16 rows to the Gluon GEMVs only for the weight
+shapes in their measured tables. With `TOKENSPEED_GEMV_AUTOTUNE=1` (off by
+default), `ops/gemm/gluon_gemv_autotune.py` measures a weight below 2 GiB that
+no table lists the first time `mm` meets it during kernel warmup: one row on
+the dense or row-CTA GEMV against mm's own path, 2 and 3-4 rows on the
+row-CTA GEMV's (4, 4) tile against the decode GEMM, then the dense GEMV over
+2-4 and 5-16 rows, each needing a 1.5% lead on the median of seven
+alternating cold-weight graph replays. The routing enters the tables and the
+kernel autotune cache; capture and later processes only read the cache.
+Serving defers these measurements to the end of its warmup, after online
+BLAS tuning (below), so each weight's GEMVs race its tuned BLAS GEMMs.
+
 `mv_fp8_weight` projects 16-bit rows through a weight-only FP8 weight: E4M3
 with one FP32 scale per output channel, as a 16-bit checkpoint quantizes at
 load. Activations stay 16-bit, so the only roundings past the weight's are
@@ -304,10 +316,24 @@ TunableOp times every solution of each GEMM it has no entry for, with the
 same rotating cold-weight buffer as the tool (512 MiB), and keeps the
 fastest. GEMMs the file lists are not re-timed, and a file from another stack
 is still ignored, so then every GEMM of those steps is tuned. Tuning stops
-before capture; the picks stay in the process and nothing is written, the
-committed file included. The cost is startup time on every start and every
-rank, and picks may differ between starts and ranks within BF16 rounding;
-commit the file with the tool above to fix them.
+before capture. Around all of the warmup's tuning blocks,
+`hipblaslt_online_tuning_cache()` keeps the picks in
+`hipblaslt_online_cache_path()`, `<hash>.hipblaslt.csv` in the kernel
+autotune cache directory, named after the device and toolchain like the
+decision cache: it is loaded after the committed files, before the first
+block, so later starts on the same stack time only GEMMs it lacks, and the
+first rank rewrites it after the last block. A
+cache with another TunableOp stamp, or listing a GEMM a committed file now
+lists, is ignored and rewritten. The committed files are never written; picks
+may differ between ranks of a first start within BF16 rounding, and commit a
+file with the tool above to fix them for everyone.
+
+`TOKENSPEED_KERNEL_AUTOTUNE=1` turns on both online tunings of the warmup,
+this one and the GEMV routing above, in that order: the GEMV routing is
+decided after BLAS tuning, against the tuned solutions (the default routing's
+GEMMs on the timed row counts are tuned first). `TOKENSPEED_HIPBLASLT_AUTOTUNE`
+and `TOKENSPEED_GEMV_AUTOTUNE` still switch each one; when set, `1` or `0`,
+they override `TOKENSPEED_KERNEL_AUTOTUNE` for their tuning.
 
 ## Per-token/per-channel FP8
 

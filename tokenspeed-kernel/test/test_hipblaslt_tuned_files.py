@@ -221,7 +221,8 @@ class _FakeTunable:
 
     def __init__(self, *, enabled: bool, results: int):
         self.enabled = enabled
-        self.tuning = False
+        # TunableOp tunes by default; loading a committed file turns it off.
+        self.tuning = not enabled
         self.filename = "committed.csv" if enabled else ""
         self.rotating_mb = 0
         self.results = [("op", "params", "solution", 1.0)] * results
@@ -253,6 +254,19 @@ class _FakeTunable:
 
     def get_results(self):
         return self.results
+
+    def get_validators(self):
+        return [("PT_VERSION", "2.9")]
+
+    def read_file(self, path):
+        self.calls.append(("read_file", path, self.tuning))
+        with open(path) as f:
+            rows = [line.rstrip("\n").split(",") for line in f]
+        self.results = self.results + [
+            (op, params, solution, float(ms))
+            for op, params, solution, ms in (r for r in rows if r[0] != "Validator")
+        ]
+        return True
 
 
 @contextlib.contextmanager
@@ -301,15 +315,122 @@ def test_online_tuning_stops_on_error():
     assert not fake.tuning and fake.rotating_mb == 0
 
 
+_COMMITTED = ("GemmTunableOp_BFloat16_TN", "tn_5120_4_6144", "Gemm_Hipblaslt_1", 0.01)
+_ONLINE = ("GemmTunableOp_BFloat16_TN", "tn_5120_8_6144", "Gemm_Rocblas_2", 0.02)
+
+
+def _online_tuning(fake, cache, *, write=True, tuned=((),)):
+    # One tuning block per entry of ``tuned``, inside one cache block.
+    with (
+        _patched_tunable(fake),
+        patch.object(tuning, "_current_validators", lambda: {"PT_VERSION": "2.9"}),
+    ):
+        with tuning.hipblaslt_online_tuning_cache(cache, write=write):
+            for block in tuned:
+                with tuning.hipblaslt_online_tuning():
+                    fake.results = fake.results + list(block)
+
+
+def _rows(path):
+    with open(path) as f:
+        return f.read().splitlines()
+
+
+def test_online_tuning_saves_its_picks_for_the_next_start(tmp_path):
+    cache = str(tmp_path / "sub" / "env.hipblaslt.csv")
+    fake = _FakeTunable(enabled=True, results=0)
+    fake.results = [_COMMITTED]
+    _online_tuning(fake, cache, tuned=[[_ONLINE]])
+    # The committed rows stay in their file; the new pick is saved, stamped.
+    saved = ["Validator,PT_VERSION,2.9", ",".join(map(str, _ONLINE))]
+    assert _rows(cache) == saved
+
+    # The next start reads the picks before tuning starts and tunes nothing.
+    fake = _FakeTunable(enabled=True, results=0)
+    fake.results = [_COMMITTED]
+    _online_tuning(fake, cache)
+    assert ("read_file", cache, False) in fake.calls
+    assert fake.results == [_COMMITTED, _ONLINE]
+    assert _rows(cache) == saved
+
+
+def test_online_tuning_saves_the_picks_of_every_block(tmp_path):
+    cache = str(tmp_path / "env.hipblaslt.csv")
+    _online_tuning(_FakeTunable(enabled=False, results=0), cache, tuned=[[_ONLINE]])
+    later = ("GemmTunableOp_BFloat16_TN", "tn_5120_16_6144", "Gemm_Hipblaslt_3", 0.03)
+    # A later start reads the first block's pick, with tuning off, and saves
+    # it with the picks of both of its blocks.
+    fake = _FakeTunable(enabled=False, results=0)
+    _online_tuning(fake, cache, tuned=[[], [later]])
+    assert ("read_file", cache, False) in fake.calls
+    assert _rows(cache) == [
+        "Validator,PT_VERSION,2.9",
+        ",".join(map(str, _ONLINE)),
+        ",".join(map(str, later)),
+    ]
+
+
+def test_online_tuning_keeps_picks_in_process_without_write(tmp_path):
+    cache = str(tmp_path / "env.hipblaslt.csv")
+    _online_tuning(_FakeTunable(enabled=False, results=0), cache, write=False)
+    assert not os.path.exists(cache)
+
+
+def test_online_tuning_writes_no_cache_on_error(tmp_path):
+    cache = str(tmp_path / "env.hipblaslt.csv")
+    with pytest.raises(RuntimeError):
+        with (
+            _patched_tunable(_FakeTunable(enabled=False, results=0)),
+            patch.object(tuning, "_current_validators", lambda: {}),
+        ):
+            with tuning.hipblaslt_online_tuning_cache(cache, write=True):
+                with tuning.hipblaslt_online_tuning():
+                    raise RuntimeError("warmup failed")
+    assert not os.path.exists(cache)
+
+
 @pytest.mark.parametrize(
-    "hip, env, expected",
-    [("7.2", None, False), ("7.2", "0", False), ("7.2", "1", True), (None, "1", False)],
+    "rows",
+    [
+        # Another stack's picks.
+        ["Validator,PT_VERSION,2.8", ",".join(map(str, _ONLINE))],
+        # A GEMM a committed file lists now.
+        ["Validator,PT_VERSION,2.9", ",".join(map(str, _COMMITTED))],
+    ],
 )
-def test_autotune_flag(monkeypatch, hip, env, expected):
-    if env is None:
-        monkeypatch.delenv(hipblaslt.AUTOTUNE_ENV, raising=False)
-    else:
-        monkeypatch.setenv(hipblaslt.AUTOTUNE_ENV, env)
+def test_stale_online_cache_is_retuned_and_rewritten(tmp_path, caplog, rows):
+    cache = tmp_path / "env.hipblaslt.csv"
+    cache.write_text("\n".join(rows) + "\n")
+    fake = _FakeTunable(enabled=True, results=0)
+    fake.results = [_COMMITTED]
+    _online_tuning(fake, str(cache), tuned=[[_ONLINE]])
+    assert not any(call[0] == "read_file" for call in fake.calls)
+    assert "Ignoring online-tuned BLAS solutions" in caplog.text
+    assert _rows(cache) == ["Validator,PT_VERSION,2.9", ",".join(map(str, _ONLINE))]
+
+
+@pytest.mark.parametrize(
+    "hip, env, unified, expected",
+    [
+        ("7.2", None, None, False),
+        ("7.2", "0", None, False),
+        ("7.2", "1", None, True),
+        (None, "1", None, False),
+        # TOKENSPEED_KERNEL_AUTOTUNE=1 turns it on unless its own flag is set.
+        ("7.2", None, "1", True),
+        ("7.2", "0", "1", False),
+        (None, None, "1", False),
+    ],
+)
+def test_autotune_flag(monkeypatch, hip, env, unified, expected):
+    for name, value in (
+        (hipblaslt.AUTOTUNE_ENV, env),
+        ("TOKENSPEED_KERNEL_AUTOTUNE", unified),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
     with patch.object(torch.version, "hip", hip):
         assert hipblaslt.hipblaslt_autotune_enabled() is expected
 
@@ -318,7 +439,10 @@ def test_online_tuning_is_noop_off_rocm():
     with (
         patch.object(torch.version, "hip", None),
         patch.object(tuning, "hipblaslt_online_tuning") as online,
+        patch.object(tuning, "hipblaslt_online_tuning_cache") as cache,
     ):
-        with hipblaslt.hipblaslt_online_tuning():
-            pass
+        with hipblaslt.hipblaslt_online_tuning_cache("unused.csv", write=True):
+            with hipblaslt.hipblaslt_online_tuning():
+                pass
     online.assert_not_called()
+    cache.assert_not_called()

@@ -30,6 +30,7 @@ order of the startup steps -- not the shape of the production source.
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import os
@@ -560,6 +561,105 @@ def test_rewarm_after_a_rebind_compiles_but_tunes_nothing(monkeypatch, tmp_path)
         "draft",
     ]
     assert not tuning_module.is_warming_up()
+
+
+@pytest.mark.parametrize("blas", [False, True])
+@pytest.mark.parametrize("gemv", [False, True])
+@pytest.mark.parametrize("global_rank", [0, 1])
+def test_online_kernel_tuning_runs_blas_before_gemv_routing(
+    monkeypatch, tmp_path, blas, gemv, global_rank
+):
+    # TOKENSPEED_KERNEL_AUTOTUNE=1 turns both on: BLAS solutions are tuned on
+    # the captured decode steps first, then each GEMV routing is timed
+    # against them; the BLAS cache is read before and the first rank saves
+    # it after all tuning blocks.
+    events = []
+
+    def forward(**kwargs):
+        events.append(("target", kwargs["input_ids"].numel()))
+
+    def decode(*, batch_sizes, graph_phase):
+        events.append(("decode", batch_sizes))
+
+    @contextlib.contextmanager
+    def blas_tuning():
+        assert tuning_module.is_warming_up()
+        events.append("blas_on")
+        yield
+        events.append("blas_off")
+
+    @contextlib.contextmanager
+    def blas_cache(path, *, write):
+        events.append(("read_blas_cache", path))
+        yield
+        events.append(("save_blas_cache", write))
+
+    @contextlib.contextmanager
+    def deferred():
+        events.append("defer_gemv")
+        yield
+        events.append("end_defer_gemv")
+
+    def tune_gemv(tuning):
+        assert tuning_module.is_warming_up()
+        events.append(("gemv", tuning is not None))
+        if tuning is not None:
+            with tuning():
+                pass
+
+    forward_step = _ForwardStepDouble(warmup_decode_path=decode, max_decode_bs=8)
+    forward_step.capture_bs = [1, 2, 4]
+    executor = _AutotuneExecutor(
+        config=_AutotuneConfig(
+            chunked_prefill_size=16,
+            autotune_cache_key={},
+            global_rank=global_rank,
+        ),
+        forward=forward,
+        input_buffers=_InputBuffersDouble(
+            input_ids_buf=torch.ones(32),
+            positions_buf=torch.arange(32),
+            max_bs=8,
+            max_num_tokens=32,
+            on_fill_dummy=lambda **_: None,
+        ),
+        prefill_graph=_PrefillGraphDouble(
+            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=None)
+        ),
+        forward_step=forward_step,
+        drafter=None,
+        model_input_kwargs=lambda n, bs, rows: {},
+        events=events,
+    )
+    monkeypatch.setattr(
+        executor_module, "autotune_cache_path", lambda key: str(tmp_path / "c.json")
+    )
+    for name in ("load_autotune_cache", "save_autotune_cache"):
+        monkeypatch.setattr(executor_module, name, lambda *args: None)
+    monkeypatch.setattr(
+        executor_module, "load_hipblaslt_tuned_solutions", lambda: False
+    )
+    monkeypatch.setattr(executor_module, "hipblaslt_autotune_enabled", lambda: blas)
+    monkeypatch.setattr(executor_module, "gemv_autotune_enabled", lambda: gemv)
+    monkeypatch.setattr(executor_module, "hipblaslt_online_cache_path", lambda: "b.csv")
+    monkeypatch.setattr(executor_module, "hipblaslt_online_tuning", blas_tuning)
+    monkeypatch.setattr(executor_module, "hipblaslt_online_tuning_cache", blas_cache)
+    monkeypatch.setattr(executor_module, "deferred_gemv_autotune", deferred)
+    monkeypatch.setattr(executor_module, "tune_deferred_gemv_routings", tune_gemv)
+
+    ModelExecutor.autotune(executor, keep_loaded_tactics=False)
+
+    blas_events = ["blas_on", ("decode", (1, 2, 4)), "blas_off"]
+    gemv_events = [("gemv", blas)] + (["blas_on", "blas_off"] if blas else [])
+    assert events == [
+        *([("read_blas_cache", "b.csv")] if blas else []),
+        *(["defer_gemv"] if gemv else []),
+        ("target", 16),
+        *(blas_events if blas else []),
+        *(gemv_events if gemv else []),
+        *(["end_defer_gemv"] if gemv else []),
+        *([("save_blas_cache", global_rank == 0)] if blas else []),
+    ]
 
 
 def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
