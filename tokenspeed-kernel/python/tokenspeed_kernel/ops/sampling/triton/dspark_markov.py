@@ -326,7 +326,7 @@ def _dspark_markov_stage1_kernel(
                 col_mask[None, :]
                 & (sub_logits != float("-inf"))
                 & (new_max[:, None] != float("-inf")),
-                tl.exp2((sub_logits - new_max[:, None]) * inv_temp_log2e),
+                tl.exp2((sub_logits - new_max[:, None]) * inv_temp_log2e[:, None]),
                 0.0,
             )
             sub_sum = tl.sum(sub_exp, axis=1)
