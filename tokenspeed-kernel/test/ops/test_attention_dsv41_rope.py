@@ -549,3 +549,34 @@ def test_rope_inplace_rotates_every_head_tail_exactly(heads, dim, strided):
     with assert_no_triton_compile(implementation._rope_inplace_kernel):
         for tokens in (1, 64, 129):
             rope_inplace(values[:tokens], positions[:tokens], cache)
+
+
+def test_global_rope_scatter_warmup_covers_warps_and_strides():
+    from tokenspeed_kernel.ops.attention.dsv41._triton import rope
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from utils import assert_no_triton_compile
+
+    values, positions, rope_cache, slots, pages = _global_inputs(17, False, "normal")
+    _, warm_cache = _global_cache(pages, False)
+    with kernel_warmup(enabled=True):
+        dsv41.global_rope_scatter(values, positions, rope_cache, warm_cache, slots)
+
+    with assert_no_triton_compile(rope._global_rope_scatter):
+        for tokens in (1, 17, 500, 513, 1024):
+            torch.manual_seed(400 + tokens)
+            val_storage = torch.randn(tokens, 768, device="cuda", dtype=torch.bfloat16)
+            vals = val_storage[:, :512]
+            pos = torch.randint(-4, 4096, (tokens * 3,), device="cuda")[::3]
+            cos_sin = torch.randn(32768, 128, device="cuda")[:, :64]
+            pages_count = (tokens + 63) // 64 + 3
+            slt = torch.arange(tokens * 5, device="cuda")[::5] + 64
+            slt[::17] = -1
+            slt[1::23] = pages_count * 64
+            actual_storage = torch.full(
+                (pages_count, 72, 320), 165, device="cuda", dtype=torch.uint8
+            )
+            actual_cache = actual_storage[:, :64, :288]
+            ref_storage = actual_storage.clone()
+            _global_reference(vals, pos, cos_sin, ref_storage[:, :64, :288], slt)
+            dsv41.global_rope_scatter(vals, pos, cos_sin, actual_cache, slt)
+            torch.testing.assert_close(actual_storage, ref_storage, rtol=0, atol=0)

@@ -11,6 +11,7 @@ there recompiles the kernel once per distinct width.
 
 from __future__ import annotations
 
+import importlib.util
 import inspect
 import os
 import sys
@@ -32,6 +33,8 @@ from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc_kernel,
     compute_out_cache_loc_uniform,
     dflash_prepare_decode,
+    fused_decode_input_prep,
+    fused_decode_input_prep_kernel,
 )
 
 _P = 16  # kernel page size for the tests
@@ -173,6 +176,46 @@ def test_max_pages_is_not_constexpr(kernel) -> None:
     (the router owns all slot math)."""
     parameter = inspect.signature(kernel.fn).parameters["max_pages"]
     assert parameter.annotation is inspect.Parameter.empty
+
+
+@requires_cuda
+def test_fused_decode_input_prep_reuses_compilation_across_step_widths() -> None:
+    """Changing uniform_input_length across verify budgets must not recompile."""
+    kernel_test_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "..",
+        "tokenspeed-kernel",
+        "test",
+    )
+    helper_spec = importlib.util.spec_from_file_location(
+        "cache_loc_kernel_test_utils", os.path.join(kernel_test_dir, "utils.py")
+    )
+    helper = importlib.util.module_from_spec(helper_spec)
+    helper_spec.loader.exec_module(helper)
+
+    req_pool = torch.tensor([3, 1, 5, 2], dtype=torch.int64, device="cuda")
+    valid_cache = torch.tensor(
+        [0, 10, 25, 40, 55, 70], dtype=torch.int32, device="cuda"
+    )
+    positions = torch.empty(4 * 8, dtype=torch.int64, device="cuda")
+    seq_lens = torch.empty(4, dtype=torch.int32, device="cuda")
+
+    fused_decode_input_prep(positions[:4], seq_lens, req_pool, valid_cache, 1)
+    with helper.assert_no_triton_compile(fused_decode_input_prep_kernel):
+        for bs in (2, 4):
+            for width in (1, 2, 4, 8):
+                pool_slice = req_pool[:bs]
+                pos_slice = positions[: bs * width]
+                seq_slice = seq_lens[:bs]
+                fused_decode_input_prep(
+                    pos_slice, seq_slice, pool_slice, valid_cache, width
+                )
+                expected_start = valid_cache[pool_slice].long()
+                expected_pos = expected_start[:, None] + torch.arange(
+                    width, dtype=torch.int64, device="cuda"
+                )
+                assert torch.equal(pos_slice.view(bs, width), expected_pos)
+                assert torch.equal(seq_slice, expected_start.int() + width)
 
 
 if __name__ == "__main__":

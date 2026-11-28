@@ -28,6 +28,7 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexGeometry, IndexMetadata
 from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 
 @triton.jit(
@@ -442,7 +443,7 @@ def _sparse_geometry(
         ends = torch.empty(tokens, dtype=torch.int32, device=cache.device)
         sparse = torch.empty_like(normalized)
         context = torch.empty_like(ends)
-        _normalize_candidate_blocks[(tokens,)](
+        kernel_launcher(_normalize_candidate_blocks, (tokens,))(
             candidates,
             visible,
             page_table,
@@ -492,3 +493,11 @@ def _sparse_geometry(
     else:
         normalized, ends, schedule, *_ = geometry.acquire()
     return normalized, ends, schedule, blocks
+
+
+# Candidate budgets up to 2048 bucket via next_power_of_2(blocks).
+_NORMALIZE_BLOCKS = tuple(1 << bit for bit in range(12))
+register_triton_warmup(
+    _normalize_candidate_blocks,
+    variants=({"BLOCK": _NORMALIZE_BLOCKS},),
+)

@@ -2043,7 +2043,9 @@ def _dspark_row_value(
     return restored
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["X0", "POS0", "CS0", "S0", "W0", "W1", "O0", "PAGES"],
+)
 def _dspark_rows_kernel(
     X,
     W,

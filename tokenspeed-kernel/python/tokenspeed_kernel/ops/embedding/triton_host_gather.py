@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -32,7 +33,9 @@ _CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
 _SIGNATURES = frozenset({format_signature(x=dense_tensor_format(torch.uint8))})
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["n_rows", "width", "table_stride", "out_stride"],
+)
 def _host_uint8_row_gather_kernel(
     table_ptr,
     indices_ptr,
@@ -44,7 +47,7 @@ def _host_uint8_row_gather_kernel(
     INDEX_INT64: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     idx = tl.load(indices_ptr + row)
     if not INDEX_INT64:
         idx = idx.to(tl.int64)
@@ -67,8 +70,19 @@ _SORT_MIN_ROWS = 32768
 _ROWS_PER_PROGRAM = 4
 
 
-# The entry count varies per batch; keep it out of the specialization key.
-@triton.jit(do_not_specialize=["n_entries"])
+# Entry counts and tensor strides vary across batches and tables; keep them out
+# of the specialization key and skip alignment checks on sliced views.
+@triton.jit(
+    do_not_specialize=[
+        "n_entries",
+        "n_rows",
+        "n_columns",
+        "index_stride_token",
+        "index_stride_column",
+        "table_stride",
+    ],
+    do_not_specialize_on_alignment=["ids_ptr", "codes_ptr", "scales_ptr"],
+)
 def _host_mxfp8_row_gather_kernel(
     table_ptr,
     ids_ptr,
@@ -139,7 +153,10 @@ def _host_mxfp8_row_gather_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["n_entries"])
+@triton.jit(
+    do_not_specialize=["n_entries"],
+    do_not_specialize_on_alignment=["codes_ptr", "scales_ptr"],
+)
 def _copy_duplicate_rows_kernel(
     dst_ptr,
     head_ptr,
@@ -174,6 +191,12 @@ def _copy_duplicate_rows_kernel(
         scales,
         mask=duplicate[:, None],
     )
+
+
+def _warmup_compile(kernel, *args, **kwargs) -> None:
+    compiled = kernel.warmup(*args, **kwargs, grid=(1,))
+    if compiled is not None:
+        compiled._init_handles()
 
 
 @register_kernel(
@@ -215,6 +238,43 @@ def triton_host_mxfp8_row_gather(
             ROWS=1,
             SORTED=False,
         )
+        if is_warming_up():
+            # Startup dummy forwards rarely reach _SORT_MIN_ROWS; precompile
+            # the sorted path and duplicate-row fanout too.
+            warm_i64 = torch.zeros((1,), dtype=torch.int64, device=codes.device)
+            warm_ids = (
+                warm_i64
+                if indices.dtype == torch.int64
+                else torch.zeros((1,), dtype=indices.dtype, device=codes.device)
+            )
+            _warmup_compile(
+                _host_mxfp8_row_gather_kernel,
+                table_ptr=table_ptr,
+                ids_ptr=warm_ids,
+                dst_ptr=warm_i64,
+                head_ptr=warm_i64,
+                codes_ptr=codes_bytes,
+                scales_ptr=scales,
+                n_entries=1,
+                n_rows=table.shape[0],
+                n_columns=1,
+                index_stride_token=1,
+                index_stride_column=0,
+                table_stride=table.stride(0),
+                DIM=dim,
+                ROWS=_ROWS_PER_PROGRAM,
+                SORTED=True,
+            )
+            _warmup_compile(
+                _copy_duplicate_rows_kernel,
+                warm_i64,
+                warm_i64,
+                codes_bytes,
+                scales,
+                1,
+                DIM=dim,
+                ROWS=_ROWS_PER_PROGRAM,
+            )
         return
     # Everything below stays on the device: no host sync on the number of
     # distinct rows, so the grids do not depend on the ids.
@@ -250,6 +310,25 @@ def triton_host_mxfp8_row_gather(
         DIM=dim,
         ROWS=_ROWS_PER_PROGRAM,
     )
+    if is_warming_up():
+        _warmup_compile(
+            _host_mxfp8_row_gather_kernel,
+            table_ptr=table_ptr,
+            ids_ptr=indices,
+            dst_ptr=indices,
+            head_ptr=indices,
+            codes_ptr=codes_bytes,
+            scales_ptr=scales,
+            n_entries=entries,
+            n_rows=table.shape[0],
+            n_columns=indices.shape[1],
+            index_stride_token=indices.stride(0),
+            index_stride_column=indices.stride(1),
+            table_stride=table.stride(0),
+            DIM=dim,
+            ROWS=1,
+            SORTED=False,
+        )
 
 
 def _next_power_of_2(n: int) -> int:
