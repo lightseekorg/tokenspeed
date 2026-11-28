@@ -2141,6 +2141,12 @@ def test_sonic_dspark_server_args_allow_fixed_width_sampled_verification():
             "--speculative-config",
             '{"method": "dspark", "draft_sample_method": "probabilistic", "num_speculative_tokens": 4}',
         ],
+        [
+            "--enable-speculative-sampling",
+            "--moe-backend",
+            "mega_moe",
+            "--enable-dp-local-cuda-graph",
+        ],
     ):
         args = prepare_server_args(
             [
@@ -2156,7 +2162,6 @@ def test_sonic_dspark_server_args_allow_fixed_width_sampled_verification():
                 "sonic",
                 "--data-parallel-size",
                 "16",
-                "--enable-dp-attention",
                 "--enable-expert-parallel",
                 "--disaggregation-mode",
                 "decode",
@@ -2168,6 +2173,9 @@ def test_sonic_dspark_server_args_allow_fixed_width_sampled_verification():
         assert args.sampling_backend == "sonic"
         assert args.mapping.attn.dp_size == 16
         assert args.mapping.attn.tp_size == 1
+        assert args.enable_dp_local_cuda_graph is (
+            "--enable-dp-local-cuda-graph" in extra
+        )
 
 
 def test_bind_sampling_backend_contracts_for_sonic_and_flashinfer():
@@ -2269,6 +2277,8 @@ def test_sonic_fixed_width_dspark_drafter_runs_sampled_and_cuda_graph(monkeypatc
 
     config = _draft_config()
     config.vocab_size = 1024
+    config.hidden_size = 256
+    config.moe_intermediate_size = 256
     config.head_dim = 512
     config.qk_rope_head_dim = 64
     config.q_lora_rank = 128

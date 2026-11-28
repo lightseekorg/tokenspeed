@@ -276,7 +276,12 @@ def _reference_dspark_markov_probs(
 def test_sonic_dspark_markov_proposals_and_cuda_graph_zero_jit(vocab: int):
     from tokenspeed_kernel.ops.sampling.triton import dspark_markov
 
+    from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
     from tokenspeed.runtime.models.deepseek_v41_dspark_heads import (
+        DSparkVanillaMarkov,
         dspark_sampled_workspace,
         sample_dspark_block_sampled,
     )
@@ -327,9 +332,15 @@ def test_sonic_dspark_markov_proposals_and_cuda_graph_zero_jit(vocab: int):
         renorm_probs=backend.renorm_dspark_probabilities,
         device=torch.device("cuda"),
     )
-    base_logits = (torch.randn(BS, block, vocab, device="cuda") * 0.25).bfloat16()
-    embed = (torch.randn(vocab, rank, device="cuda") * 0.1).bfloat16()
-    proj = (torch.randn(vocab, rank, device="cuda") * 0.1).bfloat16()
+    base_logits = torch.randn(BS, block, vocab, device="cuda") * 0.25
+    embedding = VocabParallelEmbedding(vocab, rank, params_dtype=torch.bfloat16).to(
+        "cuda"
+    )
+    projection = ParallelLMHead(vocab, rank, params_dtype=torch.bfloat16).to("cuda")
+    with torch.no_grad():
+        embedding.weight.normal_(std=0.1)
+        projection.weight.normal_(std=0.1)
+    markov_head = DSparkVanillaMarkov(embedding, projection)
     # Force flat-enough spectrum on row 1 so top-p=0.9 spans > 128 tokens when vocab >= 1024.
     base_logits[1, :, :400] = 0.0
     base_logits[1, :, 400:] = -20.0
@@ -340,21 +351,20 @@ def test_sonic_dspark_markov_proposals_and_cuda_graph_zero_jit(vocab: int):
 
     sample_dspark_block_sampled(
         base_logits,
-        embed,
-        proj,
         anchors,
+        markov_head,
         slots,
         slots,
         base_pos,
         draft_probs,
-        next_tokens,
         ws,
         vocab,
+        next_tokens[:, 1:],
     )
     expected_q0 = _reference_dspark_markov_probs(
         base_logits[:, 0],
-        embed,
-        proj,
+        embedding.weight,
+        projection.weight,
         anchors,
         pools.temperature.index_select(0, slots),
         pools.top_k.index_select(0, slots),
@@ -401,16 +411,15 @@ def test_sonic_dspark_markov_proposals_and_cuda_graph_zero_jit(vocab: int):
         with torch.cuda.graph(graph):
             sample_dspark_block_sampled(
                 base_logits,
-                embed,
-                proj,
                 anchors,
+                markov_head,
                 slots,
                 slots,
                 base_pos,
                 draft_probs,
-                next_tokens,
                 ws,
                 vocab,
+                next_tokens[:, 1:],
             )
             cap_predict, cap_accept = backend.verify(
                 LogitsProcessorOutput(next_token_logits=target_logits),
@@ -431,7 +440,12 @@ def test_sonic_dspark_markov_proposals_and_cuda_graph_zero_jit(vocab: int):
 
 
 def test_sonic_dspark_markov_verify_matches_target_distribution():
+    from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
     from tokenspeed.runtime.models.deepseek_v41_dspark_heads import (
+        DSparkVanillaMarkov,
         dspark_sampled_workspace,
         sample_dspark_block_sampled,
     )
@@ -480,10 +494,21 @@ def test_sonic_dspark_markov_verify_matches_target_distribution():
         device=torch.device("cuda"),
     )
     base_logits = (
-        row.unsqueeze(0).unsqueeze(0).expand(BS, block, VOCAB).contiguous().cuda()
+        row.float()
+        .unsqueeze(0)
+        .unsqueeze(0)
+        .expand(BS, block, VOCAB)
+        .contiguous()
+        .cuda()
     )
-    embed = (torch.randn(VOCAB, rank, device="cuda") * 0.2).bfloat16()
-    proj = (torch.randn(VOCAB, rank, device="cuda") * 0.2).bfloat16()
+    embedding = VocabParallelEmbedding(VOCAB, rank, params_dtype=torch.bfloat16).to(
+        "cuda"
+    )
+    projection = ParallelLMHead(VOCAB, rank, params_dtype=torch.bfloat16).to("cuda")
+    with torch.no_grad():
+        embedding.weight.normal_(std=0.2)
+        projection.weight.normal_(std=0.2)
+    markov_head = DSparkVanillaMarkov(embedding, projection)
     anchors = torch.zeros(BS, dtype=torch.int32, device="cuda")
     base_pos = torch.zeros(BS, dtype=torch.int64, device="cuda")
     draft_probs = torch.full((POOL + 1, N, VOCAB), THRESHOLD + 1, device="cuda")
@@ -502,16 +527,15 @@ def test_sonic_dspark_markov_verify_matches_target_distribution():
         base_pos.fill_(step)
         sample_dspark_block_sampled(
             base_logits,
-            embed,
-            proj,
             anchors,
+            markov_head,
             slots,
             slots,
             base_pos,
             draft_probs,
-            next_tokens,
             ws,
             VOCAB,
+            next_tokens[:, 1:],
         )
         offsets.fill_(step * N)
         predict, accept = backend.verify(

@@ -260,6 +260,26 @@ def test_dp_local_cuda_graph_sampled_path_keeps_adaptive_validation():
         )
 
 
+@pytest.mark.parametrize("spec_sampling", [False, True])
+def test_dp_local_cuda_graph_accepts_sonic(spec_sampling):
+    argv = _dp_local_graph_args() + [
+        "--sampling-backend",
+        "sonic",
+        "--data-parallel-size",
+        "16",
+        "--enable-expert-parallel",
+        "--disaggregation-mode",
+        "decode",
+    ]
+    if spec_sampling:
+        argv += ["--enable-speculative-sampling"]
+    args = prepare_server_args(argv)
+    assert args.enable_dp_local_cuda_graph
+    assert not args.enable_dsv41_adaptive_dspark
+    assert args.sampling_backend == "sonic"
+    assert args.enable_speculative_sampling is spec_sampling
+
+
 @pytest.mark.parametrize(
     "options, message",
     [
@@ -269,7 +289,7 @@ def test_dp_local_cuda_graph_sampled_path_keeps_adaptive_validation():
         (["--enforce-eager"], "require CUDA graphs"),
         (["--disaggregation-mode", "prefill"], "decode-capable worker"),
         (["--disaggregation-mode", "encode"], "decode-capable worker"),
-        (["--sampling-backend", "flashinfer"], "greedy sampling or adaptive"),
+        (["--sampling-backend", "flashinfer"], "greedy, sonic, or adaptive"),
         (["--tensor-parallel-size", "2"], "attention/dense/MoE/LM-head TP1"),
         (
             ["--world-size", "2", "--data-parallel-size", "2"],

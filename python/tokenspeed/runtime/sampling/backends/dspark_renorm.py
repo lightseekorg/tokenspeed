@@ -27,6 +27,8 @@ from collections.abc import Callable
 import torch
 from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_available as _FUSED_TOPK_TOPP_AVAILABLE,
+)
+from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_renorm,
     fused_topk_topp_workspace_size,
 )
@@ -75,13 +77,17 @@ def torch_small_vocab_topk_topp_renorm(
 
     k_lim = top_k_col.clamp(min=1, max=vocab_size)
     vals, idx = probs.to(torch.float32).sort(dim=-1, descending=True, stable=True)
-    ranks = torch.arange(vocab_size, device=probs.device, dtype=torch.int64).unsqueeze(0)
+    ranks = torch.arange(vocab_size, device=probs.device, dtype=torch.int64).unsqueeze(
+        0
+    )
     keep_k = ranks < k_lim
     topk_vals = torch.where(keep_k, vals, 0.0)
     cumsum = topk_vals.cumsum(dim=-1)
     total = topk_vals.sum(dim=-1, keepdim=True)
     threshold = top_p_col * total
-    keep = keep_k & ((top_p_col >= 1.0) | (ranks == 0) | ((cumsum - topk_vals) < threshold))
+    keep = keep_k & (
+        (top_p_col >= 1.0) | (ranks == 0) | ((cumsum - topk_vals) < threshold)
+    )
     kept_vals = torch.where(keep, topk_vals, 0.0)
     denom = kept_vals.sum(dim=-1, keepdim=True).clamp_min(1e-38)
     renormed = kept_vals / denom
@@ -96,8 +102,9 @@ def renorm_dspark_probabilities(
     top_ps: torch.Tensor,
     *,
     workspace: torch.Tensor | None,
-    small_vocab_renorm: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
-    | None = None,
+    small_vocab_renorm: (
+        Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] | None
+    ) = None,
 ) -> torch.Tensor:
     """In-place DSpark proposal probability top-k/top-p renormalization."""
     if (
