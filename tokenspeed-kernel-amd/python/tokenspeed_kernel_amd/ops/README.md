@@ -442,8 +442,12 @@ The dense GEMV's MFMA tile with 16-byte weight loads of 16 E4M3 values. The
 tile's `BLOCK_M` covers every row, so each weight byte is read once; the K
 step shrinks with `BLOCK_M` to keep the activation tile within 32 VGPRs a
 buffer. At most 32 outputs per program, so wide outputs (a vocabulary shard)
-launch several programs per CU. Weights pass through LDS in E4M3 and upcast
-(`v_cvt_scalef32_pk_bf16_fp8`) in the MFMA operand layout.
+launch several programs per CU; from 256 outputs per CU (a whole-vocabulary
+head) 64 per program, which halves the activation rows every program
+re-reads from L2 (2-17% faster at 1-32 rows on the 248320 x 2560 Qwen3.8
+head, MI350X; 1-8 rows stream the E4M3 weight at about 5 TB/s). Weights
+pass through LDS in E4M3 and upcast (`v_cvt_scalef32_pk_bf16_fp8`) in the
+MFMA operand layout.
 
 ### gfx950 skinny FP8 projection
 
