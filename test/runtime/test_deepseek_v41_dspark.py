@@ -1820,6 +1820,13 @@ def test_adaptive_dp_local_still_rejects_cumulative_probs(sampling_backend):
 def test_verify_graph_token_capacity(bs, capacity):
     drafter = object.__new__(DeepseekV41DSpark)
     drafter.dp_local_graph = False
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    drafter.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     drafter.device = torch.device("cpu")
     drafter.spec_num_tokens = 6
     drafter.adaptive_min_batch_size = 1
@@ -1840,6 +1847,13 @@ def test_small_or_padded_batches_keep_full_verification(actual, padded):
 
     drafter = object.__new__(DeepseekV41DSpark)
     drafter.dp_local_graph = False
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    drafter.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     drafter.spec_num_tokens = 6
     drafter.verify_budget_policy = VerifyBudgetPolicy(True, 32, 6, 0.02)
     drafter.draft_model = SimpleNamespace(mapping=_mapping(0, 1, 1))
@@ -1872,6 +1886,13 @@ def test_fine_verify_graph_capture_plan_and_keys():
 
     drafter = object.__new__(DeepseekV41DSpark)
     drafter.dp_local_graph = False
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    drafter.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     drafter.device = torch.device("cpu")
     drafter.spec_num_tokens = 6
     drafter.adaptive_min_batch_size = 1
@@ -1938,6 +1959,13 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
 
     drafter = object.__new__(DeepseekV41DSpark)
     drafter.dp_local_graph = False
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    drafter.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     from tokenspeed.runtime.execution.drafter.verify_calibration import (
         VerifyCalibration,
     )
@@ -2161,6 +2189,13 @@ def test_dp_local_device_budget_finish_round_replay_and_invalidation():
 
     drafter = object.__new__(DeepseekV41DSpark)
     drafter.dp_local_graph = True
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    drafter.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     mapping = _mapping(0, 1, 1)
     drafter.draft_model = Mock(spec=ModelRunner)
     drafter.draft_model.mapping = mapping

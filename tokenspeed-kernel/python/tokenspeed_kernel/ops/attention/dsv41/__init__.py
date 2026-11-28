@@ -2122,6 +2122,8 @@ def select_verify_budget(
         raise ValueError("seq_lens must match request_slots on device")
     profiles = int(profile_ranges.shape[0])
     candidates = int(profile_capacities.shape[0])
+    if profiles < 1 or candidates < 1:
+        raise ValueError("calibration tables must be non-empty")
     if (
         profile_ranges.shape != (profiles, 2)
         or profile_ranges.dtype != torch.int32

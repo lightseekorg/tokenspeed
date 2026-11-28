@@ -47,8 +47,15 @@ class DraftModel(nn.Module):
 
 
 def _make_drafter(mapping):
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
     drafter = object.__new__(DeepseekV41DSpark)
     drafter.dp_local_graph = False
+    drafter.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     drafter.draft_model = DraftModel(mapping)
     drafter.tp_group = mapping.attn.tp_group
     drafter.verify_feedback = VerifyFeedback(draft_width=5)

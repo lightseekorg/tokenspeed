@@ -569,6 +569,26 @@ def test_select_verify_budget_matches_policy_and_edge_cases():
     latest[2, 3] = float("inf")
     check([0, 1, 2, 3], [500] * 4)
 
+    for empty_ranges, empty_native, empty_caps, empty_step in (
+        (prof_ranges[:0], prof_native[:0], prof_caps, prof_step[:0]),
+        (prof_ranges, prof_native, prof_caps[:0], prof_step[:, :0]),
+    ):
+        with pytest.raises(ValueError, match="non-empty"):
+            select_verify_budget(
+                latest,
+                request_slots=torch.arange(4, dtype=torch.int32, device="cuda"),
+                seq_lens=torch.full((4,), 100, dtype=torch.int32, device="cuda"),
+                profile_ranges=empty_ranges,
+                profile_native_ms=empty_native,
+                profile_capacities=empty_caps,
+                profile_step_ms=empty_step,
+                selected_out=out,
+                padded_bs=4,
+                context_advance=8,
+                min_batch_size=1,
+                min_gain=0.02,
+            )
+
     # Tie on rate selects largest capacity (prof_caps descending order).
     tie_latest = torch.full((4, 3), -60.0, dtype=torch.float32, device="cuda")
     tie_ranges = torch.tensor([[1, 1000]], dtype=torch.int32, device="cuda")

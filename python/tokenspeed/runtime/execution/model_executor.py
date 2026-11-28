@@ -770,16 +770,18 @@ class ModelExecutor:
                 )
 
                 DrafterImpl = partial(EagleHarness, harness=config.eagle_harness)
-            self.drafter = DrafterImpl(
-                spec_num_tokens=config.spec_num_tokens,
-                spec_num_steps=config.spec_num_steps,
-                draft_model_runner=draft_model_runner,
-                runtime_states=self.runtime_states,
-                input_buffers=self.input_buffers,
-                attn_backend=draft_attn_backend,
-                token_to_kv_pool=draft_token_to_kv_pool,
-                vocab_size=config.vocab_size,
-            )
+            with self.memory_saver_adapter.named_region("runtime_states"):
+                self.drafter = DrafterImpl(
+                    spec_num_tokens=config.spec_num_tokens,
+                    spec_num_steps=config.spec_num_steps,
+                    draft_model_runner=draft_model_runner,
+                    runtime_states=self.runtime_states,
+                    input_buffers=self.input_buffers,
+                    attn_backend=draft_attn_backend,
+                    token_to_kv_pool=draft_token_to_kv_pool,
+                    vocab_size=config.vocab_size,
+                )
+                self.drafter.bind_memory_saver_adapter(self.memory_saver_adapter)
             self.drafter.wire_target(self.model_runner.model)
             MultimodalRuntime.wire_drafter(
                 self.input_buffers, self.model_runner.model_config

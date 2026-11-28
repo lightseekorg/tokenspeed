@@ -635,29 +635,32 @@ class DeepseekV41DSpark(BaseDrafter):
         if not matching or policy_ms is None or not capacities:
             buffers.device_cal = None
             return
-        ranges = torch.tensor(
-            [[p.min_context, p.max_context] for p in matching],
-            dtype=torch.int32,
-            device=self.device,
-        )
-        native_ms = torch.tensor(
-            [float(p.native_step_ms) for p in matching],
-            dtype=torch.float32,
-            device=self.device,
-        )
-        capacities_t = torch.tensor(capacities, dtype=torch.int32, device=self.device)
-        step_rows = [
-            [
-                (
-                    float(step_ms) + float(policy_ms)
-                    if (step_ms := profile.adaptive_step_ms.get(cap)) is not None
-                    else -1.0
-                )
-                for cap in capacities
+        with self.memory_saver_adapter.named_region("runtime_states"):
+            ranges = torch.tensor(
+                [[p.min_context, p.max_context] for p in matching],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            native_ms = torch.tensor(
+                [float(p.native_step_ms) for p in matching],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            capacities_t = torch.tensor(
+                capacities, dtype=torch.int32, device=self.device
+            )
+            step_rows = [
+                [
+                    (
+                        float(step_ms) + float(policy_ms)
+                        if (step_ms := profile.adaptive_step_ms.get(cap)) is not None
+                        else -1.0
+                    )
+                    for cap in capacities
+                ]
+                for profile in matching
             ]
-            for profile in matching
-        ]
-        step_ms_t = torch.tensor(step_rows, dtype=torch.float32, device=self.device)
+            step_ms_t = torch.tensor(step_rows, dtype=torch.float32, device=self.device)
         buffers.device_cal = _VerifyDeviceCalibration(
             ranges=ranges,
             native_ms=native_ms,
@@ -1004,50 +1007,55 @@ class DeepseekV41DSpark(BaseDrafter):
                 self.tp_group, backend="gloo", name="dsv41_verify_tp_metadata"
             )
         packet_size = 3 + graph_bs * self.block_size
-        buffers = _VerifyBudgetBuffers(
-            scores=torch.zeros(
-                (graph_bs, self.block_size), dtype=torch.float32, device=self.device
-            ),
-            counts=torch.empty(graph_bs, dtype=torch.int64, device=self.device),
-            valid=torch.empty((), dtype=torch.bool, device=self.device),
-            packet=torch.empty(packet_size, dtype=torch.float32, device=self.device),
-            peers=torch.empty(
-                (
-                    len(self._verification_group),
-                    packet_size,
+        with self.memory_saver_adapter.named_region("runtime_states"):
+            buffers = _VerifyBudgetBuffers(
+                scores=torch.zeros(
+                    (graph_bs, self.block_size),
+                    dtype=torch.float32,
+                    device=self.device,
                 ),
-                dtype=torch.float32,
-                device="cpu",
-            ),
-            device_decision=torch.empty(3, dtype=torch.int32, device=self.device),
-            free_device_slots=deque(
-                torch.empty(3, dtype=torch.int32, device="cpu", pin_memory=True)
-                for _ in range(_BUDGET_HOST_RING_SLOTS)
-            ),
-            packet_hosts=tuple(
-                torch.empty(
-                    packet_size, dtype=torch.float32, device="cpu", pin_memory=True
-                )
-                for _ in range(_BUDGET_HOST_RING_SLOTS)
-            ),
-            packet_events=[None] * _BUDGET_HOST_RING_SLOTS,
-            feedback_free=deque(
-                (
-                    torch.empty(
-                        (graph_bs, self.block_size),
-                        dtype=torch.float32,
-                        device="cpu",
-                        pin_memory=True,
+                counts=torch.empty(graph_bs, dtype=torch.int64, device=self.device),
+                valid=torch.empty((), dtype=torch.bool, device=self.device),
+                packet=torch.empty(
+                    packet_size, dtype=torch.float32, device=self.device
+                ),
+                peers=torch.empty(
+                    (
+                        len(self._verification_group),
+                        packet_size,
                     ),
+                    dtype=torch.float32,
+                    device="cpu",
+                ),
+                device_decision=torch.empty(3, dtype=torch.int32, device=self.device),
+                free_device_slots=deque(
+                    torch.empty(3, dtype=torch.int32, device="cpu", pin_memory=True)
+                    for _ in range(_BUDGET_HOST_RING_SLOTS)
+                ),
+                packet_hosts=tuple(
                     torch.empty(
-                        graph_bs, dtype=torch.int32, device="cpu", pin_memory=True
-                    ),
-                )
-                for _ in range(_BUDGET_HOST_RING_SLOTS)
-            ),
-            last_active_bs=graph_bs,
-        )
-        buffers.packet[2].fill_(graph_bs)
+                        packet_size, dtype=torch.float32, device="cpu", pin_memory=True
+                    )
+                    for _ in range(_BUDGET_HOST_RING_SLOTS)
+                ),
+                packet_events=[None] * _BUDGET_HOST_RING_SLOTS,
+                feedback_free=deque(
+                    (
+                        torch.empty(
+                            (graph_bs, self.block_size),
+                            dtype=torch.float32,
+                            device="cpu",
+                            pin_memory=True,
+                        ),
+                        torch.empty(
+                            graph_bs, dtype=torch.int32, device="cpu", pin_memory=True
+                        ),
+                    )
+                    for _ in range(_BUDGET_HOST_RING_SLOTS)
+                ),
+                last_active_bs=graph_bs,
+            )
+            buffers.packet[2].fill_(graph_bs)
         self._verify_budget_buffers[graph_bs] = buffers
         for capacity in self.decode_graph_query_capacities(graph_bs):
             if capacity == graph_bs * self.spec_num_tokens:
