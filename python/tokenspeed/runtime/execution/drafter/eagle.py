@@ -277,19 +277,20 @@ class Eagle(HiddenStateDrafter):
         self._kv_tile: _KVTile | None = None
         self._split_draft = isinstance(draft_model_runner.model, SplitExtendDraft)
 
-    def validate_decode_overlap(self) -> None:
-        """Check the draft tail before releasing the execution stream early."""
+    def decode_overlap_ineligibility(self) -> str | None:
+        """The draft tail's first unmet condition for releasing the execution stream early, or None."""
         model = self.draft_model_runner.model
         if not isinstance(model, DraftOverlapModel) or not model.supports_draft_overlap:
-            raise ValueError("Draft model does not declare support for draft overlap")
+            return "Draft model does not declare support for draft overlap"
         # The prefix event is recorded before the remaining chain steps.
         # ServerArgs already validates verify width == draft steps + 1.
         if self.spec_num_steps < 2:
-            raise ValueError("Draft graph overlap requires at least two draft steps")
+            return "Draft graph overlap requires at least two draft steps"
         if self.tree_spec is not None or self.draft_sampler is not None:
-            raise ValueError("Draft graph overlap requires a greedy draft chain")
+            return "Draft graph overlap requires a greedy draft chain"
         if self.draft_reads_token_history:
-            raise ValueError("Draft graph overlap does not support draft token history")
+            return "Draft graph overlap does not support draft token history"
+        return None
 
     @override
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:

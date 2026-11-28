@@ -33,7 +33,12 @@ import torch.distributed as dist
 import tqdm
 from tokenspeed_kernel.workspace import capture_session
 
-from tokenspeed.runtime.execution._draft_overlap import DecodeGraphOverlap
+from tokenspeed.runtime.execution._draft_overlap import (
+    DRAFT_GRAPH_OVERLAP_ENV,
+    DecodeGraphOverlap,
+    draft_overlap_ineligibility,
+    resolve_draft_overlap,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cudagraph_memory import (
     CapturedLadder,
@@ -552,58 +557,39 @@ class ForwardStepRunner:
         # capture never runs then, but the attribute must still exist.
         self.stream = self.device_module.Stream()
         self.draft_overlap: DecodeGraphOverlap | None = None
-        overlap = os.environ.get("TOKENSPEED_DRAFT_GRAPH_OVERLAP")
-        if overlap not in (None, "0", "1"):
-            raise ValueError("TOKENSPEED_DRAFT_GRAPH_OVERLAP must be 0 or 1")
-        if overlap == "1":
-            self._enable_draft_overlap()
+        if resolve_draft_overlap(
+            os.environ.get(DRAFT_GRAPH_OVERLAP_ENV),
+            self._draft_overlap_ineligibility,
+            log=self.global_rank == 0,
+        ):
+            self.draft_overlap = DecodeGraphOverlap()
         if self.drafter is not None:
             self.drafter.decode_overlap = self.draft_overlap
 
-    def _enable_draft_overlap(self) -> None:
-        """Check stream and state ownership before enabling draft-tail overlap."""
-        from tokenspeed.runtime.execution.drafter.eagle import Eagle
-
+    def _draft_overlap_ineligibility(self) -> str | None:
+        """This runner's first unmet draft-overlap condition (stream and state ownership)."""
         config = self.config
-        if (
-            torch.device(self.device).type != "cuda"
-            or torch.version.hip is not None
-            or self.disable
-            or config.pp_size != 1
-            or self.dp_size != 1
-        ):
-            raise ValueError(
-                "Draft graph overlap requires NVIDIA decode graphs, DP1/PP1"
+
+        def cache_layers() -> tuple[set[int], set[int]]:
+            draft_pool = self.draft_token_to_kv_pool
+            return set(self.token_to_kv_pool.field_layer_range), (
+                set(draft_pool.field_layer_range) if draft_pool is not None else set()
             )
-        drafter = self.drafter
-        if config.spec_algo != "MTP" or type(drafter) is not Eagle:
-            raise ValueError("Draft graph overlap requires the Eagle MTP drafter")
-        drafter.validate_decode_overlap()
-        if config.grammar_backend != "none":
-            raise ValueError("Draft graph overlap does not support grammar")
-        if (
-            self._expert_load_rows is not None
-            or self._mega_moe_live_requests is not None
-        ):
-            raise ValueError(
-                "Draft graph overlap does not support shared MoE row masks"
-            )
-        target_layers = set(self.token_to_kv_pool.field_layer_range)
-        draft_layers = (
-            set(self.draft_token_to_kv_pool.field_layer_range)
-            if self.draft_token_to_kv_pool is not None
-            else set()
+
+        return draft_overlap_ineligibility(
+            nvidia_decode_graphs=torch.device(self.device).type == "cuda"
+            and torch.version.hip is None
+            and not self.disable,
+            pp_size=config.pp_size,
+            dp_size=self.dp_size,
+            spec_algo=config.spec_algo,
+            drafter=self.drafter,
+            grammar_backend=config.grammar_backend,
+            shared_moe_row_masks=self._expert_load_rows is not None
+            or self._mega_moe_live_requests is not None,
+            cache_layers=cache_layers,
+            separate_metadata=self.attn_backend is not self.draft_attn_backend,
         )
-        if (
-            not target_layers
-            or not draft_layers
-            or not target_layers.isdisjoint(draft_layers)
-            or self.attn_backend is self.draft_attn_backend
-        ):
-            raise ValueError(
-                "Draft graph overlap requires separate target/draft cache layers and metadata"
-            )
-        self.draft_overlap = DecodeGraphOverlap()
 
     # ------------------------------------------------------------------
     # Graph capture

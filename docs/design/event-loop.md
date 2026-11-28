@@ -472,6 +472,10 @@ collective state. EAGLE-Harness chains a round's captured graphs on the GPU,
 behind the decode graph (`BaseDrafter.replay_decode_graph`), so what the
 forward queues after that graph (the verified-state commit, the outputs) runs
 beside the round too; an eager round polls a pinned flag to launch each depth.
+Draft graph overlap, on by default for eligible Eagle MTP decode graphs
+(`unified_path.md`), does the same within one captured decode graph: after its
+first draft step, the commit, outputs and next target metadata refresh run
+beside the rest of the draft chain.
 
 A JIT compilation on the forward thread is the same kind of stall, only
 longer: the round waits 100 ms to seconds while a kernel compiles for a new
