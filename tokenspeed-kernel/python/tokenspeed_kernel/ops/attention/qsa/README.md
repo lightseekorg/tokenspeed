@@ -349,6 +349,23 @@ prepares request-limited variants: pure target verification skips the writer
 when there are no extends. Changed table widths and mixed-prefill request
 counts can then reuse startup binaries.
 
+## Selected-slot expansion
+
+`qwen4_exp_qsa_selected_slots` expands each row's selected blocks, plus the
+in-progress compression group, into full-cache slots. Small row counts use
+256-column programs, which spread each row over several programs. Once that
+grid would take four waves of resident programs on the GPU, one program expands
+a whole row as a block-by-member tile instead: each block id is loaded once and
+a block's slots are stored together, with warps scaled to the tile. Alone on
+the GPU the row programs already win from about two waves, but at decode they
+share the SMs with work on other streams and lose there, so the switch keeps a
+two-fold margin. The switch was measured with 2048-token top-k at ratio 4
+(width 2051), whose threshold sits above the 512 rows of an overlapped verify;
+row tiles wider than that one (2048 block-by-member entries) keep the column
+programs. Each column's arithmetic is the same in both layouts, so the slots
+are identical across the switch. Startup warmup compiles both kernels without
+launching the one it does not use.
+
 ## Materialized Triton scoring
 
 The `logits` path materializes FP32 block scores before top-k selection.
