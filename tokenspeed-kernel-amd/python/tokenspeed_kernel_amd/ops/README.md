@@ -118,7 +118,7 @@ Qwen3.8-Flash-Next decode batches.
   (`4, 8, 16, 32, 64, 128, 256`) with a measured config in `_DECODE_CONFIGS`; each
   entry beat `torch.mm` (hipBLASLt) by at least 4%, at the row counts its
   model sends, in cold-cache sweeps at Kimi K3 TP8, Muse Spark TP4/TP8 and
-  Qwen3.8-Flash-Next TP2 shapes; table comments note the exceptions.
+  Qwen3.8-Flash-Next TP1/TP2 shapes; table comments note the exceptions.
 - `launch_gluon_mm_a16w16_decode_add3_gfx950` computes `A @ B.T + X + Y` in
   one launch, adding both BF16 addends to the FP32 accumulator before the
   single rounding. It reuses the decode tile for `M` and accepts only buckets
@@ -221,6 +221,47 @@ a few BF16 rows against a cold `[N, K]` weight whose read dominates.
   reduce is `buffer_load_dwordx4`, 16 bytes a lane.
 - The K split, the MFMA order inside a split, and the split summation order
   depend only on `K` and `SPLIT_K`, which gives the row invariance above.
+
+### gfx950 pipelined BF16 GEMM
+
+`gluon_mm_a16w16_pipelined_gfx950` (`gemm/fp16/pipelined.py`) computes
+`A @ B.T` in one launch of whole-K output tiles: no split-K, no partials,
+counters or reduce kernel.
+
+#### Contract
+
+- `A` is a contiguous `[M, K]` BF16 activation, `B` a contiguous `[N, K]` BF16
+  weight, the output a contiguous `[M, N]` BF16 tensor, all on one GPU and
+  each at a 16-byte aligned address; the launcher refuses others.
+- It runs only the `(N, K)` shapes and row ranges in `_PIPELINED_CONFIGS`,
+  each measured faster than the other `gemm.mv` and `gemm.mm` solutions
+  inside a captured decode-like graph (cold weight, hot activation);
+  `supports_gluon_mm_a16w16_pipelined_gfx950` answers for a problem.
+- M is a runtime argument and no pointer is specialized, so one binary per
+  weight shape serves every row count and every tensor location;
+  `compile_gluon_mm_a16w16_pipelined_gfx950(B)` compiles it without a launch.
+- A row's bits depend only on that row and the weight.
+
+#### Algorithm
+
+- Program `pid` (after an XCD remap that keeps the row tiles of one column
+  tile on one XCD's L2) computes row tile `pid % cdiv(M, BLOCK_M)` of column
+  tile `pid // cdiv(M, BLOCK_M)` over all of K.
+- A and B tiles go straight to LDS `NUM_STAGES - 1` K tiles ahead of the
+  `16x16x32` MFMA that reads them. Both use
+  `compute_efficient_padded_shared_layout`; the load layout is derived from it
+  so each wave's 16-byte-a-lane load fills one 512-element padding interval.
+  Rows past M and columns past N clamp onto the last valid one; the store
+  masks them. The last `NUM_STAGES - 1` iterations reload the last K tile
+  into a buffer no MFMA reads, keeping the wait counts uniform.
+- It is selected where it beat hipBLASLt on MI350X: the Qwen3.8 MoE router
+  (512 x 2560) at 65-320 rows, where hipBLASLt splits K, and the Qwen3.8 LM
+  head (248320 x 2560) at 49-64 rows.
+- Large-M tiles of this form (full-M rows, 64-wide columns) do not beat
+  hipBLASLt on the GDN in_proj or attention QKV at 64-320 rows: with 40 KB of
+  direct-to-LDS loads per 64-wide K step, the loads' cost adds to the MFMA
+  time instead of overlapping it whatever the pipeline depth (3-7 stages), and
+  the texture data unit is busy about 68% of the kernel.
 
 ### gfx950 single- and few-row BF16 GEMV
 
@@ -343,15 +384,21 @@ decode batches, `1 <= M <= 16`, with one program per CU.
   `_PREFERRED_BUCKETS`, where it beat the default (Torch's skinny GEMM at one
   row, the decode GEMM or hipBLASLt above) in cold-cache standalone sweeps.
   Direct calls take any supported shape.
-- One binary per (shape, M bucket): M = 1, and M = 2-16. `M` and `N` are
-  runtime arguments.
+- One binary per (shape, M bucket): M = 1, and M = 2-16. Shapes in
+  `_ROWS_PER_PROGRAM` may take a tile height of their own for the row
+  buckets 1, 2-4, 5-8 and 9-16, and then one binary per such bucket. `M` and
+  `N` are runtime arguments.
 
 #### Algorithm
 
 A program computes `rows = cdiv(N, CUs)` consecutive outputs over full K for
-every row of `x`, padded to a power-of-2 block of `BLOCK_N` rows. Results do
-not depend on `rows`: each output's summation order is fixed by the
-constexprs alone.
+every row of `x`, padded to a power-of-2 block of `BLOCK_N` rows. For the
+shapes and row buckets in `_ROWS_PER_PROGRAM`, a measured tile height
+replaces it: shorter tiles launch several programs per CU, which keeps more
+weight bytes in flight on each CU and trims the power-of-2 padding (a
+16480-wide projection on 256 CUs takes 65 rows a CU, a half-masked 128-row
+block). From M = 2 results do not depend on `rows`: each output's MFMA chain
+is fixed by the constexprs alone.
 
 - M = 1 (FMA tile): waves split the rows; a lane loads 16 bytes of every
   512-element K chunk, so one load instruction reads 1 KB of a row. Lanes keep

@@ -50,8 +50,9 @@ from tokenspeed_kernel.ops.layernorm.triton import (  # noqa: E402
 )
 from tokenspeed_kernel_amd._triton import triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (  # noqa: E402
-    _HALF_TILE_MAX_M,
     _PREFERRED_BUCKETS,
+    _PREFERRED_LAST_M,
+    _ROWS_PER_PROGRAM,
     gluon_gated_norm_gemv_a16w16_gfx950,
     gluon_gemv_a16w16_gfx950,
     gluon_rmsnorm_gemv_a16w16_gfx950,
@@ -161,16 +162,39 @@ def test_gemv_rejects_unsupported_shapes():
         launch_gluon_gemv_a16w16_gfx950(x, w[:, :64], x.new_empty(1, 64))
 
 
-@pytest.mark.parametrize("n,k", sorted(_HALF_TILE_MAX_M))
-@pytest.mark.parametrize("m", [2, 4, 8, 16])
-def test_half_tiles_match_one_program_per_cu_bitwise(m, n, k):
-    """16-row programs keep every column's MFMA chain, so the bits match."""
+# A row count in each row bucket of _ROWS_PER_PROGRAM (1, 2-4, 5-8, 9-16).
+_BUCKET_ROW_COUNT = {1: 1, 4: 3, 8: 7, 16: 13}
+_MEASURED_TILES = [
+    pytest.param(n, k, bucket, id=f"{n}x{k}-m{_BUCKET_ROW_COUNT[bucket]}")
+    for (n, k), buckets in sorted(_ROWS_PER_PROGRAM.items())
+    for bucket in sorted(buckets)
+]
+
+
+@pytest.mark.parametrize("n,k,bucket", _MEASURED_TILES)
+def test_measured_tile_heights_match_reference(n, k, bucket):
+    m = _BUCKET_ROW_COUNT[bucket]
+    torch.manual_seed(n + k + m)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+    launch_gluon_gemv_a16w16_gfx950(x, w, out)
+    torch.testing.assert_close(
+        out, _reference(x, w), rtol=_RTOL[torch.bfloat16], atol=_ATOL
+    )
+
+
+@pytest.mark.parametrize("n,k,bucket", [p for p in _MEASURED_TILES if p.values[2] > 1])
+def test_measured_tile_heights_match_one_program_per_cu_bitwise(n, k, bucket):
+    """Shorter MFMA tiles keep every column's MFMA chain, so the bits match."""
+    m = _BUCKET_ROW_COUNT[bucket]
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
     out = launch_gluon_gemv_a16w16_gfx950(x, w, x.new_empty(m, n))
 
     cus = torch.cuda.get_device_properties(x.device).multi_processor_count
     rows = triton.cdiv(n, cus)
+    assert rows != _ROWS_PER_PROGRAM[(n, k)][bucket]
     one_per_cu = x.new_empty(m, n)
     gluon_gemv_a16w16_gfx950[(triton.cdiv(n, rows),)](
         x,
@@ -190,9 +214,23 @@ def test_half_tiles_match_one_program_per_cu_bitwise(m, n, k):
     )
 
     assert torch.equal(out, one_per_cu)
-    torch.testing.assert_close(
-        out, _reference(x, w), rtol=_RTOL[torch.bfloat16], atol=_ATOL
-    )
+
+
+def test_gemv_compiles_once_per_tile_bucket():
+    # Each row bucket of a measured shape may take its own tile height, so
+    # one launch per bucket covers every row count.
+    n, k = 16480, 2560
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+
+    def run(m):
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        launch_gluon_gemv_a16w16_gfx950(x, w, x.new_empty(m, n))
+
+    for m in (1, 2, 5, 9):
+        run(m)
+    with assert_no_triton_compile(gluon_gemv_a16w16_gfx950):
+        for m in range(1, 17):
+            run(m)
 
 
 def test_gemv_compiles_once_per_row_bucket():
@@ -234,6 +272,8 @@ def test_selection_takes_the_gemv_on_every_listed_bucket():
         for bucket in buckets:
             assert bucket in _BUCKET_ROWS, ((n, k), bucket)
             for m in _BUCKET_ROWS[bucket]:
+                if m > _PREFERRED_LAST_M.get((n, k), 16):
+                    continue
                 selected = _select_mv(
                     m,
                     n,
@@ -417,3 +457,13 @@ def test_rmsnorm_gemv_leaves_other_rows_to_two_launches():
     # A shape where mm keeps its own GEMM.
     other = torch.empty((5000, k), dtype=torch.bfloat16, device="cuda")
     assert not mv_rmsnorm_supported(rows[:, :k], norm_weight, other)
+
+
+def test_selection_leaves_rows_past_the_last_measured_win_to_the_default():
+    n, k = 16480, 2560
+    last = _PREFERRED_LAST_M[(n, k)]
+    for m, expected in ((last, True), (last + 1, False), (16, False)):
+        selected = _select_mv(
+            m, n, k, True, torch.bfloat16, torch.bfloat16, False, True, True
+        )
+        assert (selected is registered_gemv) is expected, m
