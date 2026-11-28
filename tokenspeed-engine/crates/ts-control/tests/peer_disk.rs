@@ -323,6 +323,7 @@ impl Replica {
             let member = Member {
                 geometry: geometry.clone(),
                 bounds: vec![(HOST_BLOCKS + 1) as i64],
+                disk_bounds: Vec::new(),
                 regions: vec![(base, (DEVICE_PAGES * BLOCK_BYTES) as u64)],
             };
             let layout = Arc::new(RegisteredReplica::register([7; 32], wire.to_string().as_bytes(), &[member.encode(0)]).unwrap());
@@ -580,7 +581,9 @@ fn a_holder_pushes_a_prefix_only_its_disk_holds_into_the_readers_landing() {
         holder.settle();
     }
 
-    // The identical lookup now has only Disk pages. A new lease must miss before PIN or DMA.
+    // The holder registered without `disk_bounds` (`!can_push_disk()`), so a
+    // Disk-only prefix still misses cleanly on v1 before PIN or DMA, while
+    // legacy Disk push remains available on the same holder.
     assert!(matches!(
         v1_exchange(&mut holder, &client, &replies, query(2)),
         Message::Offered(_, None)

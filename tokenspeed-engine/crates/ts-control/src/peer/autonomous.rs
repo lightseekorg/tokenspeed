@@ -71,13 +71,16 @@ pub struct Peer {
     scheduler: Arc<Mutex<Scheduler>>,
     epoch: u64,
     device_pin_gate: Arc<servicer::DevicePinGate>,
+    pusher: Arc<dyn PagePusher>,
     port: Option<u16>,
     fence: PeerFence,
     origin: Instant,
     member: usize,
+    quarantine_us: i64,
+    push_timeout: Duration,
     metrics: Option<Arc<ts_metrics::PeerMetrics>>,
     next_sample_us: i64,
-    previous_totals: [u64; 3],
+    previous_totals: [u64; 4],
 }
 
 impl Peer {
@@ -96,6 +99,9 @@ impl Peer {
         if background && replica.len() != 1 {
             return Err(PeerError::Topology);
         }
+        let quarantine_us = settings.timeouts.quarantine_us.max(0);
+        let push_timeout = Duration::from_micros(settings.timeouts.push_us.max(0) as u64);
+        let pusher = transfers.pusher.clone();
         let mut protocol = Protocol::start(
             settings,
             progress,
@@ -144,13 +150,16 @@ impl Peer {
             epoch: 0,
             driver,
             device_pin_gate,
+            pusher,
             port,
             fence,
             origin,
             member,
+            quarantine_us,
+            push_timeout,
             metrics: None,
             next_sample_us: 0,
-            previous_totals: [0; 3],
+            previous_totals: [0; 4],
         })
     }
 
@@ -198,7 +207,7 @@ impl Peer {
         channel: Option<super::VersionedChannel>,
         retirement_bound_ms: u32,
     ) -> Result<(), PeerError> {
-        let (control, fence) = super::coordinated::Control::new(
+        let (mut control, fence) = super::coordinated::Control::new(
             self.origin,
             layout,
             self.member,
@@ -209,8 +218,12 @@ impl Peer {
             },
             channel,
             self.device_pin_gate.clone(),
+            self.pusher.clone(),
             retirement_bound_ms,
+            self.quarantine_us,
+            self.push_timeout,
         );
+        control.logical_meter = self.metrics.clone();
         if control.reader() {
             // The registered driver emits a terminal lookup answer on every path.
             // Keep shard admission deterministic across scheduler replicas.
@@ -414,7 +427,9 @@ impl Peer {
     ) {
         self.metrics = logical.clone();
         if let Some(v) = &mut self.versioned {
-            v.lock().meter = physical.clone();
+            let mut control = v.lock();
+            control.logical_meter = logical.clone();
+            control.meter = physical.clone();
         }
         match &mut self.driver {
             Driver::Rounds(p) => p.set_metrics(logical, physical),
@@ -456,6 +471,8 @@ impl Peer {
             ("pinned_blocks", stats.pinned_blocks),
             ("looking_requests", stats.looking_requests),
             ("landing_requests", stats.landing_requests),
+            ("frozen_targets", stats.frozen_targets),
+            ("frozen_blocks", stats.frozen_blocks),
         ] {
             metrics.snapshot(name, n);
         }
@@ -463,10 +480,16 @@ impl Peer {
             stats.landed_tokens,
             stats.failed_landings,
             stats.unused_host_landings,
+            stats.frozen_landings,
         ];
-        for (i, name) in ["landed_tokens", "failed_landings", "unused_host_landings"]
-            .iter()
-            .enumerate()
+        for (i, name) in [
+            "landed_tokens",
+            "failed_landings",
+            "unused_host_landings",
+            "frozen_landings",
+        ]
+        .iter()
+        .enumerate()
         {
             metrics.increment(name, totals[i].saturating_sub(self.previous_totals[i]));
         }

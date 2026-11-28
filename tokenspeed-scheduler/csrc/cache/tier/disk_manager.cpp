@@ -110,11 +110,14 @@ DiskOperation DiskTransferManager::command(std::uint64_t id, const Ticket& ticke
     DiskOperation op{.kind = ticket.kind, .op_id = id};
     for (std::size_t i = 0; i < ticket.keys.size(); ++i) {
         const auto group = static_cast<std::int32_t>(ticket.keys[i].group_id);
-        op.group_ids.push_back(ticket.keys[i].group_id);
+        const GroupAllocator& allocator = coordinator_.Allocator(group);
         const auto& host =
             ticket.kind == DiskOpKind::kWrite ? ticket.cleaning_sources[i].Block() : ticket.host_blocks[i];
-        op.host_blocks.push_back(coordinator_.Allocator(group).ResolveCacheBlockId(*host));
-        op.disk_blocks.push_back(coordinator_.Allocator(group).ResolveCacheBlockId(*ticket.disk_blocks[i]));
+        _assert(allocator.BucketOf(host->Location()) == allocator.BucketOf(ticket.disk_blocks[i]->Location()),
+                "a Disk operation pairs blocks of different owners");
+        op.group_ids.push_back(ticket.keys[i].group_id);
+        op.host_blocks.push_back(allocator.ResolveCacheBlockId(*host));
+        op.disk_blocks.push_back(allocator.ResolveCacheBlockId(*ticket.disk_blocks[i]));
     }
     return op;
 }
@@ -365,11 +368,16 @@ void DiskTransferManager::StartCleaning() {
             // The pages above it first, nearest the root first, so a cleaned page
             // never waits on the Disk for a parent only the Host holds: a Host
             // placement dropping that parent would leave it unresumable. The
-            // climb stops at a page on the Disk, whose own parents cleaning
-            // wrote before it, or one the Host does not hold.
+            // climb stops at a page on the Disk that has no remaining dirty Host
+            // keys (e.g., partial-OnDisk boundaries where History was cleaned
+            // earlier while SWA/State keys are still dirty on Host), or a page
+            // the Host does not hold.
             std::vector<const BoundaryTree::Node*> chain{node};
-            for (const BoundaryTree::Node* above = node->parent;
-                 above != nullptr && above->OnHost() && !above->OnDisk(); above = above->parent) {
+            for (const BoundaryTree::Node* above = node->parent; above != nullptr && above->OnHost();
+                 above = above->parent) {
+                if (above->OnDisk() && dirty_keys_of(*above).empty()) {
+                    break;
+                }
                 chain.push_back(above);
             }
             std::vector<CacheKey> batch;

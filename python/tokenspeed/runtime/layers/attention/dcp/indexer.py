@@ -201,9 +201,8 @@ def merge_index_candidates_row_owner(
     every rank's candidates with the kernel the all-gather path uses, and two
     all-gathers (positions, then counts) return every row's selection to
     every rank. A row's merge reads the same rank-major candidates as on the
-    all-gather path, so the selection is the same up to the order of equal
-    scores, which neither path prescribes. Every rank must call with the same
-    ``rows`` and record shape.
+    all-gather path, so the selection is the same. Every rank must call with
+    the same ``rows`` and record shape.
 
     Args:
         records: This rank's packed candidates

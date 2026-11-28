@@ -225,6 +225,9 @@ struct PeerFetchDone {
     PeerLeaseId lease;
     bool frozen{false};
 };
+struct PeerTargetRetired {
+    PeerLeaseId lease;
+};
 
 }  // namespace cache
 

@@ -570,13 +570,16 @@ def gated_residual_combine_norm(
     if block > 65536:
         raise ValueError("group_size is too large for the Triton reduction")
     rows = residual.numel() // width
+    platform = current_platform()
     groups_first = (
         4096 <= rows <= 65535
         and groups == 4
         and group_size == 2560
         and residual.dtype in (torch.bfloat16, torch.float16)
-        and current_platform().is_nvidia
-        and current_platform().arch_version == ArchVersion(10, 7)
+        and (
+            (platform.is_nvidia and platform.arch_version == ArchVersion(10, 7))
+            or (platform.is_amd and platform.arch_version == ArchVersion(9, 5))
+        )
     )
     # Reuse each row's block output without exceeding CUDA's grid-y limit.
     grid = (groups, rows) if groups_first else (rows, groups)
