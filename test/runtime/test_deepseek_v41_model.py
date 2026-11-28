@@ -419,6 +419,7 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     adapter.vision = None
     adapter.model = nn.Module()
     adapter.model.config = config
+    adapter.model.expert_placement = None
     with set_default_torch_dtype(dtype), torch.device(device):
         adapter.lm_head = adapter.resolve_lm_head(
             SimpleNamespace(text_config=config), _quant(), ""
@@ -5069,3 +5070,287 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         shared.down_proj.weight_scale_inv,
     )
     assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))
+
+
+def test_expert_placement_flags_and_replicated_checkpoint_load(monkeypatch, tmp_path):
+    from tokenspeed.runtime.models.deepseek_v41_dspark import (
+        DeepseekV41ForCausalLMDSpark,
+    )
+    from tokenspeed.runtime.moe.expert_location import (
+        ExpertLocationMetadata,
+        get_global_expert_location_metadata,
+        set_global_expert_location_metadata,
+    )
+
+    assert DeepseekV41ForCausalLM.supports_expert_placement is True
+    assert DeepseekV41ForCausalLMDSpark.supports_expert_placement is False
+
+    config = _loader_config()
+    config.moe_intermediate_size = 2304
+    # 3 layers x 4 logical experts -> 8 physical slots (2 local slots per EP4 rank),
+    # with rank 1 holding replicas of logical expert 3 in both local slots on layer 0.
+    placement_map = torch.tensor(
+        [
+            [0, 1, 3, 3, 2, 0, 1, 2],
+            [1, 2, 0, 3, 2, 1, 3, 0],
+            [3, 0, 1, 2, 0, 3, 2, 1],
+        ],
+        dtype=torch.int64,
+    )
+    placement = ExpertLocationMetadata.from_physical_to_logical_map(
+        placement_map,
+        num_logical_experts=4,
+        ep_size=4,
+        ep_rank=1,
+        ep_rank_nodes=(0, 0, 0, 0),
+    )
+    mapping = _mapping(1, 4, 4)
+    _mock_loader_hardware(monkeypatch, mapping)
+    monkeypatch.setitem(global_server_args_dict, "enable_eplb", True)
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 4)
+    monkeypatch.setitem(global_server_args_dict, "ep_dispatch_algorithm", "static")
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+
+    previous = get_global_expert_location_metadata()
+    set_global_expert_location_metadata(placement)
+    try:
+        wrapper = SimpleNamespace(text_config=config)
+        with set_default_torch_dtype(torch.bfloat16), torch.device("cpu"):
+            model = DeepseekV41ForCausalLM(
+                wrapper,
+                mapping,
+                _quant(),
+                is_multimodal_active=False,
+                mm_attention_backend=None,
+            )
+        rest = _bind_engram_tables(model, _checkpoint(config), tmp_path)
+        model.load_weights(rest.items())
+
+        # Layer 0 rank 1 holds logical expert 3 in both physical slots (2 and 3).
+        w13_l0 = model.model.layers[0].ffn.experts.w13_weight
+        assert w13_l0.shape[0] == 2
+        assert w13_l0.shape[1] == 2 * 2304
+        assert torch.equal(w13_l0[0], w13_l0[1])
+        # Unpadded lanes keep the distinct value encoded for logical expert 3 (w1=1 -> 128+3*3+1=138).
+        assert (w13_l0[0, : config.moe_intermediate_size] == 138).all()
+        assert (w13_l0[0, config.moe_intermediate_size : 2304] == 0).all()
+
+        routed_weights = model.routed_experts_weights_of_layer
+        assert sorted(routed_weights) == [0, 1, 2]
+        for layer_tensors in routed_weights.values():
+            assert len(layer_tensors) == 4
+            assert all(t.shape[0] == 2 for t in layer_tensors)
+    finally:
+        set_global_expert_location_metadata(previous)
+
+
+def test_v41_moe_placement_dispatch_and_load_recording(monkeypatch):
+    from tokenspeed.runtime.layers.moe.topk import (
+        ExpertLocationDispatchInfo,
+        StandardTopKOutput,
+    )
+    from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
+
+    placement = ExpertLocationMetadata.from_physical_to_logical_map(
+        torch.tensor([[0, 1, 2, 3, 0, 1]], dtype=torch.int64),
+        num_logical_experts=4,
+        ep_size=2,
+        ep_rank=1,
+        ep_rank_nodes=(0, 0),
+    )
+    placement.enable_load_recording(_mapping(1, 2, 2))
+    placement.reserve_load_rows(16)
+
+    class _FakeCudaTensor(torch.Tensor):
+        @property
+        def is_cuda(self) -> bool:
+            return True
+
+    def _make_moe(algorithm: str, all_to_all_ep: bool):
+        moe = v41.DeepseekV41MoE.__new__(v41.DeepseekV41MoE)
+        nn.Module.__init__(moe)
+        gate_w = torch.randn(4, 256, dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
+        moe.gate = SimpleNamespace(
+            weight=gate_w,
+            e_score_correction_bias=torch.zeros(4),
+            bias_vl=None,
+            tid2eid=None,
+        )
+        moe.experts = SimpleNamespace(supports_precomputed_topk=True)
+        moe.topk = v4.DeepseekV4TopK(
+            top_k=2,
+            renormalize=True,
+            correction_bias=moe.gate.e_score_correction_bias,
+            routed_scaling_factor=1.0,
+            hash_routing=False,
+            weights_dtype=torch.float32,
+        )
+        moe.expert_dispatch_info = ExpertLocationDispatchInfo.init_new(
+            layer_id=0,
+            ep_dispatch_algorithm=algorithm,
+            expert_location_metadata=placement,
+            all_to_all_ep=all_to_all_ep,
+        )
+        moe.config = SimpleNamespace(
+            num_experts_per_tok=2, norm_topk_prob=True, n_routed_experts=4
+        )
+        return moe
+
+    def fake_moe_topk(logits, *args, **kwargs):
+        return torch.full((2, 2), 0.5), torch.tensor(
+            [[0, 1], [1, 0]], dtype=torch.int32
+        )
+
+    monkeypatch.setattr(v41, "moe_topk", fake_moe_topk)
+    monkeypatch.setattr(v4, "moe_topk", fake_moe_topk)
+
+    x = torch.randn(2, 256, dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
+
+    # All-to-all static EP maps logical 0->4 and 1->5 (rank 1's own nearest slots)
+    # and records only local_view rows when enabled.
+    res_static = _make_moe("static", True)._compute_topk_output(x, None)
+    assert isinstance(res_static, StandardTopKOutput)
+    assert res_static.topk_ids.tolist() == [[4, 5], [5, 4]]
+    assert placement.physical_load[0].tolist() == [0, 0, 0, 0, 2, 2]
+
+    # ep_dispatch_algorithm == "fake" bypasses the fused gate and maps through physical replicas.
+    placement.reset_load()
+    routing_inputs_called = []
+    monkeypatch.setattr(
+        v41.DeepseekV4MoE,
+        "_routing_inputs",
+        lambda self, h, ids: (
+            routing_inputs_called.append(True)
+            or (torch.zeros(2, 4), torch.zeros(4), None, None)
+        ),
+    )
+    res_fake = _make_moe("fake", True)._compute_topk_output(x, None)
+    assert routing_inputs_called == [True]
+    assert placement.physical_to_logical_map[0, res_fake.topk_ids].tolist() == [
+        [0, 1],
+        [1, 0],
+    ]
+    assert int(placement.physical_load[0, [0, 4]].sum()) == 2
+    assert int(placement.physical_load[0, [1, 5]].sum()) == 2
+
+
+def test_v41_moe_static_placement_and_slot_swap_parity(monkeypatch):
+    from tokenspeed.runtime.layers.moe.topk import ExpertLocationDispatchInfo
+    from tokenspeed.runtime.moe.expert_location import (
+        ExpertLocationMetadata,
+        get_global_expert_location_metadata,
+        set_global_expert_location_metadata,
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    config = _loader_config()
+    config.hidden_size = 512
+    config.n_routed_experts = 8
+    config.num_experts_per_tok = 2
+    config.moe_intermediate_size = 128
+    # 8 logical experts mapped across 12 physical slots (4 replicated experts across 2 EP ranks).
+    placement_row = torch.tensor(
+        [[0, 1, 2, 3, 0, 1, 4, 5, 6, 7, 2, 3]], dtype=torch.int64, device=device
+    )
+    torch.manual_seed(29)
+    tokens, experts = 12, config.n_routed_experts
+    hidden = (torch.randn(tokens, config.hidden_size, device=device) * 0.05).bfloat16()
+    gate_weight = (
+        torch.randn(experts, config.hidden_size, device=device) * 0.05
+    ).bfloat16()
+    gate_weight[:, :experts] += (
+        torch.eye(experts, device=device, dtype=torch.bfloat16) * 1.5
+    )
+    for row in range(tokens):
+        primary = row % experts
+        hidden[row, primary] = 2.0
+        hidden[row, (primary + 3) % experts] = 1.6
+    bias = torch.randn(experts, device=device, dtype=torch.float32) * 0.02
+
+    previous = get_global_expert_location_metadata()
+    try:
+        for ep_rank in (0, 1):
+            placement = ExpertLocationMetadata.from_physical_to_logical_map(
+                placement_row,
+                num_logical_experts=experts,
+                ep_size=2,
+                ep_rank=ep_rank,
+                ep_rank_nodes=(0, 0),
+            )
+            placement.enable_load_recording(_mapping(0, 1, 1))
+            placement.reserve_load_rows(tokens)
+            set_global_expert_location_metadata(placement)
+            monkeypatch.setitem(
+                global_server_args_dict, "ep_dispatch_algorithm", "static"
+            )
+            monkeypatch.setitem(global_server_args_dict, "moe_runner_backend", "triton")
+            with torch.device(device):
+                moe = v41.DeepseekV41MoE(
+                    config, _mapping(0, 1, 1), _quant(), 0, "ffn", None
+                )
+            with torch.no_grad():
+                moe.gate.weight.copy_(gate_weight)
+                moe.gate.e_score_correction_bias.copy_(bias)
+            moe.expert_dispatch_info = ExpertLocationDispatchInfo.init_new(
+                layer_id=0,
+                ep_dispatch_algorithm="static",
+                expert_location_metadata=placement,
+                all_to_all_ep=True,
+            )
+
+            moe.topk.topk_config.router_topk = "fused"
+            fused = moe._compute_topk_output(hidden, None)
+            moe.topk.topk_config.router_topk = "torch"
+            unfused = moe._compute_topk_output(hidden, None)
+
+            fused_order = torch.argsort(fused.topk_ids, dim=-1)
+            unfused_order = torch.argsort(unfused.topk_ids, dim=-1)
+            torch.testing.assert_close(
+                fused.topk_ids.gather(1, fused_order),
+                unfused.topk_ids.gather(1, unfused_order),
+                atol=0,
+                rtol=0,
+            )
+            torch.testing.assert_close(
+                fused.topk_weights.gather(1, fused_order),
+                unfused.topk_weights.gather(1, unfused_order),
+                atol=2e-3,
+                rtol=2e-3,
+            )
+
+        # Verify EPLB slot-swap parity: swap physical slots 6 <-> 7 together with
+        # their physical slot weights and verify routed output invariance.
+        slot_weights = torch.randn(
+            placement_row.shape[1],
+            config.hidden_size,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        placement.reset_load()
+        moe.topk.topk_config.router_topk = "torch"
+        before_out = moe._compute_topk_output(hidden, None)
+        before_val = (
+            slot_weights[before_out.topk_ids] * before_out.topk_weights.unsqueeze(-1)
+        ).sum(dim=1)
+
+        swapped_row = placement_row.clone()
+        swapped_row[0, 6], swapped_row[0, 7] = (
+            swapped_row[0, 7].item(),
+            swapped_row[0, 6].item(),
+        )
+        prepared = placement.prepare_layers([0], swapped_row.cpu())
+        placement.switch_layer(prepared, 0)
+        swapped_weights = slot_weights.clone()
+        swapped_weights[6], swapped_weights[7] = (
+            slot_weights[7].clone(),
+            slot_weights[6].clone(),
+        )
+
+        after_out = moe._compute_topk_output(hidden, None)
+        after_val = (
+            swapped_weights[after_out.topk_ids] * after_out.topk_weights.unsqueeze(-1)
+        ).sum(dim=1)
+        assert not torch.equal(before_out.topk_ids, after_out.topk_ids)
+        torch.testing.assert_close(after_val, before_val, atol=0, rtol=0)
+    finally:
+        set_global_expert_location_metadata(previous)

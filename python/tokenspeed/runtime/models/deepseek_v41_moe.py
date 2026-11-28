@@ -38,14 +38,19 @@ from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo,
     StandardTopKOutput,
     TopK,
     TopKOutput,
+    record_expert_load,
     simulated_router_logits,
+    topk_ids_logical_to_physical,
+    transform_select_experts_inputs,
 )
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.moe.expert_location import get_global_expert_location_metadata
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -148,6 +153,7 @@ class DeepseekV4TopK(TopK):
         routing_correction_bias: torch.Tensor | None = None,
         hash_indices_table: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
+        expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
     ) -> TopKOutput:
         correction_bias = (
             self.topk_config.correction_bias
@@ -156,6 +162,9 @@ class DeepseekV4TopK(TopK):
         )
         if self.simulate_routing:
             router_logits = simulated_router_logits(router_logits)
+        router_logits, correction_bias = transform_select_experts_inputs(
+            router_logits, correction_bias, expert_location_dispatch_info
+        )
         topk_weights, topk_ids = moe_topk(
             router_logits,
             self.topk_config.top_k,
@@ -167,6 +176,19 @@ class DeepseekV4TopK(TopK):
             hash_indices_table=hash_indices_table,
             input_ids=input_ids,
             topk_weights_dtype=self.weights_dtype,
+        )
+        topk_ids = topk_ids_logical_to_physical(
+            topk_ids,
+            expert_location_dispatch_info,
+            num_experts=router_logits.shape[1],
+        )
+        record_expert_load(
+            (
+                None
+                if expert_location_dispatch_info is None
+                else expert_location_dispatch_info.load
+            ),
+            topk_ids,
         )
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
@@ -220,39 +242,24 @@ class DeepseekV4MoE(nn.Module):
         # Petit's VMM-backed collective and auxiliary-stream shared experts do
         # not replay safely together. Keep both branches on the main stream.
         self.stream_fork = StreamFork(None if self.use_gluon_petit else aux_stream)
-        if mapping.moe.ep_size > 1:
-            if global_server_args_dict.get("enable_eplb", False):
-                raise ValueError(
-                    "DeepSeek V4 EP does not support EPLB with precomputed routing."
-                )
-            if global_server_args_dict.get("init_expert_location", "trivial") not in (
-                None,
-                "trivial",
-            ):
-                raise ValueError(
-                    "DeepSeek V4 EP requires trivial expert placement with "
-                    "precomputed routing."
-                )
+        self.expert_placement = get_global_expert_location_metadata()
+        self.num_logical_experts = config.n_routed_experts
+        self.num_physical_experts = (
+            self.expert_placement.num_physical_experts
+            if self.expert_placement is not None
+            else config.n_routed_experts
+        )
         if self.use_mega_moe:
             if mapping.moe.ep_size <= 1:
                 raise ValueError("DeepSeek V4 MegaMoE requires expert parallelism.")
             if mapping.moe.tp_size != 1:
                 raise ValueError("DeepSeek V4 MegaMoE does not support mixed TP/EP.")
-            if global_server_args_dict.get("ep_num_redundant_experts", 0):
+            if self.num_physical_experts % mapping.moe.ep_size != 0:
                 raise ValueError(
-                    "DeepSeek V4 MegaMoE does not support redundant EP experts."
-                )
-            if config.n_routed_experts % mapping.moe.ep_size != 0:
-                raise ValueError(
-                    "DeepSeek V4 MegaMoE requires n_routed_experts divisible by "
+                    "DeepSeek V4 MegaMoE requires physical experts divisible by "
                     "EP size."
                 )
         elif mapping.moe.ep_size > 1:
-            if global_server_args_dict.get("ep_num_redundant_experts", 0):
-                raise ValueError(
-                    "DeepSeek V4 normal EP does not support redundant experts "
-                    "with precomputed routing."
-                )
             if mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires attention TP size 1 or "
@@ -309,7 +316,7 @@ class DeepseekV4MoE(nn.Module):
         )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=config.n_routed_experts,
+            num_experts=self.num_physical_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=routed_quant_config,
@@ -332,6 +339,18 @@ class DeepseekV4MoE(nn.Module):
             persistent_max_num_tokens_per_gpu=(
                 _deepseek_v4_mega_moe_max_num_tokens() if self.use_mega_moe else None
             ),
+        )
+        self.expert_dispatch_info = (
+            ExpertLocationDispatchInfo.init_new(
+                layer_id=layer_index,
+                ep_dispatch_algorithm=global_server_args_dict["ep_dispatch_algorithm"],
+                expert_location_metadata=self.expert_placement,
+                all_to_all_ep=(
+                    self.use_mega_moe or self.experts.supports_all_to_all_ep
+                ),
+            )
+            if self.expert_placement is not None
+            else None
         )
         self.topk = DeepseekV4TopK(
             top_k=config.num_experts_per_tok,
@@ -425,6 +444,15 @@ class DeepseekV4MoE(nn.Module):
     def _renormalize_routing_weights(self) -> bool:
         return self.config.norm_topk_prob
 
+    def get_moe_routed_weights(self) -> list[torch.Tensor]:
+        """Return routed experts' physical slot tensors, ``[num_local, ...]`` each."""
+        return [
+            param.data
+            for name, param in self.experts.named_parameters()
+            if name not in ("correction_bias", "_correction_bias")
+            and "shared_experts" not in name
+        ]
+
     def _compute_topk_output(
         self,
         hidden_states: torch.Tensor,
@@ -439,6 +467,7 @@ class DeepseekV4MoE(nn.Module):
             routing_correction_bias=correction_bias,
             hash_indices_table=hash_indices_table,
             input_ids=routing_input_ids,
+            expert_location_dispatch_info=self.expert_dispatch_info,
         )
 
     def _forward_routed_experts(

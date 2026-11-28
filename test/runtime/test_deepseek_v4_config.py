@@ -320,6 +320,7 @@ class TestDeepseekV4Config:
             experts=routed_experts,
             topk=topk,
             _routing_inputs=routing_inputs,
+            expert_dispatch_info=None,
         )
         return self._bind_deepseek_v4_moe_methods(moe)
 
@@ -665,6 +666,7 @@ class TestDeepseekV4Config:
             experts=routed_experts,
             topk=topk,
             _routing_inputs=routing_inputs,
+            expert_dispatch_info=None,
         )
         return self._bind_deepseek_v4_moe_methods(moe)
 

@@ -73,6 +73,7 @@ from collections import Counter
 from collections.abc import Iterable
 from copy import copy
 from dataclasses import dataclass, replace
+from typing import ClassVar
 from weakref import WeakValueDictionary
 
 import torch
@@ -163,7 +164,11 @@ from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
-from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
+from tokenspeed.runtime.layers.moe.topk import (
+    StandardTopKOutput,
+    record_expert_load,
+    topk_ids_logical_to_physical,
+)
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
 from tokenspeed.runtime.layers.paged_attention import QueryShardGather
 from tokenspeed.runtime.layers.parameter import ModelWeightParameter
@@ -193,7 +198,10 @@ from tokenspeed.runtime.models.deepseek_v41_engram import (
 )
 from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 from tokenspeed.runtime.models.deepseek_v41_vision import DeepseekV41Vision
-from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
+from tokenspeed.runtime.moe.expert_location import (
+    ModelConfigForExpertLocation,
+    get_global_expert_location_metadata,
+)
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     VisionEmbedder,
@@ -202,7 +210,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalForwardContext,
 )
-from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils import LazyValue, add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -1903,12 +1911,14 @@ class DeepseekV41MoE(DeepseekV4MoE):
 
     def _compute_topk_output(self, hidden_states, image_mask):
         gate, config = self.gate, self.topk.topk_config
+        info = self.expert_dispatch_info
         if (
             hidden_states.is_cuda
             and (gate.bias_vl is None or image_mask is None)
             and gate.tid2eid is None
             and not self.topk.simulate_routing
             and self.experts.supports_precomputed_topk
+            and (info is None or info.ep_dispatch_algorithm != "fake")
         ):
             # moe_topk fuses the router GEMM when a kernel supports it.
             try:
@@ -1927,6 +1937,12 @@ class DeepseekV41MoE(DeepseekV4MoE):
             except NoKernelFoundError:
                 pass
             else:
+                topk_ids = topk_ids_logical_to_physical(
+                    topk_ids,
+                    info,
+                    num_experts=gate.weight.shape[0],
+                )
+                record_expert_load(None if info is None else info.load, topk_ids)
                 return StandardTopKOutput(topk_weights, topk_ids, None)
         return super()._compute_topk_output(hidden_states, image_mask)
 
@@ -2564,6 +2580,7 @@ class DeepseekV41Model(nn.Module):
         ):
             raise ValueError("V4.1 layer count and compression ratios disagree")
         self.config, self.mapping = config, mapping
+        self.expert_placement = get_global_expert_location_metadata()
         self.pp_start_layer, self.pp_end_layer = 0, config.num_hidden_layers
         self.engram_hash = None
         self.dspark_capture_layers = ()
@@ -3186,6 +3203,24 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     model_cls = DeepseekV41Model
     logits_processor_cls = _DeepseekV41LogitsProcessor
+    supports_expert_placement: ClassVar[bool] = True
+
+    def post_init(self) -> None:
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: (
+                {}
+                if self.model is None
+                else {
+                    layer_id: layer.ffn.get_moe_routed_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if isinstance(layer.ffn, DeepseekV4MoE)
+                }
+            )
+        )
+
+    @property
+    def routed_experts_weights_of_layer(self):
+        return self._routed_experts_weights_of_layer.value
 
     def __init__(
         self,
@@ -3379,11 +3414,22 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     "weight_scale",
                 ):
                     raise ValueError(f"Unsupported V4.1 expert parameter: {name}")
-                count = self.model.config.n_routed_experts // self.mapping.moe.ep_size
-                for expert in range(
-                    self.mapping.moe.ep_rank * count,
-                    (self.mapping.moe.ep_rank + 1) * count,
-                ):
+                layer_match = re.search(r"(?:^|\.)layers\.(\d+)\.", prefix)
+                if layer_match is None:
+                    raise ValueError(f"Unsupported V4.1 expert parameter: {name}")
+                layer_id = int(layer_match[1])
+                placement = self.model.expert_placement
+                if placement is not None:
+                    local_experts = placement.local_slot_logical_experts(
+                        layer_id, self.mapping.moe.ep_rank
+                    )
+                else:
+                    count = (
+                        self.model.config.n_routed_experts // self.mapping.moe.ep_size
+                    )
+                    start = self.mapping.moe.ep_rank * count
+                    local_experts = range(start, start + count)
+                for expert in local_experts:
                     for shard in ("w1", "w3") if projection == "w13" else ("w2",):
                         field = "scale" if suffix == "weight_scale" else "weight"
                         targets[f"{prefix}.experts.{expert}.{shard}.{field}"] = (
@@ -3519,6 +3565,24 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         params = dict(self.named_parameters())
         targets = self._checkpoint_targets()
         config = self.model.config
+        placement = self.model.expert_placement
+        num_physical_experts = (
+            placement.num_physical_experts
+            if placement is not None
+            else config.n_routed_experts
+        )
+        local_logical_by_layer = (
+            [
+                set(
+                    placement.local_slot_logical_experts(
+                        layer_id, self.mapping.moe.ep_rank
+                    )
+                )
+                for layer_id in range(config.num_hidden_layers)
+            ]
+            if placement is not None
+            else None
+        )
         moe_loader = build_moe_checkpoint_loader(
             params_dict=params,
             expert_schema=ExpertCheckpointSchema(
@@ -3529,13 +3593,14 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 extra_names={},
             ),
             fused_schema=None,
-            num_experts=config.n_routed_experts,
+            num_experts=num_physical_experts,
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             fused_gate_up_as_w13=False,
             include_bias=False,
             fused_load_style="per_expert",
             transpose_local_tensor_non_bias=False,
+            expert_placement=placement,
         )
         seen, loaded = set(), set()
         skipped = Counter()
@@ -3578,8 +3643,12 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                     raise TypeError(
                         f"{raw_name}: expected packed FP4/E8M0, got {tensor.dtype}"
                     )
-                local_count = config.n_routed_experts // self.mapping.moe.ep_size
-                if expert_id // local_count != self.mapping.moe.ep_rank:
+                if local_logical_by_layer is not None:
+                    is_local = expert_id in local_logical_by_layer[layer_id]
+                else:
+                    local_count = config.n_routed_experts // self.mapping.moe.ep_size
+                    is_local = expert_id // local_count == self.mapping.moe.ep_rank
+                if not is_local:
                     skipped["remote_expert"] += 1
                     continue
                 if name not in targets:

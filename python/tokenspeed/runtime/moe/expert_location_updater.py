@@ -257,7 +257,7 @@ class ExpertLocationUpdater:
 def _all_to_all_ep(model: torch.nn.Module) -> bool:
     """Whether the model's MoE layers own all-to-all dispatch (uniform over layers)."""
     flags = {
-        module.supports_all_to_all_ep
+        module.supports_all_to_all_ep or module.plan.get("solution") == "mega_moe"
         for module in model.modules()
         if isinstance(module, MoELayer)
     }
