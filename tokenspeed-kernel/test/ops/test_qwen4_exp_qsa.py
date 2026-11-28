@@ -255,22 +255,22 @@ def test_qwen4_exp_qsa_compress_and_store_matches_torch(device: str) -> None:
     _check_compress_and_store(
         device,
         seed=5,
-        logical=[10, 11, 15],
-        requests=[0, 0, 0],
-        recent_locs=[130, 131, 134],
-        qsa_locs=[0, 263, 0],
+        positions=[10, 11, 15],
+        request_ids=[0, 0, 0],
+        recent_slots=[130, 131, 134],
+        qsa_slots=[0, 263, 0],
     )
 
 
 def test_qwen4_exp_qsa_compress_and_store_keeps_requests_apart(device: str) -> None:
-    # Rows 5 and 6 end groups next to rows of the other request or other positions.
+    # Row 5's group start and a member match under the other request; row 6's at other positions.
     _check_compress_and_store(
         device,
         seed=11,
-        logical=[5, 9, 9, 7, 10, 11, 11],
-        requests=[0, 1, 0, 0, 0, 1, 0],
-        recent_locs=[133, 201, 137, 135, 138, 203, 139],
-        qsa_locs=[0, 0, 0, 0, 0, 300, 263],
+        positions=[5, 9, 8, 7, 10, 11, 11],
+        request_ids=[0, 1, 0, 0, 0, 1, 0],
+        recent_slots=[133, 201, 136, 135, 138, 203, 139],
+        qsa_slots=[0, 0, 0, 0, 0, 300, 263],
     )
 
 
@@ -278,23 +278,24 @@ def _check_compress_and_store(
     device: str,
     *,
     seed: int,
-    logical: list[int],
-    requests: list[int],
-    recent_locs: list[int],
-    qsa_locs: list[int],
+    positions: list[int],
+    request_ids: list[int],
+    recent_slots: list[int],
+    qsa_slots: list[int],
 ) -> None:
     torch.manual_seed(seed)
     ratio, head_dim, rotary_dim, recent_page_size = 4, 16, 8, 64
     compressed_token_page_size, rows_per_page = 256, 64
-    rows = len(logical)
-    logical = torch.tensor(logical, device=device)
-    requests = torch.tensor(requests, device=device)
+    rows = len(positions)
+    logical = torch.tensor(positions, device=device)
+    requests = torch.tensor(request_ids, device=device)
     token_k = torch.randn(rows, 1, head_dim, device=device, dtype=torch.bfloat16)
     raw = torch.randn(4, ratio, 1, head_dim, device=device, dtype=torch.bfloat16)
-    position_values = torch.randint(0, 48, (rows, 3), device=device, dtype=torch.int64)
-    position_cache = torch.randint(0, 48, (4, 3), device=device, dtype=torch.int64)
-    recent_locs = torch.tensor(recent_locs, device=device, dtype=torch.int32)
-    qsa_locs = torch.tensor(qsa_locs, device=device, dtype=torch.int32)
+    # Disjoint ranges make a batch value taken for a cached one, or the reverse, visible.
+    position_values = torch.randint(0, 32, (rows, 3), device=device, dtype=torch.int64)
+    position_cache = torch.randint(32, 64, (4, 3), device=device, dtype=torch.int64)
+    recent_locs = torch.tensor(recent_slots, device=device, dtype=torch.int32)
+    qsa_locs = torch.tensor(qsa_slots, device=device, dtype=torch.int32)
     norm_weight = torch.rand(head_dim, device=device) + 0.5
     epsilon = 1e-6
     cos_sin_cache = torch.randn(64, rotary_dim, device=device)

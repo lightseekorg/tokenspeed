@@ -336,7 +336,7 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
         # Successors may prepare now; their waits still protect these outputs.
         tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
-    # A second program per row normalizes and rotates the query, off the key chain.
+    # A second program per row handles the query so its loads do not delay the key's dependent loads.
     query_program = tl.program_id(1) == 1
     half = rotary_dim // 2
     half_offsets = tl.arange(0, BLOCK_HALF)
@@ -475,7 +475,7 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
         offset = COMPRESS_RATIO - 1 - member
         source = row - offset
         expected = position - offset
-        # Masked loads instead of a branch let every member's tag loads issue at once.
+        # Masked loads let every member's tag loads issue at once.
         safe_source = tl.maximum(source, 0)
         source_request = tl.load(
             request_indices + safe_source, mask=source >= 0, other=-1
