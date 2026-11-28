@@ -2851,6 +2851,20 @@ def test_dspark_rows_reuses_compilation_across_strides_and_pools(device):
             atol=0,
         )
 
+    # Guard against i32 wrap of PAGES * P when slot capacity exceeds 2^31.
+    storage = torch.zeros(1, 64, 512, device=device, dtype=torch.bfloat16)
+    large_pages = (1 << 31) // 64 + 2
+    large_window = storage.as_strided((large_pages, 64, 512), (0, 512, 1))
+    large_vals = torch.randn(2, 512, device=device, dtype=torch.bfloat16)
+    large_pos = torch.tensor([0, 1], dtype=torch.int64, device=device)
+    large_slots = torch.tensor([5, large_pages * 64], dtype=torch.int64, device=device)
+    large_out = torch.empty_like(large_vals)
+    dsv41.dspark_rows(
+        large_vals, weight, 1e-6, large_pos, table, large_window, large_slots, large_out
+    )
+    torch.testing.assert_close(storage[0, 5], large_out[0], rtol=0, atol=0)
+    assert storage[0, :5].count_nonzero() == 0 and storage[0, 6:].count_nonzero() == 0
+
 
 def test_normalize_candidate_blocks_warmup_covers_all_block_buckets(device):
     """Startup warmup of _normalize_candidate_blocks covers all 1..2048 power-of-2 buckets."""
