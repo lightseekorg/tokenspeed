@@ -501,14 +501,45 @@ def test_weight_and_sink_reject_inconsistent_shapes():
 # Candidate transport and head-owner merging share the DCP graph contract.
 
 
+def _threshold_merge_reference(
+    row_ids: torch.Tensor, row_scores: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The merge's selection from row-major exchanged candidates: every valid
+    candidate above the k-th largest valid score and the first tied ones, in
+    candidate order, padded with -1; and the per-row counts."""
+    valid = (row_ids >= 0) & ~torch.isnan(row_scores) & (row_scores > -torch.inf)
+    scores = torch.where(valid, row_scores, -torch.inf)
+    # The k-th largest value is exact even where top-k's tie choice is not.
+    kth = torch.topk(scores, topk, dim=-1).values[:, -1:]
+    above = valid & (scores > kth)
+    tied = valid & (scores == kth)
+    tie_rank = tied.int().cumsum(dim=-1) - 1
+    keep = above | (tied & (tie_rank < topk - above.sum(dim=-1, keepdim=True)))
+    counts = keep.sum(dim=-1)
+    # A stable sort moves kept candidates first without reordering them.
+    order = torch.sort((~keep).int(), dim=-1, stable=True).indices[:, :topk]
+    slot = torch.arange(topk, device=row_ids.device)
+    positions = torch.where(slot < counts[:, None], row_ids.gather(1, order), -1)
+    return positions.int(), counts.int()
+
+
 @pytest.mark.parametrize("rows", [0, 1, 7])
 @pytest.mark.parametrize("degree", [1, 3, 8])
 @pytest.mark.parametrize("width,topk", [(16, 8), (2053, 2049)])
+@pytest.mark.parametrize("tied", [False, True])
 @requires_cuda
-def test_rank_major_merge_preserves_order_and_bits(rows, degree, width, topk):
+def test_rank_major_merge_preserves_order_and_bits(rows, degree, width, topk, tied):
+    generator = torch.Generator(device="cuda").manual_seed(rows + degree + width)
     ids = torch.arange(degree * rows * width, device="cuda", dtype=torch.int32)
     ids = ids.reshape(degree, rows, width) + 2**24 + 1
-    scores = torch.rand((degree, rows, width), device="cuda")
+    shape = (degree, rows, width)
+    if tied:
+        # Four score values: the cutoff falls inside a run of equal scores,
+        # where a top-k may keep different candidates on identical inputs.
+        scores = torch.randint(0, 4, shape, generator=generator, device="cuda")
+        scores = scores.float()
+    else:
+        scores = torch.rand(shape, generator=generator, device="cuda")
     if rows:
         ids[:, 0, -1] = -1
         scores[:, 0, :4] = torch.tensor(
@@ -519,13 +550,9 @@ def test_rank_major_merge_preserves_order_and_bits(rows, degree, width, topk):
     actual, counts = exchange.merge_packed_index_candidates(records, topk=topk)
     row_ids = ids.permute(1, 0, 2).reshape(rows, degree * width)
     row_scores = scores.permute(1, 0, 2).reshape(rows, degree * width)
-    valid = (row_ids >= 0) & ~torch.isnan(row_scores) & (row_scores > -torch.inf)
-    values, order = torch.topk(torch.where(valid, row_scores, -torch.inf), topk, dim=-1)
-    expected = torch.where(values > -torch.inf, row_ids.gather(1, order), -1)
+    expected, expected_counts = _threshold_merge_reference(row_ids, row_scores, topk)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-    torch.testing.assert_close(
-        counts, (values > -torch.inf).sum(1).int(), atol=0, rtol=0
-    )
+    torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("degree", [2, 3, 8])
@@ -574,13 +601,6 @@ def test_rank_major_merge_row_slices_match_full_merge(
     torch.testing.assert_close(
         full_counts, candidates.clamp_max(topk).int(), atol=0, rtol=0
     )
-    # Every candidate's score by position, -inf where invalid.
-    by_position = torch.where(valid, scores, -torch.inf).flatten()
-
-    def selected_scores(positions):
-        picked = by_position[(positions - base).clamp_min(0).long()]
-        picked = torch.where(positions >= 0, picked, -torch.inf)
-        return picked.sort(dim=-1, descending=True).values
 
     owned = rows // degree
     for owner in range(degree):
@@ -588,24 +608,9 @@ def test_rank_major_merge_row_slices_match_full_merge(
         positions, counts = exchange.merge_packed_index_candidates(
             records[:, part].contiguous(), topk=topk
         )
+        # Ties at the cutoff resolve in candidate order, never by batch shape.
         torch.testing.assert_close(counts, full_counts[part], atol=0, rtol=0)
-        if not tied:
-            torch.testing.assert_close(positions, full_positions[part], atol=0, rtol=0)
-            continue
-        # Ties may order or cut differently; scores and fully-selected rows still agree.
-        torch.testing.assert_close(
-            selected_scores(positions),
-            selected_scores(full_positions[part]),
-            atol=0,
-            rtol=0,
-        )
-        whole = candidates[part] <= topk
-        torch.testing.assert_close(
-            positions[whole].sort(dim=-1).values,
-            full_positions[part][whole].sort(dim=-1).values,
-            atol=0,
-            rtol=0,
-        )
+        torch.testing.assert_close(positions, full_positions[part], atol=0, rtol=0)
 
 
 @requires_cuda
@@ -832,7 +837,7 @@ def test_candidate_and_partial_fusions_do_not_recompile():
     run(4)
     with assert_no_triton_compile(
         exchange._extract_rank_major_scores,
-        exchange._gather_selected_candidates,
+        exchange._select_through_threshold,
         dcp._dispatch_dcp_attention_partials,
         dcp._combine_dcp_attention_partials,
     ):

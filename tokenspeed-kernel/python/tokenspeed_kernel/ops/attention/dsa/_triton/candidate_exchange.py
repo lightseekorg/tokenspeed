@@ -71,36 +71,6 @@ def _extract_rank_major_scores(
 
 
 @triton.jit(do_not_specialize=["rows"])
-def _gather_selected_candidates(
-    records,
-    order,
-    values,
-    positions,
-    counts,
-    rows,
-    WIDTH: tl.constexpr,
-    TOPK: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0).to(tl.int64)
-    count = tl.full((), 0, tl.int32)
-    for start in range(0, TOPK, BLOCK):
-        col = start + tl.arange(0, BLOCK)
-        selected = tl.load(order + row * TOPK + col, col < TOPK, other=0)
-        score = tl.load(values + row * TOPK + col, col < TOPK, other=-float("inf"))
-        source, local = selected // WIDTH, selected % WIDTH
-        position = tl.load(
-            records + ((source * rows + row) * WIDTH + local) * 2, col < TOPK, other=-1
-        )
-        valid = (col < TOPK) & (score > -float("inf"))
-        tl.store(
-            positions + row * TOPK + col, tl.where(valid, position, -1), col < TOPK
-        )
-        count += tl.sum(valid.to(tl.int32))
-    tl.store(counts + row, count)
-
-
-@triton.jit(do_not_specialize=["rows"])
 def _select_through_threshold(
     records,
     scores,
@@ -222,23 +192,13 @@ def merge_packed_index_candidates(
 
     The contiguous records keep the collective's source-rank layout. Filtering
     and selection use the same rank/candidate order as a row-major exchange.
-    Returns int32 [rows, topk] positions and [rows] counts; padding is -1.
+    Every KVP rank must select the same candidates from the same records, but
+    ``torch.topk`` may keep different tied candidates on identical inputs
+    (ROCm does), so only its k-th largest score is used and
+    :func:`select_through_threshold` redoes the selection from it.
+    Returns int32 [rows, topk] positions in candidate order and [rows] counts;
+    padding is -1.
     """
-    _, rows, width, _ = records.shape
-    positions = torch.empty((rows, topk), device=records.device, dtype=torch.int32)
-    counts = torch.empty((rows,), device=records.device, dtype=torch.int32)
-    if rows == 0:
-        return positions, counts
-    values, order = torch.topk(rank_major_scores(records), topk, dim=-1)
-    _gather_selected_candidates[(rows,)](
-        records,
-        order,
-        values,
-        positions,
-        counts,
-        rows,
-        WIDTH=width,
-        TOPK=topk,
-        BLOCK=triton.next_power_of_2(min(topk, _MAX_GATHER_BLOCK_SIZE)),
-    )
-    return positions, counts
+    scores = rank_major_scores(records)
+    order = torch.topk(scores, topk, dim=-1).indices
+    return select_through_threshold(records, scores, order, topk=topk)
