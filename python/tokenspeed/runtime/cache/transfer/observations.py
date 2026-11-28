@@ -30,6 +30,8 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from typing import TYPE_CHECKING, NamedTuple
 
+from tokenspeed_kernel.ops.kvcache.host_transfer import BlockTransferBatch
+
 from tokenspeed.runtime.cache.transfer.ops import PrefixLoadTelemetry, RestoreTelemetry
 
 if TYPE_CHECKING:
@@ -61,9 +63,20 @@ class CopyCounts:
 
 
 def count_owned_rows(
-    rows: Iterable[tuple[int, int, int]], groups: Sequence["CacheGroupLayout"]
+    rows: BlockTransferBatch | Iterable[tuple[int, int, int]],
+    groups: Sequence["CacheGroupLayout"],
 ) -> CopyCounts:
     """Count local CacheBlocks and the payload bytes that their fields copy."""
+    if isinstance(rows, BlockTransferBatch):
+        if rows.num_groups > len(groups):
+            raise ValueError(f"Unknown cache group {len(groups)}")
+        nbytes = 0
+        for group, count in enumerate(rows.group_counts):
+            if count:
+                nbytes += count * sum(
+                    field.payload_bytes for field in groups[group].fields
+                )
+        return CopyCounts(rows.total_blocks, nbytes)
     count = 0
     nbytes = 0
     for group, _device, _host in rows:
@@ -97,9 +110,14 @@ class PendingCopyTiming:
     def __init__(
         self, *, batch_id, backend, groups, rows, device_kind, device_module, stream
     ):
-        counts = [0] * len(groups)
-        for group, _device, _host in rows:
-            counts[group] += 1
+        if isinstance(rows, BlockTransferBatch):
+            counts = list(rows.group_counts)
+            if len(counts) < len(groups):
+                counts.extend([0] * (len(groups) - len(counts)))
+        else:
+            counts = [0] * len(groups)
+            for group, _device, _host in rows:
+                counts[group] += 1
         self.batch_id = batch_id
         self.backend = backend
         self.group_ids = tuple(group.group_id for group in groups)

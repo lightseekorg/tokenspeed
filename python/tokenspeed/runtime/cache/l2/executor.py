@@ -56,9 +56,11 @@ from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
 
+import numpy as np
 import torch
 from tokenspeed_engine.scheduler import Cache
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
+    BlockTransferBatch,
     HostTransferWorkspace,
     StagingBuffer,
     transfer_cache_blocks,
@@ -144,6 +146,73 @@ def release_checkpoint_file_cache(
             )
     if cpu_group is not None:
         torch.distributed.barrier(group=cpu_group)
+
+
+_EMPTY_BLOCK_ARRAY = np.empty(0, dtype=np.int64)
+
+
+class _BlockTransferAccumulator:
+    """Zero-boxing per-group array accumulator for columnar cache transfers."""
+
+    __slots__ = ("_num_groups", "_device_chunks", "_host_chunks")
+
+    def __init__(self, num_groups: int) -> None:
+        self._num_groups = int(num_groups)
+        self._device_chunks: list[list[np.ndarray]] | None = None
+        self._host_chunks: list[list[np.ndarray]] | None = None
+
+    def append_pairs(
+        self,
+        device_groups: tuple[np.ndarray, ...],
+        host_groups: tuple[np.ndarray, ...],
+    ) -> None:
+        if self._device_chunks is None:
+            self._device_chunks = [[] for _ in range(self._num_groups)]
+            self._host_chunks = [[] for _ in range(self._num_groups)]
+        assert self._host_chunks is not None
+        for group, (device_ids, host_ids) in enumerate(zip(device_groups, host_groups)):
+            if device_ids.size:
+                self._device_chunks[group].append(device_ids)
+                self._host_chunks[group].append(host_ids)
+
+    def build(self) -> BlockTransferBatch:
+        if self._device_chunks is None or self._host_chunks is None:
+            empty = (_EMPTY_BLOCK_ARRAY,) * self._num_groups
+            return BlockTransferBatch(
+                device_groups=empty,
+                host_groups=empty,
+                group_counts=(0,) * self._num_groups,
+                total_blocks=0,
+            )
+        device_out: list[np.ndarray] = []
+        host_out: list[np.ndarray] = []
+        counts: list[int] = []
+        total = 0
+        for d_list, h_list in zip(self._device_chunks, self._host_chunks):
+            if not d_list:
+                device_out.append(_EMPTY_BLOCK_ARRAY)
+                host_out.append(_EMPTY_BLOCK_ARRAY)
+                counts.append(0)
+            elif len(d_list) == 1:
+                d_arr = d_list[0]
+                device_out.append(d_arr)
+                host_out.append(h_list[0])
+                count = int(d_arr.size)
+                counts.append(count)
+                total += count
+            else:
+                d_arr = np.concatenate(d_list)
+                device_out.append(d_arr)
+                host_out.append(np.concatenate(h_list))
+                count = int(d_arr.size)
+                counts.append(count)
+                total += count
+        return BlockTransferBatch(
+            device_groups=tuple(device_out),
+            host_groups=tuple(host_out),
+            group_counts=tuple(counts),
+            total_blocks=total,
+        )
 
 
 def _ordered_unique(values: Iterable[int]) -> list[int]:
@@ -753,10 +822,11 @@ class HostCacheExecutor:
                 -- the one the plan's Device-to-Device copies and page zeroing
                 run on next.
         """
+        num_groups = self._num_cache_groups()
         ordered_op_ids: list[int] = []
-        ordered_transfers: list[tuple[int, int, int]] = []
+        ordered_transfers = _BlockTransferAccumulator(num_groups)
         pinned_op_ids: list[int] = []
-        pinned_transfers: list[tuple[int, int, int]] = []
+        pinned_transfers = _BlockTransferAccumulator(num_groups)
         snapshot_ops: list[SnapshotOp] = []
         snapshot_transfers: list[tuple[int, int, int]] = []
         # The whole plan is validated and translated before the first launch:
@@ -779,7 +849,7 @@ class HostCacheExecutor:
         try:
             fence = self._start_writing(
                 ordered_op_ids,
-                ordered_transfers,
+                ordered_transfers.build() if ordered_op_ids else (),
                 lane=self._ordered_write_lane,
                 prerequisite_stream=prerequisite_stream,
             )
@@ -804,7 +874,7 @@ class HostCacheExecutor:
             fence_stream.wait_event(fence)
         self._start_writing(
             pinned_op_ids,
-            pinned_transfers,
+            pinned_transfers.build() if pinned_op_ids else (),
             lane=self._pinned_write_lane,
             prerequisite_stream=prerequisite_stream,
         )
@@ -836,8 +906,9 @@ class HostCacheExecutor:
                 the store fence and the forwards in flight, so no earlier
                 write to a destination lands after its copy.
         """
+        num_groups = self._num_cache_groups()
         op_ids: list[int] = []
-        transfers: list[tuple[int, int, int]] = []
+        transfers = _BlockTransferAccumulator(num_groups)
         restore_ops: list[RestoreOp] = []
         load_observations = []
         restore_observations = []
@@ -847,13 +918,14 @@ class HostCacheExecutor:
         }
         for operation in cache_ops:
             if isinstance(operation, Cache.LoadBackOp):
-                self._append_transfers(
-                    operation.op_ids,
+                batch_op_ids = operation.op_ids
+                self._append_columnar_batch(
+                    batch_op_ids,
                     operation.group_ids,
                     operation.src_pages,
                     operation.dst_pages,
                     collected_op_ids=op_ids,
-                    transfers=transfers,
+                    accumulator=transfers,
                     source_is_device=False,
                     tier=HostTier.L2,
                 )
@@ -861,21 +933,26 @@ class HostCacheExecutor:
                     # An unobserved wire batch has no trustworthy admission
                     # identity. Keep its ACK and report missing evidence.
                     load_observations.append(
-                        ObservationBatch(dropped=len(operation.op_ids))
+                        ObservationBatch(dropped=len(batch_op_ids))
                     )
             elif isinstance(operation, PrefixLoadOp):
-                start = len(transfers)
-                self._append_transfers(
-                    [operation.op_id],
-                    [[row.group_id for row in operation.transfers]],
-                    [[row.source_page for row in operation.transfers]],
-                    [[row.destination_page for row in operation.transfers]],
-                    collected_op_ids=op_ids,
-                    transfers=transfers,
+                op_acc = (
+                    _BlockTransferAccumulator(num_groups)
+                    if self._cache_observations.enabled
+                    else None
+                )
+                d_groups, h_groups = self._translate_columnar_op(
+                    operation.op_id,
+                    [row.group_id for row in operation.transfers],
+                    [row.source_page for row in operation.transfers],
+                    [row.destination_page for row in operation.transfers],
                     source_is_device=False,
                     tier=HostTier.L2,
                 )
-                if self._cache_observations.enabled:
+                op_ids.append(int(operation.op_id))
+                transfers.append_pairs(d_groups, h_groups)
+                if op_acc is not None:
+                    op_acc.append_pairs(d_groups, h_groups)
                     load_observations.append(
                         observe_copy(
                             kind="prefix_load",
@@ -883,7 +960,7 @@ class HostCacheExecutor:
                             request_id=operation.request_id,
                             request_pool_index=operation.telemetry.request_pool_index,
                             telemetry=operation.telemetry,
-                            l2=count_owned_rows(transfers[start:], self.layout.groups),
+                            l2=count_owned_rows(op_acc.build(), self.layout.groups),
                             pool=CopyCounts(0, 0),
                             slot_state_image_bytes=0,
                         )
@@ -899,7 +976,7 @@ class HostCacheExecutor:
         # it rides the same stream behind them instead of delaying them.
         load_index = self._start_loading(
             op_ids,
-            transfers,
+            transfers.build() if op_ids else (),
             prerequisite_stream=prerequisite_stream,
             observations=ObservationBatch(
                 tuple(
@@ -925,34 +1002,106 @@ class HostCacheExecutor:
                 ),
             )
 
+    def _num_cache_groups(self) -> int:
+        if self.block_owners is not None:
+            return self.block_owners.num_groups
+        if self.snapshot_block_owners is not None:
+            return self.snapshot_block_owners.num_groups
+        return len(self.layout.groups)
+
+    def _translate_columnar_op(
+        self,
+        op_id: int,
+        groups: Sequence[int],
+        sources: Sequence[int],
+        destinations: Sequence[int],
+        *,
+        source_is_device: bool,
+        tier: HostTier,
+    ) -> tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...]]:
+        # An op with no rows at all is a malformed plan: the scheduler
+        # would hold a ticket for a copy nobody performs.
+        if len(groups) == 0:
+            raise ValueError(f"cache operation {op_id} carries no transfers")
+        if not (len(groups) == len(sources) == len(destinations)):
+            raise ValueError(f"ragged cache operation {op_id}")
+        device_blocks, host_blocks = (
+            (sources, destinations) if source_is_device else (destinations, sources)
+        )
+        return self._owners(tier).owned_group_pairs(groups, device_blocks, host_blocks)
+
+    def _append_columnar_batch(
+        self,
+        operation_ids: Sequence[int],
+        group_ids: Sequence[Sequence[int]],
+        src_blocks: Sequence[Sequence[int]],
+        dst_blocks: Sequence[Sequence[int]],
+        *,
+        collected_op_ids: list[int],
+        accumulator: _BlockTransferAccumulator,
+        source_is_device: bool,
+        tier: HostTier,
+    ) -> None:
+        if not (
+            len(operation_ids) == len(group_ids) == len(src_blocks) == len(dst_blocks)
+        ):
+            raise ValueError("ragged cache operation batch")
+        for op_id, groups, sources, destinations in zip(
+            operation_ids, group_ids, src_blocks, dst_blocks
+        ):
+            d_groups, h_groups = self._translate_columnar_op(
+                op_id,
+                groups,
+                sources,
+                destinations,
+                source_is_device=source_is_device,
+                tier=tier,
+            )
+            collected_op_ids.append(int(op_id))
+            accumulator.append_pairs(d_groups, h_groups)
+
     def _append_write_backs(
         self,
         operation,
         *,
         ordered_op_ids: list[int],
-        ordered_transfers: list[tuple[int, int, int]],
+        ordered_transfers: _BlockTransferAccumulator,
         pinned_op_ids: list[int],
-        pinned_transfers: list[tuple[int, int, int]],
+        pinned_transfers: _BlockTransferAccumulator,
     ) -> None:
+        # Read nanobind vector attributes once outside the loop so multi-op
+        # batches never repeatedly marshal C++ std::vector fields to Python.
         source_pinned = operation.source_pinned
-        if len(source_pinned) != len(operation.op_ids):
+        op_ids = operation.op_ids
+        group_ids = operation.group_ids
+        src_pages = operation.src_pages
+        dst_pages = operation.dst_pages
+        if not (
+            len(source_pinned)
+            == len(op_ids)
+            == len(group_ids)
+            == len(src_pages)
+            == len(dst_pages)
+        ):
             raise ValueError("ragged cache operation batch")
-        for index, pinned in enumerate(source_pinned):
-            op_ids, transfers = (
+        for op_id, groups, sources, destinations, pinned in zip(
+            op_ids, group_ids, src_pages, dst_pages, source_pinned
+        ):
+            d_groups, h_groups = self._translate_columnar_op(
+                op_id,
+                groups,
+                sources,
+                destinations,
+                source_is_device=True,
+                tier=HostTier.L2,
+            )
+            target_op_ids, target_acc = (
                 (pinned_op_ids, pinned_transfers)
                 if pinned
                 else (ordered_op_ids, ordered_transfers)
             )
-            self._append_transfers(
-                operation.op_ids[index : index + 1],
-                operation.group_ids[index : index + 1],
-                operation.src_pages[index : index + 1],
-                operation.dst_pages[index : index + 1],
-                collected_op_ids=op_ids,
-                transfers=transfers,
-                source_is_device=True,
-                tier=HostTier.L2,
-            )
+            target_op_ids.append(int(op_id))
+            target_acc.append_pairs(d_groups, h_groups)
 
     def _owners(self, tier: HostTier) -> BlockOwnerTranslation:
         """The ownership translation of one Host tier; raises without the tier."""
