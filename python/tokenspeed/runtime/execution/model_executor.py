@@ -28,13 +28,18 @@ from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+import numpy as np
 import torch
 from tokenspeed_kernel.ops.gemm.hipblaslt import (
     hipblaslt_autotune_enabled,
     hipblaslt_online_tuning,
     load_hipblaslt_tuned_solutions,
 )
-from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
+from tokenspeed_kernel.ops.metadata import (
+    Reg,
+    advance_accepted_frontier,
+    expand_block_table_rows,
+)
 from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.tuning import (
@@ -61,6 +66,7 @@ from tokenspeed.runtime.execution.accept_simulation import (
     simulated_output_tokens,
 )
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
+from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.context import ForwardContext, InputLogprobRows
 from tokenspeed.runtime.execution.cudagraph_memory import (
     CapturedLadder,
@@ -76,6 +82,7 @@ from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
+    compute_position_triton,
 )
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner, freeze_gc
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -1427,6 +1434,7 @@ class ModelExecutor:
                             batch_sizes=tuple(self.forward_step.capture_bs),
                             graph_phase=False,
                         )
+                self._warmup_runtime_and_scheduler_kernels()
                 if self._samples_from_vocab_shard:
                     self._warmup_vocab_shard_sampling()
         finally:
@@ -1437,6 +1445,135 @@ class ModelExecutor:
             save_autotune_cache(cache_path, cpu_group, owner_rank)
 
         logger.info(f"Kernel startup warmup finished in {time.time() - tic:.1f}s")
+
+    def _warmup_runtime_and_scheduler_kernels(self) -> None:
+        """Warm prefill, arena, metadata, stop, sampling, and n-gram kernels."""
+        self.attn_backend.warmup_prefill_kernels()
+        if self.draft_attn_backend is not None:
+            self.draft_attn_backend.warmup_prefill_kernels()
+
+        seen_arenas: set[int] = set()
+        for pool in (self.token_to_kv_pool, self.draft_token_to_kv_pool):
+            if pool is None:
+                continue
+            arena = pool.arena
+            if id(arena) in seen_arenas:
+                continue
+            seen_arenas.add(id(arena))
+            page_counts = _cache_arena_attr(pool, "cache_group_page_counts", None)
+            if not page_counts:
+                continue
+            # Page 0 is the reserved null hole: copy 1 -> 0 then zero 0 so
+            # every cache group warms both kernels without mutating live pages.
+            copy_pairs = {
+                spec.group_id: np.array([[1, 0]], dtype=np.int32)
+                for spec in arena.cache_group_specs
+                if page_counts.get(spec.group_id, 0) >= 2
+            }
+            if copy_pairs:
+                arena.copy_blocks(copy_pairs)
+            zero_pages = {
+                spec.group_id: np.array([0], dtype=np.int32)
+                for spec in arena.cache_group_specs
+                if page_counts.get(spec.group_id, 0) >= 1
+            }
+            if zero_pages:
+                arena.zero_blocks(zero_pages)
+
+        ib = self.input_buffers
+        device = torch.device(self.device)
+        positions_scratch = torch.zeros((1,), dtype=torch.int64, device=device)
+        seq_lens_scratch = torch.zeros((1,), dtype=torch.int32, device=device)
+        fused_decode_input_prep(
+            positions_scratch,
+            seq_lens_scratch,
+            torch.zeros((1,), dtype=torch.int64, device=device),
+            self.runtime_states.valid_cache_lengths,
+            1,
+        )
+        extend_seq_lens = torch.ones((1,), dtype=torch.int32, device=device)
+        compute_position_triton(
+            torch.zeros((0,), dtype=torch.int32, device=device),
+            extend_seq_lens,
+            1,
+            out=positions_scratch,
+        )
+        compute_position_triton(
+            torch.zeros((1,), dtype=torch.int32, device=device),
+            extend_seq_lens,
+            1,
+            out=positions_scratch,
+        )
+        if device.type == "cuda":
+            # Resetting from 0 scrubs any dummy extend values written during
+            # warmup while compiling the PrepTape kernel.
+            ib._pad_tape.run({Reg.TOKENS: 0, Reg.BS: 0})
+        expand_block_table_rows(
+            torch.tensor([[0, 1, 0, 1, 0]], dtype=torch.int32, device=device),
+            torch.zeros((1,), dtype=torch.int32, device=device),
+            torch.zeros((1,), dtype=torch.int32, device=device),
+        )
+
+        padding_index = ib.state_write_padding_pool_index
+        padding_slots = torch.full(
+            (1,), padding_index, dtype=torch.int64, device=device
+        )
+        decode_widths = {1}
+        if self.drafter is not None:
+            decode_widths.add(self.drafter.spec_num_tokens)
+        ones_i32 = torch.ones((1,), dtype=torch.int32, device=device)
+        ends_scratch = torch.zeros((1,), dtype=torch.int32, device=device)
+        for decode_width in sorted(decode_widths):
+            # Target padding_index so runtime_states.stopped and frontiers stay
+            # untouched across prefill (width=1) and decode verify widths.
+            self.runtime_states.apply_stop_conditions(
+                padding_slots,
+                torch.zeros((decode_width,), dtype=torch.int32, device=device),
+                ones_i32.clone(),
+                ones_i32,
+                ones_i32,
+                ends_scratch,
+                num_extends=0,
+                num_prefill_outputs=0,
+                decode_width=decode_width,
+                padding_index=padding_index,
+            )
+
+        if self.sampling_backend._sampling_offsets_pool is not None:
+            sample_padding = torch.zeros((1,), dtype=torch.int64, device=device)
+            for extend_lengths in (None, ones_i32):
+                self.sampling_backend._prepare_sampling_offsets(
+                    SamplingBatchInfo(
+                        req_pool_indices=sample_padding,
+                        valid_cache_lengths=self.runtime_states.valid_cache_lengths,
+                        extend_lengths=extend_lengths,
+                        vocab_size=self.runtime_states.vocab_size,
+                        device=device,
+                    )
+                )
+
+        tail = self.runtime_states.ngram_accepted_tokens
+        if (
+            tail is not None
+            and ib.ngram_previous_tokens_buf is not None
+            and ib.ngram_token_mask_buf is not None
+            and ib.ngram_prefix_buf is not None
+            and self.runtime_states.ngram_needs_seed is not None
+        ):
+            commit_ngram_inputs(
+                padding_slots,
+                ones_i32,
+                ones_i32,
+                ib.input_ids_buf,
+                ib.ngram_previous_tokens_buf,
+                ib.ngram_token_mask_buf,
+                ib.ngram_prefix_buf[:1],
+                tail,
+                self.runtime_states.ngram_needs_seed,
+                self.runtime_states.valid_cache_lengths,
+                0,
+                padding_index,
+            )
 
     def _warmup_vocab_shard_sampling(self) -> None:
         """Compile the sampler's selection from vocabulary shards before serving.

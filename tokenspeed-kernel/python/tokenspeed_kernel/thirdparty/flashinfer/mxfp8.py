@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import os
 import types
 
 from flashinfer.gemm import gemm_base
@@ -68,12 +69,12 @@ def _mxfp8_runner_type(*args, **kwargs):
     return TokenspeedMxfp8GemmRunner
 
 
+@functools.cache
 def _mxfp8_runner(*args, **kwargs):
     return _mxfp8_runner_type(*args, **kwargs)()
 
 
-@functools.cache
-def _private_mm_mxfp8():
+def _clone_mm_mxfp8():
     raw = inspect.unwrap(gemm_base.mm_mxfp8)
     namespace = dict(raw.__globals__)
     namespace["_cute_dsl_gemm_mxfp8_runner"] = _mxfp8_runner
@@ -82,6 +83,19 @@ def _private_mm_mxfp8():
     )
     clone.__kwdefaults__ = raw.__kwdefaults__
     clone.__annotations__ = raw.__annotations__
+    return clone, namespace
+
+
+@functools.cache
+def _raw_mm_mxfp8():
+    clone, namespace = _clone_mm_mxfp8()
+    namespace["mm_mxfp8"] = clone
+    return clone
+
+
+@functools.cache
+def _private_mm_mxfp8():
+    clone, namespace = _clone_mm_mxfp8()
     # Preserve upstream argument validation and backend selection around the
     # private body; only the cute-dsl runner factory is replaced.
     clone = gemm_base.flashinfer_api(trace=gemm_base.mm_mxfp8_trace)(clone)
@@ -102,4 +116,8 @@ def _private_mm_mxfp8():
 
 
 def mm_mxfp8(*args, **kwargs):
+    if kwargs.get("backend") == "cute-dsl" and not os.environ.get(
+        "FLASHINFER_LOGLEVEL"
+    ):
+        return _raw_mm_mxfp8()(*args, **kwargs)
     return _private_mm_mxfp8()(*args, **kwargs)

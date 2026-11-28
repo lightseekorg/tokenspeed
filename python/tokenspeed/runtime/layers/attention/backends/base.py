@@ -598,6 +598,10 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Allocate static buffers the breakable prefill graphs bake.
         Default: no-op — attention stays eager at the break points."""
 
+    def warmup_prefill_kernels(self) -> None:
+        """Warm prefill-only paths that synthetic empty-prefix warmups miss.
+        Default: no-op."""
+
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         """Allocate graph-stable target verify buffers and return their bytes.
 

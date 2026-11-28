@@ -293,8 +293,8 @@ def test_fused_decode_matches_canonical_and_keeps_prefill_weights(
         fused_attention_outputs.append(result)
         return result
 
-    def observe_projection(x, scales, weight, weight_scales, out):
-        result = project(x, scales, weight, weight_scales, out)
+    def observe_projection(x, scales, weight, weight_scales, out, plan=None):
+        result = project(x, scales, weight, weight_scales, out, plan=plan)
         projection_inputs.append((x, scales))
         return result
 

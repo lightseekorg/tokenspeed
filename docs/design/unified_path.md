@@ -934,7 +934,18 @@ the padded tail on every leaf. Sequential
 breaks may reuse handoffs after their previous results are consumed, and captures
 that never replay concurrently may share those storage slots across token buckets.
 Tensor inputs keep their weak storage aliases and context arguments are rebound
-to the live forward context, independently of the output structure.
+to the live forward context, independently of the output structure. For
+non-contiguous handoff leaves (such as MN-major 4-row-aligned scale matrices),
+`HandoffStorage` sizes the backing allocation in flat element capacity over a
+zero-initialized 1D buffer and returns an `as_strided` view sized for each
+bucket, allowing widest-first bucket captures with distinct aligned row strides
+to share one HBM slot without stride-mismatch rejections.
+
+An attention layer whose projections, RMSNorm, RoPE, and FP8 quantization run
+before and after the core attention break places the `@break_point` on the
+inner attention-and-KV call when breakable prefill capture is active for full
+(non-sharded) rows, so those dense ops remain captured in adjacent graph
+segments instead of running eagerly across the whole attention block.
 
 ### One output layout per forward
 

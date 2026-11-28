@@ -3597,6 +3597,9 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         encoder_capture = BreakableCapture()
         with encoder_capture:
             encoder_state = encoder(ctx)
+        # Inner @break_point on _sparse_attention_and_kv keeps projections
+        # captured across multiple segments around each sparse attention break.
+        assert len(encoder_capture.segments) > 3
         encoder_capture.replay()
     assert encoder_state.rows == bucket
     # Decoder capture: two completing requests of at most a window each, so
@@ -3640,6 +3643,7 @@ def _assert_split_prefill_graph_matches_eager(adapter, backend, tables):
         decoder_capture = BreakableCapture(pool=encoder_capture.pool)
         with decoder_capture:
             decoder_hidden, decoder_taps = model.decoder_forward(statics, ctx)
+        assert len(decoder_capture.segments) > 3
         rearm()
         decoder_capture.replay()
     torch.cuda.synchronize()
@@ -5069,3 +5073,137 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         shared.down_proj.weight_scale_inv,
     )
     assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_dsv41_attention_inner_breakpoint_captures_projections_and_matches_eager(
+    monkeypatch,
+):
+    """During breakable prefill capture, DeepseekV41Attention places the
+    @break_point around _sparse_attention_and_kv so pre-/post-attention
+    projections stay inside graph segments."""
+    from tokenspeed.runtime.execution.breakable_cuda_graph import (
+        BreakableCapture,
+        active_forward,
+    )
+    from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", True
+    )
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    config = _config()
+    config.hidden_size = 256
+    config.moe_intermediate_size = 256
+    config.num_attention_heads = config.o_groups = config.index_n_heads = 2
+    config.head_dim, config.index_head_dim = 512, 128
+    config.qk_rope_head_dim, config.q_lora_rank = 64, 128
+    config.o_lora_rank = 128
+
+    torch.manual_seed(41)
+    with torch.device("cuda:0"):
+        attn = DeepseekV41Attention(
+            config,
+            _mapping(0, 1, 1),
+            2,
+            v41._ced_decoder_start(config),
+            v41_mxfp8_config(_quant()),
+            "layers.2.attn",
+            aux_stream=None,
+        )
+    _initialize(attn)
+    for module in attn.modules():
+        if isinstance(module, LinearBase):
+            module.quant_method.process_weights_after_loading(module)
+            if isinstance(
+                module.quant_method, (Fp8LinearMethod, v41._ReferenceFp8LinearMethod)
+            ):
+                module.quant_method.prepare_weight_scales(module)
+    attn.prepare_output_projections()
+
+    backend = _backend("cuda:0", 2)
+    tables = _tables("cuda:0")
+    x = torch.randn(4, config.hidden_size, dtype=torch.bfloat16, device="cuda:0")
+    capturing_at_out_proj: list[bool] = []
+    orig_output_projections = attn._output_projections
+
+    def tracked_output_projections(*args, **kwargs):
+        capturing_at_out_proj.append(torch.cuda.is_current_stream_capturing())
+        return orig_output_projections(*args, **kwargs)
+
+    monkeypatch.setattr(attn, "_output_projections", tracked_output_projections)
+    cap = BreakableCapture()
+    with active_forward(_ctx(backend, 4, ForwardMode.EXTEND)):
+        cap.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap.stream):
+            for _ in range(2):
+                backend.cache_pool.arena.buffer.zero_()
+                meta = _extend(backend, tables, [4], [0], [0], [4])
+                attn(
+                    meta.positions,
+                    x,
+                    _ctx(backend, 4, ForwardMode.EXTEND),
+                    reduce_output=True,
+                )
+        cap.stream.synchronize()
+        capturing_at_out_proj.clear()
+        backend.cache_pool.arena.buffer.zero_()
+        meta = _extend(backend, tables, [4], [0], [0], [4])
+        ctx = _ctx(backend, 4, ForwardMode.EXTEND)
+        with active_forward(ctx), cap:
+            captured = attn(meta.positions, x, ctx, reduce_output=True)
+    # Segment 0 (pre-attn projections) -> break (_sparse_attention_and_kv) -> Segment 2 (_output_projections).
+    assert len(cap.segments) == 3
+    assert capturing_at_out_proj == [True]
+
+    backend.cache_pool.arena.buffer.zero_()
+    meta = _extend(backend, tables, [4], [0], [0], [4])
+    with active_forward(_ctx(backend, 4, ForwardMode.EXTEND)):
+        cap.replay()
+    torch.cuda.synchronize()
+
+    backend.cache_pool.arena.buffer.zero_()
+    meta = _extend(backend, tables, [4], [0], [0], [4])
+    expected = attn(
+        meta.positions, x, _ctx(backend, 4, ForwardMode.EXTEND), reduce_output=True
+    )
+    torch.testing.assert_close(captured, expected, rtol=1e-2, atol=1e-2)
+
+    for fused_flag in (False, True):
+        idle_out = attn._sparse_attention_and_kv(
+            _ctx(backend, 0, ForwardMode.IDLE),
+            x.new_empty((0, attn.n_local_heads, attn.head_dim)),
+            x.new_empty((0, attn.head_dim)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            fused_flag,
+        )
+        if fused_flag:
+            assert idle_out[0].shape[0] == 0 and idle_out[1].shape[0] == 0
+        else:
+            assert idle_out.shape == (0, attn.n_local_heads, attn.head_dim)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_v41_warmup_prefill_kernels_skips_negative_kv_owners():
+    """warmup_prefill_kernels() skips global cache warmup when kv_owners are all -1."""
+    from test.runtime.test_deepseek_v41_cache import _recipe
+
+    from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+        DeepseekV41AttentionBackend,
+    )
+
+    backend = _backend("cuda:0", 2)
+    backend.warmup_prefill_kernels()
+    swa_only = DeepseekV41AttentionBackend(
+        _recipe("cuda:0").attn_config, replace(backend.spec, kv_owners=(-1,))
+    )
+    swa_only.set_cache_pool(backend.cache_pool)
+    swa_only.warmup_prefill_kernels()

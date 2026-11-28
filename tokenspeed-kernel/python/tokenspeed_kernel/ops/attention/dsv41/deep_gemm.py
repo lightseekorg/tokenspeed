@@ -293,26 +293,42 @@ def _paged_scores(
     )
 
 
-def _pack_index_keys(cache, page_table, history_rows):
+def _pack_index_keys(cache, page_table, history_rows, index_metadata=None):
     """Gather each request history once into one packed key buffer.
 
     history_rows gives the consecutive query rows sharing one history. Returns
     (keys, scales) for all histories back to back, the flattened history page
     list they came from, and each row's int32 start.
-    Host ints only drive slicing and fills, so no host-device copy or sync.
+    Host ints only drive slicing and vectorized expansion, avoiding per-request
+    kernel launch loops and caching geometry within a shared IndexMetadata.
     """
     page_size = 64
-    span = page_table.shape[1] * page_size
-    starts = torch.empty(
-        page_table.shape[0], dtype=torch.int32, device=page_table.device
-    )
-    rows = []
-    first = 0
-    for run, count in enumerate(history_rows):
-        rows.append(page_table[first : first + 1])
-        starts[first : first + count].fill_(run * span)
-        first += count
-    pages = rows[0][0] if len(rows) == 1 else torch.cat(rows).reshape(-1)
+    columns = page_table.shape[1]
+    span = columns * page_size
+    entry = None if index_metadata is None else index_metadata.dense.get(columns)
+    if entry is None:
+        num_runs = len(history_rows)
+        if num_runs == 1:
+            pages = page_table[0]
+            starts = torch.zeros(
+                page_table.shape[0], dtype=torch.int32, device=page_table.device
+            )
+        else:
+            counts = torch.tensor(history_rows, dtype=torch.int64, device="cpu")
+            firsts = torch.empty(num_runs, dtype=torch.int64, device="cpu")
+            firsts[0] = 0
+            torch.cumsum(counts[:-1], dim=0, out=firsts[1:])
+            run_starts = torch.arange(num_runs, dtype=torch.int32, device="cpu") * span
+            starts_cpu = torch.repeat_interleave(
+                run_starts, counts, output_size=page_table.shape[0]
+            )
+            firsts_dev = firsts.to(device=page_table.device, non_blocking=True)
+            starts = starts_cpu.to(device=page_table.device, non_blocking=True)
+            pages = page_table.index_select(0, firsts_dev).reshape(-1)
+        if index_metadata is not None:
+            index_metadata.dense[columns] = (pages, starts)
+    else:
+        pages, starts = entry
     return gather_index_pages(cache, pages, page_size), pages, starts
 
 
@@ -453,7 +469,7 @@ def index_topk(
     key_offsets = None
     if dense:
         keys, history_pages, key_offsets = _pack_index_keys(
-            cache, page_table, history_rows
+            cache, page_table, history_rows, index_metadata
         )
     for begin in range(0, n, tile):
         end = min(begin + tile, n)

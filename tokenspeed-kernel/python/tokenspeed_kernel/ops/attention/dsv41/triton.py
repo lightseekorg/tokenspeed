@@ -2043,7 +2043,7 @@ def _dspark_row_value(
     return restored
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["PAGES"])
 def _dspark_rows_kernel(
     X,
     W,
@@ -2090,7 +2090,7 @@ def _dspark_rows_kernel(
         tl.store(OUT + token * O0 + d, restored)
     if HAS_WINDOW:
         slot = tl.load(SLOTS + token * S0).to(tl.int64)
-        live = (slot >= 0) & (slot < PAGES * P)
+        live = (slot >= 0) & (slot < PAGES.to(tl.int64) * P)
         page = tl.maximum(slot, 0) // P
         row = tl.maximum(slot, 0) % P
         tl.store(WINDOW + page * W0 + row * W1 + d, restored, live)
@@ -5619,9 +5619,86 @@ register_triton_warmup(
 register_triton_warmup(
     _write_selection, variants=({"CANDIDATE_BLOCK": _SELECTION_BLOCKS},)
 )
+
+
+def _finish_write_selection_variants(args):
+    # Precompile every execution specialization reached after startup: Full
+    # (row scoring, with/without pool across POOL_BLOCK), Dense Reindex, and
+    # BF16 native Sparse Reindex (with/without SHORT_ROWS_UNSCORED). Guard SLOTS
+    # on whether real slots tensors are bound so P/Req match runtime int64 ptrs.
+    slots_variants = (
+        ({"SLOTS": (False,), "RATIO": (1,)}, {"SLOTS": (True,), "RATIO": (1, 2)})
+        if args["SLOTS"]
+        else ({"SLOTS": (False,), "RATIO": (1,)},)
+    )
+    if args["S"].dtype == torch.bfloat16:
+        if args["POOL"]:
+            # Blackwell Full scoring passes BF16 row logits alongside an FP32
+            # candidate pool (T.dtype == float32). Warm every candidate-pool
+            # block width plus POOL=False so runtime pools never JIT-compile.
+            base = (
+                {
+                    "BLOCK_SIZE": (1,),
+                    "HAS_CANDIDATES": (False,),
+                    "SHORT_ROWS_UNSCORED": (False,),
+                    "POOL": (False,),
+                    "POOL_BLOCK": (1,),
+                },
+                {
+                    "BLOCK_SIZE": (1,),
+                    "HAS_CANDIDATES": (False,),
+                    "SHORT_ROWS_UNSCORED": (False,),
+                    "POOL": (True,),
+                    "POOL_BLOCK": _SELECTION_BLOCKS,
+                },
+            )
+        else:
+            base = (
+                {
+                    "BLOCK_SIZE": (1,),
+                    "HAS_CANDIDATES": (False,),
+                    "SHORT_ROWS_UNSCORED": (False,),
+                    "POOL": (False,),
+                    "POOL_BLOCK": (1,),
+                },
+                {
+                    "BLOCK_SIZE": (8,),
+                    "HAS_CANDIDATES": (True,),
+                    "SHORT_ROWS_UNSCORED": (False, True),
+                    "POOL": (False,),
+                    "POOL_BLOCK": (1,),
+                },
+            )
+    else:
+        base = (
+            {
+                "BLOCK_SIZE": (1,),
+                "HAS_CANDIDATES": (False,),
+                "SHORT_ROWS_UNSCORED": (False,),
+                "POOL": (False,),
+                "POOL_BLOCK": (1,),
+            },
+            {
+                "BLOCK_SIZE": (1,),
+                "HAS_CANDIDATES": (False,),
+                "SHORT_ROWS_UNSCORED": (False,),
+                "POOL": (True,),
+                "POOL_BLOCK": _SELECTION_BLOCKS,
+            },
+            {
+                "BLOCK_SIZE": (8,),
+                "HAS_CANDIDATES": (True,),
+                "SHORT_ROWS_UNSCORED": (False,),
+                "POOL": (False,),
+                "POOL_BLOCK": (1,),
+            },
+        )
+    return tuple(shape | slot_cfg for shape in base for slot_cfg in slots_variants)
+
+
 register_triton_warmup(
     _finish_write_selection,
-    variants=lambda args: ({"POOL_BLOCK": _SELECTION_BLOCKS},) if args["POOL"] else (),
+    variants=_finish_write_selection_variants,
 )
 # Canonical windows pass a row slice, reordered subsets an index tensor.
 register_triton_warmup(_prefill_indices_kernel, variants=({"HAS_ROWS": (False, True)},))

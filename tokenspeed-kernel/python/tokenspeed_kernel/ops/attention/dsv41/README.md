@@ -76,3 +76,15 @@ MXFP4 indexer with DeepGEMM and DeepSelect. Hopper and portable scorers retain
 per-request windows and reserve one packed index history; their internal query
 tiling remains responsible for bounding score memory. Cache planning uses the
 same capability check as window merging.
+
+Indexer and dispatch overhead invariants:
+- `IndexMetadata.dense` caches vectorized `(pages, starts)` index-key packing
+  metadata keyed by packed column width across prefill scoring calls.
+- `dense_format_signature` caches dense `KernelSignature` objects across
+  dispatch sites (`dsv41`, `gemm`, `quantization`), and pre-resolved
+  `KernelPlan` objects keep hot-path projections and RMSNorm-quantize off the
+  per-call selection path.
+- `finish_write_selection` expands Triton warmup over both Full (`POOL`, `MODE`,
+  `_SELECTION_BLOCKS`) and BF16 native sparse Reindex
+  (`SHORT_ROWS_UNSCORED`, `SLOTS`, `RATIO`) specializations when invoked under
+  `kernel_warmup(enabled=True)`.

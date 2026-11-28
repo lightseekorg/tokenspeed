@@ -37,7 +37,7 @@ import sys
 from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Literal, get_args
+from typing import Literal
 
 import pytest
 import torch
@@ -325,6 +325,10 @@ class _AutotuneExecutor:
         assert tuning_module.is_warming_up()
         self._events.append(("draft_experts", num_tokens))
 
+    def _warmup_runtime_and_scheduler_kernels(self):
+        assert tuning_module.is_warming_up()
+        self._events.append(("runtime_kernels",))
+
 
 class _DrafterDouble:
     """Records the startup's extend warmup (``BaseDrafter.warmup_extend``); a
@@ -487,6 +491,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
                 else []
             ),
             *(["draft"] if speculative and not prefill_only else []),
+            ("runtime_kernels",),
             ("group", None),
             *(["save"] if not disabled else []),
         ]
@@ -558,6 +563,7 @@ def test_rewarm_after_a_rebind_compiles_but_tunes_nothing(monkeypatch, tmp_path)
         ("draft_extend", 16),
         ("draft_experts", 16),
         "draft",
+        ("runtime_kernels",),
     ]
     assert not tuning_module.is_warming_up()
 
@@ -631,6 +637,7 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
     assert events == [
         ("load", None, group, 0),
         ("group", group),
+        ("runtime_kernels",),
         ("group", None),
         ("save", None, group, 0),
     ]
@@ -743,6 +750,7 @@ def test_decode_only_attention_tunes_on_a_decode_step(
         "scrub",
         *([("draft_experts", 24)] if speculative else []),
         "decode",
+        *([] if failure else [("runtime_kernels",)]),
         ("group", None),
         *(["save"] if not disabled and not failure else []),
     ]
