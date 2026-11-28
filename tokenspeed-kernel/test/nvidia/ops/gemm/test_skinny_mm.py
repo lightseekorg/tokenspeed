@@ -116,3 +116,29 @@ def test_skinny_mm_row_counts_do_not_recompile():
     with assert_no_triton_compile(_skinny_mm_kernel):
         for rows in (2, 7, 8, 24, 32):
             skinny_mm(x[:rows], weight, None, out_dtype=torch.bfloat16)
+
+
+@pytest.mark.parametrize("shape", [(512, 3072), (1536, 3072), (3072, 3072)])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("rows", [1, 6, 16, 24, 32])
+def test_skinny_mm_compact_m_matches_fp32_reference(shape, out_dtype, rows):
+    n, k = shape
+    generator = torch.Generator(device="cuda").manual_seed(157 + n + rows)
+    x = (torch.randn((rows, k), generator=generator, device="cuda") * 0.2).bfloat16()
+    weight = (torch.randn((n, k), generator=generator, device="cuda") * 0.2).bfloat16()
+    got = skinny_mm(x, weight, None, out_dtype=out_dtype, compact_m=True)
+    ref = x.float() @ weight.float().T
+    if out_dtype == torch.bfloat16:
+        torch.testing.assert_close(got, ref.to(torch.bfloat16), rtol=1e-2, atol=2e-2)
+    else:
+        torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-3)
+
+
+def test_skinny_mm_compact_m_row_counts_do_not_recompile():
+    weight = torch.randn((3072, 3072), device="cuda").bfloat16()
+    x = torch.randn((SKINNY_MM_MAX_ROWS, 3072), device="cuda").bfloat16()
+    for rows in (1, 17):
+        skinny_mm(x[:rows], weight, None, out_dtype=torch.bfloat16, compact_m=True)
+    with assert_no_triton_compile(_skinny_mm_kernel):
+        for rows in (2, 6, 16, 24, 32):
+            skinny_mm(x[:rows], weight, None, out_dtype=torch.bfloat16, compact_m=True)

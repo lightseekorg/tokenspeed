@@ -31,7 +31,7 @@ from tokenspeed_kernel.ops.gemm import (
 )
 from tokenspeed_kernel.ops.gemm.deepgemm import prepare_deepgemm_fp8_weight
 from tokenspeed_kernel.ops.quantization import quantize_fp8
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import Platform, pdl_enabled
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.parameter import (
@@ -331,6 +331,7 @@ class Fp8LinearMethod(LinearMethodBase):
             return out if out is not None else output.view(*output_shape)
         # Prequantized scales must match the layout mm_activation_scale_layout reports.
         if block_scale is None:
+            solution = self._get_block_solution()
             scale_encoding = (
                 "packed_ue8m0"
                 if layer.weight_scale_inv.dtype == torch.int32
@@ -340,28 +341,39 @@ class Fp8LinearMethod(LinearMethodBase):
                     else "float32"
                 )
             )
+            use_hopper_tma_mn = solution == "deepgemm" and Platform.get().is_hopper
             mn_major = (
                 scale_encoding == "float32"
                 and input_2d.dtype == torch.bfloat16
-                and mm_activation_scale_layout(
-                    input_2d,
-                    layer.weight,
-                    B_scales=layer.weight_scale_inv,
-                    block_size=self.quant_config.weight_block_size,
-                    out=out_2d,
-                    out_dtype=output_dtype,
-                    solution=self._get_block_solution(),
+                and input_2d.is_contiguous()
+                and (
+                    use_hopper_tma_mn
+                    or mm_activation_scale_layout(
+                        input_2d,
+                        layer.weight,
+                        B_scales=layer.weight_scale_inv,
+                        block_size=self.quant_config.weight_block_size,
+                        out=out_2d,
+                        out_dtype=output_dtype,
+                        solution=solution,
+                    )
+                    == "mn_major"
                 )
-                == "mn_major"
             )
-            # The GEMM reads MN-major scales, which this quantizer writes natively.
+            # The GEMM reads MN-major scales; Hopper DeepGEMM additionally needs
+            # 16-byte (4-float) aligned group stride to avoid an internal copy.
+            quant_override = (
+                "trtllm_quantize_fp8_mn_major_tma"
+                if (mn_major and use_hopper_tma_mn)
+                else ("trtllm_quantize_fp8_mn_major" if mn_major else None)
+            )
             input_2d, block_scale = quantize_fp8(
                 input_2d,
                 granularity="token_group",
                 group_size=self.quant_config.weight_block_size[1],
                 scale_encoding=scale_encoding,
                 enable_pdl=pdl_enabled() and not mn_major,
-                override="trtllm_quantize_fp8_mn_major" if mn_major else None,
+                override=quant_override,
             )
         output = mm(
             input_2d,

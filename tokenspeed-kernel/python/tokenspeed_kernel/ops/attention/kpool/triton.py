@@ -36,11 +36,10 @@ from tokenspeed_kernel.ops.attention.kpool._triton.expand import (
     expand_kpool_to_flat_kv,
 )
 from tokenspeed_kernel.ops.attention.kpool._triton.score import (
-    _kpool_sort_topk_kernel,
     score_kpool_dense,
     select_kpool_chunked,
 )
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -48,6 +47,7 @@ _DEFAULT_CHUNK_POOLS = 8192
 _MAX_DENSE_LOGITS_BYTES = 64 * 1024 * 1024
 _CUTE_DSL_TOPK_POOLS = 512
 _CUTE_DSL_Q_LENS = frozenset({1, 2, 3, 4, 5, 6})
+_PERSISTENT_TOPK_POOLS = frozenset({512, 1024, 2048})
 
 _TRAITS = {
     "head_dim": frozenset({128}),
@@ -183,15 +183,32 @@ def _load_cute_dsl_topk():
     return cute_dsl_decode_topk, has_cute_dsl_decode_topk
 
 
+@functools.lru_cache(maxsize=1)
+def _load_persistent_topk():
+    try:
+        from tokenspeed_kernel.ops.attention.dsa.cuda import (
+            has_ragged_decode_topk,
+            ragged_decode_topk,
+        )
+    except Exception:
+        return None, (lambda: False)
+    return ragged_decode_topk, has_ragged_decode_topk
+
+
 @triton.jit(
-    do_not_specialize=["num_tokens"],
+    do_not_specialize=["num_tokens", "max_num_pools"],
 )
 def _kpool_decode_metadata_kernel(
     seq_lens,
     req_ids,
     causal_lens,
+    pool_lens,
     num_tokens,
+    max_num_pools,
     q_len_per_req: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    WRITE_POOL_LENS: tl.constexpr,
+    CLAMP_POOL_LENS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -205,14 +222,24 @@ def _kpool_decode_metadata_kernel(
     )
     tl.store(req_ids + token, req, mask=mask)
     tl.store(causal_lens + token, causal_len, mask=mask)
+    if WRITE_POOL_LENS:
+        plen = causal_len // POOL_SIZE
+        if CLAMP_POOL_LENS:
+            plen = tl.minimum(plen, max_num_pools)
+        tl.store(pool_lens + token, plen, mask=mask)
 
 
 def _prepare_kpool_decode_metadata(
     seq_lens: torch.Tensor,
     num_tokens: int,
     q_len_per_req: int,
+    *,
+    pool_size: int = 1,
+    max_num_pools: int | None = None,
+    pool_lens_out: torch.Tensor | None = None,
+    clamp_pool_lens: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build request ids and visible lengths in one device launch."""
+    """Build request ids, visible lengths, and optional clamped pool counts in one launch."""
     req_ids = torch.empty(num_tokens, dtype=torch.int32, device=seq_lens.device)
     causal_lens = torch.empty_like(req_ids)
     block = min(triton.next_power_of_2(num_tokens), 1024)
@@ -220,8 +247,13 @@ def _prepare_kpool_decode_metadata(
         seq_lens,
         req_ids,
         causal_lens,
+        pool_lens_out if pool_lens_out is not None else causal_lens,
         num_tokens=num_tokens,
+        max_num_pools=int(max_num_pools) if max_num_pools is not None else 0,
         q_len_per_req=q_len_per_req,
+        POOL_SIZE=int(pool_size),
+        WRITE_POOL_LENS=pool_lens_out is not None,
+        CLAMP_POOL_LENS=clamp_pool_lens and max_num_pools is not None,
         BLOCK=block,
         num_warps=1,
         num_stages=1,
@@ -257,7 +289,9 @@ def _select_pools_dense(
     apply_relu: bool,
     max_num_pools: int,
     use_cute_dsl_topk: bool,
+    use_persistent_topk: bool = False,
     logical_topk: Callable[..., tuple[torch.Tensor, torch.Tensor]] | None = None,
+    pool_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens = q.shape[0]
     if max_num_pools <= topk_pools:
@@ -265,7 +299,7 @@ def _select_pools_dense(
 
     # Bounded selectors read only each row's valid pools, so the scorer can
     # leave the padded columns uninitialized.
-    bounded_topk = use_cute_dsl_topk or logical_topk is not None
+    bounded_topk = use_cute_dsl_topk or use_persistent_topk or logical_topk is not None
     row_bytes = max_num_pools * torch.float32.itemsize
     rows_per_tile = min(num_tokens, max(1, _MAX_DENSE_LOGITS_BYTES // row_bytes))
     pool_indices = (
@@ -280,13 +314,14 @@ def _select_pools_dense(
     logits_workspace = torch.empty(
         (rows_per_tile, max_num_pools), dtype=torch.float32, device=q.device
     )
-    pool_lens = None
-    if bounded_topk:
+    if bounded_topk and pool_lens is None:
         pool_lens = torch.div(causal_lens, pool_size, rounding_mode="floor").to(
             torch.int32
         )
+        if logical_topk is not None or use_persistent_topk:
+            pool_lens = pool_lens.clamp_(0, max_num_pools)
     if logical_topk is not None:
-        pool_lens = pool_lens.clamp_(0, max_num_pools)
+        assert pool_lens is not None
         pool_starts = torch.zeros_like(pool_lens)
         selected_lens = torch.empty_like(pool_lens)
 
@@ -325,6 +360,19 @@ def _select_pools_dense(
                 topk_pools,
                 next_n=1,
                 out=pool_indices[start:end],
+            )
+        elif use_persistent_topk:
+            assert pool_indices is not None and pool_lens is not None
+            ragged_decode_topk, _ = _load_persistent_topk()
+            assert ragged_decode_topk is not None
+            ragged_decode_topk(
+                logits,
+                pool_indices[start:end],
+                topk_pools,
+                lengths=pool_lens[start:end],
+                max_seq_len=max_num_pools,
+                q_len_per_req=1,
+                enable_pdl=pdl_enabled(),
             )
         else:
             selected = torch.topk(logits, k=topk_pools, dim=-1, sorted=False).indices
@@ -483,11 +531,6 @@ def dense_kpool_decode_topk(
 
     device = q.device
     seq_lens = seq_lens.to(device=device).contiguous()
-    req_ids, causal_lens = _prepare_kpool_decode_metadata(
-        seq_lens,
-        num_tokens,
-        q_len_per_req,
-    )
     _, has_cute_dsl_decode_topk = _load_cute_dsl_topk()
     use_cute = (
         logical_topk is None
@@ -495,7 +538,17 @@ def dense_kpool_decode_topk(
         and topk_pools == _CUTE_DSL_TOPK_POOLS
         and q_len_per_req in _CUTE_DSL_Q_LENS
     )
-    if use_cute or logical_topk is not None or torch.cuda.is_current_stream_capturing():
+    _, has_persistent_topk = _load_persistent_topk()
+    use_persistent = (
+        logical_topk is None
+        and not use_cute
+        and topk_pools in _PERSISTENT_TOPK_POOLS
+        and has_persistent_topk()
+    )
+    bounded_topk = use_cute or use_persistent or logical_topk is not None
+    static_bound = bounded_topk or torch.cuda.is_current_stream_capturing()
+    max_num_pools: int | None = None
+    if static_bound:
         max_num_pools = max(index_block_table.shape[1] * int(page_size), 1)
         if max_seq_len is not None:
             if int(max_seq_len) < 0:
@@ -504,7 +557,21 @@ def dense_kpool_decode_topk(
                 max_num_pools,
                 max(int(max_seq_len) // pool_size, 1),
             )
-    else:
+    pool_lens = (
+        torch.empty(num_tokens, dtype=torch.int32, device=device)
+        if bounded_topk
+        else None
+    )
+    req_ids, causal_lens = _prepare_kpool_decode_metadata(
+        seq_lens,
+        num_tokens,
+        q_len_per_req,
+        pool_size=pool_size,
+        max_num_pools=max_num_pools,
+        pool_lens_out=pool_lens,
+        clamp_pool_lens=logical_topk is not None or use_persistent,
+    )
+    if max_num_pools is None:
         max_num_pools = max(int(causal_lens.max().item()) // pool_size, 1)
 
     pool_indices = _select_pools_dense(
@@ -521,7 +588,9 @@ def dense_kpool_decode_topk(
         apply_relu=apply_relu,
         max_num_pools=max_num_pools,
         use_cute_dsl_topk=use_cute,
+        use_persistent_topk=use_persistent,
         logical_topk=logical_topk,
+        pool_lens=pool_lens,
     )
     return expand_kpool_to_flat_kv(
         pool_indices,

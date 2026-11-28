@@ -51,7 +51,11 @@ def _load_trtllm_fp8_quant_module():
 
 
 def fp8_quantize_1x128(
-    x: torch.Tensor, use_ue8m0: bool, *, mn_major: bool
+    x: torch.Tensor,
+    use_ue8m0: bool,
+    *,
+    mn_major: bool,
+    pad_mn_to_4: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize BF16 ``[M, N]`` to FP8 E4M3 with one FP32 scale per 1x128 group.
 
@@ -59,12 +63,14 @@ def fp8_quantize_1x128(
         x: Contiguous BF16 CUDA ``[M, N]`` with ``N % 16 == 0``.
         use_ue8m0: Round each dequant scale up to a power of two.
         mn_major: Store the scales MN-major instead of K-major.
+        pad_mn_to_4: When ``mn_major`` is True, pad the MN scale stride to
+            ``ceil(M / 4) * 4`` (16-byte TMA alignment for Hopper DeepGEMM).
 
     Returns:
         FP8 ``[M, N]`` codes (a row slice of an ``[ceil(M / 4) * 4, N]``
         buffer) and the FP32 dequant scales as ``[M, ceil(N / 128)]``:
-        contiguous, or with ``mn_major`` the transpose of a contiguous
-        ``[ceil(N / 128), M]``.
+        contiguous, or with ``mn_major`` a column-major view with row stride 1
+        and group stride ``ceil(M / 4) * 4`` (when ``pad_mn_to_4``) or ``M``.
     """
     if not x.is_cuda or not x.is_contiguous():
         raise ValueError("fp8_quantize_1x128 requires a contiguous CUDA tensor")
@@ -78,13 +84,16 @@ def fp8_quantize_1x128(
     m_padded = (m + 3) // 4 * 4
     groups = (n + 127) // 128
     values = torch.empty((m_padded, n), dtype=torch.float8_e4m3fn, device=x.device)
-    shape = (groups, m) if mn_major else (m, groups)
+    mn_stride = m_padded if (mn_major and pad_mn_to_4) else m
+    shape = (groups, mn_stride) if mn_major else (m, groups)
     scales = torch.empty(shape, dtype=torch.float32, device=x.device)
-    group_stride, row_stride = (m, 1) if mn_major else (1, groups)
+    group_stride, row_stride = (mn_stride, 1) if mn_major else (1, groups)
     _load_trtllm_fp8_quant_module().fp8_quantize_1x128(
         values, scales, x, bool(use_ue8m0), group_stride, row_stride
     )
-    return values[:m], scales.t() if mn_major else scales
+    if mn_major:
+        return values[:m], (scales[:, :m].t() if mn_stride != m else scales.t())
+    return values[:m], scales
 
 
 def quantize_e4m3_activation(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

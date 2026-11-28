@@ -1739,3 +1739,60 @@ def test_triton_topk_lengths_and_strides_do_not_recompile(device, cols):
     ):
         for width, rows in zip(widths, (5, 3, 7), strict=True):
             run(width, rows, 2, 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+@pytest.mark.parametrize(("num_tokens", "topk"), [(2, 512), (16, 64)])
+def test_dsa_triton_fused_sink(device, num_tokens: int, topk: int) -> None:
+    """Verify fused sink rescaling in Triton DSA decode (split-K and single-pass)."""
+    from tokenspeed_kernel.ops.attention.dsa.triton import _run_dsa
+
+    torch.manual_seed(97)
+    num_heads, page_size, num_pages = 32, 64, 16
+    kv = (
+        torch.randn(num_pages, page_size, 1, 576, dtype=torch.bfloat16, device=device)
+        * 0.2
+    )
+    q = (
+        torch.randn(num_tokens, num_heads, 576, dtype=torch.bfloat16, device=device)
+        * 0.2
+    )
+    slots = torch.randint(
+        0, num_pages * page_size, (num_tokens, topk), dtype=torch.int32, device=device
+    )
+    lens = torch.full((num_tokens,), topk, dtype=torch.int32, device=device)
+    lens[1] = 0
+    sinks = torch.randn(num_heads, dtype=torch.float32, device=device) * 2.0
+    scale = 576**-0.5
+
+    ref_o, ref_lse = _run_dsa(
+        q=q,
+        kv_cache=kv,
+        packed_kv_cache=None,
+        topk_slots=slots,
+        topk_lens=lens,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=scale,
+        k_scale=1.0,
+        out=None,
+        return_lse=True,
+    )
+    gate = torch.sigmoid(ref_lse.float() - sinks.unsqueeze(0)).unsqueeze(-1)
+    ref_o = (ref_o.float() * gate).to(ref_o.dtype)
+    got_o = _run_dsa(
+        q=q,
+        kv_cache=kv,
+        packed_kv_cache=None,
+        topk_slots=slots,
+        topk_lens=lens,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        softmax_scale=scale,
+        k_scale=1.0,
+        out=None,
+        return_lse=False,
+        sinks=sinks,
+    )
+    assert (got_o[1] == 0).all()
+    torch.testing.assert_close(got_o, ref_o, rtol=1.6e-2, atol=1e-2)
