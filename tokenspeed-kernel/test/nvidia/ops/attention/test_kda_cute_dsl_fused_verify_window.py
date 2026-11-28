@@ -467,6 +467,43 @@ def test_grids_of_one_to_two_ctas_per_sm_spread_over_all_sms():
         assert window_kernel._smem_floor(ctas, torch.device("cuda", 0)) == 0
 
 
+def test_smem_floor_below_tile_smem_reuses_one_compiled_kernel():
+    """A 128-row tile already exceeds the two-per-SM floor, so grids in
+    (sms, 2 * sms] and > 2 * sms share one compiled kernel."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    window = 4
+    # pairs > 192 selects 128-row tiles (ctas == batch * HEADS).
+    spread_batch = max(192 // HEADS + 1, sms // HEADS + 1)
+    full_batch = (2 * sms) // HEADS + 1
+    assert window_kernel._value_tile_rows(spread_batch, HEADS, window, DIM) == 128
+    assert window_kernel._value_tile_rows(full_batch, HEADS, window, DIM) == 128
+    assert sms < spread_batch * HEADS <= 2 * sms
+    floor = window_kernel._smem_floor(spread_batch * HEADS, device)
+    assert floor > 0
+    assert window_kernel._smem_floor(full_batch * HEADS, device) == 0
+    # The floor applies to the CTA's full footprint (including gated_norm): it
+    # clamps smaller tiles to exactly the floor and leaves 128-row tiles untouched.
+    for rows in (64, 128):
+        base_with_norm = window_kernel._base_smem(
+            HEADS, window, rows, window, True, True, True, True, False
+        )
+        floored = window_kernel.FusedVerifyWindow(
+            HEADS, window, rows, window, True, True, True, True, floor, False
+        )
+        assert floored.smem_bytes == max(base_with_norm, floor)
+        if rows == 128:
+            assert base_with_norm >= floor
+
+    window_kernel._compile.cache_clear()
+    _fused(_inputs(full_batch, window, seed=61), window)
+    assert window_kernel._compile.cache_info().currsize == 1
+    with assert_no_cute_compile():
+        _fused(_inputs(spread_batch, window, seed=62), window)
+    assert window_kernel._compile.cache_info().currsize == 1
+    torch.cuda.synchronize()
+
+
 def _output_norm(x, weight_dtype):
     gen = torch.Generator(device="cuda").manual_seed(91)
     weight = (1 + 0.1 * torch.randn(DIM, device="cuda", generator=gen)).to(weight_dtype)

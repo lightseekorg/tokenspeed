@@ -256,7 +256,6 @@ class FusedVerifyWindow(RecoverSsmVerify):
             self.record_words = self.record_us + self.history_rows * value_tile_rows
             # The region, its alignment and the records' mbarrier.
             self.smem_bytes += 4 * self.record_words + 128 + 8
-        self.smem_bytes = max(self.smem_bytes, smem_floor)
         # Where a tile starts its key channel's loads of the records' keys and
         # decays, so they fly before phase 1 uses them (phase 1 used to wait
         # on them, 0.2-0.4 us of a T 4 batch-1 layer with records on GB300).
@@ -278,6 +277,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
         if gated_norm:
             self.norm_words = _round_up(NORM_GROUPS * window, 4)
             self.smem_bytes += 4 * self.norm_words + 16
+        self.smem_bytes = max(self.smem_bytes, smem_floor)
 
     @cute.jit
     def _publish_pairs(self, row_addr: Int32, values, lane: Int32, barrier_addr: Int32):
@@ -1173,27 +1173,29 @@ def _smem_per_block(device_index: int) -> int:
 
 
 @functools.cache
-def _record_copy_smem(
+def _base_smem(
     heads: int,
     window: int,
+    value_tile_rows: int,
     capacity: int,
     bounded_gate: bool,
     factored: bool,
     has_metadata: bool,
     gated_norm: bool,
+    copy_records: bool,
 ) -> int:
-    """Shared memory of a 64-row-tile CTA that copies its records."""
+    """Shared memory a CTA needs without a floor."""
     return FusedVerifyWindow(
         heads,
         window,
-        64,
+        value_tile_rows,
         capacity,
         bounded_gate,
         factored,
         has_metadata,
         gated_norm,
         0,
-        True,
+        copy_records,
     ).smem_bytes
 
 
@@ -1226,8 +1228,16 @@ def _copies_records(
     if value_tile_rows != 64 or capacity <= window or not packed_records:
         return False
     sms, _ = _two_per_sm(device.index)
-    return ctas <= sms and _record_copy_smem(
-        heads, window, capacity, bounded_gate, factored, has_metadata, gated_norm
+    return ctas <= sms and _base_smem(
+        heads,
+        window,
+        64,
+        capacity,
+        bounded_gate,
+        factored,
+        has_metadata,
+        gated_norm,
+        True,
     ) <= _smem_per_block(device.index)
 
 
@@ -1424,6 +1434,22 @@ def fused_verify_window(
         output_norm is not None,
         mixed_qkv.device,
     )
+    smem_floor = _smem_floor(ctas, mixed_qkv.device)
+    # A tile whose own shared memory already exceeds the floor (such as a
+    # 128-row tile) clamps to the same smem_bytes either way; drop the no-op
+    # floor from _compile's key so both grid sizes share one binary.
+    if smem_floor <= _base_smem(
+        num_heads,
+        window,
+        value_tile_rows,
+        capacity,
+        bounded,
+        factored,
+        has_metadata,
+        output_norm is not None,
+        copy_records,
+    ):
+        smem_floor = 0
     kernel = _compile(
         num_heads,
         window,
@@ -1441,7 +1467,7 @@ def fused_verify_window(
         dt_bias.dtype,
         query_start_loc.dtype,
         state_indices.dtype,
-        _smem_floor(ctas, mixed_qkv.device),
+        smem_floor,
         copy_records,
     )
     kernel(
