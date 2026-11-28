@@ -21,15 +21,39 @@
 """Helpers for initializing and caching torch distributed process groups."""
 
 import os
+from collections.abc import MutableMapping
 from datetime import timedelta
 
 import torch
 import torch.distributed as dist
 
 from tokenspeed.runtime.distributed.mapping import Group, Mapping
+from tokenspeed.runtime.utils import get_colorful_logger
+
+logger = get_colorful_logger(__name__)
 
 # NCCL/RCCL staging-buffer bytes per channel and protocol for a one-rank world.
 SINGLE_RANK_NCCL_BUFFSIZE = 1 << 16
+
+
+def default_single_rank_nccl_buffsize(environ: MutableMapping[str, str]) -> int | None:
+    """Default ``NCCL_BUFFSIZE`` for a one-rank world, unless already set.
+
+    A one-rank communicator never moves data between peers, but still
+    allocates its per-channel staging buffers at the default NCCL_BUFFSIZE:
+    about 2 GiB of device memory per RCCL communicator on gfx950, and startup
+    creates several. NCCL reads the size once per process, before the first
+    communicator, so the default also applies to any multi-rank communicator
+    the process joins later (the weight-update group); an operator's setting
+    wins.
+
+    Returns:
+        The buffer size set, or None when ``environ`` already had one.
+    """
+    if "NCCL_BUFFSIZE" in environ:
+        return None
+    environ["NCCL_BUFFSIZE"] = str(SINGLE_RANK_NCCL_BUFFSIZE)
+    return SINGLE_RANK_NCCL_BUFFSIZE
 
 
 def _make_all_groups(group: Group) -> list[Group]:
@@ -60,6 +84,9 @@ class ProcessGroupManager:
         # this process, standing in for every logical group.
         self._emulated_rank_groups: dict[str, dist.ProcessGroup] | None = None
         self._dedicated_groups: dict[tuple[str, Group], dist.ProcessGroup] = {}
+        # NCCL_BUFFSIZE this process set for a one-rank world; None when the
+        # operator's setting or NCCL's own default stands.
+        self.single_rank_nccl_buffsize: int | None = None
 
     def init_distributed(
         self,
@@ -132,13 +159,16 @@ class ProcessGroupManager:
             self._pg_timeout = timeout
             self._device_backend = backend
             if world_size == 1 and backend == "nccl":
-                # A one-rank communicator never moves data between peers, but
-                # still allocates its per-channel staging buffers at the
-                # default NCCL_BUFFSIZE: about 2 GiB of device memory per RCCL
-                # communicator on gfx950, and startup creates several. NCCL
-                # reads the size once per process, before the first
-                # communicator; an operator's setting wins.
-                os.environ.setdefault("NCCL_BUFFSIZE", str(SINGLE_RANK_NCCL_BUFFSIZE))
+                self.single_rank_nccl_buffsize = default_single_rank_nccl_buffsize(
+                    os.environ
+                )
+                if self.single_rank_nccl_buffsize is not None:
+                    logger.info(
+                        f"One-rank world: NCCL_BUFFSIZE={self.single_rank_nccl_buffsize} "
+                        "for this process. A multi-rank group joined later, such as "
+                        "the weight-update group, uses it too; set NCCL_BUFFSIZE to "
+                        "override."
+                    )
 
             dist.init_process_group(
                 backend=backend,

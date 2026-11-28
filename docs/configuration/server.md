@@ -322,6 +322,14 @@ DP rank holds it (see
 [Weight updates under attention DP](#weight-updates-under-attention-dp)).
 Real rollout log probabilities require `--enable-output-logprobs`.
 
+A one-rank world (TP1, no DP) defaults `NCCL_BUFFSIZE` to 64 KiB for its
+process, since its own communicators move no data between peers. NCCL reads
+the size once per process, so the NCCL group that `init_weights_update_group`
+joins inherits it, and weight broadcasts stage through those small buffers;
+the engine warns when it joins. For RL weight sync on a single-GPU engine, set
+`NCCL_BUFFSIZE` in the server environment (for example `4194304`, NCCL's
+default); an explicit setting is never overridden.
+
 #### Releasing GPU memory (`--enable-memory-saver`)
 
 Set `--weight-memory-policy cpu_backup|discard` explicitly whenever

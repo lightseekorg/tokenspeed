@@ -87,3 +87,26 @@ def test_single_rank_communicators_skip_peer_staging_buffers():
     assert process.exitcode == 0
     assert values == [0.0, 1.0, 2.0, 3.0]
     assert used < 2 * MAX_COMMUNICATOR_BYTES
+
+
+def test_one_rank_buffer_default_applies_only_when_unset():
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        SINGLE_RANK_NCCL_BUFFSIZE,
+        default_single_rank_nccl_buffsize,
+    )
+
+    environ: dict[str, str] = {}
+    assert default_single_rank_nccl_buffsize(environ) == SINGLE_RANK_NCCL_BUFFSIZE
+    assert environ["NCCL_BUFFSIZE"] == str(SINGLE_RANK_NCCL_BUFFSIZE)
+
+
+def test_operator_buffer_size_wins_and_is_not_reported_as_applied():
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        default_single_rank_nccl_buffsize,
+    )
+
+    # An explicit size (e.g. for RL weight sync over the weight-update group)
+    # stands, and the engine records that it applied nothing.
+    environ = {"NCCL_BUFFSIZE": "4194304"}
+    assert default_single_rank_nccl_buffsize(environ) is None
+    assert environ == {"NCCL_BUFFSIZE": "4194304"}
