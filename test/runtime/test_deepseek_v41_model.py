@@ -5106,6 +5106,11 @@ class _TinyCompressorAndLayerWarmupModel(BaseCausalLM):
 def test_post_quant_warmup_compiles_compressor_and_mhc_layers(monkeypatch):
     """post_quant_warmup precompiles ratio-2 compressor dsv4_linear_fp32 and
     MegaMHC kernels without leaving serving-time compilations behind."""
+    import importlib.util
+    from contextlib import nullcontext
+
+    from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
+
     monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
     monkeypatch.setattr(v41, "_max_forward_tokens", lambda: 64)
     config = _config()
@@ -5117,13 +5122,32 @@ def test_post_quant_warmup_compiles_compressor_and_mhc_layers(monkeypatch):
 
     with torch.device("cuda"):
         model = _TinyCompressorAndLayerWarmupModel(config)
+
+    compile_check = nullcontext()
+    if current_platform().is_nvidia and ll_bf16_router.is_available():
+        helper_path = (
+            Path(__file__).resolve().parents[2]
+            / "tokenspeed-kernel"
+            / "test"
+            / "utils.py"
+        )
+        helper_spec = importlib.util.spec_from_file_location(
+            "v41_model_kernel_test_utils", helper_path
+        )
+        helper = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper)
+        ll_bf16_router._dotprod.clear()
+        ll_bf16_router._splitk.clear()
+        compile_check = helper.assert_no_cute_compile()
+
     model.post_quant_warmup()
 
     weight = model.compressor.wkv_wgate.weight
-    for tokens in (1, 16, 32, 64):
-        x = torch.randn(
-            (tokens, config.hidden_size), dtype=torch.bfloat16, device="cuda"
-        )
-        out = dsv4_linear_fp32(x, weight, override=None, solution=None)
-        ref = F.linear(x.float(), weight.float())
-        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+    with compile_check:
+        for tokens in (1, 5, 16, 17, 24, 32, 64):
+            x = torch.randn(
+                (tokens, config.hidden_size), dtype=torch.bfloat16, device="cuda"
+            )
+            out = dsv4_linear_fp32(x, weight, override=None, solution=None)
+            ref = F.linear(x.float(), weight.float())
+            torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

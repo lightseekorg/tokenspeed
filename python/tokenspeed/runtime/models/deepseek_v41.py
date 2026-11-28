@@ -780,6 +780,7 @@ def _warmup_compressors(
         {
             1,
             min(max_tokens, 16),
+            min(max_tokens, 32),
             *((min(max_tokens, 64),) if max_tokens > 32 else ()),
         }
     )
