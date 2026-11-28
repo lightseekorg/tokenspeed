@@ -292,23 +292,34 @@ class AutoBackend(CommBackend):
     def _multicast_reachable(group: Group) -> bool:
         """Whether symmetric-memory multicast can map across ``group``.
 
-        The rsag paths rendezvous a symmetric buffer and store through its
-        multicast pointer, so a group the fabric cannot map hangs inside the
-        rendezvous instead of falling back. Topology alone was too strict --
-        a rack's NVLink domain can span hosts, and vetoing on spread gives
-        those groups NCCL forever -- so it now only admits, and anything
-        crossing a host is probed rather than refused.
+        The NVIDIA rsag paths rendezvous a symmetric buffer and store through
+        its multicast pointer, so a group without NVLS multicast support
+        (``CU_DEVICE_ATTRIBUTE_MULTICAST_SUPPORTED == 0`` or
+        ``TORCH_SYMM_MEM_DISABLE_MULTICAST=1``) gets ``multicast_ptr=0`` and
+        crashes inside the multimem kernel, while a cross-host group the fabric
+        cannot map hangs inside the rendezvous instead of falling back.
+        Topology alone was too strict -- a rack's NVLink domain can span hosts,
+        and vetoing on spread gives those groups NCCL forever -- so it now only
+        admits, and anything crossing a host is probed rather than refused.
+        AMD's rsag path uses unicast peer buffer pointers rather than NVIDIA
+        NVLS multicast, so it checks host span / fabric only.
 
         The rank count is not a substitute for the topology test. ``Mapping``
         builds strided groups: an attention DP group is ``(0, 8)`` at
         ``attn_tp_size=8``, which is smaller than one host's device count while
         living on two hosts, so counting would admit it with no probe at all.
 
-        The world fabric map is gathered during distributed initialization, so
-        the group verdict is a local lookup with no dispatch-time collective.
+        The world fabric and multicast maps are gathered during distributed
+        initialization, so the group verdict is a local lookup with no
+        dispatch-time collective.
         """
-        from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
+        from tokenspeed_kernel.ops.communication.fabric import (
+            group_has_fabric,
+            group_has_multicast,
+        )
 
+        if current_platform().is_nvidia and not group_has_multicast(group):
+            return False
         if not AutoBackend._group_spans_nodes(group):
             return True
         return group_has_fabric(group)
