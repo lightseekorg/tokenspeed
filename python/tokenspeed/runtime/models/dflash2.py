@@ -652,6 +652,12 @@ class DFlash2DraftModel(DFlashDraftModel):
                 write_mask=write_mask,
             )
 
+    def post_load_weights(self) -> None:
+        """Derive absorbed MLA decode factors after weight loading or dummy init."""
+        if self._uses_mla:
+            for layer in self.layers:
+                absorb_mla_kv_b_proj(layer.self_attn)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         if self._uses_mla:
             loaded = self._load_mla_weights(weights)
@@ -730,8 +736,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             raise ValueError(
                 f"DFlash2 MLA checkpoint is missing {len(missing)} weights: {missing[:8]}"
             )
-        for layer in self.layers:
-            absorb_mla_kv_b_proj(layer.self_attn)
+        self.post_load_weights()
         return loaded
 
     @torch.no_grad()
