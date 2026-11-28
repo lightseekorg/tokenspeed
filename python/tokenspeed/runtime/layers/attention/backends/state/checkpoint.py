@@ -65,7 +65,6 @@ __all__ = [
     "compute_state_block_indices",
     "in_forward_state_checkpoints",
     "scan_checkpoint_plan",
-    "validate_state_block_table_bounds",
 ]
 
 
@@ -212,48 +211,12 @@ def scan_checkpoint_plan(
     return interval, cu_starts, rows
 
 
-def validate_state_block_table_bounds(
-    rows: torch.Tensor,
-    *,
-    num_blocks: int,
-    group_id: str,
-) -> None:
-    """Fail fast when any state block table entry falls outside ``-1..num_blocks-1``.
-
-    ``-1`` (pad) and ``0`` (null hole) remain valid table entries; any value
-    ``< -1`` or ``>= num_blocks`` cannot address the group's state pool and
-    would otherwise be silently skipped by the kernel-side bounds guard.
-    """
-    if num_blocks <= 0:
-        raise ValueError(
-            f"state paging: {group_id!r} pool num_blocks must be positive "
-            f"(got {num_blocks})"
-        )
-    if rows.ndim != 2:
-        raise ValueError(
-            f"state paging: {group_id!r} block table must be 2D "
-            f"(got shape {tuple(rows.shape)})"
-        )
-    invalid = (rows < -1) | (rows >= num_blocks)
-    if bool(invalid.any()):
-        bad_pos = invalid.nonzero()[0]
-        row = int(bad_pos[0])
-        slot = int(bad_pos[1])
-        bad_id = int(rows[row, slot])
-        raise ValueError(
-            f"state paging: {group_id!r} block table entry at row {row}, "
-            f"slot {slot} is {bad_id}, outside valid range "
-            f"-1..{num_blocks - 1} (pool has {num_blocks} blocks)"
-        )
-
-
 def compute_state_block_indices(
     rows: torch.Tensor,
     seq_lens_before: torch.Tensor,
     *,
     validate: bool,
     group_id: str,
-    num_blocks: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Resolve each request's (input, output) state blocks for one forward.
 
@@ -262,11 +225,9 @@ def compute_state_block_indices(
             pad, ``0`` null). Wider rows are accepted and read at slots 0/1.
         seq_lens_before: Per-request token count before this forward; ``0``
             means the request starts from the zero state and reads no block.
-        validate: Run the host-synchronizing write-side and bounds checks.
+        validate: Run the host-synchronizing write-side checks.
         group_id: State group the table belongs to; only used to attribute
             validation errors (multi-group KDA runs this once per group).
-        num_blocks: Optional state pool block count; checked when ``validate``
-            is True, rejecting entries outside ``-1..num_blocks-1``.
 
     Returns:
         ``(state_in, state_out)`` int32 block ids per request; ``state_in``
@@ -295,10 +256,6 @@ def compute_state_block_indices(
     )
 
     if validate:
-        if num_blocks is not None:
-            validate_state_block_table_bounds(
-                rows, num_blocks=num_blocks, group_id=group_id
-            )
         real = (checkpoint != -1) | (live != -1)
         if bool((state_in[has_history & real] <= 0).any()):
             raise ValueError(

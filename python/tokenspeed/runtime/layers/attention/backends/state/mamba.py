@@ -313,7 +313,6 @@ class MambaAttnBackend(AttentionBackend):
         self.speculative_num_draft_tokens = self.spec_num_tokens
         self.state_paging_active = False
         self._state_group_ids: tuple[str, ...] = ()
-        self._state_group_num_blocks: dict[str, int] = {}
         self._state_layer_geometry: _StateLayerGeometry = ()
         linear_attn = config.component(LinearAttnConfig)
         self.replay_ssm = linear_attn is not None and bool(linear_attn.replay_ssm)
@@ -420,12 +419,12 @@ class MambaAttnBackend(AttentionBackend):
             )
         return geometry
 
-    def _state_group_pool_bounds(
+    def _validate_state_group_pool_bounds(
         self,
         kv_pool: CachePool,
         state_group_ids: tuple[str, ...],
-    ) -> dict[str, int]:
-        """Physical block count per state group, checked against the contract.
+    ) -> None:
+        """Verify each state group's physical buffers cover its runtime contract.
 
         ``CacheBatchMetadata.from_forward_op`` checks every state group on CPU
         against ``contract.virtual_block_counts`` before H2D upload. Requiring
@@ -464,20 +463,17 @@ class MambaAttnBackend(AttentionBackend):
                         f"{physical_blocks} blocks, smaller than runtime contract "
                         f"virtual_block_counts[{group_id!r}]={contract_blocks}"
                     )
-        return group_num_blocks
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
         state_group_ids, _ = self._state_geometry(cache_pool)
-        self._state_group_pool_bounds(cache_pool, state_group_ids)
+        self._validate_state_group_pool_bounds(cache_pool, state_group_ids)
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         """Latch the state geometry; init and preallocate rebuild the rest."""
         state_group_ids, layer_geometry = self._state_geometry(cache_pool)
-        group_num_blocks = self._state_group_pool_bounds(cache_pool, state_group_ids)
         super()._publish_cache_pool(cache_pool)
         self._state_group_ids = state_group_ids
-        self._state_group_num_blocks = group_num_blocks
         self.state_paging_active = True
         self._state_layer_geometry = layer_geometry
         # init_cuda_graph_state and preallocate_verify_workspace rebuild these for the new pool.
@@ -1029,7 +1025,6 @@ class MambaAttnBackend(AttentionBackend):
         """
         if validate is None:
             validate = cache_debug_enabled()
-        group_num_blocks = self._state_group_num_blocks
         state_in_blocks: dict[str, torch.Tensor] = {}
         state_out_blocks: dict[str, torch.Tensor] = {}
         for group_id in self._state_group_ids:
@@ -1038,7 +1033,6 @@ class MambaAttnBackend(AttentionBackend):
                 tokens_before,
                 validate=validate,
                 group_id=group_id,
-                num_blocks=group_num_blocks.get(group_id),
             )
             state_in_blocks[group_id] = state_in
             state_out_blocks[group_id] = state_out

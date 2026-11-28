@@ -230,69 +230,6 @@ class TestComputeStatePageIndicesTest:
         assert (state_in.tolist()) == ([0])
         assert (state_out.tolist()) == ([0])
 
-    def test_num_blocks_bound_validation(self):
-        torch = self.torch
-        # validate=True checks both bounds and write-side invariants.
-        state_in, state_out = self.fn(
-            torch.tensor(
-                [[-1, -1, -1], [-1, -1, -1], [0, 9, -1], [3, 8, 9]], dtype=torch.int32
-            ),
-            torch.tensor([0, 4, 0, 64], dtype=torch.int32),
-            validate=True,
-            group_id="linear_attention",
-            num_blocks=10,
-        )
-        assert state_in.tolist() == [0, -1, 0, 3]
-        assert state_out.tolist() == [-1, -1, 9, 8]
-        for bad_rows, expected in (
-            ([[10, 4]], "row 0, slot 0 is 10"),
-            ([[0, 10]], "row 0, slot 1 is 10"),
-            ([[0, 4, 10]], "row 0, slot 2 is 10"),
-            ([[-2, 4]], "row 0, slot 0 is -2"),
-        ):
-            with pytest.raises(ValueError, match=expected):
-                self.fn(
-                    torch.tensor(bad_rows, dtype=torch.int32),
-                    torch.tensor([4], dtype=torch.int32),
-                    validate=True,
-                    group_id="linear_attention",
-                    num_blocks=10,
-                )
-
-        # validate=False stays strictly non-synchronizing even when num_blocks is supplied.
-        state_in, state_out = self.fn(
-            torch.tensor([[10, 11]], dtype=torch.int32),
-            torch.tensor([4], dtype=torch.int32),
-            validate=False,
-            group_id="linear_attention",
-            num_blocks=10,
-        )
-        assert state_in.tolist() == [10]
-        assert state_out.tolist() == [11]
-        if torch.cuda.is_available():
-            rows_cuda = torch.tensor([[10, 11]], dtype=torch.int32, device="cuda")
-            before_cuda = torch.tensor([4], dtype=torch.int32, device="cuda")
-            self.fn(
-                rows_cuda,
-                before_cuda,
-                validate=False,
-                group_id="linear_attention",
-                num_blocks=10,
-            )
-            torch.cuda.synchronize()
-            previous = torch.cuda.get_sync_debug_mode()
-            try:
-                torch.cuda.set_sync_debug_mode("error")
-                self.fn(
-                    rows_cuda,
-                    before_cuda,
-                    validate=False,
-                    group_id="linear_attention",
-                    num_blocks=10,
-                )
-            finally:
-                torch.cuda.set_sync_debug_mode(previous)
-
 
 class TestCacheContractStateBlocksTest:
     """The backend resolves every declared group once per batch."""
@@ -309,7 +246,6 @@ class TestCacheContractStateBlocksTest:
         self.torch = torch
         self.backend = object.__new__(MambaAttnBackend)
         self.backend._state_group_ids = ("linear_attention_0", "linear_attention_1")
-        self.backend._state_group_num_blocks = {}
         self.backend.pad_slot_id = -1
 
     def test_every_group_is_resolved_from_its_own_table(self):
@@ -1907,7 +1843,7 @@ class TestReplayStateTapeGPUTest:
 
 
 class TestHostStateBlockBoundsTest:
-    """Pool-vs-contract bounds checks, debug validation, and zero-sync CPU decode/verify bounds."""
+    """Pool-vs-contract bounds checks and zero-sync CPU decode/verify bounds."""
 
     GROUP = "linear_attention"
 
@@ -1954,39 +1890,6 @@ class TestHostStateBlockBoundsTest:
         )
         return backend
 
-    def test_debug_mode_init_forward_metadata_bounds_against_min_pool_capacity(
-        self, monkeypatch
-    ):
-        torch = self.torch
-        backend = self._make_backend(num_blocks=12, ssm_blocks=10)
-        assert backend._state_group_num_blocks == {self.GROUP: 10}
-
-        def _extend_kwargs_for(rows):
-            bs = len(rows)
-            lens_cpu = torch.full((bs,), 64, dtype=torch.int32)
-            prefix_cpu = torch.tensor(
-                [64 if row[0] > 0 else 0 for row in rows], dtype=torch.int32
-            )
-            return dict(
-                bs=bs,
-                num_extends=bs,
-                req_pool_indices=torch.arange(1, bs + 1, dtype=torch.int32),
-                seq_lens=prefix_cpu + lens_cpu,
-                forward_mode=self.ForwardMode.EXTEND,
-                block_tables={self.GROUP: torch.tensor(rows, dtype=torch.int32)},
-                **_extend_kwargs(torch, lens_cpu, prefix_cpu, "cpu"),
-            )
-
-        monkeypatch.setenv("TOKENSPEED_CACHE_DEBUG", "1")
-        backend.init_forward_metadata(**_extend_kwargs_for([[0, 9], [3, 8]]))
-        for bad_rows, expected in (
-            ([[10, 4]], "row 0, slot 0 is 10"),
-            ([[0, 10]], "row 0, slot 1 is 10"),
-            ([[-2, 4]], "row 0, slot 0 is -2"),
-        ):
-            with pytest.raises(ValueError, match=expected):
-                backend.init_forward_metadata(**_extend_kwargs_for(bad_rows))
-
     def test_publish_cache_pool_rejects_pool_smaller_than_contract(self):
         torch = self.torch
         fresh = self.MambaAttnBackend(
@@ -2026,7 +1929,6 @@ class TestHostStateBlockBoundsTest:
         with pytest.raises(ValueError, match="smaller than runtime contract"):
             bound.set_kv_pool(undersized_ssm)
         assert bound.kv_pool is original_pool
-        assert bound._state_group_num_blocks == {self.GROUP: 10}
 
     @pytest.mark.parametrize("device", ["cpu", "cuda"])
     @pytest.mark.parametrize("spec_tokens", [1, 4])
