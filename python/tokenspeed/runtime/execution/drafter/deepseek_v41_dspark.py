@@ -649,17 +649,19 @@ class DeepseekV41DSpark(BaseDrafter):
             capacities_t = torch.tensor(
                 capacities, dtype=torch.int32, device=self.device
             )
-            step_rows = [
-                [
-                    (
-                        float(step_ms) + float(policy_ms)
-                        if (step_ms := profile.adaptive_step_ms.get(cap)) is not None
-                        else -1.0
-                    )
-                    for cap in capacities
-                ]
-                for profile in matching
-            ]
+            step_rows = []
+            for profile in matching:
+                step_map = dict(profile.adaptive_step_ms)
+                step_rows.append(
+                    [
+                        (
+                            float(step_ms) + float(policy_ms)
+                            if (step_ms := step_map.get(cap)) is not None
+                            else -1.0
+                        )
+                        for cap in capacities
+                    ]
+                )
             step_ms_t = torch.tensor(step_rows, dtype=torch.float32, device=self.device)
         buffers.device_cal = _VerifyDeviceCalibration(
             ranges=ranges,

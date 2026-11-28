@@ -16,14 +16,10 @@
 
 from __future__ import annotations
 
-from tokenspeed_kernel._triton import tl, triton  # noqa.
+from tokenspeed_kernel._triton import libdevice, tl, triton  # noqa: F401
 
 cdiv, jit = triton.cdiv, triton.jit
-from tokenspeed_kernel._triton import tl  # noqa.
-
 builtin = tl.core.builtin
-from tokenspeed_kernel._triton import libdevice  # noqa.
-
 fast_expf, fast_logf = libdevice.fast_expf, libdevice.fast_logf
 
 
@@ -203,3 +199,56 @@ def cumulative_masking(
         values = tl.where(values >= pivot, values, minima)
 
     return values
+
+
+@jit
+def resolve_indices(
+    q_ptr,
+    f_ptr,
+    row_id,
+    lookahead: tl.constexpr,
+    batch_size: tl.int32,
+    slotted: tl.constexpr,
+    varlen: tl.constexpr,
+    block_q: tl.constexpr,
+):
+    """
+    Compute the batch id, logits margin, draft margin, step id, request length, and validity.
+
+    """
+    timesteps: tl.constexpr = lookahead + 1
+
+    if varlen:
+
+        row_ids = tl.arange(0, block_q)
+        row_mask = row_ids < (batch_size + 1)
+
+        lengths = tl.load(q_ptr + row_ids, mask=row_mask, other=0, cache_modifier=".cv")
+        marked = ((lengths <= row_id) & row_mask).to(tl.uint32)
+
+        raw_batch = tl.sum(marked, axis=0).to(tl.int32) - 1
+        row_valid = (raw_batch >= 0) & (raw_batch < batch_size)
+        safe_batch = tl.maximum(tl.minimum(raw_batch, batch_size - 1), 0)
+        margin = tl.load(q_ptr + safe_batch, mask=row_valid, other=0).to(tl.int32)
+        upper = tl.load(q_ptr + safe_batch + 1, mask=row_valid, other=0).to(tl.int32)
+
+        step_id = row_id - margin
+        req_timesteps = upper - margin
+        draft_margin = safe_batch * timesteps
+        batch_id = safe_batch
+
+    else:
+
+        batch_id = row_id // timesteps
+        step_id = row_id % timesteps
+
+        margin = batch_id * timesteps
+        draft_margin = margin
+        req_timesteps = timesteps
+        row_valid = True
+
+    if slotted:
+
+        batch_id = tl.load(f_ptr + batch_id, mask=row_valid, other=0)
+
+    return batch_id, margin, draft_margin, step_id, req_timesteps, row_valid

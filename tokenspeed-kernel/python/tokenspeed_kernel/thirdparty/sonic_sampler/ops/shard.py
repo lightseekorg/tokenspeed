@@ -40,8 +40,11 @@ from tokenspeed_kernel._triton import tl, triton  # noqa.
 
 jit = triton.jit
 
-from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import fast_expf, gdc_wait
-from tokenspeed_kernel.thirdparty.sonic_sampler.ops.multistep import (
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import (
+    fast_expf,
+    gdc_wait,
+)
+from tokenspeed_kernel.thirdparty.sonic_sampler.ops.base import (
     resolve_indices as resolve_multistep_indices,
 )
 from tokenspeed_kernel.thirdparty.sonic_sampler.ops.prologue import (
