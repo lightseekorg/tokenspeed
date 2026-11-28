@@ -824,5 +824,289 @@ def test_prepare_staged_projection(
         comm.prepare_staged_projection(16384)
 
 
+def _reset_moe_tail_state(monkeypatch, module):
+    for attr in (
+        "_routed_workspace",
+        "_latent_tail",
+        "_stage2_capacity",
+        "_multimem_group_name",
+        "_workspace_config",
+    ):
+        monkeypatch.setattr(module.K3MoeTailComm, attr, None)
+
+
+class _SimpleRMSNorm(torch.nn.Module):
+    def __init__(self, weight: torch.Tensor, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(weight.clone(), requires_grad=False)
+        self.variance_epsilon = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.variance_epsilon)
+        return x * rms * self.weight
+
+
+class _ShardedUpProj:
+    def __init__(self, weight: torch.Tensor, start: int, width: int) -> None:
+        self.weight = weight
+        self.shard_slice = (start, width)
+
+
+def _forbid_call(name: str):
+    def _fail(*args, **kwargs):
+        raise AssertionError(f"{name} must not be called when multicast is unavailable")
+
+    return _fail
+
+
+def test_moe_tail_disables_multicast_paths_when_multicast_unavailable(monkeypatch):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    _reset_moe_tail_state(monkeypatch, module)
+    mapping = Mapping(rank=0, world_size=8, attn_tp_size=8, moe_tp_size=8)
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_blackwell=True)
+    )
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        module, "_get_process_group", lambda ranks: SimpleNamespace(group_name="moe-tp")
+    )
+    monkeypatch.setattr(module, "multicast_backend_available", lambda group: False)
+    monkeypatch.setattr(
+        module,
+        "create_allreduce_fusion_workspace",
+        _forbid_call("create_allreduce_fusion_workspace"),
+    )
+    monkeypatch.setattr(
+        module, "KimiK3LatentTailOp", _forbid_call("KimiK3LatentTailOp")
+    )
+    monkeypatch.setattr(module, "multimem_prealloc", _forbid_call("multimem_prealloc"))
+
+    comm = module.K3MoeTailComm(
+        mapping=mapping,
+        hidden_size=7168,
+        routed_hidden=3584,
+        top_k=16,
+        routed_norm=_SimpleRMSNorm(torch.ones(3584)),
+        up_proj=_ShardedUpProj(torch.zeros(896, 3584), start=0, width=896),
+        experts_supports_deferred_finalize=True,
+    )
+    assert not comm.use_allreduce_fusion
+    assert not comm.defer_finalize
+    assert comm.prepare(2048)
+    assert module.K3MoeTailComm._routed_workspace is None
+    assert module.K3MoeTailComm._latent_tail is None
+    assert module.K3MoeTailComm._multimem_group_name is None
+    assert module.K3MoeTailComm._stage2_capacity == 2048
+    # Reusing a prepared tail at or below capacity succeeds; growing still fails.
+    assert comm.prepare(1024)
+    with pytest.raises(RuntimeError, match="Cannot grow"):
+        comm.prepare(4096)
+
+
+def test_moe_tail_arms_multicast_paths_when_multicast_available(monkeypatch):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    _reset_moe_tail_state(monkeypatch, module)
+    mapping = Mapping(rank=0, world_size=8, attn_tp_size=8, moe_tp_size=8)
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_blackwell=True)
+    )
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+    group = SimpleNamespace(group_name="moe-tp")
+    monkeypatch.setattr(module, "_get_process_group", lambda ranks: group)
+    monkeypatch.setattr(module, "multicast_backend_available", lambda g: True)
+    workspace = object()
+    latent_tail = object()
+    monkeypatch.setattr(
+        module, "create_allreduce_fusion_workspace", lambda **kwargs: workspace
+    )
+    monkeypatch.setattr(module, "KimiK3LatentTailOp", lambda **kwargs: latent_tail)
+    monkeypatch.setattr(module, "multimem_prealloc", lambda *args, **kwargs: True)
+
+    comm = module.K3MoeTailComm(
+        mapping=mapping,
+        hidden_size=7168,
+        routed_hidden=3584,
+        top_k=16,
+        routed_norm=_SimpleRMSNorm(torch.ones(3584)),
+        up_proj=_ShardedUpProj(torch.zeros(896, 3584), start=0, width=896),
+        experts_supports_deferred_finalize=True,
+    )
+    assert comm.use_allreduce_fusion
+    assert comm.defer_finalize
+    assert comm.prepare(2048)
+    assert module.K3MoeTailComm._routed_workspace is workspace
+    assert module.K3MoeTailComm._latent_tail is latent_tail
+    assert module.K3MoeTailComm._multimem_group_name == "moe-tp"
+    assert module.K3MoeTailComm._stage2_capacity == 2048
+
+
+def test_moe_tail_fail_fast_guards_without_multicast(monkeypatch):
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    _reset_moe_tail_state(monkeypatch, module)
+    mapping = Mapping(rank=0, world_size=4, attn_tp_size=4, moe_tp_size=4)
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_blackwell=True)
+    )
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        module, "_get_process_group", lambda ranks: SimpleNamespace(group_name="moe-tp")
+    )
+    monkeypatch.setattr(module, "multicast_backend_available", lambda group: False)
+
+    comm = module.K3MoeTailComm(
+        mapping=mapping,
+        hidden_size=16,
+        routed_hidden=8,
+        top_k=2,
+        routed_norm=_SimpleRMSNorm(torch.ones(8)),
+        up_proj=_ShardedUpProj(torch.zeros(4, 8), start=0, width=4),
+        experts_supports_deferred_finalize=True,
+    )
+    routed = torch.zeros(4, 8)
+    shared = torch.zeros(4, 16)
+    prefix = torch.zeros(4, 16)
+
+    with pytest.raises(RuntimeError, match="must be prepared"):
+        comm.shared_rs(shared)
+    with pytest.raises(RuntimeError, match="must be prepared"):
+        comm.up_proj_ag(routed, shared, prefix)
+    with pytest.raises(RuntimeError, match="must be prepared"):
+        comm.up_proj_inject_ar(routed, shared, prefix)
+
+    # Forcing allreduce fusion when multicast is unavailable must fail fast.
+    comm.use_allreduce_fusion = True
+    with pytest.raises(RuntimeError, match="NVLink multicast"):
+        comm.prepare(128)
+    comm.use_allreduce_fusion = False
+
+    assert comm.prepare(64)
+    too_wide_routed = torch.zeros(65, 8)
+    too_wide_shared = torch.zeros(65, 16)
+    too_wide_prefix = torch.zeros(65, 16)
+    with pytest.raises(ValueError, match="exceeds the prepared MoE workspace"):
+        comm.up_proj_ag(too_wide_routed, too_wide_shared, too_wide_prefix)
+    with pytest.raises(ValueError, match="exceeds the prepared MoE workspace"):
+        comm.up_proj_inject_ar(too_wide_routed, too_wide_shared, too_wide_prefix)
+
+
+@pytest.mark.parametrize(
+    "num_tokens,pre_inject_residual",
+    [
+        (4, False),
+        (40, True),
+        (40, False),
+        (1025, True),
+    ],
+)
+def test_moe_tail_no_multicast_fallback_matches_reference(
+    monkeypatch, num_tokens, pre_inject_residual
+):
+    """Multi-rank numerical equivalence for the no-multicast MoE tail fallback."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.models import kimi_k3_comm as module
+
+    _reset_moe_tail_state(monkeypatch, module)
+    tp_size = 4
+    hidden_size = 16
+    routed_hidden = 8
+    shard_width = hidden_size // tp_size
+
+    monkeypatch.setattr(
+        module, "current_platform", lambda: SimpleNamespace(is_blackwell=True)
+    )
+    monkeypatch.setattr(module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        module, "_get_process_group", lambda ranks: SimpleNamespace(group_name="moe-tp")
+    )
+    monkeypatch.setattr(module, "multicast_backend_available", lambda group: False)
+    monkeypatch.setattr(module, "multimem_stage", _forbid_call("multimem_stage"))
+    monkeypatch.setattr(
+        module,
+        "multimem_all_reduce_staged",
+        _forbid_call("multimem_all_reduce_staged"),
+    )
+
+    # Collective in-memory all-reduce across simulated TP ranks.
+    barrier = Barrier(tp_size)
+    collected: list[torch.Tensor] = []
+
+    def fake_all_reduce(tensor: torch.Tensor, group) -> torch.Tensor:
+        collected.append(tensor.clone())
+        barrier.wait()
+        total = torch.stack(collected, dim=0).sum(dim=0)
+        barrier.wait()
+        if barrier.wait() == 0:
+            collected.clear()
+        barrier.wait()
+        return total
+
+    monkeypatch.setattr(module, "all_reduce", fake_all_reduce)
+
+    gen = torch.Generator().manual_seed(1234 + num_tokens)
+    norm_weight = torch.randn(routed_hidden, generator=gen)
+    full_up_weight = torch.randn(hidden_size, routed_hidden, generator=gen)
+    routed_partials = torch.randn(tp_size, num_tokens, routed_hidden, generator=gen)
+    shared_partials = torch.randn(tp_size, num_tokens, hidden_size, generator=gen)
+    prefix_sum = torch.randn(num_tokens, hidden_size, generator=gen)
+
+    routed_norm = _SimpleRMSNorm(norm_weight)
+    comms = [
+        module.K3MoeTailComm(
+            mapping=Mapping(
+                rank=rank, world_size=tp_size, attn_tp_size=tp_size, moe_tp_size=tp_size
+            ),
+            hidden_size=hidden_size,
+            routed_hidden=routed_hidden,
+            top_k=2,
+            routed_norm=routed_norm,
+            up_proj=_ShardedUpProj(
+                full_up_weight[
+                    rank * shard_width : (rank + 1) * shard_width
+                ].contiguous(),
+                start=rank * shard_width,
+                width=shard_width,
+            ),
+            experts_supports_deferred_finalize=True,
+        )
+        for rank in range(tp_size)
+    ]
+    assert comms[0].prepare(max(num_tokens, 2048))
+
+    def run_rank(rank: int) -> torch.Tensor:
+        comm = comms[rank]
+        shared = shared_partials[rank].clone()
+        routed = routed_partials[rank].clone()
+        prefix = prefix_sum
+        if num_tokens <= module.K3_SHARED_RS_MAX_TOKENS:
+            shared_shard = comm.shared_rs(shared)
+            routed_latent = comm.routed_ar_fusion(routed, num_tokens)
+            return comm.up_proj_ag(routed_latent, shared_shard, prefix)
+        if pre_inject_residual:
+            comm.inject_residual(shared, prefix)
+            prefix = None
+        routed_latent = comm.routed_ar_fusion(routed, num_tokens)
+        return comm.up_proj_inject_ar(routed_latent, shared, prefix)
+
+    with ThreadPoolExecutor(max_workers=tp_size) as pool:
+        outputs = list(pool.map(run_rank, range(tp_size)))
+
+    expected = (
+        shared_partials.sum(dim=0)
+        + prefix_sum
+        + routed_norm(routed_partials.sum(dim=0)) @ full_up_weight.t()
+    )
+    for out in outputs:
+        torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
