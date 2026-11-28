@@ -696,3 +696,37 @@ def test_group32_reciprocal_finite_bf16_constant_blocks():
     torch.testing.assert_close(
         scales.view(torch.float8_e8m0fnu).float().reshape(-1), scale, rtol=0, atol=0
     )
+
+
+@requires_flashinfer_mxfp8
+def test_mm_mxfp8_cutedsl_fast_path_matches_loglevel_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tokenspeed_kernel.thirdparty.flashinfer.mxfp8 import mm_mxfp8
+
+    torch.manual_seed(7)
+    a_q, a_s = _quantize_mxfp8(
+        torch.randn(32, 256, device="cuda", dtype=torch.bfloat16)
+    )
+    b_q, b_s = _quantize_mxfp8(
+        torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
+    )
+    monkeypatch.delenv("FLASHINFER_LOGLEVEL", raising=False)
+    fast = mm_mxfp8(
+        a_q,
+        b_q.T,
+        a_s,
+        b_s,
+        out_dtype=torch.bfloat16,
+        backend="cute-dsl",
+    )
+    monkeypatch.setenv("FLASHINFER_LOGLEVEL", "3")
+    checked = mm_mxfp8(
+        a_q,
+        b_q.T,
+        a_s,
+        b_s,
+        out_dtype=torch.bfloat16,
+        backend="cute-dsl",
+    )
+    assert torch.equal(fast.view(torch.uint16), checked.view(torch.uint16))

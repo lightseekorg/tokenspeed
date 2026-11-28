@@ -414,6 +414,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._prefill_kv_batch: V41PrefillBatch | None = None
         self._local_decode_selections: dict[tuple, tuple] = {}
         self._partitioned_index_layers: set[int] = set()
+        self._warmed_index_heads: int | None = None
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
@@ -1662,6 +1663,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         index_values = (
             index_q.values if isinstance(index_q, dsv41.IndexQueryInput) else index_q
         )
+        if index_values is not None:
+            self._warmed_index_heads = index_values.shape[1]
         if index_values is not None and (
             index_values.shape[0] != expected_rows
             or index_weights.shape[0] != expected_rows
@@ -2021,6 +2024,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
 
         if not forward_mode.is_decode() or self.kvp_size > 1:
             return
+        self._warmed_index_heads = index_heads
         metadata = self.query_metadata(forward_mode)
         positions, requests = metadata.positions, metadata.request_indices
         n = positions.numel()
@@ -3284,20 +3288,28 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     max((item.prefix + item.count) // ratio + 63 for item, _ in members)
                     // 64,
                 )
-                parts = []
-                for item, local in members:
-                    row = table[item.request : item.request + 1, :width]
-                    row = row.masked_fill(row <= 0, -1)
-                    if local:
-                        parts.append((row, local))
-                history_rows = tuple(local for _, local in parts) or None
-                if not parts:
+                nonzero = [(item.request, local) for item, local in members if local]
+                history_rows = tuple(local for _, local in nonzero) or None
+                if not nonzero:
                     tile_table = table[:0, :width]
-                elif len(parts) == 1:
-                    tile_table = parts[0][0].expand(parts[0][1], -1)
+                elif len(nonzero) == 1:
+                    request_id, count = nonzero[0]
+                    row = table[request_id : request_id + 1, :width]
+                    row = row.masked_fill(row <= 0, -1)
+                    tile_table = row.expand(count, -1)
                 else:
-                    tile_table = torch.cat(
-                        [row.expand(local, -1) for row, local in parts], dim=0
+                    req_ids = torch.tensor(
+                        [request_id for request_id, _ in nonzero],
+                        dtype=torch.int64,
+                        device=table.device,
+                    )
+                    counts = torch.tensor(
+                        history_rows, dtype=torch.int64, device=table.device
+                    )
+                    rows_gathered = table[:, :width].index_select(0, req_ids)
+                    rows_gathered.masked_fill_(rows_gathered <= 0, -1)
+                    tile_table = rows_gathered.repeat_interleave(
+                        counts, dim=0, output_size=stop - start
                     )
             elif span is not None:
                 visible = (
@@ -3347,6 +3359,85 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             if cacheable:
                 self._index_geometry[key] = geometry
         return geometry
+
+    def warmup_prefill_kernels(self) -> None:
+        """Warm SWA/global cache gathers and sparse Reindex kernels skipped by empty-prefix warmups."""
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        if self.cache_pool is None:
+            return
+        swa_cache = self.cache_pool.swa(0)
+        if not swa_cache.is_cuda:
+            return
+        device = swa_cache.device
+        owner = self.spec.kv_owners[0]
+        global_cache = self.cache_pool.global_kv(owner)
+        real_index_cache = self.cache_pool.index_k(owner)
+
+        # Empty-prefix dummy warmups never exercise SWA prefix or global history gathers.
+        invalid_slots = torch.full((1,), -1, dtype=torch.int64, device=device)
+        dsv41.cache_gather(swa_cache, invalid_slots, self.swa_format, None)
+        dsv41.cache_gather(
+            global_cache,
+            invalid_slots,
+            self.global_format,
+            torch.empty((1, 512), dtype=torch.bfloat16, device=device),
+        )
+
+        # Warm native sparse Reindex scoring + _finish_write_selection variants
+        # against a small zero-initialized 512B-aligned cache view (no NaNs).
+        row_bytes = real_index_cache.shape[2]
+        page_stride = ((64 * row_bytes + 511) // 512) * 512
+        safe_index_cache = torch.zeros(
+            (2, page_stride), dtype=torch.uint8, device=device
+        ).as_strided((2, 64, row_bytes), (page_stride, row_bytes, 1))
+        index_heads = (
+            self._warmed_index_heads if self._warmed_index_heads is not None else 32
+        )
+        # Replicated Blackwell native scorer requires 32 local heads; other head
+        # counts still warm portable Reindex with the model's head geometry.
+        table = torch.zeros((1, 9), dtype=torch.int32, device=device)
+        visible_lens = torch.full((1,), 520, dtype=torch.int32, device=device)
+        candidates = torch.arange(65, dtype=torch.int32, device=device).unsqueeze(0)
+        positions = torch.full((1,), 1023, dtype=torch.int64, device=device)
+        requests = torch.zeros(1, dtype=torch.int64, device=device)
+        cos_sin_cache = torch.zeros((1024, 64), dtype=torch.float32, device=device)
+        index_q = dsv41.IndexQueryInput(
+            values=torch.zeros(
+                (1, index_heads, 128), dtype=torch.bfloat16, device=device
+            ),
+            positions=positions,
+            cos_sin_cache=cos_sin_cache,
+            weight_scale=1.0,
+        )
+        weights = torch.zeros((1, index_heads), dtype=torch.bfloat16, device=device)
+        slots = dsv41.SelectionSlots(
+            out=torch.empty(
+                (1, self.spec.index_topk), dtype=torch.int32, device=device
+            ),
+            positions=positions,
+            requests=requests,
+            table=table,
+            ratio=self.spec.compress_ratios[owner],
+            pages=2,
+        )
+        dsv41.index_topk(
+            index_q,
+            weights,
+            safe_index_cache,
+            table,
+            visible_lens,
+            candidates,
+            self.spec.index_topk,
+            0,
+            self.spec.candidate_block_size,
+            1,
+            8,
+            None,
+            None,
+            None,
+            slots=slots,
+        )
 
 
 register_backend("deepseek_v41", {AttentionArch.MLA}, DeepseekV41AttentionBackend)

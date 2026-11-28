@@ -96,6 +96,7 @@ from tokenspeed_kernel.ops.gemm import (
     grouped_fp8_projection_quantize_fp8,
     has_grouped_fp8_projection,
     mm,
+    plan_fp8_projection,
     prepare_fp8_projection,
     prepare_grouped_fp8_projection,
     prepare_mxfp8_weight_scales,
@@ -104,6 +105,7 @@ from tokenspeed_kernel.ops.gemm import (
 )
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.quantization import (
+    plan_rmsnorm_quantize_fp8_group32,
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
     silu_and_mul_quantize_fp8_group32,
@@ -114,7 +116,7 @@ from tokenspeed_kernel.ops.residual import (
     try_mhc_shifted_post_pre_norm_quantize_fp8,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.selection import NoKernelFoundError
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError
 from torch import nn
 
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
@@ -144,6 +146,7 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41RowPlan,
@@ -286,6 +289,7 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         # the power-of-two scales in once -- both exact in BF16 -- and run the
         # BF16 GEMM. Costs the FP8 weight size again.
         self.load_as_bf16 = current_platform().is_hopper
+        self.fp8_projection_plan: KernelPlan | None = None
 
     def create_weights(
         self,
@@ -382,10 +386,17 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         cached = self.projection_weight_scales
         if cached is None:
             self.projection_weight_scales = prepared
-            return
-        if prepared is None or prepared.shape != cached.shape:
-            raise ValueError("DeepGEMM projection weight scales changed layout")
-        cached.copy_(prepared)
+        else:
+            if prepared is None or prepared.shape != cached.shape:
+                raise ValueError("DeepGEMM projection weight scales changed layout")
+            cached.copy_(prepared)
+        if self.projection_weight_scales is not None:
+            self.fp8_projection_plan = plan_fp8_projection(
+                mode="fp8_projection",
+                output_dim=layer.weight.shape[0],
+                input_dim=layer.weight.shape[1],
+                device=layer.weight.device,
+            )
 
     def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
         # Only row-parallel layers preallocate their output, and none of them
@@ -434,6 +445,7 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
                     layer.weight,
                     self.projection_weight_scales,
                     None,
+                    plan=self.fp8_projection_plan,
                 )
             if self.prepared_weight_scales is not None:
                 return mm(
@@ -815,6 +827,60 @@ class DeepseekV41Compressor(nn.Module):
             dtype=torch.bfloat16
         )
 
+    def project(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute token-local compressor projection before cross-token pooling."""
+        if x.shape[0] == 0:
+            return x.new_empty(
+                (0, self.norm.weight.numel() * self.ratio),
+                dtype=torch.float32 if self.ratio == 2 else x.dtype,
+            )
+        if self.ratio == 1:
+            projected, _ = self.wkv(x, block_scale=None, output_dtype=None)
+            return projected
+        return (
+            dsv4_linear_fp32(
+                x.contiguous(), self.wkv_wgate.weight, override=None, solution=None
+            )
+            if x.is_cuda
+            else F.linear(x.float(), self.wkv_wgate.weight.float())
+        )
+
+    def norm_ratio1(self, projected: torch.Tensor) -> torch.Tensor:
+        """Apply RMSNorm to ratio-1 compressor projections."""
+        return _attention_norm(projected, self.norm)
+
+    def finish(
+        self,
+        projected: torch.Tensor,
+        owner,
+        positions,
+        requests,
+        backend,
+        mode,
+        *,
+        key_rows: QueryShardGather | None,
+    ):
+        """Gather shards and pool ratio-2 rows into latent KV + coordinates."""
+        if key_rows is not None:
+            projected = key_rows.plan.to_span_order(
+                token_all_gather_rows(
+                    projected.contiguous(),
+                    key_rows.group,
+                    list(key_rows.plan.row_counts),
+                )
+            )
+        if self.ratio == 2:
+            content, scores = projected.chunk(2, dim=-1)
+            return backend.compress(
+                owner,
+                content,
+                scores,
+                mode,
+                self.norm.weight,
+                self.norm.variance_epsilon,
+            )
+        return self.norm_ratio1(projected), positions, requests
+
     def forward(
         self,
         x,
@@ -850,36 +916,11 @@ class DeepseekV41Compressor(nn.Module):
                 (0, self.norm.weight.numel() * self.ratio),
                 dtype=torch.float32 if self.ratio == 2 else x.dtype,
             )
-        elif self.ratio == 1:
-            projected, _ = self.wkv(x, block_scale=None, output_dtype=None)
         else:
-            projected = (
-                dsv4_linear_fp32(
-                    x.contiguous(), self.wkv_wgate.weight, override=None, solution=None
-                )
-                if x.is_cuda
-                else F.linear(x.float(), self.wkv_wgate.weight.float())
-            )
-        if key_rows is not None:
-            projected = key_rows.plan.to_span_order(
-                token_all_gather_rows(
-                    projected.contiguous(),
-                    key_rows.group,
-                    list(key_rows.plan.row_counts),
-                )
-            )
-        if self.ratio == 2:
-            content, scores = projected.chunk(2, dim=-1)
-            content, positions, requests = backend.compress(
-                owner,
-                content,
-                scores,
-                mode,
-                self.norm.weight,
-                self.norm.variance_epsilon,
-            )
-            return content, positions, requests
-        return _attention_norm(projected, self.norm), positions, requests
+            projected = self.project(x)
+        return self.finish(
+            projected, owner, positions, requests, backend, mode, key_rows=key_rows
+        )
 
 
 class DeepseekV41Indexer(nn.Module):
@@ -966,15 +1007,20 @@ class DeepseekV41Indexer(nn.Module):
             )
         return rotary.apply_owned(q, positions, False), weights * self.scale
 
-    def key(
-        self,
-        latent: torch.Tensor,
-        positions: torch.Tensor,
-        rotary: DeepseekV41RotaryEmbedding,
-    ) -> torch.Tensor | IndexKeyInput:
+    def project_key(self, latent: torch.Tensor) -> torch.Tensor:
+        """Project KV latents to raw pre-norm index keys."""
         if self.wk is None:
             raise RuntimeError("Only a KV owner can project index keys")
         key, _ = self.wk(latent, block_scale=None, output_dtype=None)
+        return key
+
+    def finish_key(
+        self,
+        key: torch.Tensor,
+        positions: torch.Tensor,
+        rotary: DeepseekV41RotaryEmbedding,
+    ) -> torch.Tensor | IndexKeyInput:
+        """Normalize and rotate raw index keys, or bundle into IndexKeyInput on Blackwell."""
         if (
             key.is_cuda
             and current_platform().is_blackwell
@@ -990,6 +1036,14 @@ class DeepseekV41Indexer(nn.Module):
                 self.k_norm.variance_epsilon,
             )
         return rotary.apply_owned(_attention_norm(key, self.k_norm), positions, False)
+
+    def key(
+        self,
+        latent: torch.Tensor,
+        positions: torch.Tensor,
+        rotary: DeepseekV41RotaryEmbedding,
+    ) -> torch.Tensor | IndexKeyInput:
+        return self.finish_key(self.project_key(latent), positions, rotary)
 
 
 def _row_plan(layer_id: int, ced_decoder_start: int, ctx: ForwardContext) -> V41RowPlan:
@@ -1160,6 +1214,11 @@ class DeepseekV41Attention(nn.Module):
             else None
         )
         self.rotary_emb = DeepseekV41RotaryEmbedding(config, self.compress_ratio)
+        self._q_norm_quant_plan: KernelPlan | None = None
+        self._wo_a_grouped_plan: KernelPlan | None = None
+        self._wo_a_grouped_fp8_plan: KernelPlan | None = None
+        self._wo_b_fp8_plan: KernelPlan | None = None
+        self._fused_q_fp8_plan: KernelPlan | None = None
 
     def load_sink(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
         start = self.mapping.attn.head_tp_rank * self.n_local_heads
@@ -1185,6 +1244,16 @@ class DeepseekV41Attention(nn.Module):
             self.wo_a_scales = prepared
         else:
             self.wo_a_scales.copy_(prepared)
+        self._wo_a_grouped_plan = plan_fp8_projection(
+            mode="grouped_fp8_projection",
+            output_dim=self.o_lora_rank,
+            input_dim=self.wo_a.weight.shape[1],
+            device=self.wo_a.weight.device,
+        )
+        if self.wo_a.weight.is_cuda and self._q_norm_quant_plan is None:
+            self._q_norm_quant_plan = plan_rmsnorm_quantize_fp8_group32(
+                torch.bfloat16, solution="triton"
+            )
         if self.wo_b_fp8 is False:
             return
         prepared = None
@@ -1203,6 +1272,19 @@ class DeepseekV41Attention(nn.Module):
             self.wo_b_scales = prepared
         else:
             self.wo_b_scales.copy_(prepared)
+        if self.wo_b_fp8:
+            self._wo_a_grouped_fp8_plan = plan_fp8_projection(
+                mode="grouped_fp8_projection_fp8",
+                output_dim=self.o_lora_rank,
+                input_dim=self.wo_a.weight.shape[1],
+                device=self.wo_a.weight.device,
+            )
+            self._wo_b_fp8_plan = plan_fp8_projection(
+                mode="fp8_projection",
+                output_dim=self.wo_b.weight.shape[0],
+                input_dim=self.wo_b.weight.shape[1],
+                device=self.wo_b.weight.device,
+            )
 
     def warmup_output_projections(self, max_tokens: int) -> None:
         """Compile the FP8 wo_a/wo_b kernels for every count up to max_tokens."""
@@ -1261,6 +1343,13 @@ class DeepseekV41Attention(nn.Module):
             raise ValueError("V4.1 fused Q projection scales changed layout")
         else:
             self.fused_q_projection_scales.copy_(projection_scales)
+        if self.fused_q_projection_scales is not None:
+            self._fused_q_fp8_plan = plan_fp8_projection(
+                mode="fp8_projection",
+                output_dim=query.shape[0],
+                input_dim=query.shape[1],
+                device=query.device,
+            )
         if self.fused_q_weight is None:
             self.fused_q_weight, self.fused_q_scales = query, query_scales
             self.fused_wo_a_weight, self.fused_wo_a_scales = output, output_scales
@@ -1291,28 +1380,15 @@ class DeepseekV41Attention(nn.Module):
             )
         return self._padded_attn_sink
 
-    def _write_global_kv(
+    def _finish_and_write_global_kv(
         self,
-        hidden_states,
-        positions,
-        requests,
+        latent: torch.Tensor,
+        row_positions: torch.Tensor,
+        row_requests: torch.Tensor,
+        index_k: torch.Tensor | IndexKeyInput,
         backend,
         mode,
-        *,
-        key_rows: QueryShardGather | None,
-    ):
-        if self.compressor is None:
-            return
-        latent, row_positions, row_requests = self.compressor(
-            hidden_states,
-            self.layer_id,
-            positions,
-            requests,
-            backend,
-            mode,
-            key_rows=key_rows,
-        )
-        index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
+    ) -> None:
         main_rope_cache = None
         if (
             latent.is_cuda
@@ -1335,6 +1411,32 @@ class DeepseekV41Attention(nn.Module):
             row_requests,
             mode,
             main_rope_cache=main_rope_cache,
+        )
+
+    def _write_global_kv(
+        self,
+        hidden_states,
+        positions,
+        requests,
+        backend,
+        mode,
+        *,
+        key_rows: QueryShardGather | None,
+    ):
+        if self.compressor is None:
+            return
+        latent, row_positions, row_requests = self.compressor(
+            hidden_states,
+            self.layer_id,
+            positions,
+            requests,
+            backend,
+            mode,
+            key_rows=key_rows,
+        )
+        index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
+        self._finish_and_write_global_kv(
+            latent, row_positions, row_requests, index_k, backend, mode
         )
 
     def _q_scale_layout(self, rows: V41RowPlan, fused_decode: bool) -> str:
@@ -1363,24 +1465,442 @@ class DeepseekV41Attention(nn.Module):
             return "packed"
         return "swizzled" if "swizzled" in layouts else "canonical"
 
+    def _fused_decode_enabled(
+        self,
+        backend,
+        mode: ForwardMode,
+        query_gather: QueryShardGather | None,
+    ) -> bool:
+        # Prepared weights serve decode and pure prefill alike. Mixed batches and
+        # QCP shards keep the step-by-step path so row/format contracts agree.
+        return (
+            self.fused_q_weight is not None
+            and query_gather is None
+            and (
+                (mode.is_decode() and backend.supports_fused_attention)
+                or (mode.is_extend() and backend.supports_fused_prefill)
+            )
+        )
+
+    def _quantize_q_latent(
+        self,
+        qr: torch.Tensor,
+        rows: V41RowPlan,
+        fused_decode: bool,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        if (
+            qr.shape[0] > 0
+            and qr.is_cuda
+            and qr.dtype == torch.bfloat16
+            and (
+                current_platform().is_nvidia
+                or current_platform().is_cdna4
+                or current_platform().is_cdna5
+            )
+            and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
+        ):
+            if (
+                self._q_norm_quant_plan is None
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                self._q_norm_quant_plan = plan_rmsnorm_quantize_fp8_group32(
+                    qr.dtype, solution="triton"
+                )
+            qr, q_input, q_scale = rmsnorm_quantize_fp8_group32(
+                qr,
+                self.q_norm.weight,
+                self.q_norm.variance_epsilon,
+                scale_layout=self._q_scale_layout(rows, fused_decode),
+                override=None,
+                solution="triton",
+                plan=self._q_norm_quant_plan,
+            )
+        else:
+            qr = q_input = _attention_norm(qr, self.q_norm) if qr.shape[0] else qr
+            q_scale = None
+        index_q_input, index_q_scale = qr, None
+        if (
+            q_scale is not None
+            and self.indexer is not None
+            and isinstance(self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod)
+        ):
+            index_q_input, index_q_scale = q_input, q_scale
+        return qr, q_input, q_scale, index_q_input, index_q_scale
+
+    def _project_queries_and_swa(
+        self,
+        positions: torch.Tensor,
+        qr: torch.Tensor,
+        q_input: torch.Tensor,
+        q_scale: torch.Tensor | None,
+        swa: torch.Tensor,
+        mode: ForwardMode,
+        fused_decode: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if q_input.shape[0]:
+            if fused_decode and q_scale is not None and q_scale.dtype == torch.int32:
+                q = fp8_projection(
+                    q_input,
+                    q_scale,
+                    self.fused_q_weight,
+                    self.fused_q_projection_scales,
+                    None,
+                    plan=self._fused_q_fp8_plan,
+                )
+            elif fused_decode:
+                q = mm(
+                    q_input,
+                    self.fused_q_weight,
+                    A_scales=q_scale,
+                    B_scales=self.fused_q_scales,
+                    out_dtype=qr.dtype,
+                    quant="mxfp8",
+                    block_size=[1, 32],
+                    prepacked_scales=True,
+                )
+            else:
+                q, _ = self.wq_b(
+                    q_input,
+                    block_scale=q_scale,
+                    output_dtype=qr.dtype if q_scale is not None else None,
+                )
+        else:
+            q = qr.new_empty((0, self.n_local_heads * self.head_dim))
+        q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+        if (
+            not fused_decode
+            and q.is_cuda
+            and mode.is_decode()
+            and self.head_dim == 512
+            and self.n_local_heads != self.n_kernel_heads
+        ):
+            q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
+        elif not fused_decode and q.shape[0]:
+            q = self.rotary_emb.apply_owned(q, positions, False)
+        swa_rope_cache = None
+        swa_norm_weight = None
+        if swa.is_cuda and self.head_dim == 512 and self.rotary_emb.dim == 64:
+            self.rotary_emb._prepare_cache(swa.device)
+            swa_rope_cache = self.rotary_emb.cos_sin_cache
+            if (
+                current_platform().is_blackwell
+                or current_platform().is_cdna4
+                or current_platform().is_cdna5
+            ):
+                swa_norm_weight = self.kv_norm.weight
+            else:
+                swa = _attention_norm(swa, self.kv_norm) if swa.shape[0] else swa
+        elif swa.shape[0]:
+            swa = _attention_norm(swa, self.kv_norm)
+            swa = self.rotary_emb.apply_owned(swa, positions, False)
+        return q, swa, swa_rope_cache, swa_norm_weight
+
+    def _out_rope_cache(self, q: torch.Tensor) -> torch.Tensor | None:
+        # CDNA4/5 rotate the attention output back inside the attention kernel.
+        if q.is_cuda and (current_platform().is_cdna4 or current_platform().is_cdna5):
+            return self.rotary_emb.inverse_cos_sin_cache
+        return None
+
+    def _output_projections(
+        self,
+        attn_out: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        positions: torch.Tensor,
+        reduce_output: bool,
+        fused_decode: bool,
+        out_rope_cache: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if fused_decode:
+            codes, scales = attn_out
+            rows_count = codes.shape[0]
+            weight, weight_scales = self.fused_wo_a_weight, self.fused_wo_a_scales
+            out_ref = codes
+        else:
+            out = attn_out
+            rows_count = out.shape[0]
+            weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
+            weight_scales = self.wo_a_scales
+            out_ref = out
+        target = None
+        if self.mapping.attn.head_tp_size > 1:
+            target = _all_reduce_output(
+                (rows_count, self.wo_b.output_size),
+                out_ref,
+                self.mapping.attn.head_tp_group,
+            )
+        method = self.wo_b.quant_method
+        if self.wo_a_fp8:
+            # One kernel undoes RoPE and casts every 32 channels to FP8, as the
+            # reference rounds o before wo_a. Only CDNA attention rotates back
+            # itself, and no grouped FP8 kernel serves CDNA.
+            if not fused_decode:
+                codes, scales = self.rotary_emb.inverse_quantize_grouped(
+                    out, positions, self.n_local_groups
+                )
+            if self.wo_b_fp8:
+                codes, scales = grouped_fp8_projection_quantize_fp8(
+                    codes,
+                    scales,
+                    weight,
+                    weight_scales,
+                    plan=self._wo_a_grouped_fp8_plan,
+                )
+                out = fp8_projection(
+                    codes,
+                    scales,
+                    self.wo_b.weight,
+                    self.wo_b_scales,
+                    target,
+                    plan=self._wo_b_fp8_plan,
+                )
+            else:
+                out = grouped_fp8_projection(
+                    codes,
+                    scales,
+                    weight,
+                    weight_scales,
+                    None,
+                    plan=self._wo_a_grouped_plan,
+                )
+                out, _ = self.wo_b(out.flatten(1), scale=None, out=target)
+        else:
+            if out_rope_cache is None:
+                out = self.rotary_emb.apply_owned(out, positions, True)
+            grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
+            if (
+                grouped.is_cuda
+                and (current_platform().is_cdna4 or current_platform().is_cdna5)
+                and isinstance(method, _ReferenceFp8LinearMethod)
+                and method.prepared_weight_scales is None
+            ):
+                codes, scales = grouped_bf16_projection_quantize_fp8(grouped, weight)
+                out, _ = self.wo_b(codes, scale=scales, out=target)
+            else:
+                out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
+                out, _ = self.wo_b(out, scale=None, out=target)
+        if self.mapping.attn.head_tp_size > 1 and reduce_output:
+            out = all_reduce(
+                out,
+                group=self.mapping.attn.head_tp_group,
+                backend=None,
+                op=torch.distributed.ReduceOp.SUM,
+            )
+        return out
+
     @break_point
-    def forward(
+    def _sparse_attention_and_kv(
+        self,
+        ctx: ForwardContext,
+        q: torch.Tensor,
+        swa: torch.Tensor,
+        latent_or_comp: torch.Tensor | None,
+        index_k_proj: torch.Tensor | None,
+        index_q: torch.Tensor | IndexQueryInput | None,
+        index_weights: torch.Tensor | None,
+        swa_rope_cache: torch.Tensor | None,
+        swa_norm_weight: torch.Tensor | None,
+        out_rope_cache: torch.Tensor | None,
+        fused_decode: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Execute variable-length KV writes, indexer selection, and attention eagerly."""
+        backend, mode = ctx.attn_backend, ctx.forward_mode
+        rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
+        meta = rows.source
+        source_positions, source_requests = meta.positions, meta.request_indices
+        source_count = source_positions.numel()
+        if source_count > q.shape[0]:
+            raise ValueError("V4.1 hidden rows and backend query metadata disagree")
+        q, swa, latent_or_comp, index_k_proj, index_weights = slice_to_real_tokens(
+            source_count, q, swa, latent_or_comp, index_k_proj, index_weights
+        )
+        if index_q is not None:
+            iq_rows = (
+                index_q.values.shape[0]
+                if isinstance(index_q, IndexQueryInput)
+                else index_q.shape[0]
+            )
+            if source_count < iq_rows:
+                index_q = index_q[:source_count]
+        if self.compressor is not None:
+            if self.compressor.ratio == 1:
+                latent = latent_or_comp
+                row_positions, row_requests = source_positions, source_requests
+                index_k = self.indexer.finish_key(
+                    index_k_proj, row_positions, self.rotary_emb
+                )
+            else:
+                latent, row_positions, row_requests = self.compressor.finish(
+                    latent_or_comp,
+                    self.layer_id,
+                    source_positions,
+                    source_requests,
+                    backend,
+                    mode,
+                    key_rows=None,
+                )
+                index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
+            self._finish_and_write_global_kv(
+                latent, row_positions, row_requests, index_k, backend, mode
+            )
+        if self.indexer is not None:
+            if backend.indexer_needs_scores(
+                self.layer_id,
+                rows.query.positions,
+                rows.query.request_indices,
+                mode,
+            ):
+                partition = (
+                    backend.plan_indexer_queries(
+                        self.layer_id, source_positions, source_requests, mode, None
+                    )
+                    if mode.is_extend() and not mode.is_mixed()
+                    else None
+                )
+                if partition is not None:
+                    backend.prepare_global_selection(
+                        self.layer_id,
+                        index_q,
+                        index_weights,
+                        source_positions,
+                        source_requests,
+                        mode,
+                        None,
+                        projected_partition=None,
+                    )
+                    index_q = index_weights = None
+            else:
+                index_q = index_weights = None
+        out = backend.forward_v41(
+            q,
+            swa,
+            layer_id=self.layer_id,
+            positions=source_positions,
+            request_indices=source_requests,
+            forward_mode=mode,
+            index_q=index_q,
+            index_weights=index_weights,
+            attn_sink=self._kernel_attn_sink(),
+            softmax_scale=self.head_dim**-0.5,
+            index_process_group=None,
+            swa_rope_cache=swa_rope_cache,
+            swa_norm_weight=swa_norm_weight,
+            swa_norm_eps=self.kv_norm.variance_epsilon,
+            out_rope_cache=out_rope_cache,
+            fused_decode_groups=self.n_local_groups if fused_decode else None,
+            key_rows=None,
+        )
+        return out if fused_decode else out[:, : self.n_local_heads]
+
+    def _forward_captured_prefill(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         reduce_output: bool,
-        hidden_codes: torch.Tensor | None = None,
-        hidden_scales: torch.Tensor | None = None,
+        hidden_codes: torch.Tensor | None,
+        hidden_scales: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Return the attention output, reducing its TP partial when requested.
-
-        hidden_codes/hidden_scales optionally carry hidden_states already
-        quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales).
-        """
+        """Capture fixed projections in CUDA graph segments around the sparse break."""
         backend, mode = ctx.attn_backend, ctx.forward_mode
-        if mode is None:
-            raise ValueError("V4.1 attention requires an explicit forward mode")
+        rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
+        if positions.ndim != 1 or positions.shape[0] != hidden_states.shape[0]:
+            raise ValueError("V4.1 hidden rows and backend query metadata disagree")
+        fused_decode = self._fused_decode_enabled(backend, mode, None)
+        if hidden_states.shape[0]:
+            qkv, _ = self.wq_a_wkv(
+                hidden_states if hidden_codes is None else hidden_codes,
+                block_scale=hidden_scales,
+                output_dtype=None if hidden_codes is None else hidden_states.dtype,
+            )
+        else:
+            qkv = hidden_states.new_empty(
+                (0, self.q_norm.weight.numel() + self.head_dim)
+            )
+        qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
+        qr, q_input, q_scale, index_q_input, index_q_scale = self._quantize_q_latent(
+            qr, rows, fused_decode
+        )
+        if hidden_states.is_cuda:
+            self.rotary_emb._prepare_cache(hidden_states.device)
+        q, swa, swa_rope_cache, swa_norm_weight = self._project_queries_and_swa(
+            positions, qr, q_input, q_scale, swa, mode, fused_decode
+        )
+        latent_or_comp, index_k_proj = None, None
+        if self.compressor is not None:
+            if self.compressor.ratio == 1:
+                latent_or_comp = self.compressor.norm_ratio1(
+                    self.compressor.project(hidden_states)
+                )
+                index_k_proj = self.indexer.project_key(latent_or_comp)
+            else:
+                latent_or_comp = self.compressor.project(hidden_states)
+        index_q, index_weights = (None, None)
+        if self.indexer is not None:
+            if hidden_states.shape[0]:
+                index_q, index_weights = self.indexer(
+                    hidden_states,
+                    index_q_input,
+                    index_q_scale,
+                    positions,
+                    self.rotary_emb,
+                )
+            else:
+                index_q = hidden_states.new_empty(
+                    (0, self.indexer.n_local_heads, self.indexer.head_dim)
+                )
+                index_weights = hidden_states.new_empty((0, self.indexer.n_local_heads))
+        out_rope_cache = self._out_rope_cache(q)
+        attn_out = self._sparse_attention_and_kv(
+            ctx,
+            q,
+            swa,
+            latent_or_comp,
+            index_k_proj,
+            index_q,
+            index_weights,
+            swa_rope_cache,
+            swa_norm_weight,
+            out_rope_cache,
+            fused_decode,
+        )
+        return self._output_projections(
+            attn_out, positions, reduce_output, fused_decode, out_rope_cache
+        )
+
+    @break_point
+    def _forward_full_break(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        reduce_output: bool,
+        hidden_codes: torch.Tensor | None,
+        hidden_scales: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return self._forward_eager(
+            positions,
+            hidden_states,
+            ctx,
+            reduce_output,
+            hidden_codes,
+            hidden_scales,
+        )
+
+    def _forward_eager(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        reduce_output: bool,
+        hidden_codes: torch.Tensor | None,
+        hidden_scales: torch.Tensor | None,
+    ) -> torch.Tensor:
+        backend, mode = ctx.attn_backend, ctx.forward_mode
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
         meta = rows.source
         source_gather = (
@@ -1393,20 +1913,7 @@ class DeepseekV41Attention(nn.Module):
             if rows.query_shard is not None
             else None
         )
-        # The prepared weights serve decode and pure prefill alike. A mixed
-        # batch keeps the step-by-step path, as its extend and decode halves
-        # must agree on the output format. So does a query shard: the fused
-        # kernel rotates Q from the positions the backend holds, and under
-        # model QCP those are the shard's query rows rather than the source
-        # rows this layer rotates itself.
-        fused_decode = (
-            self.fused_q_weight is not None
-            and query_gather is None
-            and (
-                (mode.is_decode() and backend.supports_fused_attention)
-                or (mode.is_extend() and backend.supports_fused_prefill)
-            )
-        )
+        fused_decode = self._fused_decode_enabled(backend, mode, query_gather)
         if source_gather is not None and (
             source_gather.plan.size != len(source_gather.group)
             or self.mapping.attn.head_tp_size != 1
@@ -1467,39 +1974,9 @@ class DeepseekV41Attention(nn.Module):
                 (0, self.q_norm.weight.numel() + self.head_dim)
             )
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
-        if (
-            qr.shape[0] > 0
-            and qr.is_cuda
-            and qr.dtype == torch.bfloat16
-            and (
-                current_platform().is_nvidia
-                or current_platform().is_cdna4
-                or current_platform().is_cdna5
-            )
-            and isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
-        ):
-            # Write the scales in a layout every projection sharing them reads
-            # as given. Narrowing forces canonical: only it selects by row.
-            qr, q_input, q_scale = rmsnorm_quantize_fp8_group32(
-                qr,
-                self.q_norm.weight,
-                self.q_norm.variance_epsilon,
-                scale_layout=self._q_scale_layout(rows, fused_decode),
-                override=None,
-                solution="triton",
-            )
-        else:
-            qr = q_input = _attention_norm(qr, self.q_norm) if qr.shape[0] else qr
-            q_scale = None
-        index_q_input, index_q_scale = qr, None
-        if (
-            q_scale is not None
-            and self.indexer is not None
-            and isinstance(self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod)
-        ):
-            # Both reference methods read the layout _q_scale_layout agreed on
-            # with this projection, so they share one quantization of Q.
-            index_q_input, index_q_scale = q_input, q_scale
+        qr, q_input, q_scale, index_q_input, index_q_scale = self._quantize_q_latent(
+            qr, rows, fused_decode
+        )
         if hidden_states.is_cuda:
             # Lazy shared constants are produced before the fork event, so both
             # branches observe them even on the first eager decode after loading.
@@ -1635,65 +2112,9 @@ class DeepseekV41Attention(nn.Module):
                             projected_partition=partition,
                         )
                         index_q = index_weights = None
-            if q_input.shape[0]:
-                if (
-                    fused_decode
-                    and q_scale is not None
-                    and q_scale.dtype == torch.int32
-                ):
-                    q = fp8_projection(
-                        q_input,
-                        q_scale,
-                        self.fused_q_weight,
-                        self.fused_q_projection_scales,
-                        None,
-                    )
-                elif fused_decode:
-                    q = mm(
-                        q_input,
-                        self.fused_q_weight,
-                        A_scales=q_scale,
-                        B_scales=self.fused_q_scales,
-                        out_dtype=qr.dtype,
-                        quant="mxfp8",
-                        block_size=[1, 32],
-                        prepacked_scales=True,
-                    )
-                else:
-                    q, _ = self.wq_b(
-                        q_input,
-                        block_scale=q_scale,
-                        output_dtype=qr.dtype if q_scale is not None else None,
-                    )
-            else:
-                q = qr.new_empty((0, self.n_local_heads * self.head_dim))
-            q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
-            if (
-                not fused_decode
-                and q.is_cuda
-                and mode.is_decode()
-                and self.head_dim == 512
-                and self.n_local_heads != self.n_kernel_heads
-            ):
-                q = rope_pad_query(q, positions, self.rotary_emb.cos_sin_cache, None)
-            elif not fused_decode and q.shape[0]:
-                q = self.rotary_emb.apply_owned(q, positions, False)
-            swa_rope_cache = None
-            swa_norm_weight = None
-            if swa.is_cuda and self.head_dim == 512 and self.rotary_emb.dim == 64:
-                self.rotary_emb._prepare_cache(swa.device)
-                swa_rope_cache = self.rotary_emb.cos_sin_cache
-                if (
-                    current_platform().is_blackwell
-                    or current_platform().is_cdna4
-                    or current_platform().is_cdna5
-                ):
-                    swa_norm_weight = self.kv_norm.weight
-                else:
-                    swa = _attention_norm(swa, self.kv_norm) if swa.shape[0] else swa
-            elif swa.shape[0]:
-                swa = _attention_norm(swa, self.kv_norm)
-                swa = self.rotary_emb.apply_owned(swa, positions, False)
+            q, swa, swa_rope_cache, swa_norm_weight = self._project_queries_and_swa(
+                positions, qr, q_input, q_scale, swa, mode, fused_decode
+            )
             if (
                 mode.is_decode()
                 and self.is_index_source
@@ -1726,13 +2147,7 @@ class DeepseekV41Attention(nn.Module):
             if record.candidates is not None:
                 for tensor in (record.candidates.block_ids, record.candidates.lengths):
                     tensor.record_stream(consumer)
-        # CDNA4/5 rotate the attention output back inside the attention kernel.
-        out_rope_cache = (
-            self.rotary_emb.inverse_cos_sin_cache
-            if q.is_cuda
-            and (current_platform().is_cdna4 or current_platform().is_cdna5)
-            else None
-        )
+        out_rope_cache = self._out_rope_cache(q)
         out = backend.forward_v41(
             q,
             swa,
@@ -1754,66 +2169,64 @@ class DeepseekV41Attention(nn.Module):
             fused_decode_groups=self.n_local_groups if fused_decode else None,
             key_rows=query_gather,
         )
-        if fused_decode:
-            codes, scales = out
-            weight, weight_scales = self.fused_wo_a_weight, self.fused_wo_a_scales
-        else:
+        if not fused_decode:
             if out.shape[0] == 0 and query_gather is not None:
                 return hidden_states.new_empty((0, self.wo_b.output_size))
             out = out[:, : self.n_local_heads]
-            weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
-            weight_scales = self.wo_a_scales
-        target = None
-        if self.mapping.attn.head_tp_size > 1:
-            target = _all_reduce_output(
-                (out.shape[0], self.wo_b.output_size),
-                out,
-                self.mapping.attn.head_tp_group,
+        return self._output_projections(
+            out, positions, reduce_output, fused_decode, out_rope_cache
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        reduce_output: bool,
+        hidden_codes: torch.Tensor | None = None,
+        hidden_scales: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Return the attention output, reducing its TP partial when requested.
+
+        hidden_codes/hidden_scales optionally carry hidden_states already
+        quantized for wq_a_wkv (group-32 E4M3 codes and UE8M0 scales).
+        """
+        mode = ctx.forward_mode
+        if mode is None:
+            raise ValueError("V4.1 attention requires an explicit forward mode")
+        rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
+        if (
+            is_breakable_capture_active()
+            and not mode.is_decode()
+            and rows.source_shard is None
+            and rows.query_shard is None
+            and rows.keep_rows is None
+        ):
+            return self._forward_captured_prefill(
+                positions,
+                hidden_states,
+                ctx,
+                reduce_output,
+                hidden_codes,
+                hidden_scales,
             )
-        method = self.wo_b.quant_method
-        if self.wo_a_fp8:
-            # One kernel undoes RoPE and casts every 32 channels to FP8, as the
-            # reference rounds o before wo_a. Only CDNA attention rotates back
-            # itself, and no grouped FP8 kernel serves CDNA.
-            if not fused_decode:
-                codes, scales = self.rotary_emb.inverse_quantize_grouped(
-                    out, positions, self.n_local_groups
-                )
-            if self.wo_b_fp8:
-                # wo_a writes wo_b's FP8 input and scales; nothing quantizes between.
-                codes, scales = grouped_fp8_projection_quantize_fp8(
-                    codes, scales, weight, weight_scales
-                )
-                out = fp8_projection(
-                    codes, scales, self.wo_b.weight, self.wo_b_scales, target
-                )
-            else:
-                out = grouped_fp8_projection(codes, scales, weight, weight_scales, None)
-                out, _ = self.wo_b(out.flatten(1), scale=None, out=target)
-        else:
-            if out_rope_cache is None:
-                out = self.rotary_emb.apply_owned(out, positions, True)
-            grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
-            if (
-                grouped.is_cuda
-                and (current_platform().is_cdna4 or current_platform().is_cdna5)
-                and isinstance(method, _ReferenceFp8LinearMethod)
-                and method.prepared_weight_scales is None
-            ):
-                # wo_b's group-32 activation quantization runs in wo_a's epilogue.
-                codes, scales = grouped_bf16_projection_quantize_fp8(grouped, weight)
-                out, _ = self.wo_b(codes, scale=scales, out=target)
-            else:
-                out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
-                out, _ = self.wo_b(out, scale=None, out=target)
-        if self.mapping.attn.head_tp_size > 1 and reduce_output:
-            out = all_reduce(
-                out,
-                group=self.mapping.attn.head_tp_group,
-                backend=None,
-                op=torch.distributed.ReduceOp.SUM,
+        if is_breakable_capture_active():
+            return self._forward_full_break(
+                positions,
+                hidden_states,
+                ctx,
+                reduce_output,
+                hidden_codes,
+                hidden_scales,
             )
-        return out
+        return self._forward_eager(
+            positions,
+            hidden_states,
+            ctx,
+            reduce_output,
+            hidden_codes,
+            hidden_scales,
+        )
 
 
 def _warmup_query_projections(

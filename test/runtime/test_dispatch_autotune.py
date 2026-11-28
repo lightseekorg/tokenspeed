@@ -325,6 +325,10 @@ class _AutotuneExecutor:
         assert tuning_module.is_warming_up()
         self._events.append(("draft_experts", num_tokens))
 
+    def _warmup_runtime_and_scheduler_kernels(self):
+        assert tuning_module.is_warming_up()
+        self._events.append(("runtime_kernels",))
+
 
 class _DrafterDouble:
     """Records the startup's extend warmup (``BaseDrafter.warmup_extend``); a

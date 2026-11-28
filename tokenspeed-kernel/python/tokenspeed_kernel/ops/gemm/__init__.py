@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from math import prod
 from types import MappingProxyType
+from typing import Literal
 
 import torch
 from tokenspeed_kernel.compile_monitor import is_serving
@@ -98,6 +99,7 @@ __all__ = [
     "dsv4_linear_fp32",
     "grouped_bf16_projection",
     "grouped_bf16_projection_quantize_fp8",
+    "plan_fp8_projection",
     "fp8_projection",
     "grouped_fp8_projection",
     "grouped_fp8_projection_quantize_fp8",
@@ -355,9 +357,7 @@ def _gemm_format_signature(
             a=tensor_format("mxfp4", A.dtype, scale=a_scale),
             b=tensor_format("mxfp4", B.dtype, scale=b_scale),
         )
-    return format_signature(
-        a=dense_tensor_format(A.dtype), b=dense_tensor_format(B.dtype)
-    )
+    return dense_format_signature(("a", "b"), (A.dtype, B.dtype))
 
 
 def _online_quantize_mxfp8(
@@ -577,7 +577,7 @@ def plan_dense_gemm(
     return KernelPlan.select(
         "gemm",
         mode,
-        format_signature(a=dense_tensor_format(dtype), b=dense_tensor_format(dtype)),
+        dense_format_signature(("a", "b"), (dtype, dtype)),
         features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
         static_traits=traits,
         variable_traits=frozenset({"m"}),
@@ -1568,10 +1568,7 @@ def grouped_bf16_projection(
     kernel = select_kernel(
         "gemm",
         "grouped_bf16_projection",
-        format_signature(
-            x=dense_tensor_format(torch.bfloat16),
-            weight=dense_tensor_format(torch.bfloat16),
-        ),
+        dense_format_signature(("x", "weight"), (torch.bfloat16, torch.bfloat16)),
         traits={
             "batch": weight.shape[0],
             "m": x.shape[0],
@@ -1610,10 +1607,7 @@ def grouped_bf16_projection_quantize_fp8(
         kernel = select_kernel(
             "gemm",
             "grouped_bf16_projection_fp8",
-            format_signature(
-                x=dense_tensor_format(torch.bfloat16),
-                weight=dense_tensor_format(torch.bfloat16),
-            ),
+            dense_format_signature(("x", "weight"), (torch.bfloat16, torch.bfloat16)),
             traits={
                 "batch": weight.shape[0],
                 "n": weight.shape[1],
@@ -1637,20 +1631,77 @@ def grouped_bf16_projection_quantize_fp8(
     return kernel(x, weight)
 
 
-def _fp8_projection_kernel(
-    mode: str, device: torch.device, output_dim: int, input_dim: int
-) -> SelectedKernel:
-    return select_kernel(
+def _fp8_projection_signature():
+    return dense_format_signature(("x", "weight"), (_fp8_dtype, _fp8_dtype))
+
+
+def plan_fp8_projection(
+    *,
+    mode: Literal[
+        "fp8_projection",
+        "grouped_fp8_projection",
+        "grouped_fp8_projection_fp8",
+    ],
+    output_dim: int,
+    input_dim: int,
+    device: torch.device,
+) -> KernelPlan:
+    """Plan a DeepSeek V4.1 FP8 output projection from static weight geometry.
+
+    Args:
+        mode: Projection mode (``"fp8_projection"``, ``"grouped_fp8_projection"``,
+            or ``"grouped_fp8_projection_fp8"``).
+        output_dim: Output channels per group (N).
+        input_dim: Input channels (K).
+        device: Execution device.
+
+    Returns:
+        A :class:`KernelPlan` reused across calls without registry lookup.
+    """
+    return KernelPlan.select(
         "gemm",
         mode,
-        format_signature(
-            x=dense_tensor_format(_fp8_dtype),
-            weight=dense_tensor_format(_fp8_dtype),
-        ),
-        traits={
+        _fp8_projection_signature(),
+        features=frozenset(),
+        static_traits={
             "aligned": output_dim % 64 == 0 and input_dim % 128 == 0,
             "is_cuda": device.type == "cuda",
         },
+        variable_traits=frozenset(),
+        declared_traits=frozenset(),
+        solution=None,
+        ignore_layout=False,
+    )
+
+
+def _fp8_projection_kernel(
+    mode: str,
+    device: torch.device,
+    output_dim: int,
+    input_dim: int,
+    plan: KernelPlan | None,
+) -> SelectedKernel:
+    signature = _fp8_projection_signature()
+    traits = {
+        "aligned": output_dim % 64 == 0 and input_dim % 128 == 0,
+        "is_cuda": device.type == "cuda",
+    }
+    if plan is not None:
+        plan.validate(
+            "gemm",
+            mode,
+            signature,
+            traits=traits,
+            features=None,
+            solution=None,
+            override=None,
+        )
+        return plan.kernel
+    return select_kernel(
+        "gemm",
+        mode,
+        signature,
+        traits=traits,
     )
 
 
@@ -1677,7 +1728,9 @@ def _prepared_fp8_scales(
         )
     rows = weight.shape[0] if groups is None else weight.shape[0] // groups
     try:
-        kernel = _fp8_projection_kernel(mode, weight.device, rows, weight.shape[1])
+        kernel = _fp8_projection_kernel(
+            mode, weight.device, rows, weight.shape[1], None
+        )
     except NoKernelFoundError:
         return None
     preprocess = KernelRegistry.get().get_by_name(kernel.name).weight_preprocessor
@@ -1711,7 +1764,9 @@ def has_grouped_fp8_projection(
         weights on ``device``.
     """
     try:
-        _fp8_projection_kernel("grouped_fp8_projection", device, output_dim, input_dim)
+        _fp8_projection_kernel(
+            "grouped_fp8_projection", device, output_dim, input_dim, None
+        )
     except NoKernelFoundError:
         return False
     return True
@@ -1752,6 +1807,8 @@ def grouped_fp8_projection(
     weight: torch.Tensor,
     weight_scales: torch.Tensor,
     out: torch.Tensor | None,
+    *,
+    plan: KernelPlan | None = None,
 ) -> torch.Tensor:
     """Compute ``einsum('tgk,gnk->tgn')`` of E4M3 operands with 1x32 UE8M0 scales.
 
@@ -1766,6 +1823,7 @@ def grouped_fp8_projection(
         weight_scales: Scales from ``prepare_grouped_fp8_projection``.
         out: Optional contiguous BF16 ``[tokens, groups, output_dim]`` result.
             None allocates a fresh result.
+        plan: Optional initialization-time kernel plan.
 
     Returns:
         BF16 ``[tokens, groups, output_dim]``; ``out`` when provided.
@@ -1784,7 +1842,7 @@ def grouped_fp8_projection(
     if x.shape[0] == 0:
         return out
     kernel = _fp8_projection_kernel(
-        "grouped_fp8_projection", x.device, weight.shape[1], weight.shape[2]
+        "grouped_fp8_projection", x.device, weight.shape[1], weight.shape[2], plan
     )
     return kernel(x, x_scales, weight, weight_scales, out)
 
@@ -1794,12 +1852,15 @@ def grouped_fp8_projection_quantize_fp8(
     x_scales: torch.Tensor,
     weight: torch.Tensor,
     weight_scales: torch.Tensor,
+    *,
+    plan: KernelPlan | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``grouped_fp8_projection`` flattened and cast to E4M3 for ``fp8_projection``.
 
     Args:
         x, x_scales, weight, weight_scales: As for ``grouped_fp8_projection``;
             output_dim must be a multiple of 128.
+        plan: Optional initialization-time kernel plan.
 
     Returns:
         E4M3 codes ``[tokens, groups * output_dim]`` of the BF16-rounded
@@ -1816,7 +1877,7 @@ def grouped_fp8_projection_quantize_fp8(
     scales = _packed_fp8_scales(tokens, groups * output_dim // 128, x.device)
     if tokens:
         kernel = _fp8_projection_kernel(
-            "grouped_fp8_projection_fp8", x.device, output_dim, weight.shape[2]
+            "grouped_fp8_projection_fp8", x.device, output_dim, weight.shape[2], plan
         )
         kernel(x, x_scales, weight, weight_scales, codes, scales)
     return codes.flatten(1), scales
@@ -1846,6 +1907,8 @@ def fp8_projection(
     weight: torch.Tensor,
     weight_scales: torch.Tensor,
     out: torch.Tensor | None,
+    *,
+    plan: KernelPlan | None = None,
 ) -> torch.Tensor:
     """Compute ``x @ weight.T`` of E4M3 operands with 1x32 UE8M0 scales.
 
@@ -1859,6 +1922,7 @@ def fp8_projection(
         out: Optional BF16 ``[tokens, output_dim]`` destination with unit inner
             stride; other row strides or a base not 16-byte aligned are
             written through a temporary. None allocates a fresh result.
+        plan: Optional initialization-time kernel plan.
 
     Returns:
         BF16 ``[tokens, output_dim]``; ``out`` when provided.
@@ -1883,7 +1947,7 @@ def fp8_projection(
     )
     if x.shape[0]:
         kernel = _fp8_projection_kernel(
-            "fp8_projection", x.device, weight.shape[0], weight.shape[1]
+            "fp8_projection", x.device, weight.shape[0], weight.shape[1], plan
         )
         kernel(x, x_scales, weight, weight_scales, result)
     if out is None or direct:

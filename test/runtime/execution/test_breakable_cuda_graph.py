@@ -1215,5 +1215,59 @@ class TestPoolReuseAcrossCaptures:
             torch.testing.assert_close(outbuf[:n], eager(xbuf[:n]))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_mn_major_handoff_shares_storage_across_widest_first_buckets():
+    """Widest-first buckets with distinct aligned MN-major column strides share one
+    handoff buffer and replay bit-for-bit without stride mismatch."""
+    pool = torch.cuda.graph_pool_handle()
+    handoff_storage = {}
+    cols = 8
+    max_n = 64
+    x_buf = torch.zeros((max_n, cols), dtype=torch.bfloat16, device="cuda")
+    s_buf = torch.zeros((cols, max_n), dtype=torch.int32, device="cuda")
+    out_buf = torch.zeros((max_n, cols), dtype=torch.float32, device="cuda")
+
+    @break_point
+    def produce_mn_major(x, s_raw):
+        rows = current_valid_rows()
+        n = x.shape[0] if rows is None else rows
+        stride_n = -(-n // 4) * 4
+        # Build an MN-major (1, align4(n)) view as an output leaf of the break.
+        scales = s_raw[:, :stride_n].as_strided((n, cols), (1, stride_n)).clone()
+        return x[:n] * 2.0, scales
+
+    def forward(n):
+        stride_n = -(-n // 4) * 4
+        x_scaled, scales = produce_mn_major(x_buf[:n], s_buf[:, :stride_n])
+        y = x_scaled.float() + scales.contiguous().float()
+        out_buf[:n].copy_(y)
+        return out_buf[:n]
+
+    caps = []
+    # Capture widest-first (64, 32, 17 -> MN-major strides 64, 32, 20).
+    for n in (64, 32, 17):
+        x_buf[:n].normal_()
+        s_buf[:, :n].random_(1, 20)
+        for _ in range(2):
+            forward(n)
+        torch.cuda.synchronize()
+        cap = BreakableCapture(pool=pool, handoff_storage=handoff_storage)
+        with cap:
+            forward(n)
+        torch.cuda.synchronize()
+        caps.append((n, cap))
+
+    # One shared slot per output leaf across all three bucket widths.
+    assert len(handoff_storage) == 2
+    for n, cap in caps:
+        x_buf.normal_()
+        s_buf.random_(1, 20)
+        expected = forward(n).clone()
+        out_buf.zero_()
+        cap.replay(valid_rows=n)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out_buf[:n], expected, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -2132,3 +2132,113 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
 
     if tp > 1:
         torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dspark_warmup_extend_compiles_anchors_and_rows(monkeypatch):
+    import importlib.util
+    from test.runtime.test_deepseek_v41_cache import _tables, _verify_backend
+
+    from tokenspeed_kernel.ops.attention.dsv41.triton import (
+        _dspark_anchors_kernel,
+        _dspark_rows_kernel,
+    )
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+
+    utils_path = (
+        Path(__file__).resolve().parents[2] / "tokenspeed-kernel" / "test" / "utils.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "dspark_kernel_test_utils", utils_path
+    )
+    kernel_utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(kernel_utils)
+
+    config = _draft_config()
+    config.hidden_size = 256
+    config.moe_intermediate_size = 256
+    config.head_dim = 512
+    config.qk_rope_head_dim = 64
+    config.q_lora_rank = 128
+    config.num_attention_heads = config.o_groups = 2
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    device = "cuda:0"
+    with torch.device(device):
+        adapter = DeepseekV41ForCausalLMDSpark(
+            SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant()
+        )
+    adapter.load_weights(_draft_checkpoint(adapter.model).items())
+    adapter.set_embed_and_head(
+        *(
+            nn.Parameter(torch.full_like(p, 0.1, dtype=torch.bfloat16))
+            for p in (adapter.model.embed_tokens.weight, adapter.lm_head.weight)
+        )
+    )
+    for module in adapter.model.modules():
+        if isinstance(module, LinearBase):
+            module.quant_method.process_weights_after_loading(module)
+        elif isinstance(module, MoELayer):
+            module.process_weights_after_loading(module)
+
+    windows = torch.zeros(3, 8, 64, 512, dtype=torch.bfloat16, device=device)
+    pool = SimpleNamespace(dspark_kv=lambda stage: windows[stage])
+    backend = _verify_backend(device, 2, 6)
+    del _tables
+    drafter = DeepseekV41DSpark(
+        spec_num_tokens=6,
+        spec_num_steps=5,
+        draft_model_runner=SimpleNamespace(
+            model=adapter, mapping=adapter.mapping, device=device
+        ),
+        attn_backend=backend,
+        token_to_kv_pool=pool,
+        runtime_states=RuntimeStates(4, 128, 128, 6, device=device),
+        input_buffers=InputBuffers(2, 1024, 4, device=device),
+        vocab_size=128,
+    )
+    torch.cuda.synchronize()
+    _dspark_anchors_kernel.device_caches.clear()
+    _dspark_rows_kernel.device_caches.clear()
+    with kernel_warmup(enabled=True):
+        drafter.warmup_extend(16)
+    # Warmup writes to slot -1, leaving every cache window untouched.
+    assert windows.count_nonzero() == 0
+
+    with kernel_utils.assert_no_triton_compile(
+        _dspark_anchors_kernel, _dspark_rows_kernel
+    ):
+        next_tokens = torch.empty((1, 6), dtype=torch.int32, device=device)
+        dsv41.dspark_anchors(
+            torch.tensor([5], dtype=torch.int32, device=device),
+            torch.tensor([1], dtype=torch.int32, device=device),
+            torch.zeros((0,), dtype=torch.int64, device=device),
+            1,
+            6,
+            next_tokens,
+            torch.zeros((0,), dtype=torch.int64, device=device),
+            num_prefill_outputs=1,
+            decode_query_indptr=None,
+        )
+        assert (next_tokens == 5).all()
+        dsv41.dspark_anchors(
+            torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int32, device=device),
+            torch.tensor([2], dtype=torch.int32, device=device),
+            torch.tensor([10, 11], dtype=torch.int64, device=device),
+            0,
+            6,
+            next_tokens,
+            torch.zeros((1,), dtype=torch.int64, device=device),
+            num_prefill_outputs=0,
+            decode_query_indptr=torch.tensor([0, 2], dtype=torch.int32, device=device),
+        )
+        assert (next_tokens == 2).all()
+        adapter.model.write_context_kv(
+            torch.randn((2, drafter.hidden_width), dtype=torch.bfloat16, device=device),
+            torch.tensor([0, 1], dtype=torch.int64, device=device),
+            torch.tensor([64, 65], dtype=torch.int32, device=device),
+            pool,
+        )
+    assert windows[:, 1, :2].count_nonzero() > 0

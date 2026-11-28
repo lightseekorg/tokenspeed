@@ -59,7 +59,7 @@ from tokenspeed_kernel.ops.attention.dsv41._metadata import index_logit_rows
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import dense_format_signature
 
 VERIFY_LAYOUT_MAX_TOKENS = 4096
 
@@ -119,7 +119,7 @@ def _kernel(mode: str, x: torch.Tensor):
     return select_kernel(
         "attention",
         "dsv41_" + mode,
-        format_signature(x=dense_tensor_format(x.dtype)),
+        dense_format_signature(("x",), (x.dtype,)),
         features=None,
         platform=None,
         traits=None,
@@ -524,7 +524,7 @@ def selected_attention(
     kernel = select_kernel(
         "attention",
         "dsv41_selected_attention",
-        format_signature(x=dense_tensor_format(q.dtype)),
+        dense_format_signature(("x",), (q.dtype,)),
         features=None,
         platform=None,
         traits={"flashmla_eligible": native},
@@ -574,7 +574,7 @@ def selected_attention_rope(
         kernel = select_kernel(
             "attention",
             "dsv41_selected_attention_rope",
-            format_signature(x=dense_tensor_format(q.dtype)),
+            dense_format_signature(("x",), (q.dtype,)),
             features=None,
             platform=None,
             traits={},
@@ -798,7 +798,7 @@ def index_topk(
     kernel = select_kernel(
         "attention",
         "dsv41_index_topk",
-        format_signature(x=dense_tensor_format(query_values.dtype)),
+        dense_format_signature(("x",), (query_values.dtype,)),
         features=None,
         platform=None,
         traits=_index_topk_traits(
@@ -974,7 +974,7 @@ def prepare_index_topk(
     if not isinstance(index_metadata, IndexMetadata):
         raise TypeError("index_metadata must come from new_index_metadata")
     index_metadata.validate(page_table, visible_lens)
-    signature = format_signature(x=dense_tensor_format(query_dtype))
+    signature = dense_format_signature(("x",), (query_dtype,))
     traits = _index_topk_traits(query_heads, index_cache.is_cuda, index_cache, None)
     try:
         scorer = select_kernel(
@@ -1078,7 +1078,7 @@ def rope_inplace(
     kernel = select_kernel(
         "attention",
         "dsv41_rope_inplace",
-        format_signature(values=dense_tensor_format(values.dtype)),
+        dense_format_signature(("values",), (values.dtype,)),
         traits={},
         solution=solution,
     )
@@ -1135,7 +1135,7 @@ def rope_weights_inplace(
     kernel = select_kernel(
         "attention",
         "dsv41_rope_weights_inplace",
-        format_signature(values=dense_tensor_format(values.dtype)),
+        dense_format_signature(("values",), (values.dtype,)),
         traits={},
         solution=solution,
     )
@@ -1168,7 +1168,7 @@ def rope_pad_query(
     kernel = select_kernel(
         "attention",
         "dsv41_rope_pad_query",
-        format_signature(values=dense_tensor_format(values.dtype)),
+        dense_format_signature(("values",), (values.dtype,)),
         traits={},
         solution=solution,
     )

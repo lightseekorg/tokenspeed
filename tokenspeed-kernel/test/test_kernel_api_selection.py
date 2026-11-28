@@ -8470,3 +8470,155 @@ def test_fa3_declares_sinks_from_the_installed_signature(
         Platform.override(real_platform)
         KernelRegistry._instance = real_registry
         importlib.reload(_attention_flash_attn)
+
+
+def test_dense_format_signature_and_fast_selection_override(
+    h100_platform: PlatformInfo,
+) -> None:
+    from tokenspeed_kernel.ops.gemm import (
+        fp8_projection,
+        plan_fp8_projection,
+    )
+    from tokenspeed_kernel.ops.quantization import (
+        plan_rmsnorm_quantize_fp8_group32,
+        rmsnorm_quantize_fp8_group32,
+    )
+    from tokenspeed_kernel.registry import KernelSpec
+    from tokenspeed_kernel.selection import kernel_override
+    from tokenspeed_kernel.signature import dense_format_signature
+
+    sig = dense_format_signature(a=torch.bfloat16, b=torch.float8_e4m3fn)
+    assert sig == format_signature(
+        a=dense_tensor_format(torch.bfloat16),
+        b=dense_tensor_format(torch.float8_e4m3fn),
+    )
+
+    real_platform = Platform.get()
+    real_registry = KernelRegistry.get()
+    try:
+        Platform.override(h100_platform)
+        KernelRegistry.reset()
+        registry = KernelRegistry.get()
+        leaf_hi = lambda *_a, **_kw: "hi"  # noqa: E731
+        leaf_lo = lambda *_a, **_kw: "lo"  # noqa: E731
+        spec_hi = KernelSpec(
+            name="hi",
+            family="unit_fast",
+            mode="fast_mode",
+            solution="hi",
+            priority=Priority.PERFORMANT,
+            format_signatures=frozenset({sig}),
+            traits={"mode": frozenset({"a", "b"})},
+        )
+        spec_lo = KernelSpec(
+            name="lo",
+            family="unit_fast",
+            mode="fast_mode",
+            solution="lo",
+            priority=Priority.PORTABLE,
+            format_signatures=frozenset({sig}),
+            traits={"mode": frozenset({"a", "b"})},
+        )
+        registry.register(spec_hi, leaf_hi)
+        registry.register(spec_lo, leaf_lo)
+        registry.clear_cache()
+
+        assert select_kernel("unit_fast", "fast_mode", sig, mode="a").spec.name == "hi"
+        # Hot cache hit still returns the priority choice.
+        assert select_kernel("unit_fast", "fast_mode", sig, mode="a").spec.name == "hi"
+        with kernel_override("unit_fast", "fast_mode", "lo"):
+            assert (
+                select_kernel("unit_fast", "fast_mode", sig, mode="a").spec.name == "lo"
+            )
+        assert select_kernel("unit_fast", "fast_mode", sig, mode="a").spec.name == "hi"
+        # Multi-trait fallback matches non-1-trait fast key too.
+        spec_multi = KernelSpec(
+            name="m_hi",
+            family="unit_fast_multi",
+            mode="fast_mode",
+            solution="m_hi",
+            priority=Priority.PERFORMANT,
+            format_signatures=frozenset({sig}),
+            traits={"mode": frozenset({"a"}), "flag": frozenset({False, True})},
+        )
+        registry.register(spec_multi, leaf_hi)
+        registry.clear_cache()
+        assert (
+            select_kernel(
+                "unit_fast_multi", "fast_mode", sig, mode="a", flag=True
+            ).spec.name
+            == "m_hi"
+        )
+        assert (
+            select_kernel(
+                "unit_fast_multi", "fast_mode", sig, mode="a", flag=True
+            ).spec.name
+            == "m_hi"
+        )
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry._instance = real_registry
+
+    if not torch.cuda.is_available():
+        return
+    try:
+        x = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
+        norm_w = torch.ones(128, device="cuda", dtype=torch.bfloat16)
+        q_plan = plan_rmsnorm_quantize_fp8_group32(
+            x.dtype,
+            scale_layout="canonical",
+            output_mode="normalized_and_quantized",
+        )
+        expected_norm, expected_q, expected_s = rmsnorm_quantize_fp8_group32(
+            x,
+            norm_w,
+            1e-6,
+            scale_layout="canonical",
+            output_mode="normalized_and_quantized",
+        )
+        got_norm, got_q, got_s = rmsnorm_quantize_fp8_group32(
+            x,
+            norm_w,
+            1e-6,
+            scale_layout="canonical",
+            output_mode="normalized_and_quantized",
+            plan=q_plan,
+        )
+        torch.testing.assert_close(got_norm, expected_norm, rtol=0, atol=0)
+        assert torch.equal(got_q.view(torch.uint8), expected_q.view(torch.uint8))
+        assert torch.equal(got_s, expected_s)
+
+        w_q = torch.ones(64, 128, device="cuda", dtype=torch.float8_e4m3fn)
+        w_s = torch.full((2, 4), 127, device="cuda", dtype=torch.uint8)
+        proj_plan = plan_fp8_projection(
+            expected_q.dtype,
+            w_q.dtype,
+            torch.bfloat16,
+            granularity="tensor",
+            block_size=[1, 32],
+            scale_encoding="ue8m0",
+        )
+        expected_out = fp8_projection(
+            expected_q,
+            w_q,
+            a_scale=expected_s,
+            b_scale=w_s,
+            granularity="tensor",
+            block_size=[1, 32],
+            scale_encoding="ue8m0",
+            output_dtype=torch.bfloat16,
+        )
+        got_out = fp8_projection(
+            expected_q,
+            w_q,
+            a_scale=expected_s,
+            b_scale=w_s,
+            granularity="tensor",
+            block_size=[1, 32],
+            scale_encoding="ue8m0",
+            output_dtype=torch.bfloat16,
+            plan=proj_plan,
+        )
+        torch.testing.assert_close(got_out, expected_out, rtol=0, atol=0)
+    except kernel_NoKernelFoundError:
+        pytest.skip("Current GPU lacks MXFP8 projection/rmsnorm kernel")

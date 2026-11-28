@@ -82,10 +82,14 @@ __all__ = [
 ]
 
 
-# A leaf's shape, dtype, device and occurrence among same-shaped tuple leaves.
-HandoffKey = tuple[tuple[int, ...], torch.dtype, torch.device, int]
-# Trailing shape, dtype, device, and the output's ordinal among a capture's handoffs with them.
-HandoffSlot = tuple[tuple[int, ...], torch.dtype, torch.device, int]
+# A leaf's shape, optional explicit strides, dtype, device, and occurrence among matching leaves.
+HandoffKey = tuple[
+    tuple[int, ...], tuple[int, ...] | None, torch.dtype, torch.device, int
+]
+# Trailing shape, optional layout tag, dtype, device, and the output's ordinal among matching handoffs.
+HandoffSlot = tuple[
+    tuple[int, ...], tuple[Any, ...] | None, torch.dtype, torch.device, int
+]
 BreakOutput = torch.Tensor | tuple["BreakOutput", ...] | None
 
 # Ambient per-forward ctx; plain module state (one launch thread per rank).
@@ -481,26 +485,71 @@ def _record_break(
     return cap.add_eager(replay_fn)
 
 
-def _handoff_view(cap: BreakableCapture, key: HandoffKey) -> torch.Tensor:
-    """Leading rows of the shared storage slot for this capture's new handoff ``key``.
+def _leaf_strides(leaf: torch.Tensor) -> tuple[int, ...] | None:
+    """Return explicit strides for non-contiguous leaves, or ``None`` when contiguous."""
+    return None if leaf.is_contiguous() else tuple(leaf.stride())
 
-    The slot is the trailing shape, dtype and device plus how many of this
-    capture's handoffs already have them, so one capture's distinct shapes stay
-    in distinct storage. Storage too short for ``key`` is replaced; captures that
-    already hold the old storage keep it alive.
+
+def _slot_layout(
+    shape: tuple[int, ...], strides: tuple[int, ...] | None
+) -> tuple[Any, ...] | None:
+    """Normalize layout identity so aligned MN-major scales share slots across buckets."""
+    if strides is None:
+        return None
+    if shape and len(strides) == len(shape) and strides[0] == 1 and len(shape) >= 2:
+        tail_strides = [st for dim, st in zip(shape[1:], strides[1:]) if dim > 1]
+        if tail_strides:
+            base = min(tail_strides)
+            if (
+                base >= shape[0]
+                and base > 0
+                and all(st % base == 0 for st in strides[1:])
+            ):
+                return ("mn_major", tuple(st // base for st in strides[1:]))
+    return ("strided", strides)
+
+
+def _strided_storage_numel(shape: tuple[int, ...], strides: tuple[int, ...]) -> int:
+    """Minimum flat element span backing ``(shape, strides)``."""
+    if any(dim == 0 for dim in shape):
+        return 0
+    return sum((dim - 1) * st for dim, st in zip(shape, strides)) + 1
+
+
+def _handoff_view(cap: BreakableCapture, key: HandoffKey) -> torch.Tensor:
+    """Leading rows (or flat strided span) of the shared slot for ``key``.
+
+    The slot is the trailing shape, layout tag, dtype, and device plus how many
+    of this capture's handoffs already have them, so distinct shapes or layouts
+    (contiguous vs MN-major TMA-aligned FP8 scales) stay in distinct storage.
+    Storage too short for ``key`` is replaced; captures holding old storage
+    keep it alive.
     """
-    shape, dtype, device, _ = key
+    shape, strides, dtype, device, _ = key
     if not shape:
         return torch.empty(shape, dtype=dtype, device=device)
-    trailing = (shape[1:], dtype, device)
-    rank = sum(1 for s, d, v, _ in cap._handoff if s and (s[1:], d, v) == trailing)
+    layout = _slot_layout(shape, strides)
+    trailing = (shape[1:], layout, dtype, device)
+    rank = sum(
+        1
+        for s, st, d, v, _ in cap._handoff
+        if s and (s[1:], _slot_layout(s, st), d, v) == trailing
+    )
     slot = (*trailing, rank)
     storage = cap._handoff_storage.get(slot)
-    if storage is None or storage.shape[0] < shape[0]:
-        storage = cap._handoff_storage[slot] = torch.empty(
-            shape, dtype=dtype, device=device
+    if strides is None:
+        if storage is None or storage.shape[0] < shape[0]:
+            storage = cap._handoff_storage[slot] = torch.empty(
+                shape, dtype=dtype, device=device
+            )
+        return storage[: shape[0]]
+    needed = _strided_storage_numel(shape, strides)
+    if storage is None or storage.numel() < needed:
+        # Zero-init once so TMA alignment gaps beyond shape[0] never hold NaNs.
+        storage = cap._handoff_storage[slot] = torch.zeros(
+            needed, dtype=dtype, device=device
         )
-    return storage[: shape[0]]
+    return storage[:needed].as_strided(shape, strides)
 
 
 def break_here(
@@ -581,12 +630,23 @@ def break_point(method: Callable | None = None) -> Callable:
 
             def resolve_dst(result: BreakOutput) -> BreakOutput:
                 occurrences: dict[
-                    tuple[tuple[int, ...], torch.dtype, torch.device], int
+                    tuple[
+                        tuple[int, ...],
+                        tuple[int, ...] | None,
+                        torch.dtype,
+                        torch.device,
+                    ],
+                    int,
                 ] = {}
 
                 def resolve_leaf(leaf: torch.Tensor) -> torch.Tensor:
-                    # Handoff buffer inferred from the capture-time output, shape-keyed.
-                    shape_key = (tuple(leaf.shape), leaf.dtype, leaf.device)
+                    # Handoff buffer inferred from capture-time shape and layout.
+                    shape_key = (
+                        tuple(leaf.shape),
+                        _leaf_strides(leaf),
+                        leaf.dtype,
+                        leaf.device,
+                    )
                     occurrence = occurrences.get(shape_key, 0)
                     occurrences[shape_key] = occurrence + 1
                     key = (*shape_key, occurrence)

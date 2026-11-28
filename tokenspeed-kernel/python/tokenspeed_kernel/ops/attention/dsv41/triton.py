@@ -5619,9 +5619,58 @@ register_triton_warmup(
 register_triton_warmup(
     _write_selection, variants=({"CANDIDATE_BLOCK": _SELECTION_BLOCKS},)
 )
+
+
+def _finish_write_selection_variants(args):
+    # Precompile every execution specialization reached after startup: Full
+    # (row scoring, with/without pool across POOL_BLOCK), Dense Reindex, and
+    # BF16 native Sparse Reindex (with/without SHORT_ROWS_UNSCORED). Guard SLOTS
+    # on whether real slots tensors are bound so P/Req match runtime int64 ptrs.
+    slots_variants = (
+        ({"SLOTS": (False,), "RATIO": (1,)}, {"SLOTS": (True,), "RATIO": (1, 2)})
+        if args["SLOTS"]
+        else ({"SLOTS": (False,), "RATIO": (1,)},)
+    )
+    if args["S"].dtype == torch.bfloat16:
+        base = (
+            {
+                "BLOCK_SIZE": (8,),
+                "HAS_CANDIDATES": (True,),
+                "SHORT_ROWS_UNSCORED": (False, True),
+                "POOL": (False,),
+                "POOL_BLOCK": (1,),
+            },
+        )
+    else:
+        base = (
+            {
+                "BLOCK_SIZE": (1,),
+                "HAS_CANDIDATES": (False,),
+                "SHORT_ROWS_UNSCORED": (False,),
+                "POOL": (False,),
+                "POOL_BLOCK": (1,),
+            },
+            {
+                "BLOCK_SIZE": (1,),
+                "HAS_CANDIDATES": (False,),
+                "SHORT_ROWS_UNSCORED": (False,),
+                "POOL": (True,),
+                "POOL_BLOCK": _SELECTION_BLOCKS,
+            },
+            {
+                "BLOCK_SIZE": (8,),
+                "HAS_CANDIDATES": (True,),
+                "SHORT_ROWS_UNSCORED": (False,),
+                "POOL": (False,),
+                "POOL_BLOCK": (1,),
+            },
+        )
+    return tuple(shape | slot_cfg for shape in base for slot_cfg in slots_variants)
+
+
 register_triton_warmup(
     _finish_write_selection,
-    variants=lambda args: ({"POOL_BLOCK": _SELECTION_BLOCKS},) if args["POOL"] else (),
+    variants=_finish_write_selection_variants,
 )
 # Canonical windows pass a row slice, reordered subsets an index tensor.
 register_triton_warmup(_prefill_indices_kernel, variants=({"HAS_ROWS": (False, True)},))

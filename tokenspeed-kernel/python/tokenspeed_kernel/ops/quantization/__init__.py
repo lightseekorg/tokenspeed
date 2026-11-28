@@ -20,12 +20,8 @@ from typing import Literal
 
 import torch
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.selection import SelectedKernel, select_kernel
-from tokenspeed_kernel.signature import (
-    dense_format_signature,
-    dense_tensor_format,
-    format_signature,
-)
+from tokenspeed_kernel.selection import KernelPlan, SelectedKernel, select_kernel
+from tokenspeed_kernel.signature import dense_format_signature
 
 __all__ = [
     "dequantize_fp8_block",
@@ -41,6 +37,7 @@ __all__ = [
     "quantize_mxfp4",
     "rmsnorm_mxfp4_quant",
     "rmsnorm_nvfp4_quant",
+    "plan_rmsnorm_quantize_fp8_group32",
     "rmsnorm_quantize_fp8_group32",
     "silu_and_mul_quantize_fp8_group32",
 ]
@@ -74,6 +71,33 @@ def rmsnorm_mxfp4_quant(
     return rmsnorm_mxfp4_quantize(x, weight, eps, weight_offset)
 
 
+def plan_rmsnorm_quantize_fp8_group32(
+    dtype: torch.dtype,
+    *,
+    solution: str | None,
+) -> KernelPlan:
+    """Plan ``rmsnorm_quantize_fp8_group32`` for activations of ``dtype``.
+
+    Args:
+        dtype: Input tensor dtype (e.g. ``torch.bfloat16``).
+        solution: Optional registered solution name.
+
+    Returns:
+        A :class:`KernelPlan` reused across calls without registry lookup.
+    """
+    return KernelPlan.select(
+        "quantization",
+        "rmsnorm_fp8_group32_ue8m0",
+        dense_format_signature(("x",), (dtype,)),
+        features=frozenset(),
+        static_traits={},
+        variable_traits=frozenset(),
+        declared_traits=frozenset(),
+        solution=solution,
+        ignore_layout=False,
+    )
+
+
 def rmsnorm_quantize_fp8_group32(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -82,6 +106,7 @@ def rmsnorm_quantize_fp8_group32(
     scale_layout: Literal["canonical", "swizzled", "packed"],
     override: str | None,
     solution: str | None,
+    plan: KernelPlan | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Normalize BF16 [M,K] rows and quantize them with exact group-32 scales.
 
@@ -100,6 +125,7 @@ def rmsnorm_quantize_fp8_group32(
             ``fp8_projection`` reads, and needs K divisible by 128.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        plan: Optional initialization-time kernel plan.
 
     Returns:
         BF16 normalized rows ``[M, K]``, E4M3 codes ``[M, K]`` and the scales:
@@ -108,14 +134,27 @@ def rmsnorm_quantize_fp8_group32(
         padding zero; or packed int32 ``[M, K/128]`` words, each four UE8M0
         bytes little-endian, strided ``(1, M padded to 4)``.
     """
-    kernel = select_kernel(
-        "quantization",
-        "rmsnorm_fp8_group32_ue8m0",
-        format_signature(x=dense_tensor_format(x.dtype)),
-        traits={},
-        override=override,
-        solution=solution,
-    )
+    signature = dense_format_signature(("x",), (x.dtype,))
+    if plan is not None:
+        plan.validate(
+            "quantization",
+            "rmsnorm_fp8_group32_ue8m0",
+            signature,
+            traits=None,
+            features=None,
+            solution=solution,
+            override=override,
+        )
+        kernel = plan.kernel
+    else:
+        kernel = select_kernel(
+            "quantization",
+            "rmsnorm_fp8_group32_ue8m0",
+            signature,
+            traits={},
+            override=override,
+            solution=solution,
+        )
     return kernel(x, weight, eps, scale_layout=scale_layout)
 
 
@@ -140,7 +179,7 @@ def silu_and_mul_quantize_fp8_group32(
     kernel = select_kernel(
         "quantization",
         "silu_and_mul_fp8_group32_ue8m0",
-        format_signature(x=dense_tensor_format(x.dtype)),
+        dense_format_signature(("x",), (x.dtype,)),
         traits={},
         override=None,
         solution=None,
@@ -187,7 +226,7 @@ def _quantize_fp8_roundtrip(
         "group_size": group_size,
         "scale_encoding": scale_encoding,
     }
-    signature = format_signature(x=dense_tensor_format(x.dtype))
+    signature = dense_format_signature(("x",), (x.dtype,))
     kernel = select_kernel(
         "quantization",
         "fp8",
@@ -305,7 +344,7 @@ def quantize_fp8(
         )
 
     traits = {"dequantize": False, "has_scale": scale is not None}
-    signature = format_signature(x=dense_tensor_format(x.dtype))
+    signature = dense_format_signature(("x",), (x.dtype,))
     kernel = select_kernel(
         "quantization",
         "fp8",
@@ -447,7 +486,7 @@ def _select_fp8_dynamic(
     return select_kernel(
         "quantization",
         "fp8_with_scale",
-        format_signature(x=dense_tensor_format(dtype)),
+        dense_format_signature(("x",), (dtype,)),
         traits=traits,
         features=required_features,
         solution=solution,
@@ -639,7 +678,7 @@ def quantize_mxfp8(
     """
 
     traits = {}
-    signature = format_signature(x=dense_tensor_format(x.dtype))
+    signature = dense_format_signature(("x",), (x.dtype,))
     kernel = select_kernel(
         "quantization",
         "mxfp8",
@@ -700,7 +739,7 @@ def quantize_nvfp4(
         "scale_layout": scale_layout,
         "has_scale": scale is not None,
     }
-    signature = format_signature(x=dense_tensor_format(x.dtype))
+    signature = dense_format_signature(("x",), (x.dtype,))
     kernel = select_kernel(
         "quantization",
         "nvfp4",
@@ -772,7 +811,7 @@ def quantize_mxfp4(
         "has_global_scale": global_scale is not None,
         "scale_encoding": "ue8m0",
     }
-    signature = format_signature(x=dense_tensor_format(x.dtype))
+    signature = dense_format_signature(("x",), (x.dtype,))
     kernel = select_kernel(
         "quantization",
         "mxfp4",
@@ -827,9 +866,7 @@ def quantize_fp8_with_gate(
     kernel = select_kernel(
         "quantization",
         "gated_fp8",
-        format_signature(
-            x=dense_tensor_format(x.dtype), gate=dense_tensor_format(gate.dtype)
-        ),
+        dense_format_signature(("x", "gate"), (x.dtype, gate.dtype)),
     )
     return kernel(x, gate, norm_weight=norm_weight, eps=eps, enable_pdl=enable_pdl)
 
@@ -955,7 +992,7 @@ def _launch_output_fp8_quant_pack(
     kernel = select_kernel(
         "quantization",
         "output_fp8_packed",
-        format_signature(x=dense_tensor_format(x.dtype)),
+        dense_format_signature(("x",), (x.dtype,)),
         traits={},
         override=None,
         solution=None,
@@ -1068,7 +1105,7 @@ def dequantize_fp8_block(codes: torch.Tensor, scales: torch.Tensor) -> torch.Ten
     kernel = select_kernel(
         "quantization",
         "dequantize_fp8_block",
-        format_signature(x=dense_tensor_format(codes.dtype)),
+        dense_format_signature(("x",), (codes.dtype,)),
         traits={},
         features=frozenset({"batch_invariant"}),
         override=None,

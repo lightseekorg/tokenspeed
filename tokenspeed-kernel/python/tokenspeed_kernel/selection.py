@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from contextlib import contextmanager
@@ -324,6 +325,9 @@ def _get_oracle(family: str) -> SelectionOracle | None:
     return _oracles.get(family)
 
 
+_EMPTY_FROZENSET: frozenset[str] = frozenset()
+
+
 def _make_cache_key(
     family: str,
     mode: str,
@@ -335,8 +339,17 @@ def _make_cache_key(
     ignore_layout: bool = False,
 ) -> tuple:
     """Build a hashable cache key including selection-relevant traits."""
-    traits_key = tuple(sorted(traits.items())) if traits else ()
-    mods_key = frozenset(features) if features else frozenset()
+    if not traits:
+        traits_key: tuple = ()
+    elif len(traits) == 1:
+        traits_key = (next(iter(traits.items())),)
+    else:
+        traits_key = tuple(sorted(traits.items()))
+    mods_key = (
+        features
+        if type(features) is frozenset
+        else (frozenset(features) if features else _EMPTY_FROZENSET)
+    )
     return (
         family,
         mode,
@@ -683,6 +696,7 @@ def _log_override_selection(
     )
 
 
+@functools.cache
 def _override_env_key(family: str, mode: str) -> str:
     return f"TOKENSPEED_KERNEL_OVERRIDE_{family.upper()}_{mode.upper()}"
 
@@ -694,7 +708,11 @@ def resolve_kernel_override(family: str, mode: str, override: str | None) -> str
     override. Dispatch shortcuts must use this before consulting tuned routes.
     """
     env_key = _override_env_key(family, mode)
-    return os.environ.get(env_key) or _global_overrides.get((family, mode)) or override
+    return (
+        os.environ.get(env_key)
+        or (_global_overrides.get((family, mode)) if _global_overrides else None)
+        or override
+    )
 
 
 def _override_origin(family: str, mode: str) -> str:
@@ -703,7 +721,7 @@ def _override_origin(family: str, mode: str) -> str:
     env_key = _override_env_key(family, mode)
     if os.environ.get(env_key):
         return f"env {env_key}"
-    if _global_overrides.get((family, mode)):
+    if _global_overrides and _global_overrides.get((family, mode)):
         return "kernel_override()"
     return "explicit override= argument"
 
@@ -755,22 +773,6 @@ def select_kernel(
     override = resolve_kernel_override(family, mode, override)
     registry = KernelRegistry.get()
 
-    # Fast path: check cache (skipped when override is active)
-    cache_key = _make_cache_key(
-        family,
-        mode,
-        format_signature,
-        platform.arch,
-        features,
-        traits,
-        solution,
-        ignore_layout,
-    )
-    if override is None:
-        cached = registry.cache_get(cache_key)
-        if cached is not None:
-            return cached
-
     if override:
         selected = _resolve_override(
             registry, family, mode, format_signature, override, platform, features
@@ -779,6 +781,35 @@ def select_kernel(
             family, mode, format_signature, selected, override, platform
         )
         return selected
+
+    # Fast path: build flat cache key inline for unparameterized steady-state calls.
+    cache_key = (
+        (
+            family,
+            mode,
+            format_signature,
+            platform.arch,
+            _EMPTY_FROZENSET,
+            (),
+            None,
+            False,
+        )
+        if not traits and not features and solution is None and not ignore_layout
+        else _make_cache_key(
+            family,
+            mode,
+            format_signature,
+            platform.arch,
+            features,
+            traits,
+            solution,
+            ignore_layout,
+        )
+    )
+    if override is None:
+        cached = registry.cache_get(cache_key)
+        if cached is not None:
+            return cached
 
     # Get candidates (same filtering for both strategies)
     candidates = registry.get_for_operator(

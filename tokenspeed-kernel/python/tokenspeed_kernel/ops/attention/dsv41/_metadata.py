@@ -78,6 +78,7 @@ class IndexMetadata:
         self.history_rows = history_rows
         self.paged = {}
         self.sparse = {}
+        self.dense = {}
 
     def validate(self, table, lengths):
         if self.source.tensors[0] is not table or self.source.tensors[1] is not lengths:

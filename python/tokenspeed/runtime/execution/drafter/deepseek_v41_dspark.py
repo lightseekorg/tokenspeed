@@ -1315,6 +1315,51 @@ class DeepseekV41DSpark(BaseDrafter):
         next_tokens[num_extends:].clamp_(0, int(self.vocab_size) - 1)
         return next_tokens
 
+    @torch.inference_mode()
+    def warmup_extend(self, num_tokens: int) -> None:
+        """Warm prefill-side DSpark kernels (anchor prep and context KV write)."""
+        del num_tokens
+        accept_lengths = torch.ones((1,), dtype=torch.int32, device=self.device)
+        next_tokens = torch.empty(
+            (1, self.spec_num_tokens), dtype=torch.int32, device=self.device
+        )
+        # Warm both RAGGED=False (extend / dense decode) and RAGGED=True (packed decode).
+        dsv41.dspark_anchors(
+            torch.zeros((1,), dtype=torch.int32, device=self.device),
+            accept_lengths,
+            torch.zeros((0,), dtype=torch.int64, device=self.device),
+            1,
+            self.spec_num_tokens,
+            next_tokens,
+            torch.zeros((0,), dtype=torch.int64, device=self.device),
+            num_prefill_outputs=1,
+            decode_query_indptr=None,
+        )
+        dsv41.dspark_anchors(
+            torch.zeros((self.spec_num_tokens,), dtype=torch.int32, device=self.device),
+            accept_lengths,
+            torch.zeros((1,), dtype=torch.int64, device=self.device),
+            0,
+            self.spec_num_tokens,
+            next_tokens,
+            torch.zeros((1,), dtype=torch.int64, device=self.device),
+            num_prefill_outputs=0,
+            decode_query_indptr=torch.tensor(
+                [0, 1], dtype=torch.int32, device=self.device
+            ),
+        )
+        if self.token_to_kv_pool is not None:
+            # Negative slots skip cache stores while warming main_proj, main_norm,
+            # context_wkv, and dsv41.dspark_rows.
+            self.model.write_context_kv(
+                torch.zeros(
+                    (1, self.hidden_width), dtype=torch.bfloat16, device=self.device
+                ),
+                torch.zeros((1,), dtype=torch.int64, device=self.device),
+                torch.full((1,), -1, dtype=torch.int32, device=self.device),
+                self.token_to_kv_pool,
+            )
+
     def draft(self, *args, **kwargs) -> torch.Tensor | None:
         raise RuntimeError("DSPARK drafts through run() with target captures.")
 
