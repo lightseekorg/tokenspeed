@@ -20,14 +20,17 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import io
+import sys
+import warnings
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Callable
 
 import pytest
 import tokenspeed_kernel.plugins as plugins_mod
 import torch
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.plugins import (
     DISABLE_ENV_VAR,
     PluginInfo,
@@ -38,7 +41,8 @@ from tokenspeed_kernel.plugins import (
 )
 from tokenspeed_kernel.plugins.cli import main as cli_main
 from tokenspeed_kernel.registry import KernelRegistry, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.selection import KernelPlan, select_kernel
+from tokenspeed_kernel.signature import format_signature, format_signatures
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -109,6 +113,8 @@ def _make_register(
     priority: int = 12,
     storage_dtypes=None,
     capability: CapabilityRequirement | None = None,
+    traits=None,
+    signatures=None,
 ) -> Callable[[], None]:
     sol = solution or name
 
@@ -118,11 +124,16 @@ def _make_register(
             mode,
             name=name,
             solution=sol,
-            signatures=format_signatures(
-                ("a", "b"), "dense", storage_dtypes or {torch.bfloat16}
+            signatures=(
+                signatures
+                if signatures is not None
+                else format_signatures(
+                    ("a", "b"), "dense", storage_dtypes or {torch.bfloat16}
+                )
             ),
             priority=priority,
             capability=capability,
+            traits=traits,
         )
         def impl(*args, **kwargs):
             return name
@@ -173,6 +184,67 @@ class TestExplicitRegistration:
 
 
 class TestDiscovery:
+    @pytest.mark.parametrize("import_during_load", [True, False])
+    def test_lazy_builtins_are_not_owned_by_plugin(
+        self,
+        fresh_plugins,
+        patch_entry_points,
+        monkeypatch,
+        tmp_path,
+        import_during_load,
+    ):
+        import tokenspeed_kernel
+
+        core_name = "tokenspeed_kernel._test_lazy_core"
+        plugin_name = "test_lazy_kernel_plugin"
+        (tmp_path / "_test_lazy_core.py").write_text(
+            "from tokenspeed_kernel.registry import register_kernel\n"
+            "from tokenspeed_kernel.signature import format_signature\n"
+            "@register_kernel('test', 'core', name='core_first', solution='core', "
+            "signatures={format_signature()}, priority=12)\n"
+            "def core_impl(): return 'core'\n"
+            "register_kernel('test', 'core', name='core_second', solution='core', "
+            "signatures={format_signature()}, priority=12)(core_impl)\n"
+        )
+        core_import = f"from {core_name} import core_impl\n"
+        (tmp_path / f"{plugin_name}.py").write_text(
+            "from tokenspeed_kernel.registry import register_kernel\n"
+            "from tokenspeed_kernel.signature import format_signature\n"
+            + (core_import if import_during_load else "")
+            + "def register():\n"
+            + ("" if import_during_load else f"    {core_import}")
+            + "    register_kernel('test', 'plugin', name='plugin_reuse', "
+            "solution='plugin', signatures={format_signature()}, priority=12)(core_impl)\n"
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setattr(
+            tokenspeed_kernel, "__path__", [*tokenspeed_kernel.__path__, str(tmp_path)]
+        )
+        patch_entry_points(
+            [
+                importlib.metadata.EntryPoint(
+                    name="lazy",
+                    value=f"{plugin_name}:register",
+                    group=plugins_mod.ENTRY_POINT_GROUP,
+                )
+            ]
+        )
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                loaded = discover_plugins()
+            assert not caught
+            assert loaded[0].kernel_names == ("plugin_reuse",)
+            assert loaded[0].num_kernels == 1
+            registry = KernelRegistry.get()
+            assert registry.get_impl("core_first")() == "core"
+            assert registry.get_impl("core_second")() == "core"
+            assert registry.get_impl("plugin_reuse") is registry.get_impl("core_first")
+        finally:
+            sys.modules.pop(core_name, None)
+            sys.modules.pop(plugin_name, None)
+            vars(tokenspeed_kernel).pop("_test_lazy_core", None)
+
     def test_discover_no_plugins(self, fresh_plugins, patch_entry_points):
         patch_entry_points([])
         loaded = discover_plugins()
@@ -366,6 +438,193 @@ class TestDisable:
 
 
 class TestCollision:
+    @pytest.mark.parametrize(
+        "left,right",
+        [
+            (
+                {"capability": CapabilityRequirement(vendors=frozenset({"nvidia"}))},
+                {"capability": CapabilityRequirement(vendors=frozenset({"amd"}))},
+            ),
+            (
+                {
+                    "capability": CapabilityRequirement(
+                        max_arch_version=ArchVersion(9, 0)
+                    )
+                },
+                {
+                    "capability": CapabilityRequirement(
+                        min_arch_version=ArchVersion(10, 0)
+                    )
+                },
+            ),
+            (
+                {
+                    "capability": CapabilityRequirement(
+                        vendors=frozenset({"nvidia", "amd"}),
+                        vendor_min_arch_versions={
+                            "nvidia": ArchVersion(10, 0),
+                            "amd": ArchVersion(9, 5),
+                        },
+                    )
+                },
+                {
+                    "capability": CapabilityRequirement(
+                        vendors=frozenset({"nvidia"}),
+                        max_arch_version=ArchVersion(9, 0),
+                    )
+                },
+            ),
+            ({"storage_dtypes": {torch.bfloat16}}, {"storage_dtypes": {torch.float16}}),
+            (
+                {"traits": {"m": frozenset({16, 32})}},
+                {"traits": {"m": frozenset({64})}},
+            ),
+            (
+                {"traits": {"tokens": range(1, 257)}},
+                {"traits": {"tokens_min": frozenset({2560})}},
+            ),
+            (
+                {"traits": {"m_max": frozenset({128})}},
+                {"traits": {"m_min": frozenset({256})}},
+            ),
+            (
+                {"traits": {"m": frozenset({3, 5})}},
+                {"traits": {"m_align": frozenset({2})}},
+            ),
+            (
+                {"traits": {"hidden": frozenset({96})}},
+                {"traits": {"hidden_alignment": frozenset({128})}},
+            ),
+        ],
+        ids=[
+            "vendor",
+            "arch",
+            "vendor-arch",
+            "dtype",
+            "shape",
+            "range-bound",
+            "bounds",
+            "alignment",
+            "moe-alignment",
+        ],
+    )
+    def test_disjoint_domains_are_silent(
+        self, fresh_plugins, patch_entry_points, left, right
+    ):
+        _make_register("existing", **left)()
+        patch_entry_points([_FakeEntryPoint("plugin", _make_register("new", **right))])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            loaded = discover_plugins()
+        assert not caught
+        assert loaded[0].kernel_names == ("new",)
+        assert len(KernelRegistry.get().get_for_operator("gemm", "mm")) == 2
+
+    @pytest.mark.parametrize(
+        "traits",
+        [
+            ({"m_max": frozenset({128})}, {"m_min": frozenset({128})}),
+            ({"m_align": frozenset({32})}, {"m_align": frozenset({128})}),
+            (
+                {"hidden_alignment": frozenset({32})},
+                {"hidden_alignment": frozenset({128})},
+            ),
+            ({"head_dim": frozenset({64})}, {"head_dim": frozenset({128})}),
+        ],
+    )
+    def test_possible_overlap_still_warns(
+        self, fresh_plugins, patch_entry_points, traits
+    ):
+        _make_register("existing", traits=traits[0])()
+        patch_entry_points(
+            [_FakeEntryPoint("plugin", _make_register("new", traits=traits[1]))]
+        )
+        with pytest.warns(UserWarning, match="equal priority"):
+            discover_plugins()
+
+    def test_predicates_are_not_executed(self, fresh_plugins, patch_entry_points):
+        def predicate(*args):
+            raise AssertionError("Discovery must not execute predicates")
+
+        _make_register("existing", traits={"problem_filter": frozenset({predicate})})()
+        patch_entry_points([_FakeEntryPoint("plugin", _make_register("new"))])
+        with pytest.warns(UserWarning, match="equal priority"):
+            discover_plugins()
+
+    def test_positive_features_can_coexist(self, fresh_plugins, patch_entry_points):
+        _make_register(
+            "existing",
+            capability=CapabilityRequirement(
+                required_features=frozenset({"feature_a"})
+            ),
+        )()
+        patch_entry_points(
+            [
+                _FakeEntryPoint(
+                    "plugin",
+                    _make_register(
+                        "new",
+                        capability=CapabilityRequirement(
+                            required_features=frozenset({"feature_b"})
+                        ),
+                    ),
+                )
+            ]
+        )
+        with pytest.warns(UserWarning, match="equal priority"):
+            discover_plugins()
+
+    def test_layouts_can_be_ignored(self, fresh_plugins, patch_entry_points):
+        def layout_a():
+            pass
+
+        def layout_b():
+            pass
+
+        _make_register("existing", signatures={format_signature(layouts={layout_a})})()
+        patch_entry_points(
+            [
+                _FakeEntryPoint(
+                    "plugin",
+                    _make_register(
+                        "new", signatures={format_signature(layouts={layout_b})}
+                    ),
+                )
+            ]
+        )
+        with pytest.warns(UserWarning, match="equal priority"):
+            discover_plugins()
+
+    def test_pair_warned_once_without_changing_selection(
+        self, fresh_plugins, patch_entry_points, h100_platform
+    ):
+        def register():
+            _make_register("z_first")()
+            _make_register("a_second")()
+
+        patch_entry_points([_FakeEntryPoint("plugin", register)])
+        with pytest.warns(UserWarning, match="equal priority") as caught:
+            discover_plugins()
+        assert len(caught) == 1
+        signature = next(iter(format_signatures(("a", "b"), "dense", {torch.bfloat16})))
+        selected = select_kernel("gemm", "mm", signature, platform=h100_platform)
+        assert selected.name == "z_first"
+        assert selected() == "z_first"
+        planned = KernelPlan.select(
+            "gemm",
+            "mm",
+            signature,
+            features=frozenset(),
+            static_traits={},
+            variable_traits=frozenset(),
+            declared_traits=frozenset(),
+            solution=None,
+            ignore_layout=False,
+            platform=h100_platform,
+        )
+        assert planned.kernel.name == "a_second"
+        assert planned.kernel() == "a_second"
+
     def test_equal_priority_emits_warning(self, fresh_plugins, patch_entry_points):
         # Pre-existing kernel (built-in style) at priority 14.
         @register_kernel(
