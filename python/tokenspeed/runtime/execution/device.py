@@ -185,7 +185,6 @@ from tokenspeed.runtime.distributed.nccl_suspend import (
 from tokenspeed.runtime.engine.scheduler_utils import is_device_cache_op
 from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     ModelExecutionResult,
