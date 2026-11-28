@@ -32,6 +32,7 @@ CPU reference.
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 from copy import copy
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -113,6 +114,8 @@ def _write_window_rows(
 class _WindowAttention:
     """Borrow one stage's LCM window pages for one forward; no state survives."""
 
+    defer_final_pd_cache_step: bool = False
+
     def __init__(
         self, positions, window, history_slots, block_size, selection, request_indices
     ):
@@ -126,6 +129,17 @@ class _WindowAttention:
 
     def query_metadata(self, mode):
         return self.meta
+
+    @contextmanager
+    def record_pd_cache_step(
+        self,
+        forward_mode,
+        writes_in_call: bool,
+        record_kv_cache: bool | None,
+    ):
+        """Draft window attention writes no shared KV pool pages, so PD ticks are no-ops."""
+        del forward_mode, writes_in_call, record_kv_cache
+        yield
 
     @property
     def supports_fused_attention(self) -> bool:

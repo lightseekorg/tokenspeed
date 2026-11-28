@@ -1354,10 +1354,10 @@ def test_packed_config_and_recipe_capacity(
     )
     with pytest.raises(NotImplementedError, match="target attention"):
         DeepseekV41Config.generate(args, model, True)
-    # A PD role must transfer the cache once per prompt, not per layer.
+    # PD roles accept both synchronous (interval 0) and layerwise streaming.
     args.disaggregation_mode = "prefill"
-    with pytest.raises(NotImplementedError, match="layerwise-interval 0"):
-        DeepseekV41Config.generate(args, model, False)
+    args.disaggregation_layerwise_interval = 1
+    assert DeepseekV41Config.generate(args, model, False).pd_disaggregation_enabled
     args.disaggregation_layerwise_interval = 0
     assert DeepseekV41Config.generate(args, model, False).pd_disaggregation_enabled
     args.disaggregation_mode = "null"
@@ -3318,6 +3318,105 @@ def test_split_index_windows_uses_page_table_columns(monkeypatch):
         (1000, 1000, empty),
         (1000, 1003, None),
     ]
+
+
+def test_select_global_and_prepare_decode_cap_indexer_query_chunk_at_8192(monkeypatch):
+    from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+        V41_INDEXER_MAX_QUERY_CHUNK,
+    )
+
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: True)
+    seen_chunks = []
+
+    def spy_topk(
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        candidates,
+        topk,
+        candidate_topk,
+        block_size,
+        query_chunk,
+        score_chunk,
+        group,
+        out,
+        solution,
+        index_metadata,
+    ):
+        seen_chunks.append(query_chunk)
+        for tensor in out[:2]:
+            tensor.zero_()
+        out[2].zero_()
+        out[3].zero_()
+        return out
+
+    monkeypatch.setattr(dsv41, "index_topk", spy_topk)
+    recipe = _recipe("cpu")
+    recipe.server_args.chunked_prefill_size = 16_384
+    spec = replace(
+        recipe.attn_config.component(DeepseekV41Config),
+        max_query_tokens=16_384,
+        candidate_topk=4,
+    )
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        context_len=16_384,
+        max_bs=1,
+        max_resident_requests=1,
+        components=(spec,),
+    )
+    pool = _pool(recipe, "cpu")
+    backend = DeepseekV41AttentionBackend(recipe.attn_config, spec)
+    backend.set_cache_pool(pool)
+    widths = v41_table_widths(16_384, 0)
+    tables = {
+        gid: torch.ones((1, width), dtype=torch.int32) for gid, width in widths.items()
+    }
+    for tokens, expected_chunk in (
+        (9_000, V41_INDEXER_MAX_QUERY_CHUNK),
+        (5_000, 5_000),
+    ):
+        seen_chunks.clear()
+        meta = _extend(backend, tables, [tokens], [64], [0], [64 + tokens])
+        q = torch.zeros(tokens, 2, 128, dtype=torch.bfloat16)
+        weights = torch.ones(tokens, 2, dtype=torch.bfloat16)
+        # Candidate source layer (layer 20 -> dense Full) and Reindex (layer 24).
+        backend.select_global(
+            20,
+            q,
+            weights,
+            meta.positions,
+            meta.request_indices,
+            ForwardMode.EXTEND,
+            None,
+            query_shard=None,
+        )
+        backend.select_global(
+            24,
+            q,
+            weights,
+            meta.positions,
+            meta.request_indices,
+            ForwardMode.EXTEND,
+            None,
+            query_shard=None,
+        )
+        assert seen_chunks == [expected_chunk, expected_chunk]
+
+    # Decode preparation passes the identical capped chunk size as select_global.
+    meta = _extend(backend, tables, [9_000], [64], [0], [9_064])
+    backend.forward_decode_metadata = meta
+    decode_chunks = []
+    monkeypatch.setattr(
+        dsv41,
+        "prepare_index_topk",
+        lambda *_args: decode_chunks.append(_args[8]),
+    )
+    backend.begin_indexer_forward()
+    backend._prepare_decode_index(2, ForwardMode.DECODE, None, 32)
+    assert decode_chunks == [V41_INDEXER_MAX_QUERY_CHUNK]
 
 
 def _index_scratch_recipe(**changes):

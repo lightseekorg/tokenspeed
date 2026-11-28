@@ -752,6 +752,75 @@ def test_draft_field_writer_prefers_the_context_producer():
     assert executor.draft_field_writer is executor.dspark_context_producer
 
 
+def test_pd_layerwise_finalization_with_embedded_draft_cache_fields(monkeypatch):
+    from tokenspeed.runtime.execution.device import (
+        _arm_layerwise_streaming,
+        _supports_pd_layerwise_finalization,
+    )
+    from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
+        DeepseekV41DSpark,
+    )
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+        DeepseekV41AttentionBackend,
+    )
+    from tokenspeed.runtime.pd import utils as pd_utils
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.dspark_context_producer = None
+    executor.draft_attn_backend = None
+    executor._draft_final_step_counter = None
+
+    backend = DeepseekV41AttentionBackend.__new__(DeepseekV41AttentionBackend)
+    backend.step_counter = None
+    backend.defer_final_pd_cache_step = False
+    executor.attn_backend = backend
+
+    executor.drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+    mapping = SimpleNamespace(has_pp=False, is_last_pp_rank=True)
+    assert _supports_pd_layerwise_finalization(executor, mapping) is True
+
+    counter = SimpleNamespace(record_cache=lambda: None)
+    registered = []
+    monkeypatch.setattr(pd_utils, "StepCounter", lambda device, gpu_id: counter)
+    executor.device = "cpu"
+    server_args = SimpleNamespace(
+        disaggregation_layerwise_interval=1,
+        mapping=mapping,
+    )
+    kv_transfer = SimpleNamespace(
+        mode="prefill",
+        register_layerwise_step_counter=lambda sc, interval: registered.append(
+            (sc, interval)
+        ),
+    )
+
+    _arm_layerwise_streaming(server_args, executor, kv_transfer, gpu_id=0)
+    assert backend.step_counter is counter
+    assert backend.defer_final_pd_cache_step is True
+    assert executor._draft_final_step_counter is counter
+    assert registered == [(counter, 1)]
+
+    # Without a drafter, the last target layer must NOT defer its step.
+    backend.defer_final_pd_cache_step = False
+    backend.step_counter = None
+    executor._draft_final_step_counter = None
+    executor.drafter = None
+    registered.clear()
+    _arm_layerwise_streaming(server_args, executor, kv_transfer, gpu_id=0)
+    assert backend.defer_final_pd_cache_step is False
+    assert executor._draft_final_step_counter is None
+    assert registered == [(counter, 1)]
+
+    # Separate-draft target backends without a draft backend still fail loudly.
+    plain_backend = AttentionBackend.__new__(AttentionBackend)
+    executor.attn_backend = plain_backend
+    executor.drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+    with pytest.raises(RuntimeError, match="requires a draft backend"):
+        executor.register_draft_final_step_counter(counter)
+
+
 def test_wire_dflash_keeps_own_embed_head():
     # A DFlash draft ships its own embed/head: setup configures capture only,
     # so the factory must never read the target's weights for it.

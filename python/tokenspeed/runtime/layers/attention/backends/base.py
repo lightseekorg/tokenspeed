@@ -531,6 +531,10 @@ class AttentionBackend(CachePoolBinding, ABC):
     supports_mla_projected_value_decode: bool = False
     # Bound by register_step_counter (PD layerwise transfer); None otherwise.
     step_counter: StepCounter | None = None
+    # Defer the final layer's step when draft context fields share that step.
+    defer_final_pd_cache_step: bool = False
+    # Target backends whose final layer shares storage with draft context fields.
+    embeds_draft_cache_fields: bool = False
     # Static CUDA-graph capability of this class; the executor AND-composes
     # it over the target+draft trees (resolve_cuda_graph_support).
     cuda_graph_support: CudaGraphSupport = CudaGraphSupport()

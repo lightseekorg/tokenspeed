@@ -71,6 +71,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
     V41PrefillSpan,
@@ -274,6 +275,10 @@ class _DenseFFN(nn.Module):
 
 
 class _Backend:
+    step_counter = None
+    defer_final_pd_cache_step = False
+    record_pd_cache_step = AttentionBackend.record_pd_cache_step
+
     def __init__(self, positions, requests, view=None):
         self.meta = SimpleNamespace(positions=positions, request_indices=requests)
         self.view = (
@@ -327,6 +332,9 @@ class _Backend:
         # attention below still receives the same rows.
         self.swa_writes.append((args, kwargs))
         return True
+
+    def prepare_global_selection(self, *args, **kwargs):
+        return None
 
     def forward_v41(
         self,
@@ -1067,6 +1075,160 @@ def test_cache_only_narrowing_handoff_has_no_pending_hc(monkeypatch, attention_d
     assert seen == (list(range(20, 40)) if attention_dp else [])
     producer.assert_called_once()
     forbidden.assert_not_called()
+
+
+def test_v41_layerwise_pd_step_counter_and_dspark_deferral(monkeypatch):
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    config = _config()
+    config.num_hidden_layers = 4
+    config.compress_ratios = [0, 2, 1, 1]
+    config.kv_source_layer_ids = [1, 2]
+    config.index_source_layer_ids = [1, 2]
+    config.candidate_source_layer_id = 2
+    config.engram_layer_ids = []
+    model = DeepseekV41Model(
+        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+    )
+    _initialize(model)
+
+    events = []
+
+    class RecordingBackend(_Backend):
+        def write_global(self, owner, *args, **kwargs):
+            events.append(("write", owner))
+            return super().write_global(owner, *args, **kwargs)
+
+        def forward_v41(self, q, swa, *, layer_id, **kwargs):
+            events.append(("v41", layer_id))
+            return super().forward_v41(q, swa, layer_id=layer_id, **kwargs)
+
+    positions = torch.arange(4)
+    requests = torch.zeros_like(positions)
+
+    def run_pass(*, mode, defer_final, empty_decoder, attention_dp):
+        events.clear()
+        model.mapping = SimpleNamespace(
+            attn=SimpleNamespace(has_dp=attention_dp), world_size=1
+        )
+        for layer in model.layers:
+            layer.ffn.owns_ep_communication = attention_dp
+            monkeypatch.setattr(
+                layer.comm_manager,
+                "moe_tp_ep_group_scattered_num_tokens",
+                lambda ctx: [0, 4],
+            )
+        run_positions = positions[:0] if mode == ForwardMode.IDLE else positions
+        run_requests = requests[:0] if mode == ForwardMode.IDLE else requests
+        if empty_decoder:
+            empty = run_positions[:0]
+            query = SimpleNamespace(positions=empty, request_indices=empty)
+            view = V41DecoderView(query, None, (), empty, None)
+        else:
+            view = None
+        backend = RecordingBackend(run_positions, run_requests, view)
+        backend.defer_final_pd_cache_step = defer_final
+        backend.step_counter = SimpleNamespace(
+            record_cache=lambda: events.append("step")
+        )
+        ctx = _ctx(backend, run_positions.numel(), mode)
+        ids = torch.zeros_like(run_positions)
+        if empty_decoder:
+            state = model.encoder_forward(
+                ids,
+                run_positions,
+                ctx,
+                None,
+                None,
+                engram_hash_ids=None,
+                engram_token_mask=None,
+                image_mask=None,
+            )
+            narrowed = model.narrowing_forward(state, ctx)
+            model.decoder_forward(narrowed, ctx)
+        else:
+            model(
+                ids,
+                run_positions,
+                ctx,
+                None,
+                None,
+                engram_hash_ids=None,
+                engram_token_mask=None,
+                image_mask=None,
+            )
+        return list(events)
+
+    # Active decoder: each layer records its step after cache writes complete.
+    assert run_pass(
+        mode=ForwardMode.EXTEND,
+        defer_final=False,
+        empty_decoder=False,
+        attention_dp=False,
+    ) == [
+        ("v41", 0),
+        "step",
+        ("write", 1),
+        ("v41", 1),
+        "step",
+        ("write", 2),
+        ("v41", 2),
+        "step",
+        ("v41", 3),
+        "step",
+    ]
+
+    # Open chunk with empty narrowed rows still ticks all 4 steps on extend,
+    # both with and without attention DP.
+    for attention_dp in (False, True):
+        assert run_pass(
+            mode=ForwardMode.EXTEND,
+            defer_final=False,
+            empty_decoder=True,
+            attention_dp=attention_dp,
+        ) == [
+            ("v41", 0),
+            "step",
+            ("write", 1),
+            ("v41", 1),
+            "step",
+            ("write", 2),
+            "step",
+            "step",
+        ]
+
+    # Non-extend forwards record zero steps.
+    assert "step" not in run_pass(
+        mode=ForwardMode.DECODE,
+        defer_final=False,
+        empty_decoder=False,
+        attention_dp=False,
+    )
+    assert "step" not in run_pass(
+        mode=ForwardMode.IDLE,
+        defer_final=False,
+        empty_decoder=True,
+        attention_dp=True,
+    )
+
+    # DSpark defers the final target step to _record_draft_final_cache_step.
+    for empty_decoder in (False, True):
+        got = run_pass(
+            mode=ForwardMode.EXTEND,
+            defer_final=True,
+            empty_decoder=empty_decoder,
+            attention_dp=False,
+        )
+        assert got.count("step") == 3
+        executor = ModelExecutor.__new__(ModelExecutor)
+        executor._draft_final_step_counter = SimpleNamespace(
+            record_cache=lambda: got.append("draft-step")
+        )
+        executor._record_draft_final_cache_step(0)
+        assert "draft-step" not in got
+        executor._record_draft_final_cache_step(1)
+        assert got.count("draft-step") == 1
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -5390,3 +5552,120 @@ def test_dsv41_prefill_skip_normalized_and_aux_overlap_match_eager(monkeypatch):
     if fp8_q:
         assert recorded == [False]
     torch.testing.assert_close(captured, expected_serial, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_v41_prefill_overlap_and_capture_emit_pd_step_after_cache_write(monkeypatch):
+    """Both eager overlap and captured-prefill breaks tick StepCounter strictly
+    after forward_v41 writes SWA/global KV, and defer the last layer for DSpark."""
+    from tokenspeed.runtime.execution.breakable_cuda_graph import (
+        BreakableCapture,
+        active_forward,
+    )
+
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    monkeypatch.setattr(v41, "_max_forward_tokens", lambda: 16)
+    config = _config()
+    config.num_hidden_layers = 40
+    config.hidden_size = 256
+    config.num_attention_heads = config.o_groups = 2
+    config.head_dim, config.qk_rope_head_dim = 512, 64
+    config.q_lora_rank = config.o_lora_rank = 128
+    config.index_n_heads = 32
+    config.index_head_dim = 128
+    events = []
+    last_config = copy(config)
+    last_config.num_hidden_layers = 21
+    with torch.device("cuda:0"):
+        attn = DeepseekV41Attention(
+            config,
+            _mapping(0, 1, 1),
+            20,
+            20,
+            v41_mxfp8_config(_quant()),
+            "layers.20.attn",
+            aux_stream=torch.cuda.Stream(device="cuda:0"),
+        )
+        last_attn = DeepseekV41Attention(
+            last_config,
+            _mapping(0, 1, 1),
+            20,
+            20,
+            v41_mxfp8_config(_quant()),
+            "layers.20.attn",
+            aux_stream=None,
+        )
+    for mod in (attn, last_attn):
+        _initialize(mod)
+        for sub in mod.modules():
+            if isinstance(sub, LinearBase):
+                sub.quant_method.process_weights_after_loading(sub)
+        mod.prepare_output_projections()
+        mod.prepare_fused_decode()
+
+    backend = _backend("cuda:0", 2)
+    tables = _tables("cuda:0")
+    backend.step_counter = SimpleNamespace(record_cache=lambda: events.append("step"))
+    real_forward_v41 = backend.forward_v41
+
+    def traced_forward_v41(*args, **kwargs):
+        events.append(("v41", kwargs["layer_id"]))
+        return real_forward_v41(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "forward_v41", traced_forward_v41)
+    x = torch.randn(6, config.hidden_size, dtype=torch.bfloat16, device="cuda:0")
+    meta = _extend(backend, tables, [6], [0], [0], [6])
+
+    # Eager extend with aux_stream overlap.
+    events.clear()
+    attn(meta.positions, x, _ctx(backend, 6, ForwardMode.EXTEND), reduce_output=True)
+    assert events == [("v41", 20), "step"]
+
+    # Last layer defers its tick only when defer_final_pd_cache_step is set.
+    events.clear()
+    last_attn(
+        meta.positions, x, _ctx(backend, 6, ForwardMode.EXTEND), reduce_output=True
+    )
+    assert events == [("v41", 20), "step"]
+    backend.defer_final_pd_cache_step = True
+    events.clear()
+    last_attn(
+        meta.positions, x, _ctx(backend, 6, ForwardMode.EXTEND), reduce_output=True
+    )
+    assert events == [("v41", 20)]
+    backend.defer_final_pd_cache_step = False
+
+    # Breakable captured prefill fires inside @break_point on every replay.
+    with torch.device("cuda:0"):
+        cap_attn = DeepseekV41Attention(
+            config,
+            _mapping(0, 1, 1),
+            20,
+            21,
+            v41_mxfp8_config(_quant()),
+            "layers.20.attn",
+            aux_stream=None,
+        )
+    _initialize(cap_attn)
+    for sub in cap_attn.modules():
+        if isinstance(sub, LinearBase):
+            sub.quant_method.process_weights_after_loading(sub)
+    cap_attn.prepare_output_projections()
+    cap_attn.prepare_fused_decode()
+
+    cap = BreakableCapture()
+    ctx = _ctx(backend, 6, ForwardMode.EXTEND)
+    with active_forward(ctx):
+        cap.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap.stream):
+            for _ in range(2):
+                cap_attn(meta.positions, x, ctx, reduce_output=True)
+        cap.stream.synchronize()
+        events.clear()
+        with cap:
+            cap_attn(meta.positions, x, ctx, reduce_output=True)
+        assert events == [("v41", 20), "step"]
+        events.clear()
+        cap.replay()
+        assert events == [("v41", 20), "step"]

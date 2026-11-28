@@ -2590,6 +2590,14 @@ def _arm_layerwise_streaming(server_args, executor, kv_transfer, gpu_id: int) ->
 
     step_counter = StepCounter(executor.device, gpu_id)
     executor.attn_backend.register_step_counter(step_counter)
-    if executor.draft_attn_backend is not None:
+    # Stages that own separate draft cache fields (draft_attn_backend is not
+    # None) or embed draft fields into the target's final step defer final
+    # step readiness until drafter execution writes them.
+    has_draft_finalizer = executor.draft_attn_backend is not None or (
+        executor.draft_field_writer is not None
+        and executor.attn_backend.embeds_draft_cache_fields
+        and not (server_args.mapping.has_pp and not server_args.mapping.is_last_pp_rank)
+    )
+    if has_draft_finalizer:
         executor.register_draft_final_step_counter(step_counter)
     kv_transfer.register_layerwise_step_counter(step_counter, interval)

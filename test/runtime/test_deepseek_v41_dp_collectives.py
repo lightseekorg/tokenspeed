@@ -54,6 +54,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
 )
@@ -117,6 +118,9 @@ class _CpuAttention(nn.Module):
                 return hidden_states.index_select(0, keep)
         return hidden_states
 
+    def record_empty_pd_step(self, ctx):
+        pass
+
 
 def _cpu_model(rank, world_size, moe_ep_size, monkeypatch, transport):
     mapping = Mapping(
@@ -153,6 +157,10 @@ def _cpu_model(rank, world_size, moe_ep_size, monkeypatch, transport):
 
 
 class _CpuAttentionBackend:
+    step_counter = None
+    defer_final_pd_cache_step = False
+    record_pd_cache_step = AttentionBackend.record_pd_cache_step
+
     def __init__(self, token_ids, keep_rows):
         self.meta = SimpleNamespace(
             positions=torch.arange(token_ids.numel(), dtype=torch.int64),

@@ -1192,7 +1192,11 @@ preserves the optimization on cache-only rounds without changing the numerical
 shape of rounds that produce outputs.
 
 Final prefill windows, bootstrap tokens, and PD candidate/cache handoff remain
-unchanged. V4.1 PD still requires layerwise transfer interval zero. This does
+unchanged. V4.1 PD also supports layerwise transfer (`--disaggregation-layerwise-interval > 0`):
+each target attention layer ticks its cache step after completing global and SWA
+writes (including active extend decoder layers narrowed to zero rows), while DSpark
+defers the final target layer's step so `layer.39.dspark_stage*` fields become
+ready together with `layer.39.swa` after `DeepseekV41DSpark.run`. This does
 not enable a cache-only prefill role or reduce resident model weights. PP and
 attention-DP narrowing retain their existing restrictions.
 
@@ -2118,7 +2122,10 @@ refuses it again at executor construction. The MTP shape is:
   answers for `ModelExecutor.draft_field_writer` -- the producer when
   configured, else the drafter -- exactly as a non-PP engine does, and
   `register_draft_final_step_counter` reads the same property. The last stage
-  registers the draft-final step counter; the others count target layers only.
+  registers the draft-final step counter when it has a separate draft backend
+  or embeds draft context fields in its final target step
+  (`embeds_draft_cache_fields`, e.g. V4.1 DSpark, which defers the target's
+  final layer tick); the other stages count target layers only.
 * **Handoff.** The last stage samples, runs the drafter over the completing
   chunk and writes the candidate block into the reserved decode slot; the
   control plane shares `(output_tokens, output_lengths, next_input_ids)`
