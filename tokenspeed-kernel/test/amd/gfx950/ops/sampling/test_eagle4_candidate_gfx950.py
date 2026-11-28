@@ -75,6 +75,19 @@ def test_shard_topk_matches_reference(cols: int, levels: int, device: str) -> No
     torch.testing.assert_close(ids, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("k", [1, 32, 256])
+@pytest.mark.parametrize("cols", [248320, 4097, 300])
+def test_shard_topk_matches_reference_over_k(k: int, cols: int, device: str) -> None:
+    """Other candidate counts, a split boundary one column wide, and a
+    single split; few levels put the k-th largest's ties in many splits."""
+    rows = 5
+    scores = _scores(rows, cols, 16, cols + k, device)
+    ids = torch.empty((rows, k), dtype=torch.int64, device=device)
+    eagle4_shard_topk(scores, k, 7, ids)
+    expected = _select_reference(scores.float(), k) + 7
+    torch.testing.assert_close(ids, expected, rtol=0, atol=0)
+
+
 def test_shard_topk_writes_strided_rows_and_compiles_once(device: str) -> None:
     """Ids land in a row-strided view, and the row count never compiles."""
     scores = _scores(64, 62080, 64, 3, device)
@@ -84,9 +97,8 @@ def test_shard_topk_writes_strided_rows_and_compiles_once(device: str) -> None:
     torch.testing.assert_close(packed[:, 16:144], expected, rtol=0, atol=0)
     assert not packed[:, :16].any() and not packed[:, 144:].any()
     with assert_no_triton_compile(
-        gluon_impl.gluon_eagle4_shard_topk_hist_gfx950,
-        gluon_impl.gluon_eagle4_shard_topk_select_gfx950,
-        gluon_impl.gluon_eagle4_shard_topk_gfx950,
+        gluon_impl.gluon_eagle4_shard_topk_local_gfx950,
+        gluon_impl.gluon_eagle4_shard_topk_merge_gfx950,
     ):
         for rows in (1, 3, 17, 32, 64):
             eagle4_shard_topk(scores[:rows], 128, 62080, packed[:rows, 16:144])
