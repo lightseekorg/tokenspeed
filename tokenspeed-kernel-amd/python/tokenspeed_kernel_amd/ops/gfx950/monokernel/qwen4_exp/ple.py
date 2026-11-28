@@ -100,7 +100,10 @@ class Weights:
     gq: gl.tensor  # norm_query, the same
     gc: gl.tensor  # norm_conv, the same
     conv_w: gl.tensor  # depthwise conv weight, BF16 [WIDTH, 4]
-    table: gl.tensor  # n-gram embedding table, BF16 [rows, NGRAM_DIM]
+    # n-gram embedding table [rows, NGRAM_DIM]: BF16, or FP8 E4M3 whose
+    # values are row * table_scale
+    table: gl.tensor
+    table_scale: gl.tensor  # FP32 scale of an FP8 table (unused for BF16)
     multipliers: gl.tensor  # int64 [3], the n-gram hash multipliers
     sizes: gl.tensor  # int64 [NGRAM_HEADS], per-head vocabulary sizes
     offsets: gl.tensor  # int64 [NGRAM_HEADS], per-head table offsets
@@ -238,7 +241,7 @@ def projection_stage(mb, task, weights, step, STAGE: gl.constexpr):
             r % schedule.chain(mb.plan),
             e,
         )
-        xs += (gl.load(weights.table + ids, mask=used, other=0.0),)
+        xs += (_table_rows(weights, ids, used),)
     gl.amd.hint.sched_barrier()
     # Rows end in 32 bytes of padding (see bf16.load_rows).
     x_smem = gl.allocate_shared_memory(
@@ -252,6 +255,16 @@ def projection_stage(mb, task, weights, step, STAGE: gl.constexpr):
     mb.stamp(STAGE, trace.COMPUTED)
     mx.put_bf16_rows(mb, "pkv", task * 32, projs)
     mb.stamp(STAGE, trace.END)
+
+
+@gluon.jit
+def _table_rows(weights, ids, used):
+    """BF16 table values at ``ids``. An FP8 table's values dequantize as
+    TokenSpeed's device lookup does: ``bf16(float(value) * table_scale)``."""
+    raw = gl.load(weights.table + ids, mask=used, other=0.0)
+    if weights.table.dtype.element_ty != gl.bfloat16:
+        raw = (raw.to(gl.float32) * weights.table_scale).to(gl.bfloat16)
+    return raw
 
 
 @gluon.jit

@@ -112,6 +112,25 @@ def test_plan_row_copies_of_regions_follow_row_zero():
     assert plan.scratch_pairs == 3 * 64
 
 
+def test_plan_with_rows_keeps_each_rows_regions():
+    """A plan for some of a launch's rows keeps the stages and the regions'
+    offsets and row stride, so its mailbox at a row addresses that row's
+    regions; its rows are tokens of their own (chain 1)."""
+    plan = Plan(
+        grid=8,
+        stages=(Stage("s", 1, 0, writes=("a", "b")),),
+        regions=(("a", 40), ("b", 8)),
+        rows=8,
+        chain=4,
+    )
+    part = plan.with_rows(3)
+    assert (part.rows, part.chain) == (3, 1)
+    assert part.stages == plan.stages and part.row_pairs == plan.row_pairs
+    assert part.offset("b") == plan.offset("b")
+    assert part.key != plan.key
+    assert plan.with_rows(3) is part
+
+
 def _chain_plan() -> Plan:
     return Plan(
         grid=8,

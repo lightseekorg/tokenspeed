@@ -114,6 +114,17 @@ attempt slots. Healthy holders can continue serving requests. An unknown DMA
 retirement stays frozen through its quarantine interval and cannot enter this
 retry path until `TargetRetired` and `RELEASE(Abort)` are emitted.
 
+A reader with frozen versioned Device targets pauses new peer reads across
+holders. The scheduler suppresses new lookups and discards answered but
+unreserved peer hits before admission, recording `reader_retirement_pending`.
+Requests continue through local cache matching and prefill with the remaining
+capacity. In-flight reads and holder serving keep their existing lifetimes.
+Only retirement of the last frozen target enables peer reads for new requests
+again; cancelling a request or waiting longer does not release its DMA pages.
+This prevents further landings from consuming the cache while a failed reader
+transport drains. It cannot restore capacity already held by a transfer that
+never retires or recover a failed device.
+
 ## Two worlds: logical tokens vs. physical storage
 
 ### Logical world (token units, storage-agnostic)
@@ -3377,7 +3388,7 @@ Verified end to end for this round: DeepSeek V3.2, R1, and V4-Flash, each
 **Configuration and placement.** `ServerArgs.resolve_kv_offload()` normalizes
 `--kv-offload-config`: target attention layer IDs, per-request hot capacity,
 Host GiB budget and prefetch overlap. The plugin recipe interprets model
-options, including the explicit `kv_offload_window_ring` HF override, and
+options, including `kv_offload_window_ring` from the flat `extra_server_args`, and
 declares a `KVOffloadPolicy` with field IDs, verify width, reserved/ring rows
 and selection dependencies. The common `CacheRecipe.setup()` binds request
 slots and the extend chunk bound. Recipes without offloading support reject

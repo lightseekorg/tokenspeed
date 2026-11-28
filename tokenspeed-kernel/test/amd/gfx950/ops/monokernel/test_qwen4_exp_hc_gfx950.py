@@ -101,7 +101,7 @@ def _bf16(x: torch.Tensor) -> torch.Tensor:
 @pytest.mark.parametrize(
     "mlp, rows, one_row",
     [(False, 1, False), (False, 1, True), (False, 3, False), (True, 1, False)]
-    + [(True, 4, False)],
+    + [(True, 4, False), (True, 8, False), (False, 6, False)],
 )
 def test_mixer_matches_tokenspeed_math(mlp, rows, one_row):
     generator = torch.Generator().manual_seed(rows)
