@@ -261,6 +261,65 @@ def test_tree_update_skips_padded_entries():
     assert bool(torch.isfinite(out[1].float()).all())
 
 
+def test_tree_update_compiles_once_per_tile_across_batch_sizes():
+    """The batch only picks between a narrow and a wide feature tile; every
+    batch size reuses one of the two binaries, and both tiles give a request
+    the same bits as decoding it alone."""
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.ops.conv._triton.causal_conv1d import (
+        _causal_conv1d_tree_update_kernel,
+    )
+
+    torch.manual_seed(0)
+    dim, width, t, max_bs = 1000, 4, 16, 33
+    weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(max_bs, t, dim, device="cuda", dtype=torch.bfloat16)
+    initial = torch.randn(
+        max_bs * (t + 1), dim, width - 1, device="cuda", dtype=torch.bfloat16
+    )
+    parents = torch.full((max_bs, t), -1, dtype=torch.int32)
+    for i in range(1, t):
+        parents[:, i] = torch.randint(-1 if i < 3 else 0, i, (max_bs,))
+    parents = parents.cuda()
+
+    def run(rows):
+        conv_state = initial.clone()
+        base = (rows * (t + 1)).to(torch.int32)
+        out = causal_conv1d_update(
+            x[rows].transpose(1, 2),
+            conv_state,
+            weight,
+            bias,
+            activation="silu",
+            conv_state_indices=base,
+            output_state_indices=base[:, None]
+            + 1
+            + torch.arange(t, device="cuda", dtype=torch.int32),
+            parent_indices=parents[rows].contiguous(),
+        )
+        return out, conv_state
+
+    def check(bs):
+        rows = torch.arange(bs, device="cuda")
+        out, state = run(rows)
+        alone, alone_state = run(rows[-1:])
+        assert torch.equal(out[-1:], alone)
+        written = slice((bs - 1) * (t + 1) + 1, bs * (t + 1))
+        assert torch.equal(state[written], alone_state[written])
+
+    check(5)  # compiles both tiles: 5 requests wide, the lone request narrow
+    with patch.object(
+        _causal_conv1d_tree_update_kernel,
+        "_do_compile",
+        wraps=_causal_conv1d_tree_update_kernel._do_compile,
+    ) as compiles:
+        for bs in (2, 3, 4, 16, 17, 32, 33):
+            check(bs)
+    assert compiles.call_count == 0
+
+
 def test_decode_update_compiles_once_across_batch_sizes():
     """The decode batch changes every round; it must not key a new binary."""
     from unittest.mock import patch
