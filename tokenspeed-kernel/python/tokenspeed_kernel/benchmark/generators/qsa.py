@@ -51,8 +51,18 @@ class _QsaModelProfile:
 
 
 # Per-rank QSA geometry: Qwen3.8-Flash-Next has 24 query / 2 KV heads of 256
-# dims split over TP2, and selects 2051 KV slots per query row.
+# dims, unsplit at TP1 and halved at TP2. Its indexer budget of 2048 tokens
+# is 512 blocks of 4 (the indexer's key compression), so a query row attends
+# at most 2051 KV slots, its causal tail included.
 _MODEL_PROFILES = {
+    "qwen38_flash_tp1": _QsaModelProfile(
+        num_q_heads=24,
+        num_kv_heads=2,
+        head_dim=256,
+        block_size=4,
+        block_topk=512,
+        page_size=64,
+    ),
     "qwen38_flash_tp2": _QsaModelProfile(
         num_q_heads=12,
         num_kv_heads=1,
@@ -123,10 +133,13 @@ def prepare_qsa_sparse_attention(
 ) -> PreparedBenchmark:
     """Prepare one QSA sparse attention call over selected KV slots.
 
-    ``phase="decode"`` runs ``batch`` requests of ``q_len`` query rows (1 for
-    a draft step, the MTP width for verify) at a context of
-    ``context_tokens``. ``phase="prefill"`` runs ``batch`` prompts of
-    ``context_tokens`` rows each, every row attending to its own prefix.
+    Every request holds ``context_tokens`` of KV and its query rows are the
+    last positions of that context, each attending to its own prefix.
+    ``phase="decode"`` runs ``batch`` requests of ``q_len`` rows (1 for a
+    draft step, the MTP width for verify) as one uniform-width decode call.
+    ``phase="prefill"`` runs ``batch`` prompts of ``extend_tokens`` new rows
+    as a ragged extend; ``context_tokens - extend_tokens`` earlier tokens are
+    the prompt's cached prefix (0 for a prompt prefilled in one chunk).
     """
 
     _ = platform
@@ -155,8 +168,10 @@ def prepare_qsa_sparse_attention(
         positions = torch.arange(context - q_len + 1, context + 1, device="cuda")
         max_seqlen_q: int | None = q_len
     elif phase == "prefill":
-        q_len = context
-        positions = torch.arange(1, context + 1, device="cuda")
+        q_len = _positive(parameters, "extend_tokens")
+        if q_len > context:
+            raise _invalid("QSA extend_tokens must not exceed context_tokens")
+        positions = torch.arange(context - q_len + 1, context + 1, device="cuda")
         max_seqlen_q = None
     else:
         raise _invalid("QSA phase must be decode or prefill")
@@ -282,7 +297,7 @@ def prepare_qsa_sparse_attention(
             "model_profile": model_profile,
             "phase": phase,
             "batch": batch,
-            "q_len": q_len,
+            "q_len" if phase == "decode" else "extend_tokens": q_len,
             "context_tokens": context,
             "dtype": "bfloat16",
             "kv_dtype": kv_dtype_name,

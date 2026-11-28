@@ -203,9 +203,10 @@ def test_hyperconnection_mix_generator_selection_matches_operation_api(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("model_profile", ["qwen38_flash_tp1", "qwen38_flash_tp2"])
 @pytest.mark.parametrize("inject", [True, False])
 def test_hyperconnection_mix_generator_invokes_with_padded_storage(
-    monkeypatch: pytest.MonkeyPatch, inject: bool
+    monkeypatch: pytest.MonkeyPatch, inject: bool, model_profile: str
 ) -> None:
     from tokenspeed_kernel.ops import residual as residual_ops
 
@@ -223,7 +224,7 @@ def test_hyperconnection_mix_generator_invokes_with_padded_storage(
     )
     request = _request(
         "hyperconnection_mix",
-        model_profile="qwen38_flash_tp2",
+        model_profile=model_profile,
         tokens=tokens,
         hc_count=hc_count,
         hidden_size=hidden_size,
