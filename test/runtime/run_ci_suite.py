@@ -4,103 +4,33 @@ TokenSpeed Runtime CI Suite Runner
 
 Uses AST-based CI registration system (ci_system.ci_register) to collect, filter,
 partition, and run test files. Test files register themselves via marker
-functions like `register_cuda_ci(est_time=300, suite="runtime-1gpu")`.
+functions like `register_cuda_ci(est_time=300, suite="runtime-1gpu")`. The
+plan of which files run lives in ci_system/runtime_suite.py, which the CI scan
+also uses to skip invocations that would run none.
 
 Usage:
     python run_ci_suite.py --device cuda --suite runtime-1gpu
     python run_ci_suite.py --device cuda --suite runtime-1gpu --auto-partition-id 0 --auto-partition-size 2
 """
 
-import argparse
-import fnmatch
-import glob
 import os
 import sys
-from dataclasses import replace
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 # Add test directory to path for importing CI system helpers.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from ci_system.ci_register import (
-    CIRegistry,
-    DeviceBackend,
-    auto_partition,
-    collect_tests,
-)
+from ci_system.ci_register import CIRegistry
 from ci_system.ci_utils import run_unittest_files
-from ci_system.runtime_test_selection import CHANGED_PATHS_ENV, select_runtime_tests
-
-DEVICE_MAPPING = {
-    "cuda": DeviceBackend.CUDA,
-}
-
-# Per-commit test suites (run on every PR)
-PER_COMMIT_SUITES = {
-    DeviceBackend.CUDA: [
-        "runtime-1gpu",
-        "runtime-2gpu",
-        "runtime-prefix-cache-e2e",
-    ],
-}
-
-
-def _runner_label_skip_reason(test: CIRegistry, runner_label: str) -> Optional[str]:
-    """Return a non-None skip reason if `test` should be skipped on the
-    runner identified by `runner_label`. None means the test is allowed.
-    """
-    if not test.disabled_on_runners or not runner_label:
-        return None
-    matched = [
-        pat
-        for pat in test.disabled_on_runners
-        if fnmatch.fnmatchcase(runner_label, pat)
-    ]
-    if not matched:
-        return None
-    reason = test.disabled_on_runners_reason or (
-        f"disabled on runner matching {matched[0]!r}"
-    )
-    return f"{reason} [runner={runner_label}, pattern={matched[0]}]"
-
-
-def filter_tests(
-    ci_tests: List[CIRegistry],
-    device: DeviceBackend,
-    suite: str,
-    runner_label: Optional[str] = None,
-) -> tuple[List[CIRegistry], List[CIRegistry]]:
-    """Filter tests by device backend, suite name, and (optionally) runner label.
-
-    Returns:
-        tuple: (enabled_tests, skipped_tests)
-    """
-    ci_tests = [t for t in ci_tests if t.backend == device and t.suite == suite]
-
-    valid_suites = PER_COMMIT_SUITES.get(device, [])
-
-    if suite not in valid_suites:
-        print(f"Warning: Unknown suite {suite} for device {device.name}")
-
-    if runner_label is None:
-        runner_label = os.environ.get("CI_RUNNER_LABEL", "")
-
-    enabled_tests: List[CIRegistry] = []
-    skipped_tests: List[CIRegistry] = []
-    for t in ci_tests:
-        if t.disabled is not None:
-            skipped_tests.append(t)
-            continue
-        per_runner_reason = _runner_label_skip_reason(t, runner_label)
-        if per_runner_reason is not None:
-            # Surface the reason via the same `disabled` field so that
-            # pretty_print_tests / step summary downstream do not need to
-            # know about disabled_on_runners.
-            skipped_tests.append(replace(t, disabled=per_runner_reason))
-            continue
-        enabled_tests.append(t)
-
-    return enabled_tests, skipped_tests
+from ci_system.runtime_suite import (
+    DEVICE_MAPPING,
+    collect_runtime_tests,
+    parse_changed_paths,
+    parse_suite_arguments,
+    plan_suite,
+    tests_reached,
+)
+from ci_system.runtime_test_selection import CHANGED_PATHS_ENV
 
 
 def pretty_print_tests(
@@ -142,49 +72,22 @@ def pretty_print_tests(
 
 def run_a_suite(args):
     """Collect, filter, partition, and run a test suite."""
-    device = DEVICE_MAPPING[args.device]
-    suite = args.suite
-    auto_partition_id = args.auto_partition_id
-    auto_partition_size = args.auto_partition_size
-
-    # Scan all test files under test/runtime/
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    files = [
-        f
-        for f in glob.glob(os.path.join(base_dir, "**", "*.py"), recursive=True)
-        if not f.endswith("/conftest.py")
-        and not f.endswith("/__init__.py")
-        and not f.endswith("/run_ci_suite.py")
-    ]
-
+    repo_root = Path(__file__).resolve().parents[2]
     # Non-strict: files without CI registration are skipped.
-    sanity_check = False
-    all_tests = collect_tests(files, sanity_check=sanity_check)
-    ci_tests, skipped_tests = filter_tests(all_tests, device, suite)
-
+    registered = collect_runtime_tests(repo_root)
     # On pull requests CI lists the changed paths; run only the files they reach.
-    changed_paths = [
-        line.strip()
-        for line in os.environ.get(CHANGED_PATHS_ENV, "").splitlines()
-        if line.strip()
-    ]
-    if changed_paths:
-        repo_root = os.path.dirname(os.path.dirname(base_dir))
-        selected = select_runtime_tests(
-            [os.path.relpath(test.filename, repo_root) for test in ci_tests],
-            changed_paths,
-            Path(repo_root),
-        )
-        if selected is not None:
-            ci_tests = [
-                test
-                for test in ci_tests
-                if os.path.relpath(test.filename, repo_root) in selected
-            ]
-            print(f"Changed paths select {len(ci_tests)} test files.", flush=True)
-
-    if auto_partition_size:
-        ci_tests = auto_partition(ci_tests, auto_partition_id, auto_partition_size)
+    reached = tests_reached(
+        registered,
+        parse_changed_paths(os.environ.get(CHANGED_PATHS_ENV, "")),
+        repo_root,
+    )
+    plan = plan_suite(
+        registered, args, os.environ.get("CI_RUNNER_LABEL", ""), reached, repo_root
+    )
+    if plan.changed_selection is not None:
+        print(f"Changed paths select {plan.changed_selection} test files.", flush=True)
+    ci_tests = plan.tests
+    skipped_tests = plan.skipped
 
     pretty_print_tests(args, ci_tests, skipped_tests)
 
@@ -208,83 +111,7 @@ def run_a_suite(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TokenSpeed Runtime CI Suite Runner")
-    parser.add_argument(
-        "--device",
-        type=str,
-        choices=DEVICE_MAPPING.keys(),
-        required=True,
-        help="Device backend to run tests on.",
-    )
-    parser.add_argument(
-        "--suite",
-        type=str,
-        required=True,
-        help="Test suite to run.",
-    )
-    parser.add_argument(
-        "--timeout-per-file",
-        type=int,
-        default=1800,
-        help="The time limit for running one file in seconds (default: 1800).",
-    )
-    parser.add_argument(
-        "--continue-on-error",
-        action="store_true",
-        default=False,
-        help="Continue running remaining tests even if one fails.",
-    )
-    parser.add_argument(
-        "--auto-partition-id",
-        type=int,
-        help="Use auto load balancing. The part id.",
-    )
-    parser.add_argument(
-        "--auto-partition-size",
-        type=int,
-        help="Use auto load balancing. The number of parts.",
-    )
-    parser.add_argument(
-        "--enable-retry",
-        action="store_true",
-        default=False,
-        help="Enable smart retry for accuracy/performance assertion failures.",
-    )
-    parser.add_argument(
-        "--max-attempts",
-        type=int,
-        default=2,
-        help="Maximum number of attempts per file including initial run (default: 2).",
-    )
-    parser.add_argument(
-        "--retry-wait-seconds",
-        type=int,
-        default=60,
-        help="Seconds to wait between retries (default: 60).",
-    )
-    parser.add_argument(
-        "--retry-timeout-increase",
-        type=int,
-        default=600,
-        help="Additional timeout in seconds when retry is enabled (default: 600).",
-    )
-    args = parser.parse_args()
-
-    # Validate auto-partition arguments
-    if (args.auto_partition_id is not None) != (args.auto_partition_size is not None):
-        parser.error(
-            "--auto-partition-id and --auto-partition-size must be specified together."
-        )
-    if args.auto_partition_size is not None:
-        if args.auto_partition_size <= 0:
-            parser.error("--auto-partition-size must be positive.")
-        if not 0 <= args.auto_partition_id < args.auto_partition_size:
-            parser.error(
-                f"--auto-partition-id must be in range [0, {args.auto_partition_size}), "
-                f"but got {args.auto_partition_id}"
-            )
-
-    exit_code = run_a_suite(args)
+    exit_code = run_a_suite(parse_suite_arguments(sys.argv[1:]))
     sys.exit(exit_code)
 
 

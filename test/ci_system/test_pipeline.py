@@ -1442,6 +1442,117 @@ def test_scan_full_tests_request_skips_every_narrowing(tmp_path, capsys, monkeyp
     ] == [("kernel", None), ("other", None)]
 
 
+_RUN_SUITE = "python3 test/runtime/run_ci_suite.py --device cuda --suite"
+_RUNTIME_FILES = {
+    "test/runtime/test_long.py": 'register_cuda_ci(est_time=100, suite="runtime-1gpu")\n',
+    "test/runtime/test_short.py": 'register_cuda_ci(est_time=10, suite="runtime-1gpu")\n',
+    "test/runtime/test_pair.py": (
+        'register_cuda_ci(est_time=10, suite="runtime-2gpu", '
+        'disabled_on_runners=["h100-*"])\n'
+    ),
+    "test/runtime/test_pair_anywhere.py": (
+        'register_cuda_ci(est_time=10, suite="runtime-2gpu")\n'
+    ),
+    "test/runtime/helper.py": "",
+}
+# name: (runner labels, ut commands, changed_paths)
+_SUITE_TASKS = {
+    "part-i": (
+        ["h100-1gpu"],
+        [f"{_RUN_SUITE} runtime-1gpu --auto-partition-id 0 --auto-partition-size 2"],
+        True,
+    ),
+    "part-ii": (
+        ["h100-1gpu"],
+        [f"{_RUN_SUITE} runtime-1gpu --auto-partition-id 1 --auto-partition-size 2"],
+        True,
+    ),
+    "pair": (["h100-2gpu", "gb200-2gpu"], [f"{_RUN_SUITE} runtime-2gpu"], True),
+    # The scan cannot tell what the second command runs.
+    "cli": (
+        ["h100-1gpu"],
+        [f"{_RUN_SUITE} runtime-2gpu", "python3 -m pytest test/cli"],
+        True,
+    ),
+    "chained": (["h100-1gpu"], [f"{_RUN_SUITE} runtime-2gpu && echo done"], True),
+    # Without the changed paths the task runs the whole suite.
+    "unnarrowed": (["h100-1gpu"], [f"{_RUN_SUITE} runtime-2gpu"], False),
+}
+
+
+def _write_suite_repo(tmp_path: Path, tasks: dict) -> list[str]:
+    """Write the runtime test files and ``tasks``; return the scan arguments."""
+    for name, text in _RUNTIME_FILES.items():
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(text)
+    root = tmp_path / "test/ci"
+    root.mkdir(parents=True)
+    for name, (labels, commands, changed_paths) in tasks.items():
+        extra = "changed_paths: true\n" if changed_paths else ""
+        extra += "ut:\n  commands:\n"
+        extra += "".join(f"    - {command}\n" for command in commands)
+        _write_task_yaml(root, f"{name}.yaml", _default_body(name, labels, extra))
+    argv = ["scan", "--repo-root", str(tmp_path), "--trigger", "per-commit"]
+    return argv + ["--changed-files", str(tmp_path / "changed.txt")]
+
+
+@pytest.mark.parametrize(
+    ("changed", "dropped"),
+    [
+        # No runtime test can see a kernel test or Markdown.
+        (
+            "tokenspeed-kernel/test/ops/test_x.py\nREADME.md\n",
+            {
+                ("part-i", "h100-1gpu"),
+                ("part-ii", "h100-1gpu"),
+                ("pair", "h100-2gpu"),
+                ("pair", "gb200-2gpu"),
+            },
+        ),
+        # The partitions split the files the changes reach: one fills the first.
+        (
+            "test/runtime/test_short.py\n",
+            {("part-ii", "h100-1gpu"), ("pair", "h100-2gpu"), ("pair", "gb200-2gpu")},
+        ),
+        # The changed file is disabled on the H100 runner.
+        (
+            "test/runtime/test_pair.py\n",
+            {("part-i", "h100-1gpu"), ("part-ii", "h100-1gpu"), ("pair", "h100-2gpu")},
+        ),
+        # A helper or a runtime source can reach any test.
+        ("test/runtime/helper.py\n", set()),
+        ("python/tokenspeed/runtime/engine.py\n", set()),
+    ],
+)
+def test_scan_drops_runtime_suite_tasks_that_run_no_test(
+    changed, dropped, tmp_path, capsys, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    monkeypatch.delenv(pipeline.B200_RUNNER_LABEL_ENV, raising=False)
+    argv = _write_suite_repo(tmp_path, _SUITE_TASKS)
+    (tmp_path / "changed.txt").write_text(changed)
+    assert pipeline.main(argv) == 0
+    matrix = json.loads(capsys.readouterr().out)
+    every = {
+        (name, label)
+        for name, (labels, _, _) in _SUITE_TASKS.items()
+        for label in labels
+    }
+    assert {(e["name"], e["runner"]) for e in matrix["include"]} == every - dropped
+
+
+def test_scan_rejects_runtime_suite_arguments_the_task_would_reject(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv(pipeline.EXCLUDED_RUNNER_LABELS_ENV, raising=False)
+    monkeypatch.delenv(pipeline.B200_RUNNER_LABEL_ENV, raising=False)
+    command = f"{_RUN_SUITE} runtime-1gpu --auto-partition-id 2 --auto-partition-size 2"
+    argv = _write_suite_repo(tmp_path, {"bad": (["h100-1gpu"], [command], True)})
+    (tmp_path / "changed.txt").write_text("test/runtime/test_short.py\n")
+    with pytest.raises(SystemExit):
+        pipeline.main(argv)
+
+
 def test_validate_task_rejects_a_non_boolean_changed_paths(tmp_path):
     body = _default_body("ut-a", ["b300-1gpu"], extra="changed_paths: yes please\n")
     path = _write_task_yaml(tmp_path, "bad.yaml", body)

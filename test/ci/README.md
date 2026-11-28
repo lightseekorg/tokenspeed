@@ -245,6 +245,16 @@ test files:
 
 Any other change runs every test.
 
+The scan makes the same plan before any runner starts
+(`test/ci_system/runtime_suite.py`, which `run_ci_suite.py` uses too): for
+each runner of a task, it narrows the suite as above, drops the files disabled
+on that runner, and takes the partition. It drops the entries that would run no
+test file, so a pull request that changes only kernel tests starts no runtime
+suite, and one that reaches a single runtime test file starts only the
+partition that holds it. The scan reads only tasks whose every command is a
+plain `python3 test/runtime/run_ci_suite.py ...`; any other command, such as
+`pytest test/cli` in `ut-runtime-1gpu-part-i`, keeps the task.
+
 A reviewer can widen a pull request's tests. The `ci-full-tests` label turns
 off every changed-path narrowing (vendor path filtering, `ignore_changes`,
 and `changed_paths`), and each `CI-Extra-Changes: <path>` line in the description
