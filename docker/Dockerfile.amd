@@ -26,6 +26,19 @@ RUN python3 -m pip install --upgrade pip "setuptools<82" wheel && \
     python3 -m pip install --upgrade torch==2.14.0 torchvision==0.29.0 \
         --index-url https://download.pytorch.org/whl/rocm7.2
 
+# torch's bundled libdrm reads GPU names only from
+# /opt/amdgpu/share/libdrm/amdgpu.ids, which the base image lacks. Without it
+# torch.cuda.get_device_name() reports "AMD Radeon Graphics" on MI355X, and the
+# device_name= tuned GEMM file does not load. Link the copy torch ships, and
+# keep an existing file.
+RUN ids=/opt/amdgpu/share/libdrm/amdgpu.ids && \
+    if [ ! -e "${ids}" ]; then \
+        torch_ids="$(python3 -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent / "share/libdrm/amdgpu.ids")')" && \
+        test -f "${torch_ids}" && \
+        mkdir -p "$(dirname "${ids}")" && \
+        ln -sfn "${torch_ids}" "${ids}"; \
+    fi
+
 COPY . /workspace
 
 # Install every TokenSpeed package from this checkout. tokenspeed-kernel-amd
