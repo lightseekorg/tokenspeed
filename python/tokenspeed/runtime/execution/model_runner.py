@@ -424,6 +424,15 @@ class ModelRunner:
             world_size = int(obj.world_size)
             group_name = str(getattr(obj, "group_name", "weight_update_group"))
             backend = Backend(str(getattr(obj, "backend", "nccl")))
+            if backend == Backend.NCCL and pg_manager.single_rank_nccl_buffsize:
+                # NCCL fixed this process's staging-buffer size at world init.
+                logger.warning(
+                    f"Joining NCCL weight-update group {group_name!s} with the "
+                    f"one-rank NCCL_BUFFSIZE={pg_manager.single_rank_nccl_buffsize}: "
+                    "weight broadcasts stage through these small buffers. Set "
+                    "NCCL_BUFFSIZE when launching the server (e.g. 4194304, NCCL's "
+                    "default) for full weight-sync bandwidth."
+                )
             device = torch.device(f"cuda:{self.gpu_id}")
             torch.cuda.set_device(device)
 

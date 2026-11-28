@@ -409,6 +409,40 @@ def test_mapped_tables_lookup_local_ids(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_post_load_hooks_keep_offloaded_table_in_host_memory():
+    from tokenspeed.runtime.model_loader.loader import device_loading_context
+
+    lookup = ple_lookup.PLELookup(
+        _mapping_class()(rank=0, world_size=1),
+        vocab_size=4096,
+        ngram_heads=2,
+        head_dim=256,
+        storage_dtype=None,
+        output_dtype=torch.bfloat16,
+        offload=True,
+        table_layout="global_sharded",
+        enable_hot_cache=False,
+        prefix="",
+    )
+    table = lookup.ngram_embedding.weight
+    table.data.copy_(torch.randn(table.shape).to(table.dtype))
+    expected = table.detach().clone()
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+
+    # The post-load step wraps every module with a quant method in this context.
+    with device_loading_context(lookup.ngram_embedding, torch.device("cuda")):
+        assert lookup.ngram_embedding.weight.device.type == "cpu"
+
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() == allocated
+    assert lookup.ngram_embedding.weight is table
+    assert table.is_pinned()
+    torch.testing.assert_close(table, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 def test_host_lookup_stream_handoff(monkeypatch):
     monkeypatch.setenv("TOKENSPEED_PLE_HOST_CACHE_SLOTS", "512")
     tokens, heads, dim, vocab = 4, 16, 160, 256

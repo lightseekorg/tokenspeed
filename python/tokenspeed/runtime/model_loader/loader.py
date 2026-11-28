@@ -86,9 +86,12 @@ def device_loading_context(
 
     original_device_states: dict[str, torch.device] = {}
 
-    # Store original device states and move parameters to GPU if they're on CPU
+    # Store original device states and move parameters to GPU if they're on CPU.
+    # A ``host_resident`` parameter lives in host memory by design (an
+    # offloaded or mapped PLE table that kernels read in place); staging it
+    # through the device would copy it twice and strand a device segment.
     for name, p in module.named_parameters():
-        if p.device.type == "cpu" and not getattr(p, "ple_shared_storage", False):
+        if p.device.type == "cpu" and not getattr(p, "host_resident", False):
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)
         # Parameters already on target device are not touched
