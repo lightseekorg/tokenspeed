@@ -104,10 +104,11 @@ def rmsnorm_quantize_fp8_group32(
     eps: float,
     *,
     scale_layout: Literal["canonical", "swizzled", "packed"],
+    return_normalized: bool,
     override: str | None,
     solution: str | None,
     plan: KernelPlan | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Normalize BF16 [M,K] rows and quantize them with exact group-32 scales.
 
     Quantization preserves the 1e-4 amax floor and the BF16 normalization
@@ -123,12 +124,15 @@ def rmsnorm_quantize_fp8_group32(
             FlashInfer's F8_128x4 layout, which ``mm(prepacked_scales=True)``
             reads without repacking. ``"packed"`` is the MN-major int32 layout
             ``fp8_projection`` reads, and needs K divisible by 128.
+        return_normalized: When ``False``, omit allocating and writing the BF16
+            normalized tensor and return ``None`` in its slot.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
         plan: Optional initialization-time kernel plan.
 
     Returns:
-        BF16 normalized rows ``[M, K]``, E4M3 codes ``[M, K]`` and the scales:
+        BF16 normalized rows ``[M, K]`` (or ``None`` when ``return_normalized``
+        is ``False``), E4M3 codes ``[M, K]`` and the scales:
         canonical uint8 ``[M, K/32]``; swizzled 1-D uint8 F8_128x4 bytes for
         ``M`` rows padded to 128 and ``K/32`` scale columns padded to 4, the
         padding zero; or packed int32 ``[M, K/128]`` words, each four UE8M0
@@ -155,7 +159,13 @@ def rmsnorm_quantize_fp8_group32(
             override=override,
             solution=solution,
         )
-    return kernel(x, weight, eps, scale_layout=scale_layout)
+    return kernel(
+        x,
+        weight,
+        eps,
+        scale_layout=scale_layout,
+        return_normalized=return_normalized,
+    )
 
 
 def silu_and_mul_quantize_fp8_group32(

@@ -1657,6 +1657,7 @@ def _rmsnorm_fp8_group32_ue8m0(
     BLOCK: tl.constexpr,
     LAYOUT: tl.constexpr,
     PADDED_GROUPS: tl.constexpr,
+    RETURN_NORMALIZED: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     # Padding-only programs wait too: the scale buffer may reuse memory the
@@ -1672,8 +1673,9 @@ def _rmsnorm_fp8_group32_ue8m0(
         x = tl.load(X + row * X0 + col, col < K, 0).to(tl.float32)
         w = tl.load(W + col, col < K, 0).to(tl.float32)
         inv = tl.rsqrt(tl.sum(x * x, 0) / K + EPS)
-        normalized = (x * inv * w).to(N.dtype.element_ty)
-        tl.store(N + row * K + col, normalized, col < K)
+        normalized = (x * inv * w).to(X.dtype.element_ty)
+        if RETURN_NORMALIZED:
+            tl.store(N + row * K + col, normalized, col < K)
         values = tl.reshape(normalized.to(tl.float32), (BLOCK // 32, 32))
         raw = tl.maximum(tl.max(tl.abs(values), 1), 1e-4) * (1.0 / 448.0)
         bits = raw.to(tl.int32, bitcast=True)
@@ -1800,12 +1802,15 @@ def triton_rmsnorm_fp8_group32_ue8m0(
     eps: float,
     *,
     scale_layout: str,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return BF16 normalized rows, E4M3 codes and group-32 UE8M0 scales.
+    return_normalized: bool,
+) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
+    """Return BF16 normalized rows (or None), E4M3 codes and group-32 UE8M0 scales.
 
     The scales follow ``scale_layout``: ``"canonical"`` uint8 ``[M, K/32]``,
     ``"swizzled"`` the 1-D F8_128x4 bytes ``mm(prepacked_scales=True)`` reads,
     or ``"packed"`` int32 ``[M, K/128]`` words that ``fp8_projection`` reads.
+    When ``return_normalized`` is ``False``, the BF16 normalized tensor is
+    neither allocated nor stored, and ``None`` is returned in its slot.
     """
     if scale_layout not in ("canonical", "swizzled", "packed"):
         raise ValueError(f"unsupported group-32 scale layout: {scale_layout!r}")
@@ -1826,7 +1831,11 @@ def triton_rmsnorm_fp8_group32_ue8m0(
     if scale_layout == "packed" and x.shape[1] % 128:
         raise ValueError("Packed group-32 scales need K divisible by 128")
     m, k = x.shape
-    normalized = torch.empty_like(x, memory_format=torch.contiguous_format)
+    normalized = (
+        torch.empty_like(x, memory_format=torch.contiguous_format)
+        if return_normalized
+        else None
+    )
     quantized = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
     # Only the swizzled layout pads its row count; the kernel's padding-only
     # programs zero the bytes the GEMM reads past M and past K/32.
@@ -1847,10 +1856,10 @@ def triton_rmsnorm_fp8_group32_ue8m0(
         scales = torch.empty((m, k // 32), dtype=torch.uint8, device=x.device)
     if m:
         enable_pdl = pdl_enabled()
-        _rmsnorm_fp8_group32_ue8m0[(rows,)](
+        kernel_launcher(_rmsnorm_fp8_group32_ue8m0, (rows,))(
             x,
             weight,
-            normalized,
+            normalized if normalized is not None else x,
             quantized,
             scales,
             m,
@@ -1861,12 +1870,19 @@ def triton_rmsnorm_fp8_group32_ue8m0(
             triton.next_power_of_2(k),
             scale_layout,
             triton.next_power_of_2(triton.cdiv(k, 128) * 4),
+            return_normalized,
             enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
             **({"launch_pdl": True} if enable_pdl else {}),
         )
     return normalized, quantized, scales
+
+
+register_triton_warmup(
+    _rmsnorm_fp8_group32_ue8m0,
+    variants=({"RETURN_NORMALIZED": (False, True)},),
+)
 
 
 @triton.jit(do_not_specialize=["X0"])

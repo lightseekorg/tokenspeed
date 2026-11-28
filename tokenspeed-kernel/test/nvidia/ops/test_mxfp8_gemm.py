@@ -490,10 +490,10 @@ class TestPreparedMxfp8:
         x = torch.randn(rows, 1280, device="cuda", dtype=torch.bfloat16)
         norm = torch.randn(1280, device="cuda", dtype=torch.bfloat16)
         _, codes, scales = triton_rmsnorm_fp8_group32_ue8m0(
-            x, norm, 1e-6, scale_layout="canonical"
+            x, norm, 1e-6, scale_layout="canonical", return_normalized=False
         )
         _, swizzled_codes, swizzled = triton_rmsnorm_fp8_group32_ue8m0(
-            x, norm, 1e-6, scale_layout="swizzled"
+            x, norm, 1e-6, scale_layout="swizzled", return_normalized=False
         )
         arguments = dict(
             B_scales=prepared,
@@ -542,11 +542,13 @@ def test_rmsnorm_group32_quantization_replay(rows, hidden):
 
     x = torch.randn(rows, hidden + 32, device="cuda", dtype=torch.bfloat16)[:, :hidden]
     weight = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
-    triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6, scale_layout="canonical")
+    triton_rmsnorm_fp8_group32_ue8m0(
+        x, weight, 1e-6, scale_layout="canonical", return_normalized=True
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         normalized, codes, scales = triton_rmsnorm_fp8_group32_ue8m0(
-            x, weight, 1e-6, scale_layout="canonical"
+            x, weight, 1e-6, scale_layout="canonical", return_normalized=True
         )
     for magnitude in [1.0, 1e-8, 0.0]:
         x.normal_().mul_(magnitude)
@@ -577,7 +579,7 @@ def test_rmsnorm_group32_swizzled_scales(rows, hidden):
         x[-1, 32:64] = 1e-7
     weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
     normalized, codes, scales = triton_rmsnorm_fp8_group32_ue8m0(
-        x, weight, 1e-6, scale_layout="canonical"
+        x, weight, 1e-6, scale_layout="canonical", return_normalized=True
     )
     # Leave stale bytes for the swizzled scales to land on (several blocks, as
     # the outputs allocated before them may take the same size): the kernel
@@ -587,7 +589,9 @@ def test_rmsnorm_group32_swizzled_scales(rows, hidden):
         torch.full((count,), 0xFF, device="cuda", dtype=torch.uint8) for _ in range(4)
     ]
     del stale
-    actual = triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6, scale_layout="swizzled")
+    actual = triton_rmsnorm_fp8_group32_ue8m0(
+        x, weight, 1e-6, scale_layout="swizzled", return_normalized=True
+    )
     for got, expected in zip(actual[:2], (normalized, codes)):
         assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
     assert torch.equal(actual[2], swizzle_mxfp8_scale(scales, rows, hidden))
@@ -612,9 +616,11 @@ def test_rmsnorm_group32_packed_scales(rows, hidden):
         x[-1, 32:64] = 1e-7
     weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
     normalized, codes, canonical = triton_rmsnorm_fp8_group32_ue8m0(
-        x, weight, 1e-6, scale_layout="canonical"
+        x, weight, 1e-6, scale_layout="canonical", return_normalized=True
     )
-    actual = triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6, scale_layout="packed")
+    actual = triton_rmsnorm_fp8_group32_ue8m0(
+        x, weight, 1e-6, scale_layout="packed", return_normalized=True
+    )
     for got, expected in zip(actual[:2], (normalized, codes)):
         assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
     words = actual[2]
@@ -641,12 +647,18 @@ def test_rmsnorm_group32_quantization_dynamic_rows():
     weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
     layouts = ("canonical", "swizzled", "packed")
     for layout in layouts:
-        triton_rmsnorm_fp8_group32_ue8m0(x[:17], weight, 1e-6, scale_layout=layout)
+        triton_rmsnorm_fp8_group32_ue8m0(
+            x[:17], weight, 1e-6, scale_layout=layout, return_normalized=True
+        )
     with assert_no_triton_compile(_rmsnorm_fp8_group32_ue8m0):
         for layout in layouts:
             for rows in (1, 16, 33, 64, 128, 129):
                 triton_rmsnorm_fp8_group32_ue8m0(
-                    x[::2][:rows], weight, 1e-6, scale_layout=layout
+                    x[::2][:rows],
+                    weight,
+                    1e-6,
+                    scale_layout=layout,
+                    return_normalized=True,
                 )
 
 

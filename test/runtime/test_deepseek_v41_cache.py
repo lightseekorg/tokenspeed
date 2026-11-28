@@ -4954,3 +4954,209 @@ def test_prefill_indexer_native_architecture(monkeypatch, major, minor, expected
         assert not dsv41.prefill_indexer_batching_supported(132)
     finally:
         deep_gemm.is_native_indexer_available.cache_clear()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_prefill_direct_prefix_and_current_match_indirect_gathering(monkeypatch):
+    """Single-batch prefix/current direct workspace writes match indirect gather."""
+    backend = _backend("cuda", 2)
+    tables = _tables("cuda")
+    torch.manual_seed(71)
+
+    # First populate caches with initial chunk [9, 5] (no prefixes -> direct_current).
+    init_meta = _extend(backend, tables, [9, 5], [0, 0], [0, 0], [17, 11])
+    q_init = torch.randn(14, 2, 512, device="cuda", dtype=torch.bfloat16)
+    swa_init = torch.randn(14, 512, device="cuda", dtype=torch.bfloat16)
+    plan_init = backend._swa_query_plan(
+        init_meta.positions,
+        init_meta.request_indices,
+        ForwardMode.EXTEND,
+        query_shard=None,
+    )
+    layout_init = backend._prefill_layout(plan_init, -1, ForwardMode.EXTEND)
+    assert layout_init.prefix_slots.numel() == 0
+    assert len(layout_init.batches) == 1
+    assert layout_init.batches[0].direct_current == (14, 0, 14)
+
+    backend.forward_v41(
+        q_init,
+        swa_init,
+        layer_id=0,
+        positions=init_meta.positions,
+        request_indices=init_meta.request_indices,
+        forward_mode=ForwardMode.EXTEND,
+        index_q=None,
+        index_weights=None,
+        attn_sink=torch.zeros(2, device="cuda", dtype=torch.float32),
+        softmax_scale=512**-0.5,
+        index_process_group=None,
+        swa_rope_cache=None,
+        swa_norm_weight=None,
+        swa_norm_eps=0.0,
+        fused_decode_groups=None,
+        key_rows=None,
+    )
+
+    # Continue both requests with prefixes [9, 5] and new lengths [8, 6].
+    cont_meta = _extend(backend, tables, [8, 6], [9, 5], [0, 0], _final([8, 6], [9, 5]))
+    q_cont = torch.randn(14, 2, 512, device="cuda", dtype=torch.bfloat16)
+    swa_cont = torch.randn(14, 512, device="cuda", dtype=torch.bfloat16)
+    plan_cont = backend._swa_query_plan(
+        cont_meta.positions,
+        cont_meta.request_indices,
+        ForwardMode.EXTEND,
+        query_shard=None,
+    )
+    layout_cont = backend._prefill_layout(plan_cont, -1, ForwardMode.EXTEND)
+    assert len(layout_cont.batches) == 1
+    assert len(layout_cont.batches[0].prefix_spans) == 2
+    assert layout_cont.batches[0].direct_current is None
+
+    # Compare direct prefix gather against forced multi-batch indirect gather.
+    saved_swa = backend.cache_pool.swa(0).clone()
+    gather_outs = []
+    real_gather = dsv41.cache_gather
+
+    def spy_gather(cache, slots, fmt, out):
+        gather_outs.append(out is not None)
+        return real_gather(cache, slots, fmt, out)
+
+    monkeypatch.setattr(dsv41, "cache_gather", spy_gather)
+    orig_rows = backend._prefill_kv_rows
+    assert orig_rows >= 28
+    backend._prefill_layouts.clear()
+    direct_out = backend.forward_v41(
+        q_cont,
+        swa_cont,
+        layer_id=0,
+        positions=cont_meta.positions,
+        request_indices=cont_meta.request_indices,
+        forward_mode=ForwardMode.EXTEND,
+        index_q=None,
+        index_weights=None,
+        attn_sink=torch.zeros(2, device="cuda", dtype=torch.float32),
+        softmax_scale=512**-0.5,
+        index_process_group=None,
+        swa_rope_cache=None,
+        swa_norm_weight=None,
+        swa_norm_eps=0.0,
+        fused_decode_groups=None,
+        key_rows=None,
+    )
+    assert gather_outs and all(gather_outs)
+
+    backend.cache_pool.swa(0).copy_(saved_swa)
+    backend._prefill_layouts.clear()
+    backend._prefill_kv_rows = 20  # Forces 2 batches -> generic indirect gather.
+    indirect_out = backend.forward_v41(
+        q_cont,
+        swa_cont,
+        layer_id=0,
+        positions=cont_meta.positions,
+        request_indices=cont_meta.request_indices,
+        forward_mode=ForwardMode.EXTEND,
+        index_q=None,
+        index_weights=None,
+        attn_sink=torch.zeros(2, device="cuda", dtype=torch.float32),
+        softmax_scale=512**-0.5,
+        index_process_group=None,
+        swa_rope_cache=None,
+        swa_norm_weight=None,
+        swa_norm_eps=0.0,
+        fused_decode_groups=None,
+        key_rows=None,
+    )
+    torch.testing.assert_close(direct_out, indirect_out, rtol=0, atol=0)
+
+    # Single-request continuation enables BOTH direct_prefix and direct_current.
+    backend.cache_pool.swa(0).copy_(saved_swa)
+    backend._prefill_layouts.clear()
+    backend._prefill_kv_rows = orig_rows
+    single_meta = _extend(backend, tables, [8], [9], [0], [17])
+    plan_single = backend._swa_query_plan(
+        single_meta.positions,
+        single_meta.request_indices,
+        ForwardMode.EXTEND,
+        query_shard=None,
+    )
+    layout_single = backend._prefill_layout(plan_single, -1, ForwardMode.EXTEND)
+    assert len(layout_single.batches[0].prefix_spans) == 1
+    assert layout_single.batches[0].direct_current == (8, 9, 17)
+    direct_single = backend.forward_v41(
+        q_cont[:8],
+        swa_cont[:8],
+        layer_id=0,
+        positions=single_meta.positions,
+        request_indices=single_meta.request_indices,
+        forward_mode=ForwardMode.EXTEND,
+        index_q=None,
+        index_weights=None,
+        attn_sink=torch.zeros(2, device="cuda", dtype=torch.float32),
+        softmax_scale=512**-0.5,
+        index_process_group=None,
+        swa_rope_cache=None,
+        swa_norm_weight=None,
+        swa_norm_eps=0.0,
+        fused_decode_groups=None,
+        key_rows=None,
+    )
+    torch.testing.assert_close(direct_single, indirect_out[:8], rtol=0, atol=0)
+
+    # Also cover swa_rope_scatter(..., direct_current_slice) with direct prefix.
+    rope_cache = torch.cat(
+        (torch.ones(64, 32, device="cuda"), torch.zeros(64, 32, device="cuda")), dim=1
+    )
+    norm_weight = torch.ones(512, device="cuda", dtype=torch.bfloat16)
+    backend.cache_pool.swa(0).copy_(saved_swa)
+    backend._prefill_layouts.clear()
+    backend._prefill_kv_rows = orig_rows
+    direct_rope_out = backend.forward_v41(
+        q_cont[:8],
+        swa_cont[:8],
+        layer_id=0,
+        positions=single_meta.positions,
+        request_indices=single_meta.request_indices,
+        forward_mode=ForwardMode.EXTEND,
+        index_q=None,
+        index_weights=None,
+        attn_sink=torch.zeros(2, device="cuda", dtype=torch.float32),
+        softmax_scale=512**-0.5,
+        index_process_group=None,
+        swa_rope_cache=rope_cache,
+        swa_norm_weight=norm_weight,
+        swa_norm_eps=1e-6,
+        fused_decode_groups=None,
+        key_rows=None,
+    )
+    direct_rope_swa = backend.cache_pool.swa(0).clone()
+
+    backend.cache_pool.swa(0).copy_(saved_swa)
+    backend._prefill_layouts.clear()
+    backend._prefill_kv_rows = (
+        18  # Two-request batch forces multi-batch indirect gather.
+    )
+    indirect_rope_meta = _extend(
+        backend, tables, [8, 1], [9, 1], [0, 0], _final([8, 1], [9, 1])
+    )
+    indirect_rope_out = backend.forward_v41(
+        torch.cat((q_cont[:8], q_cont[8:9]), dim=0),
+        torch.cat((swa_cont[:8], swa_cont[8:9]), dim=0),
+        layer_id=0,
+        positions=indirect_rope_meta.positions,
+        request_indices=indirect_rope_meta.request_indices,
+        forward_mode=ForwardMode.EXTEND,
+        index_q=None,
+        index_weights=None,
+        attn_sink=torch.zeros(2, device="cuda", dtype=torch.float32),
+        softmax_scale=512**-0.5,
+        index_process_group=None,
+        swa_rope_cache=rope_cache,
+        swa_norm_weight=norm_weight,
+        swa_norm_eps=1e-6,
+        fused_decode_groups=None,
+        key_rows=None,
+    )
+    torch.testing.assert_close(direct_rope_out, indirect_rope_out[:8], rtol=0, atol=0)
+    torch.testing.assert_close(
+        backend.cache_pool.swa(0)[1:5], direct_rope_swa[1:5], rtol=0, atol=0
+    )

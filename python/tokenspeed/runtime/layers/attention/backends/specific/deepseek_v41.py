@@ -277,6 +277,10 @@ class V41PrefillBatch:
     swa_indices: torch.Tensor
     # [queries] first workspace row of each query's owner history.
     history_base: torch.Tensor
+    # Contiguous (slots, dst_start, dst_stop) per active request with prefix slots.
+    prefix_spans: tuple[tuple[torch.Tensor, int, int], ...]
+    # (expected_rows, dst_start, dst_stop) when all current rows write one slice.
+    direct_current: tuple[int, int, int] | None
 
 
 @dataclass
@@ -2344,6 +2348,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         prefix_source, prefix_target = [], []
         current_source, current_target = [], []
         history_start, swa_start = 0, history_rows
+        prefix_spans = []
+        current_contiguous = True
+        current_src_next = 0
+        current_dst_start: int | None = None
+        current_dst_end: int | None = None
         for request_plan, prefix_offset, current, history in entries:
             histories.append((request_plan, history_start, history))
             prefix_count = request_plan.prefix_slots.numel()
@@ -2351,6 +2360,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             queries = self._prefill_rows(request_plan.rows).numel()
             if queries:
                 # Requests without local queries only join history gathers.
+                if prefix_count:
+                    prefix_spans.append(
+                        (
+                            request_plan.prefix_slots,
+                            swa_start,
+                            swa_start + prefix_count,
+                        )
+                    )
                 prefix_source.append(
                     torch.arange(
                         prefix_offset, prefix_offset + prefix_count, device=device
@@ -2359,6 +2376,28 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 prefix_target.append(
                     torch.arange(swa_start, swa_start + prefix_count, device=device)
                 )
+                src_rows = (
+                    request_plan.current_rows
+                    if request_plan.current_rows is not None
+                    else request_plan.rows
+                )
+                if (
+                    current_contiguous
+                    and isinstance(src_rows, slice)
+                    and src_rows.step is None
+                    and src_rows.start == current_src_next
+                ):
+                    current_src_next = src_rows.stop
+                    req_cur_start = swa_start + prefix_count
+                    req_cur_end = swa_start + swa_count
+                    if current_dst_start is None:
+                        current_dst_start, current_dst_end = req_cur_start, req_cur_end
+                    elif req_cur_start == current_dst_end:
+                        current_dst_end = req_cur_end
+                    else:
+                        current_contiguous = False
+                else:
+                    current_contiguous = False
                 current_source.append(current)
                 current_target.append(
                     torch.arange(
@@ -2377,6 +2416,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 swa_start += swa_count
             history_start += history
         empty = torch.empty(0, dtype=torch.int64, device=device)
+        direct_current = (
+            (current_src_next, current_dst_start, current_dst_end)
+            if current_contiguous and current_dst_start is not None
+            else None
+        )
 
         def joined(parts):
             return torch.cat(parts) if parts else empty
@@ -2396,6 +2440,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 else torch.empty((0, V41_WINDOW_SIZE), dtype=torch.int32, device=device)
             ),
             joined(base_parts),
+            tuple(prefix_spans),
+            direct_current,
         )
 
     def _prefill_rows(self, rows) -> torch.Tensor:
@@ -2859,11 +2905,53 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # Quantize current rows exactly as cache storage, without publishing them
         # until every request has read its old sliding prefix.
         layout = self._prefill_layout(plan, owner, forward_mode)
-        prefixes = dsv41.cache_gather(cache, layout.prefix_slots, self.swa_format, None)
-        if swa_rope_cache is None:
-            current = dsv41.cache_unpack(
-                dsv41.cache_pack(swa_kv, self.swa_format, None), self.swa_format, None
+        single_batch = layout.batches[0] if len(layout.batches) == 1 else None
+        # Read old prefixes directly into workspace before swa_rope_scatter when
+        # one batch holds the step and only a few requests carry prefixes.
+        if layout.prefix_slots.numel() == 0:
+            prefixes = None
+        elif single_batch is not None and len(single_batch.prefix_spans) <= 4:
+            for prefix_slots, dst_start, dst_stop in single_batch.prefix_spans:
+                dsv41.cache_gather(
+                    cache,
+                    prefix_slots,
+                    self.swa_format,
+                    self._prefill_kv[dst_start:dst_stop],
+                )
+            prefixes = None
+        else:
+            prefixes = dsv41.cache_gather(
+                cache, layout.prefix_slots, self.swa_format, None
             )
+        direct_current_slice = (
+            self._prefill_kv[
+                single_batch.direct_current[1] : single_batch.direct_current[2]
+            ]
+            if single_batch is not None
+            and single_batch.direct_current is not None
+            and swa_kv.shape[0] == single_batch.direct_current[0]
+            else None
+        )
+        if swa_rope_cache is None:
+            packed = dsv41.cache_pack(swa_kv, self.swa_format, None)
+            if direct_current_slice is not None:
+                dsv41.cache_unpack(packed, self.swa_format, direct_current_slice)
+                current = None
+            else:
+                current = dsv41.cache_unpack(packed, self.swa_format, None)
+        elif direct_current_slice is not None:
+            dsv41.swa_rope_scatter(
+                swa_kv,
+                source_positions,
+                swa_rope_cache,
+                cache,
+                locations,
+                self.swa_format,
+                direct_current_slice,
+                swa_norm_weight,
+                swa_norm_eps,
+            )
+            current = None
         else:
             current = torch.empty_like(swa_kv)
             dsv41.swa_rope_scatter(
@@ -2923,13 +3011,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             # Mark the workspace as holding this batch only once its histories
             # are complete.
             self._prefill_kv_batch = None
-            if batch.prefix_target.numel():
+            if prefixes is not None and batch.prefix_target.numel():
                 workspace.index_copy_(
                     0,
                     batch.prefix_target,
                     prefixes.index_select(0, batch.prefix_source),
                 )
-            if batch.current_target.numel():
+            if current is not None and batch.current_target.numel():
                 workspace.index_copy_(
                     0,
                     batch.current_target,

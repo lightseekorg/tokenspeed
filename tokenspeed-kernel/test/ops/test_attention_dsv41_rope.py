@@ -503,6 +503,68 @@ def test_fused_rope_launches_reuse_compilation_across_token_counts():
                 global_keys(tokens)
 
 
+def test_index_query_rope_reuses_compilation_across_weight_strides():
+    """Fused wkv/weights projections pass strided weight slices; stride W0 and
+    unaligned weight views must reuse the warm kernel specialization."""
+    from tokenspeed_kernel.ops.attention.dsv41._triton import rope
+    from utils import assert_no_triton_compile
+
+    torch.manual_seed(883)
+    table = _table("cuda")
+    scale = 0.023456789
+
+    def make_weights(tokens, layout):
+        if layout == "contiguous":
+            return torch.randn(tokens, 32, device="cuda", dtype=torch.bfloat16)
+        if layout == "fused":
+            return torch.randn(tokens, 544, device="cuda", dtype=torch.bfloat16)[
+                :, 512:
+            ]
+        if layout == "unaligned":
+            return torch.randn(tokens, 64, device="cuda", dtype=torch.bfloat16)[
+                :, 31:63
+            ]
+        return torch.randn(1, 32, device="cuda", dtype=torch.bfloat16).expand(
+            tokens, -1
+        )
+
+    q_warm = torch.randn(17, 32, 128, device="cuda", dtype=torch.bfloat16)
+    pos_warm = torch.arange(17, device="cuda", dtype=torch.int32)
+    w_warm = make_weights(17, "contiguous")
+    for output_dtype in (torch.bfloat16, torch.float32):
+        dsv41.index_query_rope_quant(
+            q_warm, w_warm, pos_warm, table, scale, output_dtype
+        )
+    index_query_rope_weights(q_warm.clone(), w_warm, pos_warm, table, scale)
+
+    with assert_no_triton_compile(
+        rope._index_query_rope_quant, rope._index_query_rope_weights
+    ):
+        for tokens in (1, 33, 257):
+            q = torch.randn(tokens, 32, 128, device="cuda", dtype=torch.bfloat16)
+            pos = torch.arange(tokens, device="cuda", dtype=torch.int32)
+            for layout in ("fused", "unaligned", "broadcast"):
+                weights = make_weights(tokens, layout)
+                for output_dtype in (torch.bfloat16, torch.float32):
+                    packed_q, actual_w = dsv41.index_query_rope_quant(
+                        q, weights, pos, table, scale, output_dtype
+                    )
+                    expected_q, expected_w = pack_index_inputs(
+                        rope_inplace(q.clone(), pos, table),
+                        weights * scale,
+                        output_dtype,
+                    )
+                    for got, want in zip(packed_q, expected_q, strict=True):
+                        torch.testing.assert_close(got, want, rtol=0, atol=0)
+                    _assert_bits(actual_w, expected_w)
+                q_rw = q.clone()
+                _, actual_rw = index_query_rope_weights(
+                    q_rw, weights, pos, table, scale
+                )
+                _assert_bits(q_rw, rope_inplace(q.clone(), pos, table))
+                _assert_bits(actual_rw, weights * scale)
+
+
 def _rope_reference(values, positions, cache):
     rotary_dim = cache.shape[1]
     x = values.float()

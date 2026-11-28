@@ -57,6 +57,8 @@ writes group-32 UE8M0 scales in the explicitly selected canonical, swizzled,
 or packed layout. Packed scales use MN-major int32 words with the row count
 padded to four; their column offsets use 64-bit arithmetic as that stride
 grows with the batch. Only canonical scales support arbitrary row selection.
+`return_normalized=False` omits allocating and writing the BF16 normalized
+tensor and returns `None` in its slot when callers read only FP8 outputs.
 
 ## MN-major FP32 token-group scales
 

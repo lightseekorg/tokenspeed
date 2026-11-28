@@ -251,7 +251,7 @@ def _case_rmsnorm_fp8_group32_swizzled():
 
     def run(x):
         return triton_rmsnorm_fp8_group32_ue8m0(
-            x, weight, 1e-6, scale_layout="swizzled"
+            x, weight, 1e-6, scale_layout="swizzled", return_normalized=True
         )
 
     return real, run
