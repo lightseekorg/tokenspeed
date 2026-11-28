@@ -1965,7 +1965,10 @@ def _fake_around_the_budget(monkeypatch, free):
     monkeypatch.setattr(registry, "_check_pd_support", lambda *a, **k: None)
     monkeypatch.setattr(registry, "_apply_backend_overrides", lambda *a, **k: None)
     config = SimpleNamespace(
-        component=lambda cls: SimpleNamespace(), kvp_size=1, device="cuda"
+        component=lambda cls: SimpleNamespace(),
+        kvp_size=1,
+        device="cuda",
+        kv_cache_mxfp4=False,
     )
     monkeypatch.setattr(registry, "_create_attn_config", lambda *a, **k: config)
     monkeypatch.setattr(registry, "_resolve_cache_family", lambda *a: "mha")

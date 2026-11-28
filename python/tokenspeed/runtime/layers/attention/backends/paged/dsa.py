@@ -45,7 +45,10 @@ from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
     reserve_flashinfer_trtllm_dsa_buffers,
     trtllm_sparse_mla_query_heads,
 )
-from tokenspeed_kernel.ops.attention.dsa.mxfp4 import mxfp4_sparse_mla_attention
+from tokenspeed_kernel.ops.attention.dsa.mxfp4 import (
+    mxfp4_sparse_mla_attention,
+    mxfp4_sparse_mla_prefill,
+)
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.metadata import expand_k_row_lengths
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -953,8 +956,9 @@ class DSABackend(PagedAttentionBackend):
                 _LOGGED_SPARSE_LEAVES.add(("mxfp4",))
                 logger.info(
                     "DSA sparse leaves (kv_cache=mxfp4): "
-                    "dsa_prefill=dsa_decode=mxfp4_sparse_mla (Triton, "
-                    "MXFP8 x MXFP4 block-scaled QK, BF16 PV)"
+                    "dsa_prefill=mxfp4_sparse_mla_prefill (Gluon gfx950), "
+                    "dsa_decode=mxfp4_sparse_mla (Triton); both MXFP8 x MXFP4 "
+                    "block-scaled QK, BF16 PV"
                 )
             return
         try:
@@ -2103,12 +2107,25 @@ class DSABackend(PagedAttentionBackend):
         kv_cache: torch.Tensor,
         topk_slots: torch.Tensor,
         topk_lens: torch.Tensor | None,
+        *,
+        prefill: bool = False,
     ) -> torch.Tensor:
         """Sparse MLA of ``q_view`` over the MXFP4 latent rows ``kv_cache``
         at ``topk_slots``: the latent product on gfx950's block-scaled MFMA
-        (MXFP8 query, MXFP4 keys), the values decoded to BF16."""
+        (MXFP8 query, MXFP4 keys), the values decoded to BF16. Prefill rows
+        run the Gluon prefill kernel, decode rows the Triton kernel; both
+        compute the same products."""
         if layer.logit_cap and layer.logit_cap > 0:
             raise RuntimeError("the MXFP4 latent cache's core has no logit cap")
+        if prefill:
+            return mxfp4_sparse_mla_prefill(
+                q_view,
+                kv_cache,
+                topk_slots,
+                topk_lens,
+                kv_lora_rank=self.kv_lora_rank,
+                softmax_scale=layer.scaling,
+            )
         return mxfp4_sparse_mla_attention(
             q_view,
             kv_cache,
@@ -2245,7 +2262,9 @@ class DSABackend(PagedAttentionBackend):
         if self.kv_cache_mxfp4:
             # AttnConfig refuses KVP and QCP with it: no history, no partials.
             # Causality rides on the selection (topk_lens), as in dsa_prefill.
-            out = self._mxfp4_attention(q_view, layer, kv_cache, topk_slots, topk_lens)
+            out = self._mxfp4_attention(
+                q_view, layer, kv_cache, topk_slots, topk_lens, prefill=True
+            )
             if self.step_counter is not None:
                 self.step_counter.record_cache()
             return out.reshape(-1, heads * layer.v_head_dim)

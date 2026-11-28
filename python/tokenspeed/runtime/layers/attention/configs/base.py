@@ -265,10 +265,12 @@ class AttnConfig:
             )
         if self.kv_cache_dtype == torch.int8:
             raise ValueError("INT8 KV cache is not supported by the runtime")
-        if (self.kv_cache_dtype == torch.uint8) != self.kv_cache_mxfp4:
+        # MXFP4 latent rows are bytes. uint8 alone does not mean MXFP4: the
+        # DeepSeek V4.1 config stores its packed rows as uint8 too.
+        if self.kv_cache_mxfp4 and self.kv_cache_dtype != torch.uint8:
             raise ValueError(
-                "a uint8 KV cache is the MXFP4 MLA latent format and only that: "
-                f"kv_cache_dtype {self.kv_cache_dtype}, mxfp4={self.kv_cache_mxfp4}"
+                "MXFP4 MLA latent rows are uint8, got kv_cache_dtype "
+                f"{self.kv_cache_dtype}"
             )
         if self.kv_cache_mxfp4:
             softmax = softmax_components[0]

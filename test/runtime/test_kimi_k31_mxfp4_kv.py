@@ -79,7 +79,6 @@ def test_the_dtype_string_names_no_torch_dtype():
 @pytest.mark.parametrize(
     "change, message",
     [
-        ({"kv_cache_mxfp4": False}, "uint8"),
         ({"kv_cache_dtype": torch.bfloat16}, "uint8"),
         ({"kv_cache_quant_method": "per_token_head"}, "carries its own scales"),
         ({"kvp_size": 2}, "kv-parallel-size"),
@@ -89,6 +88,19 @@ def test_attn_config_refuses_what_the_mxfp4_rows_cannot_serve(change, message):
     config = _mxfp4_recipe().attn_config
     with pytest.raises(ValueError, match=message):
         dataclasses.replace(config, **change)
+
+
+def test_the_kimi_cache_reads_a_uint8_latent_only_as_mxfp4():
+    # The config admits uint8 without MXFP4 (DeepSeek V4.1's packed rows);
+    # the Kimi MLA pool would read such rows as MXFP4, so its recipe refuses.
+    with pytest.raises(ValueError, match="MXFP4 latent format and only that"):
+        kimi_layout(
+            kimi_recipe(
+                dsa_index_k_format="fp8_scaled",
+                kv_cache_dtype=torch.uint8,
+                kv_cache_mxfp4=False,
+            )
+        )
 
 
 def test_attn_config_refuses_mxfp4_without_the_dsa_leaf():

@@ -63,7 +63,11 @@ from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
 )
 from tokenspeed_kernel.platform import current_platform
 
-__all__ = ["MXFP4_QK_FORMATS", "mxfp4_sparse_mla_attention"]
+__all__ = [
+    "MXFP4_QK_FORMATS",
+    "mxfp4_sparse_mla_attention",
+    "mxfp4_sparse_mla_prefill",
+]
 
 # The latent q . k forms; see the module docstring.
 MXFP4_QK_FORMATS = ("mxfp8", "bf16")
@@ -334,6 +338,81 @@ def mxfp4_sparse_mla_attention(
             BLOCK_D=block_d,
             num_warps=4,
         )
+    if out is None:
+        return result
+    if not direct:
+        out.copy_(result.view(out.shape))
+    return out
+
+
+def mxfp4_sparse_mla_prefill(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    *,
+    kv_lora_rank: int,
+    softmax_scale: float,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Sparse MLA prefill over MXFP4 latent rows on gfx950's Gluon kernel.
+
+    The arithmetic of ``mxfp4_sparse_mla_attention(qk_format="mxfp8")`` --
+    MXFP8 query times the MXFP4 codes on the block-scaled MFMA, BF16 RoPE,
+    BF16 ``p . v`` on the exactly decoded values -- scheduled for prefill
+    rows (``launch_gluon_mxfp4_sparse_mla_prefill_gfx950``). It serves the
+    DeepSeek/Kimi MLA geometry only: a BF16 query of 512 latent and 64 RoPE
+    channels and dense cache rows; anything else raises.
+
+    Args and return value as ``mxfp4_sparse_mla_attention``'s.
+    """
+    if not current_platform().is_cdna4:
+        raise RuntimeError("the MXFP4 sparse MLA prefill kernel runs on gfx950")
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.mxfp4_prefill import (
+        launch_gluon_mxfp4_sparse_mla_prefill_gfx950,
+    )
+
+    if q.dim() != 3:
+        raise ValueError(f"q must be [tokens, heads, rank + rope], got {q.shape}")
+    tokens, num_heads, head_dim = q.shape
+    rope = head_dim - kv_lora_rank
+    page_size, page_stride, row_stride = mla_latent_mxfp4_geometry(
+        kv_cache, mla_mxfp4_row_bytes(kv_lora_rank, rope)
+    )
+    if topk_slots.dim() != 2 or topk_slots.shape[0] != tokens:
+        raise ValueError(
+            f"topk_slots {tuple(topk_slots.shape)} is not [{tokens}, topk]"
+        )
+    topk_slots = topk_slots.to(torch.int32).contiguous()
+    topk_lens = (
+        torch.full((tokens,), topk_slots.shape[1], dtype=torch.int32, device=q.device)
+        if topk_lens is None
+        else topk_lens.to(torch.int32).contiguous()
+    )
+    shape = (tokens, num_heads, kv_lora_rank)
+    if out is not None and (
+        out.numel() != tokens * num_heads * kv_lora_rank or out.dtype != q.dtype
+    ):
+        raise ValueError(
+            f"out {tuple(out.shape)} {out.dtype} does not hold {shape} {q.dtype}"
+        )
+    direct = out is not None and out.is_contiguous()
+    result = (
+        out.view(shape)
+        if direct
+        else torch.empty(shape, dtype=q.dtype, device=q.device)
+    )
+    launch_gluon_mxfp4_sparse_mla_prefill_gfx950(
+        q,
+        kv_cache,
+        topk_slots,
+        topk_lens,
+        page_size=page_size,
+        page_stride=page_stride,
+        row_stride=row_stride,
+        softmax_scale=softmax_scale,
+        out=result,
+    )
     if out is None:
         return result
     if not direct:

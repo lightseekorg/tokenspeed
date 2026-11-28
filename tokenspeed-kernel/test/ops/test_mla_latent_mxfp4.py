@@ -27,7 +27,10 @@ from __future__ import annotations
 import pytest
 import torch
 from attention_prologue_helpers import latent_target, mla_inputs, mla_query
-from tokenspeed_kernel.ops.attention.dsa.mxfp4 import mxfp4_sparse_mla_attention
+from tokenspeed_kernel.ops.attention.dsa.mxfp4 import (
+    mxfp4_sparse_mla_attention,
+    mxfp4_sparse_mla_prefill,
+)
 from tokenspeed_kernel.ops.attention.prologue import (
     KVCacheFormat,
     mla_prologue,
@@ -270,8 +273,41 @@ def _reference_attention(q, rows, topk_slots, topk_lens, scale):
 def test_sparse_attention_matches_fp32_over_the_decoded_rows(
     qk_format, tokens, heads, topk, paged
 ):
-    num_slots = 4096
-    g = torch.Generator(device="cuda").manual_seed(6)
+    cache, q, topk_slots, topk_lens, scale = _attention_inputs(
+        tokens, heads, topk, paged
+    )
+    out = mxfp4_sparse_mla_attention(
+        q,
+        cache,
+        topk_slots,
+        topk_lens,
+        kv_lora_rank=RANK,
+        softmax_scale=scale,
+        qk_format=qk_format,
+    )
+    ref = _reference_attention(
+        q, _rows(cache, _all_slots()), topk_slots, topk_lens, scale
+    )
+    assert out.shape == (tokens, heads, RANK) and out.dtype is torch.bfloat16
+    # bf16: BF16 rounding of the output and P only; mxfp8 adds the query's
+    # E4M3 rounding to the scores.
+    tol = 2e-2 if qk_format == "bf16" else 6e-2
+    err = (out.float() - ref).abs().max().item()
+    assert err <= tol * ref.abs().max().item(), err
+
+
+_NUM_SLOTS = 4096
+
+
+def _all_slots() -> torch.Tensor:
+    return torch.arange(_NUM_SLOTS, device="cuda")
+
+
+def _attention_inputs(tokens, heads, topk, paged, seed=6):
+    """A cache of ``_NUM_SLOTS`` random rows, a BF16 query and each row's
+    selection: row 0 short, -1 padding inside the last row's live entries."""
+    num_slots = _NUM_SLOTS
+    g = torch.Generator(device="cuda").manual_seed(seed)
     latent = torch.randn(num_slots, RANK + ROPE, device="cuda", generator=g)
     cache = _cache(num_slots, paged)
     all_slots = torch.arange(num_slots, device="cuda")
@@ -297,22 +333,85 @@ def test_sparse_attention_matches_fp32_over_the_decoded_rows(
     topk_lens[0] = max(1, topk // 3)
     topk_slots[-1, 1::7] = -1
     scale = (RANK + ROPE) ** -0.5
-    out = mxfp4_sparse_mla_attention(
+    return cache, q, topk_slots, topk_lens, scale
+
+
+_gfx950 = pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the Gluon prefill kernel is gfx950's"
+)
+
+
+@_gfx950
+@pytest.mark.parametrize(
+    "tokens,heads,topk",
+    # Split rows (few tokens), one split per row, a partial last tile, a
+    # width under one tile and a head group past the last head.
+    [(1, 12, 2048), (5, 12, 256), (600, 12, 2048), (3, 20, 96), (64, 16, 40)],
+)
+@pytest.mark.parametrize("paged", [False, True])
+def test_gluon_prefill_matches_fp32_and_the_triton_kernel(tokens, heads, topk, paged):
+    cache, q, topk_slots, topk_lens, scale = _attention_inputs(
+        tokens, heads, topk, paged
+    )
+    if tokens > 2:
+        topk_lens[1] = 0  # a row with no key attends to nothing
+    out = mxfp4_sparse_mla_prefill(
+        q, cache, topk_slots, topk_lens, kv_lora_rank=RANK, softmax_scale=scale
+    )
+    assert out.shape == (tokens, heads, RANK) and out.dtype is torch.bfloat16
+    checked = torch.arange(tokens, device="cuda")[: min(tokens, 24)]
+    ref = _reference_attention(
+        q[checked],
+        _rows(cache, _all_slots()),
+        topk_slots[checked],
+        topk_lens[checked],
+        scale,
+    )
+    err = (out[checked].float() - ref).abs().max().item()
+    assert err <= 6e-2 * ref.abs().max().item(), err
+    if tokens > 2:
+        assert not out[1].any()
+    # The Triton kernel's arithmetic: equal up to accumulation order.
+    triton_out = mxfp4_sparse_mla_attention(
         q,
         cache,
         topk_slots,
         topk_lens,
         kv_lora_rank=RANK,
         softmax_scale=scale,
-        qk_format=qk_format,
+        qk_format="mxfp8",
     )
-    ref = _reference_attention(q, _rows(cache, all_slots), topk_slots, topk_lens, scale)
-    assert out.shape == (tokens, heads, RANK) and out.dtype is torch.bfloat16
-    # bf16: BF16 rounding of the output and P only; mxfp8 adds the query's
-    # E4M3 rounding to the scores.
-    tol = 2e-2 if qk_format == "bf16" else 6e-2
-    err = (out.float() - ref).abs().max().item()
-    assert err <= tol * ref.abs().max().item(), err
+    diff = (out.float() - triton_out.float()).abs().max().item()
+    assert diff <= 1e-2 * triton_out.float().abs().max().item(), diff
+
+
+@_gfx950
+def test_gluon_prefill_writes_into_a_strided_out():
+    tokens, heads = 9, 12
+    cache, q, topk_slots, topk_lens, scale = _attention_inputs(tokens, heads, 128, True)
+    kwargs = dict(kv_lora_rank=RANK, softmax_scale=scale)
+    expected = mxfp4_sparse_mla_prefill(q, cache, topk_slots, topk_lens, **kwargs)
+    backing = torch.zeros(tokens, heads, RANK + 32, dtype=torch.bfloat16, device="cuda")
+    out = backing[..., :RANK]
+    returned = mxfp4_sparse_mla_prefill(
+        q, cache, topk_slots, topk_lens, out=out, **kwargs
+    )
+    assert returned is out
+    assert torch.equal(out, expected)
+    assert not backing[..., RANK:].any()
+
+
+@_gfx950
+def test_gluon_prefill_refuses_other_geometries():
+    tokens, heads = 2, 12
+    cache, q, topk_slots, topk_lens, scale = _attention_inputs(tokens, heads, 64, False)
+    kwargs = dict(kv_lora_rank=RANK, softmax_scale=scale)
+    with pytest.raises(ValueError, match="BF16"):
+        mxfp4_sparse_mla_prefill(q.half(), cache, topk_slots, topk_lens, **kwargs)
+    padded = torch.zeros(_NUM_SLOTS, ROW + 16, dtype=torch.uint8, device="cuda")
+    padded = padded[:, :ROW].view(_NUM_SLOTS, 1, ROW)
+    with pytest.raises(ValueError, match="dense"):
+        mxfp4_sparse_mla_prefill(q, padded, topk_slots, topk_lens, **kwargs)
 
 
 def test_sparse_attention_writes_into_a_strided_out():

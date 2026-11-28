@@ -321,6 +321,13 @@ class KimiK3Recipe(CacheRecipe):
                 f"{{torch.float8_e4m3fn, torch.bfloat16, torch.uint8}}, got "
                 f"{cache_dtype}"
             )
+        # The MLA pool reads a uint8 cache as MXFP4 latent rows.
+        if (cache_dtype == torch.uint8) != self.attn_config.kv_cache_mxfp4:
+            raise ValueError(
+                "a uint8 Kimi-K3 MLA cache is the MXFP4 latent format and only "
+                f"that: kv_cache_dtype {cache_dtype}, "
+                f"mxfp4={self.attn_config.kv_cache_mxfp4}"
+            )
         if self.attn_config.kv_cache_quant_method == "per_token_head":
             raise ValueError("Kimi-K3 cache does not support per_token_head MLA cache")
         if getattr(self._text_config, "mla_use_nope", None) is not True:
