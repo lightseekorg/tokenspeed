@@ -25,6 +25,7 @@ import functools
 from collections.abc import Callable
 
 import torch
+from tokenspeed_kernel.compile_monitor import serving_selection
 from tokenspeed_kernel.ops.communication.triton import (
     TritonRSAGState,
     all_gather_inner,
@@ -1303,6 +1304,37 @@ class LogitsProcessor(nn.Module):
         if self._use_fused_lm_head:
             return _lm_head_matmul(cast_hidden, lm_head.weight)
         return torch.matmul(cast_hidden, lm_head.weight.T)
+
+    @torch.no_grad()
+    def warmup_row_counts(
+        self, lm_head: VocabParallelEmbedding, dtype: torch.dtype, max_rows: int
+    ) -> None:
+        """Run this rank's LM-head GEMM once at every row count it can see.
+
+        The head runs eagerly at the live count of rows that need logits, and
+        the library GEMM it reaches (cuBLAS on NVIDIA) picks its kernel per row
+        count and loads a kernel on its first launch, which must not happen
+        while serving (see ``tokenspeed_kernel.ops.gemm.warmup_dsv4_linear_fp32``).
+        Kernels are selected as serving selects them.
+
+        Args:
+            lm_head: The head the forward passes.
+            dtype: Dtype of the hidden states the forward passes.
+            max_rows: Most rows one forward on this rank asks logits for. A
+                head that gathers rows across attention DP groups sees that
+                many from each group.
+        """
+        groups = self.tp_size // self._row_replicas if self.dp_lm_head_tp else 1
+        rows = max_rows * groups
+        device = lm_head.weight.device
+        hidden = torch.zeros(
+            (rows, lm_head.weight.shape[1]), dtype=dtype, device=device
+        )
+        with serving_selection():
+            # Largest first, so the outputs each launch allocates reuse cached blocks.
+            for count in range(rows, 0, -1):
+                self._project_logits(hidden[:count], lm_head, None)
+        torch.cuda.synchronize(device)
 
     def _get_logits(
         self,

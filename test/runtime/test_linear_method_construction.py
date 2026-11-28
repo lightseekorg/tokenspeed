@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.compile_monitor import serving_selection
 
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
@@ -221,3 +222,60 @@ def test_other_methods_keep_legacy_checkpoint_loading(kind, method_name):
     torch.testing.assert_close(
         layer.weight.float(), checkpoint.chunk(2, dim=dim)[1].float(), rtol=0, atol=0
     )
+
+
+def _launched_kernels(block) -> set[str]:
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        block()
+        torch.cuda.synchronize()
+    return {
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("shape", [(512, 5120), (32, 5120), (128, 512)])
+@torch.inference_mode()
+def test_unquantized_row_count_warmup_launches_every_serving_kernel(shape):
+    """After the warm-up, the layer at any row count up to the bound launches
+    only kernels the warm-up launched: none loads while serving."""
+    output_size, input_size = shape
+    with torch.device("cuda"):
+        layer = ReplicatedLinear(
+            input_size,
+            output_size,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=None,
+            prefix="model.proj",
+        )
+    assert isinstance(layer.quant_method, UnquantizedLinearMethod)
+    torch.nn.init.normal_(layer.weight, std=0.02)
+    sweep = (1, 2, 4, 5, 16, 17, 32, 33, 100, 255, 256, 257, 300)
+    inputs = {
+        rows: torch.randn(rows, input_size, device="cuda", dtype=torch.bfloat16)
+        for rows in sweep
+    }
+    warmed = _launched_kernels(lambda: layer.quant_method.warmup_row_counts(layer, 300))
+
+    def serve():
+        with serving_selection():
+            for rows in sweep:
+                layer(inputs[rows])
+
+    assert not _launched_kernels(serve) - warmed
+    with pytest.raises(ValueError, match="bias-free"):
+        with torch.device("cuda"):
+            biased = ReplicatedLinear(
+                input_size,
+                output_size,
+                bias=True,
+                params_dtype=torch.bfloat16,
+                quant_config=None,
+                prefix="model.proj",
+            )
+        biased.quant_method.warmup_row_counts(biased, 4)

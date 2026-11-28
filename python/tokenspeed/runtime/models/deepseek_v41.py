@@ -65,18 +65,21 @@ would freeze.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
 import re
+import time
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from copy import copy
 from dataclasses import dataclass, replace
 from weakref import WeakValueDictionary
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.compile_monitor import serving_selection
 from tokenspeed_kernel.ops.attention.dsv41 import (
     IndexKeyInput,
     IndexQueryInput,
@@ -99,8 +102,10 @@ from tokenspeed_kernel.ops.gemm import (
     prepare_fp8_projection,
     prepare_grouped_fp8_projection,
     prepare_mxfp8_weight_scales,
+    warmup_dsv4_linear_fp32,
     warmup_fp8_projection,
     warmup_fp8_projections,
+    warmup_grouped_bf16_projection,
 )
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.quantization import (
@@ -752,6 +757,17 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
     )
 
 
+def _max_decode_rows() -> int:
+    """The most rows one decode or verify forward carries."""
+    args = global_server_args_dict
+    rows = max(
+        int(args["max_cudagraph_capture_size"] or 0), int(args["max_num_seqs"] or 0)
+    )
+    if args["speculative_algorithm"]:
+        rows *= int(args["speculative_num_draft_tokens"])
+    return rows
+
+
 def _max_forward_tokens() -> int:
     """The most tokens one forward carries, as execution/device.py sizes it."""
     args = global_server_args_dict
@@ -761,12 +777,7 @@ def _max_forward_tokens() -> int:
         if chunk > 0
         else int(args["max_prefill_tokens"]) + int(args["max_model_len"])
     )
-    decode_rows = max(
-        int(args["max_cudagraph_capture_size"] or 0), int(args["max_num_seqs"] or 0)
-    )
-    if args["speculative_algorithm"]:
-        decode_rows *= int(args["speculative_num_draft_tokens"])
-    return max(tokens, decode_rows)
+    return max(tokens, _max_decode_rows())
 
 
 def _all_reduce_output(
@@ -1166,6 +1177,16 @@ class DeepseekV41Attention(nn.Module):
         default_weight_loader(param, loaded_weight[start : start + self.n_local_heads])
         if self._padded_attn_sink is not None:
             self._padded_attn_sink[: self.n_local_heads].copy_(param)
+
+    def wo_a_quantizes_wo_b_input(self, device: torch.device) -> bool:
+        """Whether BF16 wo_a writes wo_b's group-32 FP8 input in its epilogue."""
+        method = self.wo_b.quant_method
+        return (
+            device.type == "cuda"
+            and (current_platform().is_cdna4 or current_platform().is_cdna5)
+            and isinstance(method, _ReferenceFp8LinearMethod)
+            and method.prepared_weight_scales is None
+        )
 
     @torch.no_grad()
     def prepare_output_projections(self) -> None:
@@ -1770,7 +1791,6 @@ class DeepseekV41Attention(nn.Module):
                 out,
                 self.mapping.attn.head_tp_group,
             )
-        method = self.wo_b.quant_method
         if self.wo_a_fp8:
             # One kernel undoes RoPE and casts every 32 channels to FP8, as the
             # reference rounds o before wo_a. Only CDNA attention rotates back
@@ -1794,12 +1814,7 @@ class DeepseekV41Attention(nn.Module):
             if out_rope_cache is None:
                 out = self.rotary_emb.apply_owned(out, positions, True)
             grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
-            if (
-                grouped.is_cuda
-                and (current_platform().is_cdna4 or current_platform().is_cdna5)
-                and isinstance(method, _ReferenceFp8LinearMethod)
-                and method.prepared_weight_scales is None
-            ):
+            if self.wo_a_quantizes_wo_b_input(grouped.device):
                 # wo_b's group-32 activation quantization runs in wo_a's epilogue.
                 codes, scales = grouped_bf16_projection_quantize_fp8(grouped, weight)
                 out, _ = self.wo_b(codes, scale=scales, out=target)
@@ -1842,6 +1857,203 @@ def _warmup_query_projections(
             if key not in warmed:
                 warmup_fp8_projection(weight, scales, max_tokens)
                 warmed.add(key)
+
+
+#: The rows already launched per library GEMM in this process, keyed by op,
+#: device, weight shape, dtype and input layout. The DSpark draft shares most
+#: of the target's shapes, so it launches only its own.
+_ROW_COUNTS_WARMED: dict[tuple, int] = {}
+
+
+@dataclass(frozen=True)
+class _RowCountSite:
+    """A library GEMM that eager code runs at the live row count."""
+
+    key: tuple
+    # The most rows the call sees, read off the server arguments only once a
+    # model has sites.
+    max_rows: Callable[[], int]
+    run: Callable[[int], None]
+
+
+def _forward_rows(gather: int) -> int:
+    """The most rows a call sees that runs on the forward's tokens, gathered
+    from ``gather`` attention DP groups."""
+    return _max_forward_tokens() * gather
+
+
+def _logit_rows() -> int:
+    """The most rows one forward asks logits for: the decode or verify rows,
+    or one chunk of prompt logprobs."""
+    return max(
+        _max_decode_rows(),
+        int(global_server_args_dict["input_logprob_chunk_tokens"]),
+    )
+
+
+def _unquantized_linear_sites(
+    layers: Iterable[nn.Module], max_rows: Callable[[], int]
+) -> list[_RowCountSite]:
+    """A site for each layer whose GEMM is a library one (UnquantizedLinearMethod)."""
+    sites = []
+    for layer in layers:
+        if isinstance(layer, LinearBase) and isinstance(
+            layer.quant_method, UnquantizedLinearMethod
+        ):
+            weight = layer.weight
+            key = ("linear", weight.device, tuple(weight.shape), weight.dtype)
+            run = functools.partial(layer.quant_method.warmup_row_counts, layer)
+            sites.append(_RowCountSite(key, max_rows, run))
+    return sites
+
+
+@torch.no_grad()
+def _warmup_torch_row_counts(
+    call: Callable[[torch.Tensor], object],
+    width: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    max_rows: int,
+) -> None:
+    """Run ``call`` on ``[rows, width]`` zeros at every row count up to
+    max_rows, largest first, as serving selects kernels. For GEMMs that eager
+    code runs through torch directly, with no kernel-package op to warm them."""
+    rows = torch.zeros((max_rows, width), dtype=dtype, device=device)
+    with serving_selection():
+        for count in range(max_rows, 0, -1):
+            call(rows[:count])
+    torch.cuda.synchronize(device)
+
+
+def _row_count_sites(model: nn.Module) -> list[_RowCountSite]:
+    """The library GEMMs that eager code runs at the live row count.
+
+    The attention forward is a graph break that slices its inputs to the live
+    rows, and the narrowing layer and the LM head run eagerly, so these see
+    every count a forward carries, not only the captured buckets: the
+    unquantized linears under attention (indexer and compressor included),
+    the shared experts and the engram, the FP32 compressor and MoE-gate
+    projections, BF16 wo_a and the LM head. Not covered: the vision encoder,
+    which runs at live patch counts, and the FP32 router of image rows.
+    """
+    sites: list[_RowCountSite] = []
+    tokens = functools.partial(_forward_rows, 1)
+
+    def add_fp32(weight: torch.Tensor, max_rows: Callable[[], int]) -> None:
+        key = ("dsv4_linear_fp32", weight.device, tuple(weight.shape), weight.dtype)
+        run = functools.partial(warmup_dsv4_linear_fp32, weight, torch.bfloat16)
+        sites.append(_RowCountSite(key, max_rows, run))
+
+    for module in model.modules():
+        if isinstance(module, DeepseekV41Attention):
+            # These weights feed other ops than the layer's own GEMM.
+            skip = {id(module.wo_a)}
+            for compressor in module.modules():
+                if (
+                    isinstance(compressor, DeepseekV41Compressor)
+                    and compressor.ratio == 2
+                ):
+                    skip.add(id(compressor.wkv_wgate))
+                    add_fp32(compressor.wkv_wgate.weight, tokens)
+            sites += _unquantized_linear_sites(
+                (layer for layer in module.modules() if id(layer) not in skip),
+                tokens,
+            )
+            if not module.wo_a_fp8:
+                weight = module.wo_a.weight.reshape(
+                    module.n_local_groups, module.o_lora_rank, -1
+                )
+                quantize = module.wo_a_quantizes_wo_b_input(weight.device)
+                # The live heads, and in eager decode of 512-wide heads a slice
+                # of the padded kernel heads (rope_pad_query).
+                heads = {module.n_local_heads}
+                if module.head_dim == 512:
+                    heads.add(module.n_kernel_heads)
+                for count in sorted(heads):
+                    stride = count * module.head_dim
+                    key = (
+                        "grouped_bf16",
+                        weight.device,
+                        tuple(weight.shape),
+                        stride,
+                        quantize,
+                    )
+                    run = functools.partial(
+                        warmup_grouped_bf16_projection, weight, stride, quantize
+                    )
+                    sites.append(_RowCountSite(key, tokens, run))
+        elif isinstance(module, DeepseekV41DecoderLayer):
+            # Without expert-owned communication the MoE runs on the rows of
+            # every attention DP group in its TPxEP group.
+            mapping = module.comm_manager.mapping
+            gather = (
+                1
+                if module.ffn.owns_ep_communication
+                or module.comm_manager.use_all_reduce(is_moe=True)
+                else mapping.moe.tp_ep_size // mapping.attn.tp_size
+            )
+            moe_rows = functools.partial(_forward_rows, gather)
+            add_fp32(module.ffn.gate.weight, moe_rows)
+            if module.ffn.shared_experts is not None:
+                sites += _unquantized_linear_sites(
+                    module.ffn.shared_experts.modules(), moe_rows
+                )
+            if module.engram is not None:
+                sites += _unquantized_linear_sites(module.engram.modules(), tokens)
+    if model.logits_processor is not None:
+        weight = model.lm_head.weight
+        key = ("lm_head", weight.device, tuple(weight.shape), weight.dtype)
+        run = functools.partial(
+            model.logits_processor.warmup_row_counts, model.lm_head, weight.dtype
+        )
+        sites.append(_RowCountSite(key, _logit_rows, run))
+    return sites
+
+
+@torch.no_grad()
+def _launch_row_count_sites(sites: list[_RowCountSite]) -> None:
+    """Launch each eager library GEMM once at every row count it can see.
+
+    A library GEMM (cuBLAS on NVIDIA) picks its kernel per row count and loads
+    a kernel the process has not launched on its first launch. Under the
+    overlap schedule a first load inside a forward, while the previous
+    forward's collective is in flight, has stopped every rank of a TP engine.
+    Launching every count here, before serving and with nothing else in
+    flight, leaves no first load to serving; kernels are selected as serving
+    selects them. The forward's token budget bounds the rows, which needs
+    chunked prefill: without it a forward carries any count up to the context,
+    and a WARNING says the hazard stays open.
+    """
+    if not sites:
+        return
+    if int(global_server_args_dict["chunked_prefill_size"]) <= 0:
+        logger.warning(
+            "Eager library GEMMs are not launched at every row count before "
+            "serving: without chunked prefill a forward carries any count up to "
+            "the context, and a count's first launch while serving can stall "
+            "every rank of a TP engine; set --chunked-prefill-size"
+        )
+        return
+    bounds: dict[tuple, tuple[int, Callable[[int], None]]] = {}
+    for site in sites:
+        rows = site.max_rows()
+        if site.key not in bounds or rows > bounds[site.key][0]:
+            bounds[site.key] = (rows, site.run)
+    start = time.perf_counter()
+    seconds = []
+    for key, (rows, run) in bounds.items():
+        if _ROW_COUNTS_WARMED.get(key, 0) >= rows:
+            continue
+        begin = time.perf_counter()
+        run(rows)
+        _ROW_COUNTS_WARMED[key] = rows
+        seconds.append(
+            f"{key[0]} {list(key[2])} x{rows} {time.perf_counter() - begin:.1f} s"
+        )
+    logger.info(
+        f"Launched {len(seconds)} eager library GEMM shapes at every row count in "
+        f"{time.perf_counter() - start:.1f} s: {', '.join(seconds)}"
+    )
 
 
 class DeepseekV41MoE(DeepseekV4MoE):
@@ -3764,6 +3976,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()
+        if next(self.parameters()).is_cuda:
+            _launch_row_count_sites(_row_count_sites(self))
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens

@@ -375,6 +375,20 @@ DeepGEMM picks a tile configuration from the token count (one per 16 tokens)
 and JIT-compiles each on first use. `warmup_fp8_projections` launches every
 configuration up to a token bound at startup so serving never compiles.
 
+## Row-count warm-ups
+
+Library GEMMs (cuBLAS, hipBLASLt) choose a kernel per row count and load a
+kernel on its first launch. Eager call sites that run at the live row count,
+outside captured graphs, would make that first launch while serving.
+`warmup_dsv4_linear_fp32` and `warmup_grouped_bf16_projection` launch their
+op once at every row count up to the call site's bound, largest first, on
+inputs with the call site's dtype and token stride, under
+`compile_monitor.serving_selection()` so each count reaches the kernel
+serving selects. Every count is launched: the library's per-count choice is
+not visible to the caller. The runtime warms its unquantized dense layers and
+LM head the same way (`UnquantizedLinearMethod.warmup_row_counts`,
+`LogitsProcessor.warmup_row_counts`).
+
 ## Small-N BF16 Split-K policy
 
 `flashinfer_mm_bf16_small_n_splitk` uses FlashInfer's cached CuTe DSL Split-K

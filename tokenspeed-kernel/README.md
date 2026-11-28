@@ -326,6 +326,10 @@ once per batch shape and cannot bucket it, such as FlashInfer's joint BF16
 GEMM, checks `compile_monitor.is_serving()` where it is dispatched: startup
 tuning and graph capture use it, and eager calls while serving take a GEMM
 that never compiles.
+`compile_monitor.serving_selection()` closes the switch for a block during
+startup, so a startup pass can launch the kernels serving will select: the
+row-count warm-ups in `ops/gemm` load every library GEMM kernel an eager call
+site can reach before serving starts (`ops/gemm/README.md`).
 
 ## Nightly installation
 
