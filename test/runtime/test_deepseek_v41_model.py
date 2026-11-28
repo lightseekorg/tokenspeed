@@ -5194,6 +5194,8 @@ def test_dsv41_attention_inner_breakpoint_captures_projections_and_matches_eager
 @torch.inference_mode()
 def test_v41_warmup_prefill_kernels_skips_negative_kv_owners():
     """warmup_prefill_kernels() skips global cache warmup when kv_owners are all -1."""
+    from test.runtime.test_deepseek_v41_cache import _recipe
+
     from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
         DeepseekV41AttentionBackend,
     )
@@ -5201,7 +5203,7 @@ def test_v41_warmup_prefill_kernels_skips_negative_kv_owners():
     backend = _backend("cuda:0", 2)
     backend.warmup_prefill_kernels()
     swa_only = DeepseekV41AttentionBackend(
-        backend.config, replace(backend.spec, kv_owners=(-1,))
+        _recipe("cuda:0").attn_config, replace(backend.spec, kv_owners=(-1,))
     )
     swa_only.set_cache_pool(backend.cache_pool)
     swa_only.warmup_prefill_kernels()

@@ -8478,6 +8478,7 @@ def test_dense_format_signature_and_fast_selection_override(
     from tokenspeed_kernel.ops.gemm import (
         fp8_projection,
         plan_fp8_projection,
+        prepare_fp8_projection,
     )
     from tokenspeed_kernel.ops.quantization import (
         plan_rmsnorm_quantize_fp8_group32,
@@ -8523,14 +8524,26 @@ def test_dense_format_signature_and_fast_selection_override(
         registry.register(spec_lo, leaf_lo)
         registry.clear_cache()
 
-        assert select_kernel("unit_fast", "fast_mode", sig, mode="a").spec.name == "hi"
+        assert (
+            select_kernel("unit_fast", "fast_mode", sig, traits={"mode": "a"}).spec.name
+            == "hi"
+        )
         # Hot cache hit still returns the priority choice.
-        assert select_kernel("unit_fast", "fast_mode", sig, mode="a").spec.name == "hi"
+        assert (
+            select_kernel("unit_fast", "fast_mode", sig, traits={"mode": "a"}).spec.name
+            == "hi"
+        )
         with kernel_override("unit_fast", "fast_mode", "lo"):
             assert (
-                select_kernel("unit_fast", "fast_mode", sig, mode="a").spec.name == "lo"
+                select_kernel(
+                    "unit_fast", "fast_mode", sig, traits={"mode": "a"}
+                ).spec.name
+                == "lo"
             )
-        assert select_kernel("unit_fast", "fast_mode", sig, mode="a").spec.name == "hi"
+        assert (
+            select_kernel("unit_fast", "fast_mode", sig, traits={"mode": "a"}).spec.name
+            == "hi"
+        )
         # Multi-trait fallback matches non-1-trait fast key too.
         spec_multi = KernelSpec(
             name="m_hi",
@@ -8545,13 +8558,19 @@ def test_dense_format_signature_and_fast_selection_override(
         registry.clear_cache()
         assert (
             select_kernel(
-                "unit_fast_multi", "fast_mode", sig, mode="a", flag=True
+                "unit_fast_multi",
+                "fast_mode",
+                sig,
+                traits={"mode": "a", "flag": True},
             ).spec.name
             == "m_hi"
         )
         assert (
             select_kernel(
-                "unit_fast_multi", "fast_mode", sig, mode="a", flag=True
+                "unit_fast_multi",
+                "fast_mode",
+                sig,
+                traits={"mode": "a", "flag": True},
             ).spec.name
             == "m_hi"
         )
@@ -8564,24 +8583,22 @@ def test_dense_format_signature_and_fast_selection_override(
     try:
         x = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
         norm_w = torch.ones(128, device="cuda", dtype=torch.bfloat16)
-        q_plan = plan_rmsnorm_quantize_fp8_group32(
-            x.dtype,
-            scale_layout="canonical",
-            output_mode="normalized_and_quantized",
-        )
+        q_plan = plan_rmsnorm_quantize_fp8_group32(x.dtype, solution=None)
         expected_norm, expected_q, expected_s = rmsnorm_quantize_fp8_group32(
             x,
             norm_w,
             1e-6,
-            scale_layout="canonical",
-            output_mode="normalized_and_quantized",
+            scale_layout="packed",
+            override=None,
+            solution=None,
         )
         got_norm, got_q, got_s = rmsnorm_quantize_fp8_group32(
             x,
             norm_w,
             1e-6,
-            scale_layout="canonical",
-            output_mode="normalized_and_quantized",
+            scale_layout="packed",
+            override=None,
+            solution=None,
             plan=q_plan,
         )
         torch.testing.assert_close(got_norm, expected_norm, rtol=0, atol=0)
@@ -8589,35 +8606,19 @@ def test_dense_format_signature_and_fast_selection_override(
         assert torch.equal(got_s, expected_s)
 
         w_q = torch.ones(64, 128, device="cuda", dtype=torch.float8_e4m3fn)
-        w_s = torch.full((2, 4), 127, device="cuda", dtype=torch.uint8)
+        w_s = torch.full((64, 4), 127, device="cuda", dtype=torch.uint8)
+        prepared_w_s = prepare_fp8_projection(w_q, w_s)
+        if prepared_w_s is None:
+            pytest.skip("Current GPU lacks fp8_projection kernel")
         proj_plan = plan_fp8_projection(
-            expected_q.dtype,
-            w_q.dtype,
-            torch.bfloat16,
-            granularity="tensor",
-            block_size=[1, 32],
-            scale_encoding="ue8m0",
+            mode="fp8_projection",
+            output_dim=w_q.shape[0],
+            input_dim=w_q.shape[1],
+            device=x.device,
         )
-        expected_out = fp8_projection(
-            expected_q,
-            w_q,
-            a_scale=expected_s,
-            b_scale=w_s,
-            granularity="tensor",
-            block_size=[1, 32],
-            scale_encoding="ue8m0",
-            output_dtype=torch.bfloat16,
-        )
+        expected_out = fp8_projection(expected_q, expected_s, w_q, prepared_w_s, None)
         got_out = fp8_projection(
-            expected_q,
-            w_q,
-            a_scale=expected_s,
-            b_scale=w_s,
-            granularity="tensor",
-            block_size=[1, 32],
-            scale_encoding="ue8m0",
-            output_dtype=torch.bfloat16,
-            plan=proj_plan,
+            expected_q, expected_s, w_q, prepared_w_s, None, plan=proj_plan
         )
         torch.testing.assert_close(got_out, expected_out, rtol=0, atol=0)
     except kernel_NoKernelFoundError:
