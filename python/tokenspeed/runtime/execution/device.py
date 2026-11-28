@@ -1422,7 +1422,7 @@ def _warmup_expert_placements(
 
 
 def start_expert_load_window(executor: ModelExecutor) -> None:
-    """Zero the expert load counters once the startup forwards are done.
+    """Clear startup routes and open the first serving window.
 
     Autotune, warm-up and graph capture route tokens through the MoE layers,
     and none of that is traffic: the first window a rebalance
@@ -1438,6 +1438,8 @@ def start_expert_load_window(executor: ModelExecutor) -> None:
     with executor.device_module.stream(executor.execution_stream):
         for placement in placements:
             placement.reset_load()
+            if placement.load_rows.recording_enabled is not None:
+                placement.load_rows.recording_enabled.fill_(True)
 
 
 def arm_data_plane_sync_debug(device: str) -> None:
@@ -1524,7 +1526,7 @@ def _warm_rebound_draft(executor, server_args: ServerArgs, *, has_draft: bool) -
 def _capture_serving_graphs(
     executor, server_args: ServerArgs, replays_prefill_graphs: bool
 ) -> None:
-    """Capture every graph and leave the generator and expert-load state serving starts from."""
+    """Capture every serving graph and reset the generator."""
     from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
     from tokenspeed.runtime.utils import set_random_seed
 
@@ -1544,7 +1546,6 @@ def _capture_serving_graphs(
         )
     # Tuning and capture draw from the generator; this is the state startup leaves.
     set_random_seed(48)
-    start_expert_load_window(executor)
 
 
 def recapture_graphs(executor, server_args: ServerArgs) -> None:
@@ -2212,6 +2213,7 @@ def build_device_side(
 
     with startup_phase("graph.capture"):
         _capture_serving_graphs(executor, server_args, replays_prefill_graphs)
+        start_expert_load_window(executor)
 
     # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
     if attn_tp_rank == 0:

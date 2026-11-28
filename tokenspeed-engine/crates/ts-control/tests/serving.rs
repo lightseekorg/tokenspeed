@@ -4238,7 +4238,8 @@ fn manual_rebalance_refuses_unmapped_weights_and_can_retry() {
                     .iter()
                     .filter(|op| op.starts_with("record "))
                     .collect();
-                assert_eq!(edges, ["record true", "record false"]);
+                // The retry uses the first window, already open at startup.
+                assert_eq!(edges, ["record false"]);
             }
             assert!(rank.device_ops.iter().any(|op| op == "apply expert chunk"));
             assert_eq!(

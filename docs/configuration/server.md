@@ -636,7 +636,7 @@ split knobs.
 | `--expert-distribution-recorder-mode` | `stat` (the only mode): count the routes to every physical expert so the `EXPERT_LOAD` profile activity can write each rank's load record when its profile stops and `--enable-eplb` can rebalance from the counters. |
 | `--enable-eplb` | Online expert rebalancing: every `--eplb-rebalance-num-iterations` forwards the sampled routing load is rebalanced with the EPLB algorithm and the expert weights move between slots. Requires `--expert-distribution-recorder-mode stat` and a static `--ep-dispatch-algorithm`, both explicit, and `ep_size > 1`; `--ep-num-redundant-experts 0` is allowed (permutation only). `RebalanceExpertsReqInput` triggers a manual cycle. Under a `--numerics` envelope it rides the placement-independent slot-order MoE combine the envelope folds in (`--moe-combine-order slot`). |
 | `--eplb-rebalance-num-iterations` | Forwards between two load snapshots; required with `--enable-eplb`, `> 0`. |
-| `--eplb-window-size` | Sample the last W forwards of each interval (1 ≤ W ≤ interval). Defaults to the entire interval. |
+| `--eplb-window-size` | Forwards sampled per snapshot (1 ≤ W ≤ interval). The first snapshot is taken after W forwards, then one per interval. Defaults to the entire interval. |
 | `--[no-]eplb-balance-draft` | Balance an eligible draft independently. Default on. |
 | `--eplb-rebalance-layers-per-chunk` | MoE layers whose experts move in one scheduling round; `1..num MoE layers`, default `min(8, target MoE layers)`. Fewer layers per chunk bound the per-round stall. |
 

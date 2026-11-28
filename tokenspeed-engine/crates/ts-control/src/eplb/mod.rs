@@ -270,8 +270,8 @@ impl Controller {
             chunks.extend(draft_chunks);
         }
         Ok(Self {
-            next_snapshot_at: config.rebalance_num_iterations,
-            recording: config.window_size == config.rebalance_num_iterations,
+            next_snapshot_at: config.window_size,
+            recording: true,
             config,
             chunks,
             phase: Phase::Idle,
@@ -803,14 +803,12 @@ mod tests {
             cfg.window_size = 7;
             cfg.commit_delay_forwards = 4;
             let mut c = Controller::new(cfg).unwrap();
-            rounds(&mut c, 2, true);
-            rounds(&mut c, 16, false);
-            assert!(!c.recording());
-            c.note_round(true);
             assert!(c.recording());
+            assert!(rounds(&mut c, 16, false).is_empty());
             c.note_round(true);
             assert_eq!(c.request_window(), Some(6)); // Keep the sample already in progress.
-            assert_eq!(rounds(&mut c, 6, true), [InternalOp::Snapshot]);
+            assert!(rounds(&mut c, 5, true).is_empty());
+            assert_eq!(c.note_round(true), [InternalOp::Snapshot]);
             assert!(!c.recording());
             snapshot(&mut c).unwrap();
             assert!(matches!(rounds(&mut c, 4, true)[0], InternalOp::Commit));

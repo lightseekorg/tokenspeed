@@ -638,9 +638,10 @@ distribution without a restart. For example, a LongCat launch can use
 --eplb-rebalance-layers-per-chunk 4
 ```
 
-`--eplb-rebalance-num-iterations N` sets the interval. Every `N`
-forwards (real or DP-idle, so every rank counts the same) the runtime reads
-the routing load from the last `--eplb-window-size` forwards (default `N`). It derives a
+`--eplb-window-size W` sets the number of forwards sampled per snapshot.
+The first snapshot is taken after `W` forwards, then every
+`--eplb-rebalance-num-iterations N` forwards using the most recent `W`
+(default `W = N`). Real and DP-idle forwards both count. The runtime derives a
 new placement from those routes, and the weights move. `--eplb-rebalance-layers-per-chunk L`
 bounds the stall each scheduling round pays: the rebalance switches the
 model's MoE layers `L` per round, each layer's weights first and its routing

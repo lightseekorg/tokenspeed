@@ -4727,7 +4727,8 @@ class ServerArgs:
             "--eplb-window-size",
             type=int,
             default=ServerArgs.eplb_window_size,
-            help="Record the last W forwards of each EPLB interval (default: the full interval).",
+            help="Take the first snapshot after W forwards and sample the last W "
+            "forwards of each subsequent interval (default: the full interval).",
         )
         parser.add_argument(
             "--eplb-balance-draft",
