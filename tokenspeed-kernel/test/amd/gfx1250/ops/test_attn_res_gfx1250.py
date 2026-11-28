@@ -91,9 +91,11 @@ def _run(inputs, valid_blocks, write_block):
 
 
 # Snapshot counts cover a power-of-two tile (prefix scored separately), tiles
-# with a spare row for the prefix, and the 16-row tile.
+# with a spare row for the prefix, and the 16-row tile. Each token runs on its
+# own workgroup, so 4 tokens cover decode's eight warps and 300 the four-warp
+# prefill workgroups.
 @pytest.mark.parametrize("valid_blocks", [0, 1, 3, 4, 6, 8, 11])
-@pytest.mark.parametrize("tokens", [1, 4, 300])
+@pytest.mark.parametrize("tokens", [4, 300])
 @pytest.mark.parametrize(
     "delta,write_block", [(False, False), (True, False), (False, True)]
 )
@@ -129,7 +131,7 @@ def test_attn_res_token_counts_reuse_compilation():
             torch.testing.assert_close(actual, expected, rtol=1.6e-2, atol=1.6e-2)
 
 
-@pytest.mark.parametrize("weight_view", ["odd_offset", "strided", "fp32"])
+@pytest.mark.parametrize("weight_view", ["odd_offset", "strided"])
 def test_attn_res_rejects_weights_it_cannot_read_as_pairs(weight_view):
     # Weights are read as 4-byte BF16 pairs; views that would misread every
     # pair must be refused rather than silently mixed.
@@ -138,10 +140,8 @@ def test_attn_res_rejects_weights_it_cannot_read_as_pairs(weight_view):
     if weight_view == "odd_offset":
         storage = torch.empty(HIDDEN + 1, device="cuda", dtype=torch.bfloat16)
         inputs["res_weight"] = storage[1:].copy_(weight)
-    elif weight_view == "strided":
+    else:
         storage = torch.empty(2 * HIDDEN, device="cuda", dtype=torch.bfloat16)
         inputs["res_weight"] = storage[::2].copy_(weight)
-    else:
-        inputs["res_weight"] = weight.float()
     with pytest.raises(ValueError, match="AttnRes"):
         _run(inputs, 3, False)

@@ -51,6 +51,17 @@ files with the checkpoint. Pass a custom filename pattern through
 `{"pattern": "model-rank-{rank}-part-{part}.safetensors"}`. The serving CLI does
 not expose this loader or its extra configuration.
 
+## Plugin server arguments
+
+Installed plugins may register typed options for the flat `--extra-server-args`
+JSON object, for example `--extra-server-args '{"extension_tile_size":64}'` when
+a plugin owns that field. This is the only CLI entry for plugin options;
+registration does not add per-field flags. Python callers pass the same dictionary through
+`ServerArgs(extra_server_args=...)`. Unknown fields, invalid values and duplicate
+field registrations are rejected. HF overrides remain for model definitions.
+See [plugin server arguments](../design/plugin-server-args.md) for registration
+and model-construction contracts.
+
 ## Sparse KV offloading
 
 `--kv-offload-config` accepts a JSON object with four required fields:
@@ -60,9 +71,10 @@ boolean enabling cross-layer prefetch). Omitting the argument disables offload.
 The model cache recipe validates supported fields, selection capacity, and
 execution constraints; unsupported recipes reject the configuration.
 
-Model-specific behavior stays in `--hf-overrides`. For a plugin supporting a
-window ring, set its `kv_offload_window_ring` option explicitly. Do not put
-`window_ring` in the runtime object or use the legacy `hf_overrides.kv_offload`
+Plugin execution options use `--extra-server-args`, a flat JSON object whose
+fields are registered and validated by the owning plugin. For a plugin supporting
+a window ring, set `kv_offload_window_ring` there explicitly. Do not put
+`window_ring` in the offload object or use the legacy `hf_overrides.kv_offload`
 entry; both are rejected. This option does not enable MTP, CUDA Graph, scheduler
 overlap, or change numerical settings implicitly.
 
@@ -321,6 +333,14 @@ supported: the scheduler completes an operation only in a round where every
 DP rank holds it (see
 [Weight updates under attention DP](#weight-updates-under-attention-dp)).
 Real rollout log probabilities require `--enable-output-logprobs`.
+
+A one-rank world (TP1, no DP) defaults `NCCL_BUFFSIZE` to 64 KiB for its
+process, since its own communicators move no data between peers. NCCL reads
+the size once per process, so the NCCL group that `init_weights_update_group`
+joins inherits it, and weight broadcasts stage through those small buffers;
+the engine warns when it joins. For RL weight sync on a single-GPU engine, set
+`NCCL_BUFFSIZE` in the server environment (for example `4194304`, NCCL's
+default); an explicit setting is never overridden.
 
 #### Releasing GPU memory (`--enable-memory-saver`)
 
@@ -2322,18 +2342,24 @@ request computes the prefix itself.
 | `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
 | `--peer-prefix-landing-tier` | required | `device` reads the prefix into the GPU pages the request's admission allocates, which wait out the transfer; `host` reads it into Host blocks before the admission, which then takes it as a Host hit, at the cost of Host capacity and one host-to-device copy ([RFC 0006](../rfcs/0006-disk-tier.md)). |
 
-Peer sharing needs the Host tier (`--enable-kvstore`) and prefix caching.
-A `--disaggregation-mode decode` server serves the history it decoded, its
-prompts and replies, so the next turn's prefill server reads a reply rather
-than computing it; it never reads itself, since its prefill server sends what
-it lacks ([RFC 0005](../rfcs/0005-runtime-pd-roles.md)). Run it with
-`--kvstore-write-policy write_back` for its Host to hold what its GPU evicts.
+Peer sharing requires prefix caching. Prefill and fused workers also require
+Host L2 (`--enable-kvstore`). A Decode worker receives its prompt through
+the [PD path](../rfcs/0005-runtime-pd-roles.md) and offers the prompt and
+generated tokens to subsequent Prefill requests. With Host L2 enabled, use
+`--kvstore-write-policy write_back` to retain pages evicted from Device.
+
+A TP1/KVP1 Decode worker can serve device-resident prefixes with
+`--disable-kvstore --peer-prefix-landing-tier device` and a configured
+`--peer-prefix-port`. Omit the Host write-back policy in this mode. A
+TP8/KVP8 Prefill worker can read the resident history, including draft cache
+fields. Once the Decode worker evicts those pages, it cannot serve them.
+
 Peer sharing is refused with
 `--kvstore-storage-backend`, `--pipeline-parallel-size > 1`,
 `--query-context-parallel-size > 1` and `--enable-memory-saver` (releasing
-Device KV memory invalidates registered Mooncake MRs); the
-scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded
-groups). RDMA devices come from `--disaggregation-ib-device`. Replicas read
+Device KV memory invalidates registered Mooncake MRs). KV-page sharding
+requires the [sharded peer protocol](../rfcs/0004-peer-prefix-sharing.md).
+RDMA devices come from `--disaggregation-ib-device`. Replicas read
 each other within one namespace when their configured model and draft revisions,
 cache layout and numerical settings are compatible. Deploy the same weights on
 all peers and identify each generation with the same `--weight-version`. At

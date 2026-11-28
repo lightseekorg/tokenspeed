@@ -24,7 +24,8 @@ A sparse-attention verify scores ``k`` query rows per request. The indexer
 reads each row's request context length, and the sparse decode core reads each
 row's causal KV length: verify row ``t`` sees ``length - (k - 1 - t)`` tokens,
 clamped at zero. On CUDA (and ROCm) devices one Triton launch writes both;
-other devices run the same arithmetic as tensor ops.
+other devices run the same arithmetic as tensor ops. A KVP indexer reads every
+row's request and unclamped causal end instead, written in one launch too.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
-__all__ = ["expand_k_row_lengths"]
+__all__ = ["expand_k_row_lengths", "expand_k_row_requests"]
 
 _BLOCK = 256
 
@@ -132,6 +133,90 @@ def expand_k_row_lengths(
         causal_out,
         rows,
         K=k,
+        BLOCK=_BLOCK,
+        num_warps=4,
+    )
+
+
+# The row count and width are runtime values: every batch and width share one binary.
+@triton.jit(do_not_specialize=["rows", "k"])
+def _expand_k_row_requests_kernel(
+    lengths_ptr,
+    requests_out_ptr,
+    ends_out_ptr,
+    rows,
+    k,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    live = row < rows
+    request = row // k
+    offset = (row - request * k).to(tl.int32)
+    length = tl.load(lengths_ptr + request, mask=live, other=0).to(tl.int32)
+    tl.store(requests_out_ptr + row, request.to(tl.int32), mask=live)
+    tl.store(ends_out_ptr + row, length + offset - (k - 1), mask=live)
+
+
+def expand_k_row_requests(
+    lengths: torch.Tensor,
+    *,
+    k: int,
+    requests_out: torch.Tensor,
+    ends_out: torch.Tensor,
+) -> None:
+    """Write every per-token row's request and causal end in one launch.
+
+    Row ``r * k + t`` belongs to request ``r`` and ends at
+    ``lengths[r] - (k - 1 - t)``. Unlike :func:`expand_k_row_lengths`'
+    causal rows, the ends are not clamped: a row past a short request's
+    length keeps a non-positive end, which a top-k reads as no visible
+    tokens.
+
+    Args:
+        lengths: ``[requests]`` int32 or int64 request lengths, dense.
+        k: Query rows per request.
+        requests_out: Contiguous int32 ``[rows]`` with ``rows`` at most
+            ``requests * k``: ``requests_out[r * k + t]`` is ``r``.
+        ends_out: Contiguous int32 ``[rows]`` causal ends.
+
+    Returns:
+        None. The outputs are written in place.
+
+    Raises:
+        ValueError: A tensor is not the shape, dtype, or layout the expansion
+            indexes with.
+    """
+    rows = requests_out.numel()
+    if k < 1:
+        raise ValueError(f"k must be positive, got {k}")
+    if (
+        lengths.dim() != 1
+        or lengths.dtype not in (torch.int32, torch.int64)
+        or lengths.stride(0) != 1
+    ):
+        raise ValueError("request lengths must be dense int32/int64 [requests]")
+    if rows > lengths.shape[0] * k:
+        raise ValueError(f"{rows} rows exceed {lengths.shape[0]} requests of {k}")
+    for out in (requests_out, ends_out):
+        if out.dtype != torch.int32 or out.shape != (rows,) or not out.is_contiguous():
+            raise ValueError(f"per-token rows must be {rows} contiguous int32 values")
+        if out.device != lengths.device:
+            raise ValueError("expand_k_row_requests needs colocated tensors")
+    if rows == 0:
+        return
+    if not lengths.is_cuda:
+        row = torch.arange(rows, device=lengths.device, dtype=torch.int32)
+        request = row // k
+        requests_out.copy_(request)
+        ends_out.copy_(lengths[request.long()] + (row - request * k) - (k - 1))
+        return
+
+    _expand_k_row_requests_kernel[(triton.cdiv(rows, _BLOCK),)](
+        lengths,
+        requests_out,
+        ends_out,
+        rows,
+        k,
         BLOCK=_BLOCK,
         num_warps=4,
     )

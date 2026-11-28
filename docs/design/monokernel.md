@@ -224,12 +224,14 @@ tokens in order, and it reads every value that an earlier token of the launch
 produced (for example its k and v) from that token's mailbox row, not from the
 cache, since another CTA's cache write need not be visible.
 
-Later stages can serve fewer rows than the first ones. In a draft model's
-first step, every verified row writes its cache entries, but only the row
-that the draft samples runs the rest of the layer, as the regular path's
-draft narrowing does. Those later stages use a plan of one row, with the
-same stages and regions, and the mailbox view of that row. The row is a
-runtime value.
+A step whose rows narrow is two launches, not a mode of one. In a draft
+model's first step, every verified row writes its cache entries, but only
+the row that the draft samples runs the rest of the layer, as the regular
+path's draft narrowing does. A prefix launch (a plan of the stages up to
+the cache writes, tagged with a layer slot of its own) runs every row; the
+regular path's narrowing gathers the sampled rows; an ordinary decode
+launch runs them and reads the other rows from the caches, which the
+kernel boundary makes visible. The sampled rows are runtime values.
 
 A request's operands are passed once a request, not once a row: its
 lengths, page tables, and state pages. A bundle's per-row view points at the

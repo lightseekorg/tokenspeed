@@ -409,6 +409,40 @@ def test_mapped_tables_lookup_local_ids(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_post_load_hooks_keep_offloaded_table_in_host_memory():
+    from tokenspeed.runtime.model_loader.loader import device_loading_context
+
+    lookup = ple_lookup.PLELookup(
+        _mapping_class()(rank=0, world_size=1),
+        vocab_size=4096,
+        ngram_heads=2,
+        head_dim=256,
+        storage_dtype=None,
+        output_dtype=torch.bfloat16,
+        offload=True,
+        table_layout="global_sharded",
+        enable_hot_cache=False,
+        prefix="",
+    )
+    table = lookup.ngram_embedding.weight
+    table.data.copy_(torch.randn(table.shape).to(table.dtype))
+    expected = table.detach().clone()
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+
+    # The post-load step wraps every module with a quant method in this context.
+    with device_loading_context(lookup.ngram_embedding, torch.device("cuda")):
+        assert lookup.ngram_embedding.weight.device.type == "cpu"
+
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() == allocated
+    assert lookup.ngram_embedding.weight is table
+    assert table.is_pinned()
+    torch.testing.assert_close(table, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 def test_host_lookup_stream_handoff(monkeypatch):
     monkeypatch.setenv("TOKENSPEED_PLE_HOST_CACHE_SLOTS", "512")
     tokens, heads, dim, vocab = 4, 16, 160, 256
@@ -446,3 +480,32 @@ def test_host_lookup_stream_handoff(monkeypatch):
     graph.replay()
     expected = table[ids.cpu()].reshape(tokens, -1)
     torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+
+def test_device_table_scale_dequantizes_the_device_lookup():
+    """A device FP8 table's rows read through ``device_table_scale`` (as the
+    Qwen4-Exp decode monokernel gathers them) equal the device lookup; a
+    table in the output dtype has no scale."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU")
+    mapping = _mapping_class()(rank=0, world_size=1)
+    assert _lookup(mapping).device_table_scale is None
+    vocab, heads, dim = 8, 2, 4
+    lookup = ple_lookup.PLELookup(
+        mapping,
+        vocab_size=vocab,
+        ngram_heads=heads,
+        head_dim=dim,
+        storage_dtype=torch.float8_e4m3fn,
+        output_dtype=torch.bfloat16,
+        offload=False,
+        table_layout="global_sharded",
+        enable_hot_cache=False,
+        prefix="",
+    ).cuda()
+    table = torch.linspace(-3.0, 5.0, vocab * dim).reshape(vocab, dim).bfloat16()
+    lookup.load_shard(table, 0, 1, prescanned=False)
+    ids = torch.tensor([[1, 6], [7, 0]], device="cuda")
+    weight = lookup.ngram_embedding.weight.data
+    expected = (weight[ids].float() * lookup.device_table_scale).bfloat16()
+    assert torch.equal(lookup.gather_device(ids), expected.flatten(-2))

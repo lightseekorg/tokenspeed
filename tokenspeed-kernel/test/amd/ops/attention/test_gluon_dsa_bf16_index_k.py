@@ -153,10 +153,16 @@ def _decode(
     )
 
 
-@pytest.mark.parametrize("q_len", (1, 4))
+# The batching test below runs 32 heads with BF16 weights; FP32 weights and
+# 64 heads here, each at one row and at a four-row block.
 @pytest.mark.parametrize(
-    ("heads", "weight_dtype"),
-    ((32, torch.float32), (32, torch.bfloat16), (64, torch.bfloat16)),
+    ("q_len", "heads", "weight_dtype"),
+    (
+        (1, 32, torch.float32),
+        (4, 32, torch.float32),
+        (1, 64, torch.bfloat16),
+        (4, 64, torch.bfloat16),
+    ),
 )
 def test_bf16_plane_decode_matches_fp32_reference(
     q_len: int, heads: int, weight_dtype: torch.dtype
@@ -324,7 +330,8 @@ def test_bf16_plane_prefill_selection_is_independent_of_row_blocking(
     _assert_selection(together, together_lens, expected, expected_lens, candidates)
 
 
-@pytest.mark.parametrize("q_len", (1, 2, 3, 5, 6))
+# Every row block (1, 2, 4 and 8 rows), the wider two padded.
+@pytest.mark.parametrize("q_len", (1, 2, 3, 5))
 def test_bf16_plane_decode_selection_is_independent_of_batching(q_len: int) -> None:
     """Every q_len_per_req selects per request what the batch selects.
 

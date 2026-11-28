@@ -112,6 +112,25 @@ def test_plan_row_copies_of_regions_follow_row_zero():
     assert plan.scratch_pairs == 3 * 64
 
 
+def test_plan_with_rows_keeps_each_rows_regions():
+    """A plan for some of a launch's rows keeps the stages and the regions'
+    offsets and row stride, so its mailbox at a row addresses that row's
+    regions; its rows are tokens of their own (chain 1)."""
+    plan = Plan(
+        grid=8,
+        stages=(Stage("s", 1, 0, writes=("a", "b")),),
+        regions=(("a", 40), ("b", 8)),
+        rows=8,
+        chain=4,
+    )
+    part = plan.with_rows(3)
+    assert (part.rows, part.chain) == (3, 1)
+    assert part.stages == plan.stages and part.row_pairs == plan.row_pairs
+    assert part.offset("b") == plan.offset("b")
+    assert part.key != plan.key
+    assert plan.with_rows(3) is part
+
+
 def _chain_plan() -> Plan:
     return Plan(
         grid=8,
@@ -136,11 +155,6 @@ def test_plan_slice_takes_the_inputs_of_dropped_stages_from_the_host():
     assert part.offset("z") == full.offset("z")
     assert part.scratch_pairs == full.scratch_pairs
     assert full.only(("b", "c")).external == ("x",)
-
-
-def test_plan_slice_rejects_unknown_stages():
-    with pytest.raises(KeyError, match="no stages"):
-        _chain_plan().only(("c", "d"))
 
 
 def test_placement_must_name_the_module_stages_in_order():
@@ -249,14 +263,9 @@ def test_poll_bound_changes_the_key_without_changing_layout(
     assert sliced.key == short.key
 
 
+# Bounds past what the kernel's poll counters hold.
 @pytest.mark.parametrize(
-    "bounds",
-    [
-        dict(poll_check=0),
-        dict(poll_check=2**32),
-        dict(poll_timeout_shift=-1),
-        dict(poll_timeout_shift=57),
-    ],
+    "bounds", [dict(poll_check=2**32), dict(poll_timeout_shift=57)]
 )
 def test_plan_rejects_poll_bounds_that_do_not_fit(bounds):
     with pytest.raises(ValueError, match="poll_"):

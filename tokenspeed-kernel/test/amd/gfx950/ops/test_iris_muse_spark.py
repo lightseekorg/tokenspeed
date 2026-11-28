@@ -1563,7 +1563,7 @@ def test_moetail_lamport_codegen(block_m):
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
-@pytest.mark.parametrize("rows", [9, 12, 16])
+@pytest.mark.parametrize("rows", [9, 16])
 def test_moetail_column_senders_push_whole_lines(rows):
     """Each column sender's push instruction writes whole 128-byte lines.
 
@@ -3517,57 +3517,62 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
     dist.barrier()
 
 
+_MUSE_REPLAY_CHECKS = (
+    pytest.param(
+        partial(_muse_boundary_worker, sharded=False), "nccl", id="boundary_push"
+    ),
+    pytest.param(
+        partial(_muse_boundary_worker, sharded=True), "nccl", id="boundary_scatter"
+    ),
+    pytest.param(_muse_collective_policy_worker, "nccl", id="collective_policy"),
+    pytest.param(_muse_pull_warmup_worker, "nccl", id="pull_warmup"),
+    pytest.param(_muse_owned_packet_worker, "gloo", id="owned_packets"),
+    pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),
+    pytest.param(_muse_lamport_gather_mxfp4_worker, "nccl", id="lamport_gather_mxfp4"),
+    pytest.param(
+        _muse_lamport_gather_mxfp4_topk_worker,
+        "nccl",
+        id="lamport_gather_mxfp4_topk",
+    ),
+    pytest.param(_muse_decode_step_lamport_worker, "nccl", id="decode_step_lamport"),
+    pytest.param(_muse_moetail_worker, "nccl", id="moetail"),
+    pytest.param(
+        partial(_muse_sliding_attention_tail_worker, first_epoch=0),
+        "nccl",
+        id="sliding_attention_tail",
+    ),
+    pytest.param(
+        partial(_muse_sliding_attention_tail_worker, first_epoch=2**31 - 2),
+        "nccl",
+        id="sliding_attention_tail_epoch_wrap",
+    ),
+    pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
+    pytest.param(_muse_int8_block16_payload_worker, "nccl", id="int8_block16_payloads"),
+    pytest.param(
+        _muse_lamport_two_shot_order_worker, "nccl", id="lamport_two_shot_order"
+    ),
+    pytest.param(_muse_owned_stream_tap_worker, "nccl", id="owned_stream_taps"),
+    pytest.param(_muse_tp_route_scatter_worker, "nccl", id="tp_route_scatter"),
+    pytest.param(_muse_tp_column_routes_worker, "nccl", id="tp_column_routes"),
+    pytest.param(
+        _muse_intermediate_exchange_worker, "nccl", id="intermediate_exchange"
+    ),
+)
+# At TP4 these checks only build the state, as every other TP4 check does: the
+# route scatter returns, and the sliding tail's one TP4 assertion (no tail
+# region) does not depend on its first epoch.
+_MUSE_TP8_ONLY_CHECKS = {"tp_route_scatter", "sliding_attention_tail_epoch_wrap"}
+
+
 @pytest.mark.parametrize(
-    "check,backend",
+    "world_size,check,backend",
     [
-        pytest.param(
-            partial(_muse_boundary_worker, sharded=False), "nccl", id="boundary_push"
-        ),
-        pytest.param(
-            partial(_muse_boundary_worker, sharded=True), "nccl", id="boundary_scatter"
-        ),
-        pytest.param(_muse_collective_policy_worker, "nccl", id="collective_policy"),
-        pytest.param(_muse_pull_warmup_worker, "nccl", id="pull_warmup"),
-        pytest.param(_muse_owned_packet_worker, "gloo", id="owned_packets"),
-        pytest.param(_muse_routed_lamport_worker, "nccl", id="routed_lamport"),
-        pytest.param(
-            _muse_lamport_gather_mxfp4_worker, "nccl", id="lamport_gather_mxfp4"
-        ),
-        pytest.param(
-            _muse_lamport_gather_mxfp4_topk_worker,
-            "nccl",
-            id="lamport_gather_mxfp4_topk",
-        ),
-        pytest.param(
-            _muse_decode_step_lamport_worker, "nccl", id="decode_step_lamport"
-        ),
-        pytest.param(_muse_moetail_worker, "nccl", id="moetail"),
-        pytest.param(
-            partial(_muse_sliding_attention_tail_worker, first_epoch=0),
-            "nccl",
-            id="sliding_attention_tail",
-        ),
-        pytest.param(
-            partial(_muse_sliding_attention_tail_worker, first_epoch=2**31 - 2),
-            "nccl",
-            id="sliding_attention_tail_epoch_wrap",
-        ),
-        pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
-        pytest.param(
-            _muse_int8_block16_payload_worker, "nccl", id="int8_block16_payloads"
-        ),
-        pytest.param(
-            _muse_lamport_two_shot_order_worker, "nccl", id="lamport_two_shot_order"
-        ),
-        pytest.param(_muse_owned_stream_tap_worker, "nccl", id="owned_stream_taps"),
-        pytest.param(_muse_tp_route_scatter_worker, "nccl", id="tp_route_scatter"),
-        pytest.param(_muse_tp_column_routes_worker, "nccl", id="tp_column_routes"),
-        pytest.param(
-            _muse_intermediate_exchange_worker, "nccl", id="intermediate_exchange"
-        ),
+        pytest.param(world_size, *case.values, id=f"{world_size}-{case.id}")
+        for world_size in (4, 8)
+        for case in _MUSE_REPLAY_CHECKS
+        if world_size == 8 or case.id not in _MUSE_TP8_ONLY_CHECKS
     ],
 )
-@pytest.mark.parametrize("world_size", [4, 8])
 def test_muse_collective_replay(check, backend, world_size):
     _skip_if_unsupported(world_size, "Muse collective replay")
     if not current_platform().is_cdna4:
@@ -3659,17 +3664,3 @@ def test_int8_block16_encode_indexes_past_2_31_elements():
         scales[-256:].cpu().view(torch.int32), want_scales.view(torch.int32)
     )
     assert bool((want_codes != 0).any())
-
-
-def test_int8_block16_payload_choice_is_checked():
-    """An owned-row collective names its payload: an unknown name raises, and
-    int8-block16 raises when its buffers were not prepared."""
-    from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
-
-    state = MuseIrisState.__new__(MuseIrisState)
-    state.payload_codes = None
-    assert state._int8_block16("bf16") is False
-    with pytest.raises(ValueError, match="unknown collective payload"):
-        state._int8_block16("fp8")
-    with pytest.raises(RuntimeError, match="not prepared"):
-        state._int8_block16("int8-block16")

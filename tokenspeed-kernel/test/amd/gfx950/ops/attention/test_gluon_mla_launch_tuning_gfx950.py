@@ -30,26 +30,16 @@ mla_decode = pytest.importorskip(
 )
 
 
+# Every batch, head block and workgroup target once; the split count scales
+# linearly in the target.
 @pytest.mark.parametrize(
     "batch,block_h,target_workgroups,expected_splits",
     [
         pytest.param(1, 16, 256, 64, id="bh16-b1-w256"),
         pytest.param(2, 64, 64, 32, id="bh64-b2-w64"),
-        pytest.param(2, 64, 128, 64, id="bh64-b2-w128"),
-        pytest.param(2, 64, 256, 128, id="bh64-b2-w256"),
-        pytest.param(2, 64, 512, 256, id="bh64-b2-w512"),
-        pytest.param(4, 64, 64, 16, id="bh64-b4-w64"),
-        pytest.param(4, 64, 128, 32, id="bh64-b4-w128"),
-        pytest.param(4, 64, 256, 64, id="bh64-b4-w256"),
         pytest.param(4, 64, 512, 128, id="bh64-b4-w512"),
-        pytest.param(2, 16, 64, 8, id="bh16-b2-w64"),
         pytest.param(2, 16, 128, 16, id="bh16-b2-w128"),
-        pytest.param(2, 16, 256, 32, id="bh16-b2-w256"),
-        pytest.param(2, 16, 512, 64, id="bh16-b2-w512"),
         pytest.param(4, 16, 64, 4, id="bh16-b4-w64"),
-        pytest.param(4, 16, 128, 8, id="bh16-b4-w128"),
-        pytest.param(4, 16, 256, 16, id="bh16-b4-w256"),
-        pytest.param(4, 16, 512, 32, id="bh16-b4-w512"),
     ],
 )
 def test_small_batch_split_selection_hits_target_workgroups(
@@ -93,18 +83,6 @@ def test_small_batch_split_selection_caps_at_available_kv_blocks() -> None:
             1,
             16,
             id="bh16-multiblock-invalid-heads",
-        ),
-        pytest.param(
-            "launch_gluon_mla_decode_bf16xbf16_gfx950_bh16_multiblock",
-            3,
-            64,
-            id="bh16-multiblock-invalid-batch",
-        ),
-        pytest.param(
-            "launch_gluon_mla_decode_bf16xbf16_gfx950_bh64_small",
-            1,
-            16,
-            id="bh64-small-invalid-heads",
         ),
         pytest.param(
             "launch_gluon_mla_decode_bf16xbf16_gfx950_bh64_small",

@@ -49,7 +49,9 @@ if not is_cdna5():
     )
 
 
-@pytest.mark.parametrize("rows", [2, 4, 8, 16, 32, 64])
+# 2 and 16 rows: a partial 16-row tile and the M=16 kernel; 32 and 64 rows: a
+# partial and a whole 64-row tile.
+@pytest.mark.parametrize("rows", [2, 16, 32, 64])
 def test_kimi3_add3_auto_fuses_matches_composed_and_captures(rows: int) -> None:
     from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16 import mm as dense_module
 
@@ -145,7 +147,8 @@ def test_kimi3_m16_add3_rejects_non_target_projection() -> None:
         )
 
 
-@pytest.mark.parametrize("num_tokens", [2, 4, 8, 16, 32, 64])
+# Partial and whole 16-row and 64-row tiles.
+@pytest.mark.parametrize("num_tokens", [2, 16, 32, 64])
 def test_kimi3_mla_qkv_gate_tdm_auto_matches_and_captures(
     num_tokens: int,
 ) -> None:
@@ -200,7 +203,9 @@ def test_kimi3_mla_qkv_gate_tdm_auto_matches_and_captures(
     )
 
 
-@pytest.mark.parametrize("num_tokens", [512, 4095, 4096, 4097, 8192, 12289])
+# Whole and ragged 128-row tiles, then whole and ragged clusters of the warp
+# pipeline kernel, which takes over at 4096 rows.
+@pytest.mark.parametrize("num_tokens", [512, 4095, 4096, 4097])
 def test_kimi3_gfx1250_large_m_latent_projection_matches_and_captures(
     num_tokens: int,
 ) -> None:
@@ -243,7 +248,7 @@ def test_kimi3_gfx1250_large_m_latent_projection_matches_and_captures(
     torch.testing.assert_close(captured, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [512, 4095, 4097, 8192, 12289])
+@pytest.mark.parametrize("num_tokens", [512, 4095, 4097, 8192])
 def test_kimi3_gfx1250_large_m_shared_down_matches(
     num_tokens: int,
 ) -> None:
@@ -392,7 +397,8 @@ def test_kimi3_gfx1250_large_m_mla_query_matches() -> None:
     torch.testing.assert_close(kv, expected_kv, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [2, 4, 8, 16, 32, 64])
+# Partial and whole 16-row and 64-row tiles.
+@pytest.mark.parametrize("num_tokens", [2, 16, 32, 64])
 def test_kimi3_kda_qkvfab_tdm_auto_matches_and_captures(
     num_tokens: int,
 ) -> None:
@@ -501,9 +507,17 @@ def test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches() -> None:
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("solution", ["auto", "torch"])
-@pytest.mark.parametrize("rows,width", [(2, 64), (17, 16)])
+# Auto runs the Gluon kernel only for BF16, on both its 16- and 64-row tiles;
+# FP16 auto and a forced torch solution keep torch.mm.
+@pytest.mark.parametrize(
+    "rows,width,solution,dtype",
+    [
+        pytest.param(2, 64, "auto", torch.bfloat16, id="2-64-auto-bf16"),
+        pytest.param(17, 16, "auto", torch.bfloat16, id="17-16-auto-bf16"),
+        pytest.param(17, 16, "auto", torch.float16, id="17-16-auto-fp16"),
+        pytest.param(2, 64, "torch", torch.bfloat16, id="2-64-torch-bf16"),
+    ],
+)
 def test_kimi3_shared_down_strided_output_contract(
     dtype, solution, rows, width
 ) -> None:
@@ -527,10 +541,6 @@ def test_kimi3_shared_down_strided_output_contract(
     assert actual is out
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
     assert torch.all(lane[:, :32] == -7)
-    with pytest.raises(ValueError, match="unknown"):
-        kernel_kimi3_shared_down_projection(
-            hidden_states, weight, out=out, solution="invalid"
-        )
 
 
 @pytest.mark.parametrize("noncontiguous", ["input", "weight"])

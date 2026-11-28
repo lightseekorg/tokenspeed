@@ -83,8 +83,10 @@ def _assert_outputs(
         torch.testing.assert_close(result, correct, rtol=2e-2, atol=2e-2)
 
 
+# Decode, the first row counts past 64 and 256, and a large prefill; the
+# kernels' own tests cover the remaining row counts.
 @pytest.mark.parametrize("mode", ["mhc_pre", "mhc_post"])
-@pytest.mark.parametrize("tokens", [1, 64, 65, 256, 257, 848, 8192])
+@pytest.mark.parametrize("tokens", [1, 65, 257, 8192])
 def test_glm_residual_benchmark_checks_outputs_and_persistent_inputs(
     mode: str, tokens: int
 ) -> None:

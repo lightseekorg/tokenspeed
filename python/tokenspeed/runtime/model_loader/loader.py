@@ -86,9 +86,12 @@ def device_loading_context(
 
     original_device_states: dict[str, torch.device] = {}
 
-    # Store original device states and move parameters to GPU if they're on CPU
+    # Store original device states and move parameters to GPU if they're on CPU.
+    # A ``host_resident`` parameter lives in host memory by design (an
+    # offloaded or mapped PLE table that kernels read in place); staging it
+    # through the device would copy it twice and strand a device segment.
     for name, p in module.named_parameters():
-        if p.device.type == "cpu" and not getattr(p, "ple_shared_storage", False):
+        if p.device.type == "cpu" and not getattr(p, "host_resident", False):
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)
         # Parameters already on target device are not touched
@@ -169,11 +172,22 @@ def _initialize_model(
             raise ValueError(
                 "This model does not implement peer expert-weight ownership"
             )
-    # Only VLM wrappers accept these kwargs.
+    # Profiles opt into runtime policy; VLM wrappers also receive encoder settings.
     extra_kwargs: dict = {}
+    if model_config.runtime_config is not None:
+        extra_kwargs["runtime_config"] = model_config.runtime_config
     if model_config.is_multimodal:
         extra_kwargs["is_multimodal_active"] = model_config.is_multimodal_active
         extra_kwargs["mm_attention_backend"] = model_config.mm_attention_backend
+    profile = model_config.model_profile
+    if profile is not None and profile.create_model_kwargs is not None:
+        model_kwargs = profile.create_model_kwargs(model_config, load_config)
+        conflicts = extra_kwargs.keys() & model_kwargs.keys()
+        if conflicts:
+            raise ValueError(
+                f"Model constructor arguments already supplied: {sorted(conflicts)}"
+            )
+        extra_kwargs.update(model_kwargs)
     return model_class(
         config=model_config.hf_config,
         mapping=mapping,
@@ -682,9 +696,12 @@ def post_load_transformed_modules(model: nn.Module) -> list[str]:
         ``named_modules`` order; empty when every hook is a no-op.
     """
     from tokenspeed.runtime.layers.moe.expert import MoELayer
+    from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
     from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE
 
-    no_op_hooks = no_op_post_load_hooks()
+    no_op_hooks: frozenset[Any] = no_op_post_load_hooks()
+    if isinstance(model, BaseCausalLM):
+        no_op_hooks = no_op_hooks | model.reloadable_post_load_hooks()
     transformed: list[str] = []
     for name, module in model.named_modules():
         owners = [type(module)]
@@ -699,7 +716,7 @@ def post_load_transformed_modules(model: nn.Module) -> list[str]:
                 preprocessor = (getattr(module, "plan", None) or {}).get(
                     "weight_preprocessor"
                 )
-                if preprocessor is None:
+                if preprocessor is None or preprocessor in no_op_hooks:
                     continue
                 owner_name = getattr(preprocessor, "__name__", repr(preprocessor))
             elif hook is DeepseekV4MoE.process_weights_after_loading:
@@ -794,8 +811,20 @@ class DummyModelLoader(BaseModelLoader):
             # give those random values as well. This also overwrites the
             # values a floating-point parameter's dummy initializer set, so a
             # copy post-processing derived from such a parameter does not
-            # match it afterwards.
-            initialize_dummy_weights(model)
+            # match it afterwards. Skip composite peer-weight views: finalize
+            # already copied and distributed the initialized owned shards and
+            # shared staging pools must not be overwritten across layers.
+            from tokenspeed.runtime.layers.moe.peer_weights import (
+                peer_weights_controller_for,
+            )
+
+            exclude_data_ptrs: set[int] | None = None
+            controller = peer_weights_controller_for(model)
+            if controller is not None and controller.finalized:
+                exclude_data_ptrs = {
+                    p.data_ptr() for p in controller.managed_parameters() if p.numel()
+                }
+            initialize_dummy_weights(model, exclude_data_ptrs=exclude_data_ptrs)
         return model.eval()
 
 

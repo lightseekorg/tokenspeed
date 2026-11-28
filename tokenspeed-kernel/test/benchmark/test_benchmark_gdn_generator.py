@@ -157,18 +157,31 @@ def test_gdn_staged_verify_writes_each_position_to_its_own_row(
     assert int(rows.max()) < call["initial_state"].shape[0]
 
 
+# Value heads per rank: Qwen3.8-Flash-Next's 48 GDN value heads split over TP.
+_PROFILE_VALUE_HEADS = [("qwen38_flash_tp1", 48), ("qwen38_flash_tp2", 24)]
+
+
+@pytest.mark.parametrize("model_profile, value_heads", _PROFILE_VALUE_HEADS)
 @pytest.mark.parametrize("state_dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("state_writes", [None, "none", "per_token"])
-def test_gdn_decode_benchmark_runs_with_explicit_state_dtype(state_dtype, state_writes):
+def test_gdn_decode_benchmark_runs_with_explicit_state_dtype(
+    model_profile, value_heads, state_dtype, state_writes
+):
     if state_writes is None:
         prepare = gdn_generator.prepare_gdn_decode_step
-        request = _request("gdn_decode_step", batch=2, state_dtype=state_dtype)
+        request = _request(
+            "gdn_decode_step",
+            model_profile=model_profile,
+            batch=2,
+            state_dtype=state_dtype,
+        )
         tokens = 1
     else:
         prepare = gdn_generator.prepare_gdn_decode_mtp
         tokens = 4
         request = _request(
             "gdn_decode_mtp",
+            model_profile=model_profile,
             batch=2,
             tokens=tokens,
             state_writes=state_writes,
@@ -176,27 +189,55 @@ def test_gdn_decode_benchmark_runs_with_explicit_state_dtype(state_dtype, state_
         )
     prepared = prepare(replace(request, solution="triton"), current_platform())
     output = prepared.invocation.invoke()
-    assert output.shape == (2, tokens, 24, 128)
+    assert output.shape == (2, tokens, value_heads, 128)
     assert torch.isfinite(output).all()
     assert prepared.parameters["state_dtype"] == state_dtype
 
 
-@pytest.mark.parametrize("state_dtype", [None, "float16"])
-@pytest.mark.parametrize("mode", ["gdn_decode_step", "gdn_decode_mtp"])
-def test_gdn_decode_benchmark_rejects_missing_or_unsupported_state_dtype(
-    mode, state_dtype
+@pytest.mark.parametrize("model_profile, value_heads", _PROFILE_VALUE_HEADS)
+@pytest.mark.parametrize("state_dtype", ["float32", "bfloat16"])
+def test_gdn_chunk_prefill_benchmark_runs_with_explicit_state_dtype(
+    model_profile, value_heads, state_dtype
 ):
-    request = _request(mode, batch=2, tokens=4, state_writes="none")
+    request = _request(
+        "gdn_chunk_prefill",
+        model_profile=model_profile,
+        sequences=3,
+        tokens_per_sequence=80,
+        state_dtype=state_dtype,
+    )
+    prepared = gdn_generator.prepare_gdn_chunk_prefill(request, current_platform())
+    result = prepared.invocation.invoke()
+
+    assert result.out.shape == (1, 240, value_heads, 128)
+    assert torch.isfinite(result.out).all()
+    assert result.final_state.shape == (3, value_heads, 128, 128)
+    assert prepared.parameters["state_dtype"] == state_dtype
+
+
+@pytest.mark.parametrize("state_dtype", [None, "float16"])
+@pytest.mark.parametrize(
+    "mode", ["gdn_decode_step", "gdn_decode_mtp", "gdn_chunk_prefill"]
+)
+def test_gdn_benchmark_rejects_missing_or_unsupported_state_dtype(mode, state_dtype):
+    request = _request(
+        mode,
+        batch=2,
+        tokens=4,
+        state_writes="none",
+        sequences=2,
+        tokens_per_sequence=64,
+    )
     parameters = dict(request.parameters)
     if state_dtype is None:
         del parameters["state_dtype"]
     else:
         parameters["state_dtype"] = state_dtype
-    prepare = (
-        gdn_generator.prepare_gdn_decode_step
-        if mode == "gdn_decode_step"
-        else gdn_generator.prepare_gdn_decode_mtp
-    )
+    prepare = {
+        "gdn_decode_step": gdn_generator.prepare_gdn_decode_step,
+        "gdn_decode_mtp": gdn_generator.prepare_gdn_decode_mtp,
+        "gdn_chunk_prefill": gdn_generator.prepare_gdn_chunk_prefill,
+    }[mode]
     with pytest.raises(BenchmarkCaseError, match="state_dtype") as error:
         prepare(replace(request, parameters=parameters), current_platform())
     assert error.value.status == BenchmarkStatus.INVALID_CASE

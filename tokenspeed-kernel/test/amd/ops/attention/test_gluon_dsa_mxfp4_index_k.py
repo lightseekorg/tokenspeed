@@ -133,8 +133,16 @@ def test_writer_matches_dsv41_codec(masked):
     assert torch.equal(buf.view(pages, -1), want)
 
 
-@pytest.mark.parametrize("heads", [32, 64])
-@pytest.mark.parametrize("q_len", [1, 4, 8])
+# Each head count at one row and at a wider row block; every row block once.
+@pytest.mark.parametrize(
+    ("q_len", "heads"),
+    [
+        pytest.param(1, 32, id="1-32"),
+        pytest.param(4, 32, id="4-32"),
+        pytest.param(1, 64, id="1-64"),
+        pytest.param(8, 64, id="8-64"),
+    ],
+)
 def test_decode_scores(captured_logits, heads, q_len):
     torch.manual_seed(0)
     pages = 96

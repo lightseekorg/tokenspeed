@@ -263,13 +263,50 @@ def test_settings_separate_the_qsa_bf16_prefill_scratch(construction):
     # Off, the producer facts are those of a build without the option, so
     # existing deployments keep their identity.
     assert "enable_qsa_prefill_bf16_scratch" not in _kv_producer_options(
-        args, draft_dtype=""
+        args, draft_dtype="", plugin_runtime_config=False
     )
     without = l3_settings(args, model, None, **factory_kwargs)
     args.enable_qsa_prefill_bf16_scratch = True
     with_scratch = l3_settings(args, model, None, **factory_kwargs)
     # Large prefill calls attend through another kernel.
     assert with_scratch.deployment_id != without.deployment_id
+
+
+def test_settings_separate_plugin_execution_options(construction):
+    from dataclasses import dataclass
+
+    from tokenspeed.runtime.plugins.registry import (
+        recording,
+        register_extra_server_args,
+    )
+
+    @dataclass(frozen=True)
+    class Options:
+        fixture_arithmetic: str = "native"
+
+    args, model, _, factory_kwargs = construction
+    original = l3_settings(args, model, None, **factory_kwargs)
+    model.runtime_config = Options()
+    default_policy = l3_settings(args, model, None, **factory_kwargs)
+    assert default_policy.deployment_id != original.deployment_id
+    with recording() as registration:
+        register_extra_server_args("l3_fixture", Options, validate=None)
+    try:
+        native = replace(args, extra_server_args={"fixture_arithmetic": "native"})
+        precise = replace(args, extra_server_args={"fixture_arithmetic": "bitwise"})
+        native.mapping.rank = args.mapping.rank
+        precise.mapping.rank = args.mapping.rank
+        left = l3_settings(native, model, None, **factory_kwargs)
+        right = l3_settings(precise, model, None, **factory_kwargs)
+        assert left.deployment_id != right.deployment_id
+        snapshot = _kv_producer_options(
+            native, draft_dtype="", plugin_runtime_config=True
+        )
+        native.extra_server_args["fixture_arithmetic"] = "bitwise"
+        assert snapshot["extra_server_args"]["fixture_arithmetic"] == "native"
+    finally:
+        for undo in reversed(registration.undo):
+            undo()
 
 
 def test_settings_ignore_flat_kv_flag_for_an_unchanged_layout(construction):
@@ -322,7 +359,9 @@ def test_qwen4_flat_and_ordinary_layouts_have_distinct_namespaces(construction):
                 draft_attention_backend="mha",
                 skip_softmax_threshold=0.0,
                 eagle3_layers_to_capture=(),
-                kv_producer=_kv_producer_options(args, draft_dtype="bfloat16"),
+                kv_producer=_kv_producer_options(
+                    args, draft_dtype="bfloat16", plugin_runtime_config=False
+                ),
             )
     assert identities[False, False] == identities[False, True]
     assert identities[True, False] == identities[True, True]

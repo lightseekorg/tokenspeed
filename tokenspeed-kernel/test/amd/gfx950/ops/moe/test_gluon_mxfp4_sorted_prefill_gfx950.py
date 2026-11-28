@@ -363,16 +363,24 @@ _CLAMPED = {"swiglu_alpha": 1.702, "swiglu_limit": 7.0, "swiglu_beta": 1.0}
 _SITU = {"swiglu_alpha": 1.0, "situ_linear_beta": 4.0}
 
 
-@pytest.mark.parametrize("routing", ["uniform", "zipf"])
-@pytest.mark.parametrize("block_m", [64, 128])
+# Each row count runs both sort blocks, each with a different routing.
 @pytest.mark.parametrize(
-    "rows",
+    "rows, block_m, routing",
     [
-        200,  # small round: most blocks end in padding
-        1031,  # ragged tail
-        4099,
-        8193,  # past 8,192 rows, where serving takes 128-row sort blocks
-        16391,  # 16k round with a ragged tail
+        # Small round: most blocks end in padding.
+        (200, 64, "uniform"),
+        (200, 128, "zipf"),
+        # Ragged tail.
+        (1031, 64, "zipf"),
+        (1031, 128, "uniform"),
+        (4099, 64, "uniform"),
+        (4099, 128, "zipf"),
+        # Past 8,192 rows, where serving takes 128-row sort blocks.
+        (8193, 64, "zipf"),
+        (8193, 128, "uniform"),
+        # 16k round with a ragged tail.
+        (16391, 64, "uniform"),
+        (16391, 128, "zipf"),
     ],
 )
 def test_wide_stage1_tile_writes_the_general_tile_bits(
@@ -393,15 +401,19 @@ def test_wide_stage1_tile_writes_the_general_tile_bits(
     assert torch.equal(wide[1], general[1])
 
 
+# Every K-loop shape with SiLU; each other epilogue on one K-loop shape.
 @pytest.mark.parametrize(
-    "hidden",
+    "hidden, activation",
     [
-        512,  # two K tiles: no steady-state loop
-        1280,  # five K tiles: an odd steady count takes the single-tile step
-        2048,
+        # Two K tiles: no steady-state loop.
+        pytest.param(512, _SILU, id="silu-512"),
+        # Five K tiles: an odd steady count takes the single-tile step.
+        pytest.param(1280, _SILU, id="silu-1280"),
+        pytest.param(2048, _SILU, id="silu-2048"),
+        pytest.param(512, _CLAMPED, id="clamped-512"),
+        pytest.param(1280, _SITU, id="situ-1280"),
     ],
 )
-@pytest.mark.parametrize("activation", [_SILU, _CLAMPED, _SITU])
 def test_wide_stage1_tile_bits_hold_across_k_tiles_and_activations(
     hidden: int, activation: dict
 ) -> None:
@@ -622,9 +634,24 @@ def _sorted_stage2_inputs(rows: int, k: int, sort_block_m: int, routing: str):
     return inter, inter_scale, sorted_ids, sorted_weights, expert_ids, valid
 
 
-@pytest.mark.parametrize("routing", ["uniform", "zipf"])
-@pytest.mark.parametrize("sort_block_m", [64, 128])
-@pytest.mark.parametrize("rows", [200, 1031, 3072, 8193, 16391, 24576])
+# Each row count runs both sort blocks, each with a different routing.
+@pytest.mark.parametrize(
+    "rows, sort_block_m, routing",
+    [
+        (200, 64, "uniform"),
+        (200, 128, "zipf"),
+        (1031, 64, "zipf"),
+        (1031, 128, "uniform"),
+        (3072, 64, "uniform"),
+        (3072, 128, "zipf"),
+        (8193, 64, "zipf"),
+        (8193, 128, "uniform"),
+        (16391, 64, "uniform"),
+        (16391, 128, "zipf"),
+        (24576, 64, "zipf"),
+        (24576, 128, "uniform"),
+    ],
+)
 def test_wide_stage2_tile_writes_the_general_tile_bits(
     rows: int, sort_block_m: int, routing: str
 ) -> None:
@@ -643,14 +670,16 @@ def test_wide_stage2_tile_writes_the_general_tile_bits(
 
 
 @pytest.mark.parametrize(
-    "k",
+    "k, do_finalize",
     [
-        512,  # two K tiles: no steady-state loop
-        1280,  # five K tiles: an odd steady count takes the single-tile step
-        2048,
+        # Two K tiles: no steady-state loop.
+        (512, False),
+        # Five K tiles: an odd steady count takes the single-tile step.
+        (1280, False),
+        (1280, True),
+        (2048, False),
     ],
 )
-@pytest.mark.parametrize("do_finalize", [False, True])
 def test_wide_stage2_tile_bits_hold_across_k_tiles_and_finalize(
     k: int, do_finalize: bool
 ) -> None:
@@ -679,8 +708,17 @@ def _by_route(routes, data, scales, count: int) -> torch.Tensor:
     return rows
 
 
-@pytest.mark.parametrize("routing", ["uniform", "zipf"])
-@pytest.mark.parametrize("rows", [200, 1031, 3072, 8193, 16391, 24576])
+@pytest.mark.parametrize(
+    "rows, routing",
+    [
+        (200, "uniform"),
+        (1031, "zipf"),
+        (3072, "uniform"),
+        (8193, "zipf"),
+        (16391, "uniform"),
+        (24576, "zipf"),
+    ],
+)
 def test_wide_tiles_write_every_route_as_the_general_kernels(
     monkeypatch, rows: int, routing: str
 ) -> None:

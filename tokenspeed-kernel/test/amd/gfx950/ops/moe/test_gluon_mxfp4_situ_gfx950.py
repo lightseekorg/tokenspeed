@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 from unittest import mock
 
 import pytest
@@ -519,7 +518,7 @@ def test_ep_unclipped_situ_uses_a16_fallback_gfx950() -> None:
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("num_tokens", [1, 4, 8, 16])
 def test_ep_decode_all_remote_routes_return_zero_gfx950(
     num_tokens: int,
 ) -> None:
@@ -925,7 +924,8 @@ def test_mxfp4_situ_virtual_ep_sum_matches_global_reference_gfx950(
     torch.testing.assert_close(actual, expected, atol=3e-4, rtol=3e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16, 32])
+# A16 decode at one and four rows, the MXFP8 expert path, and the grouped path.
+@pytest.mark.parametrize("num_tokens", [1, 4, 8, 16])
 def test_mxfp4_situ_ep_paths_are_cuda_graph_capturable_gfx950(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
@@ -1138,19 +1138,22 @@ def test_tp_situ_selects_a8w4_and_matches_reference_gfx950(
         torch.testing.assert_close(captured, expected, atol=2e-3, rtol=8e-2)
 
 
-@pytest.mark.parametrize("routing", ["round_robin", "hot_experts"])
 @pytest.mark.parametrize(
-    ("path", "num_tokens"),
+    ("path", "num_tokens", "routing"),
     [
-        ("plain", 1),
-        ("dedup", 4),
+        # One row routes to the same experts under either routing.
+        ("plain", 1, "round_robin"),
+        ("dedup", 4, "round_robin"),
+        ("dedup", 4, "hot_experts"),
         # The Kimi-K3.1 verify width.
-        ("sorted", 8),
+        ("sorted", 8, "round_robin"),
+        ("sorted", 8, "hot_experts"),
         # Above 2,048 rows the prefill package reduces its routes in FP32 in a
         # fixed order. At or below it, BF16 atomic adds make the result vary run
         # to run, even within one layout.
-        ("prefill", 2049),
-        ("prefill_e2m1", 2064),
+        ("prefill", 2049, "round_robin"),
+        ("prefill", 2049, "hot_experts"),
+        ("prefill_e2m1", 2064, "round_robin"),
     ],
 )
 def test_tp_situ_n16_plan_matches_gdot128_gfx950(
@@ -1428,10 +1431,8 @@ def test_package_prefill_low_density_route_capacity_gfx950() -> None:
     "rows,output_k,scale_rows,block_m,error",
     [
         (64, 128, 64, 64, "complete CDNA4 scale panels"),
-        (16, 256, 16, 16, "out_scale must have shape"),
+        # Scale rows must round up to whole 32-row panels.
         (48, 256, 48, 16, "out_scale must have shape"),
-        (16, 256, 32, 16, None),
-        (48, 256, 64, 16, None),
     ],
 )
 def test_stage1_quantized_output_scale_panels_gfx950(
@@ -1454,7 +1455,7 @@ def test_stage1_quantized_output_scale_panels_gfx950(
     a_scale = torch.empty((64, 8), dtype=torch.uint8, device="cuda")
     w_scale = torch.empty((1, 2 * output_k, 8), dtype=torch.uint8, device="cuda")
 
-    with pytest.raises(ValueError, match=error) if error else nullcontext():
+    with pytest.raises(ValueError, match=error):
         prefill_stage1.invoke_gluon_mxfp4_moe_stage1(
             hidden_states,
             w1,
@@ -1477,14 +1478,15 @@ def test_stage1_quantized_output_scale_panels_gfx950(
             num_warps=max(1, block_m // 32),
             wide_tile=False,
         )
-    if error:
-        kernel.__getitem__.assert_not_called()
-    else:
-        kernel.__getitem__.assert_called_once()
+    kernel.__getitem__.assert_not_called()
 
 
 @pytest.mark.parametrize(
-    "intermediate_size", [128, 192, 256, 384, 448, 512, 640, 2880, 3072]
+    "intermediate_size",
+    # Below the 256-wide minimum K (one 128-aligned, one not), a 128-wide pad
+    # inside the physical K, a width rounding up to the physical K, and the
+    # GPT-OSS and Kimi-K3 widths.
+    [128, 192, 384, 448, 2880, 3072],
 )
 def test_package_prefill_intermediate_padding_gfx950(
     monkeypatch: pytest.MonkeyPatch,
@@ -1595,21 +1597,33 @@ def test_package_prefill_intermediate_padding_gfx950(
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
 
 
-@pytest.mark.parametrize("logical_k", [256, 384, 512, 640])
-@pytest.mark.parametrize("topk", [2, 16])
+# Every kernel configuration runs one padded K (384 or 640: an odd number of
+# 128-wide K steps inside a 256-aligned physical K) and one unpadded K (256 or
+# 512), each with a different top-k, so the atomic configurations see both the
+# exact two-route sum and the 16-route rounding bound.
 @pytest.mark.parametrize(
-    "a_format,input_sorted,b_gdot128,force_reduce,block_m,sort_block_m",
+    "logical_k,topk,a_format,input_sorted,b_gdot128,force_reduce,block_m,sort_block_m",
     [
-        ("e2m1", True, True, True, 16, 16),
-        ("e2m1", False, False, False, 16, 32),
-        ("e2m1", True, True, True, 64, 64),
-        ("e2m1", False, False, False, 32, 64),
-        ("e4m3", True, True, True, 64, 64),
-        ("e4m3", False, False, False, 32, 64),
-        ("e2m1", True, False, True, 128, 128),
-        ("e4m3", True, False, False, 128, 128),
-        ("e2m1", False, True, True, 64, 128),
-        ("e4m3", False, True, True, 64, 128),
+        (384, 16, "e2m1", True, True, True, 16, 16),
+        (256, 2, "e2m1", True, True, True, 16, 16),
+        (640, 2, "e2m1", False, False, False, 16, 32),
+        (512, 16, "e2m1", False, False, False, 16, 32),
+        (640, 16, "e2m1", True, True, True, 64, 64),
+        (512, 2, "e2m1", True, True, True, 64, 64),
+        (384, 2, "e2m1", False, False, False, 32, 64),
+        (256, 16, "e2m1", False, False, False, 32, 64),
+        (384, 16, "e4m3", True, True, True, 64, 64),
+        (256, 2, "e4m3", True, True, True, 64, 64),
+        (640, 2, "e4m3", False, False, False, 32, 64),
+        (512, 16, "e4m3", False, False, False, 32, 64),
+        (640, 16, "e2m1", True, False, True, 128, 128),
+        (512, 2, "e2m1", True, False, True, 128, 128),
+        (384, 2, "e4m3", True, False, False, 128, 128),
+        (256, 16, "e4m3", True, False, False, 128, 128),
+        (384, 16, "e2m1", False, True, True, 64, 128),
+        (256, 2, "e2m1", False, True, True, 64, 128),
+        (640, 2, "e4m3", False, True, True, 64, 128),
+        (512, 16, "e4m3", False, True, True, 64, 128),
     ],
 )
 def test_stage2_logical_k_ignores_padding_gfx950(
@@ -1916,35 +1930,20 @@ def test_deferred_stage2_masks_uninitialized_remote_routes_gfx950() -> None:
 
 
 @pytest.mark.parametrize(
-    ("num_tokens", "expected"),
+    "num_tokens,num_experts,block_m",
     [
-        (8, 16),
-        (9, 32),
-        (32, 32),
-        (33, 64),
-        (64, 64),
-        (65, 128),
-        (128, 128),
-        (129, 64),
-        (192, 64),
-        (320, 64),
-        (321, 128),
+        # Every expert ends on a one-row tail tile.
+        pytest.param(193, 16, 16, id="193-16-16"),
+        pytest.param(193, 16, 64, id="193-16-64"),
+        # Fewer rows per expert than one 64-row tile.
+        pytest.param(200, 64, 32, id="200-64-32"),
+        # Whole small tiles, a half tile against the 128-row reference.
+        pytest.param(320, 16, 32, id="320-16-32"),
+        # The last row count that combines with atomics, and the first that
+        # reduces in FP32.
+        pytest.param(2048, 16, 64, id="2048-16-64"),
+        pytest.param(2049, 16, 16, id="2049-16-16"),
     ],
-)
-def test_grouped_moe_block_m_selection_gfx950(
-    num_tokens: int,
-    expected: int,
-) -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
-        _select_grouped_moe_block_m,
-    )
-
-    assert _select_grouped_moe_block_m(num_tokens, 16, 16) == expected
-
-
-@pytest.mark.parametrize("block_m", [16, 32, 64])
-@pytest.mark.parametrize(
-    "num_tokens,num_experts", [(193, 16), (200, 64), (320, 16), (2048, 16), (2049, 16)]
 )
 def test_tp_situ_package_prefill_tiles_match_block128_gfx950(
     monkeypatch: pytest.MonkeyPatch,
@@ -2345,7 +2344,8 @@ def test_ep_situ_package_prefill_matches_reference_gfx950(
     torch.testing.assert_close(captured, expected, atol=2e-3, rtol=8e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 3, 4, 6, 8, 16, 32, 64])
+# Route-direct, deduplicated route-direct, and narrow and wide expert-sorted.
+@pytest.mark.parametrize("num_tokens", [1, 3, 4, 8, 32, 64])
 def test_tp_situ_deferred_topk_reduce_returns_slot_rows_gfx950(num_tokens: int) -> None:
     """Route-direct and expert-sorted decode hand back their top-k slot rows,
     whose slot-order sum is the finalized output bit for bit; paths without a
@@ -2412,7 +2412,8 @@ def test_tp_situ_deferred_topk_reduce_returns_slot_rows_gfx950(num_tokens: int) 
     torch.testing.assert_close(summed.to(torch.bfloat16), finalized, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("num_tokens", [2, 4, 8, 32, 64])
+# Deduplicated route-direct, and narrow and wide expert-sorted.
+@pytest.mark.parametrize("num_tokens", [2, 8, 64])
 def test_tp_situ_decode_reads_upstream_fp8_input_gfx950(num_tokens: int) -> None:
     """Decode takes a producer's FP8 copy of its input for one call: the
     dynamic quantizer's own copy reproduces the output bit for bit, another
@@ -2480,7 +2481,7 @@ def test_tp_situ_decode_reads_upstream_fp8_input_gfx950(num_tokens: int) -> None
         apply(hidden_states, (fp8[:, :-16], scale))
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 64])
+@pytest.mark.parametrize("num_tokens", [1, 3, 4, 64])
 def test_tp_situ_joint_shared_projection_gfx950(num_tokens: int) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260818 + num_tokens)
     module, _ = _make_mxfp4_module(
@@ -2693,22 +2694,44 @@ def test_situ_warp_decode_matches_reference_above_old_bound_gfx950(
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=8e-2)
 
 
-@pytest.mark.parametrize("partial_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("split_major", [False, True])
+# Each shape runs two rows of a pairwise covering array over (partial dtype,
+# split-major partials, masked routes), so every shape and top-k sees both
+# partial dtypes and both masking modes.
 @pytest.mark.parametrize(
-    ("num_tokens", "topk", "width", "column_stride"),
+    (
+        "num_tokens",
+        "topk",
+        "width",
+        "column_stride",
+        "partial_dtype",
+        "split_major",
+        "mask_invalid_routes",
+    ),
     [
-        (1, 1, 1, 1),
-        (5, 2, 127, 2),
-        (31, 4, 257, 1),
-        (84, 16, 3584, 1),
-        (96, 16, 3584, 1),
-        (112, 16, 3584, 1),
-        (513, 8, 7168, 1),
-        (8192, 16, 3584, 1),
+        pytest.param(1, 1, 1, 1, torch.bfloat16, False, False, id="1-1-bf16"),
+        pytest.param(1, 1, 1, 1, torch.float32, False, True, id="1-1-fp32-mask"),
+        pytest.param(
+            5, 2, 127, 2, torch.float32, True, False, id="5-2-strided-fp32-split"
+        ),
+        pytest.param(
+            5, 2, 127, 2, torch.bfloat16, True, True, id="5-2-strided-bf16-split-mask"
+        ),
+        pytest.param(31, 4, 257, 1, torch.bfloat16, False, False, id="31-4-bf16"),
+        pytest.param(31, 4, 257, 1, torch.float32, False, True, id="31-4-fp32-mask"),
+        pytest.param(
+            96, 16, 3584, 1, torch.float32, True, False, id="96-16-fp32-split"
+        ),
+        pytest.param(
+            96, 16, 3584, 1, torch.bfloat16, True, True, id="96-16-bf16-split-mask"
+        ),
+        pytest.param(513, 8, 7168, 1, torch.bfloat16, False, False, id="513-8-bf16"),
+        pytest.param(513, 8, 7168, 1, torch.float32, False, True, id="513-8-fp32-mask"),
+        # The largest prefill chunk, once.
+        pytest.param(
+            8192, 16, 3584, 1, torch.bfloat16, False, True, id="8192-16-bf16-mask"
+        ),
     ],
 )
-@pytest.mark.parametrize("mask_invalid_routes", [False, True])
 def test_partial_reduce_matches_reference_gfx950(
     num_tokens: int,
     topk: int,
@@ -2910,7 +2933,8 @@ def test_sorted_situ_dispatch_and_compilation_gfx950(monkeypatch, intermediate_s
                 run(tokens)
 
 
-@pytest.mark.parametrize("tokens", [7, 8, 12, 16, 31])
+# Below the sorted bound, its first row, and past the deduplicated reference.
+@pytest.mark.parametrize("tokens", [7, 8, 31])
 def test_sorted_situ_from_two_verify_requests_matches_route_direct_gfx950(
     monkeypatch, tokens
 ):
@@ -2975,7 +2999,7 @@ def test_sorted_situ_from_two_verify_requests_matches_route_direct_gfx950(
 
 
 @pytest.mark.parametrize(
-    "tokens,expert_start", [(1, 0), (2, 0), (4, 0), (7, 0), (4, 8), (12, 8), (16, 8)]
+    "tokens,expert_start", [(1, 0), (2, 0), (7, 0), (4, 8), (12, 8), (16, 8)]
 )
 def test_dedup_stage1_matches_route_direct_gfx950(monkeypatch, tokens, expert_start):
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import moe

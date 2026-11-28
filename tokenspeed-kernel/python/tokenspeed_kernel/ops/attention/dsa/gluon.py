@@ -53,6 +53,10 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
         launch_gluon_dsa_prefill_gfx950 as _dsa_prefill_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.candidate_merge import (
+        launch_gluon_dsa_merge_candidates_gfx950,
+        merge_candidates_supported,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (
         gathered_owned_selection_supported,
         gluon_dsa_select_owned_from_gathered_gfx950,
@@ -1090,3 +1094,36 @@ if current_platform().is_amd:
             out=out,
             lens_out=lens_out,
         )
+
+    @register_kernel(
+        "attention",
+        "dsa_merge_candidates",
+        name="gluon_dsa_merge_candidates_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {format_signature(records=dense_tensor_format(torch.int32))}
+        ),
+        traits={
+            "problem_filter": frozenset(
+                {
+                    traits_problem_filter(
+                        merge_candidates_supported, "ranks", "candidates"
+                    )
+                }
+            ),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_dsa_merge_candidates_gfx950(
+        records: torch.Tensor, *, topk: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``dsa_merge_candidates`` in one launch: the radix-selected k-th
+        score and the candidate-order tie quota of
+        ``triton_dsa_merge_candidates``, bit for bit, without a ``torch.topk``,
+        for the sizes ``merge_candidates_supported`` admits."""
+        return launch_gluon_dsa_merge_candidates_gfx950(records, topk=topk)

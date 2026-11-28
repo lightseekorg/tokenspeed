@@ -42,7 +42,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.configs.model_profile import ModelProfile
-from tokenspeed.runtime.configs.numerics import register_numerics_envelope
+from tokenspeed.runtime.configs.numerics import (
+    register_model_rl_numerics,
+    register_numerics_envelope,
+)
+from tokenspeed.runtime.plugins.server_args import (
+    get_extra_server_args,
+    register_extra_server_args,
+)
 from tokenspeed.runtime.utils import get_colorful_logger
 
 if TYPE_CHECKING:
@@ -99,6 +106,10 @@ __all__ = [
     "register_linear_attention_backend",
     "register_model",
     "register_numerics_envelope",
+    "register_model_rl_numerics",
+    "register_sampling_backend",
+    "register_extra_server_args",
+    "get_extra_server_args",
     "registered_architectures",
     "registered_model",
     "resolve_model_profile",
@@ -307,6 +318,18 @@ def register_model(
 def registered_model(architecture: str) -> RegisteredModel | None:
     """Return the plugin registration for ``architecture``, if any."""
     return _MODELS.get(architecture)
+
+
+def register_sampling_backend(name: str, cls: type, *, override: bool = False) -> None:
+    """Register a plugin sampling backend with transactional activation.
+
+    Unlike in-tree backend imports, this explicit registration is reverted if
+    the plugin fails to activate. The selected name is accepted by the CLI and
+    resolved through the ordinary sampling registry at execution startup.
+    """
+    from tokenspeed.runtime.sampling.registry import _BACKEND_REGISTRY
+
+    _put(_BACKEND_REGISTRY, name, cls, kind="sampling backend", override=override)
 
 
 def registered_architectures() -> frozenset[str]:

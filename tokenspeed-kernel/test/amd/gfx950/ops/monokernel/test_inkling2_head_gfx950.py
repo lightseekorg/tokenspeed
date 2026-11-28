@@ -65,18 +65,20 @@ STEP = 5
 H = DIMS.hidden
 SCALE = 0.4472135954999579  # 5 ** -0.5
 CACHE_SLOTS = 128  # KV cache rows of the head tests (at least the rows)
-ROWS = [(1, 1), (8, 8), (16, 8), (32, 8), (64, 8)]
 
 
 # The head tests' row counts at every geometry, and the 4-token verify
-# blocks of the half-width geometry's checkpoint.
+# blocks of the half-width geometry's checkpoint: a decode row, and verify
+# batches of several requests (each its own ring slot and length) at each
+# head task shape (a head a task up to 16 rows, grouped heads past them;
+# ``plan.HEAD_SHAPES``).
 HEAD_ROWS = [
     pytest.param(d, rows, chain, id=f"{d.hidden}-r{rows}-c{chain}")
     for d in ip.GEOMETRIES
-    for rows, chain in ROWS
+    for rows, chain in [(1, 1), (16, 8), (64, 8)]
 ] + [
     pytest.param(ip.GEOMETRIES[1], rows, 4, id=f"{ip.GEOMETRIES[1].hidden}-r{rows}-c4")
-    for rows in (4, 8, 16, 32)
+    for rows in (4, 16, 32)
 ]
 
 
@@ -340,10 +342,13 @@ def test_head_prologue_matches_tokenspeed_math(dims, rows, chain):
 
 # The mix stages at every geometry the plans lay out: the regular combine
 # kernel's tiles follow the row width (Small's 4608 as 4096 + 512 columns,
-# 2304 as 2048 + 256 of a masked tile), and so do the stages'.
+# 2304 as 2048 + 256 of a masked tile), and so do the stages'. They take a
+# task a row (a full layer's mix three), the same code at every row count:
+# one row, a verify block and the largest launch cover their placements.
 _MIX_DIMS = pytest.mark.parametrize(
     "dims", ip.GEOMETRIES, ids=[f"h{d.hidden}" for d in ip.GEOMETRIES]
 )
+_MIX_ROWS = [(1, 1), (8, 8), (64, 8)]
 
 
 def _assert_writes_only(before, after, plan, regions):
@@ -473,8 +478,7 @@ def _run_attention_mix(dims, rows, chain, terms, g):
 
 @_MIX_DIMS
 @pytest.mark.parametrize(
-    "rows,chain,terms",
-    [(1, 1, 3), (4, 4, 2), (8, 8, 3), (8, 8, 2), (16, 8, 3), (32, 8, 2), (64, 8, 3)],
+    "rows,chain,terms", [(1, 1, 3), (8, 8, 3), (8, 8, 2), (64, 8, 3)]
 )
 def test_attention_mix_is_the_regular_kernel(dims, rows, chain, terms):
     """Bit for bit the regular decode path's attention mix (it stores the
@@ -493,8 +497,7 @@ def test_attention_mix_is_the_regular_kernel(dims, rows, chain, terms):
 
 @_MIX_DIMS
 @pytest.mark.parametrize(
-    "rows,chain,terms",
-    [(1, 1, 3), (4, 4, 2), (8, 8, 3), (8, 8, 2), (16, 8, 3), (32, 8, 2), (64, 8, 3)],
+    "rows,chain,terms", [(1, 1, 3), (8, 8, 3), (8, 8, 2), (64, 8, 3)]
 )
 def test_attention_mix_matches_tokenspeed_math(dims, rows, chain, terms):
     g = torch.Generator().manual_seed(100 + rows + terms)
@@ -564,7 +567,7 @@ def _run_mlp_mix(dims, rows, chain, g):
 
 
 @_MIX_DIMS
-@pytest.mark.parametrize("rows,chain", ROWS + [(4, 4)])
+@pytest.mark.parametrize("rows,chain", _MIX_ROWS)
 def test_mlp_mix_is_the_regular_kernel(dims, rows, chain):
     """Bit for bit the regular decode path's MLP mix of the terms ``(P,
     A)``, over enough launches that a different summation order or
@@ -577,7 +580,7 @@ def test_mlp_mix_is_the_regular_kernel(dims, rows, chain):
 
 
 @_MIX_DIMS
-@pytest.mark.parametrize("rows,chain", ROWS + [(4, 4)])
+@pytest.mark.parametrize("rows,chain", _MIX_ROWS)
 def test_mlp_mix_matches_tokenspeed_math(dims, rows, chain):
     g = torch.Generator().manual_seed(200 + rows)
     (p_term, a_term, w, gain, acc, m, s), x = _run_mlp_mix(dims, rows, chain, g)
@@ -809,8 +812,7 @@ def _full_mix_kernel(scratch, step, terms, cand_out, queries, PLAN: gl.constexpr
 
 @_MIX_DIMS
 @pytest.mark.parametrize(
-    "rows,chain,terms",
-    [(4, 4, 1), (8, 8, 1), (8, 8, 3), (16, 8, 1), (32, 8, 3), (64, 8, 1), (64, 8, 3)],
+    "rows,chain,terms", [(4, 4, 1), (8, 8, 1), (8, 8, 3), (64, 8, 1), (64, 8, 3)]
 )
 def test_full_attention_mix_is_the_regular_kernel(dims, rows, chain, terms):
     """A full layer's three-query mix (Q, K and V sources, each its own

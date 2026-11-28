@@ -150,13 +150,9 @@ REGIONS = (
 )
 
 
-def stages(
-    bases: dict[str, int], rows: int, attended: int, X: str
-) -> tuple[Stage, ...]:
-    """Q1-Q6, placed by ``bases``. Q1 and Q2 run for ``rows`` rows, Q3-Q6
-    (the attention) for ``attended`` rows: ``rows``, or one row per request
-    in an MTP draft catch-up step. ``X`` is the region prefix of the mixed
-    row (the row of the attention mixer)."""
+def stages(bases: dict[str, int], rows: int, X: str) -> tuple[Stage, ...]:
+    """Q1-Q6 for ``rows`` rows, placed by ``bases``. ``X`` is the region
+    prefix of the mixed row (the row of the attention mixer)."""
     q1, q2, q3, q4, q4f, q5, q6 = placement(
         bases, ("q1", "q2", "q3", "q4", "q4f", "q5", "q6")
     )
@@ -169,27 +165,25 @@ def stages(
             reads=("qp",),
             writes=("qn", "kn", "iq", "ck"),
         ),
-        Stage(
-            "q3", int(SCORE_TASKS) * attended, q3, reads=("iq", "ck"), writes=("isc",)
-        ),
+        Stage("q3", int(SCORE_TASKS) * rows, q3, reads=("iq", "ck"), writes=("isc",)),
         Stage(
             "q4",
-            int(SELECT_CHUNKS) * attended,
+            int(SELECT_CHUNKS) * rows,
             q4,
             reads=("isc",),
             writes=("csc", "cid", "sel"),
         ),
-        Stage("q4f", attended, q4f, reads=("csc", "cid"), writes=("sel",)),
+        Stage("q4f", rows, q4f, reads=("csc", "cid"), writes=("sel",)),
         Stage(
             "q5",
-            int(ATTN_TASKS) * attended,
+            int(ATTN_TASKS) * rows,
             q5,
             reads=("sel", "qn", "kn", "qp"),
             writes=("part", "lse"),
         ),
         Stage(
             "q6",
-            int(MERGE_TASKS) * min(attended, MERGE_ROWS),
+            int(MERGE_TASKS) * min(rows, MERGE_ROWS),
             q6,
             reads=("part", "lse", "qp"),
             writes=("obf",),
@@ -255,7 +249,7 @@ class Cache:
     draft_k: gl.tensor | gl.constexpr
     draft_positions: gl.tensor | gl.constexpr
     draft_logical: gl.tensor | gl.constexpr
-    # None, or in an MTP draft catch-up step (the draft's first step, over the
+    # None, or in the prefix launch of an MTP draft's first step (over the
     # verified rows) the request's int32 accepted length: a row at or past it
     # is a rejected token. It writes its K / V, but no index or compressed key.
     accepted: gl.tensor | gl.constexpr

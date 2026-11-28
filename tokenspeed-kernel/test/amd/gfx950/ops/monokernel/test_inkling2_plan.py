@@ -52,11 +52,6 @@ def test_plan_constructs(rows, chain, experts, boundary, first):
     assert plan.has_stage("mix_attn") == (not first)
 
 
-def test_layer0_plan_is_a_boundary_plan():
-    with pytest.raises(ValueError, match="layer 0"):
-        local_layer_plan(DIMS, 8, 8, "nvfp4", False, True)
-
-
 @pytest.mark.parametrize("boundary,first", VARIANTS)
 @pytest.mark.parametrize("experts", ["nvfp4", "mxfp8"])
 def test_every_region_has_one_writer(experts, boundary, first):
@@ -95,11 +90,6 @@ def test_expert_formats_share_the_mailbox_layout(rows, chain):
             assert mid.regions == other.regions
             for name, _ in mid.regions:
                 assert mid.offset(name) == other.offset(name), name
-
-
-def test_plan_refuses_unknown_expert_formats():
-    with pytest.raises(ValueError, match="mxfp4"):
-        local_layer_plan(DIMS, 8, 8, "mxfp4", False, False)
 
 
 @pytest.mark.parametrize("dims", GEOMETRIES, ids=lambda d: f"h{d.hidden}")

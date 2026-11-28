@@ -533,7 +533,10 @@ def test_standard_cache_decode_logits_cover_empty_and_short_spans() -> None:
         assert logits[row, length:].isnan().all()
 
 
-@pytest.mark.parametrize("q_len", (1, 2, 3, 4, 5, 6))
+# The decode oracle test covers every specialization eagerly. Replay refreshes
+# a BF16 query and weights (q_len 1) and an FP8 query, its scales and FP32
+# weights over 64 heads (q_len 4).
+@pytest.mark.parametrize("q_len", (1, 4))
 def test_standard_cache_decode_cuda_graph_replays_changed_inputs(q_len: int) -> None:
     generator = _generator(400 + q_len)
     heads = 32 if q_len % 2 else 64

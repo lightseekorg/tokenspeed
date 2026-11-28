@@ -36,21 +36,45 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.attention import (
     launch_gluon_dsa_prefill_gfx950,
 )
 
+_LAUNCHES = {
+    "decode": (launch_gluon_dsa_decode_gfx950, 8),
+    "prefill": (launch_gluon_dsa_prefill_gfx950, 16),
+}
+_DTYPE_IDS = {
+    torch.bfloat16: "bf16",
+    torch.float8_e4m3fn: "e4m3",
+    torch.float8_e5m2: "e5m2",
+}
 
+
+# Matching FP8 inputs run every launch and rope width (prefill with rope takes
+# the FP8 prefill kernel). BF16, mixed and mismatched FP8 inputs take the dense
+# kernel and run one launch and rope width each.
 @pytest.mark.parametrize(
-    ("launch", "tokens"),
-    (
-        pytest.param(launch_gluon_dsa_decode_gfx950, 8, id="decode"),
-        pytest.param(launch_gluon_dsa_prefill_gfx950, 16, id="prefill"),
-    ),
+    ("launch", "tokens", "q_dtype", "kv_dtype", "rope_dim"),
+    [
+        pytest.param(
+            *_LAUNCHES[name],
+            q_dtype,
+            kv_dtype,
+            rope_dim,
+            id=f"{name}-{_DTYPE_IDS[q_dtype]}x{_DTYPE_IDS[kv_dtype]}-rope{rope_dim}",
+        )
+        for name, q_dtype, kv_dtype, rope_dim in [
+            *(
+                (name, dtype, dtype, rope_dim)
+                for dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                for name in _LAUNCHES
+                for rope_dim in (0, 64)
+            ),
+            ("decode", torch.bfloat16, torch.bfloat16, 64),
+            ("prefill", torch.bfloat16, torch.bfloat16, 0),
+            ("prefill", torch.bfloat16, torch.float8_e4m3fn, 64),
+            ("decode", torch.float8_e5m2, torch.bfloat16, 0),
+            ("prefill", torch.float8_e4m3fn, torch.float8_e5m2, 64),
+        ]
+    ],
 )
-@pytest.mark.parametrize(
-    "q_dtype", (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
-)
-@pytest.mark.parametrize(
-    "kv_dtype", (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2)
-)
-@pytest.mark.parametrize("rope_dim", (0, 64))
 def test_dense_launch_parameters_ignore_live_length(
     monkeypatch: pytest.MonkeyPatch,
     launch: Callable[..., torch.Tensor],

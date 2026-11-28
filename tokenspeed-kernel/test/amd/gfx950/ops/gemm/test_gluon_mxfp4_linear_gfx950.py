@@ -109,8 +109,9 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 @pytest.mark.parametrize(
     "m",
-    # Decode (MTP draft and verify), mid-size and prefill M buckets.
-    [1, 7, 16, 33, 64, 200, 600, 2500],
+    # Decode, mid-size and prefill M buckets; M is a runtime argument inside
+    # a bucket.
+    [1, 33, 64, 200, 600, 2500],
 )
 def test_shared_expert_matches_unfused_path(m: int) -> None:
     torch.manual_seed(0)

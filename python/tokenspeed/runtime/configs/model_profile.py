@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.configs.load_config import LoadConfig
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -92,6 +93,12 @@ class ModelProfile:
             component afterwards. The factory owns validation of its cache
             format and execution constraints; its errors are not retried
             through the architecture's generator.
+        create_runtime_config: Optional access to a model's launch configuration.
+            The result is separate from HF metadata and passed as runtime_config
+            to the model entry. Plugins can return shared immutable server args.
+        create_model_kwargs: Optional constructor inputs from the actual model
+            and loading configurations. Use this for per-model owners such as
+            checkpoint loaders; these inputs never enter shared server args.
     """
 
     configure_attention: Callable[[ModelConfig, ServerArgs], None]
@@ -107,8 +114,20 @@ class ModelProfile:
         Callable[[ServerArgs, ModelConfig, bool], AttnConfig] | None
     )
     request_token_history_lookback: int | None = None
+    create_runtime_config: Callable[[ModelConfig, ServerArgs], object] | None = None
+    create_model_kwargs: Callable[[ModelConfig, LoadConfig], dict] | None = None
 
     def __post_init__(self) -> None:
+        if self.create_model_kwargs is not None and not callable(
+            self.create_model_kwargs
+        ):
+            raise TypeError("ModelProfile.create_model_kwargs must be callable or None")
+        if self.create_runtime_config is not None and not callable(
+            self.create_runtime_config
+        ):
+            raise TypeError(
+                "ModelProfile.create_runtime_config must be callable or None"
+            )
         if self.create_attention_config is not None and not callable(
             self.create_attention_config
         ):

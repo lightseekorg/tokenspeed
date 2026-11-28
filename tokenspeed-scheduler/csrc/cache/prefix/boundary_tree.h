@@ -488,6 +488,9 @@ private:
             node.closed_entries_[kDevice] += hold.closed_ ? delta : 0;
             FatalCheck(node.entries_[kDevice] >= 0 && node.closed_entries_[kDevice] >= 0,
                        "a boundary node lost a holder it did not have");
+            if (config_.has_disk_tier && !hold.closed_ && node.entries_[kDisk] > 0 && lower_tier_entries_observer_) {
+                lower_tier_entries_observer_(node.hash);
+            }
             return false;
         }
         // Only a State group's entry or a checkpoint's store changes a
@@ -506,7 +509,8 @@ private:
                 node.state_entries_[hold.tier_] += hold.state_ ? delta : 0;
                 node.closed_entries_[hold.tier_] += hold.closed_ ? delta : 0;
                 node.closed_pairs_ += hold.paired_ ? delta : 0;
-                if (((hold.tier_ != kDevice && hold.closed_) || (hold.state_ && config_.has_disk_tier)) &&
+                if (((hold.tier_ != kDevice && (hold.closed_ || config_.has_disk_tier)) ||
+                     (hold.state_ && config_.has_disk_tier)) &&
                     lower_tier_entries_observer_) {
                     lower_tier_entries_observer_(node.hash);
                 }
@@ -514,7 +518,8 @@ private:
             case Hold::Kind::kPendingStore:
                 node.pending_stores_ += delta;
                 node.pending_checkpoint_stores_ += hold.state_ ? delta : 0;
-                if (hold.state_ && config_.has_disk_tier && lower_tier_entries_observer_) {
+                if (config_.has_disk_tier && (hold.state_ || node.entries_[kDisk] > 0) &&
+                    lower_tier_entries_observer_) {
                     lower_tier_entries_observer_(node.hash);
                 }
                 break;

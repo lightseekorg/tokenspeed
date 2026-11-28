@@ -2904,7 +2904,9 @@ if platform.is_amd:
             "swiglu_form": frozenset({"standard"}),
             "activation_clamped": frozenset({False}),
             "routing_mode": frozenset({"precomputed_topk"}),
-            "supports_deferred_finalize": frozenset({False}),
+            "supports_deferred_finalize": frozenset({True}),
+            "deferred_output_is_token_order": frozenset({True}),
+            "deferred_finalize_is_slot_sum": frozenset({True}),
             "supports_ep": frozenset({False}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({64}),
@@ -2944,16 +2946,17 @@ if platform.is_amd:
             topk_ids: Expert ids ``[tokens, top_k]``; out-of-range ids add 0.
             num_tokens_global: Unused; expert parallelism is unsupported.
             max_num_tokens_per_gpu: Unused token-capacity hint.
-            do_finalize: Must be true.
+            do_finalize: Combine the routes; otherwise return them in token
+                order, every row defined, for the caller's finalize.
             enable_pdl: Unused launch hint.
 
         Returns:
-            BF16 output ``[tokens, hidden]``.
+            BF16 output ``[tokens, hidden]``, or with ``do_finalize=False``
+            ``(route_outputs [tokens * top_k, hidden], FP32 route weights,
+            None)``.
         """
         del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
         del enable_pdl
-        if not do_finalize:
-            raise ValueError("gfx950 A4W4 Gluon MoE cannot defer finalization")
         if topk_weights is None or topk_ids is None:
             raise ValueError("gfx950 A4W4 Gluon MoE requires precomputed top-k")
         # The kernels compute SiLU(gate) * up: alpha 1, no clamp (limit 0), beta 0.
@@ -2968,6 +2971,7 @@ if platform.is_amd:
             w.w2_weight_scale,
             topk_weights,
             topk_ids,
+            do_finalize,
         )
 
     @register_kernel(

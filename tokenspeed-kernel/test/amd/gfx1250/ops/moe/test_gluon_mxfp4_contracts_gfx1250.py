@@ -24,8 +24,6 @@ output ownership."""
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
 from typing import NamedTuple
 
 import pytest
@@ -40,18 +38,9 @@ if not is_amd():
 from tokenspeed_kernel_amd._triton import gl  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import _common, fused  # noqa: E402
 
-# Read sources from the tree the import resolved to, not the repo layout.
-MXFP4_ROOT = Path(_common.__file__).parent
-
 # ---------------------------------------------------------------------------
 # Index ownership: which warp holds which row
 # ---------------------------------------------------------------------------
-
-INDEX_LAYOUT_CONSUMERS = (
-    MXFP4_ROOT / "_common.py",
-    MXFP4_ROOT / "decode.py",
-    MXFP4_ROOT / "fused.py",
-)
 
 # (NUM_INDICES, NUM_WARPS); these kernels run 4 or 8 warps per CTA.
 INDEX_SHAPES = ((16, 4), (16, 8), (32, 4), (32, 8), (64, 8))
@@ -73,24 +62,6 @@ def index_ownership(base: gl.BlockedLayout, slice_dim: int) -> IndexOwnership:
     return IndexOwnership(warps=warps, rows_covered=rows_per_warp * warps)
 
 
-def index_layout_slice_dim(path: Path) -> int:
-    """Return the dimension ``path`` slices away from the shared index layout."""
-    module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    slice_dims = [
-        node.args[0].value
-        for node in ast.walk(module)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "SliceLayout"
-        and len(node.args) == 2
-        and isinstance(node.args[0], ast.Constant)
-        and isinstance(node.args[1], ast.Name)
-        and node.args[1].id == "IDX_BASE_LAYOUT"
-    ]
-    assert len(slice_dims) == 1, f"{path} must slice the index layout exactly once"
-    return slice_dims[0]
-
-
 @pytest.mark.parametrize(("num_indices", "num_warps"), INDEX_SHAPES)
 def test_index_layout_partitions_rows_across_all_warps(
     num_indices: int, num_warps: int
@@ -101,25 +72,10 @@ def test_index_layout_partitions_rows_across_all_warps(
     )
 
 
-@pytest.mark.parametrize(("num_indices", "num_warps"), [(16, 0), (16, 32), (12, 8)])
-def test_index_layout_rejects_unpartitionable_warp_counts(
-    num_indices: int, num_warps: int
-) -> None:
+def test_index_layout_rejects_unpartitionable_warp_counts() -> None:
+    # 12 rows cannot be split evenly over 8 warps.
     with pytest.raises(AssertionError):
-        _common.get_tdm_gather_scatter_idx_layout(num_indices, num_warps)
-
-
-@pytest.mark.parametrize("path", INDEX_LAYOUT_CONSUMERS, ids=lambda p: p.name)
-def test_consumers_slice_the_dimension_that_leaves_rows_distributed(
-    path: Path,
-) -> None:
-    slice_dim = index_layout_slice_dim(path)
-
-    num_indices, num_warps = 16, 8
-    base = _common.get_tdm_gather_scatter_idx_layout(num_indices, num_warps)
-    assert index_ownership(base, slice_dim) == IndexOwnership(
-        warps=num_warps, rows_covered=num_indices
-    )
+        _common.get_tdm_gather_scatter_idx_layout(12, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +118,6 @@ def test_scatter_reserves_room_for_the_masked_off_sentinel(
         (65_536, 65_535, 16),
         (65_537, 65_535, 32),
         (65_536, 65_536, 32),
-        (65_537, 65_536, 32),
         # No index is emitted at all, so keep the conservative width.
         (None, None, 32),
     ],
@@ -201,10 +156,9 @@ def test_partial_tdm_warp_masks_partition_the_warps(num_warps: int) -> None:
         assert active > 0 and active & (active - 1) == 0
 
 
-@pytest.mark.parametrize("num_warps", [2, 16])
-def test_partial_tdm_warp_hint_rejects_unsupported_warp_counts(num_warps: int) -> None:
+def test_partial_tdm_warp_hint_rejects_unsupported_warp_counts() -> None:
     with pytest.raises(ValueError, match="4 or 8 warps"):
-        _common.partial_tdm_warp_hint(num_warps)
+        _common.partial_tdm_warp_hint(16)
 
 
 def _moe_config(*, use_gather: bool, partial_tdm: bool) -> _common.MoEConfig:

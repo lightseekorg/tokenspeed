@@ -92,11 +92,37 @@ def _fp64_reference(normalized, projection, up, projection_scale):
     )
 
 
-@pytest.mark.parametrize("rows", [1, 7, 16, 17, 32, 33, 64, 100, 256])
-@pytest.mark.parametrize("projection_rows", [LOWRANK + HC_COUNT, LOWRANK])
-@pytest.mark.parametrize("projection_scale", [1.0, 0.25])
-# Serving stores the projection padded to eight rows (324 -> 328).
-@pytest.mark.parametrize("padded", [True, False])
+# Up to MAX_ROWS (192) rows run the split-K pair; larger batches run the GEMM
+# down projection and the pipelined up projection, including partial tiles.
+def _epilogue_cases():
+    """Both sides of each split-K row bucket's bound (<= 16, <= 32, up to
+    MAX_ROWS), then one partial, two whole and a multi-tile partial 128-row
+    tile past it, with and without the inject rows, padded or not; the
+    projection scale, a runtime multiplier, once per weight layout."""
+    cases = []
+    # Serving stores the projection padded to eight rows (324 -> 328).
+    for padded in (True, False):
+        for projection_rows in (LOWRANK + HC_COUNT, LOWRANK):
+            for scale, rows_list in (
+                (1.0, (1, 16, 17, 32, 33, 192, 193, 256, 1000)),
+                (0.25, (33,)),
+            ):
+                for rows in rows_list:
+                    cases.append(
+                        pytest.param(
+                            rows,
+                            projection_rows,
+                            scale,
+                            padded,
+                            id=f"{padded}-{scale}-{projection_rows}-{rows}",
+                        )
+                    )
+    return cases
+
+
+@pytest.mark.parametrize(
+    "rows,projection_rows,projection_scale,padded", _epilogue_cases()
+)
 def test_mix_matches_gemm_epilogue_path(
     rows, projection_rows, projection_scale, padded
 ):
@@ -125,19 +151,19 @@ def test_mix_dispatch_and_float16():
     capture.enabled = True
     capture.clear()
     try:
-        for rows in (1, 64, 256, 257):
+        for rows in (1, 64, 192, 193, 4096):
             _mix(_inputs(rows, LOWRANK + HC_COUNT, torch.float16, seed=5), None)
         names = [record.kernel_name for record in capture._records]
     finally:
         capture.enabled = previous
         capture.clear()
-    assert names == ["gluon_hyperconnection_mix_gfx950"] * 3 + [
-        "triton_hyperconnection_mix"
-    ]
-    inputs = _inputs(48, LOWRANK + HC_COUNT, torch.float16, seed=6)
-    mixed, _ = _mix(inputs, "gluon_hyperconnection_mix_gfx950")
-    exact_mixed, _ = _fp64_reference(*inputs, 1.0)
-    torch.testing.assert_close(mixed.double(), exact_mixed, rtol=8e-3, atol=8e-3)
+    # Decode and prefill batches select the same kernel.
+    assert names == ["gluon_hyperconnection_mix_gfx950"] * 5
+    for rows in (48, 300):
+        inputs = _inputs(rows, LOWRANK + HC_COUNT, torch.float16, seed=6)
+        mixed, _ = _mix(inputs, "gluon_hyperconnection_mix_gfx950")
+        exact_mixed, _ = _fp64_reference(*inputs, 1.0)
+        torch.testing.assert_close(mixed.double(), exact_mixed, rtol=8e-3, atol=8e-3)
 
 
 def test_mix_graph_replay_reuses_workspace():
@@ -173,7 +199,8 @@ def test_mix_workspace_is_not_first_created_under_capture(monkeypatch):
     assert hyperconnection._workspaces == {}
 
 
-@pytest.mark.parametrize("tail", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+# The largest rejected tail, the smallest accepted one and a full extra step.
+@pytest.mark.parametrize("tail", [16, 32, 256])
 def test_mix_supports_rank_tails_that_fill_an_mfma_step(tail):
     lowrank = 256 + tail
     supported = tail >= 32
@@ -241,5 +268,73 @@ def test_mix_row_count_does_not_recompile():
         hyperconnection.gluon_hyperconnection_mix_gfx950,
         hyperconnection.gluon_hyperconnection_mix_up_gfx950,
     ):
-        for rows in (1, 3, 15, 17, 31, 33, 63, 65, 200, 256):
+        for rows in (1, 3, 15, 17, 31, 33, 63, 65, 150, 192):
             run(rows)
+
+
+def _prefill_up_inputs(rows, seed):
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    activated = (
+        torch.randn(rows, LOWRANK, device="cuda", generator=generator) * 0.5
+    ).to(torch.bfloat16)
+    up = (torch.randn(WIDE, LOWRANK, device="cuda", generator=generator) * 0.05).to(
+        torch.bfloat16
+    )
+    normalized = torch.randn(rows, WIDE, device="cuda", generator=generator).to(
+        torch.bfloat16
+    )
+    return activated, up, normalized
+
+
+def _prefill_up_reference(activated, up, normalized):
+    # The GEMM-plus-epilogue path: BF16 gate logits, FP32 gated sum.
+    gate = torch.nn.functional.linear(activated, up).float()
+    gated = torch.sigmoid(gate) * normalized.float()
+    return gated.view(-1, HC_COUNT, HIDDEN_SIZE).sum(1) / HC_COUNT
+
+
+@pytest.mark.parametrize("rows", [1, 127, 128, 129, 777])
+def test_prefill_up_projection_matches_gemm_epilogue(rows):
+    activated, up, normalized = _prefill_up_inputs(rows, seed=rows)
+    # Padded row strides check that the strides, not the widths, index rows.
+    activated = torch.nn.functional.pad(activated, (0, 64))[:, :LOWRANK]
+    normalized = torch.nn.functional.pad(normalized, (0, 128))[:, :WIDE]
+    mixed = hyperconnection.launch_gluon_hyperconnection_mix_up_prefill_gfx950(
+        activated, up, normalized, HC_COUNT, HIDDEN_SIZE, LOWRANK
+    )
+    expected = _prefill_up_reference(activated, up, normalized)
+    # FP32 accumulation and branch-sum order differ by at most one BF16 ulp.
+    torch.testing.assert_close(mixed.float(), expected, rtol=8e-3, atol=4e-3)
+
+
+def test_prefill_up_projection_row_count_does_not_recompile():
+    activated, up, normalized = _prefill_up_inputs(1000, seed=12)
+
+    def run(rows):
+        hyperconnection.launch_gluon_hyperconnection_mix_up_prefill_gfx950(
+            activated[:rows], up, normalized[:rows], HC_COUNT, HIDDEN_SIZE, LOWRANK
+        )
+
+    run(193)
+    with assert_no_triton_compile(
+        hyperconnection.gluon_hyperconnection_mix_up_prefill_gfx950
+    ):
+        for rows in (1, 200, 256, 511, 1000):
+            run(rows)
+
+
+def test_prefill_up_projection_offsets_past_int32():
+    # The last row tile starts past 2**31 normalized elements; only that tile
+    # is initialized and checked.
+    rows = (1 << 31) // WIDE + 200
+    checked = 200
+    activated = torch.empty(rows, LOWRANK, device="cuda", dtype=torch.bfloat16)
+    normalized = torch.empty(rows, WIDE, device="cuda", dtype=torch.bfloat16)
+    tail_activated, up, tail_normalized = _prefill_up_inputs(checked, seed=13)
+    activated[-checked:] = tail_activated
+    normalized[-checked:] = tail_normalized
+    mixed = hyperconnection.launch_gluon_hyperconnection_mix_up_prefill_gfx950(
+        activated, up, normalized, HC_COUNT, HIDDEN_SIZE, LOWRANK
+    )
+    expected = _prefill_up_reference(tail_activated, up, tail_normalized)
+    torch.testing.assert_close(mixed[-checked:].float(), expected, rtol=8e-3, atol=4e-3)

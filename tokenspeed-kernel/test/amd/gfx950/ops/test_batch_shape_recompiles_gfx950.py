@@ -297,13 +297,38 @@ def test_mha_prefill_token_stride_and_request_count(window):
         run([1], views=False)
 
 
-# FP8 caches run the products on the F8F6F4 MFMA, a separate set of variants.
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("window", [-1, 127, 2047])
-# Head dim 256 (24 query heads over 4 KV heads) runs single-buffered.
-@pytest.mark.parametrize(
-    "heads,kv_heads,dim", [(16, 2, 64), (24, 4, 256)], ids=["hd64", "hd256"]
-)
+def _extend_warmup_cases():
+    """Full attention, which adds the split and reduce variants, in every
+    dtype and head dim; each sliding window in both dtypes and both head
+    dims, one dtype per head dim.
+
+    FP8 caches run the products on the F8F6F4 MFMA, a separate set of
+    variants. Head dim 256 (24 query heads over 4 KV heads) runs
+    single-buffered."""
+    bf16, fp8 = torch.bfloat16, torch.float8_e4m3fn
+    heads = {"hd64": (16, 2, 64), "hd256": (24, 4, 256)}
+    cases = [
+        ("hd64", -1, bf16),
+        ("hd64", -1, fp8),
+        ("hd256", -1, bf16),
+        ("hd256", -1, fp8),
+        ("hd64", 127, fp8),
+        ("hd256", 127, bf16),
+        ("hd64", 2047, bf16),
+        ("hd256", 2047, fp8),
+    ]
+    return [
+        pytest.param(
+            window,
+            dtype,
+            *heads[head],
+            id=f"{head}-{window}-dtype{0 if dtype == bf16 else 1}",
+        )
+        for head, window, dtype in cases
+    ]
+
+
+@pytest.mark.parametrize("window,dtype,heads,kv_heads,dim", _extend_warmup_cases())
 def test_mha_extend_startup_warmup_covers_every_variant(
     window, dtype, heads, kv_heads, dim
 ):

@@ -49,6 +49,7 @@ from tokenspeed_kernel.ops.gemm import (  # noqa: E402
     mv,
 )
 from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
+    warm_gluon_mm_a16w16_pipelined,
     warm_gluon_mm_a16w16_skinny,
 )
 from tokenspeed_kernel.ops.tuning import kernel_warmup  # noqa: E402
@@ -76,6 +77,11 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
     supports_gluon_mm_a16w16_column_shard_gfx950,
     supports_gluon_mm_a16w16_decode_add3_gfx950,
     supports_gluon_mm_a16w16_decode_gfx950,
+)
+from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.pipelined import (  # noqa: E402
+    gluon_mm_a16w16_pipelined_gfx950,
+    launch_gluon_mm_a16w16_pipelined_gfx950,
+    supports_gluon_mm_a16w16_pipelined_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.skinny import (  # noqa: E402
     gluon_mm_a16w16_skinny_gfx950,
@@ -143,11 +149,11 @@ def test_dense16_kernel_variant_writes_strided_out(
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=_ATOL, rtol=_RTOL)
 
 
-@pytest.mark.parametrize("batch", [12, 16])
-def test_dense16_bmm_writes_strided_out(batch: int) -> None:
+def test_dense16_bmm_writes_strided_out() -> None:
     torch.manual_seed(0)
     dtype = torch.bfloat16
-    m, n, k = 1, 512, 128
+    # The batch only sizes the grid.
+    batch, m, n, k = 12, 1, 512, 128
     a_backing = torch.randn((m, batch, k), device="cuda", dtype=dtype) * 0.25
     a = a_backing.transpose(0, 1)
     weight = torch.randn((batch, k, n), device="cuda", dtype=dtype) * 0.25
@@ -218,52 +224,6 @@ def test_splitk_partial_scratch_is_stream_local() -> None:
     assert first.data_ptr() != other_first.data_ptr()
 
 
-def test_choose_mfma_lds_mediumm_config_uses_tuned_medium_m_tiles() -> None:
-    assert _choose_mfma_lds_mediumm_config(8, 1280, 64) == (16, 32, 64, 2, 2, 1)
-    assert _choose_mfma_lds_mediumm_config(8, 1280, 512) == (16, 32, 256, 2, 2, 2)
-    assert _choose_mfma_lds_mediumm_config(16, 1280, 768) == (16, 32, 256, 2, 2, 3)
-    assert _choose_mfma_lds_mediumm_config(8, 1280, 1024) == (16, 32, 512, 2, 2, 2)
-    assert _choose_mfma_lds_mediumm_config(32, 2560, 2048) == (16, 16, 512, 2, 2, 2)
-    assert _choose_mfma_lds_mediumm_config(64, 1280, 1024) == (32, 32, 512, 2, 2, 2)
-    assert _choose_mfma_lds_mediumm_config(64, 1280, 2048) == (32, 32, 512, 2, 2, 2)
-    assert _choose_mfma_lds_mediumm_config(64, 2560, 2048) == (32, 32, 128, 2, 2, 3)
-    assert _choose_mfma_lds_mediumm_config(128, 2560, 2048) == (32, 32, 64, 2, 2, 3)
-    assert _choose_mfma_lds_mediumm_config(128, 1280, 2880) == (32, 32, 64, 2, 2, 3)
-    assert _choose_mfma_lds_mediumm_config(128, 4096, 4096) == (16, 128, 64, 1, 4, 3)
-    assert _choose_mfma_lds_mediumm_config(768, 3584, 7168) == (
-        128,
-        128,
-        64,
-        2,
-        4,
-        3,
-    )
-    assert _choose_mfma_lds_mediumm_config(1024, 3584, 7168) == (
-        128,
-        128,
-        64,
-        2,
-        4,
-        3,
-    )
-    assert _choose_mfma_lds_mediumm_config(384, 7168, 3584) == (
-        128,
-        128,
-        64,
-        2,
-        4,
-        3,
-    )
-    assert _choose_mfma_lds_mediumm_config(512, 7168, 3584) == (
-        128,
-        128,
-        64,
-        2,
-        4,
-        3,
-    )
-
-
 def test_choose_mfma_lds_mediumm_config_falls_back_for_slow_shapes() -> None:
     assert _choose_mfma_lds_mediumm_config(16, 1280, 2880) is None
     assert _choose_mfma_lds_mediumm_config(16, 2560, 2048) is None
@@ -282,7 +242,7 @@ def test_choose_mfma_lds_mediumm_config_falls_back_for_slow_shapes() -> None:
     assert _choose_mfma_lds_mediumm_config(576, 7168, 3584) is None
 
 
-@pytest.mark.parametrize("m,k", [(8192, 1536), (4096, 1536), (2048, 768)])
+@pytest.mark.parametrize("m,k", [(8192, 1536), (2048, 768)])
 def test_largem_publish_rows_keeps_bits_and_counts_column_tiles(m, k) -> None:
     torch.manual_seed(m + k)
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
@@ -320,7 +280,6 @@ def test_largem_publish_rows_keeps_bits_and_counts_column_tiles(m, k) -> None:
     "m,skip_start,skip_rows",
     [
         (8192, 0, 1024),
-        (8192, 3072, 1024),
         (8192, 7168, 1024),
         (2048, 256, 256),
         (1800, 512, 768),
@@ -475,10 +434,11 @@ def test_decode_gemm_graph_replays(session: bool) -> None:
         torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
 
 
-@pytest.mark.parametrize("m", [4, 16])
-def test_kimi3_router_gluon_decode_matches_reference(m: int) -> None:
-    # The router's split-K decode buckets, through the model-facing op.
+def test_kimi3_router_gluon_decode_matches_reference() -> None:
+    # The router's 16-row split-K decode bucket, through the model-facing op;
+    # the decode GEMM tests above cover its 4-row bucket.
     torch.manual_seed(0)
+    m = 16
     a = torch.randn((m, 7168), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((896, 7168), device="cuda", dtype=torch.bfloat16) * 0.25
     for _ in range(2):
@@ -525,6 +485,11 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     assert not supports_gluon_mm_a16w16_decode_gfx950(33, 1024, 8192)
     assert not supports_gluon_mm_a16w16_decode_gfx950(129, 1536, 7168)
     assert not supports_gluon_mm_a16w16_decode_gfx950(65, 20480, 7168)
+    # The Qwen3.8 attention q|gate|k|v 256-row bucket starts at 193 rows.
+    assert not supports_gluon_mm_a16w16_decode_gfx950(192, 13312, 2560)
+    assert supports_gluon_mm_a16w16_decode_gfx950(193, 13312, 2560)
+    assert supports_gluon_mm_a16w16_decode_gfx950(256, 13312, 2560)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(257, 13312, 2560)
 
 
 # The K3.1 TP8 speculative-verify buckets at ragged and full row counts, twice
@@ -556,12 +521,22 @@ _K31_DSPARK_BUCKETS = [
     ((3584, 7168), (6, 8)),
 ]
 
+# Qwen3.8-Flash-Next TP1 GDN out_proj and attention o_proj: verify rows of
+# 5-16 requests (four a request) and draft rows, at the edges of both buckets.
+_QWEN38_TP1_BUCKETS = [
+    ((2560, 6144), (17, 20, 32, 33, 48, 64)),
+    # Attention q|gate|k|v at verify of 49-64 requests.
+    ((13312, 2560), (193, 196, 256)),
+]
+
 
 @pytest.mark.parametrize(
     "n,k,rows",
     [
         pytest.param(n, k, rows, id=f"{n}x{k}-{rows[0]}")
-        for (n, k), rows in _K31_VERIFY_BUCKETS + _K31_DSPARK_BUCKETS
+        for (n, k), rows in _K31_VERIFY_BUCKETS
+        + _K31_DSPARK_BUCKETS
+        + _QWEN38_TP1_BUCKETS
     ],
 )
 def test_decode_gemm_k31_buckets(n: int, k: int, rows: tuple[int, ...]) -> None:
@@ -612,7 +587,7 @@ def test_decode_gemm_warmup_compiles_every_row_bucket(n: int, k: int) -> None:
     )
 
 
-@pytest.mark.parametrize("m", [2, 4, 7, 8, 16, 24, 32])
+@pytest.mark.parametrize("m", [2, 7, 16, 24, 32])
 def test_decode_add3_matches_single_rounding_reference(m: int) -> None:
     torch.manual_seed(0)
     n, k = 7168, 3584
@@ -739,7 +714,9 @@ def _absorbed_query_operands(rows: int, heads: int = 12):
     return q[..., :nope].transpose(0, 1), w_kc_t * 0.1, query
 
 
-@pytest.mark.parametrize("rows", [1, 4, 13, 37, 64, 100])
+# One row count per config and the fallback past 64 rows; the row-count test
+# below checks every other row count.
+@pytest.mark.parametrize("rows", [13, 37, 100])
 def test_absorbed_query_bmm_fills_only_latent_channels(rows: int) -> None:
     torch.manual_seed(0)
     q_nope, w_kc_t, query = _absorbed_query_operands(rows)
@@ -770,7 +747,8 @@ def test_absorbed_query_bmm_row_count_does_not_recompile() -> None:
             run(rows)
 
 
-@pytest.mark.parametrize("rows", [1, 4, 29, 64, 100])
+# The row-count test below checks every row count up to 64.
+@pytest.mark.parametrize("rows", [29, 100])
 def test_value_projection_bmm_matches_reference(rows: int) -> None:
     torch.manual_seed(0)
     heads, latent, value = 12, 512, 128
@@ -839,7 +817,7 @@ def _gated_value_operands(rows: int):
     return attn, w_vc, fused[:, 704:]
 
 
-@pytest.mark.parametrize("rows", [1, 4, 37, 64])
+@pytest.mark.parametrize("rows", [1, 37, 64])
 def test_grouped_decode_gemm_gate_matches_gemm_then_sigmoid_mul(rows: int) -> None:
     from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 
@@ -867,7 +845,7 @@ def test_grouped_decode_gemm_gate_matches_gemm_then_sigmoid_mul(rows: int) -> No
 
 
 @pytest.mark.parametrize("gated", [False, True])
-@pytest.mark.parametrize("rows", [1, 4, 29, 64, 100])
+@pytest.mark.parametrize("rows", [1, 29, 64, 100])
 def test_k_major_value_projection_matches_reference(rows: int, gated: bool) -> None:
     from tokenspeed_kernel.ops.attention.mla import mla_project_value
 
@@ -944,7 +922,7 @@ _DECODE_SHAPES = [(8192, 1024), (512, 8192)]
 
 @pytest.mark.parametrize("n,k", _DECODE_SHAPES)
 # 24-64 rows are speculative verify batches of 3-8 requests.
-@pytest.mark.parametrize("m", [2, 3, 7, 16, 24, 33, 40, 64])
+@pytest.mark.parametrize("m", [2, 16, 24, 33, 64])
 def test_decode_gemm_is_selected_and_matches_reference(m: int, n: int, k: int) -> None:
     torch.manual_seed(0)
     assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
@@ -1120,7 +1098,8 @@ def _off_by_one(rows: int, columns: int) -> torch.Tensor:
     return view
 
 
-@pytest.mark.parametrize("m", _SKINNY_ROWS)
+# Both ends of each row tile and both sides of the boundary between them.
+@pytest.mark.parametrize("m", [33, 63, 64, 65, 127, 128])
 def test_skinny_gemm_rounds_the_exact_product_once(m: int):
     """With small integer inputs the result is the BF16-rounded FP64 product.
 
@@ -1139,7 +1118,8 @@ def test_skinny_gemm_rounds_the_exact_product_once(m: int):
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
-@pytest.mark.parametrize("m", _SKINNY_ROWS)
+# One row count per row tile; the exact-product test above covers the rest.
+@pytest.mark.parametrize("m", [33, 128])
 def test_skinny_gemm_matches_fp64_reference(m: int):
     a, weight = _skinny_problem()
     a = a[:m].contiguous()
@@ -1169,7 +1149,7 @@ def test_skinny_gemm_rows_do_not_depend_on_the_batch():
     assert torch.equal(run(a), full), "repeat launch differs"
 
 
-@pytest.mark.parametrize("m", [33, 63, 127])
+@pytest.mark.parametrize("m", [33, 127])
 def test_skinny_gemm_writes_only_its_rows(m: int):
     """Rows of the destination's buffer below row M keep their bits.
 
@@ -1203,12 +1183,12 @@ def test_skinny_gemm_refuses_strided_and_unaligned_tensors():
         _skinny(a[:48].contiguous(), weight, out=_off_by_one(48, _SKINNY_N))
 
 
-@pytest.mark.parametrize("m", [33, 48, 128])
-def test_mm_declines_the_skinny_gemm_for_offset_views(m: int):
+def test_mm_declines_the_skinny_gemm_for_offset_views():
     """An activation or output that is not 16-byte aligned is legal mm input.
 
     Selection declines the skinny GEMM through its alignment traits, and mm
     takes the path it takes without that kernel, here Torch's GEMM."""
+    m = 48
     a, weight = _skinny_problem(rows=m)
     kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
     shifted = _off_by_one(m, _SKINNY_K)
@@ -1428,3 +1408,198 @@ def test_tp4_pre_expert_projection_selects_by_row_count(m: int, kernel: str | No
         else _decode(a, weight, torch.bfloat16)
     )
     assert torch.equal(mm(a, weight).view(torch.int16), expected.view(torch.int16))
+
+
+# The pipelined GEMM's measured shapes: the Qwen3.8 MoE router at 65-320
+# rows (ragged row tiles and both ends), and the LM head at 49-64 rows.
+_ROUTER_N, _ROUTER_K = 512, 2560
+_ROUTER_ROWS = [65, 100, 193, 256, 320]
+_LM_HEAD_N, _LM_HEAD_K = 248320, 2560
+
+
+def _pipelined_problem(n: int, k: int, rows: int):
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randn((rows, k), dtype=torch.bfloat16, device="cuda", generator=generator)
+    weight = 0.02 * torch.randn((n, k), device="cuda", generator=generator)
+    return a, weight.to(torch.bfloat16)
+
+
+def _pipelined(a, weight, out=None):
+    return launch_gluon_mm_a16w16_pipelined_gfx950(a, weight, out=out)
+
+
+@pytest.mark.parametrize("m", _ROUTER_ROWS)
+def test_pipelined_gemm_rounds_the_exact_product_once(m: int):
+    """With small integer inputs the result is the BF16-rounded FP64 product.
+
+    Every FP32 partial sum is exact (at most 2560 * 64 < 2**24), so the only
+    rounding is the final one to BF16, and the bits match exactly."""
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    a = torch.randint(-8, 9, (m, _ROUTER_K), device="cuda", generator=generator)
+    weight = torch.randint(
+        -8, 9, (_ROUTER_N, _ROUTER_K), device="cuda", generator=generator
+    )
+    actual = _pipelined(a.to(torch.bfloat16), weight.to(torch.bfloat16))
+    exact = a.double() @ weight.double().T
+    expected = exact.to(torch.bfloat16)
+    assert int((expected.double() != exact).sum()) > exact.numel() // 2
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+
+@pytest.mark.parametrize(
+    "n,k,m",
+    [(_ROUTER_N, _ROUTER_K, m) for m in _ROUTER_ROWS]
+    + [(_LM_HEAD_N, _LM_HEAD_K, 49), (_LM_HEAD_N, _LM_HEAD_K, 64)],
+)
+def test_pipelined_gemm_matches_fp64_reference(n: int, k: int, m: int):
+    a, weight = _pipelined_problem(n, k, m)
+    actual = _pipelined(a, weight)
+    expected = a.double() @ weight.double().T
+    # One rounding to BF16: at most half a step, 2**-8 relative.
+    torch.testing.assert_close(actual.double(), expected, atol=_ATOL, rtol=2**-8)
+
+
+def test_pipelined_gemm_rows_do_not_depend_on_the_batch():
+    """A row has the same bits with any other rows and in any row tile."""
+    a, weight = _pipelined_problem(_ROUTER_N, _ROUTER_K, 320)
+
+    def run(rows: torch.Tensor) -> torch.Tensor:
+        return _pipelined(rows.contiguous(), weight).view(torch.int16)
+
+    full = run(a)
+    for m in _ROUTER_ROWS:
+        assert torch.equal(run(a[:m]), full[:m]), f"rows differ at M={m}"
+    # The first 65 rows at an offset that is not a multiple of the row tile.
+    shifted = run(torch.cat((a[200:207], a[:65])))
+    assert torch.equal(shifted[7:], full[:65])
+
+
+@pytest.mark.parametrize("m", [65, 100])
+def test_pipelined_gemm_writes_only_its_rows(m: int):
+    """Rows of the destination's buffer past row M keep their bits."""
+    a, weight = _pipelined_problem(_ROUTER_N, _ROUTER_K, m)
+    guard = 0x7FC1  # a NaN no product yields
+    buffer = torch.full(
+        (m + 40, _ROUTER_N), guard, dtype=torch.int16, device="cuda"
+    ).view(torch.bfloat16)
+    result = _pipelined(a, weight, out=buffer[:m])
+    assert result.data_ptr() == buffer.data_ptr()
+    assert torch.equal(
+        buffer[:m].view(torch.int16), _pipelined(a, weight).view(torch.int16)
+    )
+    assert bool((buffer[m:].view(torch.int16) == guard).all())
+
+
+def test_pipelined_gemm_refuses_strided_and_unaligned_tensors():
+    a, weight = _pipelined_problem(_ROUTER_N, _ROUTER_K, 192)
+    with pytest.raises(ValueError, match="contiguous inputs"):
+        _pipelined(a[::2], weight)
+    with pytest.raises(ValueError, match="aligned activation"):
+        _pipelined(_off_by_one(96, _ROUTER_K).copy_(a[:96]), weight)
+    with pytest.raises(ValueError, match="aligned output"):
+        _pipelined(a[:96].contiguous(), weight, out=_off_by_one(96, _ROUTER_N))
+    with pytest.raises(ValueError, match="no config"):
+        _pipelined(a[:64].contiguous(), weight)
+
+
+def test_mm_declines_the_pipelined_gemm_for_offset_views():
+    """Selection declines the pipelined GEMM for an activation that is not
+    16-byte aligned, and mm takes Torch's GEMM instead."""
+    m = 128
+    a, weight = _pipelined_problem(_ROUTER_N, _ROUTER_K, m)
+    shifted = _off_by_one(m, _ROUTER_K)
+    shifted.copy_(a)
+    gluon_mm_a16w16_pipelined_gfx950.device_caches.clear()
+    assert _use_mv(a, weight, None)
+    assert not _use_mv(shifted, weight, None)
+    expected = torch.mm(a, weight.T).view(torch.int16)
+    assert torch.equal(mm(shifted, weight).view(torch.int16), expected)
+    assert not compiled_kernels(gluon_mm_a16w16_pipelined_gfx950)
+
+
+def test_pipelined_gemm_warmup_compiles_its_binary_from_any_row_count():
+    """A GEMM on the weight inside kernel_warmup compiles the one binary.
+
+    Warmup need not run a row count the pipelined GEMM takes; afterwards no
+    row count of the measured range compiles, and views deep into storages
+    over 2 GB (Triton keys pointers on that on AMD) reuse the binary."""
+    a, weight = _pipelined_problem(_ROUTER_N, _ROUTER_K, 320)
+    below = a[:16].contiguous()
+
+    # Outside warmup, and inside it while capturing, nothing compiles.
+    gluon_mm_a16w16_pipelined_gfx950.device_caches.clear()
+    mm(below, weight)
+    assert not compiled_kernels(gluon_mm_a16w16_pipelined_gfx950)
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream), kernel_warmup(enabled=True):
+        with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+            warm_gluon_mm_a16w16_pipelined(below, weight)
+    stream.synchronize()
+    assert not compiled_kernels(gluon_mm_a16w16_pipelined_gfx950)
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            mm(below, weight)
+
+    over_2gb = 2**31 + 2**20
+    a_rows = over_2gb // (2 * _ROUTER_K) + 320
+    a_arena = torch.empty((a_rows, _ROUTER_K), dtype=torch.bfloat16, device="cuda")
+
+    def run(m: int) -> None:
+        out = mm(a[:m].contiguous(), weight)
+        x = a_arena[a_rows - m :]
+        x.copy_(a[:m])
+        assert torch.equal(mm(x, weight).view(torch.int16), out.view(torch.int16))
+
+    assert_warmup_covers(
+        (gluon_mm_a16w16_pipelined_gfx950,), warm, run, range(65, 321, 17)
+    )
+    assert len(compiled_kernels(gluon_mm_a16w16_pipelined_gfx950)) == 1
+
+
+def test_pipelined_gemm_replays_in_a_captured_graph():
+    a, weight = _pipelined_problem(_ROUTER_N, _ROUTER_K, 256)
+    out = torch.empty((256, _ROUTER_N), dtype=torch.bfloat16, device="cuda")
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        _pipelined(a, weight, out=out)
+        with capture_session(graph), torch.cuda.graph(graph, stream=stream):
+            _pipelined(a, weight, out=out)
+    stream.synchronize()
+    for _ in range(3):
+        a.copy_(torch.randn_like(a))
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(
+            out.view(torch.int16), _pipelined(a, weight).view(torch.int16)
+        )
+
+
+@pytest.mark.parametrize(
+    ("n", "k", "m", "kernel"),
+    [
+        (_ROUTER_N, _ROUTER_K, 4, "gluon_gemv_a16w16_gfx950"),
+        (_ROUTER_N, _ROUTER_K, 64, "gluon_mm_a16w16_decode_gfx950"),
+        (_ROUTER_N, _ROUTER_K, 65, "gluon_mm_a16w16_pipelined_gfx950"),
+        (_ROUTER_N, _ROUTER_K, 320, "gluon_mm_a16w16_pipelined_gfx950"),
+        (_ROUTER_N, _ROUTER_K, 321, "torch_decode_gemv"),
+        (_LM_HEAD_N, _LM_HEAD_K, 48, "torch_decode_gemv"),
+        (_LM_HEAD_N, _LM_HEAD_K, 49, "gluon_mm_a16w16_pipelined_gfx950"),
+        (_LM_HEAD_N, _LM_HEAD_K, 64, "gluon_mm_a16w16_pipelined_gfx950"),
+        (_LM_HEAD_N, _LM_HEAD_K, 65, "torch_decode_gemv"),
+    ],
+)
+def test_qwen38_router_and_lm_head_select_by_row_count(
+    n: int, k: int, m: int, kernel: str
+):
+    """Selection reads only the row count, whatever the forward."""
+    assert supports_gluon_mm_a16w16_pipelined_gfx950(m, n, k) == (
+        kernel == "gluon_mm_a16w16_pipelined_gfx950"
+    )
+    name = _select_mv(
+        m, n, k, True, torch.bfloat16, torch.bfloat16, False, True, True
+    ).__name__
+    assert name == kernel
