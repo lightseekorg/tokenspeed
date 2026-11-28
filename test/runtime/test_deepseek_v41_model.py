@@ -5505,7 +5505,7 @@ def test_v41_moe_fused_router_eplb_parity_gpu(monkeypatch):
             )
             torch.testing.assert_close(
                 fused.topk_ids.gather(1, fused_order),
-                unfused.topk_ids.gather(1, unfused_order),
+                unfused.topk_ids.to(torch.int64).gather(1, unfused_order),
                 atol=0,
                 rtol=0,
             )

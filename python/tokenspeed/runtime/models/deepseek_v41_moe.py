@@ -42,7 +42,10 @@ from tokenspeed.runtime.layers.moe.topk import (
     StandardTopKOutput,
     TopK,
     TopKOutput,
+    record_expert_load,
     simulated_router_logits,
+    topk_ids_logical_to_physical,
+    transform_select_experts_inputs,
 )
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization import Fp8Config, Mxfp4Config
@@ -149,6 +152,7 @@ class DeepseekV4TopK(TopK):
         routing_correction_bias: torch.Tensor | None = None,
         hash_indices_table: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
+        expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
     ) -> TopKOutput:
         correction_bias = (
             self.topk_config.correction_bias
@@ -157,6 +161,9 @@ class DeepseekV4TopK(TopK):
         )
         if self.simulate_routing:
             router_logits = simulated_router_logits(router_logits)
+        router_logits, correction_bias = transform_select_experts_inputs(
+            router_logits, correction_bias, expert_location_dispatch_info
+        )
         topk_weights, topk_ids = moe_topk(
             router_logits,
             self.topk_config.top_k,
@@ -168,6 +175,19 @@ class DeepseekV4TopK(TopK):
             hash_indices_table=hash_indices_table,
             input_ids=input_ids,
             topk_weights_dtype=self.weights_dtype,
+        )
+        topk_ids = topk_ids_logical_to_physical(
+            topk_ids,
+            expert_location_dispatch_info,
+            num_experts=router_logits.shape[1],
+        )
+        record_expert_load(
+            (
+                None
+                if expert_location_dispatch_info is None
+                else expert_location_dispatch_info.load
+            ),
+            topk_ids,
         )
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
@@ -452,6 +472,7 @@ class DeepseekV4MoE(nn.Module):
             routing_correction_bias=correction_bias,
             hash_indices_table=hash_indices_table,
             input_ids=routing_input_ids,
+            expert_location_dispatch_info=self.expert_dispatch_info,
         )
 
     def _forward_routed_experts(
