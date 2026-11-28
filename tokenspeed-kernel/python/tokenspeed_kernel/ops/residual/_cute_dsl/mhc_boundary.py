@@ -54,6 +54,11 @@ def mhc_boundary_max_decode_tokens_cute_dsl(device: torch.device | str | int) ->
     """Return max tokens fitting one 16-CTA cluster wave on ``device`` (or 0)."""
     if not _blackwell_cute_dsl_available():
         return 0
+    # One-wave mhc_boundary underperforms StreamFork/unfused decode on SM103,
+    # so disable single-wave decode routing there while keeping prefill
+    # fallback support enabled.
+    if current_platform().arch_version == ArchVersion(10, 3):
+        return 0
     from tokenspeed_kernel.thirdparty.cute_dsl.mhc_boundary import (
         max_decode_wave_tokens,
     )

@@ -40,6 +40,7 @@ from tokenspeed.runtime.execution.slot_state import (
     unpack_slot_rows,
     write_prepared_marker,
 )
+from tokenspeed.runtime.utils.pinned_host_ring import PinnedHostRing
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -315,30 +316,49 @@ class SamplingBackend(ABC):
             self._tp_pg = pg_manager.get_device_process_group(config.tp_group)
             self._tp_src_global_rank = config.tp_group[0]
 
-        # Verify outputs live in one packed int32 buffer so a single broadcast
-        # syncs predict, accept_length and accept_index across TP ranks.
+        # Verify outputs and per-row request_ends share one packed int32 buffer
+        # so TP broadcast and host D2H copies execute cleanly in one op.
         # Backends with DP padding re-carve it for their padded batch.
+        self._d2h_host_ring = PinnedHostRing(config.device)
+        self._pack_rows: int = 0
         self._predict_max: int = 0
         self._output_pack_buf: torch.Tensor = torch.empty(
             (0,), dtype=torch.int32, device=config.device
         )
         self._predict_buf: torch.Tensor = self._output_pack_buf
         self._accept_length_buf: torch.Tensor = self._output_pack_buf
+        self._request_ends_buf: torch.Tensor = self._output_pack_buf
         self._accept_index_buf: torch.Tensor = self._output_pack_buf
         self._allocate_verify_outputs(config.max_bs, config.max_draft_tokens_per_req)
 
+    _PACK_ACCEPT_INDEX = True
+
+    @property
+    def request_ends_buf(self) -> torch.Tensor:
+        """Per-row device ``request_ends`` slice contiguous inside ``_output_pack_buf``."""
+        return self._request_ends_buf
+
     def _allocate_verify_outputs(self, max_rows: int, max_n: int) -> None:
-        """Carve predict / accept_length / accept_index out of one buffer.
+        """Carve predict / accept_length / request_ends (/ accept_index) out of one buffer.
 
         Layout: ``[0, max_rows * max_n)`` predict, then ``max_rows``
-        accept_length entries, then ``max_rows * max_n`` accept_index entries.
-        Each region is flat so ``[:bs * n].view(bs, n)`` is contiguous for
-        any bs/n, and the whole buffer is what ``broadcast_verify_outputs``
-        sends.
+        accept_length entries, then ``max_rows`` request_ends entries, and
+        (when ``_PACK_ACCEPT_INDEX`` is true) ``max_rows * max_n`` accept_index
+        entries. Each region is flat so ``[:bs * n].view(bs, n)`` is contiguous
+        for any bs/n, ``broadcast_verify_outputs`` sends the pack in one
+        collective, and ``get_packed_outputs_and_ends_d2h`` copies predict,
+        lengths, and request_ends in one pinned D2H.
         """
+        self._pack_rows = max_rows
         self._predict_max = max_rows * max_n
+        pack_accept_index = self._PACK_ACCEPT_INDEX
+        total = (
+            self._predict_max
+            + 2 * max_rows
+            + (self._predict_max if pack_accept_index else 0)
+        )
         self._output_pack_buf = torch.zeros(
-            (2 * self._predict_max + max_rows,),
+            (total,),
             dtype=torch.int32,
             device=self.config.device,
         )
@@ -346,7 +366,17 @@ class SamplingBackend(ABC):
         self._accept_length_buf = self._output_pack_buf[
             self._predict_max : self._predict_max + max_rows
         ]
-        self._accept_index_buf = self._output_pack_buf[self._predict_max + max_rows :]
+        self._request_ends_buf = self._output_pack_buf[
+            self._predict_max + max_rows : self._predict_max + 2 * max_rows
+        ]
+        if pack_accept_index:
+            self._accept_index_buf = self._output_pack_buf[
+                self._predict_max + 2 * max_rows :
+            ]
+        else:
+            self._accept_index_buf = torch.zeros(
+                (self._predict_max,), dtype=torch.int32, device=self.config.device
+            )
 
     def _allocate_pool_index_buffer(self, max_rows: int) -> None:
         """Size the int32 pool-index staging buffer for up to ``max_rows`` rows."""
@@ -803,15 +833,76 @@ class SamplingBackend(ABC):
             return None
         n_t = output_tokens.numel()
         n_l = output_lengths.numel()
+        if n_t > self._predict_max or n_l > self._pack_rows:
+            return None
+        if n_t == 0 and n_l == 0:
+            return (
+                torch.empty(output_tokens.shape, dtype=output_tokens.dtype),
+                torch.empty(output_lengths.shape, dtype=output_lengths.dtype),
+            )
         # Copy the whole [0, predict_max + n_l). The gap [n_t, predict_max)
-        # is stale padding (max_bs * max_n  vs.  bs * n) — small enough that
+        # is stale padding (max_bs * max_n vs. bs * n) — small enough that
         # the saved launch beats the wasted bandwidth.
         size = self._predict_max + n_l
-        cpu_pack = torch.empty(size, dtype=torch.int32, pin_memory=True)
-        cpu_pack.copy_(self._output_pack_buf[:size], non_blocking=True)
-        return (
-            cpu_pack[:n_t].view(output_tokens.shape),
-            cpu_pack[self._predict_max : self._predict_max + n_l],
+        tokens_cpu, lengths_cpu = self._d2h_host_ring.copy_packed_d2h(
+            self._output_pack_buf[:size],
+            (
+                (0, output_tokens.shape, output_tokens.dtype),
+                (self._predict_max, output_lengths.shape, output_lengths.dtype),
+            ),
+        )
+        return tokens_cpu, lengths_cpu
+
+    def get_packed_outputs_and_ends_d2h(
+        self,
+        output_tokens: torch.Tensor,
+        output_lengths: torch.Tensor,
+        request_ends: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """One D2H of packed predict + accept_length + request_ends via host ring."""
+        if (
+            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
+            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
+            or request_ends.data_ptr() != self._request_ends_buf.data_ptr()
+        ):
+            return None
+        n_t = output_tokens.numel()
+        n_l = output_lengths.numel()
+        n_e = request_ends.numel()
+        if n_t > self._predict_max or n_l > self._pack_rows or n_e > self._pack_rows:
+            return None
+        if n_t == 0 and n_l == 0 and n_e == 0:
+            return (
+                torch.empty(output_tokens.shape, dtype=output_tokens.dtype),
+                torch.empty(output_lengths.shape, dtype=output_lengths.dtype),
+                torch.empty(request_ends.shape, dtype=request_ends.dtype),
+            )
+        ends_offset = self._predict_max + self._pack_rows
+        size = ends_offset + n_e
+        tokens_cpu, lengths_cpu, ends_cpu = self._d2h_host_ring.copy_packed_d2h(
+            self._output_pack_buf[:size],
+            (
+                (0, output_tokens.shape, output_tokens.dtype),
+                (self._predict_max, output_lengths.shape, output_lengths.dtype),
+                (ends_offset, request_ends.shape, request_ends.dtype),
+            ),
+        )
+        return tokens_cpu, lengths_cpu, ends_cpu
+
+    def copy_outputs_d2h(
+        self,
+        output_tokens: torch.Tensor,
+        output_lengths: torch.Tensor,
+        request_ends: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Copy output tokens, lengths, and request_ends into fenced pinned host memory."""
+        packed = self.get_packed_outputs_and_ends_d2h(
+            output_tokens, output_lengths, request_ends
+        )
+        if packed is not None:
+            return packed
+        return self._d2h_host_ring.copy_tensors_d2h(
+            output_tokens, output_lengths, request_ends
         )
 
     @abstractmethod

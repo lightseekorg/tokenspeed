@@ -834,9 +834,7 @@ def test_graph_padding_restores_live_output_layout(live_bs):
     runner = SimpleNamespace(
         _can_use_graph=lambda *args: True,
         _padded_bs=lambda *args: padded_bs,
-        _pad_graph_req_pool_indices=lambda indices, bs: torch.nn.functional.pad(
-            indices, (0, bs - len(indices)), value=0
-        ),
+        _graph_pad_req_pool_index=lambda: 0,
         _prepare_request_token_history_graph_inputs=lambda **kwargs: None,
         _prepare_decode_metadata=lambda *args, **kwargs: None,
         _cuda_graph_key=lambda bs: (CUDA_GRAPH_VARIANT_DEFAULT, bs),

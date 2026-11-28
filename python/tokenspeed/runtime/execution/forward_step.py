@@ -1392,12 +1392,7 @@ class ForwardStepRunner:
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
 
-    def _pad_graph_req_pool_indices(
-        self, active_req_pool_indices: torch.Tensor, padded_bs: int
-    ) -> torch.Tensor:
-        pad = padded_bs - active_req_pool_indices.shape[0]
-        if pad <= 0:
-            return active_req_pool_indices
+    def _graph_pad_req_pool_index(self) -> int:
         if self.config.spec_algo in ("DFLASH", "DSPARK"):
             # Route padding rows to the sentinel req-pool slot
             # (max_req_pool_size), not slot 0. The DFLASH draft derives each
@@ -1405,15 +1400,21 @@ class ForwardStepRunner:
             # padding rows pointing at slot 0 would grow unbounded with
             # request 0's context and hang the draft block-decode kernel.
             # The sentinel row stays zero-init (length 0, dummy page 0).
-            sentinel = int(self.config.max_req_pool_size)
-            return torch.cat(
-                [
-                    active_req_pool_indices,
-                    active_req_pool_indices.new_full((pad,), sentinel),
-                ]
-            )
+            return int(self.config.max_req_pool_size)
+        return 0
+
+    def _pad_graph_req_pool_indices(
+        self, active_req_pool_indices: torch.Tensor, padded_bs: int
+    ) -> torch.Tensor:
+        pad = padded_bs - active_req_pool_indices.shape[0]
+        if pad <= 0:
+            return active_req_pool_indices
+        pad_idx = self._graph_pad_req_pool_index()
         return torch.cat(
-            [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
+            [
+                active_req_pool_indices,
+                active_req_pool_indices.new_full((pad,), pad_idx),
+            ]
         )
 
     def __call__(
@@ -1467,7 +1468,6 @@ class ForwardStepRunner:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
-        active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
         live_output_layout = ctx.output_layout
         if use_graph and padded_bs != bs:
@@ -1475,18 +1475,12 @@ class ForwardStepRunner:
             ctx.output_layout = ForwardOutputLayout(
                 0, 0, padded_bs, self.max_tokens_per_req
             )
-            pad = padded_bs - bs
-            seq_lens = torch.nn.functional.pad(
-                self.input_buffers.seq_lens_buf[:bs], (0, pad), value=1
+            self.input_buffers.seq_lens_buf[bs:padded_bs].fill_(1)
+            self.input_buffers.req_pool_indices_buf[bs:padded_bs].fill_(
+                self._graph_pad_req_pool_index()
             )
-            req_pool_indices = self._pad_graph_req_pool_indices(
-                active_req_pool_indices, padded_bs
-            )
-            self.input_buffers.seq_lens_buf[:padded_bs].copy_(seq_lens)
-            self.input_buffers.req_pool_indices_buf[:padded_bs].copy_(req_pool_indices)
-        else:
-            seq_lens = self.input_buffers.seq_lens_buf[:padded_bs]
-            req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
+        seq_lens = self.input_buffers.seq_lens_buf[:padded_bs]
+        req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
 
         if use_graph:
             self._prepare_request_token_history_graph_inputs(

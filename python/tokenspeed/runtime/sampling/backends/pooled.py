@@ -48,6 +48,7 @@ class PooledSamplingBackend(SamplingBackend):
 
     _HAS_POOL_STATE = True
     _SUPPORTS_DP_VERIFY = True
+    _PACK_ACCEPT_INDEX = False
 
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
@@ -181,17 +182,7 @@ class PooledSamplingBackend(SamplingBackend):
         self._ones_buf = torch.ones(
             (max_pad_bs,), dtype=torch.int32, device=config.device
         )
-        self._predict_max = max_pad_bs * max_n
-        self._output_pack_buf = torch.zeros(
-            (self._predict_max + max_pad_bs,),
-            dtype=torch.int32,
-            device=config.device,
-        )
-        self._predict_buf = self._output_pack_buf[: self._predict_max]
-        self._accept_length_buf = self._output_pack_buf[self._predict_max :]
-        self._accept_index_buf = torch.zeros(
-            (max_pad_bs * max_n,), dtype=torch.int32, device=config.device
-        )
+        self._allocate_verify_outputs(max_pad_bs, max_n)
 
         self._predict_local_buf: torch.Tensor | None = None
         self._accept_index_local_buf: torch.Tensor | None = None
