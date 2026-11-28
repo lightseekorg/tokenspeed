@@ -74,16 +74,17 @@ def gluon_rowcta_bf16_gemv_geometry_gfx950(n: int, k: int) -> tuple[int, int]:
 # where projecting a few rows with the single-row reduction beat the default
 # selection of ``gemm.mv`` (Gluon MFMA decode GEMM) in cold-weight graph replay
 # on MI355X (median of six alternating trials). Eight rows and the 8192x1024
-# attention output measured slower than the MFMA GEMM.
+# attention output measured slower than the MFMA GEMM. A bucket listed here
+# also ranks above the dense GEMV's 2-4 row bucket (``gemv._PREFERRED_BUCKETS``).
 _ROWS_CONFIGS: dict[tuple[int, int], dict[int, tuple[int, int]]] = {
     (512, 8192): {2: (2, 8), 4: (1, 8)},  # Muse Spark pre-expert TP8
     # Qwen3.8-27B TP1.
-    (5120, 6144): {2: (4, 4), 4: (4, 4)},  # GDN out_proj, attention o_proj
+    (5120, 6144): {2: (4, 4)},  # GDN out_proj, attention o_proj
     (14336, 5120): {2: (4, 4)},  # attention QKV with the output gate
-    (16480, 5120): {2: (4, 4), 4: (4, 4)},  # GDN in_proj_qkvzba
-    (34816, 5120): {2: (4, 4), 4: (4, 4)},  # MLP gate-up
+    (16480, 5120): {2: (4, 4)},  # GDN in_proj_qkvzba
+    (34816, 5120): {2: (4, 4)},  # MLP gate-up
     # EAGLE-4 draft layer for Qwen3.8-27B.
-    (5120, 5120): {2: (4, 4), 4: (4, 4)},  # attention o_proj
+    (5120, 5120): {2: (4, 4)},  # attention o_proj
     (15360, 10240): {2: (2, 4)},  # attention QKV
     (32768, 5120): {2: (4, 4)},  # MLP gate-up
 }

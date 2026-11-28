@@ -384,7 +384,10 @@ decode batches, `1 <= M <= 16`, with one program per CU.
   `_PREFERRED_BUCKETS`, where it beat the default (Torch's skinny GEMM at one
   row, the decode GEMM or hipBLASLt above) in cold-cache standalone sweeps.
   Direct calls take any supported shape.
-- One binary per (shape, M bucket): M = 1, and M = 2-16. Shapes in
+- Two rows of a shape with a measured row-CTA tile (`_ROWS_CONFIGS`) keep
+  that tile.
+- One binary per (shape, M bucket): M = 1, and M = 2-16 (M = 2-4 and 5-16
+  for other outputs wider than 32 columns a CU). Shapes in
   `_ROWS_PER_PROGRAM` may take a tile height of their own for the row
   buckets 1, 2-4, 5-8 and 9-16, and then one binary per such bucket. `M` and
   `N` are runtime arguments.
@@ -397,8 +400,11 @@ shapes and row buckets in `_ROWS_PER_PROGRAM`, a measured tile height
 replaces it: shorter tiles launch several programs per CU, which keeps more
 weight bytes in flight on each CU and trims the power-of-2 padding (a
 16480-wide projection on 256 CUs takes 65 rows a CU, a half-masked 128-row
-block). From M = 2 results do not depend on `rows`: each output's MFMA chain
-is fixed by the constexprs alone.
+block). Other outputs wider than 32 columns a CU at M >= 2 split into
+several programs a CU: 16 columns over eight waves at M = 2-4, 32 columns
+above; one 64-256 column tile a CU ran up to 5x slower than hipBLASLt there.
+From M = 2 results do not depend on `rows`: each output's MFMA chain is
+fixed by the constexprs alone.
 
 - M = 1 (FMA tile): waves split the rows; a lane loads 16 bytes of every
   512-element K chunk, so one load instruction reads 1 KB of a row. Lanes keep

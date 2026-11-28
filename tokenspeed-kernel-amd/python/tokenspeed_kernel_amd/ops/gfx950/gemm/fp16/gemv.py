@@ -22,8 +22,10 @@
 
 One program computes ``rows`` consecutive output columns over the full K, so
 a launch has one program per CU (``rows = cdiv(N, CUs)``, or the measured
-tile height in ``_ROWS_PER_PROGRAM``) and every program issues its whole
-weight share without split-K or cross-CU reductions:
+tile height in ``_ROWS_PER_PROGRAM``; several 16- or 32-column programs for
+other outputs wider than ``_MFMA_MAX_BLOCK_N`` a CU at M > 1) and every
+program issues its whole weight share without split-K or cross-CU
+reductions:
 
 * M = 1, ``BLOCK_M == 1``: FMA tile. Waves split the rows, lanes split each
   K chunk with 16-byte loads (one load instruction reads a 1 KB contiguous
@@ -130,6 +132,14 @@ _ROWS_PER_PROGRAM: dict[tuple[int, int], dict[int, int]] = {
     # Qwen3.8-Flash-Next TP1 attention q (with the output gate), k, v.
     (13312, 2560): {1: 8, 4: 32, 8: 32, 16: 64},
 }
+# Outputs wider than _MFMA_MAX_BLOCK_N columns a CU (N above 8192 on 256 CUs)
+# with no measured tile height in _ROWS_PER_PROGRAM split into 32-column
+# programs, or 16-column eight-wave programs at up to _MFMA_NARROW_MAX_M rows.
+# At N = 14336-34816, K = 5120 on MI355X one 64-256 column tile a CU ran up to
+# 5x slower than hipBLASLt; the narrow programs ran 3-20% faster than
+# hipBLASLt at 3-12 rows.
+_MFMA_MAX_BLOCK_N = 32
+_MFMA_NARROW_MAX_M = 4
 # Gated GEMV: every K iteration's weights are in registers at once, and past 8
 # rows the norm each program repeats outlasts the weight stream.
 _GATED_MAX_ITERS = 3
@@ -919,10 +929,11 @@ def gluon_rmsnorm_gemv_a16w16_gfx950(
     )
 
 
-def _mfma_k_step(k: int) -> tuple[int, int]:
+def _mfma_k_step(k: int, num_warps: int | None = None) -> tuple[int, int]:
     """``(BLOCK_K, num_warps)`` of the MFMA tile over a K-long row."""
     # Long K splits over eight waves, doubling the weight bytes in flight per CU.
-    num_warps = _MFMA_LONG_K_WARPS if k >= _MFMA_LONG_K else NUM_WARPS
+    if num_warps is None:
+        num_warps = _MFMA_LONG_K_WARPS if k >= _MFMA_LONG_K else NUM_WARPS
     return (128 if k >= 128 * num_warps else 64), num_warps
 
 
@@ -934,9 +945,8 @@ def _row_bucket(m: int) -> int:
 def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int, int]:
     """``(rows, BLOCK_M, BLOCK_N, BLOCK_K, STAGES, num_warps)`` of a GEMV
     with ``n`` outputs on ``cus`` CUs."""
-    rows = _ROWS_PER_PROGRAM.get((n, k), {}).get(_row_bucket(m))
-    if rows is None:
-        rows = triton.cdiv(n, cus)
+    measured = _ROWS_PER_PROGRAM.get((n, k), {}).get(_row_bucket(m))
+    rows = triton.cdiv(n, cus) if measured is None else measured
     if m == 1:
         block_n = max(triton.next_power_of_2(rows), NUM_WARPS)
         rows_per_wave = block_n // NUM_WARPS
@@ -958,6 +968,14 @@ def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int, 
             return rows, 1, block_n, _FMA_MIN_CHUNK, stages, NUM_WARPS
         return rows, 1, block_n, chunk, 0, NUM_WARPS
     block_k, num_warps = _mfma_k_step(k)
+    if measured is None and rows > _MFMA_MAX_BLOCK_N:
+        # Wide outputs: several narrow programs a CU instead of one tile of
+        # more than _MFMA_MAX_BLOCK_N columns.
+        if m <= _MFMA_NARROW_MAX_M:
+            rows = _MFMA_MIN_BLOCK_N
+            block_k, num_warps = _mfma_k_step(k, _MFMA_LONG_K_WARPS)
+        else:
+            rows = _MFMA_MAX_BLOCK_N
     block_n = max(triton.next_power_of_2(rows), _MFMA_MIN_BLOCK_N)
     return rows, _MFMA_BLOCK_M, block_n, block_k, 0, num_warps
 
@@ -1021,12 +1039,18 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     # rows in cold-weight graph replay on MI355X.
     (7168, 8192): frozenset({16}),
     (8192, 3584): frozenset({16}),
-    # Qwen3.8-27B TP1 and its EAGLE-4 draft layer.
-    (5120, 5120): frozenset({16}),  # draft attention o_proj
-    (5120, 6144): frozenset({16}),  # GDN out_proj, attention o_proj
+    # Qwen3.8-27B TP1 and its EAGLE-4 draft layer. Two rows of the shapes in
+    # decode_gemv's _ROWS_CONFIGS take the row-CTA GEMV's measured tile.
+    (5120, 5120): frozenset({4, 16}),  # draft attention o_proj
+    (5120, 6144): frozenset({4, 16}),  # GDN out_proj, attention o_proj
     (5120, 15360): frozenset({1, 4, 16}),  # draft fc
     (5120, 16384): frozenset({4, 16}),  # draft MLP down
     (5120, 17408): frozenset({1, 4, 16}),  # MLP down
+    (14336, 5120): frozenset({4, 16}),  # attention QKV with the output gate
+    (16480, 5120): frozenset({4, 16}),  # GDN in_proj_qkvzba
+    (34816, 5120): frozenset({4, 16}),  # MLP gate-up
+    (15360, 10240): frozenset({4}),  # draft attention QKV
+    (32768, 5120): frozenset({4}),  # draft MLP gate-up
     # Qwen3.8-Flash-Next TP1 (tile heights in _ROWS_PER_PROGRAM).
     (16480, 2560): frozenset({1, 4, 16}),  # GDN in_proj
     (13312, 2560): frozenset({1, 4, 16}),  # attention QKV with the output gate

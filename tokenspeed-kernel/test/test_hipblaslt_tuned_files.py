@@ -109,12 +109,12 @@ def _gemm_keys(path) -> set[tuple[str, str]]:
 @pytest.mark.parametrize(
     "device_name, arch_name, files, rows",
     [
-        # Unchanged from the single MI355X file this split replaced.
+        # The single MI355X file this split replaced, plus six 32-row picks.
         (
             "AMD Instinct MI355X",
             _GFX950,
             ["gcn_arch=gfx950.csv", "device_name=AMD_Instinct_MI355X.csv"],
-            105,
+            111,
         ),
         # A generic name some MI355X drivers report, and the MI350X, share the
         # architecture's rows only.
