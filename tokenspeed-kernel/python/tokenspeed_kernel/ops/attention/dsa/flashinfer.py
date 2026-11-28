@@ -35,6 +35,8 @@ from __future__ import annotations
 import math
 
 import torch
+from tokenspeed_kernel.ops.kvcache import flatten_paged_latent_cache
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import remap_cache_slots
 from tokenspeed_kernel.ops.tuning import untuned
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -166,9 +168,9 @@ def _flashinfer_trtllm_mla_kv_cache(
         )
     if kv_cache.dim() == 4:
         if kv_cache.shape[1] == int(page_size) and kv_cache.shape[2] == 1:
-            return kv_cache.permute(0, 2, 1, 3).contiguous()
+            return kv_cache.permute(0, 2, 1, 3)
         if kv_cache.shape[1] == 1 and kv_cache.shape[2] == int(page_size):
-            return kv_cache.contiguous()
+            return kv_cache
     raise ValueError(
         "kv_cache must be flat [slots, dim], flat [slots, 1, dim], or paged "
         f"[pages, page_size, 1, dim] for FlashInfer/TRTLLM sparse MLA, got {tuple(kv_cache.shape)}"
@@ -318,6 +320,15 @@ def _flashinfer_trtllm_dsa_impl(
 
     kv_dtype = q.dtype if q.dtype == torch.float8_e4m3fn else kv_cache.dtype
     kv = _flashinfer_trtllm_mla_kv_cache(kv_cache, page_size, kv_dtype)
+    if not kv.is_contiguous():
+        # Sparse TRTLLM indexes physical rows, independently of dense page strides.
+        _, cache_page_size, cache_page_stride = flatten_paged_latent_cache(kv)
+        topk_slots = remap_cache_slots(
+            topk_slots,
+            page_size=cache_page_size,
+            page_stride=cache_page_stride,
+            lengths=None,
+        )
     output_shape = (num_tokens, 1, num_heads, int(kv_lora_rank))
     kernel_out = None
     if out is not None:

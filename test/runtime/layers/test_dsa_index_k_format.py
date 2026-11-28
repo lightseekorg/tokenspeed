@@ -288,7 +288,7 @@ def _pool(plane: torch.Tensor) -> DSATokenToKVPool:
 
 
 def test_bf16_plane_takes_the_keys_unquantized():
-    plane = torch.zeros((8, HEAD_DIM), dtype=torch.bfloat16)
+    plane = torch.zeros((PREFIX, HEAD_DIM), dtype=torch.bfloat16)
     keys = torch.randn(3, HEAD_DIM).to(torch.bfloat16)
     loc = torch.tensor([5, 1, 6])
 
@@ -301,7 +301,7 @@ def test_bf16_plane_takes_the_keys_unquantized():
 
 
 def test_bf16_plane_write_mask_keeps_foreign_rows():
-    plane = torch.full((8, HEAD_DIM), 7.0, dtype=torch.bfloat16)
+    plane = torch.full((PREFIX, HEAD_DIM), 7.0, dtype=torch.bfloat16)
     keys = torch.randn(3, HEAD_DIM).to(torch.bfloat16)
     loc = torch.tensor([5, 1, 6])
 

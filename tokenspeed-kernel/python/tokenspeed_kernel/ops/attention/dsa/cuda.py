@@ -48,6 +48,8 @@ from tokenspeed_kernel.ops.attention.dsv4.cuda import (
     has_persistent_topk,
     persistent_topk,
 )
+from tokenspeed_kernel.ops.kvcache import flatten_paged_latent_cache
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import remap_cache_slots
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -129,21 +131,6 @@ def _pad_decode_query(q: torch.Tensor, q_len_per_req: int) -> tuple[torch.Tensor
     q_padded[:, :, :actual_heads, :].copy_(q)
     q_padded[:, :, actual_heads:, :].zero_()
     return q_padded, actual_heads
-
-
-def _flatten_regular_kv_cache(kv_cache: torch.Tensor, page_size: int) -> torch.Tensor:
-    if kv_cache.dim() == 2:
-        return kv_cache.view(-1, 1, kv_cache.shape[-1])
-    if kv_cache.dim() == 3:
-        return kv_cache.reshape(-1, kv_cache.shape[-2], kv_cache.shape[-1])
-    if kv_cache.dim() == 4:
-        if kv_cache.shape[1] != int(page_size):
-            raise ValueError(
-                f"paged kv_cache page size mismatch: got {kv_cache.shape[1]}, "
-                f"expected {page_size}"
-            )
-        return kv_cache.reshape(-1, kv_cache.shape[-2], kv_cache.shape[-1])
-    raise ValueError(f"unsupported kv_cache shape {tuple(kv_cache.shape)}")
 
 
 def _paged_sparse_kv_cache(
@@ -432,8 +419,14 @@ if _HAS_FLASH_MLA:
         if logit_cap != 0.0:
             raise RuntimeError("FlashMLA sparse prefill does not support logit_cap")
         q_kernel, actual_heads = _pad_prefill_query(q)
-        kv = _flatten_regular_kv_cache(kv_cache, page_size)
-        slots = _mask_sparse_slots(topk_slots, topk_lens)
+        kv, cache_page_size, cache_page_stride = flatten_paged_latent_cache(kv_cache)
+        kv = kv.unsqueeze(1)
+        slots = remap_cache_slots(
+            topk_slots,
+            page_size=cache_page_size,
+            page_stride=cache_page_stride,
+            lengths=topk_lens,
+        )
         # topk_length stops each row at its owned prefix; its -1 tail adds nothing.
         topk_length = None
         if topk_lens is not None:

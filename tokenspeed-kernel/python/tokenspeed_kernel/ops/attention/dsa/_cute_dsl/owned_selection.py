@@ -38,7 +38,7 @@ import functools
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Int32, Uint32
+from cutlass import Int32, Int64, Uint32
 from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.primitives import (
     float_bits,
 )
@@ -98,11 +98,12 @@ class OwnedSelect:
         out: cute.Tensor,
         lens: cute.Tensor,
         rank: Int32,
+        output_page_stride: Int64,
         stream,
     ):
-        self.kernel(scores, positions, table, requests, out, lens, rank).launch(
-            grid=(out.shape[0], 1, 1), block=(THREADS, 1, 1), stream=stream
-        )
+        self.kernel(
+            scores, positions, table, requests, out, lens, rank, output_page_stride
+        ).launch(grid=(out.shape[0], 1, 1), block=(THREADS, 1, 1), stream=stream)
 
     @cute.jit
     def digit(self, hist, info, keys, shift, mask, match_shift, match, tid):
@@ -170,7 +171,9 @@ class OwnedSelect:
         return threshold, take, tie_rank
 
     @cute.kernel
-    def kernel(self, scores, positions, table, requests, out, lens, rank):
+    def kernel(
+        self, scores, positions, table, requests, out, lens, rank, output_page_stride
+    ):
         """Select rank ``rank``'s share of one row's merged top-k.
 
         Reads the row's scores of every rank, finds the threshold key in three
@@ -218,7 +221,10 @@ class OwnedSelect:
                 if position >= Int32(0):
                     page = table_entry(table, request, position // Int32(self.page))
                     if page >= Int32(0):
-                        slot = page * Int32(self.page) + position % Int32(self.page)
+                        slot = Int32(
+                            Int64(page) * output_page_stride
+                            + Int64(position % Int32(self.page))
+                        )
             own_keys.append(key)
             slots.append(slot)
         live = warp_sum(live)
@@ -300,6 +306,7 @@ def compile_owned_select(degree: int, width: int, page: int):
         out,
         lens,
         Int32(0),
+        Int64(0),
         stream,
         options="--enable-tvm-ffi",
     )
@@ -336,6 +343,7 @@ def cute_dsl_select_owned_from_gathered(
     rank: int,
     topk: int,
     page_size: int,
+    output_page_stride: int,
     out: torch.Tensor,
     lens_out: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -345,6 +353,7 @@ def cute_dsl_select_owned_from_gathered(
     contiguous) and writes int32 ``out`` ``[rows, topk]``, the kept local slots
     first in candidate order and ``-1`` after, and ``lens_out`` ``[rows]``
     counts.
+    ``output_page_stride`` includes padding between physical cache pages.
     """
     degree, rows, width = scores.shape
     if rows:
@@ -356,5 +365,6 @@ def cute_dsl_select_owned_from_gathered(
             out,
             lens_out,
             rank,
+            output_page_stride,
         )
     return out, lens_out

@@ -229,7 +229,13 @@ def test_compact_owned_slots_matches_reference(
             slots.to(device),
             None if lengths is None else lengths.to(device),
             rank=rank,
+            output_page_stride=rows_per_page + 16,
             **geometry,
+        )
+        expected = torch.where(
+            expected >= 0,
+            expected // rows_per_page * (rows_per_page + 16) + expected % rows_per_page,
+            -1,
         )
         assert local.dtype == torch.int32 and counts.dtype == torch.int32
         assert local.shape == slots.shape and local.is_contiguous()
@@ -333,8 +339,17 @@ def test_compact_owned_slots_graph_replay():
         assert torch.equal(counts.cpu(), expected_counts)
 
     # Rows, widths and strides are runtime: one binary per placement and lengths form.
-    compact_owned_slots(selection(4, 512, 7).cuda(), None, **geometry)
-    with assert_no_triton_compile(triton_cache_placement._compact_owned_slots):
+    warm, warm_counts = compact_owned_slots(
+        selection(4, 512, 7).cuda(), None, **geometry
+    )
+    for lengths in (None, warm_counts):
+        triton_cache_placement.remap_cache_slots(
+            warm, page_size=128, page_stride=144, lengths=lengths
+        )
+    with assert_no_triton_compile(
+        triton_cache_placement._compact_owned_slots,
+        triton_cache_placement._remap_cache_slots,
+    ):
         for rows, width in ((1, 2048), (3, 2051), (16, 512), (33, 2048)):
             slots = selection(rows, width, rows).cuda()
             lengths = torch.full((rows,), width // 2, dtype=torch.int32).cuda()
@@ -347,6 +362,16 @@ def test_compact_owned_slots_graph_replay():
                 )
                 assert torch.equal(local.cpu(), expected)
                 assert torch.equal(counts.cpu(), expected_counts)
+                mapped = triton_cache_placement.remap_cache_slots(
+                    local,
+                    page_size=128,
+                    page_stride=144,
+                    lengths=None if row_lengths is None else counts,
+                )
+                expected = torch.where(
+                    expected >= 0, expected // 128 * 144 + expected % 128, -1
+                )
+                assert torch.equal(mapped.cpu(), expected)
 
 
 def test_compact_owned_slots_rejects_invalid_inputs():

@@ -181,16 +181,21 @@ def test_prims_sparse_attention_graph_and_reference(heads, mode, width, with_len
     check(captured, captured_lse)
 
 
-@pytest.mark.parametrize("layout", ["flat", "latent", "nhd", "hnd"])
+@pytest.mark.parametrize("layout", ["flat", "latent", "nhd", "hnd", "padded"])
 def test_prims_cache_layout_and_optional_output(layout):
     torch.manual_seed(79)
     q = (torch.randn(3, 12, 576, device="cuda") * 0.5).to(torch.float8_e4m3fn)
     kv = (torch.randn(4096, 576, device="cuda") * 0.25).to(q.dtype)
+    if layout == "padded":
+        storage = torch.empty((64, 79, 576), device="cuda", dtype=kv.dtype)
+        padded = storage[:, :64].unsqueeze(2)
+        padded.copy_(kv.view(64, 64, 1, 576))
     cache = {
         "flat": kv,
         "latent": kv.view(4096, 1, 576),
         "nhd": kv.view(64, 64, 1, 576),
         "hnd": kv.view(64, 1, 64, 576),
+        "padded": padded if layout == "padded" else None,
     }[layout]
     slots = (
         torch.arange(512, device="cuda", dtype=torch.int32).expand(3, -1).contiguous()

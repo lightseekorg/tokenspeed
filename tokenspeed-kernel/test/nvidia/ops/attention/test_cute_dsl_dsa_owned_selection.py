@@ -195,6 +195,7 @@ def test_owned_selection_is_each_ranks_share_of_the_merge(
     requests = (torch.arange(rows, device="cuda") // q_len).int()
 
     for rank, (slots, counts) in enumerate(expected):
+        output_page_stride = _PAGE + 16
         local_slots, local_counts = dsa_select_owned_candidates(
             gathered,
             positions[rank].contiguous(),
@@ -203,9 +204,13 @@ def test_owned_selection_is_each_ranks_share_of_the_merge(
             rank=rank,
             topk=topk,
             page_size=_PAGE,
+            output_page_stride=output_page_stride,
             solution="cute_dsl",
         )
 
+        slots = torch.where(
+            slots >= 0, slots // _PAGE * output_page_stride + slots % _PAGE, -1
+        )
         torch.testing.assert_close(local_slots, slots, atol=0, rtol=0)
         torch.testing.assert_close(local_counts, counts, atol=0, rtol=0)
     total = sum(counts for _, counts in expected)

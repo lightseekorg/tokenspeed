@@ -254,6 +254,16 @@ _LENGTHS = {
 @pytest.mark.parametrize("q_len", sorted(_LENGTHS))
 def test_logits_match_the_reference(q_len) -> None:
     case = _case(_LENGTHS[q_len], q_len, seed=10 + q_len)
+    if q_len == 1:
+        pages = case["cache"].view(-1, PAGE * (DIM + 4))
+        combined = torch.empty(
+            (pages.shape[0], PAGE * (576 + DIM + 4)),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        strided = combined[:, PAGE * 576 :]
+        strided.copy_(pages)
+        case["cache"] = strided.view(-1, PAGE, DIM + 4)
     _, _, logits, q_fp8, folded = _fused(case)
     reference = _reference_logits(
         q_fp8, folded, case["seq_lens"], case["table"], case["cache"], q_len
@@ -477,6 +487,15 @@ def test_no_recompile_across_batch_shapes() -> None:
             (8, [2055] * 9, 7),
         ):
             case = _case(lengths, q_len, seed=95, extra_pages=extra_pages)
+            pages = case["cache"].view(-1, PAGE * (DIM + 4))
+            combined = torch.empty(
+                (pages.shape[0], PAGE * (576 + DIM + 4)),
+                dtype=torch.uint8,
+                device="cuda",
+            )
+            strided = combined[:, PAGE * 576 :]
+            strided.copy_(pages)
+            case["cache"] = strided.view(-1, PAGE, DIM + 4)
             out, lens, logits, _, _ = _fused(case)
             _check_selection(case, out, lens, _kernel_logits(case, logits))
 

@@ -435,7 +435,7 @@ def test_rank_major_kv_handles_owner_padding_and_workspace_overflow(
     # Six logical rows: rank 0 owns A,C,D,F; rank 1 owns B,E; rank 2 is empty.
     logical = torch.arange(10, 16, dtype=torch.bfloat16)[:, None].repeat(1, KV_DIM)
     owned_positions = ([0, 2, 3, 5], [1, 4], [])
-    plane = torch.zeros((5, 1, KV_DIM), dtype=torch.bfloat16)
+    plane = torch.zeros((3 * PAGE, 1, KV_DIM), dtype=torch.bfloat16)
     mine = owned_positions[rank]
     plane[1 : 1 + len(mine), 0] = logical[mine]
     send_slots = torch.zeros(4, dtype=torch.int64)

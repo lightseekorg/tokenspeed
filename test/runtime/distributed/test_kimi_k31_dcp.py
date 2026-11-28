@@ -114,7 +114,7 @@ def _dense_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
         hidden,
         prompt=prompt,
         spec_width=spec_width,
-        blocks=[4, 7, 2],
+        blocks=[4, 7, 2, 9, 5],
     )
     _assert_close_to_reference(prefill, reference[:prompt], fraction)
     _assert_close_to_reference(eager, reference[prompt : prompt + spec_width], fraction)
@@ -201,7 +201,7 @@ def _selection_case(
         dtype=torch.bfloat16,
         generator=torch.Generator(device="cuda").manual_seed(7),
     )
-    blocks = [9, 2, 7, 4, 11, 6, 1, 8, 3, 10]
+    blocks = [9, 2, 7, 4, 11, 6, 1, 8, 3, 10, 12, 17, 14, 19, 16, 13, 20, 15, 18, 5]
     run = dict(prompt=prompt, spec_width=spec_width, blocks=blocks)
     if value_tail:
         assert sharded[0].owned_decode_value_weight() is not None
@@ -221,6 +221,9 @@ def _selection_case(
             expected_slots,
             expected_counts,
             sharded[2].cache_placement(sharded[0].attn_mqa),
+            output_page_stride=sharded[2].decode_topk_page_stride(
+                sharded[0].attn_mqa, sharded[3].get_key_buffer(3)
+            ),
         )
         total = counts.clone()
         dist.all_reduce(total)
@@ -329,7 +332,10 @@ def _prefix_case(rank: int, kv_cache_dtype, spec_width: int, fraction: float):
         generator=torch.Generator(device="cuda").manual_seed(7),
     )
     resumed, expected = _extend_over_a_cached_prefix(
-        *stacks, hidden, prefix=640, blocks=[9, 2, 7, 4, 11, 6, 1, 8, 3, 10]
+        *stacks,
+        hidden,
+        prefix=640,
+        blocks=[9, 2, 7, 4, 11, 6, 1, 8, 3, 10, 12, 17, 14, 19, 16, 13, 20, 15, 18, 5],
     )
     _assert_close_to_reference(resumed, expected.float(), fraction)
 

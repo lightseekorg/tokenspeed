@@ -78,9 +78,8 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
 
         super().__init__(**kwargs)
 
-    # A KDA layer has conv/recurrent planes planned and an MLA layer has a
-    # latent plane; the plan's field list decides per layer. Latent-page
-    # contiguity is a plan invariant (exact_page_stride).
+    # The plan chooses each layer's fields; padded latent pages retain
+    # their page axis so writers use the physical page stride.
     # State planes keep their planned shape: the KDA decode ABI reads them
     # as the plan lays them out.
     layer_plane_bindings: ClassVar[dict[str, str]] = {
@@ -146,16 +145,14 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
 
 
 class HybridKDADSATokenToKVPool(HybridKDATokenToKVPool, DSATokenToKVPool):
-    """Kimi-K3.1: the K3 latent-KV/KDA-state view plus one index-K plane per
-    DSA layer.
+    """Kimi-K3.1: latent KV and index-K share each DSA layer's plane.
 
     The index-K rows are companion fields of the MLA layer's full-attention
     pages (``KimiK3Recipe``), so they are allocated, prefix-matched,
     transferred and freed with the latent rows. The write, the packed-row
-    gather and the top-k scorers address the plane in DSA kernel pages
-    (``index_k_page_size``), which subdivide K3's 128-token cache blocks the
-    same way the router subdivides the latent pages. KDA layers and draft
-    MLA layers have no index-K plane.
+    gather and the top-k scorers address native DSA kernel pages
+    (``index_k_page_size``). KDA and sliding-draft parents reuse the combined
+    planes; KDA layers and draft MLA layers have no index-K field.
     """
 
     layer_plane_bindings: ClassVar[dict[str, str]] = {

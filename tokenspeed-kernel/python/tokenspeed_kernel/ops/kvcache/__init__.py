@@ -23,6 +23,34 @@
 import torch
 
 
+def flatten_paged_latent_cache(cache: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+    """View latent KV as physical rows, including whole-row page padding.
+
+    Args:
+        cache: Dense [slots, dim], [slots, 1, dim], or paged NHD/HND
+            latent KV with one KV head and contiguous rows within each page.
+
+    Returns:
+        A [physical rows, dim] view without copying, logical rows per page,
+        and physical rows between page starts. Indices into the returned
+        view must include its padding rows.
+    """
+    if cache.ndim == 4:
+        cache = cache.squeeze(1 if cache.shape[1] == 1 else 2)
+    if cache.ndim == 2:
+        cache = cache.unsqueeze(1)
+    pages, page_size, dim = cache.shape
+    if cache.stride(-1) != 1 or cache.stride(1) != dim or cache.stride(0) % dim:
+        raise ValueError("latent pages need contiguous rows and whole-row page strides")
+    page_stride = cache.stride(0) // dim
+    if page_stride < page_size:
+        raise ValueError("latent pages must not overlap")
+    rows = (pages - 1) * page_stride + page_size
+    if rows >= 2**31 - 1:
+        raise ValueError("latent cache rows exceed signed int32 indices")
+    return cache.as_strided((rows, dim), (dim, 1)), page_size, page_stride
+
+
 def zero_byte_ranges(
     backing: torch.Tensor, ranges: list[tuple[int, int]], *, device: str | torch.device
 ) -> None:

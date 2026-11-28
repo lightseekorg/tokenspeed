@@ -1220,7 +1220,8 @@ def _copy_key_tile(
         pages = slots // PAGE_SIZE
         rows = pages * PAGE_STRIDE_BYTES + (slots - pages * PAGE_SIZE) * key_bytes
     else:
-        rows = slots * HEAD_DIM
+        pages = slots // PAGE_SIZE
+        rows = pages * (PAGE_STRIDE_BYTES // 2) + (slots - pages * PAGE_SIZE) * HEAD_DIM
     if USE_BUFFER_LOAD:
         gl.amd.cdna4.async_copy.buffer_load_to_shared(
             key_shared.index(buffer_id),
@@ -2012,6 +2013,8 @@ def gluon_dsa_prefill_topk_bf16_gfx950(
     logits_stride,
     model_scale,
     num_candidates,
+    PAGE_SIZE: gl.constexpr,
+    PAGE_STRIDE_BYTES: gl.constexpr,
     NUM_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     ROWS: gl.constexpr,
@@ -2056,7 +2059,7 @@ def gluon_dsa_prefill_topk_bf16_gfx950(
         model_scale,
         num_candidates,
         1,
-        1,
+        PAGE_SIZE,
         NUM_HEADS,
         HEAD_DIM,
         ROWS,
@@ -2066,7 +2069,7 @@ def gluon_dsa_prefill_topk_bf16_gfx950(
         WARPS_N,
         NUM_STAGES,
         False,
-        0,
+        PAGE_STRIDE_BYTES,
         False,
         "bf16",
         USE_BUFFER_LOAD,
@@ -2098,6 +2101,7 @@ def gluon_dsa_decode_topk_bf16_gfx950(
     num_candidates,
     q_len_per_req,
     PAGE_SIZE: gl.constexpr,
+    PAGE_STRIDE_BYTES: gl.constexpr,
     NUM_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     ROWS: gl.constexpr,
@@ -2153,7 +2157,7 @@ def gluon_dsa_decode_topk_bf16_gfx950(
         WARPS_N,
         NUM_STAGES,
         True,
-        0,
+        PAGE_STRIDE_BYTES,
         False,
         "bf16",
         USE_BUFFER_LOAD,
