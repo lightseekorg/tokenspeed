@@ -90,17 +90,37 @@ def _reference(q, kv, table, lengths):
     return out, lse
 
 
+_SOFTMAX_CASES = [
+    pytest.param(
+        [[3000, 3001, 3001, 3002], [64, 64, 65, 66], [1, 2, 3, 4]], 96, id="ragged"
+    ),
+    pytest.param([[2500], [7000]], 96, id="one-row"),
+    pytest.param([[0, 0, 0, 1], [129, 129, 129, 129]], 96, id="idle-rows"),
+    pytest.param([[5000, 5001, 5002], [300, 300, 301]], 32, id="heads32"),
+    pytest.param([[4096] * 8, [17] * 8], 16, id="heads16"),
+]
+# BF16 queries over an E4M3 cache run every case; the E5M2 cache only changes
+# the dequantization, and FP8 queries run every head count and the idle rows.
+_SOFTMAX_CASES_BY_DTYPES = {
+    _DTYPES[0]: ("ragged", "one-row", "idle-rows", "heads32", "heads16"),
+    _DTYPES[1]: ("one-row", "heads32"),
+    _DTYPES[2]: ("ragged", "idle-rows", "heads16"),
+}
+
+
 @pytest.mark.parametrize(
-    "lengths,heads",
+    "lengths,heads,q_dtype,kv_dtype",
     [
-        ([[3000, 3001, 3001, 3002], [64, 64, 65, 66], [1, 2, 3, 4]], 96),
-        ([[2500], [7000]], 96),
-        ([[0, 0, 0, 1], [129, 129, 129, 129]], 96),
-        ([[5000, 5001, 5002], [300, 300, 301]], 32),
-        ([[4096] * 8, [17] * 8], 16),
+        pytest.param(
+            *case.values,
+            *dtypes,
+            id=f"{case.id}-{str(dtypes[0])[6:]}x{str(dtypes[1])[6:]}",
+        )
+        for dtypes, case_ids in _SOFTMAX_CASES_BY_DTYPES.items()
+        for case in _SOFTMAX_CASES
+        if case.id in case_ids
     ],
 )
-@pytest.mark.parametrize("q_dtype,kv_dtype", _DTYPES)
 def test_matches_fp32_softmax(lengths, heads, q_dtype, kv_dtype):
     q, kv, table, row_lengths = _inputs(lengths, heads, q_dtype, kv_dtype)
     assert supports_mla_decode_query_rows(

@@ -252,10 +252,11 @@ def _ring_rows(chain):
 
 
 # The cases at every geometry (8-token verify blocks), and the half-width
-# geometry's checkpoint's 4-token verify blocks.
+# geometry's checkpoint's 4-token verify blocks: (pending terms, request
+# starts). The mix takes a task a row, so one or three terms need not meet
+# every row count.
 _CASES = [
     (1, (9000,)),
-    (3, (300,)),
     (1, (40, 70000)),
     (3, (1013, 4096, 20000, 77)),
     (1, (40, 300, 1013, 1500, 4096, 77, 9000, 2048)),

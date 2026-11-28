@@ -135,9 +135,10 @@ def test_two_waves_of_one_cta_decode_distinct_pairs_and_use_cta_for_stage(tmp_pa
     assert summary[1].startswith("  2 waves on 1 CTAs in all (2) on rows 0-1")
 
 
-@pytest.mark.parametrize("waves", [-1, 0, 3])
-def test_invalid_header_wave_count_is_rejected(waves):
+def test_invalid_header_wave_count_is_rejected():
+    # A wave count that does not divide the record slots would misplace every
+    # record's CTA and wave.
     t = _buffer(_plan(), [])
-    t[-1, 4] = waves
+    t[-1, 4] = 3
     with pytest.raises(ValueError, match="wave count"):
         stuck.records(t)

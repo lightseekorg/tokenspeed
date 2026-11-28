@@ -71,8 +71,15 @@ def _make_cache(x, fmt):
     return cache
 
 
-@pytest.mark.parametrize("heads", [1, 7, 16])
-@pytest.mark.parametrize("with_global", [False, True])
+# Each head count once, with and without the global reader.
+@pytest.mark.parametrize(
+    ("heads", "with_global"),
+    [
+        pytest.param(7, False, id="False-7"),
+        pytest.param(1, True, id="True-1"),
+        pytest.param(16, True, id="True-16"),
+    ],
+)
 def test_fused_selected_attention_matches_gather_softmax(heads, with_global):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA/ROCm")
@@ -206,19 +213,31 @@ def _padded_query(tokens, real_heads, heads, device, seed):
     return q.to(device), sink.to(device)
 
 
+def _decode_shape(with_rope, tokens, real_heads, heads):
+    return pytest.param(
+        tokens,
+        real_heads,
+        heads,
+        with_rope,
+        id=f"{with_rope}-{tokens}-{real_heads}-{heads}",
+    )
+
+
+# The rope case runs the plain launch too and checks its output through the
+# rope launch's, so every shape runs with rope and one shape also without.
 @pytest.mark.parametrize(
-    ("tokens", "real_heads", "heads"),
+    ("tokens", "real_heads", "heads", "with_rope"),
     [
-        (6, 16, 64),
-        (6, 64, 64),
-        (24, 16, 64),
-        (48, 16, 64),
-        (192, 16, 64),
-        (192, 64, 64),
-        (6, 16, 128),
+        _decode_shape(False, 6, 16, 64),
+        _decode_shape(True, 6, 16, 64),
+        _decode_shape(True, 6, 64, 64),
+        _decode_shape(True, 24, 16, 64),
+        _decode_shape(True, 48, 16, 64),
+        _decode_shape(True, 192, 16, 64),
+        _decode_shape(True, 192, 64, 64),
+        _decode_shape(True, 6, 16, 128),
     ],
 )
-@pytest.mark.parametrize("with_rope", [False, True])
 def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads, with_rope):
     """Split (6, 24, 48 rows) and single-workgroup (192 rows) decode paths.
 

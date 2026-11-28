@@ -346,7 +346,7 @@ def tp8_channel_fixture():
     return native, candidate, weights
 
 
-@pytest.mark.parametrize("tokens", [16, 32, 64, 128, 256, 848, 896, 8192])
+@pytest.mark.parametrize("tokens", [16, 64, 256, 848, 896, 8192])
 def test_tp8_public_operation_reference_and_changed_route_graph(
     tp8_channel_fixture, tokens
 ):

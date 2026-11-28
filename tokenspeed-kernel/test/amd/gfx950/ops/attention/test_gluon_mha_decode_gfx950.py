@@ -131,7 +131,8 @@ def _decode(q, k_cache, v_cache, page_table, cache_seqlens, sinks, window_left):
     )
 
 
-@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16])
+# One request and a batch; the batch size changes only the grid here.
+@pytest.mark.parametrize("batch", [1, 16])
 def test_split_sliding_decode_matches_reference_and_replays(batch: int) -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, sinks = _make_inputs(
         batch, 20260915 + batch
@@ -430,31 +431,77 @@ def _check_verify(actual: torch.Tensor, expected: torch.Tensor) -> None:
     torch.testing.assert_close(actual.float(), expected, atol=2**-8, rtol=2**-7)
 
 
-@pytest.mark.parametrize("with_sinks", [False, True], ids=["no-sinks", "sinks"])
+# (max_seqlen_q, q_heads, kv_heads, head_dim) by id.
+_VERIFY_SHAPES = {
+    # 8 tokens x 8 heads fill one 64-row, four-wave block.
+    "64-rows": (VERIFY_TOKENS, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64),
+    # 2 x 8 rows fit a single wave.
+    "16-rows": (2, 16, 2, 64),
+    # 3 x 6 rows pad a two-wave block; query positions straddle waves.
+    "18-rows": (3, 12, 2, 64),
+    # 16 x 8 rows take two blocks per KV head.
+    "128-rows": (16, 8, 1, 64),
+    "head-dim-128": (VERIFY_TOKENS, 8, 1, 128),
+    # 16 x 6 rows: under a short window, six one-wave blocks whose rows
+    # straddle query positions.
+    "96-rows": (16, 6, 1, 128),
+    # Qwen3.5-style full attention: 24 query over 4 KV heads, head dim
+    # 256, at decode and at an 8-token verify (48 rows, four waves).
+    "head-dim-256-decode": (1, 24, 4, 256),
+    "head-dim-256": (VERIFY_TOKENS, 24, 4, 256),
+}
+_VERIFY_WINDOWS = {
+    "full": -1,
+    "window-2047": 2047,
+    "window-511": 511,
+    "window-255": 255,
+    "window-40": 40,
+}
+# Every shape runs full attention and the long (row-tiled) window. The short
+# windows (one-wave blocks of 16 rows) run on the shapes where they split
+# (511 and 255 over few row blocks), straddle query positions (96 rows) or
+# change the head dim. Sinks alternate so every window runs with and without.
+_VERIFY_CASES = [
+    ("64-rows", "full", False),
+    ("64-rows", "window-2047", True),
+    ("64-rows", "window-511", False),
+    ("64-rows", "window-40", True),
+    ("16-rows", "full", True),
+    ("16-rows", "window-2047", False),
+    ("16-rows", "window-511", True),
+    ("16-rows", "window-255", False),
+    ("18-rows", "full", False),
+    ("18-rows", "window-2047", True),
+    ("18-rows", "window-511", False),
+    ("128-rows", "full", True),
+    ("128-rows", "window-2047", False),
+    ("head-dim-128", "full", False),
+    ("head-dim-128", "window-2047", True),
+    ("head-dim-128", "window-255", True),
+    ("96-rows", "full", True),
+    ("96-rows", "window-2047", False),
+    ("96-rows", "window-511", True),
+    ("96-rows", "window-40", False),
+    ("head-dim-256-decode", "full", False),
+    ("head-dim-256-decode", "window-2047", True),
+    ("head-dim-256-decode", "window-511", True),
+    ("head-dim-256-decode", "window-40", False),
+    ("head-dim-256", "full", True),
+    ("head-dim-256", "window-2047", False),
+    ("head-dim-256", "window-255", False),
+]
+
+
 @pytest.mark.parametrize(
-    "window_left",
-    [-1, 2047, 511, 255, 40],
-    ids=["full", "window-2047", "window-511", "window-255", "window-40"],
-)
-@pytest.mark.parametrize(
-    "max_seqlen_q,q_heads,kv_heads,head_dim",
+    "max_seqlen_q,q_heads,kv_heads,head_dim,window_left,with_sinks",
     [
-        # 8 tokens x 8 heads fill one 64-row, four-wave block.
-        pytest.param(VERIFY_TOKENS, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, id="64-rows"),
-        # 2 x 8 rows fit a single wave.
-        pytest.param(2, 16, 2, 64, id="16-rows"),
-        # 3 x 6 rows pad a two-wave block; query positions straddle waves.
-        pytest.param(3, 12, 2, 64, id="18-rows"),
-        # 16 x 8 rows take two blocks per KV head.
-        pytest.param(16, 8, 1, 64, id="128-rows"),
-        pytest.param(VERIFY_TOKENS, 8, 1, 128, id="head-dim-128"),
-        # 16 x 6 rows: under a short window, six one-wave blocks whose rows
-        # straddle query positions.
-        pytest.param(16, 6, 1, 128, id="96-rows"),
-        # Qwen3.5-style full attention: 24 query over 4 KV heads, head dim
-        # 256, at decode and at an 8-token verify (48 rows, four waves).
-        pytest.param(1, 24, 4, 256, id="head-dim-256-decode"),
-        pytest.param(VERIFY_TOKENS, 24, 4, 256, id="head-dim-256"),
+        pytest.param(
+            *_VERIFY_SHAPES[shape],
+            _VERIFY_WINDOWS[window],
+            sinks,
+            id=f"{shape}-{window}-{'sinks' if sinks else 'no-sinks'}",
+        )
+        for shape, window, sinks in _VERIFY_CASES
     ],
 )
 def test_verify_rows_match_reference_and_replay(
@@ -738,17 +785,19 @@ def _balanced(inputs: dict, sinks=None, schedule=None) -> torch.Tensor:
     )
 
 
-@pytest.mark.parametrize("with_sinks", [False, True], ids=["no-sinks", "sinks"])
+# Sinks alternate across the shapes.
 @pytest.mark.parametrize(
-    "max_seqlen_q,q_heads,kv_heads,head_dim",
+    "max_seqlen_q,q_heads,kv_heads,head_dim,with_sinks",
     [
-        pytest.param(VERIFY_TOKENS, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, id="64-rows"),
-        pytest.param(1, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, id="decode"),
-        pytest.param(3, 12, 2, 64, id="18-rows"),
-        pytest.param(16, 8, 1, 64, id="128-rows"),
-        pytest.param(VERIFY_TOKENS, 8, 1, 128, id="head-dim-128"),
-        pytest.param(1, 24, 4, 256, id="head-dim-256-decode"),
-        pytest.param(VERIFY_TOKENS, 24, 4, 256, id="head-dim-256"),
+        pytest.param(
+            VERIFY_TOKENS, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, False, id="64-rows"
+        ),
+        pytest.param(1, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, True, id="decode-sinks"),
+        pytest.param(3, 12, 2, 64, False, id="18-rows"),
+        pytest.param(16, 8, 1, 64, True, id="128-rows-sinks"),
+        pytest.param(VERIFY_TOKENS, 8, 1, 128, False, id="head-dim-128"),
+        pytest.param(1, 24, 4, 256, True, id="head-dim-256-decode-sinks"),
+        pytest.param(VERIFY_TOKENS, 24, 4, 256, False, id="head-dim-256"),
     ],
 )
 def test_balanced_rows_match_reference_and_replay(
@@ -969,13 +1018,35 @@ def test_balanced_schedule_buffer_at_capacity_ignores_its_stale_tail() -> None:
     )
 
 
-@pytest.mark.parametrize("schedule", [False, True], ids=["split-grid", "balanced"])
-# A 2-page window runs the sliding decode unsplit; 2047 splits it.
+# Each final store at decode and at verify, with 1, 9 and 24 requests spread
+# over them. A 2-page window runs the sliding decode unsplit; 2047 splits it.
+# Only verify takes the balanced schedule, under full attention.
 @pytest.mark.parametrize(
-    "window_left", [-1, 2047, 127], ids=["full", "window-2047", "window-127"]
+    "requests,max_seqlen_q,window_left,schedule",
+    [
+        pytest.param(
+            requests,
+            max_seqlen_q,
+            window_left,
+            schedule,
+            id=(
+                f"{requests}-{'verify' if max_seqlen_q > 1 else 'decode'}-"
+                f"{'full' if window_left < 0 else f'window-{window_left}'}-"
+                f"{'balanced' if schedule else 'split-grid'}"
+            ),
+        )
+        for requests, max_seqlen_q, window_left, schedule in (
+            (1, 1, -1, False),
+            (24, 8, -1, False),
+            (24, 1, 2047, False),
+            (9, 8, 2047, False),
+            (9, 1, 127, False),
+            (1, 8, 127, False),
+            (9, 8, -1, True),
+            (24, 8, -1, True),
+        )
+    ],
 )
-@pytest.mark.parametrize("max_seqlen_q", [1, 8], ids=["decode", "verify"])
-@pytest.mark.parametrize("requests", [1, 9, 24])
 def test_output_gate_is_bitwise_to_the_separate_gated_norm(
     requests: int, max_seqlen_q: int, window_left: int, schedule: bool
 ) -> None:
@@ -990,8 +1061,6 @@ def test_output_gate_is_bitwise_to_the_separate_gated_norm(
     from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
     from torch.profiler import ProfilerActivity, profile
 
-    if schedule and window_left >= 0:
-        pytest.skip("the balanced schedule serves full attention only")
     cache_lens = [
         [max_seqlen_q + 3, 40 * PAGE_SIZE + 9, 470 * PAGE_SIZE + 33][i % 3]
         for i in range(requests)
@@ -1045,13 +1114,33 @@ def test_output_gate_is_bitwise_to_the_separate_gated_norm(
     assert not any("gated_sigmoid" in event.name for event in prof.events())
 
 
-@pytest.mark.parametrize("schedule", [False, True], ids=["split-grid", "balanced"])
-@pytest.mark.parametrize(
-    "kv_dtype", [torch.float8_e4m3fn, torch.bfloat16], ids=["fp8", "bf16"]
-)
 # Per-rank heads of a 128-head model over TP16 / TP8 / TP4 / TP2: the separate
-# op's Triton layout holds 2 / 4 / 8 / 8 values of a head a lane.
-@pytest.mark.parametrize("q_heads", [8, 16, 32, 64])
+# op's Triton layout holds 2 / 4 / 8 / 8 values of a head a lane. Every head
+# count runs both stores; the K/V dtype alternates across them.
+@pytest.mark.parametrize(
+    "q_heads,kv_dtype,schedule",
+    [
+        pytest.param(
+            q_heads,
+            kv_dtype,
+            schedule,
+            id=(
+                f"{q_heads}-{'fp8' if kv_dtype == torch.float8_e4m3fn else 'bf16'}-"
+                f"{'balanced' if schedule else 'split-grid'}"
+            ),
+        )
+        for q_heads, kv_dtype, schedule in (
+            (8, torch.float8_e4m3fn, False),
+            (8, torch.bfloat16, True),
+            (16, torch.bfloat16, False),
+            (16, torch.float8_e4m3fn, True),
+            (32, torch.float8_e4m3fn, False),
+            (32, torch.bfloat16, True),
+            (64, torch.bfloat16, False),
+            (64, torch.float8_e4m3fn, True),
+        )
+    ],
+)
 def test_output_gate_matches_the_separate_gated_norm_at_every_head_count(
     q_heads: int, kv_dtype: torch.dtype, schedule: bool
 ) -> None:

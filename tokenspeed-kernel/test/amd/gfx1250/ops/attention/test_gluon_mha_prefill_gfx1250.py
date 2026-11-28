@@ -102,8 +102,18 @@ def test_mha_prefill_long_prefill(dtype, head_dim):
     _check_sampled_fp64(out, q, k, v, cu_cpu)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("group_size", [1, 2, 4, 8, 32])
+# Group sizes change the packed row mapping; FP16 and BF16 share it, so each
+# size runs in one of them.
+@pytest.mark.parametrize(
+    "dtype,group_size",
+    [
+        pytest.param(torch.bfloat16, 1, id="1-dtype0"),
+        pytest.param(torch.float16, 2, id="2-dtype1"),
+        pytest.param(torch.bfloat16, 4, id="4-dtype0"),
+        pytest.param(torch.float16, 8, id="8-dtype1"),
+        pytest.param(torch.bfloat16, 32, id="32-dtype0"),
+    ],
+)
 def test_mha_prefill_packed_gqa(dtype, group_size):
     """Packed query rows preserve attention across all supported group sizes."""
     q, k, v, cu, cu_cpu, maximum = _inputs(
@@ -284,8 +294,8 @@ def test_mha_prefill_reverse_counts_live_ragged_workgroups():
     _check_sampled_fp64(out, q, k, v, cu_cpu)
 
 
-# The two-head case is the same schedule at a size the MI450 simulator affords.
-@pytest.mark.parametrize("n_q_heads,n_kv_heads", [(8, 2), (2, 1)], ids=["gqa4", "sim"])
+# Two heads keep the schedule at a size the MI450 simulator affords.
+@pytest.mark.parametrize("n_q_heads,n_kv_heads", [(2, 1)], ids=["sim"])
 def test_mha_prefill_tdm_warp_hint_remainder(n_q_heads, n_kv_heads):
     """Changing scheduling preserves outputs on partial query blocks."""
     q, k, v, cu, cu_cpu, maximum = _inputs(
@@ -307,8 +317,8 @@ def test_mha_prefill_tdm_warp_hint_remainder(n_q_heads, n_kv_heads):
     _check_sampled_fp64(out, q, k, v, cu_cpu)
 
 
-# The two-head case is the same schedule at a size the MI450 simulator affords.
-@pytest.mark.parametrize("n_q_heads,n_kv_heads", [(8, 2), (2, 1)], ids=["gqa4", "sim"])
+# Two heads keep the schedule at a size the MI450 simulator affords.
+@pytest.mark.parametrize("n_q_heads,n_kv_heads", [(2, 1)], ids=["sim"])
 def test_mha_prefill_reverse_q_blocks_ragged(n_q_heads, n_kv_heads):
     """Changing scheduling preserves outputs on partial query blocks."""
     q, k, v, cu, cu_cpu, maximum = _inputs(
@@ -454,15 +464,16 @@ def test_mha_prefill_query_tail_lengths_do_not_recompile(dtype):
 
 
 @pytest.mark.parametrize("n_q_heads,n_kv_heads", [(8, 1), (8, 8), (32, 8), (32, 1)])
-@pytest.mark.parametrize("input_scale", [1.0, 8.0])
-def test_mha_prefill_fp16_full_tiles(n_q_heads, n_kv_heads, input_scale):
-    # Exercise automatic selection, including the different packed group sizes.
+def test_mha_prefill_fp16_full_tiles(n_q_heads, n_kv_heads):
+    # Exercise automatic selection, including the different packed group sizes,
+    # on sharp FP16 softmax distributions. test_mha_prefill_storage_offset_repeated
+    # runs these shapes at unit scale.
     torch.manual_seed(42)
     q, k, v, cu, cu_cpu, maximum = _inputs(
         [4096] * 4, n_q_heads, n_kv_heads, 128, "cuda", torch.float16
     )
-    q.mul_(input_scale)
-    k.mul_(input_scale)
+    q.mul_(8.0)
+    k.mul_(8.0)
     out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, maximum)
     _check_sampled_fp64(out, q, k, v, cu_cpu)
 

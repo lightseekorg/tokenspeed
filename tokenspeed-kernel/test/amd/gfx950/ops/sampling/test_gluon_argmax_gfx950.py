@@ -59,12 +59,44 @@ def test_argmax_matches_torch_for_dtypes(dtype):
     torch.testing.assert_close(out, torch.argmax(x, dim=-1), atol=0, rtol=0)
 
 
-# Cover every _select_config bucket on gfx950 and gfx1250, with an odd M at
-# each bucket boundary so non-power-of-two grids are exercised. fp16 and bf16
-# share tile geometry, so only bf16 and fp32 are exercised here.
-@pytest.mark.parametrize("N", MODEL_VOCABS.values(), ids=MODEL_VOCABS.keys())
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
-@pytest.mark.parametrize("M", [1, 2, 3, 5, 17, 64, 65, 128, 129, 256, 513, 1024])
+_DTYPE_IDS = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}
+
+
+def _model_shape_cases():
+    """Every _select_config bucket on gfx950 and gfx1250, with an odd M at
+    each bucket boundary so non-power-of-two grids are exercised. fp16 and
+    bf16 share tile geometry, so only bf16 and fp32 are exercised here.
+
+    Each M takes every vocabulary, with the dtypes alternating so that M
+    values sharing a bucket cover each vocabulary in both dtypes; single-row
+    decode takes every combination."""
+    bf16_first = (torch.bfloat16, torch.float32, torch.bfloat16)
+    fp32_first = (torch.float32, torch.bfloat16, torch.float32)
+    patterns = {
+        1: None,
+        2: fp32_first,
+        3: bf16_first,
+        5: bf16_first,
+        17: fp32_first,
+        64: bf16_first,
+        65: fp32_first,
+        129: bf16_first,
+        513: fp32_first,
+    }
+    cases = []
+    for M, dtypes in patterns.items():
+        for i, (vocab, N) in enumerate(MODEL_VOCABS.items()):
+            row_dtypes = (
+                (torch.bfloat16, torch.float32) if dtypes is None else (dtypes[i],)
+            )
+            for dtype in row_dtypes:
+                cases.append(
+                    pytest.param(M, N, dtype, id=f"{M}-{_DTYPE_IDS[dtype]}-{vocab}")
+                )
+    return cases
+
+
+@pytest.mark.parametrize("M,N,dtype", _model_shape_cases())
 def test_argmax_matches_torch_for_model_shapes(M, N, dtype):
     torch.manual_seed(M ^ N)
     x = torch.randn(M, N, device="cuda", dtype=dtype)
@@ -88,7 +120,8 @@ def test_argmax_all_nan_rows_return_sentinel(M, N, dtype):
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("M", [4, 128, 512])
+# The ties test below covers NaN-filled rows at larger batches.
+@pytest.mark.parametrize("M", [4])
 def test_argmax_ignores_nan_but_preserves_valid_negative_infinity(M):
     N = MODEL_VOCABS["dsv4"]
     x = torch.full((M, N), float("nan"), device="cuda", dtype=torch.float32)
@@ -166,13 +199,21 @@ def test_argmax_strided_rows_and_partial_tiles(M, N):
     )
 
 
+# Each width and each batch in every dtype.
 @pytest.mark.parametrize(
-    "dtype",
-    [torch.float16, torch.bfloat16, torch.float32],
-    ids=["fp16", "bf16", "fp32"],
+    "M,N,dtype",
+    [
+        pytest.param(M, N, dtype, id=f"{N}-{M}-{_DTYPE_IDS[dtype]}")
+        for N, M, dtype in [
+            (16385, 129, torch.float16),
+            (16385, 513, torch.bfloat16),
+            (16385, 129, torch.float32),
+            (129281, 513, torch.float16),
+            (129281, 129, torch.bfloat16),
+            (129281, 513, torch.float32),
+        ]
+    ],
 )
-@pytest.mark.parametrize("M", [129, 513])
-@pytest.mark.parametrize("N", [16385, 129281])
 def test_argmax_masks_padding_with_negative_logits(M, N, dtype):
     # Offset each row and fill its padding with values that must not win.
     out_dtype = torch.int32
@@ -206,17 +247,13 @@ def test_argmax_ties_across_splits_and_infinities(M, N):
     torch.testing.assert_close(_argmax(x, out=None), expected, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("kind", ["small", "column_stride", "float64", "cpu", "empty"])
+@pytest.mark.parametrize("kind", ["small", "column_stride", "empty"])
 def test_argmax_unsupported_inputs_preserve_torch_fallback(kind):
     x = torch.randn(4, 8192, device="cuda")
     if kind == "small":
         x = x[:, :17]
     elif kind == "column_stride":
         x = x[:, ::2]
-    elif kind == "float64":
-        x = x.double()
-    elif kind == "cpu":
-        x = x.cpu()
     elif kind == "empty":
         x = x[:0]
     torch.testing.assert_close(

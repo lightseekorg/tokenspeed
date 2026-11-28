@@ -69,8 +69,9 @@ _NO_REGRESSION_TOL = 5e-3
 _DEGRADATION_BOUND = 0.6
 # Unanimity means the output only moves well past the point where rows start
 # voting: 0.3 has 31.9% of pairs voting and no block elided, 0.7 and 0.9 elide
-# 0.2% and 1.2%. The authors' own benchmark sweeps this from 0.5 to 5.0.
-_THRESHOLDS = [1e-3, 1e-2, 5e-2, 1e-1, 3e-1, 0.7, 0.9]
+# 0.2% and 1.2%. The authors' own benchmark sweeps this from 0.5 to 5.0. The
+# thresholds are runtime values: a few votes, many votes, and elision.
+_THRESHOLDS = [1e-2, 3e-1, 0.9]
 _TINY_THRESHOLD = 1e-9
 
 
@@ -180,8 +181,9 @@ def test_skip_softmax_high_threshold_no_nan(threshold: float) -> None:
     assert torch.isfinite(out).all()
 
 
+# The skip-enabled build without and with skipping; 0.0 builds the skip out.
 @pytest.mark.parametrize("window_left", [1, 64, 256])
-@pytest.mark.parametrize("threshold", [0.0, _TINY_THRESHOLD, 3e-1, 12.0])
+@pytest.mark.parametrize("threshold", [_TINY_THRESHOLD, 12.0])
 def test_skip_softmax_sliding_window_stays_finite(
     threshold: float, window_left: int
 ) -> None:
@@ -195,7 +197,7 @@ def test_skip_softmax_sliding_window_stays_finite(
     assert torch.isfinite(out).all()
 
 
-@pytest.mark.parametrize("threshold", [0.0, _TINY_THRESHOLD, 3e-1, 12.0])
+@pytest.mark.parametrize("threshold", [_TINY_THRESHOLD, 12.0])
 def test_skip_softmax_with_sinks_stays_finite(threshold: float) -> None:
     """[5] Sinks initialise m_i finite, so an early block can legitimately skip."""
     q, k, v = _qkv()

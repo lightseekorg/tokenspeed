@@ -35,8 +35,26 @@ from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
 )
 
 
-@pytest.mark.parametrize("split_k", [1, 2, 4, 8, None])
-@pytest.mark.parametrize("m,n", [(1, 80), (16, 7168), (17, 128), (64, 128)])
+# 16- and 64-row tiles store the strided output both directly and through the
+# split-K reduction. Every split appears; 8 leaves four K tiles per split, which
+# also caps the TDM ring at four. Selection (None) picks 1 for 16 x 7168 and 4
+# for 64 x 128.
+@pytest.mark.parametrize(
+    "m,n,split_k",
+    [
+        pytest.param(m, n, split_k, id=f"{m}-{n}-{split_k}")
+        for m, n, split_k in (
+            (1, 80, 1),
+            (1, 80, 8),
+            (16, 7168, None),
+            (16, 7168, 2),
+            (17, 128, 1),
+            (17, 128, 4),
+            (64, 128, 2),
+            (64, 128, None),
+        )
+    ],
+)
 def test_dense_split_k_strided_output_and_replay(split_k, m, n):
     torch.manual_seed(1250)
     k = 8192

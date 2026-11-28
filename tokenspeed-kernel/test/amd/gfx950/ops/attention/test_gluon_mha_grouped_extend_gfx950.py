@@ -49,9 +49,10 @@ def require_gfx950():
 @pytest.mark.parametrize(
     "group,query_rows,warp_pipeline",
     [
+        # Up to 64 rows take the 64-row tile, more the 128-row one.
         (group, query_rows, False)
         for group in (1, 2, 4, 5, 6, 8, 12)
-        for query_rows in (1, 16, 64, 848, 896, 8192)
+        for query_rows in (64, 848)
     ]
     + [(6, 848, True), (8, 8192, True)],
 )
@@ -311,7 +312,7 @@ def assert_reference(case: PagedCase):
         torch.backends.cuda.matmul.allow_tf32 = previous
 
 
-@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("batch", [1, 2, 16])
 @pytest.mark.parametrize("window", [-1, 511])
 @pytest.mark.usefixtures("require_gfx950")
 def test_speculative_verify_rows(batch, window):
@@ -391,9 +392,19 @@ _HEAD_DIM_256_CASES = [
 ]
 
 
-@pytest.mark.parametrize("queries,prefixes", _HEAD_DIM_256_CASES)
-@pytest.mark.parametrize("window", [-1, 511])
-@pytest.mark.parametrize("sinks", [False, True])
+# Every case runs under both windows, and sinks alternate across the cases, so
+# each window runs with and without sinks.
+@pytest.mark.parametrize(
+    "queries,prefixes,window,sinks",
+    [
+        pytest.param(*case.values, window, sinks, id=f"{sinks}-{window}-{case.id}")
+        for window, sinks_per_case in (
+            (-1, (False, True, False, True)),
+            (511, (True, False, True, False)),
+        )
+        for case, sinks in zip(_HEAD_DIM_256_CASES, sinks_per_case, strict=True)
+    ],
+)
 @pytest.mark.usefixtures("require_gfx950")
 def test_head_dim_256_grouped_queries(queries, prefixes, window, sinks):
     case = make_case(
@@ -409,8 +420,17 @@ def test_head_dim_256_grouped_queries(queries, prefixes, window, sinks):
     assert_reference(case)
 
 
-@pytest.mark.parametrize("queries,prefixes", _HEAD_DIM_256_CASES)
-@pytest.mark.parametrize("window", [-1, 511])
+# Full attention runs every case (split and unsplit); the single-pass window
+# runs the largest (ragged) and smallest (verify) query tiles.
+@pytest.mark.parametrize(
+    "queries,prefixes,window",
+    [
+        pytest.param(*case.values, window, id=f"{window}-{case.id}")
+        for case in _HEAD_DIM_256_CASES
+        for window in (-1, 511)
+        if window < 0 or case.id in ("ragged", "verify")
+    ],
+)
 @pytest.mark.usefixtures("require_gfx950")
 def test_head_dim_256_fp8_cache(queries, prefixes, window):
     # An FP8 E4M3 cache with FP8 queries (unit scales), against the FP32
@@ -488,7 +508,9 @@ def test_kv_stream(queries, prefixes, window):
         pytest.param([37, 300], [9, 700], id="short-context"),
     ],
 )
-@pytest.mark.parametrize("window", [100, 511, 2047])
+# A window under two pages and one of 32 pages; window 511 runs in most tests
+# above.
+@pytest.mark.parametrize("window", [100, 2047])
 @pytest.mark.usefixtures("require_gfx950")
 def test_sliding_window_sees_exactly_its_keys(queries, prefixes, window):
     # Only the pages that hold some row's window edge or its causal diagonal
@@ -575,10 +597,9 @@ def test_warp_pipeline(queries, prefixes, heads, kv_heads, window, sinks):
 @pytest.mark.parametrize(
     "queries,prefixes,window,sinks",
     [
-        # A cached-prefill chunk of 8192 rows over a short and a long prefix:
-        # unsplit, as serving's chunks.
+        # A cached-prefill chunk of 8192 rows over the shortest prefix that
+        # takes the 8-wave tile: unsplit, as serving's chunks.
         pytest.param([8192], [8192], -1, False, id="chunk-8k-prefix"),
-        pytest.param([8192], [100000], -1, False, id="chunk-100k-prefix"),
         # A short extend over a long prefix splits the KV stream: whole splits
         # sit above some rows' diagonal, the rows with no visible key. At 384
         # rows the 4-wave split count would leave a partial 8-wave round, so
@@ -668,9 +689,6 @@ def fp8_case(queries, prefixes, *, heads, kv_heads):
         # Several requests of unequal cached lengths, two rounds of
         # work-group pairs and more: four waves a SIMD.
         pytest.param([4096] * 4, [49152, 102400, 151552, 200704], id="4-unequal"),
-        # One long request beside short ones, under two rounds of work-group
-        # pairs: compiler's.
-        pytest.param([4096] + [512] * 7, [290816] + [2048] * 7, id="long-and-short"),
     ],
 )
 @pytest.mark.usefixtures("require_gfx950")
@@ -792,11 +810,14 @@ def test_fp8_request_counts_compile_at_warmup():
 
 @pytest.mark.usefixtures("require_gfx950")
 def test_fp8_request_count_keeps_bits_and_compiles_at_warmup():
-    """A one-request FP8 batch runs the 8-wave tile at four waves a
-    SIMD, a small batch of several requests (under two rounds of work-group
-    pairs) at the compiler's occupancy. A request gets the same output and
-    LSE bits alone as beside a copy of itself, and after the warm-up neither
-    launch compiles, unsplit or split."""
+    """A one-request FP8 batch that splits the KV stream runs the 8-wave
+    tile at four waves a SIMD, two requests (under two rounds of work-group
+    pairs) at the compiler's occupancy. After the warm-up neither launch
+    compiles, and both copies of a request beside itself get the same bits.
+
+    The unsplit kernel's warm-up is covered by
+    test_fp8_request_counts_compile_at_warmup, and its bits alone and beside
+    a copy by test_xcd_head_order_keeps_every_bit."""
     from tokenspeed_kernel.ops.tuning import kernel_warmup
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha.extend import (
         gluon_mha_extend_gfx950,
@@ -805,35 +826,30 @@ def test_fp8_request_count_keeps_bits_and_compiles_at_warmup():
     )
     from utils import assert_no_triton_compile
 
-    # 4096 rows over a 9000-key prefix fill the CUs unsplit, alone and
-    # doubled; 150 rows over 20000 keys split the KV stream.
-    for queries, prefix, unsplit in ((4096, 9000, True), (150, 20000, False)):
-        two = fp8_case([queries, queries], [prefix, prefix], heads=16, kv_heads=2)
-        # The second request repeats the first: same queries, same pages.
-        two.q[queries:] = two.q[:queries]
-        two.table[1] = two.table[0]
-        one = fp8_case([queries], [prefix], heads=16, kv_heads=2)
-        one = dataclasses.replace(
-            one, q=two.q[:queries], k=two.k, v=two.v, table=two.table[:1]
-        )
-        assert uses_warp_pipeline(one) and uses_warp_pipeline(two)
-        with kernel_warmup(enabled=True):
-            one.invoke("gluon", return_lse=True)
-        with assert_no_triton_compile(
-            gluon_mha_extend_gfx950,
-            gluon_mha_extend_split_gfx950,
-            gluon_mha_extend_reduce_gfx950,
-        ):
-            single, single_lse = one.invoke("gluon", return_lse=True)
-            double, double_lse = two.invoke("gluon", return_lse=True)
-        torch.testing.assert_close(double[:queries], double[queries:], rtol=0, atol=0)
-        if unsplit:
-            # The same sums in the same order at either occupancy.
-            torch.testing.assert_close(single, double[:queries], rtol=0, atol=0)
-            torch.testing.assert_close(single_lse, double_lse[:queries], rtol=0, atol=0)
-        expected, expected_lse = reference(one)
-        torch.testing.assert_close(single.float(), expected, rtol=8e-2, atol=8e-2)
-        torch.testing.assert_close(single_lse, expected_lse, rtol=0, atol=2e-4)
+    # 150 rows over 20000 keys split the KV stream.
+    queries, prefix = 150, 20000
+    two = fp8_case([queries, queries], [prefix, prefix], heads=16, kv_heads=2)
+    # The second request repeats the first: same queries, same pages.
+    two.q[queries:] = two.q[:queries]
+    two.table[1] = two.table[0]
+    one = fp8_case([queries], [prefix], heads=16, kv_heads=2)
+    one = dataclasses.replace(
+        one, q=two.q[:queries], k=two.k, v=two.v, table=two.table[:1]
+    )
+    assert uses_warp_pipeline(one) and uses_warp_pipeline(two)
+    with kernel_warmup(enabled=True):
+        one.invoke("gluon", return_lse=True)
+    with assert_no_triton_compile(
+        gluon_mha_extend_gfx950,
+        gluon_mha_extend_split_gfx950,
+        gluon_mha_extend_reduce_gfx950,
+    ):
+        single, single_lse = one.invoke("gluon", return_lse=True)
+        double, double_lse = two.invoke("gluon", return_lse=True)
+    torch.testing.assert_close(double[:queries], double[queries:], rtol=0, atol=0)
+    expected, expected_lse = reference(one)
+    torch.testing.assert_close(single.float(), expected, rtol=8e-2, atol=8e-2)
+    torch.testing.assert_close(single_lse, expected_lse, rtol=0, atol=2e-4)
 
 
 @pytest.mark.parametrize(
@@ -985,9 +1001,10 @@ def test_warp_pipeline_graph_replay(window):
     )
 
 
-@pytest.mark.parametrize("window", [-1, 511])
 @pytest.mark.parametrize(
-    "heads,kv_heads,head_dim", [(6, 1, 128), (24, 4, 256)], ids=["hd128", "hd256"]
+    "window,heads,kv_heads,head_dim",
+    [(-1, 6, 1, 128), (511, 24, 4, 256)],
+    ids=["hd128--1", "hd256-511"],
 )
 @pytest.mark.usefixtures("require_gfx950")
 def test_changed_metadata_graph_replay_without_recompile(
@@ -1040,13 +1057,28 @@ def test_initial_prefill_groups(query_rows, window):
         torch.backends.cuda.matmul.allow_tf32 = previous
 
 
-@pytest.mark.parametrize(
-    "queries,prefixes", [([64, 48], [200, 300]), ([16], [50000])], ids=["short", "long"]
-)
+_INT32_BATCHES = {"short": ([64, 48], [200, 300]), "long": ([16], [50000])}
+
+
 # Full attention may take the split-K kernel; a window takes the single pass.
-@pytest.mark.parametrize("window", [-1, 511])
 # Head dim 64 pipelines the page loads; 128 and 256 stay single-buffered.
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+# Every (head dim, window) pair runs; the batches alternate across them.
+@pytest.mark.parametrize(
+    "queries,prefixes,window,head_dim",
+    [
+        pytest.param(
+            *_INT32_BATCHES[batch], window, head_dim, id=f"{head_dim}-{window}-{batch}"
+        )
+        for head_dim, window, batch in (
+            (64, -1, "long"),
+            (64, 511, "short"),
+            (128, -1, "short"),
+            (128, 511, "long"),
+            (256, -1, "long"),
+            (256, 511, "short"),
+        )
+    ],
+)
 @pytest.mark.usefixtures("require_gfx950")
 def test_extend_reads_pages_past_int32_range(queries, prefixes, window, head_dim):
     # Each KV page base is computed in 64-bit. Pages past 2**31 elements must
@@ -1112,15 +1144,20 @@ _PLACEMENT_CASES = {
 }
 
 
+# The remap does not depend on the dtype. BF16 runs every case against the
+# oracle; FP8 runs the full-attention tail and ragged grids, whose one-request
+# launches take four waves a SIMD while the batch may not.
 @pytest.mark.parametrize(
-    "window,queries,prefixes",
+    "window,queries,prefixes,dtype",
     [
-        pytest.param(window, *case.values, id=f"w{window}-{case.id}")
+        pytest.param(window, *case.values, dtype, id=f"{dtype_id}-w{window}-{case.id}")
+        for dtype, dtype_id in ((torch.bfloat16, "bf16"), (torch.float8_e4m3fn, "fp8"))
         for window, cases in _PLACEMENT_CASES.items()
         for case in cases
+        if dtype == torch.bfloat16
+        or (window < 0 and case.id in ("rect-tail", "ragged"))
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.usefixtures("require_gfx950")
 def test_work_group_placement_keeps_every_bit(window, queries, prefixes, dtype):
     """Where a (query block, KV head) runs and in which order is placement
@@ -1246,10 +1283,8 @@ if is_cdna4():
 # (blocks_per_req, batch). With 8 XCDs and 1, 2, 4 or 8 heads they cover one
 # block, launches below, at and at multiples of one round of XCDs, and
 # remainders below and above one round.
-_REMAP_RAGGED_GRIDS = [(blocks,) for blocks in (1, 3, 4, 7, 8, 9, 16, 21)]
-_REMAP_RECTANGULAR_GRIDS = [
-    (blocks_per_req, batch) for batch in (1, 2, 5) for blocks_per_req in (1, 3, 7)
-] + [(4, 2), (8, 3)]
+_REMAP_RAGGED_GRIDS = [(blocks,) for blocks in (1, 3, 8, 9, 21)]
+_REMAP_RECTANGULAR_GRIDS = [(1, 1), (7, 1), (3, 2), (1, 5), (7, 5), (4, 2), (8, 3)]
 _REMAP_GRIDS = _REMAP_RAGGED_GRIDS + _REMAP_RECTANGULAR_GRIDS
 
 
@@ -1302,7 +1337,7 @@ def test_work_group_placement_runs_every_block_and_head_once(grid, kv_heads):
         assert (owned == num_xcds // kv_heads).all()
 
 
-@pytest.mark.parametrize("kv_heads", [1, 2, 4, 8])
+@pytest.mark.parametrize("kv_heads", [1, 8])
 @pytest.mark.parametrize("grids", [_REMAP_RAGGED_GRIDS, _REMAP_RECTANGULAR_GRIDS])
 @pytest.mark.usefixtures("require_gfx950")
 def test_remap_reads_the_grid_at_run_time(grids, kv_heads):

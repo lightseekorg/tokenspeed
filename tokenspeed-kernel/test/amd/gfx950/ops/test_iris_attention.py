@@ -41,16 +41,18 @@ def _require_iris():
     pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
 
 
-@pytest.mark.parametrize("rank", (0, 7))
+# Every residual case once, and each operation on the first and last rank,
+# whose peer offsets and local-term position in the sum differ the most.
 @pytest.mark.parametrize(
-    "operation,has_residual,residual_is_sharded",
+    "operation,has_residual,residual_is_sharded,rank",
     (
-        ("reduce", False, False),
-        ("reduce", True, False),
-        ("reduce", True, True),
-        ("published", False, False),
-        ("published", True, True),
-        ("gather", False, False),
+        pytest.param("reduce", False, False, 0, id="reduce-False-False-0"),
+        pytest.param("reduce", True, False, 7, id="reduce-True-False-7"),
+        pytest.param("reduce", True, True, 0, id="reduce-True-True-0"),
+        pytest.param("published", False, False, 7, id="published-False-False-7"),
+        pytest.param("published", True, True, 0, id="published-True-True-0"),
+        pytest.param("gather", False, False, 0, id="gather-False-False-0"),
+        pytest.param("gather", False, False, 7, id="gather-False-False-7"),
     ),
 )
 def test_attention_row_vector_codegen(

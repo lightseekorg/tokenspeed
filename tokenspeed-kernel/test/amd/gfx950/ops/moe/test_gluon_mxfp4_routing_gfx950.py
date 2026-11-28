@@ -187,12 +187,19 @@ def test_sigmoid_bias_topk_route_gluon_matches_supported_dtype_reference(
     torch.testing.assert_close(actual_weights, expected_weights, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("dtype", _ROUTE_DTYPES)
+# Each logits dtype reads both non-finite values; each value runs with and
+# without top-k weight normalization.
 @pytest.mark.parametrize(
-    "logit_value",
-    [pytest.param(float("nan"), id="nan"), pytest.param(-float("inf"), id="neg-inf")],
+    ("dtype", "logit_value", "normalize_topk_weights"),
+    [
+        pytest.param(torch.float16, float("nan"), True, id="float16-nan-norm"),
+        pytest.param(torch.float16, -float("inf"), False, id="float16-neg-inf"),
+        pytest.param(torch.bfloat16, float("nan"), False, id="bfloat16-nan"),
+        pytest.param(torch.bfloat16, -float("inf"), True, id="bfloat16-neg-inf-norm"),
+        pytest.param(torch.float32, float("nan"), False, id="float32-nan"),
+        pytest.param(torch.float32, -float("inf"), True, id="float32-neg-inf-norm"),
+    ],
 )
-@pytest.mark.parametrize("normalize_topk_weights", [False, True])
 def test_sigmoid_bias_topk_route_gluon_matches_nan_and_neg_inf_reference(
     dtype: torch.dtype,
     logit_value: float,

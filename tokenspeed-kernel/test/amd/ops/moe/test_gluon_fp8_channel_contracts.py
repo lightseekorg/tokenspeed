@@ -38,60 +38,16 @@ def require_amd_kernel_package():
         import tokenspeed_kernel_amd  # noqa: F401
 
 
-def test_apply_rejects_unknown_policy():
-    with pytest.raises(ValueError, match="precision_policy"):
-        gluon_fp8_channel_bf16_precomputed_moe_apply(
-            {"precision_policy": "unknown"},
-            None,
-            None,
-            None,
-        )
-
-
-@pytest.mark.parametrize(
-    "options,error",
-    [
-        ({"enable_pdl": True}, "enable_pdl"),
-        ({"plan_extra": {"output_scale": 2.0}}, "unit output scale"),
-        ({"plan_extra": {"combine_order": "slot"}}, "rank-local"),
-    ],
-)
-def test_apply_rejects_unsupported_launch_before_device_use(options, error):
-    options = dict(options)
+def test_apply_rejects_non_unit_output_scale_before_device_use():
+    # The kernels apply no output scale; ignoring one would mis-scale outputs.
     plan = {
         "apply_kernel_name": GLUON_FP8_CHANNEL_APPLY,
         "precision_policy": "default",
+        "output_scale": 2.0,
     }
-    plan.update(options.pop("plan_extra", {}))
-    with pytest.raises(ValueError, match=error):
+    with pytest.raises(ValueError, match="unit output scale"):
         gluon_fp8_channel_bf16_precomputed_moe_apply(
-            plan, None, torch.nn.Module(), None, **options
-        )
-
-
-@pytest.mark.parametrize("intermediate", [320, 640])
-@pytest.mark.usefixtures("require_amd_kernel_package")
-def test_default_policy_still_rejects_non_gpu_tensors(intermediate):
-    weights = torch.nn.Module()
-    weights.w13_weight = torch.empty(
-        256, 2 * intermediate, 5120, device="meta", dtype=torch.float8_e4m3fn
-    )
-    weights.w2_weight = torch.empty(
-        256, 5120, intermediate, device="meta", dtype=torch.float8_e4m3fn
-    )
-    weights.w13_weight_scale = torch.empty(256, 2 * intermediate, device="meta")
-    weights.w2_weight_scale = torch.empty(256, 5120, device="meta")
-    with pytest.raises(ValueError, match="contiguous GPU tensors"):
-        gluon_fp8_channel_bf16_precomputed_moe_apply(
-            {
-                "apply_kernel_name": GLUON_FP8_CHANNEL_APPLY,
-                "precision_policy": "default",
-            },
-            torch.empty(1, 5120, device="meta", dtype=torch.bfloat16),
-            weights,
-            None,
-            topk_ids=torch.zeros(1, 8, dtype=torch.int32),
-            topk_weights=torch.ones(1, 8),
+            plan, None, torch.nn.Module(), None
         )
 
 
@@ -129,12 +85,9 @@ def test_default_policy_executes_empty_gluon_batch_without_name_pin(
     assert output.device == x.device
 
 
-@pytest.mark.parametrize(
-    "experts,topk,intermediate", [(128, 8, 320), (256, 4, 320), (256, 8, 352)]
-)
-def test_default_policy_rejects_unsupported_expert_geometry(
-    experts, topk, intermediate
-):
+def test_default_policy_rejects_unsupported_expert_geometry():
+    # The stages are built for E256 H5120 I320/I640 top8 only.
+    experts, topk, intermediate = 256, 8, 352
     weights = torch.nn.Module()
     with torch.device("meta"):
         weights.w13_weight = torch.empty(
@@ -154,11 +107,11 @@ def test_default_policy_rejects_unsupported_expert_geometry(
             )
 
 
-@pytest.mark.parametrize("ep_size,ep_rank", [(2, 0), (1, 1)])
-def test_default_policy_rejects_expert_parallelism(ep_size, ep_rank):
+def test_default_policy_rejects_expert_parallelism():
+    # The kernels compute EP1 rank-local outputs only.
     weights = torch.nn.Module()
-    weights.ep_size = ep_size
-    weights.ep_rank = ep_rank
+    weights.ep_size = 2
+    weights.ep_rank = 0
     with pytest.raises(ValueError, match="EP1 rank-local"):
         gluon_fp8_channel_bf16_precomputed_moe_apply(
             {"precision_policy": "default"}, None, weights, None

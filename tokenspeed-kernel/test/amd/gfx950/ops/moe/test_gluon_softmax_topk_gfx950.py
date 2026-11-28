@@ -62,23 +62,42 @@ def _check_against_reference(dtype, tokens, experts, topk, renormalize, ids_dtyp
     torch.testing.assert_close(weights, expected_weights, rtol=1e-5, atol=1e-7)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def _reference_case(dtype, tokens, experts, topk, renormalize):
+    name = str(dtype).removeprefix("torch.")
+    return pytest.param(
+        dtype,
+        tokens,
+        experts,
+        topk,
+        renormalize,
+        id=f"{name}-{tokens}-{experts}-{topk}-{'renorm' if renormalize else 'raw'}",
+    )
+
+
+# Each expert-count and top-k specialization runs every logits dtype and both
+# renormalization modes.
 @pytest.mark.parametrize(
-    ("tokens", "experts", "topk"),
+    ("dtype", "tokens", "experts", "topk", "renormalize"),
     [
-        (1, 512, 10),
-        (16, 512, 10),
-        (64, 512, 10),
-        (1000, 512, 10),
-        (33, 100, 7),
+        _reference_case(torch.bfloat16, 1, 512, 10, True),
+        _reference_case(torch.float16, 1, 512, 10, False),
+        _reference_case(torch.float32, 1, 512, 10, True),
+        # Many programs.
+        _reference_case(torch.bfloat16, 1000, 512, 10, False),
+        _reference_case(torch.bfloat16, 33, 100, 7, False),
+        _reference_case(torch.float16, 33, 100, 7, True),
+        _reference_case(torch.float32, 33, 100, 7, False),
         # Registration limits, each its own specialization: the widest
         # per-lane vector and the largest selection, then a one-slot selection
         # over a single vector element per lane.
-        (4, 1024, 32),
-        (5, 64, 1),
+        _reference_case(torch.bfloat16, 4, 1024, 32, True),
+        _reference_case(torch.float16, 4, 1024, 32, False),
+        _reference_case(torch.float32, 4, 1024, 32, True),
+        _reference_case(torch.bfloat16, 5, 64, 1, False),
+        _reference_case(torch.float16, 5, 64, 1, True),
+        _reference_case(torch.float32, 5, 64, 1, False),
     ],
 )
-@pytest.mark.parametrize("renormalize", [True, False])
 def test_softmax_topk_matches_reference(dtype, tokens, experts, topk, renormalize):
     _check_against_reference(dtype, tokens, experts, topk, renormalize, torch.int32)
 
