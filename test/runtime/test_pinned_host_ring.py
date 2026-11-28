@@ -36,12 +36,12 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
 from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
-from tokenspeed.runtime.execution.forward_batch_info import (  # noqa: E402
-    ForwardMode,
-    ForwardOutputLayout,
-)
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner  # noqa: E402
 from tokenspeed.runtime.execution.input_buffer import InputBuffers  # noqa: E402
+from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
+    ForwardOutputLayout,
+)
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates  # noqa: E402
 from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
     CUDA_GRAPH_VARIANT_DEFAULT,
@@ -141,12 +141,14 @@ def test_pinned_host_ring_grows_and_falls_back_when_all_slots_busy() -> None:
     assert [t.tolist() for t in held] == [[1] * 4, [2] * 4, [3] * 4]
     held.clear()
 
-    # Reclaiming a slot with larger size grows it once, then steady reuse has 0 allocs.
-    with ring.staging():
-        (big,) = ring.acquire_views([(64, torch.int32)])
-        big.fill_(11)
-        del big
+    # Reclaiming both ring slots at larger size grows each once, then steady reuse has 0 allocs.
+    for _ in range(2):
+        with ring.staging():
+            (big,) = ring.acquire_views([(64, torch.int32)])
+            big.fill_(11)
+            del big
     grown_allocs = ring.alloc_count
+    assert grown_allocs == 5
     for step in range(25):
         with ring.staging():
             (v,) = ring.acquire_views([(64, torch.int32)])
@@ -172,12 +174,14 @@ def test_copy_host_values_handles_empty_list_array_and_tensor() -> None:
         assert dst.tolist() == [2, 0, 1]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_input_buffers_reuses_pinned_ring_and_forward_step_pads_in_place() -> None:
+    device = "cuda"
     ib = InputBuffers(
         max_bs=8,
         max_num_tokens=64,
         state_write_padding_pool_index=9,
-        device="cpu",
+        device=device,
         reads_state_checkpoints=False,
     )
     runtime = RuntimeStates(
@@ -185,7 +189,7 @@ def test_input_buffers_reuses_pinned_ring_and_forward_step_pads_in_place() -> No
         input_vocab_size=128,
         vocab_size=128,
         output_length=1,
-        device="cpu",
+        device=device,
     )
 
     for step in range(12):
@@ -201,6 +205,7 @@ def test_input_buffers_reuses_pinned_ring_and_forward_step_pads_in_place() -> No
             num_extends=lambda: 0,
         )
         ib.fill_input_buffers(forward_op, runtime, total_tokens=2)
+        torch.cuda.synchronize()
     assert ib._pinned_ring.alloc_count == 1
     assert ib._pinned_ring.fallback_alloc_count == 0
     assert ib.req_pool_indices_buf[:2].tolist() == [4, 5]
@@ -211,8 +216,12 @@ def test_input_buffers_reuses_pinned_ring_and_forward_step_pads_in_place() -> No
     for spec_algo, expected_pad in ((None, 0), ("DSPARK", 9)):
         ib.seq_lens_buf.fill_(99)
         ib.req_pool_indices_buf.fill_(88)
-        ib.req_pool_indices_buf[:2].copy_(torch.tensor([3, 6], dtype=torch.int64))
-        ib.seq_lens_buf[:2].copy_(torch.tensor([11, 12], dtype=torch.int32))
+        ib.req_pool_indices_buf[:2].copy_(
+            torch.tensor([3, 6], dtype=torch.int64, device=device)
+        )
+        ib.seq_lens_buf[:2].copy_(
+            torch.tensor([11, 12], dtype=torch.int32, device=device)
+        )
         seq_ptr = ib.seq_lens_buf.data_ptr()
         req_ptr = ib.req_pool_indices_buf.data_ptr()
 
@@ -236,7 +245,7 @@ def test_input_buffers_reuses_pinned_ring_and_forward_step_pads_in_place() -> No
             commit_state_after_acceptance=lambda *_a, **_kw: None
         )
         runner.max_tokens_per_req = 1
-        runner.device = "cpu"
+        runner.device = device
         runner.drafter = None
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
         runner.token_to_kv_pool = SimpleNamespace(
@@ -252,8 +261,8 @@ def test_input_buffers_reuses_pinned_ring_and_forward_step_pads_in_place() -> No
         }
         runner.output_buffers = {
             (CUDA_GRAPH_VARIANT_DEFAULT, 6): (
-                torch.arange(6, dtype=torch.int32),
-                torch.ones(6, dtype=torch.int32),
+                torch.arange(6, dtype=torch.int32, device=device),
+                torch.ones(6, dtype=torch.int32, device=device),
                 None,
                 None,
                 None,
@@ -321,6 +330,7 @@ def test_pinned_host_ring_cuda_real_event_and_zero_gpu_alloc() -> None:
         assert cpu_tail.tolist() == list(range(step + 12, step + 16))
         del cpu_out, cpu_tail
 
+    del gpu_dst
     torch.cuda.synchronize()
     after_bytes = torch.cuda.memory_allocated()
     assert after_bytes == before_bytes
