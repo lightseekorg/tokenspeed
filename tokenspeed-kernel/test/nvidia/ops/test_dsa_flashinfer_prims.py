@@ -25,8 +25,10 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.workspace import capture_session
+from utils import assert_no_cute_compile
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
@@ -306,3 +308,48 @@ def test_fp8_decode_with_lse_meets_the_reference_on_the_default_kernel():
     reference, ref_lse, bound = _reference(q, kv, slots, None, 1.0)
     _check_fp8_output(output, reference, bound)
     torch.testing.assert_close(lse.double(), ref_lse, rtol=1e-4, atol=2e-4)
+
+
+def test_prims_prefill_warmup_covers_smaller_power_of_two_buckets():
+    """One prefill warmup launch at the peak row count warms every smaller
+    power-of-two bucket so serving prefills trigger no CuTe DSL compiles."""
+    torch.manual_seed(91)
+    max_rows, heads = 33, 12
+    q = (torch.randn(max_rows, heads, 576, device="cuda") * 0.5).to(torch.float8_e4m3fn)
+    kv = (torch.randn(4096, 576, device="cuda") * 0.25).to(q.dtype)
+    slots = torch.stack(
+        [torch.randperm(4096, device="cuda")[:512] for _ in range(max_rows)]
+    ).int()
+    lengths = torch.full((max_rows,), 512, device="cuda", dtype=torch.int32)
+
+    with kernel_warmup(enabled=True):
+        warm_out = _call(
+            q,
+            kv,
+            slots,
+            lengths,
+            mode="prefill",
+            width=1,
+            out=None,
+            lse=False,
+            k_scale=1.0,
+            solution="flashinfer_prims",
+        )
+    expected, _, bound = _reference(q, kv, slots, lengths, 1.0)
+    _check_fp8_output(warm_out, expected, bound)
+
+    with assert_no_cute_compile():
+        for rows in (1, 2, 3, 4, 7, 8, 15, 16, 17, 32, 33):
+            actual = _call(
+                q[:rows],
+                kv,
+                slots[:rows],
+                lengths[:rows],
+                mode="prefill",
+                width=1,
+                out=None,
+                lse=False,
+                k_scale=1.0,
+                solution="flashinfer_prims",
+            )
+            _check_fp8_output(actual, expected[:rows], bound[:rows])

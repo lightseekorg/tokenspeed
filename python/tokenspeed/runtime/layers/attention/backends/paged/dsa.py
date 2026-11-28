@@ -47,6 +47,7 @@ from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
 )
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.metadata import expand_k_row_lengths
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry, priority_band_name
 from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
@@ -415,6 +416,12 @@ class DSABackend(PagedAttentionBackend):
             and len(self.kvp_group) == 1
             and len(self.qcp_group) == 1
             and self.num_attention_heads <= 128
+        )
+        # Tracks (stream, dtype, topk, logit_cap) keys whose unsharded local-head
+        # prefill path (rows < _ROW_SHARD_MIN_ROWS) has been warmed during
+        # row-sharded startup warmup.
+        self._row_shard_unsharded_warmed: set[tuple[int, torch.dtype, int, float]] = (
+            set()
         )
         if self._row_shard_prefill:
             # NCCL connects the exchange's peers on its first all-to-all.
@@ -2426,6 +2433,58 @@ class DSABackend(PagedAttentionBackend):
         """
         if self.data_type == torch.float8_e4m3fn and q_view.dtype != self.data_type:
             q_view = q_view.to(self.data_type)
+        kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if is_warming_up() and not (
+            q_view.is_cuda and torch.cuda.is_current_stream_capturing()
+        ):
+            stream_id = (
+                torch.cuda.current_stream(q_view.device).cuda_stream
+                if q_view.is_cuda
+                else 0
+            )
+            warm_key = (
+                stream_id,
+                q_view.dtype,
+                topk_slots.shape[1],
+                float(layer.logit_cap),
+            )
+            if warm_key not in self._row_shard_unsharded_warmed:
+                # Startup warmup hits this row-sharded branch (gathered
+                # core_heads on N/tp rows) whenever max_prefill_tokens >=
+                # _ROW_SHARD_MIN_ROWS, leaving the unsharded local-head prefill
+                # path (1 <= rows < _ROW_SHARD_MIN_ROWS) cold until live traffic.
+                # Warm the top unsharded bucket once per launch config so
+                # backends such as Prims-TS compile every smaller bucket too.
+                warm_rows = min(q_view.shape[0], _ROW_SHARD_MIN_ROWS)
+                dsa_prefill(
+                    q=q_view[:warm_rows],
+                    kv_cache=kv_cache,
+                    sparse_kv_cache=None,
+                    topk_slots=topk_slots[:warm_rows],
+                    topk_lens=topk_lens[:warm_rows]
+                    .to(device=q_view.device, dtype=torch.int32)
+                    .contiguous(),
+                    kv_seq_lens=(
+                        None
+                        if kv_seq_lens is None
+                        else kv_seq_lens[:warm_rows]
+                        .to(device=q_view.device, dtype=torch.int32)
+                        .contiguous()
+                    ),
+                    max_seqlen_k=max_seq_len,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    softmax_scale=layer.scaling,
+                    page_size=self.kernel_page_size,
+                    logit_cap=layer.logit_cap,
+                    k_scale=1.0,
+                    return_lse=False,
+                    solution=self.kernel_solution,
+                    kernel_plan=self.prefill_kernel_plan,
+                    slot_order=self.slot_order,
+                )
+                self._row_shard_unsharded_warmed.add(warm_key)
         group = self.attn_tp_group
         counts = scatter_count(q_view.shape[0], len(group))
         start = sum(counts[: self.attn_tp_rank])
@@ -2435,7 +2494,7 @@ class DSABackend(PagedAttentionBackend):
             q=exchange_query_rows_padded(
                 q_view, group, self.attn_tp_rank, counts, core_heads
             ),
-            kv_cache=token_to_kv_pool.get_key_buffer(layer.layer_id),
+            kv_cache=kv_cache,
             sparse_kv_cache=None,
             topk_slots=topk_slots[rows],
             topk_lens=topk_lens[rows]
