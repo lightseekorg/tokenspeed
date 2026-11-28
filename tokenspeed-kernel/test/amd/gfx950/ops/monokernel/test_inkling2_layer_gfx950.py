@@ -449,13 +449,35 @@ LAUNCHES = [
 ]
 
 
-def _geometry_id(value):
-    return f"h{value.hidden}" if isinstance(value, ip.Dims) else None
+def _id(value):
+    if isinstance(value, ip.Dims):
+        return f"h{value.hidden}"
+    if isinstance(value, tuple):  # padded requests
+        return f"padded{'_'.join(map(str, value))}"
+    return str(value)
 
 
-@pytest.mark.parametrize("boundary,layer0,full_splits,n_terms", KINDS)
-@pytest.mark.parametrize("experts", ["nvfp4", "mxfp8"])
-@pytest.mark.parametrize("d,rows,chain,first", LAUNCHES, ids=_geometry_id)
+def _with_kinds(cases):
+    """Every case with every layer kind, the experts' format alternating so
+    that each case and each kind run with both formats (the expert stages
+    do not depend on the kind)."""
+    return [
+        pytest.param(
+            *case,
+            experts,
+            *kind,
+            id="-".join(map(_id, (*case, experts, *kind))),
+        )
+        for i, case in enumerate(cases)
+        for j, kind in enumerate(KINDS)
+        for experts in [ip.EXPERT_FORMATS[(i + j) % 2]]
+    ]
+
+
+@pytest.mark.parametrize(
+    "d,rows,chain,first,experts,boundary,layer0,full_splits,n_terms",
+    _with_kinds(LAUNCHES),
+)
 def test_local_layer_launch_equals_its_stage_slices(
     d, rows, chain, first, experts, boundary, layer0, full_splits, n_terms
 ):
@@ -588,28 +610,22 @@ def _requests_worker(
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("boundary,layer0,full_splits,n_terms", KINDS)
-@pytest.mark.parametrize("experts", ["nvfp4", "mxfp8"])
+# Each geometry's batches of verify blocks, some of them padding: the live
+# requests check the rows contract, the padded ones the padding's.
 @pytest.mark.parametrize(
-    "d,chain,rows,padded",
-    [
-        *(
-            (ip.GEOMETRIES[0], 8, rows, padded)
-            for rows, padded in [
-                (16, ()),
-                (16, (1,)),
-                (32, ()),
-                (32, (2, 3)),
-                (64, ()),
-                (64, (5, 6, 7)),
-            ]
-        ),
-        *(
-            (ip.GEOMETRIES[1], 4, rows, padded)
-            for rows, padded in [(8, ()), (8, (1,)), (16, (2, 3)), (32, (5, 6, 7))]
-        ),
-    ],
-    ids=_geometry_id,
+    "d,chain,rows,padded,experts,boundary,layer0,full_splits,n_terms",
+    _with_kinds(
+        [
+            *(
+                (ip.GEOMETRIES[0], 8, rows, padded)
+                for rows, padded in [(16, (1,)), (32, (2, 3)), (64, (5, 6, 7))]
+            ),
+            *(
+                (ip.GEOMETRIES[1], 4, rows, padded)
+                for rows, padded in [(8, (1,)), (16, (2, 3)), (32, (5, 6, 7))]
+            ),
+        ]
+    ),
 )
 def test_rows_equal_one_request_launches(
     d, chain, rows, padded, experts, boundary, layer0, full_splits, n_terms
@@ -731,9 +747,18 @@ def _part_worker(rank, port, d, rows, chain, first, experts, full_splits, part):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("part", ip.LATER_PARTS)
-@pytest.mark.parametrize("full_splits", [0, ip.FULL_SPLITS])
-@pytest.mark.parametrize("experts", ["nvfp4", "mxfp8"])
+# The attention part at either attention kind (it runs no expert stage),
+# the MoE part with either experts' format (it does not depend on the
+# attention kind).
+@pytest.mark.parametrize(
+    "part,full_splits,experts",
+    [
+        ("attention", 0, "nvfp4"),
+        ("attention", ip.FULL_SPLITS, "nvfp4"),
+        ("mlp", 0, "nvfp4"),
+        ("mlp", 0, "mxfp8"),
+    ],
+)
 @pytest.mark.parametrize(
     "rows,chain,first", [(4, 4, 1500), (16, 4, 900), (32, 4, 1500)]
 )
@@ -747,8 +772,6 @@ def test_later_pass_parts_equal_their_stage_slices(
     same bits."""
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
-    if part == "mlp" and full_splits:
-        pytest.skip("the MoE part does not depend on the attention kind")
     with socket.socket() as sock:
         sock.bind(("", 0))
         port = sock.getsockname()[1]

@@ -146,7 +146,6 @@ def test_prefill_matches_reference(tokens: int) -> None:
         (1, "gluon_latent_input_decode_gfx1250"),
         (64, "gluon_latent_input_decode_gfx1250"),
         (129, "gluon_latent_input_largem_gfx1250"),
-        (848, "gluon_latent_input_largem_gfx1250"),
         (8192, "gluon_latent_input_largem_gfx1250"),
     ],
 )
@@ -164,18 +163,13 @@ def test_dispatch_selects_by_token_count(tokens: int, expected: str) -> None:
         torch.testing.assert_close(chosen, forced, atol=0.0, rtol=0.0)
 
 
-@pytest.mark.parametrize("foreign", ["all", "tail"])
-def test_launcher_rejects_a_packed_weight_that_is_not_the_views(
-    foreign: str,
-) -> None:
+def test_launcher_rejects_a_packed_weight_that_is_not_the_views() -> None:
     """A partly aliasing set is the dangerous case: the router can match while
     the routed and shared weights belong to another allocation entirely."""
-    packed, views = _weights()
+    packed, _views = _weights()
     _other, other_views = _weights()
-    if foreign == "all":
-        views = other_views
-    else:
-        views = [packed[: WIDTHS[0]], other_views[1], other_views[2]]
+    # The router is the packed weight's own first view; the rest are foreign.
+    views = [packed[: WIDTHS[0]], other_views[1], other_views[2]]
     hidden = torch.randn(1, HIDDEN, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(ValueError, match="consecutive view"):
         launch_gluon_latent_input_decode_gfx1250(

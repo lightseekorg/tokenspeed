@@ -63,7 +63,8 @@ _DTYPE = torch.bfloat16
 _TINY_THRESHOLD = 1e-9
 # Rows vote, no block goes unanimous. Measured at 8/2 heads, seqlen 4096,
 # seed 0: 0.3 has 31.9% of row-block pairs voting and 0% of blocks elided.
-_ROW_VOTE_RATES = [1e-3, 1e-2, 1e-1, 0.3]
+# Lower thresholds have fewer rows voting; 1e-2 keeps a sparse-vote case.
+_ROW_VOTE_RATES = [1e-2, 0.3]
 # Past that range: 1.16% of blocks elided at 0.9 on the same shape.
 _ELIDING_THRESHOLDS = [0.7, 0.9]
 _GQA_SHAPES = [(8, 8), (8, 2)]

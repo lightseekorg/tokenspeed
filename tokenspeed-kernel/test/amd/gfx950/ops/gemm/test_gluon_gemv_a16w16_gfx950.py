@@ -87,9 +87,18 @@ def _reference(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return torch_mm(x.double(), w.double(), None, None, x.dtype)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+# Every shape on the single-row FMA tile and the 2..16-row MFMA tile in both
+# dtypes, and BF16 on a partial and a full MFMA tile; row counts inside the
+# MFMA bucket are a runtime argument of one binary. The measured shapes' tile
+# height per row bucket: test_measured_tile_heights_match_reference.
+@pytest.mark.parametrize(
+    "m,dtype",
+    [
+        *(pytest.param(m, torch.bfloat16, id=f"{m}-bf16") for m in (1, 5, 16)),
+        *(pytest.param(m, torch.float16, id=f"{m}-fp16") for m in (1, 2)),
+    ],
+)
 @pytest.mark.parametrize("n,k", _SHAPES)
-@pytest.mark.parametrize("m", [1, 2, 5, 16])
 def test_gemv_matches_reference(m, n, k, dtype):
     torch.manual_seed(n + k + m)
     x = torch.randn(m, k, device="cuda", dtype=dtype)
@@ -298,7 +307,8 @@ def test_mm_routes_a_measured_shape_through_the_gemv(m):
     assert torch.equal(mm(x, w), expected)
 
 
-@pytest.mark.parametrize("m", [2, 5, 8])
+# The 2..4 and 5..8 row buckets.
+@pytest.mark.parametrize("m", [2, 8])
 def test_gated_norm_gemv_matches_the_gated_norm_then_mm(m):
     """One launch reproduces ``rmsnorm_gated_sigmoid`` and ``mm`` bit for bit.
 
@@ -366,8 +376,8 @@ def test_gated_norm_gemv_leaves_other_rows_and_heads_to_two_launches():
     assert not mv_rmsnorm_gated_sigmoid_supported(gate, norm_weight[:64], weight)
 
 
-@pytest.mark.parametrize("m", [2, 3, 5, 8])
-@pytest.mark.parametrize("with_kv", [True, False])
+# Both row buckets (2..4 and 5..8), each with and without the KV norm.
+@pytest.mark.parametrize("m,with_kv", [(3, True), (8, True), (2, False), (5, False)])
 def test_rmsnorm_gemv_matches_the_fused_norm_then_mm(m, with_kv):
     """One launch reproduces ``rmsnorm_fused_parallel`` and ``mm`` bit for bit.
 

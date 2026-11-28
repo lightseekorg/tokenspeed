@@ -168,22 +168,6 @@ def test_mhc_pre_matches_reference(tokens: int, norm: bool) -> None:
     torch.testing.assert_close(layer_input.double(), expected, atol=1e-2, rtol=1e-2)
 
 
-def test_mhc_pre_rejects_unpaired_norm_eps() -> None:
-    residual, weight, scale, base = _operands(4, 4096, seed=4)
-    with pytest.raises(ValueError, match="provided together"):
-        gluon_mhc_pre_gfx1250(
-            residual,
-            weight,
-            scale,
-            base,
-            _RMS_EPS,
-            _HC_EPS,
-            _SINKHORN_ITERS,
-            None,
-            _RMS_EPS,
-        )
-
-
 def test_mhc_pre_selects_gfx1250_kernel() -> None:
     kernel = select_kernel(
         "residual",

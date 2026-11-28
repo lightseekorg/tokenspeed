@@ -64,13 +64,36 @@ def _kernel_module(kernel):
     )
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-@pytest.mark.parametrize("dtype", _FP8_DTYPES)
+def _params(cases):
+    """pytest params named after their values, with short kernel names."""
+    short = {_KERNELS[0]: "4wave", _KERNELS[1]: "8wave"}
+    return [
+        pytest.param(
+            *case,
+            id="-".join(short.get(v, str(v).removeprefix("torch.")) for v in case),
+        )
+        for case in cases
+    ]
+
+
+# Each kernel runs every output dtype once. Per kernel, the input dtype, head
+# count and causal flag form an orthogonal array, and the other kernel takes
+# the complement, so every value pair of those axes runs on each kernel.
 @pytest.mark.parametrize(
-    "out_dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+    "kernel,dtype,out_dtype,num_heads,is_causal",
+    _params(
+        [
+            (_KERNELS[0], torch.float8_e4m3fn, torch.float16, 12, False),
+            (_KERNELS[0], torch.float8_e4m3fn, torch.bfloat16, 128, True),
+            (_KERNELS[0], torch.float8_e5m2, torch.float32, 12, True),
+            (_KERNELS[0], torch.float8_e5m2, torch.float64, 128, False),
+            (_KERNELS[1], torch.float8_e5m2, torch.float16, 128, True),
+            (_KERNELS[1], torch.float8_e5m2, torch.bfloat16, 12, False),
+            (_KERNELS[1], torch.float8_e4m3fn, torch.float32, 128, False),
+            (_KERNELS[1], torch.float8_e4m3fn, torch.float64, 12, True),
+        ]
+    ),
 )
-@pytest.mark.parametrize("num_heads", [12, 128])
-@pytest.mark.parametrize("is_causal", [False, True])
 def test_mla_prefill_gluon_strided_output(
     device, require, kernel, dtype, out_dtype, num_heads, is_causal
 ):
@@ -119,25 +142,18 @@ def test_mla_prefill_gluon_strided_output(
     assert torch.isnan(storage[:, :, -1]).all()
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-@pytest.mark.parametrize("dtype", _FP8_DTYPES)
-@pytest.mark.parametrize("num_heads", [12, 128])
-@pytest.mark.parametrize("q_lens", [(2048, 1), (1, 2048), (257, 257), (1,) * 40])
-def test_mla_prefill_gluon_static_grid(require, kernel, dtype, num_heads, q_lens):
-    require("attention", "mla_prefill", "gluon", dtype, "q")
-    q = torch.empty((sum(q_lens), num_heads, 192), dtype=dtype, device="meta")
-    config = _kernel_module(kernel).get_config(q=q, k=q)
-    assert config.grid == (512,)
-    assert config.num_warps == 8
-
-
-@pytest.mark.parametrize("kernel", _KERNELS)
-@pytest.mark.parametrize("dtype", _FP8_DTYPES)
-@pytest.mark.parametrize("is_causal", [False, True])
-@pytest.mark.parametrize("max_seqlen_q", [512, 65536])
-def test_mla_prefill_gluon_static_grid_graph(
-    device, require, kernel, dtype, is_causal, max_seqlen_q
-):
+@pytest.mark.parametrize(
+    "kernel,dtype,is_causal",
+    _params(
+        [
+            (_KERNELS[0], torch.float8_e4m3fn, False),
+            (_KERNELS[0], torch.float8_e5m2, True),
+            (_KERNELS[1], torch.float8_e5m2, False),
+            (_KERNELS[1], torch.float8_e4m3fn, True),
+        ]
+    ),
+)
+def test_mla_prefill_gluon_static_grid_graph(device, require, kernel, dtype, is_causal):
     require("attention", "mla_prefill", "gluon", dtype, "q")
     q = _randn((512, 12, 192), dtype, device)
     k = _randn((768, 12, 192), dtype, device)
@@ -153,7 +169,8 @@ def test_mla_prefill_gluon_static_grid_graph(
             v=v,
             cu_seqlens_q=cu_q,
             cu_seqlens_kv=cu_kv,
-            max_seqlen_q=max_seqlen_q,
+            # FP8 launches clamp this bound to the query buffer's 512 tokens.
+            max_seqlen_q=65536,
             max_seqlen_kv=512,
             softmax_scale=192**-0.5,
             is_causal=is_causal,
@@ -174,9 +191,17 @@ def test_mla_prefill_gluon_static_grid_graph(
         torch.testing.assert_close(actual_lse, expected_lse, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
+# The clamp depends only on the input width (and the kernel).
 @pytest.mark.parametrize(
-    "dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]
+    "kernel,dtype",
+    _params(
+        [
+            (_KERNELS[0], torch.float16),
+            (_KERNELS[0], torch.float8_e4m3fn),
+            (_KERNELS[1], torch.bfloat16),
+            (_KERNELS[1], torch.float8_e5m2),
+        ]
+    ),
 )
 def test_mla_prefill_gluon_launch_runtime_bound(require, monkeypatch, kernel, dtype):
     # Launcher-level, so it also covers 16-bit inputs the 8-wave kernel is not
@@ -222,9 +247,17 @@ def test_mla_prefill_gluon_launch_runtime_bound(require, monkeypatch, kernel, dt
     assert all(launch == launches[0] for launch in launches)
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-@pytest.mark.parametrize("is_causal", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "kernel,dtype,is_causal",
+    _params(
+        [
+            (_KERNELS[0], torch.bfloat16, False),
+            (_KERNELS[0], torch.float8_e4m3fn, True),
+            (_KERNELS[1], torch.float8_e4m3fn, False),
+            (_KERNELS[1], torch.bfloat16, True),
+        ]
+    ),
+)
 def test_mla_prefill_gluon_reuses_kernel_across_batch_and_query_sizes(
     device, require, kernel, is_causal, dtype
 ):
@@ -283,12 +316,42 @@ def test_mla_prefill_gluon_reuses_kernel_across_batch_and_query_sizes(
             invoke(batch, q_len)
 
 
+_SCHEDULER_Q_LENS = {
+    "257": (257,),
+    "8193": (8193,),
+    "11009": (11009,),
+    # A zero-length request in a ragged batch.
+    "ragged": (0, 1, 2048),
+    "batch40": (257,) * 40,
+}
+# The causal scheduler packs min(batch, 512 // heads) batch slots and
+# 512 // (batch_slots * heads) query slots, and compacts the launch when the
+# query blocks (256 rows) fit in the query slots. The flat non-causal scheduler
+# compacts when batch * heads * query blocks fit in 512 programs.
+_SCHEDULER_CASES = [
+    pytest.param(
+        is_causal,
+        num_heads,
+        _SCHEDULER_Q_LENS[name],
+        id=f"{is_causal}-{num_heads}-{name}",
+    )
+    for is_causal, num_heads, names in (
+        # 42 query slots: compact through 33 blocks (8193), full at 44 (11009);
+        # 40 requests leave one query slot each.
+        (True, 12, ("257", "8193", "11009", "ragged", "batch40")),
+        # Four query slots: compact at two blocks; 40 requests make ten
+        # batch groups.
+        (True, 128, ("257", "11009", "ragged", "batch40")),
+        # 11009 is 528 work items, just past one per program.
+        (False, 12, ("257", "11009", "ragged")),
+        (False, 128, ("257", "batch40")),
+    )
+    for name in names
+]
+
+
 @pytest.mark.parametrize("kernel", _KERNELS)
-@pytest.mark.parametrize("is_causal", [False, True])
-@pytest.mark.parametrize("num_heads", [12, 128])
-@pytest.mark.parametrize(
-    "q_lens", [(128,), (257,), (8193,), (11009,), (0, 1, 2048), (257,) * 40]
-)
+@pytest.mark.parametrize("is_causal,num_heads,q_lens", _SCHEDULER_CASES)
 def test_mla_prefill_gluon_scheduler_coverage(
     device, require, kernel, is_causal, num_heads, q_lens
 ):
@@ -341,9 +404,32 @@ def test_mla_prefill_gluon_scheduler_coverage(
     )
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, *_FP8_DTYPES])
-@pytest.mark.parametrize("q_len,kv_len", [(129, 65), (65, 129), (257, 193), (65, 0)])
+_CAUSAL_CUTOFF_SHAPES = [(129, 65), (65, 129), (257, 193), (65, 0)]
+
+
+# 16-bit and FP8 inputs use different query/key tiles, so each kernel runs
+# every shape on one dtype of each width and one shape on the other two.
+@pytest.mark.parametrize(
+    "kernel,dtype,q_len,kv_len",
+    _params(
+        [
+            *(
+                (_KERNELS[0], dtype, *shape)
+                for dtype in (torch.bfloat16, torch.float8_e4m3fn)
+                for shape in _CAUSAL_CUTOFF_SHAPES
+            ),
+            (_KERNELS[0], torch.float16, 257, 193),
+            (_KERNELS[0], torch.float8_e5m2, 129, 65),
+            *(
+                (_KERNELS[1], dtype, *shape)
+                for dtype in (torch.float16, torch.float8_e5m2)
+                for shape in _CAUSAL_CUTOFF_SHAPES
+            ),
+            (_KERNELS[1], torch.bfloat16, 65, 129),
+            (_KERNELS[1], torch.float8_e4m3fn, 65, 0),
+        ]
+    ),
+)
 def test_mla_prefill_gluon_causal_cutoff(device, kernel, dtype, q_len, kv_len):
     launcher = getattr(_kernel_module(kernel), f"launch_{kernel}")
     storage_dtype = torch.float16 if dtype == torch.float16 else torch.bfloat16
@@ -387,11 +473,36 @@ def test_mla_prefill_gluon_causal_cutoff(device, kernel, dtype, q_len, kv_len):
     torch.testing.assert_close(lse, expected_lse, rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-@pytest.mark.parametrize("dtype", _FP8_DTYPES)
-@pytest.mark.parametrize("changed_row", [None, 13, 45, 254])
+# (changed_row, kv_len). The keys below move the running maximum of the
+# q = +1 rows at tiles 0 and 4 and of the changed (q = -1) row at tiles 2, 3
+# and 5. Lengths 129, 193, 257 and 321 put one of those jumps in the masked
+# tail tile; 576 runs nine full tiles through two K/V-ring wraps, so each
+# changed row also has to veto its wave's unchanged-maximum vote away from the
+# tail.
+_ONLINE_MAX_CASES = [
+    (None, 1),
+    (None, 64),
+    (None, 65),
+    (None, 256),
+    (None, 257),
+    (13, 129),
+    (45, 193),
+    (254, 321),
+    (13, 576),
+    (45, 576),
+    (254, 576),
+]
+
+
+# Both FP8 formats share the tile loop; they alternate across the cases, and
+# the two kernels take opposite formats for each case.
 @pytest.mark.parametrize(
-    "kv_len", [1, 64, 65, 128, 129, 193, 256, 257, 321, 512, 513, 576]
+    "kernel,dtype,changed_row,kv_len",
+    _params(
+        (kernel, _FP8_DTYPES[(index + kernel_index) % 2], changed_row, kv_len)
+        for kernel_index, kernel in enumerate(_KERNELS)
+        for index, (changed_row, kv_len) in enumerate(_ONLINE_MAX_CASES)
+    ),
 )
 def test_mla_prefill_gluon_online_max(
     device, require, kernel, dtype, changed_row, kv_len
@@ -448,11 +559,20 @@ def test_mla_prefill_gluon_online_max(
     )
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-@pytest.mark.parametrize("dtype", _FP8_DTYPES)
-@pytest.mark.parametrize("is_causal", [False, True])
 @pytest.mark.parametrize(
-    "q_len,kv_len,num_heads", [(64, 1000, 2), (257, 257, 2), (600, 600, 1)]
+    "kernel,dtype,is_causal,q_len,kv_len,num_heads",
+    _params(
+        [
+            (_KERNELS[0], torch.float8_e4m3fn, True, 64, 1000, 2),
+            (_KERNELS[0], torch.float8_e5m2, True, 600, 600, 1),
+            (_KERNELS[0], torch.float8_e5m2, False, 257, 257, 2),
+            (_KERNELS[0], torch.float8_e4m3fn, False, 600, 600, 1),
+            (_KERNELS[1], torch.float8_e5m2, True, 64, 1000, 2),
+            (_KERNELS[1], torch.float8_e4m3fn, True, 257, 257, 2),
+            (_KERNELS[1], torch.float8_e4m3fn, False, 64, 1000, 2),
+            (_KERNELS[1], torch.float8_e5m2, False, 600, 600, 1),
+        ]
+    ),
 )
 def test_mla_prefill_gluon_repeated_launches(
     device, require, kernel, dtype, is_causal, q_len, kv_len, num_heads
@@ -511,8 +631,10 @@ def test_mla_prefill_gluon_repeated_launches(
             torch.testing.assert_close(lse, first[1], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("dtype", _FP8_DTYPES)
-@pytest.mark.parametrize("is_causal", [False, True])
+@pytest.mark.parametrize(
+    "dtype,is_causal",
+    _params([(torch.float8_e4m3fn, True), (torch.float8_e5m2, False)]),
+)
 def test_mla_prefill_gluon_kernels_agree(device, require, dtype, is_causal):
     # Both kernels stay reachable by name, e.g. for A/B runs.
     require("attention", "mla_prefill", "gluon", dtype, "q")
@@ -557,11 +679,11 @@ def test_mla_prefill_gluon_kernels_agree(device, require, dtype, is_causal):
         (True, True, 1, 0, 0),
     ],
 )
-@pytest.mark.parametrize("kernel", _KERNELS)
 def test_mla_prefill_gluon_launch_metadata(
-    device, kernel, is_causal, has_lse, total_q, total_kv, pairs
+    device, is_causal, has_lse, total_q, total_kv, pairs
 ):
-    module = _kernel_module(kernel)
+    # Both kernels report through the same metadata function.
+    module = _kernel_module("gluon_mla_prefill_gfx950")
     batch, heads = 2, 12
     fp8 = torch.float8_e4m3fn
     q = torch.empty((total_q, heads, 192), dtype=fp8, device=device)
@@ -592,7 +714,11 @@ def test_mla_prefill_gluon_launch_metadata(
         "flops8": 2 * batch * pairs * heads * (192 + 128),
         "bytes": tensor_bytes + (lse.numel() * 4 if has_lse else 0),
     }
-    assert getattr(module, kernel).launch_metadata is module.prefill_launch_metadata
+    for kernel in _KERNELS:
+        assert (
+            getattr(_kernel_module(kernel), kernel).launch_metadata
+            is module.prefill_launch_metadata
+        )
 
 
 def test_mla_prefill_8wave_votes_on_maxima_in_compiled_code():

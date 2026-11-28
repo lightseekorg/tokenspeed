@@ -52,6 +52,20 @@ HALF_WIDTH = [
 ]
 
 
+# One projection per compiled (K, SPLIT_K) specialization and the narrow
+# 8-column kernel; 3808 and 2168 have ragged last column tiles, 2168 an N not a
+# multiple of 16.
+DISTINCT_SPLITS = [
+    (8, 4608),
+    (384, 4608),
+    (3808, 4608),
+    (4608, 1536),
+    (2168, 2304),
+    (128, 2304),
+    (2304, 768),
+]
+
+
 def split_counters(m, n):
     """Arrival counters of the program-a-split kernel's 16x64 tiles."""
     return torch.zeros(-(-m // 16) * -(-n // 64), device="cuda", dtype=torch.int32)
@@ -75,6 +89,7 @@ def project(a, b, out):
     )
 
 
+# Every projection: each must route through mm to a batch-invariant kernel.
 @pytest.mark.parametrize(
     "n,k",
     [(8, 4608), (384, 4608), (3792, 4608), (3808, 4608), (4608, 1536), *HALF_WIDTH],
@@ -104,10 +119,7 @@ def test_gfx950_projection_batch_invariance_and_accuracy(n, k):
     assert not torch.equal(first, first.bfloat16().float())
 
 
-@pytest.mark.parametrize(
-    "n,k",
-    [(8, 4608), (384, 4608), (3792, 4608), (3808, 4608), (4608, 1536), *HALF_WIDTH],
-)
+@pytest.mark.parametrize("n,k", DISTINCT_SPLITS)
 @pytest.mark.parametrize("padding,offset", [(3, 0), (4, 1)])
 def test_gfx950_projection_strided_output_graph(n, k, padding, offset):
     torch.manual_seed(11)
@@ -150,7 +162,9 @@ def test_gfx950_projection_strided_output_graph(n, k, padding, offset):
         (2168, [(1024, 1280), (2158, 2166)]),
     ],
 )
-@pytest.mark.parametrize("m", [8, 129, 769, 2048])
+# The program-a-split kernel, then 64x64 serial tiles for both, then 128x128
+# serial tiles for the whole QKV only.
+@pytest.mark.parametrize("m", [8, 129, 769])
 def test_gfx950_qkv_rows_project_their_columns_of_the_whole_qkv(n, segments, m):
     """A K or V source's rows of the QKV weight give the bits of their
     columns in the whole projection."""
@@ -189,11 +203,30 @@ def test_gfx950_projection_rejects_split_k_offset_overflow():
         launch_gluon_mm_bf16_fp32_gfx950(a, b, out, counters=counters)
 
 
+# Every projection on both tiles at ragged rows, and the row counts from a
+# single row to many row-tile groups on two ragged-column projections.
+_SERIAL_SPLIT_CASES = [
+    *(
+        (n, k, tile, 383)
+        for n, k in [(384, 4608), (3792, 4608), (3808, 4608), (4608, 1536), *HALF_WIDTH]
+        for tile in [(64, 64), (128, 128)]
+    ),
+    *(
+        (n, k, tile, m)
+        for n, k in [(3808, 4608), (2168, 2304)]
+        for tile in [(64, 64), (128, 128)]
+        for m in [1, 24, 128, 2048, 4096]
+    ),
+]
+
+
 @pytest.mark.parametrize(
-    "n,k", [(384, 4608), (3792, 4608), (3808, 4608), (4608, 1536), *HALF_WIDTH]
+    "n,k,tile,m",
+    [
+        pytest.param(n, k, tile, m, id=f"{n}-{k}-tile{tile[0]}-{m}")
+        for n, k, tile, m in _SERIAL_SPLIT_CASES
+    ],
 )
-@pytest.mark.parametrize("tile", [(64, 64), (128, 128)])
-@pytest.mark.parametrize("m", [1, 24, 128, 383, 2048, 4096])
 def test_gfx950_projection_serial_splits_give_the_split_k_bits(n, k, tile, m):
     """Every K split in one program, added in split order, gives each output
     the bits of a program a split (FP32 words compared, -0.0 included)."""
@@ -210,8 +243,9 @@ def test_gfx950_projection_serial_splits_give_the_split_k_bits(n, k, tile, m):
     assert torch.signbit(serial[m // 2]).any()
 
 
-@pytest.mark.parametrize("n,k", [(384, 4608), (3808, 4608), (4608, 1536)])
-def test_gfx950_projection_serial_kernel_writes_strided_rows(n, k):
+def test_gfx950_projection_serial_kernel_writes_strided_rows():
+    # A ragged last column tile next to the padding.
+    n, k = 3808, 4608
     torch.manual_seed(n)
     m = 300
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)

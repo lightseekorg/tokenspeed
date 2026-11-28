@@ -44,11 +44,14 @@ _RTOL = {torch.bfloat16: 2**-7, torch.float16: 2**-10}
 _ATOL = 1e-3
 
 # (N, K): a draft MLP's gate/up and down at TP8, an LM-head shard (several
-# programs a CU), ragged N, a K tail inside the last iteration, and a tiny N.
+# programs a CU), a ragged whole-vocabulary-wide output (64-column programs
+# from 256 columns a CU on 256 CUs), ragged N, a K tail inside the last
+# iteration, and a tiny N.
 _SHAPES = [
     (7168, 8192),
     (8192, 3584),
     (25256, 8192),
+    (65601, 512),
     (1000, 1040),
     (300, 8208),
     (8, 64),
@@ -65,9 +68,17 @@ def _reference(x, q, scale):
     return exact.to(x.dtype)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+# BF16 on every row tile (BLOCK_M 16 at one and seven rows, 32, 64, 128) of
+# every shape; FP16 changes only the MFMA operand type, so it takes the single
+# row and one multi-row tile.
+@pytest.mark.parametrize(
+    "m,dtype",
+    [
+        *(pytest.param(m, torch.bfloat16, id=f"{m}-bf16") for m in (1, 7, 24, 64, 128)),
+        *(pytest.param(m, torch.float16, id=f"{m}-fp16") for m in (1, 24)),
+    ],
+)
 @pytest.mark.parametrize("n,k", _SHAPES)
-@pytest.mark.parametrize("m", [1, 7, 24, 64, 128])
 def test_gemv_matches_reference(m, n, k, dtype):
     torch.manual_seed(n + k + m)
     x = torch.randn(m, k, device="cuda", dtype=dtype)

@@ -43,9 +43,16 @@ def _reference(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype):
     return torch_mla_kv_pack(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype)
 
 
-@pytest.mark.parametrize("seq_len", [0, 7, 256, 2048])
-@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
-@pytest.mark.parametrize("k_pe_ndim", [2, 3])
+# Every sequence length once and every pair of FP8 dtype and k_pe rank.
+@pytest.mark.parametrize(
+    ("seq_len", "fp8_dtype", "k_pe_ndim"),
+    [
+        pytest.param(7, torch.float8_e4m3fn, 2, id="2-fp8_dtype0-7"),
+        pytest.param(2048, torch.float8_e5m2, 3, id="3-fp8_dtype1-2048"),
+        pytest.param(0, torch.float8_e4m3fn, 3, id="3-fp8_dtype0-0"),
+        pytest.param(256, torch.float8_e5m2, 2, id="2-fp8_dtype1-256"),
+    ],
+)
 def test_gluon_mla_kv_pack_quantize_fp8(
     seq_len: int, fp8_dtype: torch.dtype, k_pe_ndim: int
 ) -> None:

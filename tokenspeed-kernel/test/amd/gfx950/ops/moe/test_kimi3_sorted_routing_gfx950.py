@@ -65,7 +65,7 @@ def _logits(kind: str, rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor
     return logits.float().contiguous(), bias.float().contiguous()
 
 
-def _reference(logits, bias, scale, normalize, deterministic_order):
+def _reference(logits, bias, scale, normalize):
     from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
         kimi3_sigmoid_bias_topk,
     )
@@ -79,7 +79,8 @@ def _reference(logits, bias, scale, normalize, deterministic_order):
         routed_scaling_factor=scale,
         normalize_topk_weights=normalize,
     )
-    # The A8W4 decode's call (fused/moe.py), whose stage GEMMs read this format.
+    # The A8W4 decode's call (fused/moe.py), whose stage GEMMs read this format,
+    # in the stable expert order the fused sort writes.
     sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, _ = gluon_moe_sorting(
         ids,
         weights,
@@ -89,7 +90,7 @@ def _reference(logits, bias, scale, normalize, deterministic_order):
         _BLOCK,
         use_minimum_route_chunks=True,
         runtime_rows=False,
-        deterministic_order=deterministic_order,
+        deterministic_order=True,
     )
     return weights, ids, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids
 
@@ -147,21 +148,7 @@ def _assert_scratch_ready(scratch: torch.Tensor) -> None:
     assert not torch.any(buffers[parity]) and int(counters[parity]) == 0
 
 
-def _route_blocks(sorted_ids, sorted_weights, sorted_expert_ids, total, rows):
-    """Each route's sorted expert block and weight bits, indexed by route."""
-    ids = sorted_ids[:total].long()
-    token, slot = ids & 0xFFFFFF, ids >> 24
-    real = token < rows
-    route = token[real] * _TOPK + slot[real]
-    position = torch.arange(total, device=ids.device)[real]
-    expert = torch.full((rows * _TOPK,), -1, dtype=torch.int64, device=ids.device)
-    weight = torch.zeros((rows * _TOPK,), dtype=torch.int32, device=ids.device)
-    expert[route] = sorted_expert_ids[position // _BLOCK].long()
-    weight[route] = _bits(sorted_weights[:total])[real]
-    return expert, weight, int(real.sum())
-
-
-def _check(fused, reference, rows, order_exact):
+def _check(fused, reference, rows):
     weights, ids, sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = fused
     (
         want_weights,
@@ -188,30 +175,37 @@ def _check(fused, reference, rows, order_exact):
     padding = sorted_ids[:total] >> 24 == _TOPK
     assert torch.equal(padding, want_sorted_ids[:total] >> 24 == _TOPK)
     assert torch.all(sorted_ids[:total][padding] == (_TOPK << 24) | rows)
-    if order_exact:
-        # Against deterministic_order=True every valid slot matches.
-        assert torch.equal(sorted_ids[:total], want_sorted_ids[:total])
-        real = ~padding
-        assert torch.equal(
-            _bits(sorted_weights[:total])[real],
-            _bits(want_sorted_weights[:total])[real],
-        )
-    else:
-        # The default sort keeps arrival order inside an expert's run.
-        got = _route_blocks(sorted_ids, sorted_weights, sorted_expert_ids, total, rows)
-        want = _route_blocks(
-            want_sorted_ids, want_sorted_weights, want_sorted_expert_ids, total, rows
-        )
-        assert got[2] == want[2] == rows * _TOPK
-        assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
-        assert torch.equal(got[0], ids.flatten().long())
-        assert torch.equal(got[1], _bits(weights).flatten())
+    # Every valid slot matches the stable expert order, so the order-independent
+    # route-to-block map matches any order the sort may take as well.
+    assert torch.equal(sorted_ids[:total], want_sorted_ids[:total])
+    real = ~padding
+    assert torch.equal(
+        _bits(sorted_weights[:total])[real],
+        _bits(want_sorted_weights[:total])[real],
+    )
 
 
-@pytest.mark.parametrize("rows", _ROWS)
-@pytest.mark.parametrize("kind", ("random", "coarse", "same_rows", "special"))
-@pytest.mark.parametrize("deterministic_order", (True, False))
-def test_sorted_routing_matches_topk_and_sort(rows, kind, deterministic_order):
+# Random logits at every row count; ties, a single repeated row, and non-finite
+# logits once in each mask-word bucket (through 32, 64, 128 and 256 rows).
+@pytest.mark.parametrize(
+    "kind, rows",
+    [
+        *(("random", rows) for rows in _ROWS),
+        ("coarse", 13),
+        ("coarse", 33),
+        ("coarse", 128),
+        ("coarse", 256),
+        ("same_rows", 32),
+        ("same_rows", 64),
+        ("same_rows", 128),
+        ("same_rows", 256),
+        ("special", 1),
+        ("special", 33),
+        ("special", 128),
+        ("special", 192),
+    ],
+)
+def test_sorted_routing_matches_topk_and_sort(rows, kind):
     from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
         kimi3_sorted_routing_scratch,
     )
@@ -221,10 +215,10 @@ def test_sorted_routing_matches_topk_and_sort(rows, kind, deterministic_order):
         ((2.827, True), (1.0, True), (2.5, False))
     ):
         logits, bias = _logits(kind, rows, 1000 * rows + seed)
-        reference = _reference(logits, bias, scale, normalize, deterministic_order)
+        reference = _reference(logits, bias, scale, normalize)
         fused = _fused(logits, bias, scale, normalize, scratch)
         torch.cuda.synchronize()
-        _check(fused, reference, rows, order_exact=deterministic_order)
+        _check(fused, reference, rows)
         _assert_scratch_ready(scratch)
 
 
@@ -262,7 +256,7 @@ def test_sorted_routing_graph_replay_and_one_binary():
         _logits("random", rows, 77 + rows)
         for rows in (16, 192, 8, 64, 17, 128, 33, 255)
     ]
-    references = [_reference(*layer, 2.827, True, True) for layer in layers]
+    references = [_reference(*layer, 2.827, True) for layer in layers]
     snapshots = []
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream), assert_no_triton_compile(
@@ -271,7 +265,7 @@ def test_sorted_routing_graph_replay_and_one_binary():
         eager = [_fused(*layer, 2.827, True, scratch) for layer in layers]
         stream.synchronize()
         for (logits, _), got, want in zip(layers, eager, references, strict=True):
-            _check(got, want, logits.shape[0], order_exact=True)
+            _check(got, want, logits.shape[0])
         _assert_scratch_ready(scratch)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
@@ -286,7 +280,7 @@ def test_sorted_routing_graph_replay_and_one_binary():
         graph.replay()
         torch.cuda.synchronize()
         for (logits, _), got, want in zip(layers, snapshots, references, strict=True):
-            _check(got, want, logits.shape[0], order_exact=True)
+            _check(got, want, logits.shape[0])
         _assert_scratch_ready(scratch)
 
 
@@ -335,8 +329,10 @@ def _k3_tp8_experts(request):
     return plan, module
 
 
-@pytest.mark.parametrize("rows", (8, 64, 192))
-@pytest.mark.parametrize("kind", ("random", "same_rows"))
+# The narrow and the wide sorted stage 2, and every row on the same experts.
+@pytest.mark.parametrize(
+    "kind, rows", (("random", 8), ("same_rows", 64), ("random", 192))
+)
 def test_a8w4_moe_takes_the_fused_sort_bitwise(
     _k3_tp8_experts, rows, kind, monkeypatch
 ):
@@ -389,8 +385,17 @@ def test_a8w4_moe_takes_the_fused_sort_bitwise(
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
-@pytest.mark.parametrize("rows", (1, 33, 128))
-@pytest.mark.parametrize("out_kind", ("contiguous", "strided", "allocated"))
+# 32-column programs through 32 rows, 64-column programs above; a row-strided
+# output in both.
+@pytest.mark.parametrize(
+    "rows, out_kind",
+    (
+        (1, "strided"),
+        (1, "allocated"),
+        (33, "contiguous"),
+        (128, "strided"),
+    ),
+)
 def test_sorted_routing_carries_shared_down(rows, out_kind):
     """The shared down projection rides along without changing the routes."""
     from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
@@ -409,7 +414,7 @@ def test_sorted_routing_carries_shared_down(rows, out_kind):
     carried = _fused(logits, bias, 2.827, True, scratch, (hidden, weight, out))
     torch.cuda.synchronize()
     assert len(carried) == 7
-    _check(carried[:6], _reference(logits, bias, 2.827, True, True), rows, True)
+    _check(carried[:6], _reference(logits, bias, 2.827, True), rows)
     if out is not None:
         assert carried[6] is out
     _check_shared_down(carried[6], hidden, weight)
@@ -431,7 +436,7 @@ def test_sorted_routing_shared_down_graph_replay():
         hidden, weight = _shared_down_inputs(rows, 950 + rows)
         out = torch.empty((rows, _SHARED_N), dtype=torch.bfloat16, device="cuda")
         layers.append((logits, bias, hidden, weight, out))
-    references = [_reference(layer[0], layer[1], 2.827, True, True) for layer in layers]
+    references = [_reference(layer[0], layer[1], 2.827, True) for layer in layers]
     stream = torch.cuda.Stream()
     snapshots = []
     with torch.cuda.stream(stream):
@@ -455,7 +460,7 @@ def test_sorted_routing_shared_down_graph_replay():
         torch.cuda.synchronize()
         for layer, got, want in zip(layers, snapshots, references, strict=True):
             logits, _, hidden, weight, out = layer
-            _check(got, want, logits.shape[0], order_exact=True)
+            _check(got, want, logits.shape[0])
             _check_shared_down(out, hidden, weight)
         _assert_scratch_ready(scratch)
 

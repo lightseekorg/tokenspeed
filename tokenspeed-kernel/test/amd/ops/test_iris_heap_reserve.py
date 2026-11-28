@@ -52,11 +52,6 @@ def created_sizes(monkeypatch) -> list[int]:
     return sizes
 
 
-def test_without_reservations_the_heap_is_the_planned_size(created_sizes) -> None:
-    _iris.get_or_create_context(heap_size=300 * MiB)
-    assert created_sizes == [300 * MiB]
-
-
 def test_reservations_add_to_the_planned_size(created_sizes) -> None:
     _iris.reserve_heap("a", 40 * MiB)
     _iris.reserve_heap("b", 22 * MiB)

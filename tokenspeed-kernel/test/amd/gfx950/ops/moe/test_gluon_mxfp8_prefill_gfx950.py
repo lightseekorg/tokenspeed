@@ -277,7 +277,7 @@ def _quantize_probe(x, fused):
     return q, scales, compiled
 
 
-@pytest.mark.parametrize("k", [256, 3072, 3584])
+@pytest.mark.parametrize("k", [256, 3584])
 @pytest.mark.parametrize("fused", [False, True])
 def test_q32_finite_bits_and_signed_zero(k, fused):
     values = torch.tensor(
@@ -349,9 +349,25 @@ def test_q32_all_bf16_encodings_use_hardware_scaled_downcast(fused):
     assert "v_cvt_scalef32_pk_fp8_f32" in compiled.asm["amdgcn"]
 
 
-@pytest.mark.parametrize("topk", [1, 16, 32, 33, 65])
-@pytest.mark.parametrize("block_m", [32, 128])
-@pytest.mark.parametrize("m", [1, 5, 35, 64, 65])
+@pytest.mark.parametrize(
+    "topk,block_m,m",
+    [
+        # One-pass small mesh: at most 64 rows and 32 slots.
+        (1, 32, 5),
+        (1, 128, 64),
+        (16, 32, 35),
+        (16, 128, 1),
+        (32, 128, 5),
+        (32, 32, 64),
+        # Cleared, filled and counted mesh: past 64 rows or one 32-slot word.
+        (1, 32, 65),
+        (16, 128, 65),
+        (33, 32, 35),
+        (33, 128, 65),
+        (65, 128, 1),
+        (65, 32, 64),
+    ],
+)
 def test_mesh_preserves_repeated_slots_and_remote_routes(topk, block_m, m):
     e, start = 3, 32
     ids = torch.full((m, topk), start, dtype=torch.int64, device="cuda")
@@ -400,9 +416,17 @@ def test_mesh_preserves_repeated_slots_and_remote_routes(topk, block_m, m):
     torch.testing.assert_close(weights, saved_weights, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("k", [256, 3072, 3584])
-@pytest.mark.parametrize("block_m", [32, 128])
-@pytest.mark.parametrize("slot_major", [False, True])
+@pytest.mark.parametrize(
+    "slot_major,block_m,k",
+    [
+        (False, 32, 256),
+        (True, 128, 256),
+        (True, 32, 3072),
+        (False, 128, 3072),
+        (False, 32, 3584),
+        (True, 128, 3584),
+    ],
+)
 def test_sorted_scale_words_follow_token_slot_rows(k, block_m, slot_major):
     m, topk = 17, 4
     ids = (
@@ -501,7 +525,7 @@ def test_fused_quantizer_empty_prefix_preserves_scale_storage(slot_major):
     torch.testing.assert_close(storage, saved, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("k", [256, 3072, 3584])
+@pytest.mark.parametrize("k", [256, 3584])
 @pytest.mark.parametrize("slot_major", [False, True])
 def test_fused_quantizer_partial_prefix_preserves_scale_storage(k, slot_major):
     m, topk, capacity = 17, 4, 128
@@ -687,31 +711,21 @@ def _check_stage2_basis(k, m, *, pitch, buffer_safe, block_m):
     )
 
 
-@pytest.mark.parametrize("block_m", [32, 128])
-def test_stage1_full_k_gate_up_basis_and_bf16_intermediate(block_m):
-    _check_stage1_basis(3584, False, block_m)
-
-
 @pytest.mark.parametrize("d", [256, 3328, 3584])
 @pytest.mark.parametrize("block_m", [32, 128])
 def test_stage1_all_scale_roles_and_odd_even_tail(d, block_m):
-    _check_stage1_basis(d, True, block_m)
-
-
-def _check_stage1_basis(d, varying_scales, block_m):
+    """Full-K gate/up basis vectors with varying scales into a BF16 intermediate."""
     m, i = 129, 3072
     module, raw = _module(1, d, i, 1)
     raw["w13_weight"].zero_()
     n = torch.arange(2 * i, device="cuda")
     group = (n * 17 + n // i * 7) % (d // 32)
     raw["w13_weight"][0, n, group * 16] = (2 + n % 4).to(torch.uint8)
-    raw["w13_scale"].fill_(125)
-    if varying_scales:
-        raw["w13_scale"].copy_(
-            (123 + (n[:, None] // 16 + torch.arange(d // 32, device="cuda")) % 5).to(
-                torch.uint8
-            )
+    raw["w13_scale"].copy_(
+        (123 + (n[:, None] // 16 + torch.arange(d // 32, device="cuda")) % 5).to(
+            torch.uint8
         )
+    )
     x = torch.exp2(
         (
             (
@@ -809,10 +823,23 @@ def _a_tile_probe(
         gl.barrier()
 
 
-@pytest.mark.parametrize("k", [256, 3072, 3584])
-@pytest.mark.parametrize("slot_major", [False, True])
-@pytest.mark.parametrize("buffer_safe", [False, True])
-@pytest.mark.parametrize("block_m", [32, 128])
+@pytest.mark.parametrize(
+    "block_m,buffer_safe,slot_major,k",
+    [
+        # Every load path over many K tiles, alternating the two model widths.
+        (32, False, False, 3072),
+        (32, False, True, 3584),
+        (32, True, False, 3584),
+        (32, True, True, 3072),
+        (128, False, False, 3584),
+        (128, False, True, 3072),
+        (128, True, False, 3072),
+        (128, True, True, 3584),
+        # A single K tile.
+        (32, True, False, 256),
+        (128, False, True, 256),
+    ],
+)
 def test_xor_a_tiles_safe_padding_and_split_fragments(
     k, slot_major, buffer_safe, block_m
 ):
@@ -921,7 +948,9 @@ def test_situ_nonfinite_and_signed_zero_classification(record_property):
     )
 
 
-@pytest.mark.parametrize("m", [0, 1, 5, 8, 16, 32, 33, 64, 129, 896, 1024, 1025])
+# Empty, one-pass small mesh (through 64 rows), the general mesh, and the
+# switch from 32-row to 128-row expert tiles past 1,024 rows.
+@pytest.mark.parametrize("m", [0, 1, 5, 33, 64, 129, 1024, 1025])
 @pytest.mark.parametrize("policy", ["input", "fp8"])
 def test_public_prefill_strides_duplicates_empty_and_input_preservation(
     m, policy, monkeypatch
@@ -1084,7 +1113,7 @@ def test_public_prefill_reuses_compiled_handles_across_rows(
         _assert_compiled_reuse(handles, f"{name}_bm{bucket}_{stage}", record_property)
 
 
-@pytest.mark.parametrize("m", [5, 8, 16, 33, 896, 1024, 1025])
+@pytest.mark.parametrize("m", [5, 33, 1024, 1025])
 def test_public_prefill_graph_replay_changed_routes_and_values(m):
     module, raw = _module(2, 3584, 3072, 16)
     plan = _plan("input")
@@ -1275,16 +1304,16 @@ def test_n16_joint_decode_retains_raw_bank_arithmetic(joint_bank, m):
     torch.testing.assert_close(routed, oracle, atol=2e-3, rtol=8e-2)
 
 
-@pytest.mark.parametrize("m", [4, 8])
 @pytest.mark.parametrize(
-    "d,i",
+    "d,i,m",
     [
-        pytest.param(256, 128, id="linear-I128-n16-rejected"),
-        (256, 256),
-        (256, 512),
-        (512, 768),
-        (768, 768),
-        (3584, 3072),
+        pytest.param(256, 128, 4, id="linear-I128-n16-rejected-4"),
+        (256, 256, 8),
+        (256, 512, 4),
+        (512, 768, 8),
+        (768, 768, 4),
+        (3584, 3072, 4),
+        (3584, 3072, 8),
     ],
 )
 def test_n16_a16_cell_tiles_tails_and_strided_output(m, d, i):

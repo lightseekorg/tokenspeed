@@ -63,8 +63,8 @@ def _select_reference(values: torch.Tensor, k: int) -> torch.Tensor:
     return order.sort(-1).indices[:, :k]
 
 
-# Shard vocabs of a 248320 vocab at TP 8, 4, 2 and 1, and a ragged small one.
-@pytest.mark.parametrize("cols", [31040, 62080, 124160, 248320, 5000])
+# Shard vocabs of a 248320 vocab at TP 8, 4 and 1, and a ragged small one.
+@pytest.mark.parametrize("cols", [31040, 62080, 248320, 5000])
 @pytest.mark.parametrize("levels", [64, 60000])
 def test_shard_topk_matches_reference(cols: int, levels: int, device: str) -> None:
     rows = 7
@@ -99,15 +99,31 @@ def _tail_problem(ranks: int, rows: int, nc: int, levels: int, seed: int, device
     return logits.view(ranks, rows, nc), tokens.view(ranks, rows, nc)
 
 
-@pytest.mark.parametrize("nc", [32, 128, 256])
-@pytest.mark.parametrize("ranks", [1, 2, 4])
-@pytest.mark.parametrize("top_k", [0, 1, 8, 32])
+# Each pair of candidate count, rank count and top-k (every combination
+# compiles its own tail), and the largest of all three; each with many ties
+# and with few.
+@pytest.mark.parametrize(
+    ("nc", "ranks", "top_k"),
+    [
+        (32, 1, 0),
+        (32, 2, 1),
+        (32, 2, 8),
+        (32, 4, 32),
+        (128, 1, 1),
+        (128, 2, 32),
+        (128, 4, 0),
+        (128, 4, 8),
+        (256, 1, 8),
+        (256, 1, 32),
+        (256, 2, 0),
+        (256, 4, 1),
+        (256, 4, 32),
+    ],
+)
 @pytest.mark.parametrize("levels", [16, 60000])
 def test_candidate_tail_matches_reference(
     nc: int, ranks: int, top_k: int, levels: int, device: str
 ) -> None:
-    if ranks * nc > 1024:
-        pytest.skip("the tail covers ranks * nc <= 1024")
     rows = 6
     cand_logits, cand_tokens = _tail_problem(
         ranks, rows, nc, levels, nc + top_k, device

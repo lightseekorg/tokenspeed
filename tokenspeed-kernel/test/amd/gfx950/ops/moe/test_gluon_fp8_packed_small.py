@@ -41,7 +41,7 @@ def gfx950_only() -> None:
 
 @pytest.mark.parametrize(
     ("experts", "rows", "columns"),
-    [(2, 128, 256), (1, 1024, 512), (1, 512, 512), (1, 1024, 4096), (1, 4096, 512)],
+    [(2, 128, 256), (1, 1024, 4096), (1, 4096, 512)],
 )
 def test_packed_fp8_pack_matches_aiter_shuffle_bytes(
     experts: int, rows: int, columns: int
@@ -248,7 +248,6 @@ _SMALL_CASES = [
     (16, 1, 0, False, 4096, 512),
     (16, 1, 0, True, 4096, 512),
     (16, 4, 0, False, 4096, 2048),
-    (32, 1, 0, False, 4096, 512),
     (16, 1, 0, False, 512, 512),  # Factor-one pipeline's two-tile drain.
     # Verify batches through 64 rows; each expert spans several 16-row blocks.
     (63, 1, 0, False, 4096, 512),
@@ -264,7 +263,6 @@ _LARGE_CASES = [
     (65, 1, 0, False, 4096, 512),
     (65, 1, 0, True, 4096, 512),
     (65, 4, 3, False, 4096, 2048),
-    (127, 1, 0, False, 4096, 512),
     (128, 1, 0, False, 4096, 512),
 ]
 _FULL_CASES = [

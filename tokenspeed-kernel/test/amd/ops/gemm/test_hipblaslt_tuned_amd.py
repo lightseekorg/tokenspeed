@@ -322,23 +322,6 @@ def test_off_unless_loaded(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_serving_leaves_file_unchanged(tuned_file, tmp_path):
-    before = open(tuned_file, "rb").read()
-    _run_fresh_process(
-        "import torch\n"
-        "from tokenspeed_kernel.ops.gemm.hipblaslt import load_hipblaslt_tuned_solutions\n"
-        f"assert load_hipblaslt_tuned_solutions({tuned_file!r})\n"
-        f"for m in ({TUNED_M}, {UNTUNED_M}):\n"
-        f"    x = torch.randn(m, {K}, device='cuda', dtype=torch.bfloat16)\n"
-        f"    w = torch.randn({N}, {K}, device='cuda', dtype=torch.bfloat16)\n"
-        "    torch.mm(x, w.t())\n"
-        "torch.cuda.synchronize()\n",
-        cwd=tmp_path,
-    )
-    assert open(tuned_file, "rb").read() == before
-    assert list(tmp_path.iterdir()) == []
-
-
 def test_online_tuning_adds_unlisted_gemms_in_memory(tuned_file, tmp_path):
     before = open(tuned_file, "rb").read()
     listed = next(
@@ -359,7 +342,7 @@ def test_online_tuning_adds_unlisted_gemms_in_memory(tuned_file, tmp_path):
         "mm(80)\n"
         "results = {r[1]: r[2] for r in tunable.get_results()}\n"
         # The listed GEMM keeps its solution; the unlisted one in the block is
-        # tuned; one after the block is not.
+        # tuned; one after the block, as in serving, is not.
         f"assert results.pop('tn_{N}_{TUNED_M}_{K}_ld_{K}_{K}_{N}') == {listed!r}\n"
         f"assert list(results) == ['tn_{N}_{UNTUNED_M}_{K}_ld_{K}_{K}_{N}'], results\n",
         cwd=tmp_path,

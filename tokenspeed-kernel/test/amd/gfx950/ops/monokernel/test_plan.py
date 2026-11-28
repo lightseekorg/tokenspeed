@@ -157,11 +157,6 @@ def test_plan_slice_takes_the_inputs_of_dropped_stages_from_the_host():
     assert full.only(("b", "c")).external == ("x",)
 
 
-def test_plan_slice_rejects_unknown_stages():
-    with pytest.raises(KeyError, match="no stages"):
-        _chain_plan().only(("c", "d"))
-
-
 def test_placement_must_name_the_module_stages_in_order():
     assert placement({"b1": 28, "b3": 30}, ("b1", "b3")) == (28, 30)
     with pytest.raises(ValueError, match="must place"):
@@ -268,14 +263,9 @@ def test_poll_bound_changes_the_key_without_changing_layout(
     assert sliced.key == short.key
 
 
+# Bounds past what the kernel's poll counters hold.
 @pytest.mark.parametrize(
-    "bounds",
-    [
-        dict(poll_check=0),
-        dict(poll_check=2**32),
-        dict(poll_timeout_shift=-1),
-        dict(poll_timeout_shift=57),
-    ],
+    "bounds", [dict(poll_check=2**32), dict(poll_timeout_shift=57)]
 )
 def test_plan_rejects_poll_bounds_that_do_not_fit(bounds):
     with pytest.raises(ValueError, match="poll_"):

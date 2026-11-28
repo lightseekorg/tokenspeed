@@ -153,9 +153,17 @@ def test_public_fp32_scales_arbitrary_strides_and_canaries(shape, online, unalig
     assert torch.equal(actual_sa, saved[0]) and torch.equal(sb, saved[1])
 
 
-@pytest.mark.parametrize("shape", [(17, 130, 3072), (300, 384, 4096)])
-@pytest.mark.parametrize("scale_name", ["A_scales", "B_scales"])
-@pytest.mark.parametrize("invalid", ["dtype", "shape"])
+# Each scale's dtype and shape check once, spread over a decode and a matrix
+# shape.
+@pytest.mark.parametrize(
+    "shape,scale_name,invalid",
+    [
+        ((17, 130, 3072), "A_scales", "dtype"),
+        ((300, 384, 4096), "A_scales", "shape"),
+        ((300, 384, 4096), "B_scales", "dtype"),
+        ((17, 130, 3072), "B_scales", "shape"),
+    ],
+)
 def test_invalid_fp32_scale_reports_expected_and_received(shape, scale_name, invalid):
     m, n, k = shape
     a, b, sa, sb = values(m, n, k)

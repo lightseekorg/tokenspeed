@@ -250,26 +250,18 @@ def test_validate_layer_accepts_dsv41_at_ep4_and_ep8(profile, ep_size) -> None:
     assert _validate_layer(layer) == profile
 
 
+# One profile that supports only EP8 and one that also supports EP4.
 @pytest.mark.parametrize(
     "build,ep_size,error",
     [
         (_gpt_oss_layer, 4, "supports EP8 for gpt_oss_120b; got EP4"),
-        (partial(_dsv4_layer, None), 4, "supports EP8 for dsv4; got EP4"),
-        (_kimi_k3_layer, 4, "supports EP8 for kimi_k3; got EP4"),
-        (_muse_spark_layer, 4, "supports EP8 for muse_spark; got EP4"),
         (
             partial(_dsv41_layer, _DSV41_FLASH_PROFILE),
             2,
             "supports EP4/8 for dsv41_flash; got EP2",
         ),
     ],
-    ids=[
-        "gpt_oss_120b-ep4",
-        "dsv4-ep4",
-        "kimi_k3-ep4",
-        "muse_spark-ep4",
-        "dsv41_flash-ep2",
-    ],
+    ids=["gpt_oss_120b-ep4", "dsv41_flash-ep2"],
 )
 def test_validate_layer_rejects_ep_sizes_outside_the_profile(
     build, ep_size, error

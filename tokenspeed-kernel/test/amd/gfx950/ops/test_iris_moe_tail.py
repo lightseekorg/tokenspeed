@@ -40,8 +40,13 @@ def _require_iris():
     pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
 
 
-@pytest.mark.parametrize("rank", (0, 7))
-@pytest.mark.parametrize("prefix_is_sharded", (False, True))
+@pytest.mark.parametrize(
+    "prefix_is_sharded,rank",
+    (
+        pytest.param(False, 0, id="False-0"),
+        pytest.param(True, 7, id="True-7"),
+    ),
+)
 def test_moe_gather_vector_codegen(rank, prefix_is_sharded, tmp_path):
     """Runtime row counts must retain vectorized payload loads and peer stores."""
     from tokenspeed_kernel._triton import gluon, triton

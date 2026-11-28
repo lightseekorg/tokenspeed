@@ -250,20 +250,16 @@ MAX_SEQLEN_K = 262144
     _geometry_cases(
         [
             (1, (40,)),
-            (8, (40,)),
-            (8, (300,)),
+            # One verify block just inside the 1024-key window.
             (8, (1013,)),
-            (8, (1500,)),
-            (8, (4096,)),
-            # Verify batches of 2, 4 and 8 requests, each of its own length.
+            # Verify batches of 2, 4 and 8 requests, each of its own length
+            # (within and past the window).
             (8, (300, 1500)),
             (8, (40, 1013, 1500, 4096)),
             (8, (40, 300, 1013, 1500, 4096, 77, 1024, 2048)),
         ],
         [
-            (4, (40,)),
             (4, (1013,)),
-            (4, (1500,)),
             (4, (300, 1500)),
             (4, (40, 1013, 1500, 4096)),
             (4, (40, 300, 1013, 1500, 4096, 77, 1024, 2048)),
@@ -401,11 +397,13 @@ def _topk_kernel(scratch, step, bias, PLAN: gl.constexpr):
 
 
 # The routing and quantization stages at every geometry the plans lay out
-# (384 or 128 experts; 288 or 144 quantization groups a row).
+# (384 or 128 experts; 288 or 144 quantization groups a row). They take a
+# task a row: one row, rows that fit the CTAs past the stage's first, and
+# rows that wrap around the grid.
 _ROUTE_DIMS = pytest.mark.parametrize(
     "dims", ip.GEOMETRIES, ids=[f"h{d.hidden}" for d in ip.GEOMETRIES]
 )
-_ROUTE_ROWS = [(1, 1), (4, 4), (8, 8), (16, 8), (32, 8), (64, 8)]
+_ROUTE_ROWS = [(1, 1), (8, 8), (64, 8)]
 
 
 def _monokernel_topk(plan, logits, bias):
@@ -755,18 +753,29 @@ def _full_launch(case, chain, plan, scratch, tag, shared):
     )
 
 
+def _full_attention_cases(cases, half_cases):
+    """``_geometry_cases`` with the rows a task takes (``shared``): a row
+    (0) in every case, and in blocks of 8 also the verify block's 8 or 4."""
+    geometry = [(d, *case) for d in ip.GEOMETRIES for case in cases]
+    geometry += [(_HALF, *case) for case in half_cases]
+    return [
+        pytest.param(
+            d, chain, firsts, shared, id=f"{shared}-{d.hidden}-{(chain, firsts)}"
+        )
+        for d, chain, firsts in geometry
+        for shared in ((0, 4, 8) if chain == 8 else (0,))
+    ]
+
+
 @pytest.mark.parametrize(
-    "dims,chain,firsts",
-    _geometry_cases(
+    "dims,chain,firsts,shared",
+    _full_attention_cases(
         [
             (1, (40,)),
-            (8, (40,)),
-            (8, (1013,)),
+            # One verify block across 1024 keys (32 keys a split, then 64),
+            # one ending at 32 whole splits of 1024 keys.
             (8, (1020,)),
-            (8, (3000,)),
-            (8, (9000,)),
             (8, (32760,)),
-            (8, (70000,)),
             # The served context length's last verify block.
             (8, (FULL_MAX_SEQLEN_K - 8,)),
             # Verify batches of 2, 4 and 8 requests, each of its own length.
@@ -783,9 +792,7 @@ def _full_launch(case, chain, plan, scratch, tag, shared):
             (8, (9175, 8477)),
         ],
         [
-            (4, (40,)),
             (4, (1020,)),
-            (4, (9000,)),
             (4, (FULL_MAX_SEQLEN_K - 4,)),
             (4, (300, 9000)),
             (4, (40, 1013, 4096, 20000)),
@@ -795,14 +802,11 @@ def _full_launch(case, chain, plan, scratch, tag, shared):
         ],
     ),
 )
-@pytest.mark.parametrize("shared", [0, 4, 8])
 def test_full_attention_and_merge_equal_regular_decode(dims, chain, firsts, shared):
     """A full attention layer's stages equal, bit for bit, the regular
     decode of the same rows (no window, 32 splits of one or more KV
     blocks, relative logits within 1024 keys), with a row a task or a
     verify block's 8 or 4 rows a task (``shared``)."""
-    if shared and chain != 8:
-        pytest.skip("a task shares a verify block's 8 rows")
     hq, hkv = dims.q_heads, dims.kv_heads
     case = _full_case(dims, firsts, chain, firsts[0] + len(firsts))
     rows = case["rows"]

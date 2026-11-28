@@ -202,9 +202,24 @@ def _reference(
     return expected, row_ends
 
 
-@pytest.mark.parametrize(("padding_bytes", "as_rows"), ((0, False), (192, True)))
-@pytest.mark.parametrize(("pool_offset", "window_cols"), ((13, 173), (240, 64)))
-@pytest.mark.parametrize("weight_dtype", (torch.bfloat16, torch.float32))
+# Every pair of weight dtype, window and cache layout.
+@pytest.mark.parametrize(
+    ("padding_bytes", "as_rows", "pool_offset", "window_cols", "weight_dtype"),
+    (
+        pytest.param(
+            0, False, 13, 173, torch.bfloat16, id="weight_dtype0-13-173-0-False"
+        ),
+        pytest.param(
+            192, True, 240, 64, torch.bfloat16, id="weight_dtype0-240-64-192-True"
+        ),
+        pytest.param(
+            192, True, 13, 173, torch.float32, id="weight_dtype1-13-173-192-True"
+        ),
+        pytest.param(
+            0, False, 240, 64, torch.float32, id="weight_dtype1-240-64-0-False"
+        ),
+    ),
+)
 def test_kpool_prefill_logits_match_weighted_relu_and_local_window(
     padding_bytes: int,
     as_rows: bool,
@@ -276,8 +291,14 @@ def test_kpool_prefill_logits_match_weighted_relu_and_local_window(
         assert actual[row, end:].isnan().all()
 
 
-@pytest.mark.parametrize("weight_dtype", (torch.bfloat16, torch.float32))
-@pytest.mark.parametrize("ordered_head_fold", (False, True))
+# Each head-fold order (compiled) once; the test above covers both dtypes.
+@pytest.mark.parametrize(
+    ("weight_dtype", "ordered_head_fold"),
+    (
+        pytest.param(torch.bfloat16, False, id="False-weight_dtype0"),
+        pytest.param(torch.float32, True, id="True-weight_dtype1"),
+    ),
+)
 def test_kpool_plan_logits_match_ragged_physical_slots_and_padded_stride(
     weight_dtype: torch.dtype,
     ordered_head_fold: bool,

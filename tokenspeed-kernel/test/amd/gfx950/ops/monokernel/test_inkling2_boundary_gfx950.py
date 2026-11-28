@@ -62,7 +62,18 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import launch_tag  # noqa:
 NUM_WARPS = 8
 STEP = 17
 Q = gl.constexpr(ip.SET_QUERIES)
-ROWS = [(1, 1), (4, 4), (8, 8), (16, 8), (32, 8), (64, 8)]
+# The sweep's tasks (a row and query each) run in rounds past the grid. Each
+# row count sweeps 1, 3 or 7 stored blocks (a runtime count).
+SWEEP_CASES = [
+    pytest.param(rows, chain, stored, id=f"{rows}-{chain}-{stored}")
+    for (rows, chain), stored in zip(
+        [(1, 1), (4, 4), (8, 8), (16, 8), (32, 8), (64, 8)], [1, 3, 7] * 2
+    )
+]
+# The MLP mix and the attention norm take a task a row, the same code at
+# every row count: one row, a verify block and the largest launch cover
+# their placements.
+ROWS = [(1, 1), (8, 8), (64, 8)]
 # Each geometry's tiles: Small's 4608-wide rows split 4096 + 512, the
 # half-width geometry's 2304 2048 + 256 (a masked second tile).
 GEOMETRIES = pytest.mark.parametrize(
@@ -96,8 +107,7 @@ def _sweep_kernel(scratch, step, sweep, PLAN: gl.constexpr):
 
 
 @GEOMETRIES
-@pytest.mark.parametrize("stored", [1, 3, 7])
-@pytest.mark.parametrize("rows,chain", ROWS)
+@pytest.mark.parametrize("rows,chain,stored", SWEEP_CASES)
 def test_sweep_is_the_regular_kernel(dims, rows, chain, stored):
     """The new block set's partials over ``stored`` blocks and this launch's
     candidate (from its mailbox) equal the regular partials kernel's over

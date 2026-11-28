@@ -675,13 +675,15 @@ def test_one_row_input_equals_repeated_streams(with_ple):
         assert torch.equal(one_row, repeated)
 
 
+# Up to 2 rows B1 also runs the recurrence (layer._delta_stages): a block of
+# 2. Past them, a block of 4 (MTP's, each conv tap reaching back into the
+# block) with and without the PLE block, two requests' blocks of 2, and two
+# requests' blocks of 4 (8 rows) with and without the PLE block.
 @pytest.mark.parametrize(
     "requests, chain, with_ple",
     [
         (1, 2, False),
-        (1, 3, False),
         (1, 4, False),
-        (2, 2, False),
         (1, 4, True),
         (2, 2, True),
         # An MTP verify of 2 requests (8 rows).
@@ -865,8 +867,20 @@ def test_delta_layer_verify_equals_decode_steps(requests, chain, with_ple):
     torch.testing.assert_close(replayed[final], ssm[final], rtol=1e-4, atol=1e-5)
 
 
-@pytest.mark.parametrize("rows", [2, 3, 4, 6, 8])
-@pytest.mark.parametrize("with_ple", [False, True])
+# 2 rows (B1 also runs the recurrence), 3 and 4 past them, and 6 and 8 in
+# blocks of 8 (layer.MAX_ROWS); the PLE block's rows at 4 and 8.
+@pytest.mark.parametrize(
+    "rows, with_ple",
+    [
+        pytest.param(2, False, id="False-2"),
+        pytest.param(3, False, id="False-3"),
+        pytest.param(4, False, id="False-4"),
+        pytest.param(4, True, id="True-4"),
+        pytest.param(6, False, id="False-6"),
+        pytest.param(8, False, id="False-8"),
+        pytest.param(8, True, id="True-8"),
+    ],
+)
 def test_delta_layer_rows_equal_one_row_launches(rows, with_ple):
     """Each request row of a multi-row launch computes and writes exactly
     what a launch of that row alone does."""
@@ -1016,11 +1030,12 @@ def _qsa_tensors(g, final: bool, experts: str) -> dict:
 
 
 # Rows at different positions. 2998 needs the top-k (749 complete blocks).
+# Q6 merges at most 2 rows of tasks at once (qsa.MERGE_ROWS): 2 rows, and 4
+# and 8 rows with either experts' format.
 @pytest.mark.parametrize(
     ("lengths", "final", "experts"),
     [
         ((999, 37), False, "mxfp4"),
-        ((2998, 1500, 400), False, "mxfp4"),
         ((999, 2998, 64, 1203), True, "mxfp4"),
         ((999, 2998, 64, 1203), True, "bf16"),
         ((999, 2998, 64, 1203, 37, 1500, 400, 2050), True, "mxfp4"),
@@ -1249,9 +1264,10 @@ def test_qsa_layer_verify_equals_decode_steps(starts, chain, final):
 
 # Four draft positions from a block's first token (before and past the top-k),
 # and from its third token (the completed block mixes ring and draft members).
-@pytest.mark.parametrize("experts", ["mxfp4", "bf16"])
+# The draft scratch is the attention's; the experts are the MTP draft layer's
+# BF16 ones (the decode tests cover MXFP4 experts at one row).
 @pytest.mark.parametrize("start", [1000, 1002, 2996])
-def test_qsa_layer_draft_steps_equal_decode_steps(start, experts):
+def test_qsa_layer_draft_steps_equal_decode_steps(start):
     """MTP draft steps (one row, ``draft`` scratch) compute what decode steps
     compute (outputs, KV and compressed caches). They stage each index key
     and its group-start position in the draft scratch, which the next steps'
@@ -1259,7 +1275,7 @@ def test_qsa_layer_draft_steps_equal_decode_steps(start, experts):
     page, max_pos = 256, 4096
     g = torch.Generator().manual_seed(80 + start % 7)
     dev = "cuda"
-    tensors = _qsa_tensors(g, False, experts)
+    tensors = _qsa_tensors(g, False, "bf16")
     fused = prepare_qwen4_exp_qsa_layer(max_rows=1, tensors=tensors, dense_tiled=False)
     scratch = torch.zeros(fused.scratch_pairs, dtype=torch.int64, device=dev)
     h = (torch.randn(4, WIDTH, generator=g) * 3).bfloat16().cuda()
@@ -1341,10 +1357,21 @@ def test_qsa_layer_draft_steps_equal_decode_steps(start, experts):
             assert torch.equal(draft[1][0], decode["rope_position"][ring])
 
 
-# Rows 997-1000: 999 completes a block. Accepted lengths before, at and past it.
-@pytest.mark.parametrize("final", [False, True])
-@pytest.mark.parametrize("experts", ["mxfp4", "bf16"])
-@pytest.mark.parametrize("accepted", [1, 2, 3, 4])
+# Rows 997-1000: 999 completes a block. Accepted lengths before, at and past
+# it, with the MTP draft layer's BF16 experts, with and without the final
+# mixer. The MXFP4 experts run in one case, whose live row is the third: it
+# completes the block, and the last row's index key is masked.
+@pytest.mark.parametrize(
+    ("accepted", "experts", "final"),
+    [
+        *(
+            pytest.param(accepted, "bf16", final, id=f"{accepted}-bf16-{final}")
+            for final in (False, True)
+            for accepted in (1, 2, 3, 4)
+        ),
+        pytest.param(3, "mxfp4", False, id="3-mxfp4-False"),
+    ],
+)
 def test_qsa_layer_draft_first_step_writes_accepted_index_keys(
     accepted, experts, final
 ):
