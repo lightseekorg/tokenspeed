@@ -49,6 +49,7 @@ import torch
 import torch.distributed as dist
 
 from tokenspeed.runtime.epd.recv_pool import (
+    embedding_budget_bytes,
     is_epd_receive_node,
     recv_pool_geometry,
     split_slot,
@@ -107,6 +108,7 @@ class EpdReceiveSettings:
             (``str(torch.dtype)``).
         element_size: Bytes per element.
         shard: Each rank receives only its share of an image's rows.
+        embedding_budget_bytes: Maximum live reconstructed bytes per rank.
         timeout_s: How long a request may wait for its embeddings
             (``TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT``).
     """
@@ -123,6 +125,7 @@ class EpdReceiveSettings:
     dtype: str
     element_size: int
     shard: bool
+    embedding_budget_bytes: int
     timeout_s: float
     # Aggregated receivers own transport; PD receivers share the KV peer.
     transport: PeerSettings | None = None
@@ -216,6 +219,9 @@ class EmbeddingPublisher:
         # (the event after a publish's copies, their slots), in publish
         # order: appended by the forward thread, read by the control thread.
         self._copies: list[tuple[Any | None, list[int]]] = []
+        self._retirements: list[
+            tuple[Any | None, list[str], tuple[torch.Tensor, ...]]
+        ] = []
         self._lock = threading.Lock()
 
     def publish(
@@ -292,6 +298,34 @@ class EmbeddingPublisher:
                 else:
                     pending.append((event, slots))
             self._copies = pending
+        return done
+
+    def retire(
+        self, rids: list[str], event: Any | None, keepalive: Sequence[torch.Tensor]
+    ) -> None:
+        """Fence ended requests after their final use on the forward stream.
+
+        Called on the forward thread after this request's final queued use.
+        Keep request-owned tensors alive until the event completes: the event
+        itself does not inform the caching allocator that another stream used
+        their storage. Receive-slot copies have an independent, earlier fence.
+        """
+        if not rids:
+            return
+        with self._lock:
+            self._retirements.append((event, list(rids), tuple(keepalive)))
+
+    def retired(self) -> list[str]:
+        """Ended requests whose device use has completed, once each."""
+        done = []
+        with self._lock:
+            pending = []
+            for event, rids, keepalive in self._retirements:
+                if event is None or event.query():
+                    done.extend(rids)
+                else:
+                    pending.append((event, rids, keepalive))
+            self._retirements = pending
         return done
 
 
@@ -396,6 +430,7 @@ def build_epd_receive(
         dtype=str(facts.dtype),
         element_size=facts.dtype.itemsize,
         shard=shards is not None,
+        embedding_budget_bytes=embedding_budget_bytes(),
         timeout_s=float(envs.TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT.get()),
     )
     publisher = EmbeddingPublisher(

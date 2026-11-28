@@ -75,3 +75,24 @@ def recv_pool_bytes(server_args: ServerArgs, is_multimodal_active: bool) -> int:
         return 0
     n_slots, slot_mb = recv_pool_geometry()
     return n_slots * (slot_mb << 20)
+
+
+def embedding_budget_bytes() -> int:
+    """Per-rank budget for complete request embeddings, including deepstack.
+
+    This is additional to the registered receive workspace. TP row sharding
+    does not reduce the reconstructed tensor size.
+    """
+    budget_mb = envs.TOKENSPEED_EPD_EMBEDDING_BUDGET_MB.get()
+    if budget_mb <= 0 or budget_mb > ((1 << 63) - 1) >> 20:
+        raise ValueError(
+            "TOKENSPEED_EPD_EMBEDDING_BUDGET_MB must be positive and fit int64 bytes"
+        )
+    return budget_mb << 20 if recv_pool_geometry()[0] else 0
+
+
+def recv_memory_bytes(server_args: ServerArgs, is_multimodal_active: bool) -> int:
+    """Workspace plus live embedding allowance to leave out of the KV budget."""
+    if not is_epd_receive_node(server_args, is_multimodal_active):
+        return 0
+    return recv_pool_bytes(server_args, is_multimodal_active) + embedding_budget_bytes()

@@ -183,7 +183,7 @@ from tokenspeed.runtime.distributed.nccl_suspend import (
     suspend_nccl_communicators,
 )
 from tokenspeed.runtime.engine.scheduler_utils import is_device_cache_op
-from tokenspeed.runtime.epd.recv_pool import recv_pool_bytes
+from tokenspeed.runtime.epd.recv_pool import recv_memory_bytes
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
@@ -486,6 +486,20 @@ class DeviceHandle:
         forward runs behind it; a forward finishes the round itself, at the
         point where it overlaps the most (``docs/design/event-loop.md``)."""
         self._executor.complete_pending_drafting()
+
+    def record_execution_event(self):
+        """Fence both model use and current-stream input copies.
+
+        The returned event is queried by the control thread; recording it
+        enqueues waits only and never synchronizes the serving thread.
+        """
+        executor = self._executor
+        if self._forward_device.type not in ("cuda", "npu"):
+            return None
+        event = executor.device_module.Event()
+        executor.execution_stream.wait_stream(executor.default_stream)
+        event.record(executor.execution_stream)
+        return event
 
     # ------------------------------------------------------------------
     # Per-round work
@@ -1925,12 +1939,15 @@ def build_device_side(
     if communication_first:
         prepare_multimodal()
 
-    post_profile_bytes = recv_pool_bytes(server_args, model_config.is_multimodal_active)
+    post_profile_bytes = recv_memory_bytes(
+        server_args, model_config.is_multimodal_active
+    )
     if post_profile_bytes:
         logger.info(
             f"KV cache budget leaves out the {post_profile_bytes / (1 << 30):.2f} GiB "
-            "EPD receive pool (TOKENSPEED_EPD_RECV_POOL_SLOTS x "
-            "TOKENSPEED_EPD_RECV_POOL_SLOT_MB)"
+            "EPD receive workspace and reconstructed embedding budget "
+            "(TOKENSPEED_EPD_RECV_POOL_SLOTS x TOKENSPEED_EPD_RECV_POOL_SLOT_MB "
+            "+ TOKENSPEED_EPD_EMBEDDING_BUDGET_MB)"
         )
 
     @startup_phase("kv.build")

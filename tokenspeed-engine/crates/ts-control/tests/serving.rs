@@ -407,6 +407,7 @@ struct FakeDevice {
     epd_copying: Vec<usize>,
     /// EPD: slots reported copied out.
     epd_released: Arc<Mutex<Vec<usize>>>,
+    epd_retired: Arc<Mutex<Vec<String>>>,
     /// Grammar: each constrained request's matcher handle.
     grammars: HashMap<String, u64>,
 }
@@ -686,29 +687,58 @@ impl TransferPeer for FakePeer {
 /// landed item takes one slot of eight.
 struct FakeReceiver {
     rank: usize,
-    staged: Vec<(String, Vec<EmbeddingItem>, usize)>,
+    lease_limit: usize,
+    staged: Vec<(String, Vec<EmbeddingItem>, usize, usize)>,
     free: Vec<usize>,
     awaiting: Vec<usize>,
 }
 
 impl EmbeddingReceiver for FakeReceiver {
+    fn admission_plan(&self) -> Vec<i64> {
+        vec![2; self.staged.len()]
+    }
+
+    fn admit_requests(&mut self, _: &[i64]) {}
+
+    fn retire_pending(&mut self, _: &[String]) {}
+
+    fn retire_requests(&mut self, _: &[String]) {}
+
+    fn failure_reason(&self, _: &str) -> Option<String> {
+        None
+    }
+
+    fn lease_capacity(&mut self) -> usize {
+        self.free.len()
+    }
+
+    fn lease_items(&mut self, count: usize) {
+        self.lease_limit = count;
+    }
+
     fn stage(&mut self, rid: &str, items: &[EmbeddingItem]) {
         assert!(!items.is_empty());
-        self.staged.push((rid.to_owned(), items.to_vec(), 0));
+        self.staged.push((rid.to_owned(), items.to_vec(), 0, 0));
     }
 
     fn poll(&mut self) -> Vec<i64> {
         let rank = self.rank;
+        let mut available = self.free.len().min(self.lease_limit);
         self.staged
             .iter_mut()
-            .map(|(rid, _, polls)| {
+            .map(|(rid, items, polls, published)| {
                 *polls += 1;
                 let landed_at = if rid.starts_with("lost") {
                     return i64::from(*polls < 2);
                 } else {
                     3 + rank
                 };
-                if *polls >= landed_at {
+                if *polls < landed_at {
+                    return 1;
+                }
+                let newly = (items.len() - *published).min(available);
+                available -= newly;
+                if *published + newly == items.len() {
                     2
                 } else {
                     1
@@ -717,36 +747,68 @@ impl EmbeddingReceiver for FakeReceiver {
             .collect()
     }
 
+    fn landed_prefixes(&self) -> Vec<i64> {
+        let mut available = self.free.len().min(self.lease_limit);
+        self.staged
+            .iter()
+            .map(|(_, items, polls, published)| {
+                if *polls < 3 + self.rank {
+                    return *published as i64;
+                }
+                let newly = (items.len() - *published).min(available);
+                available -= newly;
+                (*published + newly) as i64
+            })
+            .collect()
+    }
+
+    fn publish_prefixes(&mut self, prefixes: &[i64]) -> Vec<LandedRequest> {
+        let mut landed = Vec::new();
+        for ((rid, items, _, published), &prefix) in self.staged.iter_mut().zip(prefixes) {
+            if prefix == 0 {
+                continue;
+            }
+            let end = prefix as usize;
+            let mut newly = Vec::new();
+            for item in &items[*published..end] {
+                let slot = self.free.pop().expect("a free receive slot");
+                self.awaiting.push(slot);
+                newly.push(LandedItem {
+                    index: item.index,
+                    slot: Some(slot),
+                    row_start: 0,
+                    row_count: item.rows,
+                    rows: item.rows,
+                    sharded: false,
+                });
+            }
+            *published = end;
+            if !newly.is_empty() {
+                landed.push(LandedRequest {
+                    rid: rid.clone(),
+                    items: newly,
+                });
+            }
+        }
+        landed
+    }
+
     fn settle(&mut self, codes: &[i64]) -> Vec<LandedRequest> {
         assert_eq!(codes.len(), self.staged.len());
-        let mut landed = Vec::new();
         let mut kept = Vec::new();
-        for ((rid, items, polls), &code) in self.staged.drain(..).zip(codes) {
+        for ((rid, items, polls, published), &code) in self.staged.drain(..).zip(codes) {
             match code {
-                2 => landed.push(LandedRequest {
-                    rid,
-                    items: items
-                        .into_iter()
-                        .map(|item| {
-                            let slot = self.free.pop().expect("a free slot");
-                            self.awaiting.push(slot);
-                            LandedItem {
-                                index: item.index,
-                                slot: Some(slot),
-                                row_start: 0,
-                                row_count: item.rows,
-                                rows: item.rows,
-                                sharded: false,
-                            }
-                        })
-                        .collect(),
-                }),
-                1 => kept.push((rid, items, polls)),
+                2 => assert_eq!(
+                    published,
+                    items.len(),
+                    "admitted before every item was published"
+                ),
+                1 => kept.push((rid, items, polls, published)),
                 _ => {}
             }
         }
         self.staged = kept;
-        landed
+        Vec::new()
     }
 
     fn release(&mut self, slots: &[usize]) {
@@ -976,6 +1038,7 @@ impl DataPlane for FakeDevice {
             self.replay_pending
                 .push_back((id, self.replay_ack_polls.unwrap()));
         }
+        self.epd_retired.lock().unwrap().extend_from_slice(rids);
         let mut released = self.released.lock().unwrap();
         for rid in rids {
             let generated = self
@@ -1116,10 +1179,11 @@ impl DataPlane for FakeDevice {
     }
 
     /// The published rows are copied out by the next query.
-    fn epd_released(&mut self) -> Result<Vec<usize>, DataPlaneError> {
+    fn epd_released(&mut self) -> Result<(Vec<usize>, Vec<String>), DataPlaneError> {
         let slots = std::mem::take(&mut self.epd_copying);
         self.epd_released.lock().unwrap().extend(&slots);
-        Ok(slots)
+        let retired = std::mem::take(&mut *self.epd_retired.lock().unwrap());
+        Ok((slots, retired))
     }
 
     #[allow(clippy::type_complexity)]
@@ -2019,6 +2083,7 @@ fn run_rank<F: Frontend>(
             embeddings: epd_receive_enabled.then(|| {
                 Box::new(FakeReceiver {
                     rank,
+                    lease_limit: 0,
                     staged: Vec::new(),
                     free: (0..8).collect(),
                     awaiting: Vec::new(),
@@ -9809,6 +9874,44 @@ fn duplicate_bootstrap_room_is_refused_while_epd_staged_and_released_on_epd_fail
     assert_room_conflict_409(&ranks[0].outputs, "dup-same-round");
     assert_room_conflict_409(&ranks[0].outputs, "dup-while-staged");
     assert_scripted_tokens(&ranks[0], "after-epd-fail", 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn epd_request_larger_than_receive_pool_publishes_before_admission() {
+    let engine = start_ranks_with(
+        Layout::Tp(2),
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            epd_receive_enabled: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let mut input = epd_request("many-images");
+    let media = input.multimodal_inputs.as_mut().unwrap();
+    let item = media.mm_items[0].clone();
+    media.mm_items = (0..17)
+        .map(|index| {
+            let mut item = item.clone();
+            item.offsets = Some(vec![(index, index)]);
+            item.encode_handshake = Some(Dict(vec![
+                (Value::from("bootstrap_room"), Value::from(index + 100)),
+                (Value::from("bootstrap_host"), Value::from("127.0.0.1")),
+                (Value::from("bootstrap_port"), Value::from(8998)),
+            ]));
+            item
+        })
+        .collect();
+    input.input_ids = Some(vec![1; 32]);
+    let outputs = run_all(&engine.client, vec![input]).await;
+    assert_eq!(tokens(&outputs[0]), [1000, 1001, 1002]);
+    engine.settle().await;
+    for rank in 0..2 {
+        assert_eq!(engine.ranks[rank].epd_admitted.lock().unwrap().len(), 3);
+        assert_eq!(engine.ranks[rank].epd_released.lock().unwrap().len(), 17);
+        assert_eq!(engine.released_on(rank).len(), 1);
+    }
 }
 
 /// What a test's pool did, in order.

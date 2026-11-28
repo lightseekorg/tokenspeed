@@ -1055,6 +1055,24 @@ class HostDataPlane:
         shared-memory features go behind every forward launched before this,
         the ones that may read them."""
         requests = [(rid, self._requests.pop(rid)) for rid in rids]
+        epd_requests = [
+            (rid, request)
+            for rid, request in requests
+            if self._epd is not None
+            and request.multimodal_inputs is not None
+            and any(
+                item.encode_handshake is not None
+                for item in request.multimodal_inputs.mm_items
+            )
+        ]
+        epd_rids = [rid for rid, _ in epd_requests]
+        epd_tensors = [
+            tensor
+            for _, request in epd_requests
+            for item in request.multimodal_inputs.mm_items
+            for tensor in (item.encoded, item.encoded_deepstack)
+            if tensor is not None
+        ]
         retirement_slots = []
         if retirement_id is not None:
             retirement_slots = [
@@ -1062,13 +1080,17 @@ class HostDataPlane:
                 for _, request in requests
                 if request.replay_slot is not None
             ]
-        if retirement_slots or any(
-            request.grammar is not None
-            or (
-                request.multimodal_inputs is not None
-                and request.multimodal_inputs.has_pending_shm_features()
+        if (
+            epd_rids
+            or retirement_slots
+            or any(
+                request.grammar is not None
+                or (
+                    request.multimodal_inputs is not None
+                    and request.multimodal_inputs.has_pending_shm_features()
+                )
+                for _, request in requests
             )
-            for _, request in requests
         ):
             # A release is a data-plane task: it runs behind a drafter's
             # pending round.
@@ -1088,6 +1110,11 @@ class HostDataPlane:
                     logger.exception(
                         f"releasing the shared-memory features of {rid} failed"
                     )
+
+        if epd_rids:
+            self._epd.retire(
+                epd_rids, self._device.record_execution_event(), epd_tensors
+            )
 
     def land(
         self,
@@ -1205,10 +1232,10 @@ class HostDataPlane:
             ]
         )
 
-    def epd_released(self) -> list[int]:
+    def epd_released(self) -> tuple[list[int], list[str]]:
         """EPD: the receive slots whose rows ``epd_publish`` finished copying
         out; a completion query, on the control thread."""
-        return self._epd.released()
+        return self._epd.released(), self._epd.retired()
 
     def snapshot_expert_load(self) -> tuple[list[list[int]], list[list[int]]]:
         """This rank's route counters since the previous snapshot and the
