@@ -112,10 +112,27 @@ protected:
     }
 };
 
+class WaitRoundPrefillOrderTest : public ShortPrefillOrderTest {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto config = ShortPrefillOrderTest::MakeConfig();
+        config.short_prefill_aging = ShortPrefillAging::kWaitRounds;
+        return config;
+    }
+
+    std::vector<std::string> RunPrefill() {
+        const auto plan = PlanOnce();
+        Land(plan);
+        const auto* batch = FindForwardBatch(plan);
+        return batch ? batch->request_ids : std::vector<std::string>{};
+    }
+};
+
 INSTANTIATE_TEST_SUITE_P(PrefillRole, ShortPrefillYieldOrderTest, ::testing::Values(Role::kP));
 
 INSTANTIATE_TEST_SUITE_P(LocalRoles, PrefillOrderTest, ::testing::Values(Role::kP, Role::kFused));
 INSTANTIATE_TEST_SUITE_P(LocalRoles, ShortPrefillOrderTest, ::testing::Values(Role::kP, Role::kFused));
+INSTANTIATE_TEST_SUITE_P(LocalRoles, WaitRoundPrefillOrderTest, ::testing::Values(Role::kP, Role::kFused));
 
 TEST_P(PrefillOrderTest, DefaultKeepsSubmissionOrderDespiteCachedWork) {
     Seed(RequestSpec{.request_id = "seed", .tokens = MakeTokens(64), .max_new_tokens = 1});
@@ -246,6 +263,47 @@ TEST_P(ShortPrefillOrderTest, BypassLimitIsAppliedWithinOneBatch) {
     EXPECT_EQ(old - batch->request_ids.begin(), 8);
     EXPECT_EQ(batch->request_ids.back(), "old-long");
     EXPECT_EQ(batch->input_lengths.back(), 56);
+}
+
+TEST_P(WaitRoundPrefillOrderTest, ResidentChunksCountTowardTheFourthRoundForEveryWaiter) {
+    Start({RequestSpec{.request_id = "resident", .tokens = MakeTokens(192, 1000), .max_new_tokens = 1}});
+    ASSERT_EQ(RunPrefill(), (std::vector<std::string>{"resident"}));
+    Start({RequestSpec{.request_id = "first", .tokens = MakeTokens(102, 2000), .max_new_tokens = 1},
+           RequestSpec{.request_id = "second", .tokens = MakeTokens(100, 3000), .max_new_tokens = 1}});
+    ASSERT_EQ(RunPrefill(), (std::vector<std::string>{"resident"}));
+    ASSERT_EQ(RunPrefill(), (std::vector<std::string>{"resident"}));
+
+    // On their third round both waiters still rank behind a fresh 96-token prompt.
+    Start({RequestSpec{.request_id = "new", .tokens = MakeTokens(96, 4000), .max_new_tokens = 1}});
+    ASSERT_EQ(RunPrefill(), (std::vector<std::string>{"new"}));
+    Start({RequestSpec{.request_id = "small", .tokens = MakeTokens(8, 5000), .max_new_tokens = 1},
+           RequestSpec{.request_id = "medium", .tokens = MakeTokens(48, 6000), .max_new_tokens = 1}});
+
+    // Only 24 tokens remain after the resident and the small prompt. The old
+    // waiters rank at the full chunk of 64, so the 48-token prompt starts first.
+    ASSERT_EQ(RunPrefill(), (std::vector<std::string>{"new", "small", "medium"}));
+    Start({RequestSpec{.request_id = "waiting", .tokens = MakeTokens(128, 7000), .max_new_tokens = 1}});
+    ASSERT_EQ(RunPrefill(), (std::vector<std::string>{"medium", "first"}));
+    ASSERT_EQ(RunPrefill(), (std::vector<std::string>{"first", "second"}));
+    ASSERT_EQ(RunPrefill(), (std::vector<std::string>{"second"}));
+
+    // On its fourth round, "waiting" ranks at 64 and beats a fresh 65.
+    Start({RequestSpec{.request_id = "fresh", .tokens = MakeTokens(65, 8000), .max_new_tokens = 1}});
+    EXPECT_EQ(RunPrefill(), (std::vector<std::string>{"second", "waiting"}));
+}
+
+TEST_P(WaitRoundPrefillOrderTest, MultipleAdmissionsInOneBatchCountAsOneRound) {
+    std::vector<RequestSpec> requests{{.request_id = "long", .tokens = MakeTokens(128, 1000), .max_new_tokens = 1},
+                                      {.request_id = "medium", .tokens = MakeTokens(65, 2000), .max_new_tokens = 1}};
+    std::vector<std::string> expected;
+    for (int i = 0; i < 8; ++i) {
+        const auto id = "short" + std::to_string(i);
+        requests.push_back(RequestSpec{.request_id = id, .tokens = MakeTokens(1, 3000 + i), .max_new_tokens = 1});
+        expected.push_back(id);
+    }
+    Start(requests);
+    expected.push_back("medium");
+    EXPECT_EQ(RunPrefill(), expected);
 }
 
 TEST_P(ShortPrefillOrderTest, EachOldestPromptGetsItsOwnBypassAllowance) {

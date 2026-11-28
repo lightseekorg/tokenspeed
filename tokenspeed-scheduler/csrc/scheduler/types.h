@@ -37,6 +37,8 @@
 
 namespace tokenspeed {
 
+enum class ShortPrefillAging : std::uint8_t { kBypass, kWaitRounds };
+
 // Resolved once after startup validation. Legacy binding fields below remain
 // input adapters; production, publication and retention consume these contracts.
 struct CheckpointProductionConfig {
@@ -188,11 +190,10 @@ struct SchedulerConfig {
     // always owes them.
     std::int32_t prefill_interval_min_decoding{0};
     // P and fused roles: rank new local prefills by work after Device/Host
-    // prefix reuse, keeping stable ties and resident chunks first. Only the
-    // oldest waiting prompt counts successful later first admissions; after
-    // eight, it gains selection priority. Off preserves submission order.
+    // prefix reuse, keeping resident chunks first. Off preserves submission order.
     // See docs/design/scheduler.md section 1.1.
     bool enable_short_prefill_first{false};
+    ShortPrefillAging short_prefill_aging{ShortPrefillAging::kBypass};
 
     // The P and D roles ARE the cache-transfer PD protocol: there is no
     // disaggregated deployment without it, so everything PD-specific

@@ -28,6 +28,7 @@ import torch
 from tokenspeed_engine.scheduler import (
     DiskConfig,
     PeerConfig,
+    SchedulerConfig,
     SharedL2Config,
     StorageConfig,
 )
@@ -351,4 +352,6 @@ def scheduler_config_from_args(
         shared_l2_config=shared_l2_config,
     )
     config.peer_config = peer_config
+    if server_args.short_prefill_aging == "wait-rounds":
+        config.short_prefill_aging = SchedulerConfig.ShortPrefillAging.WaitRounds
     return config

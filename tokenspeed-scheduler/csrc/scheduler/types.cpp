@@ -144,6 +144,10 @@ void SchedulerConfig::Validate() const {
         throw std::invalid_argument(
             "Scheduler: demote_superseded_state_checkpoints requires state_checkpoint_in_forward");
     }
+    if (short_prefill_aging == ShortPrefillAging::kWaitRounds && !enable_short_prefill_first) {
+        throw std::invalid_argument(
+            "Scheduler: --short-prefill-aging wait-rounds requires --enable-short-prefill-first");
+    }
     if (prefill_chunk_yield_tokens < 0) {
         throw std::invalid_argument(
             "Scheduler: prefill_chunk_yield_tokens (--prefill-chunk-yield-tokens) must be >= 0");

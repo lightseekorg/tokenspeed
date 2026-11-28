@@ -78,6 +78,8 @@ constexpr std::int32_t kMaxRestoreAttemptsPerRound = 4;
 constexpr std::int32_t kMaxYieldProbesPerRound = 8;
 
 constexpr std::int32_t kMaxPrefillBypasses = 8;
+constexpr std::int32_t kPrefillAgeRounds = 4;
+constexpr std::int32_t kUnrankablePrefillWork = std::numeric_limits<std::int32_t>::max();
 
 // An incomplete prefill keeps the head of line: admission reserved only this
 // chunk, and a later candidate could strand it by consuming the capacity it
@@ -86,7 +88,10 @@ bool holdsHeadOfLine(const Request& request) {
     return request.Is<fsm::Prefilling>();
 }
 
-void recordPrefillBypass(std::span<Request* const> candidates, const Request* admitted) {
+void recordPrefillBypass(const SchedulerConfig& config, std::span<Request* const> candidates, const Request* admitted) {
+    if (!config.enable_short_prefill_first || config.short_prefill_aging != ShortPrefillAging::kBypass) {
+        return;
+    }
     // Count only for the oldest waiting prompt. Aging every older prompt
     // together would disable short-work preference after eight admissions.
     for (Request* older : candidates) {
@@ -94,8 +99,9 @@ void recordPrefillBypass(std::span<Request* const> candidates, const Request* ad
             break;
         }
         if (auto* waiting = older->GetIf<fsm::Submitted>()) {
-            waiting->admission.prefill_bypasses =
-                std::min(kMaxPrefillBypasses, waiting->admission.prefill_bypasses + 1);
+            if (waiting->admission.short_prefill_age < kMaxPrefillBypasses) {
+                ++waiting->admission.short_prefill_age;
+            }
             break;
         }
     }
@@ -1722,8 +1728,8 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
                     build.scheduled.insert(blocker);
                     build.remote_prefill.emplace_back(std::move(*admitted));
                 } else {
-                    if (config_.enable_short_prefill_first && first_admission) {
-                        recordPrefillBypass(candidates, blocker);
+                    if (first_admission) {
+                        recordPrefillBypass(config_, candidates, blocker);
                     }
                     pushOperation(build, *blocker, std::move(*admitted));
                     blocker->TrackScheduledForward();
@@ -1937,21 +1943,28 @@ struct PendingPrefill {
 
 // The next prompt by rank, with the work it was ranked by; a null request once
 // none is left.
-PendingPrefill popShortPrefill(std::vector<PendingPrefill>& pending) {
+PendingPrefill popShortPrefill(std::vector<PendingPrefill>& pending, const SchedulerConfig& config) {
     if (pending.empty()) {
         return PendingPrefill{nullptr, 0};
     }
-    // Reevaluate age after every admission, including inside one batch.
-    // min_element preserves submission order for equal work or protected requests.
-    const auto selected =
-        std::min_element(pending.begin(), pending.end(), [](const PendingPrefill& a, const PendingPrefill& b) {
-            const bool aged_a = a.request->GetIf<fsm::Submitted>()->admission.prefill_bypasses >= kMaxPrefillBypasses;
-            const bool aged_b = b.request->GetIf<fsm::Submitted>()->admission.prefill_bypasses >= kMaxPrefillBypasses;
-            if (aged_a != aged_b) {
-                return aged_a;
-            }
-            return !aged_a && a.remaining_tokens < b.remaining_tokens;
+    // min_element keeps submission order when the policy's keys tie.
+    auto selected = pending.begin();
+    if (config.short_prefill_aging == ShortPrefillAging::kWaitRounds) {
+        selected = std::ranges::min_element(pending, {}, [&config](const PendingPrefill& prompt) {
+            const auto age = prompt.request->GetIf<fsm::Submitted>()->admission.short_prefill_age;
+            const bool aged = age >= kPrefillAgeRounds && prompt.remaining_tokens != kUnrankablePrefillWork;
+            const auto work =
+                aged ? std::min(prompt.remaining_tokens, config.max_scheduled_tokens) : prompt.remaining_tokens;
+            return std::pair{work, aged ? -age : std::int64_t{0}};
         });
+    } else {
+        // Bypasses can accrue between admissions in the same batch.
+        selected = std::ranges::min_element(pending, {}, [](const PendingPrefill& prompt) {
+            const bool aged =
+                prompt.request->GetIf<fsm::Submitted>()->admission.short_prefill_age >= kMaxPrefillBypasses;
+            return std::pair{!aged, aged ? 0 : prompt.remaining_tokens};
+        });
+    }
     const PendingPrefill popped = *selected;
     pending.erase(selected);
     return popped;
@@ -2076,9 +2089,7 @@ std::int32_t Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild
         if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget, decode_reserve,
                                                      build.load_backs, build.kv_page_budget, /*yield_tokens=*/0,
                                                      /*must_complete=*/true)) {
-            if (config_.enable_short_prefill_first) {
-                recordPrefillBypass(candidates, request);
-            }
+            recordPrefillBypass(config_, candidates, request);
             pushOperation(build, *request, std::move(*admitted));
             request->TrackScheduledForward();
             ++admitted_prompts;
@@ -2102,6 +2113,34 @@ bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) c
     return config_.role != Role::kFused ||
            (build.options.allow_prefill &&
             (request.Is<fsm::Prefilling>() || !build.options.apply_prefill_watermark || belowPrefillWatermark()));
+}
+
+// Count a prefill formation before the resident takes its chunk, even when
+// that chunk leaves no budget for newcomers. A closed gate does not age them.
+void Scheduler::ageWaitingPrefills(const PlanBuild& build, std::span<Request* const> candidates,
+                                   bool new_prompts_sealed) const {
+    if (build.Full(config_.max_batch_size) || build.token_budget <= 0 || lone_requests_.ActedInPlan()) {
+        return;
+    }
+    auto waiting = std::views::filter(candidates, [&build](const Request* request) {
+        return request->Is<fsm::Submitted>() && !build.Scheduled(*request);
+    });
+    if (waiting.empty()) {
+        return;
+    }
+    const bool newcomers_can_run =
+        !new_prompts_sealed && req_pool_allocator_.AvailableSlots() > 0 && prefillAllowed(*waiting.front(), build);
+    if (!newcomers_can_run && !std::ranges::any_of(candidates, [&build](const Request* request) {
+            return request->Is<fsm::Prefilling>() && !build.Scheduled(*request);
+        })) {
+        return;
+    }
+    for (Request* request : waiting) {
+        auto& age = request->GetIf<fsm::Submitted>()->admission.short_prefill_age;
+        if (age < std::numeric_limits<std::int64_t>::max()) {
+            ++age;
+        }
+    }
 }
 
 // Local prefill phases shared by the P and fused grammars: resident chunks
@@ -2135,8 +2174,8 @@ bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) c
 // then fills the budget it leaves the same way: from the same list in
 // submission order or, with enable_short_prefill_first, from the new prompts
 // still ranked, in rank order (popShortPrefill; for a resident's chunk ranked
-// after its admission), so a protected prompt goes first. The carry keeps
-// submission order either way. The chunk is still admitted first, and a
+// after its admission). The carry keeps submission order either way.
+// The chunk is still admitted first, and a
 // resident's chunk that fails admission still stops everything behind it. A
 // chunk whose admission compacted carries and fills none: they would be later
 // admissions in the compaction's plan. The fused role does neither.
@@ -2144,6 +2183,9 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
                                          std::int32_t decode_reserve) {
     ProfileSpan profile_span{"Scheduler::scheduleLocalPrefillWork"};
+    if (config_.short_prefill_aging == ShortPrefillAging::kWaitRounds) {
+        ageWaitingPrefills(build, candidates, new_prompts_sealed);
+    }
     std::optional<std::vector<WholePrompt>> whole_prompts;
     for (const bool resident : {true, false}) {
         if (build.Full(config_.max_batch_size) || build.token_budget <= 0 ||
@@ -2164,7 +2206,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 const auto match = matchPrefixAtAdmission(request);
                 const auto hit_tokens =
                     std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
-                const auto remaining = match.waits_for_eviction_store ? std::numeric_limits<std::int32_t>::max()
+                const auto remaining = match.waits_for_eviction_store ? kUnrankablePrefillWork
                                                                       : request->PrefillSize() - hit_tokens +
                                                                             coordinator_.ReplayTokens(hit_tokens);
                 pending.push_back(PendingPrefill{request, remaining});
@@ -2176,7 +2218,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
         auto fifo = candidates;
         const auto next_request = [&]() -> Request* {
             if (short_work_first) {
-                return popShortPrefill(pending).request;
+                return popShortPrefill(pending, config_).request;
             }
             if (fifo.empty()) {
                 return nullptr;
@@ -2246,8 +2288,8 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
                                                          decode_reserve, build.load_backs, build.kv_page_budget,
                                                          yield_tokens, /*must_complete=*/false)) {
-                if (short_work_first) {
-                    recordPrefillBypass(candidates, request);
+                if (!resident) {
+                    recordPrefillBypass(config_, candidates, request);
                 }
                 spdlog::debug("[Scheduler] prefill {} scheduled ({} tokens)", request->Id(), admitted->input_length);
                 pushOperation(build, *request, std::move(*admitted));
@@ -2269,18 +2311,17 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                         !lone_requests_.ActedInPlan()) {
                         if (config_.enable_short_prefill_first) {
                             // With the new prompts ranked, in rank order,
-                            // submitted before this prompt or not: a
-                            // protected one first, priority reevaluated after
-                            // each admission. A resident's chunk ranks them
-                            // after its admission, which published what its
-                            // last chunk completed.
+                            // submitted before this prompt or not. Bypass
+                            // priority can change after each admission.
+                            // A resident's chunk ranks them after its admission
+                            // published what its last chunk completed.
                             if (resident) {
                                 rank_new_prompts();
                             }
                             while (!build.Full(config_.max_batch_size) && build.token_budget > 0 &&
                                    req_pool_allocator_.AvailableSlots() > 0 && !feedback.admission_failed) {
                                 // Drop those the carry admitted (the pop reads
-                                // a waiting prompt's bypasses) and those whose
+                                // a waiting prompt's age) and those whose
                                 // ranked work exceeds the budget left: it only
                                 // shrinks, so popping them would only skip
                                 // them, at O(n) a pop.
@@ -2288,7 +2329,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                                     return build.Scheduled(*prompt.request) ||
                                            prompt.remaining_tokens > build.token_budget;
                                 });
-                                const PendingPrefill next = popShortPrefill(pending);
+                                const PendingPrefill next = popShortPrefill(pending, config_);
                                 if (next.request == nullptr) {
                                     break;
                                 }

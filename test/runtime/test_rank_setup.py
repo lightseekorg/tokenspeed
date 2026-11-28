@@ -233,6 +233,24 @@ def test_short_prefill_flag_controls_real_scheduler_order(enabled, role, interva
     assert plan.forward[0].input_lengths == ([1, 63] if enabled else [64])
 
 
+@pytest.mark.parametrize(
+    "aging,expected",
+    [(None, "Bypass"), ("bypass", "Bypass"), ("wait-rounds", "WaitRounds")],
+)
+def test_short_prefill_aging_reaches_the_scheduler(aging, expected):
+    flags = [] if aging is None else ["--short-prefill-aging", aging]
+    args = prepare_server_args(["--model", "x", "--enable-short-prefill-first", *flags])
+    cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
+    assert cfg.short_prefill_aging == ts.SchedulerConfig.ShortPrefillAging[expected]
+
+
+def test_wait_rounds_requires_short_prefill_ordering():
+    with pytest.raises(
+        ValueError, match="wait-rounds requires --enable-short-prefill-first"
+    ):
+        prepare_server_args(["--model", "x", "--short-prefill-aging", "wait-rounds"])
+
+
 def test_make_config_requires_and_maps_the_host_write_policy():
     fields = dict(
         prefix_cache_evict_policy="lru",
