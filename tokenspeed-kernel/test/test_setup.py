@@ -162,7 +162,7 @@ def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None
     assert "torch-npu-memory-saver" not in requirements
     assert "tokenspeed-triton-kernels" not in requirements
     assert requirements["nvidia-cutlass-dsl"].extras == {"cu13"}
-    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.32.0"
+    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.33.0"
 
 
 def test_cuda_thirdparty_requirements_are_exactly_pinned() -> None:
