@@ -1320,6 +1320,9 @@ does not start a Prometheus endpoint.
 
 ### Prometheus metrics
 
+For L3 series, aggregation, and alerts, see
+[Observing the L3 cache tier](../operations/l3-observability.md).
+
 With `--enable-metrics` and the `prometheus` reporter, every engine rank on a
 node writes its metrics to a node-local `PROMETHEUS_MULTIPROC_DIR`, and the
 node's launcher process aggregates and serves them as `GET /metrics` in
