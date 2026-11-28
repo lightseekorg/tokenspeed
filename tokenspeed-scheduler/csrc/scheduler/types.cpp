@@ -165,6 +165,12 @@ void SchedulerConfig::Validate() const {
         throw std::invalid_argument(
             "Scheduler: prefill_chunk_yield_max_rounds must be positive when prefill_chunk_yield_tokens is positive");
     }
+    if (max_remote_admissions_per_round <= 0) {
+        throw std::invalid_argument("Scheduler: max_remote_admissions_per_round must be positive");
+    }
+    if (max_remote_admissions_per_round > 1 && role != Role::kD) {
+        throw std::invalid_argument("Scheduler: max_remote_admissions_per_round > 1 applies to the D role only");
+    }
     if (!enable_l3_storage && storage_config) {
         throw std::invalid_argument("StorageConfig requires L3 storage to be enabled");
     }
