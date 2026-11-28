@@ -36,7 +36,7 @@ def _api():
     return deep_gemm
 
 
-_MIN_CAPTURE_SAFE_DEEPGEMM_VERSION = "2.8.2"
+_MIN_CAPTURE_SAFE_DEEPGEMM_VERSION = "2.8.3"
 
 
 @lru_cache(maxsize=1)
@@ -49,7 +49,11 @@ def is_mega_mhc_available() -> bool:
 
 
 def is_mega_mhc_capture_safe() -> bool:
-    """Return True when DeepGEMM exposes epoch split barriers (>= 2.8.2)."""
+    """Return True when DeepGEMM supports CUDA graph capture (>= 2.8.3).
+
+    DeepGEMM 2.8.2.post20261115 still asserts ``CaptureStatus::None`` in
+    ``mega_mhc.hpp``, so only 2.8.3+ may run MegaMHC inside captured graphs.
+    """
     if not is_mega_mhc_available():
         return False
     try:

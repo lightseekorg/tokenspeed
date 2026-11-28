@@ -218,6 +218,10 @@ def test_shifted_mhc_unsupported_returns_none(monkeypatch, case):
 @pytest.mark.parametrize("quantize_fp8", [False, True])
 @pytest.mark.parametrize("tokens", [48, 1024])
 def test_shifted_mhc_cudagraph_replay_after_stream_warmup(tokens, quantize_fp8):
+    from tokenspeed_kernel.ops.residual import is_mega_mhc_capture_safe
+
+    if not is_mega_mhc_capture_safe():
+        pytest.skip("requires DeepGEMM >= 2.8.3 capture-safe MegaMHC")
     args = _inputs(tokens, 5120, 20)
     call = (
         try_mhc_shifted_post_pre_norm_quantize_fp8
@@ -268,10 +272,12 @@ def test_is_mega_mhc_capture_safe_version_gate(monkeypatch):
     monkeypatch.setattr(native, "_api", lambda: SimpleNamespace(__version__="2.8.1"))
     assert not is_mega_mhc_capture_safe()
     monkeypatch.setattr(native, "_api", lambda: SimpleNamespace(__version__="2.8.2"))
-    assert is_mega_mhc_capture_safe()
+    assert not is_mega_mhc_capture_safe()
     monkeypatch.setattr(
         native, "_api", lambda: SimpleNamespace(__version__="2.8.2.post20261115")
     )
+    assert not is_mega_mhc_capture_safe()
+    monkeypatch.setattr(native, "_api", lambda: SimpleNamespace(__version__="2.8.3"))
     assert is_mega_mhc_capture_safe()
     monkeypatch.setattr(native, "_api", lambda: SimpleNamespace(__version__=None))
     assert not is_mega_mhc_capture_safe()
@@ -296,7 +302,7 @@ def test_shifted_mhc_two_graphs_on_same_stream_replay(quantize_fp8):
     from tokenspeed_kernel.ops.residual import is_mega_mhc_capture_safe
 
     if not is_mega_mhc_capture_safe():
-        pytest.skip("requires DeepGEMM >= 2.8.2 epoch split barriers for capture")
+        pytest.skip("requires DeepGEMM >= 2.8.3 capture-safe MegaMHC")
     call = (
         try_mhc_shifted_post_pre_norm_quantize_fp8
         if quantize_fp8

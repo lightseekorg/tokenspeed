@@ -5221,16 +5221,18 @@ def test_mhc_boundary_gpu_layer_and_prefill_graph_matches_fallback(
     monkeypatch.setattr(layer.hc_stream_fork, "scope", record_scope)
     actual = _complete_layer(*args)
 
+    # _complete_layer enters with pending_post=None, so only the post-attention
+    # (FFN) boundary runs _v41_hc_post_pre; attention keeps StreamFork overlap in decode.
     if mode == ForwardMode.DECODE and tokens <= decode_wave_limit:
-        assert boundary_calls.call_count == 2
+        assert boundary_calls.call_count == 1
         assert mega_calls.call_count == 0
-        assert scopes == [False, False]
+        assert scopes == [True, False]
     elif mode == ForwardMode.DECODE:
         assert boundary_calls.call_count == 0
         assert mega_calls.call_count == 0
         assert scopes == [True, True]
     else:
-        assert mega_calls.call_count == 2
+        assert mega_calls.call_count == 1
         assert boundary_calls.call_count == 0
         assert scopes == [False, False]
 
@@ -5259,7 +5261,7 @@ def test_mhc_boundary_gpu_layer_and_prefill_graph_matches_fallback(
         boundary_calls.reset_mock()
         with torch.cuda.graph(graph, stream=stream):
             captured = _complete_layer(*args)
-        assert boundary_calls.call_count == 2
+        assert boundary_calls.call_count == 1
         for _ in range(3):
             residual.normal_()
             pre.uniform_()
@@ -5277,7 +5279,7 @@ def test_mhc_boundary_gpu_layer_and_prefill_graph_matches_fallback(
                 with guarded_cap:
                     guarded_out = _complete_layer(*args)
                 assert mega_calls.call_count == 0
-                assert boundary_calls.call_count == 2
+                assert boundary_calls.call_count == 1
                 for got, ref in zip(guarded_out[:2], expected[:2], strict=True):
                     torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
 
@@ -5294,7 +5296,7 @@ def test_mhc_boundary_gpu_layer_and_prefill_graph_matches_fallback(
             scopes.clear()
             with cap:
                 captured = _complete_layer(*args)
-            assert mega_calls.call_count == 2
+            assert mega_calls.call_count == 1
             assert scopes == [False, False]
             for _ in range(3):
                 residual.normal_()

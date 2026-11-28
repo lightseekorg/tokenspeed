@@ -2016,9 +2016,10 @@ def _v41_hc_post_pre(
     if not prefer_overlap and (
         is_mega_mhc_capture_safe() or not is_breakable_capture_active()
     ):
-        # Prefill / PrefillGraph (stream-warmed when DeepGEMM >= 2.8.2):
+        # Prefill / PrefillGraph (when DeepGEMM >= 2.8.3):
         # prefer MegaMHC here since it emits quantized wq_a_wkv inputs too;
-        # older DeepGEMM versions stay excluded under breakable capture.
+        # DeepGEMM builds through 2.8.2.post20261115 assert CaptureStatus::None
+        # under capture and stay excluded under breakable capture.
         join = (
             try_mhc_shifted_post_pre_norm_quantize_fp8
             if quantize_fp8

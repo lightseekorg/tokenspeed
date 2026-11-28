@@ -1284,7 +1284,9 @@ def mhc_shifted_post_pre_boundary(
 
     Returns ``(new_residual, layer_input, new_pre, new_post, new_comb)`` with
     shapes ``([T,4,H], [T,H], [T,4], [T,4], [T,4,4])``, or ``None`` if inputs
-    are ineligible or compilation would occur inside CUDA graph capture.
+    are ineligible or compilation would occur inside CUDA graph capture. Due to
+    tile-local accumulators, mix outputs vary <= 1e-3 relative across token
+    tiles.
     """
     if not boundary_inputs_eligible(
         x,

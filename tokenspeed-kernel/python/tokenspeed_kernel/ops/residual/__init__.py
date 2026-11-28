@@ -921,7 +921,7 @@ def try_mhc_shifted_post_pre_norm_quantize_fp8(
 
 
 def is_mega_mhc_capture_safe() -> bool:
-    """Return True when DeepGEMM supports epoch-based stream capture (>= 2.8.2)."""
+    """Return True when DeepGEMM supports CUDA graph capture (>= 2.8.3)."""
     from tokenspeed_kernel.thirdparty.cuda.mega_mhc import (
         is_mega_mhc_capture_safe as _is_mega_mhc_capture_safe,
     )
