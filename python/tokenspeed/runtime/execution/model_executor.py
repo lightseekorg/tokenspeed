@@ -837,12 +837,7 @@ class ModelExecutor:
             device=self.device,
         )
 
-        # A backend that defers dense state writes completes them in the
-        # decode commit of the forward that ends a request, and reports a row
-        # whose state it could not complete in request_ends.
-        self.attn_backend.bind_request_stop_flags(
-            self.runtime_states.stopped, self.request_ends
-        )
+        self._bind_forward_rows()
         self._configure_for_pools()
 
         # Backend-declared CUDA-graph support, AND-composed over the target
@@ -965,6 +960,18 @@ class ModelExecutor:
             self.input_buffers.positions_buf[: bs * tree.num_nodes],
         )
 
+    def _bind_forward_rows(self) -> None:
+        """Share the per-row device inputs every forward refreshes in place
+        with the attention backends, once, at construction."""
+        # A backend that defers dense state writes completes them in the
+        # decode commit of the forward that ends a request, and reports a row
+        # whose state it could not complete in request_ends.
+        self.attn_backend.bind_request_stop_flags(
+            self.runtime_states.stopped, self.request_ends
+        )
+        # Each forward row's execution slot; padding rows hold max_bs + 1.
+        self.attn_backend.bind_execution_slots(self.input_buffers.execution_slots_buf)
+
     def _configure_for_pools(self) -> None:
         """Publish the bound pools to the backends and the model's layers."""
         with self.memory_saver_adapter.named_region("attention_state"):
@@ -1015,6 +1022,14 @@ class ModelExecutor:
         self.runtime_states.reset_states(
             slots, torch.zeros_like(slots, dtype=torch.int32)
         )
+        # The captures' dummy forwards read the bound execution slots, which
+        # still hold the last served batch's. Reset them here, outside any
+        # graph and behind the execution stream's last fill, on the stream the
+        # captures order behind; a replay reads what the scheduler stages.
+        self.device_module.current_stream(self.device).wait_stream(
+            self.execution_stream
+        )
+        self.input_buffers.forget_served_slots()
 
     def release_graphs(self) -> None:
         """Drop the captured graphs and unfreeze the workspace they pinned.
@@ -2722,6 +2737,29 @@ class ModelExecutor:
             )
         return rows
 
+    def _fill_batch_inputs(self, forward_op, total_tokens: int) -> list[int] | None:
+        """Stage what the batch fixes on its own and clear its fresh slots.
+
+        Runs on ``execution_stream`` ahead of every launch of the forward and
+        behind the plan's ``fold_deferred_state``, which the data plane
+        enqueued on the same stream first: a slot a retraction released in
+        this plan is folded from before its new owner's reset clears it. A
+        batch without fresh rows resets nothing. Returns
+        ``fill_input_buffers``' decode-input overrides.
+        """
+        decode_input_ids = self.input_buffers.fill_input_buffers(
+            forward_op=forward_op,
+            runtime_states=self.runtime_states,
+            total_tokens=total_tokens,
+        )
+        fresh_execution_slots = self.input_buffers.fresh_execution_slots()
+        if fresh_execution_slots.numel():
+            # The slots' previous owners left their workspace behind.
+            self.attn_backend.reset_execution_workspace(
+                fresh_execution_slots, stream=self.execution_stream
+            )
+        return decode_input_ids
+
     def execute_forward_op(
         self,
         forward_op,
@@ -2807,11 +2845,7 @@ class ModelExecutor:
                         cache_metadata.tables_cpu(active_forward_op=forward_op)
                     )
             # What the batch fixes on its own is staged while a pending round still drafts.
-            decode_input_ids = self.input_buffers.fill_input_buffers(
-                forward_op=forward_op,
-                runtime_states=self.runtime_states,
-                total_tokens=total_tokens,
-            )
+            decode_input_ids = self._fill_batch_inputs(forward_op, total_tokens)
             state_group_ids = self._state_group_ids()
             if (
                 self.config.overlap_schedule_depth > 0

@@ -309,7 +309,9 @@ class TestDeferredDecodeState:
             group: pairs.tolist()
             for group, pairs in retraction.state_folds_arrays().items()
         }
-        expected = {group: [[slot, page]] for group, page in live.items()}
+        # (request slot, page, execution slot): fused rows are their own
+        # execution slots.
+        expected = {group: [[slot, page, slot]] for group, page in live.items()}
         assert folds == (expected if deferred else {})
 
 

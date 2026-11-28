@@ -409,7 +409,7 @@ class Glm53FlashRecipe(CacheRecipe):
 
     @override
     def workspace_bytes(self) -> int:
-        """Shared KPool tails, request-slot KDA history and verify staging."""
+        """Shared KPool tails, execution-slot KDA history and verify staging."""
         tail_bytes = self.pool_options().workspace_bytes
         width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
         if self.server_args.disaggregation_mode == "prefill":

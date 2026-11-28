@@ -188,6 +188,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_group_geometry.cpp
         tests/cpp/test_token_position_bounds.cpp
         tests/cpp/test_forward_batch.cpp
+        tests/cpp/test_execution_slots.cpp
         tests/cpp/test_full_cache_benchmark.cpp
         tests/cpp/test_parent_fit_eviction.cpp
         tests/cpp/test_kv_cache_lifecycle.cpp

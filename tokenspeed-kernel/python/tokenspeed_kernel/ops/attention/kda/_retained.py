@@ -165,6 +165,7 @@ def batched_commit(
     retained_key,
     retained_decay,
     replay_length,
+    request_slots,
     request_stopped,
     request_ends,
     draft_token_num,
@@ -207,10 +208,14 @@ def batched_commit(
     its records and the verify read none (eff = 0, else eff = H). The first
     launch reads H in every layer and never writes it; the second writes each
     carried request's count once, to eff plus its acceptance. request_stopped
-    is a bool per request slot, set for a request that ended in this forward.
-    Such a request's accepted records, through this round's acceptance, are
-    folded into its live page's dense state, and its count is cleared instead
-    of advanced. No other dense checkpoint or record is copied. request_ends
+    is a bool per request slot, set for a request that ended in this forward;
+    request_slots (INT32 or INT64 [requests], any stride) gives each row's
+    request slot, independent of its record slot. A row's stop flag is read
+    at its request slot, and one outside [0, request_stopped.numel()) reads
+    as not ended; its records and count stay at its record slot. Such a
+    request's accepted records, through this round's acceptance, are folded
+    into its live page's dense state, and its record slot's count is cleared
+    instead of advanced. No other dense checkpoint or record is copied. request_ends
     is the contiguous INT32 [requests] ``apply_stop_conditions`` report for
     these rows, ``REQUEST_ENDED`` exactly for the requests set in
     request_stopped: a request that ended but whose commit a layer that
@@ -261,11 +266,12 @@ def batched_commit(
         or accepted_length.shape != (batch,)
         or query_start_loc.shape != (batch + 1,)
         or record_slots.shape != (batch,)
+        or request_slots.shape != (batch,)
         or record_slot_count <= 0
     ):
         raise ValueError(
             "retained commit requires layer groups, [groups, batch] pages, "
-            "packed boundaries and one record slot per request"
+            "packed boundaries and one record and request slot per request"
         )
     if any(
         x.dtype not in (torch.int32, torch.int64)
@@ -276,6 +282,7 @@ def batched_commit(
             accepted_length,
             query_start_loc,
             record_slots,
+            request_slots,
         )
     ):
         raise ValueError(
@@ -327,6 +334,7 @@ def batched_commit(
             record_metadata,
             record_stamps,
             *records,
+            request_slots,
             request_stopped,
             request_ends,
         )
@@ -347,6 +355,7 @@ def batched_commit(
         record_slots,
         record_metadata,
         record_stamps,
+        request_slots,
         request_stopped,
         replay_length,
         request_ends,
@@ -357,6 +366,7 @@ def batched_commit(
         query_start_loc.stride(0),
         record_slots.stride(0),
         record_slot_count,
+        request_slots.stride(0),
         replay_length.stride(0),
         record_stamps.stride(),
         record_stamps.shape[1],
@@ -387,6 +397,7 @@ def batched_commit(
         accepted_length,
         query_start_loc,
         record_slots,
+        request_slots,
         request_stopped,
         replay_length,
         batch,
@@ -398,6 +409,7 @@ def batched_commit(
         query_start_loc.stride(0),
         record_slots.stride(0),
         record_slot_count,
+        request_slots.stride(0),
         replay_length.stride(0),
         request_stopped.numel(),
         CAPACITY=history_capacity,

@@ -94,6 +94,9 @@ def _op(states, rids, slots, lengths, prefixes, replays, overrides):
     return SimpleNamespace(
         request_ids=rids,
         request_pool_indices=slots,
+        # A fused node's execution slot is the request row.
+        execution_slots=slots,
+        execution_slot_fresh=[i < len(prefixes) for i in range(len(rids))],
         input_lengths=lengths,
         prefill_lengths=[
             len(states[r].prompt_input_ids) + len(states[r].output_ids) for r in rids

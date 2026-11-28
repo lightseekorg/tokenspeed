@@ -361,15 +361,54 @@ class CachePoolBinding:
         for child in self.child_backends():
             child.bind_request_stop_flags(stopped, request_ends)
 
+    def bind_execution_slots(self, execution_slots: torch.Tensor) -> None:
+        """Share each forward row's execution slot with the nodes that read it.
+
+        ``execution_slots`` is ``InputBuffers.execution_slots_buf``: INT64,
+        one entry per row of a forward up to the executor's ``max_bs``, on
+        the device. Row i holds that row's execution slot in ``1..max_bs``
+        (``ForwardBatch.execution_slots``: a PD decode node's decode permit,
+        the request-pool row on every other role); rows past the batch, CUDA
+        graph padding included, hold ``RequestSlotLayout(max_bs).padding``.
+        Row 0 of a workspace keyed by it is never a real slot. A mixed forward
+        lists its extend rows first, as ``request_pool_indices`` does. The
+        executor refreshes it before every forward, eager or graph, and binds
+        it once; its storage lives as long as the executor. Broadcast to
+        child backends; a node without execution-slot workspace ignores it.
+        """
+        for child in self.child_backends():
+            child.bind_execution_slots(execution_slots)
+
+    def reset_execution_workspace(
+        self, execution_slots: torch.Tensor, *, stream: torch.Stream
+    ) -> None:
+        """Clear the execution-slot workspace a slot's previous owner left.
+
+        ``execution_slots`` holds the INT64 device execution slots of the
+        forward's fresh rows (``ForwardBatch.execution_slot_fresh``: the
+        request's first forward on that slot), never empty and distinct. The
+        executor calls this on ``stream`` after the plan's
+        ``fold_deferred_state``, which may fold a retraction victim's slot
+        that this plan hands to another request, and before the forward's
+        launches; a forward without fresh rows makes no call. Broadcast to
+        child backends; a node without execution-slot workspace does nothing.
+        """
+        for child in self.child_backends():
+            child.reset_execution_workspace(execution_slots, stream=stream)
+
     def fold_deferred_state(
         self, state_folds: Mapping[str, torch.Tensor], *, stream: torch.Stream
     ) -> None:
         """Fold retraction victims' deferred decode state into their live blocks.
 
         ``state_folds`` is the plan's ``state_folds``: per State group id in
-        ``deferred_decode_state_groups``, an ``(n, 2)`` int32 CPU tensor of
-        (request slot, page id), each a victim's live block, which its image
-        and every reader of the endpoint its retraction published read. The
+        ``deferred_decode_state_groups``, an ``(n, 3)`` int32 CPU tensor of
+        (request slot, page id, execution slot), each a victim's live block,
+        which its image and every reader of the endpoint its retraction
+        published read, and the execution slot the victim held (taken before
+        the retraction released it, so the same plan may hand it to another
+        request, whose fresh reset ``reset_execution_workspace`` orders after
+        this fold); -1 for a victim without one. The
         data plane calls this on ``stream`` ahead of the plan's stores, device
         copies, zeroing and forward. Broadcast to child backends; a node whose
         pages always hold complete state does nothing. KDA folds each slot's

@@ -53,6 +53,7 @@ from test.runtime.test_kimi_k3_kda import (  # noqa: E402
     _LOWER_BOUND,
     _assert_close,
     _backend_config,
+    _stage_execution_slots,
     _stub_contract,
     _StubContractPool,
 )
@@ -155,6 +156,10 @@ class _Server:
             kda_backend=_prefill_solution(),
         )
         self.backend.set_kv_pool(self.pool)
+        # InputBuffers.execution_slots_buf, as the executor binds it.
+        self.backend.bind_execution_slots(
+            torch.zeros(self.backend.max_bs, dtype=torch.int64, device="cuda")
+        )
         self.backend.init_cuda_graph_state(max_bs=4)
         config = ts.SchedulerConfig()
         config.prefix_granularity = PAGE
@@ -208,6 +213,7 @@ class _Server:
         lengths = torch.tensor([end - begin], dtype=torch.int32)
         prefixes = torch.tensor([begin], dtype=torch.int32)
         offsets = list(batch.extend_state_checkpoint_lens)
+        _stage_execution_slots(self.backend, batch.execution_slots)
         self.backend.init_forward_metadata(
             bs=1,
             num_extends=1,
@@ -394,6 +400,8 @@ def test_a_forward_stores_the_checkpoints_of_several_rows(eviction_policy):
     tables = {group: [[0, 1, 2], [0, 3, 4]] for group in KIMI_STATE_GROUPS}
     tables["full_attention"] = [[1, 2, 3], [4, 5, 0]]
     lengths_cpu = torch.tensor(lengths, dtype=torch.int32)
+    # A fused role runs each request on its request row.
+    _stage_execution_slots(server.backend, [2, 1])
     server.backend.init_forward_metadata(
         bs=2,
         num_extends=2,

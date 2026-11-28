@@ -387,19 +387,20 @@ def _plan(
     plan exposes, so a fake cannot hide a renamed one. ``pages_to_zero`` is
     the real plan's shape: every cache group listed, empty or not, with the
     given pages under ``"kv"``. ``pages_to_copy`` and ``state_folds`` are the
-    ``*_arrays()`` views: ``[n, 2]`` int32 arrays per group id, read-only as
-    the binding's are."""
+    ``*_arrays()`` views: int32 arrays per group id, read-only as the
+    binding's are, ``[n, 2]`` (source, destination) copies and ``[n, 3]``
+    (request slot, page, execution slot) folds."""
 
-    def arrays(pairs_by_group):
+    def arrays(rows_by_group, width):
         out = {}
-        for group_id, pairs in (pairs_by_group or {}).items():
-            view = np.asarray(pairs, dtype=np.int32).reshape(-1, 2)
+        for group_id, rows in (rows_by_group or {}).items():
+            view = np.asarray(rows, dtype=np.int32).reshape(-1, width)
             view.setflags(write=False)
             out[group_id] = view
         return out
 
-    copies = arrays(pages_to_copy)
-    folds = arrays(state_folds)
+    copies = arrays(pages_to_copy, 2)
+    folds = arrays(state_folds, 3)
     return SimpleNamespace(
         pages_to_zero={"kv": list(pages_to_zero), "state": []},
         pages_to_copy_arrays=lambda: copies,
@@ -894,7 +895,7 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
             _SnapshotBatch([(7, 3, 0), (8, 5, 1)]),
             _RestoreBatch([(9, 4, 2)]),
         ],
-        state_folds={"state": [(3, 30), (5, 50)]},
+        state_folds={"state": [(3, 30, 1), (5, 50, 2)]},
     )
 
     def submit_write_backs(ops, *, prerequisite_stream, fence_stream):
@@ -925,7 +926,11 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
         "load_backs",
     ]
     # The victims' live pages, before anything of the plan reads them.
-    assert trace[0] == ("fold", {"state": [[3, 30], [5, 50]]}, "execution-stream")
+    assert trace[0] == (
+        "fold",
+        {"state": [[3, 30, 1], [5, 50, 2]]},
+        "execution-stream",
+    )
     # Stores precede the zeroing, and the fence they record lands on the
     # stream the zeroing runs on.
     stores = trace[1][1]
@@ -971,7 +976,7 @@ def test_a_peer_pins_the_retracted_endpoints_only_behind_their_commit(wire_ops):
     plan = _plan(
         cache=[_SnapshotBatch([(7, 3, 0)])],
         state_commit_fence=11,
-        state_folds={"state": [(3, 30)]},
+        state_folds={"state": [(3, 30, 1)]},
     )
     handle = _handle(
         trace,
@@ -990,7 +995,7 @@ def test_a_peer_pins_the_retracted_endpoints_only_behind_their_commit(wire_ops):
     _execute(handle, plan, None)
 
     assert trace[:3] == [
-        ("fold", {"state": [[3, 30]]}, "execution-stream"),
+        ("fold", {"state": [[3, 30, 1]]}, "execution-stream"),
         ("commit recorded", "execution-stream"),
         "stores",
     ]
@@ -1016,7 +1021,7 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
     plan = _plan(
         pages_to_zero=[2],
         cache=[_SnapshotBatch([(1, 6, 0)])],
-        state_folds={"state": [(6, 60)]},
+        state_folds={"state": [(6, 60, 1)]},
     )
     handle = _handle(
         trace,
@@ -1039,7 +1044,7 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
     _execute(handle, plan, planned)
 
     assert trace == [
-        ("fold", {"state": [[6, 60]]}, "execution-stream"),
+        ("fold", {"state": [[6, 60, 1]]}, "execution-stream"),
         ("store", [6]),
         "zero",
         ("default waits", "execution-stream"),
@@ -1058,11 +1063,19 @@ def test_a_refused_images_folds_run_with_no_cache_op():
     handle = _handle(trace)
     handle._executor.complete_pending_drafting = lambda: trace.append("settle")
 
-    _execute(handle, _plan(state_folds={"state": [(6, 60)], "state2": [(6, 61)]}), None)
+    _execute(
+        handle,
+        _plan(state_folds={"state": [(6, 60, 1)], "state2": [(6, 61, 1)]}),
+        None,
+    )
 
     assert trace == [
         "settle",
-        ("fold", {"state": [[6, 60]], "state2": [[6, 61]]}, "execution-stream"),
+        (
+            "fold",
+            {"state": [[6, 60, 1]], "state2": [[6, 61, 1]]},
+            "execution-stream",
+        ),
     ]
 
 

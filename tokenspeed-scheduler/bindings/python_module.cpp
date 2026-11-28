@@ -84,6 +84,15 @@ void BindForwardCommonFields(Cls& cls) {
             "request_pool_indices",
             [](const Op& op) -> const std::vector<std::int32_t>& { return op.request_pool_indices; },
             nb::rv_policy::reference_internal)
+        // Parallel to request_pool_indices: each row's execution slot
+        // (1..max_batch_size, -1 for a row the transfer peer runs) and
+        // whether this is the request's first forward on it.
+        .def_prop_ro(
+            "execution_slots", [](const Op& op) -> const std::vector<std::int32_t>& { return op.execution_slots; },
+            nb::rv_policy::reference_internal)
+        .def_prop_ro(
+            "execution_slot_fresh", [](const Op& op) -> const std::vector<bool>& { return op.execution_slot_fresh; },
+            nb::rv_policy::reference_internal)
         .def_prop_ro(
             "input_lengths", [](const Op& op) -> const std::vector<std::int32_t>& { return op.input_lengths; },
             nb::rv_policy::reference_internal);
@@ -927,6 +936,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("reason", &tokenspeed::SchedulerAbort::reason)
         .def_ro("detail", &tokenspeed::SchedulerAbort::detail);
 
+    nb::class_<tokenspeed::StateFold>(m, "StateFold")
+        .def_ro("request_slot", &tokenspeed::StateFold::request_slot)
+        .def_ro("page", &tokenspeed::StateFold::page)
+        .def_ro("execution_slot", &tokenspeed::StateFold::execution_slot);
+
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
@@ -992,20 +1006,21 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                  return out;
              })
         // The live State blocks of this plan's retraction victims, per
-        // deferred-decode-state group, as (request pool index, page id): the
-        // runtime folds each slot's accepted decode records into its block on
-        // the execution stream before the plan's stores, copies, zeroing and
-        // forward. No ACK.
+        // deferred-decode-state group (tokenspeed::StateFold): the runtime
+        // folds each victim's accepted decode records, kept in its execution
+        // slot's workspace, into its block on the execution stream before the
+        // plan's stores, copies, zeroing and forward. No ACK.
         .def_ro("state_folds", &tokenspeed::ExecutionPlan::state_folds)
         .def("state_folds_arrays", [](nb::handle self) {
-            // Zero-copy (n, 2) int32 views of state_folds, one per listed
-            // group: column 0 the request pool index, column 1 the page id.
+            // Zero-copy (n, 3) int32 views of state_folds, one per listed
+            // group: column 0 the request pool index, column 1 the page id,
+            // column 2 the execution slot (-1 for a victim holding none).
             auto& plan = nb::cast<tokenspeed::ExecutionPlan&>(self);
             nb::dict out;
-            for (auto& [gid, pairs] : plan.state_folds) {
-                const auto* data = pairs.empty() ? nullptr : reinterpret_cast<const std::int32_t*>(pairs.data());
+            for (auto& [gid, folds] : plan.state_folds) {
+                const auto* data = folds.empty() ? nullptr : reinterpret_cast<const std::int32_t*>(folds.data());
                 out[nb::str(gid.c_str())] =
-                    nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(data, {pairs.size(), 2}, self);
+                    nb::ndarray<nb::numpy, const std::int32_t, nb::ndim<2>>(data, {folds.size(), 3}, self);
             }
             return out;
         });

@@ -45,6 +45,58 @@ Forward resources belong to the request's current FSM state. Admission may
 reuse a reference to those resources within one attempt; the reference must
 not cross a state transition or outlive the request.
 
+### Execution slots
+
+Every forward row carries an **execution slot** (`ForwardBatch.execution_slots`,
+`Request::ExecutionSlot`): the row of the runtime's per-slot execution
+workspace, the GPU state a backend keeps for a request between its forwards
+outside the KV pages (KDA's retained decode records, for instance). It lies in
+1..max_batch_size on every role, so that workspace does not grow with
+max_resident_requests:
+
+- **D role:** the decode permit. A request without one (RemotePrefilling, or
+  a PrefillDone waiting for its first decode) has no execution slot, and its
+  rows on `plan.remote_prefill` carry -1.
+- **P and fused roles:** the request row, which already spans
+  1..max_batch_size there. Rows on `plan.remote_decode` carry -1: the peer
+  decodes them.
+
+The contract the runtime relies on:
+
+- Rows of one batch hold distinct execution slots.
+- `execution_slot_fresh` marks the first forward of a request on its slot: the
+  first chunk after an admission, the first forward after a peer landing or a
+  restore and, on the D role, the first decode. The runtime starts the slot's
+  workspace empty before that forward reads it. Later chunks, decode rounds and
+  verify rounds on the same slot are never fresh. The request's
+  `ForwardResources` record the first forward; an admission and a restore build
+  new resources, so each ownership starts unrecorded.
+- A slot is released only when no forward is in flight for its holder. A
+  finish or an abort keeps it in Finishing until the results land, and a
+  retraction victim is quiescent. A later plan can therefore hand the slot out
+  fresh, and under the overlap schedule that plan is built only after those
+  results have landed.
+- **Fold, then clear.** A retraction releases the victim's slot while the plan
+  is being built, and a later row of the same plan may take it as a fresh slot.
+  The victim's accepted decode records are still in that slot's workspace, so
+  the plan lists the victim's execution slot in each of its `state_folds`
+  (column 2 of `state_folds_arrays()`; -1 for a victim that holds none). The
+  slot is read before the retraction releases it. The runtime runs a plan's
+  folds before its stores, copies, zeroing and forward, so the new owner's
+  fresh clear comes after the fold on the same stream.
+- **Only a slot the victim forwarded on is folded.** Records come only from
+  forwards since the victim's current resources were built: an admission, a
+  peer landing's admission or a restore starts the per-residency record
+  unset, and the first forward scheduled on the slot sets it (the same record
+  that makes that forward fresh). A victim retracted before that forward lists
+  no fold. This covers a restored request retracted again before its first
+  resumed forward: its restored live block already holds the folded state,
+  while its newly acquired slot has not been started fresh and may still hold
+  a previous owner's records, which a fold would write over that block.
+
+None of this changes when slots are allocated or released: the permit and
+the request row keep their RAII lifetimes and in-flight guards.
+
 ## 1. Admission is per chunk
 
 An optional `--chunk-prefill-kv-size` also bounds the KV read by a local

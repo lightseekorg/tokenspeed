@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from itertools import accumulate
+from itertools import accumulate, compress
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.metadata.ngram import NGramHashParams, prepare_ngram_
 
 from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
+from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
 from tokenspeed.runtime.execution.types import NGramInputs
 from tokenspeed.runtime.multimodal.inputs import Modality, substitute_mm_pad_
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -85,8 +86,9 @@ class InputBuffers:
         with torch.device(device):
             # Initialise buffers to the *padding* values the captured graph
             # expects for padded rows (input_ids=1, positions=0, req_pool=0,
-            # seq_lens=1). Each iteration overwrites the active prefix
-            # [:total_tokens]; fill_input_buffers refreshes the padding tail
+            # seq_lens=1, execution slot=max_bs + 1). Each iteration
+            # overwrites the active prefix [:total_tokens];
+            # fill_input_buffers refreshes the padding tail
             # [total_tokens:] back to these defaults every step, because a
             # larger prior iter can leave stale values past the current
             # prefix. KV write locations are backend-owned (write_locations);
@@ -108,7 +110,30 @@ class InputBuffers:
             self.mrope_positions_buf = torch.zeros(
                 (3, max_num_tokens), dtype=torch.int64
             )
-            self.req_pool_indices_buf = torch.zeros((max_bs,), dtype=torch.int64)
+            # Per-row slot vectors, adjacent so one H2D carries them all (see
+            # _stage_row_slots): [fresh execution slots | execution slots |
+            # request-pool rows], max_bs each. A forward's k fresh slots are
+            # staged at the END of the first segment, so they, the execution
+            # slots (padding tail included) and the request-pool rows form one
+            # contiguous range.
+            self.execution_slot_padding = RequestSlotLayout(max_bs).padding
+            row_slots = torch.zeros((3, max_bs), dtype=torch.int64)
+            row_slots[1].fill_(self.execution_slot_padding)
+            self._row_slots_flat = row_slots.view(-1)
+            self.fresh_execution_slots_buf = row_slots[0]
+            # Each row's execution slot (1..max_bs): the record row a backend
+            # keeps per-forward-row workspace in (a PD decode node's decode
+            # permit, the request-pool row on every other role). Rows past the
+            # batch, graph padding included, hold execution_slot_padding.
+            self.execution_slots_buf = row_slots[1]
+            self.req_pool_indices_buf = row_slots[2]
+            self.fresh_execution_slot_count = 0
+            # What a dummy forward reads from the last two segments: every
+            # execution slot padding, every request-pool row 0. One device
+            # copy of a prefix restores them (_reset_row_slots).
+            self._dummy_row_slots = row_slots[1:].clone().view(-1)
+            # Whether a served forward's slots may still be in the buffer.
+            self._row_slots_served = False
             self.state_write_req_pool_indices_buf = torch.full(
                 (max_bs,), state_write_padding_pool_index, dtype=torch.int64
             )
@@ -379,6 +404,79 @@ class InputBuffers:
         bulk = torch.empty(off, dtype=torch.int8, pin_memory=True)
         return [bulk[o : o + n * dt.itemsize].view(dt) for o, n, dt in offsets]
 
+    def _stage_row_slots(
+        self,
+        staging: torch.Tensor,
+        fresh_execution_slots: list[int],
+        execution_slots: list[int],
+        req_pool_indices: list[int],
+    ) -> torch.Tensor:
+        """Upload a forward's per-row slot vectors in ONE H2D.
+
+        ``staging`` is this step's pinned int64 vector of
+        ``k + max_bs + bs`` entries, laid out like the device range it fills:
+        the k fresh execution slots (the last k entries of
+        ``fresh_execution_slots_buf``), every row's execution slot followed by
+        the padding slot up to ``max_bs`` (all of ``execution_slots_buf``, so
+        graph padding rows read ``execution_slot_padding`` with no separate
+        fill), then the bs request-pool rows. Records the fresh count for
+        :meth:`fresh_execution_slots`.
+
+        Returns:
+            The staged request-pool rows, a view of ``staging``.
+        """
+        num_fresh = len(fresh_execution_slots)
+        batch_size = len(req_pool_indices)
+        rows = staging.numpy()
+        rows[:num_fresh] = fresh_execution_slots
+        slots = rows[num_fresh : num_fresh + self.max_bs]
+        slots[:batch_size] = execution_slots
+        slots[batch_size:] = self.execution_slot_padding
+        rows[num_fresh + self.max_bs :] = req_pool_indices
+        start = self.max_bs - num_fresh
+        self._row_slots_flat[start : start + staging.numel()].copy_(
+            staging, non_blocking=True
+        )
+        self.fresh_execution_slot_count = num_fresh
+        self._row_slots_served = True
+        return staging[num_fresh + self.max_bs :]
+
+    def _reset_row_slots(self, batch_size: int) -> None:
+        """Give a dummy forward every execution slot as padding and request
+        rows ``[:batch_size]`` as 0, and forget the fresh slots.
+
+        One device copy of the packed template does both, the whole execution
+        slot vector included: a dummy batch smaller than the last served one
+        (a DP-idle replay at a smaller graph bucket, a capture) must read no
+        served slot past its rows either. With no request row to write and no
+        served slot left, nothing is launched.
+        """
+        self.fresh_execution_slot_count = 0
+        if batch_size == 0 and not self._row_slots_served:
+            return
+        end = self.max_bs + batch_size
+        self._row_slots_flat[self.max_bs : self.max_bs + end].copy_(
+            self._dummy_row_slots[:end]
+        )
+        self._row_slots_served = False
+
+    def forget_served_slots(self) -> None:
+        """Return the execution slots to their startup state: all padding, no
+        fresh slot. On the current stream, outside any graph; for the dummy
+        forwards of a recapture after serving."""
+        self._reset_row_slots(0)
+
+    def fresh_execution_slots(self) -> torch.Tensor:
+        """The device execution slots of the last filled forward's fresh rows.
+
+        A row is fresh on its request's first forward on that execution slot
+        (``ForwardBatch.execution_slot_fresh``); its workspace still holds
+        whatever the slot's previous owner left. Empty when no row is fresh.
+        """
+        return self.fresh_execution_slots_buf[
+            self.max_bs - self.fresh_execution_slot_count :
+        ]
+
     def set_mm_pad_substitute_ids(
         self, substitute_ids: dict[Modality, int], vocab_size: int
     ) -> None:
@@ -421,15 +519,21 @@ class InputBuffers:
         decode_input_ids = forward_op.decode_input_ids
         if decode_input_ids is not None and all(x == -1 for x in decode_input_ids):
             decode_input_ids = None
-        req_pool_indices_cpu, input_lengths_cpu = self._bulk_pinned(
-            (len(req_pool_indices), torch.int64), (len(input_lengths), torch.int32)
+        execution_slots = forward_op.execution_slots
+        fresh_execution_slots = list(
+            compress(execution_slots, forward_op.execution_slot_fresh)
         )
-        req_pool_indices_cpu.copy_(torch.as_tensor(req_pool_indices, dtype=torch.int64))
+        row_slots_cpu, input_lengths_cpu = self._bulk_pinned(
+            (len(fresh_execution_slots) + self.max_bs + batch_size, torch.int64),
+            (len(input_lengths), torch.int32),
+        )
+        req_pool_indices_cpu = self._stage_row_slots(
+            row_slots_cpu,
+            fresh_execution_slots,
+            execution_slots,
+            req_pool_indices,
+        )
         input_lengths_cpu.copy_(torch.as_tensor(input_lengths, dtype=torch.int32))
-        self.req_pool_indices_buf[:batch_size].copy_(
-            req_pool_indices_cpu,
-            non_blocking=True,
-        )
         self.state_write_req_pool_indices_buf[:batch_size].copy_(
             req_pool_indices_cpu,
             non_blocking=True,
@@ -579,7 +683,8 @@ class InputBuffers:
         # tears the server down. The __init__ safe defaults (input_ids=1,
         # req_pool=0, positions=0) are not enough on their own once a larger
         # iter has overwritten the tail, so scrub it back here (cheap
-        # tail-only fills; the active prefix was written above).
+        # tail-only fills; the active prefix was written above). The
+        # execution-slot tail needs none: _stage_row_slots uploads it.
         if self._pad_tape is not None:
             self._pad_tape.run({Reg.TOKENS: total_tokens, Reg.BS: batch_size})
         else:
@@ -787,9 +892,11 @@ class InputBuffers:
             self.input_ids_buf[:total_tokens].fill_(1)
             self.positions_buf[:total_tokens].fill_(0)
             self.mrope_positions_buf[:, :total_tokens].zero_()
+        # Request rows 0 and every execution slot padding, in the launch that
+        # zeroed the request rows alone before execution slots.
+        self._reset_row_slots(batch_size)
         if batch_size > 0:
             self.input_lengths_buf[:batch_size].zero_()
-            self.req_pool_indices_buf[:batch_size].fill_(0)
             self.state_write_req_pool_indices_buf[:batch_size].fill_(
                 self.state_write_padding_pool_index
             )

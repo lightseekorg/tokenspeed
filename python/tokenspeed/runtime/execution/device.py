@@ -613,11 +613,15 @@ class DeviceHandle:
             if len(page_ids)
         }
         # A retraction victim's live blocks in groups that defer their decode
-        # state, as (request slot, page id), whether or not its image was taken.
+        # state, whether or not its image was taken: (n, 3) rows of (request
+        # slot, page id, execution slot), the last the slot the victim held
+        # (-1 for none), which this plan's forward may already hand to another
+        # request as a fresh slot. Passed through whole; the executor's fresh
+        # reset of that slot orders behind the fold on the execution stream.
         folds = {
-            group_id: torch.from_numpy(pairs.copy())
-            for group_id, pairs in execution_plan.state_folds_arrays().items()
-            if len(pairs)
+            group_id: torch.from_numpy(rows.copy())
+            for group_id, rows in execution_plan.state_folds_arrays().items()
+            if len(rows)
         }
         fence = execution_plan.state_commit_fence
         peer = self._kv_transfer

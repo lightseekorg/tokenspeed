@@ -1,10 +1,13 @@
 # KDA kernels
 
-Each physical checkpoint holds only a dense recurrent base. Each resident
-request slot holds every layer's FP32 correction U, normalized K and
-multiplicative decay records plus one INT32 accepted count that all its layers
-share: the number of records accepted since the dense base of the request's
-pages. The logical endpoint is the base followed by
+Each physical checkpoint holds only a dense recurrent base. Each record slot
+holds every layer's FP32 correction U, normalized K and multiplicative decay
+records plus one INT32 accepted count that all its layers share: the number of
+records accepted since the dense base of the request's pages. The runtime keys
+record slots by execution slot (a PD decode node's decode permit, the request
+row on every other role), so the workspace has `max_bs + 2` rows however many
+requests stay resident: row 0 is never a slot and graph padding rows read row
+`max_bs + 1`, whose count stays zero. The logical endpoint is the base followed by
 `S = S * decay + outer(U, K)` in record order. The base follows
 `--mamba-ssm-dtype` (FP32 or BF16). Accumulation and history remain FP32.
 Materialization casts the result to the dense base dtype.
@@ -43,7 +46,7 @@ lies outside [0, C - T]. Verify applies `eff` records to the live base: H, or
 0 for an overflowing H, whose records the prepare (below) folded into the live
 base. Each verify kernel derives `eff` itself, with one scalar select on its
 compile-time capacity and window. It writes candidate U/K/decay into the
-request slot after `eff` records and never changes the base or the count.
+record slot after `eff` records and never changes the base or the count.
 Rejected candidate suffixes need no clearing.
 
 Commit validates candidate stamps, updates convolution from original QKV, then
@@ -58,12 +61,17 @@ count once, to `eff` plus the acceptance, with no scratch and no cross-program
 reduction. A row is carried when its source and live pages lie in the pool in
 a State group a launched layer lists, its record slot is resident and its
 window is non-empty; a row no layer carries (graph padding, a masked overlap
-row, a row paged only in groups no launched layer lists) keeps its count. A
-request whose slot is set in `request_stopped` ended in this forward: the
-convolution launch also folds its records, through this round's acceptance,
-into its live page (each program of a row takes some heads), and the count
-launch clears its count instead of advancing it. Other commits read no record
-and write no dense state. Stamp-ring capacity is independent of
+row, a row paged only in groups no launched layer lists) keeps its count.
+Stop flags are per request row while records and counts are per record slot,
+so the commit takes both vectors: `request_slots` (INT32 or INT64
+`[requests]`, any stride) gives each row's request slot in `request_stopped`,
+and `record_slots` its records and count. A request slot outside
+`[0, request_stopped.numel())` reads as not ended. A request whose request
+slot is set in `request_stopped` ended in this forward: the convolution launch
+also folds its records, through this round's acceptance, into its live page
+(each program of a row takes some heads), and the count launch clears its
+record slot's count instead of advancing it. Other commits read no record and
+write no dense state. Stamp-ring capacity is independent of
 retained-history capacity.
 Padding rows (a page at or below 0, or one past the checkpoint pool) leave all
 pages and counts untouched.
@@ -170,7 +178,9 @@ live page at or below 0, or at or past the pool's `page_count`) as the gather
 does. Final/checkpoint dense stores use the selected base dtype. Before a retraction stores its image or anything
 reads the endpoint it published, `kda_materialize_retained_pages` folds each
 victim's records into the live page the scheduler lists, layer by layer, and
-`kda_reset_retained_length` then clears the slots' counts once.
+`kda_reset_retained_length` then clears the slots' counts once. The runtime
+passes the execution slot each victim held, so a new owner the same plan gives
+the slot starts from a zero count; a victim without one reaches no kernel.
 
 Retained numerical tests cover accepted-prefix rounds, boundary materialization,
 the fold at a request's end, private/shared pages, stale stamps, graph

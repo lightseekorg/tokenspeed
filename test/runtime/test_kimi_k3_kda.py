@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import replace
 from importlib.util import find_spec
 from types import SimpleNamespace
 
@@ -169,13 +170,28 @@ def _backend_config(device: str, *, spec_tokens: int = 1):
     return config, spec
 
 
-def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> KdaAttnBackend:
+def _backend(
+    device: str, *, contract_pool, spec_tokens: int = 1, max_resident_requests=None
+) -> KdaAttnBackend:
     kda_backend = "auto" if current_platform().is_amd else "fla"
     config, spec = _backend_config(device, spec_tokens=spec_tokens)
+    if max_resident_requests is not None:
+        config = replace(config, max_resident_requests=max_resident_requests)
     backend = KdaAttnBackend(
         config, spec, enable_prefill_graph=False, kda_backend=kda_backend
     )
     backend.set_kv_pool(contract_pool)
+    # InputBuffers.execution_slots_buf, as the executor binds it: every row
+    # reads the padding slot until a forward's rows are staged
+    # (_stage_execution_slots).
+    backend.bind_execution_slots(
+        torch.full(
+            (config.max_bs,),
+            RequestSlotLayout(config.max_bs).padding,
+            dtype=torch.int64,
+            device=device,
+        )
+    )
     # RuntimeStates.stopped and the executor's per-row request ends, as the
     # executor binds them; no request ends here.
     backend.bind_request_stop_flags(
@@ -187,6 +203,17 @@ def _backend(device: str, *, contract_pool, spec_tokens: int = 1) -> KdaAttnBack
         torch.zeros(config.max_bs, dtype=torch.int32, device=device),
     )
     return backend
+
+
+def _stage_execution_slots(backend: KdaAttnBackend, slots) -> None:
+    """Stage a forward's rows' execution slots into the bound vector, as the
+    executor's input fill does: the padding slot past the batch."""
+    bound = backend._record_slots
+    staged = torch.full(
+        (bound.numel(),), RequestSlotLayout(backend.max_bs).padding, dtype=torch.int64
+    )
+    staged[: len(slots)] = torch.as_tensor(list(slots), dtype=torch.int64)
+    bound.copy_(staged)
 
 
 def _stub_contract(*, prefix_granularity: int, usable_pages: int):
@@ -266,18 +293,18 @@ class _StubContractPool:
         return self._components[layer_id][name]
 
 
-def _logical_checkpoint(backend, layer, page, request_slot):
-    """The page's dense state followed by its request slot's accepted records."""
+def _logical_checkpoint(backend, layer, page, execution_slot):
+    """The page's dense state followed by its execution slot's accepted records."""
     pool = backend.kv_pool
     state = pool.get_component(layer, "recurrent_state")[page].float().clone()
     if backend._retained_records is None:
-        # No decode has allocated the request-slot workspace yet.
+        # No decode has allocated the execution-slot workspace yet.
         return state
     # Every layer shares the slot's count.
-    length = int(backend._replay_length[request_slot].item())
+    length = int(backend._replay_length[execution_slot].item())
     if length:
         layer_row = backend._descriptor_row_by_layer[layer]
-        correction, key, decay = backend._retained_records[request_slot, layer_row]
+        correction, key, decay = backend._retained_records[execution_slot, layer_row]
         for token in range(length):
             state = (
                 state * decay[:, token, None, :]
@@ -325,7 +352,7 @@ def test_set_kv_pool_binds_contract_state_groups() -> None:
 
 
 def test_retained_state_groups_defer_their_decode_state() -> None:
-    """Every KDA State group keeps decode records in request slots until a
+    """Every KDA State group keeps decode records in execution slots until a
     request ends or is retracted, which the scheduler's peer fence relies on;
     a composite reports its KDA child's groups and nothing else."""
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -341,6 +368,72 @@ def test_retained_state_groups_defer_their_decode_state() -> None:
     assert full.deferred_decode_state_groups() == frozenset()
     root = HybridLinearAttnBackend(full, backend, [])
     assert root.deferred_decode_state_groups() == frozenset(_STATE_GROUPS)
+
+
+# ---------------------------------------------------------------------------
+# Execution-slot workspace
+# ---------------------------------------------------------------------------
+
+
+def test_retained_records_take_one_row_per_execution_slot() -> None:
+    """Records and counts take RequestSlotLayout(max_bs).capacity rows -- the
+    null row, the max_bs execution slots and the padding row -- however many
+    requests a decode node keeps resident."""
+    pool = _make_kimi_pool("cpu", usable_pages=24)
+    backend = _backend("cpu", contract_pool=pool, max_resident_requests=24)
+    backend.preallocate_verify_workspace(backend.max_bs, 1)
+    rows = RequestSlotLayout(backend.max_bs).capacity
+    assert rows == backend.max_bs + 2
+    assert backend._record_slot_count == rows
+    assert backend._retained_records.shape[0] == rows
+    assert backend._replay_length.shape == (rows, 1)
+    # The commit's request rows, which it reads the stop flags by.
+    assert backend._commit_request_slots.shape == (backend.max_bs,)
+
+
+def test_execution_slots_bind_once_and_survive_a_pool_rebind() -> None:
+    """Retained kernels need the bound execution slots: an INT64 vector of at
+    least max_bs rows, which a pool rebind keeps."""
+    config, spec = _backend_config("cpu")
+    backend = KdaAttnBackend(
+        config,
+        spec,
+        enable_prefill_graph=False,
+        kda_backend="auto" if current_platform().is_amd else "fla",
+    )
+    backend.set_kv_pool(_make_kimi_pool("cpu"))
+    with pytest.raises(RuntimeError, match="bind_execution_slots"):
+        backend._execution_rows(0, 1)
+    with pytest.raises(ValueError, match="INT64"):
+        backend.bind_execution_slots(torch.ones(config.max_bs, dtype=torch.int32))
+    with pytest.raises(ValueError, match="INT64"):
+        backend.bind_execution_slots(torch.ones(config.max_bs - 1, dtype=torch.int64))
+    slots = torch.full((config.max_bs,), config.max_bs + 1, dtype=torch.int64)
+    backend.bind_execution_slots(slots)
+    backend.set_kv_pool(_make_kimi_pool("cpu", usable_pages=26))
+    assert backend._execution_rows(2, 3).data_ptr() == slots[2:].data_ptr()
+    with pytest.raises(ValueError, match="exceed"):
+        backend._execution_rows(config.max_bs - 1, 2)
+
+
+def test_only_a_fresh_execution_slot_clears_its_count() -> None:
+    """Records are keyed by execution slot. A request row's new owner (a PD
+    landing, a rebind) and a restore leave every count alone; the first
+    forward on a slot clears that slot's count, and only it."""
+    pool = _make_kimi_pool("cpu", usable_pages=24)
+    backend = _backend("cpu", contract_pool=pool, max_resident_requests=16)
+    backend.preallocate_verify_workspace(backend.max_bs, 1)
+    counts = backend._replay_length
+    counts.fill_(5)
+    backend.reset_request_workspace(torch.tensor([2, 4, 12]), stream=None)
+    backend.import_slot_state(
+        6, torch.empty(0, dtype=torch.uint8), None, admission_id=9
+    )
+    assert counts.flatten().tolist() == [5] * counts.shape[0]
+    backend.reset_execution_workspace(torch.tensor([4, 2]), stream=None)
+    assert counts.flatten().tolist() == [
+        0 if slot in (2, 4) else 5 for slot in range(counts.shape[0])
+    ]
 
 
 def _kimi_tables(bs: int, width: int, *, base: int = 1) -> dict[str, np.ndarray]:
@@ -480,8 +573,13 @@ class _KDAHarness:
     WIDTH = 4
     MAX_BS = 4
 
-    def __init__(self, pool, contract, layer_ids, device="cuda", seed=0):
+    def __init__(
+        self, pool, contract, layer_ids, device="cuda", seed=0, execution_slots=None
+    ):
         torch.manual_seed(seed)
+        # Request row -> execution slot; a row maps to itself by default, as
+        # on every role but a PD decode node.
+        self.execution_slots = dict(execution_slots or {})
         self.pool = pool
         self.contract = contract
         self.device = device
@@ -560,14 +658,12 @@ class _KDAHarness:
         bs = len(seq_lens)
         prefix_cpu = torch.tensor(extend_prefix_lens, dtype=torch.int32)
         new_cpu = torch.tensor(seq_lens, dtype=torch.int32) - prefix_cpu
+        rows = list(range(1, bs + 1) if request_slots is None else request_slots)
+        self.stage(rows)
         self.backend.init_forward_metadata(
             bs=bs,
             num_extends=num_extends,
-            req_pool_indices=torch.tensor(
-                range(1, bs + 1) if request_slots is None else request_slots,
-                dtype=torch.int32,
-                device=self.device,
-            ),
+            req_pool_indices=torch.tensor(rows, dtype=torch.int32, device=self.device),
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
             forward_mode=ForwardMode.from_num_extends(num_extends, bs),
             block_tables=self._delivered(tables),
@@ -584,6 +680,7 @@ class _KDAHarness:
     def decode_metadata(self, tables, seq_lens):
         """A decode step: the same unpadded refresh the runner issues."""
         bs = len(seq_lens)
+        self.stage(range(1, bs + 1))
         self.backend.refresh_decode_metadata(
             bs,
             bs,
@@ -592,6 +689,14 @@ class _KDAHarness:
             forward_mode=ForwardMode.DECODE,
             block_tables=self._delivered(tables),
         )
+
+    def slot(self, request_row):
+        """The execution slot request row ``request_row`` runs on."""
+        return self.execution_slots.get(request_row, request_row)
+
+    def stage(self, request_rows):
+        """Stage the rows' execution slots, as the executor's input fill does."""
+        _stage_execution_slots(self.backend, [self.slot(row) for row in request_rows])
 
     def extend(self, layer_id, mixed, g_raw, beta_raw, bs=1, *, forward_mode):
         seq_len = mixed.shape[0]
@@ -823,16 +928,23 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
 
 @requires_cuda
 @requires_fla
-def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
+@pytest.mark.parametrize(
+    "execution_slots", [None, {1: 3, 2: 1}], ids=["request-rows", "permuted"]
+)
+def test_kda_prefix_resume_copy_on_write_and_isolation(execution_slots) -> None:
     """Prefix hit at a published prompt-end checkpoint: the shared block is
     read-only for both branches, and a MIXED forward and batched decode keep
-    requests isolated."""
+    requests isolated. Records follow each request's execution slot, which
+    on a decode node is not its request row; a MIXED forward's decode row
+    finds its slot after the extend rows'."""
     P, usable = 4, 16
     contract = _stub_contract(prefix_granularity=P, usable_pages=usable)
     pool = _StubContractPool(
         contract, "cuda", conv_dim=3 * 4 * 128, width=4, num_heads=4, head_dim=128
     )
-    h = _KDAHarness(pool, contract, layer_ids=[0, 1, 2], seed=1)
+    h = _KDAHarness(
+        pool, contract, layer_ids=[0, 1, 2], seed=1, execution_slots=execution_slots
+    )
     layer_id = 0
     gid = "linear_attention_0"
 
@@ -970,12 +1082,12 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     _assert_close(flat_a, naive_a, "branch A out vs naive")
     _assert_close(flat_b, naive_b[4 * h.H :], "branch B out vs naive")
     _assert_close(
-        _logical_checkpoint(h.backend, layer_id, 2, 1),
+        _logical_checkpoint(h.backend, layer_id, 2, h.slot(1)),
         state_a,
         "branch A final state vs naive",
     )
     _assert_close(
-        _logical_checkpoint(h.backend, layer_id, 5, 2),
+        _logical_checkpoint(h.backend, layer_id, 5, h.slot(2)),
         state_b,
         "branch B final state vs naive",
     )

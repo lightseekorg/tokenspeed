@@ -57,6 +57,7 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 from tokenspeed.runtime.execution.drafter.eagle import Eagle  # noqa: E402
 from tokenspeed.runtime.execution.drafter.mtp import Mtp  # noqa: E402
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
+from tokenspeed.runtime.execution.request_slots import RequestSlotLayout  # noqa: E402
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates  # noqa: E402
 from tokenspeed.runtime.execution.slot_state import (  # noqa: E402
     PREPARED_MARKER_BYTES,
@@ -755,17 +756,32 @@ def test_kda_backend_slot_state_is_complete():
     backend.preallocate_verify_workspace(MAX_BS, config.speculative_num_draft_tokens)
     assert backend.slot_state_rows(MAX_RESIDENT_REQUESTS) == []
     assert backend.slot_state_bytes() == 0
+    # The retained records and their accepted counts are execution-slot
+    # workspace, folded before a retraction releases the slot: declared as
+    # such, never imaged, and one row per execution slot, not per request row.
+    retained = ("_retained_records", "_replay_length")
+    assert set(retained) <= set(backend.workspace_slot_state)
+    execution_rows = RequestSlotLayout(MAX_BS).capacity
+    assert execution_rows != POOL_ROWS
+    for name in retained:
+        assert getattr(backend, name).shape[0] == execution_rows
+    # Scan both slot domains, so a retained tensor that loses its workspace
+    # declaration is reported as unexported per-slot state.
     _assert_slot_state_complete(
         backend,
         exporter=backend,
-        slot_domains={POOL_ROWS},
+        slot_domains={POOL_ROWS, execution_rows},
         workspace_slot_state=backend.workspace_slot_state,
     )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs KDA GPU registration")
 def test_kda_recycled_and_restored_slots_start_without_accepted_records():
-    """A slot that starts a new admission never replays a previous owner's records."""
+    """A slot that starts a new owner never replays a previous owner's records.
+
+    Records are keyed by execution slot: request-row events leave them alone,
+    and a request's first forward on an execution slot clears its count.
+    """
     from dataclasses import replace
     from test.runtime.conftest import make_kimi_pool
     from test.runtime.test_kimi_k3_kda import _backend_config
@@ -779,18 +795,21 @@ def test_kda_recycled_and_restored_slots_start_without_accepted_records():
     )
     backend.set_kv_pool(make_kimi_pool("cpu", usable_pages=24))
     backend.preallocate_verify_workspace(MAX_BS, config.speculative_num_draft_tokens)
-    # One accepted count per slot, which every KDA layer shares.
+    # One accepted count per execution slot, which every KDA layer shares.
     counts = backend._replay_length
-    assert counts.shape == (backend._record_slot_count, 1)
+    assert counts.shape == (RequestSlotLayout(MAX_BS).capacity, 1)
     counts.fill_(5)
-    # Slots 2 and 4 start serving new admissions (RuntimeStates.bind_stop_criteria).
+    # Request rows 2 and 4 start serving new admissions
+    # (RuntimeStates.bind_stop_criteria), and a restore imports no KDA rows.
     backend.reset_request_workspace(torch.tensor([2, 4]), stream=None)
-    # A restore imports no KDA rows; the restored slot starts empty too.
     backend.import_slot_state(
-        6, torch.empty(0, dtype=torch.uint8), None, admission_id=9
+        3, torch.empty(0, dtype=torch.uint8), None, admission_id=9
     )
+    assert counts.flatten().tolist() == [5] * counts.shape[0]
+    # Their first forwards run on fresh execution slots 1 and 3.
+    backend.reset_execution_workspace(torch.tensor([1, 3]), stream=None)
     for slot in range(counts.shape[0]):
-        expected = 0 if slot in (2, 4, 6) else 5
+        expected = 0 if slot in (1, 3) else 5
         assert counts[slot].item() == expected, slot
 
 

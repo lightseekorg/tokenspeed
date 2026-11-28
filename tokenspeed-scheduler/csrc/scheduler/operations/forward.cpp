@@ -260,9 +260,22 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
 
 namespace {
 
+// Read after the event that installs the slot: a D-role permit moves in with
+// the first decode. The resources the request holds record that a forward ran
+// on the slot, so only the first forward of each ownership is fresh -- the
+// first chunk after an admission, the first forward after a peer landing or a
+// restore, a D-role request's first decode. A row without a slot (a D-role
+// remote prefill) leaves the record alone.
+void assignExecutionSlot(ForwardOperationBase& operation, Request& request, Role role) {
+    operation.execution_slot = request.ExecutionSlot(role);
+    if (operation.execution_slot != -1) {
+        operation.execution_slot_fresh = !std::exchange(request.ForwardResourcesRef().execution_slot_forwarded, true);
+    }
+}
+
 template <typename Event>
     requires(std::same_as<Event, fsm::SchedulePrefillFirstChunkEvent> || std::same_as<Event, fsm::SchedulePrefillEvent>)
-PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCoordinator& coordinator,
+PrefillOperation applyPrefillEvent(Request& request, Event& event, Role role, const CacheCoordinator& coordinator,
                                    std::span<const std::string> group_ids) {
     request.Apply(event);
     const PrefillInfo info = request.CurrentPrefillInfo();
@@ -270,6 +283,7 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCo
     PrefillOperation operation;
     operation.request_id = request.Id();
     operation.request_pool_index = request.RequestPoolIndex();
+    assignExecutionSlot(operation, request, role);
     operation.input_length = info.extend_len;
     operation.prefill_length = request.PrefillSize();
     operation.input_ids = info.input_ids;
@@ -293,8 +307,9 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCo
     return operation;
 }
 
-DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent event, std::int32_t decode_input_tokens,
-                                 const CacheCoordinator& coordinator, std::span<const std::string> group_ids) {
+DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent event, Role role,
+                                 std::int32_t decode_input_tokens, const CacheCoordinator& coordinator,
+                                 std::span<const std::string> group_ids) {
     request.Apply(std::move(event));
 
     DecodeOperation operation{{
@@ -303,6 +318,7 @@ DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent even
         .input_length = decode_input_tokens,
         .prefill_length = request.PrefillSize(),
     }};
+    assignExecutionSlot(operation, request, role);
     fillBlockTables(operation, request, coordinator, group_ids);
     return operation;
 }
@@ -1078,7 +1094,7 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
     // The event consumes the Submitted state and with it any L3 Ready hold:
     // the admission's load pairs, and then the ordinary H2D ticket, own the
     // Host sources.
-    PrefillOperation operation = applyPrefillEvent(*request, event, coordinator_, cache_group_ids_);
+    PrefillOperation operation = applyPrefillEvent(*request, event, config_.role, coordinator_, cache_group_ids_);
     std::vector<BlockTransfer> load_pairs = event.TakeLoadPairs();
     if (!load_pairs.empty()) {
         load_back_operations.push_back(startPrefixLoad(*request, std::move(load_pairs)));
@@ -1087,7 +1103,7 @@ PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::S
 }
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillEvent event) {
-    return applyPrefillEvent(*request, event, coordinator_, cache_group_ids_);
+    return applyPrefillEvent(*request, event, config_.role, coordinator_, cache_group_ids_);
 }
 
 DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event) {
@@ -1107,8 +1123,8 @@ DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::Sc
     std::vector<std::int32_t> spec_candidate_ids =
         config_.role == Role::kP && needs_bootstrap_token ? request->TakeSpecCandidates() : std::vector<std::int32_t>{};
     // The event builds a fresh Decoding, so the restore marker is consumed here.
-    DecodeOperation operation =
-        applyDecodeEvent(*request, std::move(event), config_.decode_input_tokens, coordinator_, cache_group_ids_);
+    DecodeOperation operation = applyDecodeEvent(*request, std::move(event), config_.role, config_.decode_input_tokens,
+                                                 coordinator_, cache_group_ids_);
     if (needs_explicit_token) {
         operation.decode_input_id = explicit_token;
         operation.spec_candidate_ids = std::move(spec_candidate_ids);
@@ -1291,6 +1307,14 @@ Scheduler::StateCommitPages Scheduler::liveDeferredStatePages(const Request& req
     if (request.NumComputedTokens() <= request.PrefillSize()) {
         return pages;  // no decode step has run, so no record has
     }
+    // Records accumulate only from forwards on the slot the request holds
+    // now. A restored request that has not forwarded since its restore has
+    // none: its restored live block already holds the folded state, while its
+    // slot's workspace may still hold another owner's records until its first
+    // forward starts it fresh.
+    if (!request.ExecutionSlotForwarded()) {
+        return pages;
+    }
     const std::vector<BlockTable>& tables = request.BlockTablesRef();
     for (std::uint32_t group = 0; group < tables.size(); ++group) {
         const std::span<const std::int32_t> page_ids = tables[group].PageIds();
@@ -1306,7 +1330,11 @@ void Scheduler::planStateFolds(const Request& victim, const StateCommitPages& li
     const std::vector<BlockTable>& tables = victim.BlockTablesRef();
     for (const auto& [group, page] : live_state) {
         if (tables[group].PageIds()[kLiveStateSlot] == page) {
-            plan.state_folds[cache_group_ids_[group]].emplace_back(victim.RequestPoolIndex(), page);
+            plan.state_folds[cache_group_ids_[group]].push_back(StateFold{
+                .request_slot = victim.RequestPoolIndex(),
+                .page = page,
+                .execution_slot = victim.ExecutionSlot(config_.role),
+            });
         }
     }
 }
@@ -2384,7 +2412,11 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
         if (request->Is<fsm::PrefillDone>()) {
             if (auto event = scheduleDecode(build.plan, feedback, request)) {
                 build.scheduled.insert(request);
-                build.remote_decode.emplace_back(applyEventAndBuildOperation(request, std::move(*event)));
+                DecodeOperation operation = applyEventAndBuildOperation(request, std::move(*event));
+                // The peer decodes it on an execution slot of its own.
+                operation.execution_slot = -1;
+                operation.execution_slot_fresh = false;
+                build.remote_decode.emplace_back(std::move(operation));
             }
         }
     }

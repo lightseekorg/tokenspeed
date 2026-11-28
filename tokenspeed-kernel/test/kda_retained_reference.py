@@ -410,7 +410,10 @@ def _run_commit(
     activation_dtype,
     conv_state_dtype,
 ):
-    """Run the production batched retained commit over a single layer."""
+    """Run the production batched retained commit over a single layer.
+
+    The history's record slots stand in for the rows' request slots too.
+    """
     heads, dim = state.shape[1], state.shape[-1]
     kernel = kda.resolve_kda_batched_retained_commit(
         activation_dtype, num_heads=heads, head_dim=dim, recurrent_layout="v_major"
@@ -431,6 +434,7 @@ def _run_commit(
         retained_key=history.key[:, None],
         retained_decay=history.decay[:, None],
         replay_length=history.length,
+        request_slots=history.record_slots,
         request_stopped=request_stopped,
         request_ends=request_ends,
         draft_token_num=width,

@@ -40,6 +40,7 @@ from test.runtime.test_kimi_k3_kda import (
     _backend,
     _KDAHarness,
     _logical_checkpoint,
+    _stage_execution_slots,
     _stub_contract,
     _StubContractPool,
     requires_fla,
@@ -143,10 +144,23 @@ class _KDA:
         prefill: bool,
         request_slot: int,
         prompt_tokens: int,
+        execution_slot: int | None = None,
+        fresh: bool = False,
     ):
         # Use the same contract-to-runtime table bridge as the numerical KDA
         # harness, with the complete unmodified scheduler tables supplied here.
         delivered = _KDAHarness._delivered(self, tables)
+        # The row's execution slot keys its records: the request row on this
+        # fused role unless the plan's row says otherwise. As the executor
+        # does, a request's first forward on the slot clears what the slot's
+        # previous owner left there.
+        slot = request_slot if execution_slot is None else execution_slot
+        _stage_execution_slots(self.backend, [slot])
+        if fresh:
+            self.backend.reset_execution_workspace(
+                torch.tensor([slot], device="cuda"),
+                stream=torch.cuda.current_stream(),
+            )
         request_indices = torch.tensor([request_slot], dtype=torch.int32, device="cuda")
         seq_lens = torch.tensor([end], dtype=torch.int32, device="cuda")
         if prefill:
@@ -373,6 +387,8 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
         end=4,
         prefill=True,
         request_slot=batch.request_pool_indices[0],
+        execution_slot=batch.execution_slots[0],
+        fresh=batch.execution_slot_fresh[0],
         prompt_tokens=batch.prefill_lengths[0],
     )
     outputs = actual.forward(inputs, begin=0, end=4, prefill=True)
@@ -415,6 +431,8 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
             end=computed + _WIDTH,
             prefill=False,
             request_slot=batch.request_pool_indices[0],
+            execution_slot=batch.execution_slots[0],
+            fresh=batch.execution_slot_fresh[0],
             prompt_tokens=0,
         )
         outputs = actual.forward(
@@ -520,6 +538,8 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
             end=end,
             prefill=True,
             request_slot=batch.request_pool_indices[0],
+            execution_slot=batch.execution_slots[0],
+            fresh=batch.execution_slot_fresh[0],
             prompt_tokens=batch.prefill_lengths[0],
         )
         outputs = actual.forward(inputs, begin=begin, end=end, prefill=True)
@@ -659,6 +679,8 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
         end=4,
         prefill=True,
         request_slot=batch.request_pool_indices[0],
+        execution_slot=batch.execution_slots[0],
+        fresh=batch.execution_slot_fresh[0],
         prompt_tokens=batch.prefill_lengths[0],
     )
     actual.forward(inputs, begin=0, end=4, prefill=True)
@@ -682,6 +704,8 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
             end=consumed + width,
             prefill=False,
             request_slot=slot,
+            execution_slot=batch.execution_slots[0],
+            fresh=batch.execution_slot_fresh[0],
             prompt_tokens=0,
         )
         actual.forward(inputs, begin=consumed, end=consumed + width, prefill=False)
@@ -941,6 +965,8 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode(
             prefill=prefill,
             request_slot=batch.request_pool_indices[row],
             prompt_tokens=batch.prefill_lengths[row] if prefill else 0,
+            execution_slot=batch.execution_slots[row],
+            fresh=batch.execution_slot_fresh[row],
         )
         outputs = actual.forward(
             inputs if rid == "source" else pressure_inputs,

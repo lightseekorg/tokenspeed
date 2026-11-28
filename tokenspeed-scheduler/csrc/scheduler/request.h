@@ -348,6 +348,27 @@ public:
 
     bool HasDecodeSlot() const { return forwardResources("HasDecodeSlot").decode_slot.valid(); }
 
+    // The row of the per-slot execution workspace this request's forwards
+    // use, in 1..max_batch_size (docs/design/scheduler.md, Execution slots):
+    // the decode permit on the D role, whose request rows outnumber the
+    // batch; the request row on the other roles, where the rows already span
+    // the batch. Like the accessors around it, it requires a state that holds
+    // ForwardResources; -1 covers an index unassigned within such a state (a
+    // D-role request before its first decode).
+    std::int32_t ExecutionSlot(Role role) const {
+        const fsm::ForwardResources& resources = forwardResources("ExecutionSlot");
+        if (role == Role::kD) {
+            return resources.decode_slot.valid() ? resources.decode_slot.slot_ : -1;
+        }
+        return resources.RequestPoolIndex();
+    }
+
+    // Whether a forward has been scheduled on the execution slot since the
+    // current resources were built (an admission or a restore):
+    // fsm::ForwardResources::execution_slot_forwarded. Requires a state that
+    // holds ForwardResources.
+    bool ExecutionSlotForwarded() const { return forwardResources("ExecutionSlotForwarded").execution_slot_forwarded; }
+
     // The reference must not outlive the request or cross Request::Apply.
     fsm::ForwardResources& ForwardResourcesRef() { return forwardResources("ForwardResourcesRef"); }
 

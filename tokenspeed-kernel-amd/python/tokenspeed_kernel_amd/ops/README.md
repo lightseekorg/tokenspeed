@@ -2227,10 +2227,16 @@ every layer shares is an INT32 `[slots, 1]` tensor of its own, and record
 slots select each request's. One launch updates all layers' convolution and
 reads the counts; a second, one-dimensional launch then writes each carried
 request's count once, to `eff` plus its acceptance, with no scratch and no
-cross-program reduction. A request whose slot is set in `request_stopped`
-ended in this forward: the convolution launch also folds its records into its
-live page, each program taking some heads, and the count launch clears its
-count. Rows no layer carries (graph padding, a masked overlap row, a row paged
+cross-program reduction. Stop flags are per request row while records and
+counts are per record slot: `request_slots` (INT32 or INT64 `[requests]`, any
+stride) gives each row's request slot in `request_stopped`, and a request slot
+outside `[0, request_stopped.numel())` reads as not ended. A request whose
+request slot is set in `request_stopped` ended in this forward: the
+convolution launch also folds its records into its live page, each program
+taking some heads, and the count launch clears its record slot's count. The
+convolution launch loads the request slot right after the commit checks,
+ahead of the descriptor fields and with no store before it. Rows no layer
+carries (graph padding, a masked overlap row, a row paged
 only in groups no launched layer lists) keep their counts.
 Public verify requires retained records; unsupported configurations fail
 instead of selecting another checkpoint format.
