@@ -248,6 +248,21 @@ def test_flip_detection_writes_slot_state_once():
     torch.cuda.synchronize()
     assert buffers.temperature[1].item() == pytest.approx(9.0)
 
+    # Under enable_speculative_sampling, proposal pools preserve disabled top_k (-1 -> 1<<30)
+    # for full-vocab top-p / skip checks while keeping state.top_k capped at MAX_K.
+    from tokenspeed.runtime.sampling.sampling_params import _TOP_K_DISABLED
+
+    spec_cfg = _make_config()
+    spec_cfg = dataclasses.replace(spec_cfg, enable_speculative_sampling=True)
+    spec_backend = _backend_cls()(spec_cfg)
+    _prepare(spec_backend, [sp_a, sp_b, sp_c], slots=[1, 3, 5])
+    torch.cuda.synchronize()
+    pools = spec_backend.speculative_sampling_pools()
+    assert spec_backend.state.top_k[5].item() == 128
+    assert pools.top_k[1].item() == 50
+    assert pools.top_k[3].item() == 1
+    assert pools.top_k[5].item() == _TOP_K_DISABLED
+
 
 # --------------------------------------------------------------------- #
 # greedy

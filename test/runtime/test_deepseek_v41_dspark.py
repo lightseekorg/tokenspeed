@@ -2132,3 +2132,305 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
 
     if tp > 1:
         torch.distributed.destroy_process_group()
+
+
+def test_sonic_dspark_server_args_allow_fixed_width_sampled_verification():
+    for extra in (
+        ["--enable-speculative-sampling"],
+        [
+            "--speculative-config",
+            '{"method": "dspark", "draft_sample_method": "probabilistic", "num_speculative_tokens": 4}',
+        ],
+    ):
+        args = prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--speculative-algorithm",
+                "DSPARK",
+                "--speculative-num-steps",
+                "4",
+                "--speculative-num-draft-tokens",
+                "5",
+                "--sampling-backend",
+                "sonic",
+                "--data-parallel-size",
+                "16",
+                "--enable-dp-attention",
+                "--enable-expert-parallel",
+                "--disaggregation-mode",
+                "decode",
+                *extra,
+            ]
+        )
+        assert args.enable_speculative_sampling is True
+        assert args.enable_dsv41_adaptive_dspark is False
+        assert args.sampling_backend == "sonic"
+        assert args.mapping.attn.dp_size == 16
+        assert args.mapping.attn.tp_size == 1
+
+
+def test_bind_sampling_backend_contracts_for_sonic_and_flashinfer():
+    from unittest.mock import patch
+
+    from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+    from tokenspeed.runtime.sampling.backends.sonic import SonicSamplingBackend
+    from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
+
+    vocab, pool, width = 512, 6, 5
+    states = RuntimeStates(pool, vocab, vocab, width, device="cpu")
+    states.init_draft_probs(spec_num_tokens=width, reject_threshold=2.0)
+
+    def _drafter(*, adaptive: bool, attn_tp: int = 1):
+        drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+        drafter.device = torch.device("cpu")
+        drafter.vocab_size = vocab
+        drafter.spec_num_tokens = width
+        drafter.spec_num_steps = width - 1
+        drafter.runtime_states = states
+        drafter.input_buffers = InputBuffers(4, 4 * width, pool, device="cpu")
+        drafter.draft_model = SimpleNamespace(
+            mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=attn_tp))
+        )
+        drafter.model = SimpleNamespace(
+            markov_embedding=SimpleNamespace(
+                embedding_dim=8, weight=SimpleNamespace(dtype=torch.bfloat16)
+            )
+        )
+        drafter.verify_budget_policy = (
+            VerifyBudgetPolicy(True, 1, width, 0.02) if adaptive else None
+        )
+        drafter._sample_proposals = None
+        drafter._sampled_workspace = None
+        return drafter
+
+    sonic_cfg = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
+        enable_speculative_sampling=True,
+        sampling_stream="batch",
+        logprob_order="torch",
+        max_bs=4,
+        max_draft_tokens_per_req=width,
+        max_req_pool_size=pool,
+        vocab_size=vocab,
+        device="cpu",
+    )
+    sonic = SonicSamplingBackend(sonic_cfg)
+    bound = _drafter(adaptive=False)
+    bound.bind_sampling_backend(sonic)
+    assert bound._sample_proposals is None
+    assert bound._sampled_workspace is not None
+
+    with pytest.raises(ValueError, match="attention TP1"):
+        _drafter(adaptive=False, attn_tp=2).bind_sampling_backend(sonic)
+    with pytest.raises(ValueError, match="fixed-width verification"):
+        _drafter(adaptive=True).bind_sampling_backend(sonic)
+
+    non_spec_sonic = SonicSamplingBackend(
+        SamplingBackendConfig(
+            synthetic_acceptance_length=None,
+            enable_speculative_sampling=False,
+            sampling_stream="batch",
+            logprob_order="torch",
+            max_bs=4,
+            max_draft_tokens_per_req=width,
+            max_req_pool_size=pool,
+            vocab_size=vocab,
+            device="cpu",
+        )
+    )
+    with pytest.raises(ValueError, match="enable_speculative_sampling"):
+        _drafter(adaptive=False).bind_sampling_backend(non_spec_sonic)
+
+    with patch.object(
+        torch.cuda,
+        "get_device_properties",
+        return_value=SimpleNamespace(multi_processor_count=4),
+    ):
+        triton_backend = TritonSamplingBackend(sonic_cfg)
+    with pytest.raises(ValueError, match="adaptive flashinfer or fixed-width sonic"):
+        _drafter(adaptive=False).bind_sampling_backend(triton_backend)
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and current_platform().is_nvidia),
+    reason="sonic sampled DSpark requires NVIDIA CUDA",
+)
+@torch.inference_mode()
+def test_sonic_fixed_width_dspark_drafter_runs_sampled_and_cuda_graph(monkeypatch):
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+    from tokenspeed.runtime.sampling.backends.sonic import SonicSamplingBackend
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+    config = _draft_config()
+    config.vocab_size = 1024
+    config.head_dim = 512
+    config.qk_rope_head_dim = 64
+    config.q_lora_rank = 128
+    config.num_attention_heads = config.o_groups = 2
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    monkeypatch.setitem(global_server_args_dict, "enable_dsv41_adaptive_dspark", False)
+    with torch.device("cuda:0"):
+        adapter = DeepseekV41ForCausalLMDSpark(
+            SimpleNamespace(text_config=config), _mapping(0, 1, 1), _quant()
+        )
+    adapter.load_weights(_draft_checkpoint(adapter.model).items())
+    adapter.set_embed_and_head(
+        *(
+            nn.Parameter(torch.full_like(p, 0.1, dtype=torch.bfloat16))
+            for p in (adapter.model.embed_tokens.weight, adapter.lm_head.weight)
+        )
+    )
+    model = adapter.model
+    for module in model.modules():
+        if isinstance(module, LinearBase):
+            module.quant_method.process_weights_after_loading(module)
+        elif isinstance(module, MoELayer):
+            module.process_weights_after_loading(module)
+    for weight in (
+        model.markov_embedding.weight,
+        model.markov_projection.weight,
+    ):
+        weight.copy_(torch.randn_like(weight, dtype=torch.float32).to(weight.dtype))
+
+    width, block, n = 6, 5, 3
+    ib = InputBuffers(n, 1024, 8, device="cuda:0")
+    states = RuntimeStates(
+        8, config.vocab_size, config.vocab_size, width, device="cuda:0"
+    )
+    states.init_draft_probs(spec_num_tokens=width, reject_threshold=2.0)
+    drafter = DeepseekV41DSpark(
+        spec_num_tokens=width,
+        spec_num_steps=block,
+        draft_model_runner=SimpleNamespace(
+            model=adapter,
+            mapping=adapter.mapping,
+            device="cuda:0",
+            server_args=ServerArgs(model="unused", disaggregation_mode="null"),
+        ),
+        attn_backend=None,
+        token_to_kv_pool=None,
+        runtime_states=states,
+        input_buffers=ib,
+        vocab_size=config.vocab_size,
+    )
+    drafter.wire_target(
+        SimpleNamespace(
+            set_dspark_layers_to_capture=Mock(),
+            logits_processor=SimpleNamespace(tp_group=adapter.mapping.attn.tp_group),
+        )
+    )
+    sampler = SonicSamplingBackend(
+        SamplingBackendConfig(
+            synthetic_acceptance_length=None,
+            enable_speculative_sampling=True,
+            sampling_stream="batch",
+            logprob_order="torch",
+            max_bs=n,
+            max_draft_tokens_per_req=width,
+            max_req_pool_size=8,
+            vocab_size=config.vocab_size,
+            device="cuda:0",
+        )
+    )
+    params = [
+        SamplingParams(temperature=0.8, top_k=-1, top_p=0.9, seed=11),
+        SamplingParams(temperature=0.7, top_k=32, top_p=0.95, seed=22),
+        SamplingParams(temperature=0.0, top_k=-1, top_p=1.0, seed=33),
+    ]
+    for i, sp in enumerate(params):
+        sp.verify(config.vocab_size)
+        sp.resolve_seed(f"sonic-dspark-{i}")
+        sp.normalize(None)
+    sampler.prepare_step(
+        [f"sonic-dspark-{i}" for i in range(n)], [1, 2, 3], params, width
+    )
+    drafter.bind_sampling_backend(sampler)
+    assert drafter.verify_budget_policy is None
+    assert drafter._sample_proposals is None
+    assert drafter._sampled_workspace is not None
+
+    windows = torch.zeros(3, 8, 64, 512, dtype=torch.bfloat16, device="cuda:0")
+    pool = SimpleNamespace(dspark_kv=lambda stage: windows[stage])
+    starts = [300, 40, 380]
+    accepts = [4, 1, 6]
+    hidden = torch.randn(
+        n, width, drafter.hidden_width, dtype=torch.bfloat16, device="cuda:0"
+    )
+    tokens = torch.randint(0, config.vocab_size, (n, width), device="cuda:0").to(
+        torch.int32
+    )
+
+    def run(order, *, state_write_slots=None):
+        positions = torch.cat(
+            [torch.arange(starts[i], starts[i] + width, device="cuda:0") for i in order]
+        )
+        meta = SimpleNamespace(
+            positions=positions,
+            swa_write_slots=_paged_slots(positions, 64),
+            request_indices=torch.arange(n, device="cuda:0").repeat_interleave(width),
+        )
+        backend = SimpleNamespace(
+            query_metadata=lambda mode: meta,
+            decoder_view=lambda: V41DecoderView(meta, None, (), None, None),
+            window_slots=lambda group, start_pos, requests: (
+                _history_slots(start_pos, 128, 64),
+                None,
+            ),
+        )
+        ctx = _ctx(None, n * width, ForwardMode.DECODE)
+        ctx.bs, ctx.num_extends = n, 0
+        ctx.output_layout = ForwardOutputLayout(0, 0, n, width)
+        ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
+        windows.zero_()
+        slots = torch.tensor([i + 1 for i in order], device="cuda:0")
+        write_slots = (
+            slots
+            if state_write_slots is None
+            else torch.tensor(state_write_slots, device="cuda:0")
+        )
+        ib.req_pool_indices_buf[:n].copy_(slots)
+        ib.state_write_req_pool_indices_buf[:n].copy_(write_slots)
+        return drafter.run(
+            base_ctx=ctx,
+            logits_output=SimpleNamespace(
+                hidden_states=hidden[order].reshape(-1, drafter.hidden_width)
+            ),
+            output_tokens=tokens[order].reshape(-1),
+            accept_lengths=torch.tensor(
+                [accepts[i] for i in order], device="cuda:0", dtype=torch.int32
+            ),
+        )
+
+    forward = run([0, 1, 2]).clone()
+    proposal_laws = states.draft_probs[1:4, :block].clone()
+    torch.testing.assert_close(
+        proposal_laws.sum(-1), torch.ones(n, block, device="cuda:0")
+    )
+    assert (proposal_laws.gather(-1, forward[:, 1:, None].long()) > 0).all()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run([0, 1, 2])
+    states.draft_probs[1:4, :block].zero_()
+    graph.replay()
+    torch.testing.assert_close(captured, forward, rtol=0, atol=0)
+    torch.testing.assert_close(
+        states.draft_probs[1:4, :block], proposal_laws, rtol=0, atol=0
+    )
+    graph.reset()
+
+    rotated = run([2, 0, 1])
+    torch.testing.assert_close(rotated, forward[[2, 0, 1]], rtol=0, atol=0)
+    states.draft_probs[1].fill_(-17)
+    masked = run([0, 1, 2], state_write_slots=[0, 2, 3])
+    torch.testing.assert_close(masked, forward, rtol=0, atol=0)
+    assert (states.draft_probs[1] == -17).all()
+    torch.testing.assert_close(
+        states.draft_probs[0, :block], proposal_laws[0], rtol=0, atol=0
+    )

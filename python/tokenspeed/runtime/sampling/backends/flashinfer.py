@@ -36,7 +36,6 @@ from tokenspeed_kernel.ops.sampling.cuda import (
 from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_prepare,
     fused_topk_topp_renorm,
-    fused_topk_topp_workspace_size,
 )
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     softmax,
@@ -62,6 +61,12 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackend,
     SamplingBackendConfig,
     SpeculativeSamplingPools,
+)
+from tokenspeed.runtime.sampling.backends.dspark_renorm import (
+    dspark_topk_topp_workspace_size as _dspark_topk_topp_workspace_size,
+)
+from tokenspeed.runtime.sampling.backends.dspark_renorm import (
+    renorm_dspark_probabilities as _renorm_dspark_probabilities,
 )
 from tokenspeed.runtime.sampling.backends.greedy import _verify_chain_greedy
 from tokenspeed.runtime.sampling.dp_sampling_config import (
@@ -1052,13 +1057,9 @@ class FlashInferSamplingBackend(SamplingBackend):
 
     def dspark_topk_topp_workspace_size(self, max_rows: int, vocab_size: int) -> int:
         """Byte size of static scratch for in-place DSpark Top-K/Top-P renorm."""
-        if (
-            not _FUSED_TOPK_TOPP_AVAILABLE
-            or vocab_size < 1024
-            or self._temperature_pool.device.type != "cuda"
-        ):
-            return 0
-        return fused_topk_topp_workspace_size(max_rows, vocab_size)
+        return _dspark_topk_topp_workspace_size(
+            max_rows, vocab_size, device=self._temperature_pool.device
+        )
 
     def renorm_dspark_probabilities(
         self,
@@ -1076,21 +1077,18 @@ class FlashInferSamplingBackend(SamplingBackend):
         sub-1024-vocab fallback both leave ``top_k == 1`` rows untouched rather
         than recomputing ``argmax`` from ``logits``.
         """
-        if _FUSED_TOPK_TOPP_AVAILABLE and probs.shape[1] >= 1024:
-            return fused_topk_topp_renorm(
-                probs,
-                top_ks,
-                top_ps,
-                workspace=workspace,
-                out=probs,
-                in_place_skip=True,
-            )
-        return self._apply_small_vocab_topk_topp(
+        return _renorm_dspark_probabilities(
             probs,
             top_ks,
             top_ps,
-            greedy_one_hot=probs,
-            in_place=True,
+            workspace=workspace,
+            small_vocab_renorm=lambda p, k, top_p: self._apply_small_vocab_topk_topp(
+                p,
+                k,
+                top_p,
+                greedy_one_hot=p,
+                in_place=True,
+            ),
         )
 
     @staticmethod

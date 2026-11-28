@@ -80,6 +80,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling import sonic, vocab_topk_merge_supports
+from tokenspeed_kernel.ops.sampling.cuda import fused_topk_topp_prepare
 from tokenspeed_kernel.ops.sampling.sonic import (
     MAX_K,
     MAX_OFFSET,
@@ -99,8 +100,18 @@ from tokenspeed.runtime.sampling.backends.base import (
     SamplingBackendConfig,
     SpeculativeSamplingPools,
 )
+from tokenspeed.runtime.sampling.backends.dspark_renorm import (
+    dspark_topk_topp_workspace_size as _dspark_topk_topp_workspace_size,
+)
+from tokenspeed.runtime.sampling.backends.dspark_renorm import (
+    renorm_dspark_probabilities as _renorm_dspark_probabilities,
+)
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.sampling_params import _SAMPLING_EPS, SamplingParams
+from tokenspeed.runtime.sampling.sampling_params import (
+    _SAMPLING_EPS,
+    _TOP_K_DISABLED,
+    SamplingParams,
+)
 from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
 from tokenspeed.runtime.sampling.utils import gather_token_logprobs_torch
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -302,6 +313,14 @@ class SonicSamplingBackend(SamplingBackend):
             self.pool_rows, self.n_max, self.vocab_size, config.random_seed, self.device
         )
         self._exact_state = self.state.with_scalars(self.exact_scalars)
+        if self.spec and config.enable_speculative_sampling:
+            fused_topk_topp_prepare(config.device)
+        with torch.device(self.device):
+            self._proposal_top_k: torch.Tensor | None = (
+                torch.full((self.pool_rows,), _TOP_K_DISABLED, dtype=torch.int32)
+                if config.enable_speculative_sampling
+                else None
+            )
 
         # xgrammar's int32 bitmask layout, scattered per step by ``_scatter_grammar``.
         self.grammar = self.state.grammar
@@ -367,10 +386,30 @@ class SonicSamplingBackend(SamplingBackend):
         """
         return SpeculativeSamplingPools(
             temperature=self._exact_state.temperature,
-            top_k=self.state.top_k,
+            top_k=(
+                self._proposal_top_k
+                if self._proposal_top_k is not None
+                else self.state.top_k
+            ),
             top_p=self._exact_state.top_p,
             seed=self.state.seeds,
         )
+
+    def dspark_topk_topp_workspace_size(self, max_rows: int, vocab_size: int) -> int:
+        """Byte size of static scratch for in-place DSpark Top-K/Top-P renorm."""
+        return _dspark_topk_topp_workspace_size(
+            max_rows, vocab_size, device=self.device
+        )
+
+    def renorm_dspark_probabilities(
+        self,
+        probs: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        *,
+        workspace: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return _renorm_dspark_probabilities(probs, top_ks, top_ps, workspace=workspace)
 
     def _gather_pairs(
         self, staged: torch.Tensor, tp_size: int, tp_group: tuple[int, ...]
@@ -552,6 +591,13 @@ class SonicSamplingBackend(SamplingBackend):
         its q (``enable_speculative_sampling``)."""
 
         temperature, top_k, top_p, min_p = _sanitize(sp)
+        if self._proposal_top_k is not None:
+            proposal_k = (
+                1
+                if top_k == 1
+                else (_TOP_K_DISABLED if sp.top_k == -1 else int(sp.top_k))
+            )
+            self._proposal_top_k[pool_idx].fill_(proposal_k)
 
         bias: dict[int, float] | None = None
 
@@ -624,7 +670,7 @@ class SonicSamplingBackend(SamplingBackend):
         state = self.state
         rows = slice(slot, slot + 1)
 
-        return [
+        rows_list = [
             state.indicators[rows],
             state.temperature[rows],
             state.top_k[rows],
@@ -639,6 +685,9 @@ class SonicSamplingBackend(SamplingBackend):
             state.seeds[rows],
             *(row[rows] for row in self.exact_scalars),
         ]
+        if self._proposal_top_k is not None:
+            rows_list.append(self._proposal_top_k[rows])
+        return rows_list
 
     @override
     def reset_capture_state(self) -> None:

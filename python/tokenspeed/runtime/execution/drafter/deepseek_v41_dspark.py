@@ -266,17 +266,33 @@ class DeepseekV41DSpark(BaseDrafter):
         from tokenspeed.runtime.sampling.backends.flashinfer import (
             FlashInferSamplingBackend,
         )
+        from tokenspeed.runtime.sampling.backends.sonic import (
+            SonicSamplingBackend,
+        )
 
-        if (
-            self.verify_budget_policy is None
-            or self.draft_model.mapping.attn.tp_size != 1
-            or not isinstance(sampling_backend, FlashInferSamplingBackend)
-        ):
+        if self.draft_model.mapping.attn.tp_size != 1:
+            raise ValueError("sampled V4.1 DSpark requires attention TP1")
+        if isinstance(sampling_backend, FlashInferSamplingBackend):
+            if self.verify_budget_policy is None:
+                raise ValueError(
+                    "flashinfer sampled V4.1 DSpark requires adaptive verification"
+                )
+            self._sample_proposals = sampling_backend.sample_dspark_proposals
+        elif isinstance(sampling_backend, SonicSamplingBackend):
+            if self.verify_budget_policy is not None:
+                raise ValueError(
+                    "sonic sampled V4.1 DSpark requires fixed-width verification"
+                )
+            if not sampling_backend.config.enable_speculative_sampling:
+                raise ValueError(
+                    "sonic sampled V4.1 DSpark requires enable_speculative_sampling"
+                )
+            self._sample_proposals = None
+        else:
             raise ValueError(
-                "sampled V4.1 DSpark requires adaptive flashinfer verification "
-                "and attention TP1"
+                "sampled V4.1 DSpark requires adaptive flashinfer or "
+                "fixed-width sonic verification"
             )
-        self._sample_proposals = sampling_backend.sample_dspark_proposals
         vocab_size = int(self.vocab_size)
         self._sampled_workspace = dspark_sampled_workspace(
             max_rows=int(self.input_buffers.max_bs),
@@ -1200,7 +1216,7 @@ class DeepseekV41DSpark(BaseDrafter):
                 "DSpark base logits do not span the Markov projection's local "
                 f"vocabulary: {local_logits.shape[-1]} != {markov_vocab}"
             )
-        if self._sample_proposals is None:
+        if self._sampled_workspace is None and self._sample_proposals is None:
             sample_dspark_block_greedy(
                 local_logits,
                 bonus,

@@ -1479,3 +1479,120 @@ def test_sampled_drafting_state_survives_sleep_with_zero_ordinary_bytes(sparse):
             check=True,
             timeout=90,
         )
+
+
+def _check_sonic_dspark_sampled_drafting_on_cuda():
+    """Check Sonic + DSpark sampled workspace and proposal pools release/resume cleanly."""
+    from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
+        DeepseekV41DSpark,
+    )
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+    from tokenspeed.runtime.sampling.backends.sonic import SonicSamplingBackend
+
+    vocab, pool, width, max_bs, rank = 1024, 6, 5, 4, 8
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
+
+    with saver.named_region("runtime_states"):
+        states = RuntimeStates(
+            req_pool_size=pool,
+            input_vocab_size=vocab,
+            vocab_size=vocab,
+            output_length=width,
+            device="cuda",
+        )
+        states.init_draft_probs(spec_num_tokens=width, reject_threshold=2.0)
+        buffers = InputBuffers(
+            max_bs=max_bs,
+            max_num_tokens=max_bs * width,
+            state_write_padding_pool_index=pool,
+            device="cuda",
+        )
+        sampler = SonicSamplingBackend(
+            SamplingBackendConfig(
+                synthetic_acceptance_length=None,
+                enable_speculative_sampling=True,
+                sampling_stream="batch",
+                logprob_order="torch",
+                max_bs=max_bs,
+                max_draft_tokens_per_req=width,
+                max_req_pool_size=pool,
+                vocab_size=vocab,
+                device="cuda",
+            )
+        )
+        drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+        drafter.device = torch.device("cuda")
+        drafter.vocab_size = vocab
+        drafter.spec_num_tokens = width
+        drafter.spec_num_steps = width - 1
+        drafter.runtime_states = states
+        drafter.input_buffers = buffers
+        drafter.verify_budget_policy = None
+        drafter._sample_proposals = None
+        drafter._sampled_workspace = None
+        drafter.draft_model = SimpleNamespace(
+            mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1))
+        )
+        drafter.model = SimpleNamespace(
+            markov_embedding=SimpleNamespace(
+                embedding_dim=rank, weight=SimpleNamespace(dtype=torch.bfloat16)
+            )
+        )
+        drafter.bind_sampling_backend(sampler)
+
+    ws = drafter._sampled_workspace
+    assert ws is not None
+    assert sampler._proposal_top_k is not None
+    states.draft_probs[2, 1, :] = torch.arange(vocab, device="cuda") / vocab
+    sampler._proposal_top_k[2] = 64
+    ws.kernel_ws.probs[0, :vocab].fill_(0.25)
+    retained = [
+        states.draft_probs,
+        sampler._proposal_top_k,
+        sampler.state.temperature,
+        ws.kernel_ws.markov_embed,
+        ws.kernel_ws.probs,
+        ws.kernel_ws.partial_max,
+        ws.kernel_ws.top_ks,
+        ws.topk_topp_ws,
+    ]
+    snapshots = [(t, t.data_ptr(), t.cpu()) for t in retained]
+    for _ in range(3):
+        torch.cuda.synchronize()
+        saver.pause(tag="weights")
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        ordinary_bytes = sum(
+            segment["total_size"]
+            for segment in torch.cuda.memory_snapshot()
+            if segment["device"] == torch.cuda.current_device()
+            and tuple(segment["segment_pool_id"]) == (0, 0)
+        )
+        assert ordinary_bytes == 0, ordinary_bytes
+        saver.resume(tag="weights")
+        for tensor, pointer, reference in snapshots:
+            assert tensor.data_ptr() == pointer
+            torch.testing.assert_close(tensor.cpu(), reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+def test_sonic_dspark_sampled_drafting_survives_sleep_with_zero_ordinary_bytes():
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_torch_memory_saver_adapter import "
+                "_check_sonic_dspark_sampled_drafting_on_cuda; "
+                "_check_sonic_dspark_sampled_drafting_on_cuda()",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=90,
+        )
