@@ -94,6 +94,10 @@ struct CacheGroupConfig {
     // the device; a decoded endpoint a retraction publishes is withheld from
     // peers until the runtime acknowledges it (cache::StateCommitDone).
     bool deferred_decode_state{false};
+    // Only the trailing retained window needs backing blocks during prefill
+    // forwards (e.g. a compressor tail whose interior pairs pass inside the
+    // chunk forward). Allowed only on sinkless replayable sliding-window groups.
+    bool boundary_only_in_prefill{false};
 
     void Validate() const;
     // Validate() without the total_pages check: every field the capacity

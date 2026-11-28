@@ -358,4 +358,162 @@ TEST_F(KimiFourGroupSuite, FinishAndAbortRestoreAllUsablePages) {
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), before);
 }
 
+class InPlaceSwaReclaimTestSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 4;
+        cfg.device_allocator.total_pages = 16;
+        cfg.host_allocator.total_pages = 16;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+
+        CacheGroupConfig full_grp;
+        full_grp.group_id = "full";
+        full_grp.block_granularity = 4;
+        full_grp.cache_blocks_per_lcm_block = 1;
+        full_grp.total_pages = cfg.device_allocator.total_pages;
+        full_grp.attn_kind = AttnKind::kFull;
+
+        CacheGroupConfig swa_grp;
+        swa_grp.group_id = "swa";
+        swa_grp.block_granularity = 2;
+        swa_grp.cache_blocks_per_lcm_block = 2;
+        swa_grp.total_pages = cfg.device_allocator.total_pages * 2;
+        swa_grp.attn_kind = AttnKind::kSlidingWindow;
+        swa_grp.sliding_window_tokens = 4;
+
+        cfg.cache_groups = {full_grp, swa_grp};
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(InPlaceSwaReclaimTestSuite, SlidingWindowReclaimsInPlaceWithoutAdmission) {
+    Submit(MakeRequestSpec("r1", /*num_pages=*/1));  // 4 tokens [0..3]
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("r1", {42});
+
+    // Step 0 crosses the 4-token boundary (4 -> 5), opening LCM block 1.
+    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    SendForwardDone("r1", {43});
+    const std::uint64_t admissions_after_open = SchedulerTestAccess::DecodeAdmissions(*scheduler_);
+
+    // Step 1 advances within LCM block 1 (5 -> 6): swa block 0 ([0..2)) expires
+    // because the live window is [2..6), but no group opens a block. Reclaim
+    // must happen in place without calling Admit().
+    const ExecutionPlan in_place_plan = PlanOnce();
+    const ForwardBatch* decode = FindForwardBatch(in_place_plan);
+    ASSERT_NE(decode, nullptr);
+    EXPECT_EQ(SchedulerTestAccess::DecodeAdmissions(*scheduler_), admissions_after_open);
+    const auto swa_row = decode->BlockTables().at("swa").at(0);
+    ASSERT_GE(swa_row.size(), 3u);
+    EXPECT_EQ(swa_row.at(0), 0) << "expired SWA block 0 must be reclaimed in place";
+    EXPECT_GT(swa_row.at(1), 0);
+    EXPECT_GT(swa_row.at(2), 0);
+
+    SendForwardDone("r1", {44});
+    SendFinish("r1");
+    PlanOnce();
+}
+
+class BoundaryOnlyPrefillTestSuite : public SchedulerTestSuite {
+protected:
+    virtual std::int32_t ChunkBudget() const { return 64; }
+
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 4;
+        cfg.device_allocator.total_pages = 16;
+        cfg.host_allocator.total_pages = 16;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        cfg.max_scheduled_tokens = ChunkBudget();
+        cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+
+        CacheGroupConfig full_grp;
+        full_grp.group_id = "full";
+        full_grp.block_granularity = 4;
+        full_grp.total_pages = cfg.device_allocator.total_pages;
+        full_grp.attn_kind = AttnKind::kFull;
+
+        CacheGroupConfig tail_grp;
+        tail_grp.group_id = "tail";
+        tail_grp.block_granularity = 2;
+        tail_grp.cache_blocks_per_lcm_block = 2;
+        tail_grp.total_pages = cfg.device_allocator.total_pages * 2;
+        tail_grp.attn_kind = AttnKind::kSlidingWindow;
+        tail_grp.sliding_window_tokens = 2;
+        tail_grp.replayable = true;
+        tail_grp.boundary_only_in_prefill = true;
+
+        cfg.cache_groups = {full_grp, tail_grp};
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(BoundaryOnlyPrefillTestSuite, PrefillBoundaryOnlyWindowAllocatesSuffixOnly) {
+    const std::int32_t idle = scheduler_->AvailableLcmBlocks();
+    Submit(RequestSpec{.request_id = "r1", .tokens = MakeTokens(10, 1)});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    const auto tail_row = batch->BlockTables().at("tail").at(0);
+    // Prompt 10 tokens with window=2 retains [9, 10) plus 1 decode reserve token -> blocks [4, 5].
+    ASSERT_GE(tail_row.size(), 6u);
+    for (std::size_t slot = 0; slot < 4; ++slot) {
+        EXPECT_EQ(tail_row.at(slot), 0) << "interior boundary_only slot " << slot;
+    }
+    EXPECT_GT(tail_row.at(4), 0);
+    EXPECT_GT(tail_row.at(5), 0);
+
+    SendForwardDone("r1", {42});
+    SendFinish("r1");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), idle);
+}
+
+TEST_F(BoundaryOnlyPrefillTestSuite, MultiChunkPreservesBoundaryAcrossChunksAndValidatesConfig) {
+    SchedulerConfig bad = MakeConfig();
+    bad.cache_groups[0].boundary_only_in_prefill = true;
+    EXPECT_THROW(bad.Validate(), std::invalid_argument);
+    bad = MakeConfig();
+    bad.cache_groups[1].replayable = false;
+    EXPECT_THROW(bad.Validate(), std::invalid_argument);
+
+    SchedulerConfig chunked = MakeConfig();
+    chunked.max_scheduled_tokens = 6;
+    Scheduler sched{WithHostPackingFromDevice(chunked)};
+    sched.SubmitRequests({RequestSpec{.request_id = "r1", .tokens = MakeTokens(12, 1)}});
+
+    const Scheduler::PlanOptions plan_options{.allow_prefill = true, .apply_prefill_watermark = false};
+    const ExecutionPlan chunk1 = sched.NextExecutionPlan(plan_options);
+    const ForwardBatch* b1 = FindForwardBatch(chunk1);
+    ASSERT_NE(b1, nullptr);
+    const auto row1 = b1->BlockTables().at("tail").at(0);
+    ASSERT_GE(row1.size(), 3u);
+    EXPECT_EQ(row1.at(0), 0);
+    EXPECT_EQ(row1.at(1), 0);
+    EXPECT_GT(row1.at(2), 0);  // token 5 retained in block [4, 6) for chunk 2 boundary
+    sched.Advance(ExecutionEvent{}.With(forward::ExtendResult{.request_id = "r1", .tokens = {}}));
+
+    const ExecutionPlan chunk2 = sched.NextExecutionPlan(plan_options);
+    const ForwardBatch* b2 = FindForwardBatch(chunk2);
+    ASSERT_NE(b2, nullptr);
+    const auto row2 = b2->BlockTables().at("tail").at(0);
+    ASSERT_GE(row2.size(), 7u);
+    EXPECT_GT(row2.at(2), 0);  // prior boundary block stays readable at chunk 2 start
+    EXPECT_EQ(row2.at(3), 0);
+    EXPECT_EQ(row2.at(4), 0);
+    EXPECT_GT(row2.at(5), 0);
+    EXPECT_GT(row2.at(6), 0);
+}
+
 }  // namespace tokenspeed::test

@@ -580,6 +580,47 @@ def test_a_page_aligned_short_prompt_end_keeps_its_state():
     assert prefill_and_hand_off(scheduler, "longer", [1, 2, 3, 4, 5, 6]) == 4
 
 
+def test_max_remote_admissions_per_round_and_boundary_only_validation():
+    cfg = make_prefill_state_config(False)
+    assert cfg.max_remote_admissions_per_round == 1
+    cfg.max_remote_admissions_per_round = 4
+    with pytest.raises(ValueError, match="D role only"):
+        Scheduler(cfg)
+    cfg.max_remote_admissions_per_round = 0
+    with pytest.raises(ValueError, match="max_remote_admissions_per_round"):
+        Scheduler(cfg)
+
+    decode_cfg = SchedulerConfig()
+    decode_cfg.role = SchedulerConfig.Role.D
+    decode_cfg.prefix_granularity = 4
+    decode_cfg.num_device_pages = 32
+    decode_cfg.num_snapshot_pages = 1
+    decode_cfg.max_retracted_requests = 0
+    decode_cfg.max_scheduled_tokens = 32
+    decode_cfg.max_batch_size = 4
+    decode_cfg.max_resident_requests = 4
+    decode_cfg.disable_l2_cache = True
+    decode_cfg.disable_prefix_cache = True
+    decode_cfg.max_remote_admissions_per_round = 4
+    group = CacheGroupConfig(
+        "tail", 2, 32, AttnKind.SlidingWindow, sliding_window_tokens=2, replayable=True
+    )
+    group.transfer_policy = CacheTransferPolicy.FullSuffix
+    group.boundary_only_in_prefill = True
+    decode_cfg.cache_groups = [group]
+    scheduler = Scheduler(decode_cfg)
+    assert scheduler is not None
+    assert decode_cfg.max_remote_admissions_per_round == 4
+    assert decode_cfg.cache_groups[0].boundary_only_in_prefill is True
+
+    bad_group = CacheGroupConfig(
+        "swa", 2, 32, AttnKind.SlidingWindow, sliding_window_tokens=2, replayable=False
+    )
+    bad_group.boundary_only_in_prefill = True
+    with pytest.raises(ValueError, match="boundary_only_in_prefill"):
+        bad_group.validate()
+
+
 def test_dropping_short_prompt_ends_takes_the_prefill_role_and_the_in_forward_checkpoint():
     cfg = make_prefill_state_config(True)
     cfg.state_checkpoint_in_forward = False

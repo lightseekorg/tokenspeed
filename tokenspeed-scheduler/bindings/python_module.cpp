@@ -241,6 +241,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
         .def_rw("checkpoint_granularity", &tokenspeed::CacheGroupConfig::checkpoint_granularity)
         .def_rw("deferred_decode_state", &tokenspeed::CacheGroupConfig::deferred_decode_state)
+        .def_rw("boundary_only_in_prefill", &tokenspeed::CacheGroupConfig::boundary_only_in_prefill)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 
@@ -306,7 +307,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         // max_scheduled_tokens), and the most rounds one prompt gives way
         // (unbounded by default; positive while the yield is on).
         .def_rw("prefill_chunk_yield_tokens", &tokenspeed::SchedulerConfig::prefill_chunk_yield_tokens)
-        .def_rw("prefill_chunk_yield_max_rounds", &tokenspeed::SchedulerConfig::prefill_chunk_yield_max_rounds);
+        .def_rw("prefill_chunk_yield_max_rounds", &tokenspeed::SchedulerConfig::prefill_chunk_yield_max_rounds)
+        .def_rw("max_remote_admissions_per_round", &tokenspeed::SchedulerConfig::max_remote_admissions_per_round);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and

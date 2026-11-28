@@ -602,4 +602,56 @@ TEST_F(PrefillDecodeOrderTest, ALongPromptAndCarriedShortPromptsComplete) {
     EXPECT_FALSE(Run(setup, prompts, 200).contains("Z"));
 }
 
+TEST(MaxRemoteAdmissionsTest, DecodeAdmitsMultipleSubmittedRequestsUpToConfiguredLimit) {
+    auto base_cfg = [] {
+        SchedulerConfig cfg{};
+        cfg.role = Role::kD;
+        cfg.prefix_granularity = 4;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 0;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.max_resident_requests = 8;
+        cfg.max_remote_admissions_per_round = 3;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full",
+            .block_granularity = 4,
+            .total_pages = 64,
+            .attn_kind = AttnKind::kFull,
+            .transfer_policy = CacheTransferPolicy::FullSuffix,
+        });
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    };
+
+    SchedulerConfig bad_zero = base_cfg();
+    bad_zero.max_remote_admissions_per_round = 0;
+    EXPECT_THROW(bad_zero.Validate(), std::invalid_argument);
+    SchedulerConfig bad_role = base_cfg();
+    bad_role.role = Role::kFused;
+    EXPECT_THROW(bad_role.Validate(), std::invalid_argument);
+
+    Scheduler scheduler{WithHostPackingFromDevice(base_cfg())};
+    for (int i = 0; i < 4; ++i) {
+        const std::string rid = "r" + std::to_string(i);
+        scheduler.SubmitRequests({RequestSpec{
+            .request_id = rid,
+            .tokens = MakeTokens(4, 100 * (i + 1)),
+            .max_new_tokens = 4,
+        }});
+        scheduler.Advance(ExecutionEvent{}.With(pd::BootstrappedEvent{rid}));
+    }
+
+    const Scheduler::PlanOptions options{.allow_prefill = true, .apply_prefill_watermark = false};
+    const ExecutionPlan p1 = scheduler.NextExecutionPlan(options);
+    ASSERT_TRUE(p1.remote_prefill.has_value());
+    EXPECT_EQ(p1.remote_prefill->request_ids, (std::vector<std::string>{"r0", "r1", "r2"}));
+
+    const ExecutionPlan p2 = scheduler.NextExecutionPlan(options);
+    ASSERT_TRUE(p2.remote_prefill.has_value());
+    EXPECT_EQ(p2.remote_prefill->request_ids, (std::vector<std::string>{"r3"}));
+}
+
 }  // namespace tokenspeed::test

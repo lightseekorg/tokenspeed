@@ -223,13 +223,17 @@ the drain, so its keys cannot keep a later plan waiting. Each probe uses fresh
 cache residency with this maintained key set; it does not rebuild the set or
 reuse a previous reachability result.
 
-Decode consumes an existing reserve in place when no page or pending State
-checkpoint became complete and no sliding-window block needs reclaiming; such
-a step needs no admission. Any other step publishes and admits on progress
-staged in place (see "resources and publication progress land when an
-admission succeeds" in §2), so a failed admission still leaves the request
-unchanged. Previously published checkpoint holders are
+Decode consumes an existing reserve and reclaims any expired sliding-window
+blocks in place when no page or pending State checkpoint became complete and no
+group needs new blocks; such a step needs no admission. Any other step
+publishes and admits on progress staged in place (see "resources and publication
+progress land when an admission succeeds" in §2), so a failed admission still
+leaves the request unchanged. Previously published checkpoint holders are
 released after the in-place step, as they are after a successful admission.
+For a sinkless replayable sliding-window group marked
+`CacheGroupConfig::boundary_only_in_prefill`, each local prefill chunk
+materializes only its trailing boundary window as a sparse suffix instead of
+dense interior blocks.
 
 Two adjustments ride on top of the raw chunk size. Both are pure token
 arithmetic kept out of the planner: how a chunk is cut lives in

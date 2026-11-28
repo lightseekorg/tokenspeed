@@ -147,12 +147,35 @@ void holdCopyInBlocks(std::vector<std::vector<CacheBlockRef>>& held, std::vector
     }
 }
 
+// Sliding-window groups marked boundary_only_in_prefill (such as compressor
+// tails whose interior pairs pass inside the chunk forward) only read/write
+// their trailing boundary window, so prefill skips interior chunk pages.
+void shapeBoundaryOnlyWindows(std::span<GroupDemand> demands, const CacheCoordinator& coordinator,
+                              std::span<const CacheGroupConfig> cache_groups, std::int32_t extent_tokens) {
+    for (std::size_t i = 0; i < demands.size(); ++i) {
+        const CacheGroupConfig& group = cache_groups[i];
+        if (!group.boundary_only_in_prefill) {
+            continue;
+        }
+        const std::int32_t grain = coordinator.GroupBlockGranularity(static_cast<std::int32_t>(i));
+        const std::int64_t retained_begin =
+            std::max<std::int64_t>(0, std::int64_t{extent_tokens} - *group.sliding_window_tokens + 1);
+        const std::int32_t first_block = static_cast<std::int32_t>(retained_begin / grain);
+        if (first_block > demands[i].table->NumBlocks()) {
+            demands[i].extent = SparseSuffix{
+                .extent_tokens = extent_tokens,
+                .first_block = first_block,
+                .head_blocks = 0,
+            };
+        }
+    }
+}
+
 bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::span<const BlockTable> tables,
-                                     std::int32_t num_tokens, std::int32_t num_computed_tokens) {
+                                     std::int32_t num_tokens) {
     for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
         const BlockTable& table = tables[static_cast<std::size_t>(i)];
-        if (coordinator.GroupBlocksNeededFor(i, table, num_tokens) != 0 ||
-            coordinator.GroupHasReclaimableBlocksAt(i, table, num_computed_tokens)) {
+        if (coordinator.GroupBlocksNeededFor(i, table, num_tokens) != 0) {
             return false;
         }
     }
@@ -627,7 +650,10 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                       .checkpoint = false});
         materialization.ApplyOutputDemand(demands);
         ReservePrefillDemands(demands, config_.cache_groups, reserve);
-        if (source != fsm::PrefillSource::kLocal) {
+        if (source == fsm::PrefillSource::kLocal) {
+            shapeBoundaryOnlyWindows(demands, coordinator_, config_.cache_groups,
+                                     CheckedInt32(std::int64_t{hit_tokens} + tokens));
+        } else {
             // A full-history group's blocks up to the landing's end land
             // whole and are not zeroed (GroupDemand::landed_tokens). Cached
             // windows already own the hit's blocks, including a fresh partial
@@ -884,6 +910,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                   .completes_prefill = tokens == unscheduled,
                                   .prompt_headroom_tokens = 0,
                               });
+        shapeBoundaryOnlyWindows(demands, coordinator_, config_.cache_groups,
+                                 CheckedInt32(std::int64_t{first_pos} + tokens));
         return demands;
     };
     // The prompt end's copy-in blocks of the slots this chunk allocates.
@@ -1001,9 +1029,11 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     const bool completed_checkpoint =
         cache_progress.state_checkpoint_tokens > 0 && num_computed_tokens >= cache_progress.state_checkpoint_tokens;
     // Between publication points, consuming an existing reserve cannot fail
-    // and does not change the hash chain, so it needs no admission.
+    // and does not change the hash chain, so it needs no admission. Reclaim any
+    // newly expired sliding-window blocks in place before advancing the frontier.
     if (!completed_page && !completed_checkpoint && state_step.kind != StateStep::Kind::kRotate &&
-        canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
+        canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens)) {
+        coordinator_.ReclaimExpired(tables, num_computed_tokens);
         coordinator_.ConsumeReservedTokens(tables, reserve_tokens);
         if (state_step.kind == StateStep::Kind::kRelease) {
             coordinator_.ReleaseStateInputs(tables);
@@ -2416,18 +2446,19 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
     // prefills use only the remaining execution capacity.
     scheduleDecodeBatch(feedback, build, candidates);
 
-    // Phase 3: at most one remote admission -- the whole prompt reserves at
-    // once, so admitting a queue's worth in one round would drain the pool
-    // before any of their KV arrives. It rides plan.remote_prefill beside
-    // the decode batch: no token budget, no batch slot. No
-    // TrackScheduledForward: the peer runs this prefill, so no forward of
-    // this engine's is out against the pages; the RemotePrefilling state it
-    // enters is what holds them (pdTransferInFlight). As in
-    // scheduleLocalPrefillWork, nothing is admitted after a lone-request
-    // compaction in the plan.
+    // Phase 3: bounded remote admissions (SchedulerConfig::max_remote_admissions_per_round)
+    // -- the whole prompt reserves at once, so capping per-round admissions prevents a
+    // queue burst from draining the pool before any of their KV arrives. It rides
+    // plan.remote_prefill beside the decode batch: no token budget, no batch slot.
+    // No TrackScheduledForward: the peer runs this prefill, so no forward of this
+    // engine's is out against the pages; the RemotePrefilling state it enters is what
+    // holds them (pdTransferInFlight). As in scheduleLocalPrefillWork, nothing is
+    // admitted after a lone-request compaction in the plan.
     if (!new_prompts_sealed) {
+        std::int32_t admitted_remote = 0;
         for (Request* request : candidates) {
-            if (lone_requests_.ActedInPlan()) {
+            if (lone_requests_.ActedInPlan() || admitted_remote >= config_.max_remote_admissions_per_round ||
+                req_pool_allocator_.AvailableSlots() == 0) {
                 break;
             }
             if (!request->Is<fsm::Submitted>()) {
@@ -2440,9 +2471,8 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
                                                          /*must_complete=*/false)) {
                 build.scheduled.insert(request);
                 build.remote_prefill.emplace_back(std::move(*admitted));
-                break;
-            }
-            if (feedback.admission_failed) {
+                ++admitted_remote;
+            } else if (feedback.admission_failed) {
                 spdlog::debug("[Scheduler] decode preallocation blocked: rid={} prompt_tokens={}", request->Id(),
                               request->PrefillSize());
                 feedback.NoteCapacityBlocked(request);

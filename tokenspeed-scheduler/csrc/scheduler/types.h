@@ -292,6 +292,9 @@ struct SchedulerConfig {
     // Positive when prefill_chunk_yield_tokens is; the default leaves it
     // unbounded.
     std::int32_t prefill_chunk_yield_max_rounds{std::numeric_limits<std::int32_t>::max()};
+    // D role: maximum Submitted prompts admitted remotely into plan.remote_prefill
+    // in one scheduling round (default 1; positive, > 1 for D role only).
+    std::int32_t max_remote_admissions_per_round{1};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks
