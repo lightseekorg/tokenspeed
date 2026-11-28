@@ -50,6 +50,7 @@ class KVCacheFormat(Enum):
     NATIVE = "native"
     FP8 = "fp8"
     MXFP8 = "mxfp8"
+    MXFP8_PACKED = "mxfp8_packed"
     FP8_PER_TENSOR = "fp8_per_tensor"
     FP8_PER_TOKEN_HEAD = "fp8_per_token_head"
 
@@ -294,26 +295,42 @@ class PerTokenHeadPlanes:
 
 
 @dataclass(frozen=True)
+class PackedMXFP8Rows:
+    """Packed MLA cache rows, quantized jointly over latent and RoPE channels.
+
+    Attributes:
+        rows: uint8 ``[slots, 1, record_bytes]``. A record contains one e4m3fn
+            payload byte per channel, followed by one UE8M0 scale byte per
+            32 channels, then zero padding to a multiple of 16 bytes. The
+            channel count comes from the prologue's latent input.
+    """
+
+    rows: torch.Tensor
+
+
+@dataclass(frozen=True)
 class LatentKVCache:
     """One MLA layer's latent cache destination.
 
     Attributes:
         kv_cache: ``[slots, 1, kv_lora_rank + rope_dim]`` FP8 e4m3 or native
             rows, a strided [pages, page_size, 1, width] view of those rows,
-            or the planes of an FP8_PER_TOKEN_HEAD cache.
+            the planes of an FP8_PER_TOKEN_HEAD cache, or packed MXFP8 rows.
         sanitize: Replace NaN/Inf with finite values before storing.
         slots: Dense 1-D destination slot of each written row.
         write_mask: True for each row to store, or None to store every row;
             a skipped row's slot is still a valid address.
     """
 
-    kv_cache: torch.Tensor | PerTokenHeadPlanes
+    kv_cache: torch.Tensor | PerTokenHeadPlanes | PackedMXFP8Rows
     sanitize: bool
     slots: torch.Tensor
     write_mask: torch.Tensor | None
 
     @property
     def format(self) -> KVCacheFormat:
+        if isinstance(self.kv_cache, PackedMXFP8Rows):
+            return KVCacheFormat.MXFP8_PACKED
         if isinstance(self.kv_cache, PerTokenHeadPlanes):
             return KVCacheFormat.FP8_PER_TOKEN_HEAD
         if self.kv_cache.dtype == torch.float8_e4m3fn:

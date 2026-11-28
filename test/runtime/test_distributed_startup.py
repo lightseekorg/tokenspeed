@@ -55,11 +55,17 @@ class _Device:
 
 
 @pytest.mark.parametrize(
-    "enabled,fusion_tokens,expected_capacity",
-    [(True, 2048, 2048), (True, 64, 128), (False, 2048, 128)],
+    "enabled,fusion_tokens,deterministic,expected_capacity",
+    [
+        (True, 2048, False, 2048),
+        (True, 64, False, 128),
+        (False, 2048, False, 128),
+        (True, 2048, True, 2048),
+        (False, 2048, True, None),
+    ],
 )
 def test_startup_arms_the_complete_selected_fusion_window(
-    monkeypatch, enabled, fusion_tokens, expected_capacity
+    monkeypatch, enabled, fusion_tokens, deterministic, expected_capacity
 ):
     import tokenspeed_kernel.ops.communication.fabric as fabric
     import tokenspeed_kernel.ops.communication.iris as kernel_iris
@@ -73,6 +79,7 @@ def test_startup_arms_the_complete_selected_fusion_window(
         world_size=2,
         nprocs_per_node=2,
         enable_allreduce_fusion=enabled,
+        force_deterministic_rsag=deterministic,
         comm_fusion_max_num_tokens=fusion_tokens,
         layer_boundary_norm="fused" if enabled else "unfused",
     )
@@ -117,5 +124,8 @@ def test_startup_arms_the_complete_selected_fusion_window(
         config.mapping.moe.tp_ep_group,
     }
     assert groups and all(len(group) == 2 for group in groups)
-    for group in groups:
-        assert backend.trtllm_ar.capacities[group] == (expected_capacity, 8192)
+    if expected_capacity is None:
+        assert backend.trtllm_ar.capacities == {}
+    else:
+        for group in groups:
+            assert backend.trtllm_ar.capacities[group] == (expected_capacity, 8192)

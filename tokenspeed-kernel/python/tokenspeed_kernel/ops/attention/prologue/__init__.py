@@ -63,6 +63,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     MLAPrologueOutput,
     MRope,
     MXFP8Scales,
+    PackedMXFP8Rows,
     PerTokenHeadPlanes,
     RelativeHeadNorm,
     RopeStyle,
@@ -430,7 +431,7 @@ def latent_store(
     kv_lora_rank: int,
     cache: LatentKVCache,
 ) -> None:
-    """Store rotated latent rows into a native latent cache.
+    """Store rotated latent rows into a native or packed MXFP8 latent cache.
 
     The store step of :func:`mla_prologue` on its own, for rows the prologue
     rotated without a cache (``cache=None``): the leading
@@ -444,7 +445,7 @@ def latent_store(
             in the activation dtype (``MLAPrologueOutput.latent``, possibly
             gathered across ranks since).
         kv_lora_rank: Width of the latent part; the rest of a row is RoPE.
-        cache: Native latent cache destination with its slots and write mask.
+        cache: Native or packed MXFP8 destination with its slots and write mask.
     """
     from tokenspeed_kernel.ops.attention.prologue.composite import (
         composite_latent_store,
@@ -474,6 +475,7 @@ __all__ = [
     "MLAPrologueOutput",
     "MRope",
     "MXFP8Scales",
+    "PackedMXFP8Rows",
     "PerTokenHeadPlanes",
     "RelativeHeadNorm",
     "RopeStyle",

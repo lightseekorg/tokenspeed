@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     Rotary,
 )
 from tokenspeed_kernel.ops.embedding import apply_rope, apply_rope_mla
+from tokenspeed_kernel.ops.kvcache._triton.mxfp8_latent import store_mxfp8_latent
 from tokenspeed_kernel.ops.kvcache.per_token_head import store_latent_per_token_head
 from tokenspeed_kernel.ops.kvcache.triton import (
     fused_fp8_set_kv_buffer,
@@ -333,6 +334,16 @@ def _write_latent(
 ) -> None:
     if cache.slots.numel() == 0:
         return
+    if cache.format is KVCacheFormat.MXFP8_PACKED:
+        store_mxfp8_latent(
+            cache.kv_cache.rows,
+            cache.slots,
+            k_nope,
+            k_rope,
+            sanitize=cache.sanitize,
+            write_mask=cache.write_mask,
+        )
+        return
     if cache.format is KVCacheFormat.FP8_PER_TOKEN_HEAD:
         planes = cache.kv_cache
         store_latent_per_token_head(
@@ -385,7 +396,7 @@ def _write_latent(
     traits={
         "expanded": BOOLS,
         "full_write": BOOLS,
-        "kv_format": frozenset({"native", "fp8", "fp8_per_token_head"}),
+        "kv_format": frozenset({"native", "fp8", "fp8_per_token_head", "mxfp8_packed"}),
         "kv_convert": BOOLS,
         "rope_style": ROPE_STYLES,
         "sanitize": BOOLS,

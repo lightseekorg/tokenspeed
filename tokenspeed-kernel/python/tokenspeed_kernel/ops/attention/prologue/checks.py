@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     LatentKVCache,
     MLAExpandedKV,
     MXFP8Scales,
+    PackedMXFP8Rows,
     RelativeHeadNorm,
     Rotary,
 )
@@ -109,11 +110,12 @@ def _cache_key(cache: HeadKVCache | LatentKVCache) -> tuple:
             _layout(cache.slots),
         )
     kv = cache.kv_cache
-    kv_key = (
-        _layout(kv)
-        if isinstance(kv, torch.Tensor)
-        else (_layout(kv.latent), _layout(kv.scale), _layout(kv.rope))
-    )
+    if isinstance(kv, torch.Tensor):
+        kv_key = _layout(kv)
+    elif isinstance(kv, PackedMXFP8Rows):
+        kv_key = (PackedMXFP8Rows, _layout(kv.rows))
+    else:
+        kv_key = (_layout(kv.latent), _layout(kv.scale), _layout(kv.rope))
     mask = None if cache.write_mask is None else _layout(cache.write_mask)
     return (kv_key, cache.sanitize, _layout(cache.slots), mask)
 
@@ -605,7 +607,7 @@ def check_latent_store(latent: torch.Tensor, cache: LatentKVCache) -> None:
         latent: Rotated latent rows ``[num_tokens, kv_lora_rank + rope_dim]``
             in the activation dtype, as :func:`mla_prologue` returns them
             without a cache.
-        cache: Latent cache destination, native rows only.
+        cache: Latent cache destination, native or packed MXFP8 rows.
     """
     if latent.dim() != 2 or latent.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(
@@ -614,12 +616,9 @@ def check_latent_store(latent: torch.Tensor, cache: LatentKVCache) -> None:
         )
     if latent.stride(-1) != 1 or _overlapping(latent) or _misaligned(latent):
         raise ValueError("latent rows must be dense, 16-byte aligned and non-aliasing")
-    if cache.format is not KVCacheFormat.NATIVE:
-        raise ValueError("latent_store writes native latent caches only")
-    if cache.kv_cache.shape[-1] != latent.shape[-1]:
+    if cache.format not in (KVCacheFormat.NATIVE, KVCacheFormat.MXFP8_PACKED):
         raise ValueError(
-            f"latent rows are {latent.shape[-1]} wide but the cache holds "
-            f"{cache.kv_cache.shape[-1]}"
+            "latent_store writes native or packed MXFP8 latent caches only"
         )
     _check_latent_cache(cache, latent, latent.shape[0], 0, latent.shape[-1])
 
@@ -633,6 +632,24 @@ def _check_latent_cache(
 ) -> None:
     _check_slots(cache, num_tokens)
     _check_write_mask(cache)
+    if cache.format is KVCacheFormat.MXFP8_PACKED:
+        width = kv_lora_rank + rope_dim
+        rows = cache.kv_cache.rows
+        record_bytes = ((width + width // 32 + 15) // 16) * 16
+        if (
+            width <= 0
+            or width % 32
+            or rows.dtype != torch.uint8
+            or rows.dim() != 3
+            or rows.shape[1:] != (1, record_bytes)
+            or rows.stride(-1) != 1
+            or _overlapping(rows)
+        ):
+            raise ValueError(
+                "packed MXFP8 needs a positive multiple of 32 channels and "
+                f"uint8 [slots, 1, {record_bytes}] cache rows"
+            )
+        return
     if cache.format is KVCacheFormat.FP8_PER_TOKEN_HEAD:
         planes = cache.kv_cache
         rows = (

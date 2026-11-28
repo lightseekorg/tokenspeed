@@ -262,8 +262,11 @@ class DistributedInitializer:
 
             discover_iris_world()
 
-        # Arm the trtllm AR workspaces; --force-deterministic-rsag overrides at dispatch.
-        if config.hidden_size > 0:
+        # Deterministic collectives do not consume the TRTLLM workspaces.
+        # Enabled fusion (explicit or auto-enabled) still needs those workspaces.
+        if config.hidden_size > 0 and (
+            not config.force_deterministic_rsag or config.comm_fusion_token_capacity > 0
+        ):
             from tokenspeed.runtime.distributed.comm_backend import (
                 get_global_backend,
             )

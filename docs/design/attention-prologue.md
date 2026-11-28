@@ -33,7 +33,7 @@ Typed holders carry each optional step: `HeadNorm` or `RelativeHeadNorm`
 (with `KVShortConv`, its `ConvStream`s and `ConvBatch`),
 `Rotary` (with `MRope`),
 `HeadKVCache` (with `MXFP8Scales`), `LatentKVCache` (with
-`PerTokenHeadPlanes`), and `MLAExpandedKV`.
+`PerTokenHeadPlanes` or `PackedMXFP8Rows`), and `MLAExpandedKV`.
 
 In the runtime, a layer states its steps once: `PagedAttention(...,
 rotary_emb=..., qk_norm=...)`, with `None` for a step the layer skips.
@@ -568,3 +568,19 @@ directly; `_gather_send` (`gather_send_rows`) is reused for history and current
 sends; `_current_receive` (`current_receive_rows`) holds gathered current rows
 before they are unpacked. `current_rank_stride` is the aligned distance between
 producers' current regions in the attention planes, distinct from send capacity.
+
+## Packed MXFP8 latent rows
+
+A pool with group-32 compressed MLA rows returns `LatentKVCache` containing
+`PackedMXFP8Rows`. Each uint8 record stores all latent and rotated RoPE
+channels as e4m3fn payload, followed by one UE8M0 scale per 32 channels and
+zero padding to a 16-byte boundary. The channel count must be divisible by
+32. The scale is the power-of-two ceiling of `max(amax(abs(group)), 1e-4) / 448`.
+The query remains in the activation dtype; rotation rounds to that dtype
+before cache quantization. The composite prologue owns the masked scatter,
+including padding, with no intermediate packed tensor or persistent allocation.
+`latent_store` accepts the same descriptor after a caller gathers rotated rows.
+Every slot must be a valid cache address, including masked rows, as for other
+`LatentKVCache` layouts. Only the write mask skips a row; invalid slots are not
+silently dropped.
+Native, plain FP8 and per-token-head cache paths are unchanged.
