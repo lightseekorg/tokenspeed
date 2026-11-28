@@ -1210,6 +1210,9 @@ def log_gpu_memory_summary(
         def _accumulate(name, tensor, sink):
             if tensor is None or tensor.device.type != device_type:
                 return
+            # A peer-mapped host-NUMA table exposes a CUDA tensor for GPU reads.
+            if getattr(tensor, "engram_host_table", False):
+                return
             ptr = tensor.data_ptr()
             if ptr in seen:
                 return

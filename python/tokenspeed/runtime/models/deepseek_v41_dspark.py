@@ -327,9 +327,7 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         draft.kv_source_layer_ids = []
         draft.index_source_layer_ids = []
         draft.compress_ratios = [0] * stages
-        super().__init__(
-            draft, mapping, quant_config, prefix, False, "replicated", None
-        )
+        super().__init__(draft, mapping, quant_config, prefix, host_table=False)
         self.num_stages = stages
         self.block_size = block_size
         self.target_layer_ids = taps

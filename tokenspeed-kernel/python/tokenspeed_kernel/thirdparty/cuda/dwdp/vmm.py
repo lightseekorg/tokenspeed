@@ -28,6 +28,7 @@ import math
 
 import torch
 from cuda.bindings import driver as cu
+from tokenspeed_kernel import host_memory
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,28 @@ def allocation_prop(device: int, *, handle_type: str | None):
         else cu.CUmemAllocationHandleType(0)
     )
     return prop
+
+
+def fabric_allocation_properties(device: int, *, host: bool):
+    """Return FABRIC allocation properties and the minimum mapping granularity in bytes."""
+    prop = allocation_prop(device, handle_type="fabric")
+    if host:
+        node = host_memory.host_numa_node(device)
+        if node is None:
+            raise RuntimeError(f"CUDA device {device} has no host NUMA node")
+        prop.location.type = cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_HOST_NUMA
+        prop.location.id = node
+    minimum = checked(
+        cu.cuMemGetAllocationGranularity(
+            prop, cu.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_MINIMUM
+        )
+    )
+    return prop, int(minimum)
+
+
+def allocate_from_properties(size: int, prop: cu.CUmemAllocationProp) -> int:
+    """Allocate size bytes with the given placement and export type."""
+    return int(checked(cu.cuMemCreate(size, prop, 0)))
 
 
 def granularity(device: int, *, handle_type: str) -> int:

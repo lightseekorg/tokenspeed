@@ -43,8 +43,10 @@ coordinates always describe the complete span; only compute rows are local.
   per forward from host spans.
 - Ranks without local rows still join every collective: projection and SWA
   gathers, KVP history gathers, Engram and MoE.
-- Engram gathers hash IDs and reduce-scatters the table contributions back to
-  local rows. The output gathers only the sampled rows. With DSpark it also
+- With TP-sharded Engram tables, Engram gathers hash IDs and reduce-scatters
+  table contributions back to local rows. A shared host table or a group of
+  peer-mapped Engram shards reads each rank’s local query IDs directly.
+  The output gathers only the sampled rows. With DSpark it also
   restores gathered CED taps to span order, so the drafter writes the
   replicated SWA-window fields from complete rows.
 

@@ -1607,6 +1607,28 @@ token ID. A five-token block is therefore six kernels and five all-gathers
 instead of a per-step chain of masked embedding lookups, GEMMs, reductions, and
 two all-gathers.
 
+V4.1 instances in one NVLink domain can share the two immutable Engram tables
+through CUDA FABRIC handles. All workers need access to the same IMEX channel.
+Start every instance with the same checkpoint, revision and Engram table layout,
+`--engram-group-size` (the total number of participating GPUs), and
+`--engram-group-store` (a fresh directory on a filesystem they all see).
+For example, two separately launched two-GPU instances both take
+`--engram-group-size 4 --engram-group-store /shared/run-42/engram`.
+The workers split the table into whole rows at CUDA allocation boundaries.
+Each GPU maps one contiguous view of all rows and loads only its own range
+from the checkpoint. A small table can have owners with empty ranges.
+By default the rows occupy HBM.
+Add `--engram-host-table` on every instance to place each slice in its GPU's
+host NUMA memory. Both placements use the same packed-row lookup as a shared
+host table and read the rank's local query IDs directly.
+
+The store exchanges raw CUDA FABRIC handles at startup. Exporters keep their
+allocations alive through a single model-wide wait for all mappings and
+checkpoint writes.
+Each instance then reads the rows it needs independently. Restart
+the whole group with a fresh store to replace a worker or reload weights. This
+placement requires PP1 and resident weights throughout the group's lifetime.
+
 Before each forward, one pinned upload carries every request's Engram history
 snapshot. `prepare_ngram_inputs` resolves the previous-three tokens and validity
 mask, clears padding, and computes table rows for all Engram layers in one

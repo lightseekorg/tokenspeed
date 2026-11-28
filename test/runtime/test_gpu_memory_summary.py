@@ -99,6 +99,11 @@ def test_summary_lists_engram_tables_and_kv_pool_bytes(caplog):
     engram_bytes = model.layers[0].engram.embed.weight.nbytes
     assert table["Engram weights (tables/wkv)"] == round(engram_bytes / gb, 2) > 0
     assert table["KV cache"] == round(kv.nbytes / gb, 2) > 0
+    model.layers[0].engram.embed.weight.engram_host_table = True
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger=logger.name):
+        log_gpu_memory_summary(model, 0, 0, logger, kv_pool=pool, device="cuda")
+    assert "Engram weights" not in caplog.records[0].getMessage()
     # No Engram parameters on the device: the row is omitted, not printed as 0.
     caplog.clear()
     with caplog.at_level(logging.INFO, logger=logger.name):

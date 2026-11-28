@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Readiness probe for CUDA fabric-handle (MNNVL) memory.
+"""Readiness probes and peer mappings for CUDA fabric-handle (MNNVL) memory.
 
 Multi-node NVLink buffers need the full IMEX stack (nvidia-imex daemon plus
 /dev/nvidia-caps-imex-channels), which only exists on NVLink-domain machines
@@ -35,13 +35,16 @@ import ctypes
 import hashlib
 import logging
 import socket
-from collections.abc import Sequence
+import weakref
+from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 from pathlib import Path
 
 import torch
 from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
+    "FabricRowAllocator",
     "fabric_allocation_supported",
     "gather_fabric_map",
     "group_has_fabric",
@@ -186,6 +189,105 @@ def fabric_allocation_supported(device_index: int) -> bool:
         _probe_cache[device_index] = cached
         logger.info(f"fabric allocation on device {device_index!s}: {cached!s}")
     return cached
+
+
+def _close_fabric_mappings(device: torch.device, mappings: ExitStack) -> None:
+    with torch.cuda.device(device):
+        try:
+            torch.cuda.synchronize(device)
+        finally:
+            mappings.close()
+
+
+class FabricRowAllocator:
+    """Allocate FABRIC-exportable row shards and map them into dense uint8 tensors.
+
+    Args:
+        device: CUDA device which reads the mapped rows.
+        host: Place the local shard in this GPU's host NUMA node when true, or HBM
+            otherwise. `granularity` reports the local allocation granularity in bytes.
+    """
+
+    def __init__(self, device: torch.device, *, host: bool):
+        from tokenspeed_kernel.thirdparty.cuda.dwdp import vmm
+
+        with torch.cuda.device(device):
+            self.device = torch.device("cuda", torch.cuda.current_device())
+            self._properties, self.granularity = vmm.fabric_allocation_properties(
+                self.device.index, host=host
+            )
+
+    def map_rows(
+        self,
+        bounds: Sequence[int],
+        row_bytes: int,
+        *,
+        rank: int,
+        granularity: int,
+        exchange_handles: Callable[[bytes], Sequence[bytes]],
+    ) -> tuple[torch.Tensor, int]:
+        """Return a dense [rows, row_bytes] view and the local physical allocation size.
+
+        `bounds` holds the row boundaries in rank order, starting at zero. Interior
+        byte offsets are aligned to `granularity`, a common multiple of all owners'
+        granularities. Equal boundaries denote an empty shard. `exchange_handles`
+        takes the local export (empty bytes for an empty shard) and returns every rank's export.
+        """
+        from tokenspeed_kernel.thirdparty.cuda.dwdp import vmm
+        from tokenspeed_kernel.thirdparty.cuda.dwdp.layout import align_up
+
+        offsets = [align_up(row * row_bytes, granularity) for row in bounds]
+        local_bytes = offsets[rank + 1] - offsets[rank]
+        with (
+            torch.cuda.device(self.device),
+            ExitStack() as imports,
+            ExitStack() as mappings,
+        ):
+            handle = None
+            payload = b""
+            if local_bytes:
+                handle = vmm.allocate_from_properties(local_bytes, self._properties)
+                # A slow peer can import the export as long as this tensor is alive.
+                mappings.callback(vmm.release_handle, handle)
+                payload = vmm.export(handle, handle_type="fabric")
+            handles = exchange_handles(payload)
+            if len(handles) != len(bounds) - 1:
+                raise ValueError("Expected one FABRIC handle entry per shard")
+
+            # CUDA accepts a power-of-two reservation alignment. Align within the VA
+            # range when the owners have different, non-nested granularities.
+            alignment = granularity
+            reserve_bytes = offsets[-1]
+            if alignment & (alignment - 1):
+                reserve_bytes += alignment
+                alignment = 0
+            reservation = vmm.reserve(reserve_bytes, alignment)
+            mappings.callback(vmm.free_address, reservation, reserve_bytes)
+            base = align_up(reservation, granularity)
+            for owner_rank, payload in enumerate(handles):
+                shard_bytes = offsets[owner_rank + 1] - offsets[owner_rank]
+                if not shard_bytes:
+                    continue
+                peer = handle
+                if owner_rank != rank:
+                    if not payload:
+                        raise ValueError(f"Missing FABRIC handle for rank {owner_rank}")
+                    peer = vmm.import_handle(payload, handle_type="fabric")
+                    imports.callback(vmm.release_handle, peer)
+                address = base + offsets[owner_rank]
+                vmm.map_handle(address, shard_bytes, peer)
+                mappings.callback(vmm.unmap, address, shard_bytes)
+                vmm.set_access(address, shard_bytes, self.device.index)
+            table = vmm.tensor_view(
+                base, (bounds[-1], row_bytes), torch.uint8, self.device, owner=mappings
+            )
+            # The storage retains the original stack. The finalizer owns its callbacks.
+            cleanup = mappings.pop_all()
+            finalizer = weakref.finalize(
+                mappings, _close_fabric_mappings, self.device, cleanup
+            )
+            finalizer.atexit = False
+            return table, local_bytes
 
 
 def host_identity() -> int:
