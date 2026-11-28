@@ -138,6 +138,12 @@ def triton_qwen4_exp_mtp_fuse_inputs(
     """See :func:`tokenspeed_kernel.ops.model.qwen4_exp.monokernel.qwen4_exp_mtp_fuse_inputs`."""
     size = embedding.shape[1]
     rows = input_ids.shape[0]
+    # Tiles of 4 rows, bucketed: 4 rows share one compile, 8 another.
+    tiles = triton.next_power_of_2(-(-rows // _TILE_ROWS))
+    # The 8-row bucket's operand tiles are twice as tall, so pipeline its K
+    # loop over two stages instead of NVIDIA's default three, which exceed
+    # sm100's shared memory; AMD pipelines two stages by default.
+    pipeline = {"num_stages": 2} if tiles > 1 else {}
     _qwen4_exp_mtp_fuse_inputs_kernel[(size // 16,)](
         input_ids,
         embedding,
@@ -154,11 +160,11 @@ def triton_qwen4_exp_mtp_fuse_inputs(
         EPS=eps,
         H=size,
         BN=16,
-        # Tiles of 4 rows, bucketed: 4 rows share one compile, 8 another.
-        TILES=triton.next_power_of_2(-(-rows // _TILE_ROWS)),
-        # 512 measured 4 us faster than 256 cold (fewer, longer weight runs).
+        TILES=tiles,
+        # 512 beats 256 cold (fewer, longer weight runs).
         BK=512,
         num_warps=4,
+        **pipeline,
     )
 
 
