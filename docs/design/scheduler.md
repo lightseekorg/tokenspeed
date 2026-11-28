@@ -428,10 +428,11 @@ carried prompt could make the chunk's own request that victim.
 **New prompts retain submission order by default.**
 `--enable-short-prefill-first` opts in to ordering by prompt tokens minus
 currently reusable Device or Host prefixes, plus any tokens replayed to
-regenerate replayable groups; equal work preserves submission order. Resident chunks retain priority. The policy applies to P and fused
+regenerate replayable groups. Resident chunks retain priority. The policy applies to P and fused
 local prefill; D's remote admission and decode ordering are unchanged.
 
-Only the oldest waiting prompt counts successful later first admissions.
+With the default `--short-prefill-aging bypass`, only the oldest waiting prompt
+counts successful later first admissions. Equal-ranked prompts keep submission order.
 After eight, it receives selection priority; once it starts or leaves, the
 next oldest gets its own allowance. Priority is reevaluated after each
 admission, including within one batch. Failed admissions and resident chunks
@@ -454,6 +455,16 @@ counts; a resident chunk granted capacity does not.
 Priority cannot bypass resource or transfer dependencies. In the new-prompt
 phase an inadmissible protected prompt does not block other admissible
 requests; in a fill, its capacity failure ends the fill, as any prompt's does.
+
+With `--short-prefill-aging wait-rounds`, each waiting prompt ages once per
+local prefill scheduling opportunity. The scheduler counts the round before
+admission, even when a resident chunk consumes the budget or all candidates
+are waiting for an eviction write-back. A round that admits several prompts
+still counts once. Decode-only rounds imposed by the prefill gate do not count.
+From the fourth eligible round, the ranking cost is capped at the full configured
+chunk budget. On equal cost, prompts that have reached the threshold come first,
+then the one with more waiting rounds. Ties keep submission order. A steady
+stream of shorter prompts can still delay a long one.
 
 Both policies share the same admission and execution path. Ranking does not
 reserve pages or replace the admission-time cache check. With the option

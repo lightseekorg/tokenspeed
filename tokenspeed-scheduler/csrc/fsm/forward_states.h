@@ -173,8 +173,9 @@ struct AdmissionResources {
     std::optional<std::size_t> disk_retry_below_held_blocks;
     std::uint8_t disk_read_retries{0};
     std::optional<PeerHit> peer_hit;
-    // Successful later first admissions while this is the oldest waiting prompt.
-    std::int32_t prefill_bypasses{0};
+    // Oldest prompt's bypass count, or eligible prefill rounds spent waiting,
+    // according to the scheduler's short-prefill aging policy.
+    std::int64_t short_prefill_age{0};
     // Fixed prompt identities for admission retries, never residency. Leaving
     // the pre-admission states releases them together with the storage hold.
     PreparedPrefixKeys prefix_keys;

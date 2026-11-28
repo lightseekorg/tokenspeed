@@ -1637,6 +1637,29 @@ TEST_F(PrefillChunkYieldSuite, AResidentChunkFillsInRankOrderAfterItsAdmission) 
     EXPECT_EQ(Round(), (PrefillRows{{"f", 0, 14, 14}, {"sibling", 8, 10, 10}, {"holder", 8, 24, 100}}));
 }
 
+TEST_F(PrefillChunkYieldSuite, WaitRoundRankedFillBreaksEqualWorkByEligibleRounds) {
+    hybrid_ = true;
+    Restart(0);
+    config_.enable_short_prefill_first = true;
+    config_.short_prefill_aging = ShortPrefillAging::kWaitRounds;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const auto shared = MakeTokens(168, 5000);
+    Publish("seed", Extending(shared, {6000, 6001, 6002}));
+    SubmitPrompt("holder", Extending(shared, MakeTokens(32, 8000)));
+    ASSERT_EQ(Round(), (PrefillRows{{"holder", 0, 32, 200}}));
+
+    SubmitPrompt("early", MakeTokens(16, 2000), /*bootstrap=*/false);
+    SubmitPrompt("late", MakeTokens(16, 3000));
+    ASSERT_EQ(Round(), (PrefillRows{{"holder", 32, 64, 200}}));
+    SendBootstrapped("early");
+    for (int start = 64; start < 160; start += kBudget) {
+        ASSERT_EQ(Round(), (PrefillRows{{"holder", start, start + kBudget, 200}}));
+    }
+    // The junction leaves room for one whole prompt. "late" was ready for
+    // five prefill rounds and "early" for four, despite their submission order.
+    EXPECT_EQ(Round(), (PrefillRows{{"late", 0, 16, 16}, {"holder", 160, 168, 200}}));
+}
+
 // In rank order too, the fill ends at its first capacity failure. In a
 // 28-page pool no page is free once the 100-token prompt's second chunk and
 // s1 and s2, which it gives way to, hold theirs. "a" ranks first, 1 token
@@ -2160,6 +2183,23 @@ TEST_F(PrefillDecodeIntervalSuite, ShortPrefillOrderingResumesAfterTheDecodeInte
     EXPECT_EQ(Round({"long"}), "P:long");
     EXPECT_EQ(Round({"long"}), "P:long");
     EXPECT_EQ(Round(), "P:long");
+}
+
+TEST_F(PrefillDecodeIntervalSuite, DecodeOnlyRoundsDoNotAgeWaitingPrefills) {
+    auto cfg = MakeConfig();
+    cfg.enable_short_prefill_first = true;
+    cfg.short_prefill_aging = ShortPrefillAging::kWaitRounds;
+    cfg.prefill_decode_interval = 4;
+    cfg.max_consecutive_prefill_rounds = 1;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg));
+    Submit(MakeRequestSpec("decoding", 2));
+    ASSERT_EQ(Round(), "P:decoding");
+    Submit(MakeRequestSpec("older", 12, /*start=*/100));
+    for (int i = 0; i < 4; ++i) {
+        ASSERT_EQ(Round(), "D:decoding");
+    }
+    Submit(MakeRequestSpec("new", 7, /*start=*/200));
+    EXPECT_EQ(Round({"new"}), "P:new");
 }
 
 TEST_F(PrefillDecodeIntervalSuite, APromptIsHeldBackAtMostTheIntervalAcrossItsChunks) {

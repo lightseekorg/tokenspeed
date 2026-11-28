@@ -184,6 +184,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("D", tokenspeed::Role::kD)
         .value("Fused", tokenspeed::Role::kFused);
 
+    nb::enum_<tokenspeed::ShortPrefillAging>(scheduler_config, "ShortPrefillAging")
+        .value("Bypass", tokenspeed::ShortPrefillAging::kBypass)
+        .value("WaitRounds", tokenspeed::ShortPrefillAging::kWaitRounds);
+
     nb::enum_<tokenspeed::SchedulerConfig::HostWritePolicy>(scheduler_config, "HostWritePolicy")
         .value("Unspecified", tokenspeed::SchedulerConfig::HostWritePolicy::kUnspecified)
         .value("WriteThrough", tokenspeed::SchedulerConfig::HostWritePolicy::kWriteThrough)
@@ -248,6 +252,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
         .def_rw("enable_short_prefill_first", &tokenspeed::SchedulerConfig::enable_short_prefill_first)
+        .def_rw("short_prefill_aging", &tokenspeed::SchedulerConfig::short_prefill_aging)
         .def_rw("max_kv_page_num", &tokenspeed::SchedulerConfig::max_kv_page_num)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("max_resident_requests", &tokenspeed::SchedulerConfig::max_resident_requests)

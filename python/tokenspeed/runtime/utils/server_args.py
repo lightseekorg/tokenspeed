@@ -548,6 +548,7 @@ class ServerArgs:
     # prefill rounds that hold a decode back. 0 always owes the interval.
     prefill_interval_min_decoding: int = 0
     enable_short_prefill_first: bool = False
+    short_prefill_aging: str = "bypass"
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
     # a scattered prompt does not interrupt every rank's decode. Unset keeps
@@ -3638,6 +3639,17 @@ class ServerArgs:
             raise ValueError("--input-logprob-chunk-tokens must be positive")
         if self.chunk_prefill_kv_size is not None and self.chunk_prefill_kv_size <= 0:
             raise ValueError("--chunk-prefill-kv-size must be positive")
+        if self.short_prefill_aging not in ("bypass", "wait-rounds"):
+            raise ValueError(
+                f"Unknown --short-prefill-aging: {self.short_prefill_aging!r}"
+            )
+        if (
+            self.short_prefill_aging == "wait-rounds"
+            and not self.enable_short_prefill_first
+        ):
+            raise ValueError(
+                "--short-prefill-aging wait-rounds requires --enable-short-prefill-first"
+            )
         if self.prefill_decode_interval < 0:
             raise ValueError("--prefill-decode-interval must be non-negative")
         if self.prefill_decode_interval and self.disaggregation_mode != "null":
@@ -4104,9 +4116,17 @@ class ServerArgs:
             "--enable-short-prefill-first",
             action="store_true",
             default=ServerArgs.enable_short_prefill_first,
-            help="Prefer new local prefill requests with less uncached work, with "
-            "oldest-request starvation protection. Off by default; resident "
-            "chunks retain priority. Applies to fused and prefill roles.",
+            help="Prefer new local prefill requests with less uncached work. "
+            "Resident chunks retain priority. Applies to fused and prefill roles.",
+        )
+        parser.add_argument(
+            "--short-prefill-aging",
+            choices=("bypass", "wait-rounds"),
+            default=ServerArgs.short_prefill_aging,
+            help="With --enable-short-prefill-first, bypass promotes the oldest "
+            "prompt after eight later admissions. From its fourth eligible "
+            "prefill round, wait-rounds ranks each waiting prompt at no more "
+            "than one chunk of work.",
         )
         parser.add_argument(
             "--enable-mixed-batch",

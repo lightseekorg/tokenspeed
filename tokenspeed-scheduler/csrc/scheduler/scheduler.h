@@ -889,7 +889,7 @@ private:
     // `request` and `tokens`. Nothing it admits holds the head of line, and
     // the holder's operation then moves behind theirs: the completing
     // prefills run first, the incomplete one last. candidates supplies the
-    // round's FIFO order. With enable_short_prefill_first, a successful
+    // round's FIFO order. With bypass-based short-prefill aging, a successful
     // carried first admission that overtakes the oldest waiting prompt
     // increments that prompt's bypass count.
     // Returns how many of `carried` it admitted.
@@ -996,6 +996,8 @@ private:
     bool prefillRunCappedBelowThreshold() const;
     bool belowPrefillWatermark() const;
     bool prefillAllowed(const Request& request, const PlanBuild& build) const;
+    void ageWaitingPrefills(const PlanBuild& build, std::span<Request* const> candidates,
+                            bool new_prompts_sealed) const;
     // Admits the waiting prompts whose holder answered with more than their
     // local hit, each as a landing (fsm::PrefillSource::kPeer) that rides
     // ExecutionPlan::peer_fetches beside the batch, taking no token budget
