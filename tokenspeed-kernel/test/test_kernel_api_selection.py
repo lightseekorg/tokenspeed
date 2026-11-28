@@ -8525,23 +8525,21 @@ def test_dense_format_signature_and_fast_selection_override(
         registry.clear_cache()
 
         assert (
-            select_kernel("unit_fast", "fast_mode", sig, traits={"mode": "a"}).spec.name
+            select_kernel("unit_fast", "fast_mode", sig, traits={"mode": "a"}).name
             == "hi"
         )
         # Hot cache hit still returns the priority choice.
         assert (
-            select_kernel("unit_fast", "fast_mode", sig, traits={"mode": "a"}).spec.name
+            select_kernel("unit_fast", "fast_mode", sig, traits={"mode": "a"}).name
             == "hi"
         )
         with kernel_override("unit_fast", "fast_mode", "lo"):
             assert (
-                select_kernel(
-                    "unit_fast", "fast_mode", sig, traits={"mode": "a"}
-                ).spec.name
+                select_kernel("unit_fast", "fast_mode", sig, traits={"mode": "a"}).name
                 == "lo"
             )
         assert (
-            select_kernel("unit_fast", "fast_mode", sig, traits={"mode": "a"}).spec.name
+            select_kernel("unit_fast", "fast_mode", sig, traits={"mode": "a"}).name
             == "hi"
         )
         # Multi-trait fallback matches non-1-trait fast key too.
@@ -8562,7 +8560,7 @@ def test_dense_format_signature_and_fast_selection_override(
                 "fast_mode",
                 sig,
                 traits={"mode": "a", "flag": True},
-            ).spec.name
+            ).name
             == "m_hi"
         )
         assert (
@@ -8571,7 +8569,7 @@ def test_dense_format_signature_and_fast_selection_override(
                 "fast_mode",
                 sig,
                 traits={"mode": "a", "flag": True},
-            ).spec.name
+            ).name
             == "m_hi"
         )
     finally:
