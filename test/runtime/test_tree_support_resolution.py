@@ -78,10 +78,11 @@ def _trtllm(kv_cache_dtype=torch.bfloat16):
     return leaf
 
 
-def _mha(cls=MHAAttnBackend, kv_cache_dtype=torch.bfloat16):
+def _mha(cls=MHAAttnBackend, kv_cache_dtype=torch.bfloat16, is_mxfp8=False):
     leaf = object.__new__(cls)
     leaf.kv_cache_dtype = kv_cache_dtype
     leaf.qkv_dtype = torch.bfloat16
+    leaf.is_mxfp8 = is_mxfp8
     return leaf
 
 
@@ -124,8 +125,12 @@ def test_trtllm_router_supports_verify_and_lanes(kv_cache_dtype):
     )
 
 
-def test_mha_router_supports_verify_and_lanes():
-    resolve_tree_support(_router(_mha()), _router(_mha()))
+@pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_mha_router_supports_verify_and_lanes(kv_cache_dtype):
+    resolve_tree_support(
+        _router(_mha(kv_cache_dtype=kv_cache_dtype)),
+        _router(_mha(kv_cache_dtype=kv_cache_dtype)),
+    )
 
 
 @pytest.mark.parametrize("cls", [TRTLLMMLABackend, CuteDSLMLABackend])
@@ -167,8 +172,8 @@ def test_draft_with_linear_layers_is_refused():
     "target, blocker",
     [
         (
-            lambda: _router(_mha(kv_cache_dtype=torch.float8_e4m3fn)),
-            "MHAAttnBackend .* kv_cache_dtype",
+            lambda: _router(_mha(kv_cache_dtype=torch.float8_e4m3fn, is_mxfp8=True)),
+            r"MHAAttnBackend .* kv_cache_dtype .* \(MXFP8\)",
         ),
         (lambda: _router(_mha(QSAAttnBackend)), "QSAAttnBackend has no tree verify"),
         (lambda: _router(_trtllm(torch.float8_e5m2)), "kv_cache_dtype"),

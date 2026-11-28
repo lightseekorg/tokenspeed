@@ -342,8 +342,9 @@ to e4m3's range: the layer passes `FP8TensorScales` as the write target's
 `scales` (format `fp8_per_tensor`, which the Triton solution writes). Every
 reader must apply them, so the layer refuses a backend whose
 `reads_fp8_kv_scales` is false. The MHA leaf reads through kernels that declare
-the `scaled-fp8` cache signature: trtllm-gen folds `k_scale` into the logit
-scale and `v_scale` into the output's. A cache of another dtype ignores the
+the `scaled-fp8` cache signature: trtllm-gen and the portable Triton decode
+and extend fold `k_scale` into the logit scale and `v_scale` into the
+output's. A cache of another dtype ignores the
 scales. MLA caches run at unit scale.
 
 An MLA layer reads its query in the activation dtype, except that an FP8
@@ -354,8 +355,11 @@ cache differ: the backend's `query_dtype` names it per layer and forward
 mode, and the prologue returns the query in it (the Triton solution rounds
 once from fp32, the composite converts its result), so no separate cast runs
 before attention. The MHA backend asks for unscaled FP8 in decode over an FP8
-cache; a fresh prefill attends the activation-dtype key and value rows the
-prologue returns, so extend keeps the activation dtype.
+cache when a decode kernel reads FP8 queries for the layer's traits, and the
+activation dtype otherwise: the portable Triton kernels widen FP8 K/V tiles
+under a 16-bit query (`mha_fp8_kvcache_query_dtype`); so does a bound draft
+tree's cascade. A fresh prefill attends the activation-dtype key and value rows
+the prologue returns, so extend keeps the activation dtype.
 
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.
