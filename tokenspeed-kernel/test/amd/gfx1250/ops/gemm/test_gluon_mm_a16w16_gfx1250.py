@@ -68,10 +68,36 @@ def _assert_bf16_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     torch.testing.assert_close(actual.double(), expected, atol=_ATOL, rtol=2**-8)
 
 
+# Every tile choice, with ragged and whole last row tiles: 16-, 32-, 64- and
+# 128-row dense tiles over 16 or 32 columns (split K by 5 from 33 rows),
+# 128 x 64 tiles split by 2 or not, and the large-M kernel. 128 and 384
+# columns pick the same tiles.
 @pytest.mark.parametrize(
-    "m", [1, 5, 6, 16, 17, 24, 33, 64, 65, 96, 128, 200, 2048, 2049, 8192]
+    "m,n",
+    [
+        pytest.param(m, n, id=f"{n}-{m}")
+        for n, m in (
+            (128, 1),
+            (128, 16),
+            (128, 24),
+            (128, 33),
+            (128, 64),
+            (128, 65),
+            (128, 128),
+            (128, 200),
+            (128, 2048),
+            (384, 6),
+            (384, 8192),
+            (1024, 17),
+            (1024, 33),
+            (1024, 64),
+            (1024, 96),
+            (1024, 128),
+            (1024, 2048),
+            (1024, 2049),
+        )
+    ],
 )
-@pytest.mark.parametrize("n", [128, 384, 1024])
 def test_mm_a16w16_fp32_matches_reference(m: int, n: int) -> None:
     a, b = _operands(m, n, 5120, seed=m * 7 + n)
     actual = _mm_fp32(a, b)
@@ -246,8 +272,24 @@ def _split_bf16_projection(x: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
     return projected
 
 
-@pytest.mark.parametrize("groups", [1, 2])
-@pytest.mark.parametrize("tokens", [1, 5, 40, 80, 300, 2048])
+# Every row tile of the quantizing reduction with one or two groups, and the
+# rows past those tiles.
+@pytest.mark.parametrize(
+    "tokens,groups",
+    [
+        pytest.param(tokens, groups, id=f"{tokens}-{groups}")
+        for tokens, groups in (
+            (1, 1),
+            (5, 2),
+            (40, 1),
+            (40, 2),
+            (80, 2),
+            (300, 1),
+            (2048, 1),
+            (2048, 2),
+        )
+    ],
+)
 def test_grouped_bf16_projection_fp8_matches_unfused(groups: int, tokens: int) -> None:
     x, weight = _two_group_operands(tokens, seed=tokens + 7)
     x, weight = x[:, :groups], weight[:groups]

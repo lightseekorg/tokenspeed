@@ -73,19 +73,50 @@ def _mxfp8_values(codes, exponents):
     return (codes.float() * scale).bfloat16()
 
 
-@pytest.mark.parametrize(
-    "fmt,bf16_x",
-    [("nvfp4", False), ("nvfp4", True), ("mxfp8", False), ("mxfp8", True)],
-)
-@pytest.mark.parametrize("per_token", [True, False])
-@pytest.mark.parametrize(
-    "tiles", [(16, 128, 256), (16, 64, 256), (32, 128, 128), (64, 128, 128)]
-)
+_EXPERT_MM_TILES = [(16, 128, 256), (16, 64, 256), (32, 128, 128), (64, 128, 128)]
 # Ragged shapes take the masked loop. Whole tiles of NVFP4 or MXFP8 weights
 # with BF16 activations take the LDS ring; 3 programs run several tiles each
 # through it.
+_EXPERT_MM_SHAPES = {
+    "ragged": (96, 160, False),
+    "whole": (128, 768, False),
+    "few-programs": (128, 768, True),
+}
+
+
+# Every format and activation kind runs each shape once. The tiles and input
+# indexing are spread so that every pair of values of any two axes runs, and
+# each tile runs once through the LDS ring.
 @pytest.mark.parametrize(
-    "n,k,few_programs", [(96, 160, False), (128, 768, False), (128, 768, True)]
+    "fmt,bf16_x,per_token,tiles,n,k,few_programs",
+    [
+        pytest.param(
+            fmt,
+            bf16_x,
+            per_token,
+            _EXPERT_MM_TILES[tile],
+            *_EXPERT_MM_SHAPES[shape],
+            id=(
+                f"{fmt}-{'bf16' if bf16_x else 'codes'}-"
+                f"{'per-token' if per_token else 'per-route'}-"
+                f"{'x'.join(map(str, _EXPERT_MM_TILES[tile]))}-{shape}"
+            ),
+        )
+        for fmt, bf16_x, per_token, tile, shape in (
+            ("nvfp4", False, True, 0, "ragged"),
+            ("nvfp4", False, False, 1, "whole"),
+            ("nvfp4", False, True, 2, "few-programs"),
+            ("nvfp4", True, False, 3, "ragged"),
+            ("nvfp4", True, True, 0, "whole"),
+            ("nvfp4", True, False, 1, "few-programs"),
+            ("mxfp8", False, False, 2, "ragged"),
+            ("mxfp8", False, True, 3, "whole"),
+            ("mxfp8", False, False, 0, "few-programs"),
+            ("mxfp8", True, True, 1, "ragged"),
+            ("mxfp8", True, False, 2, "whole"),
+            ("mxfp8", True, True, 3, "few-programs"),
+        )
+    ],
 )
 def test_expert_mm_masking_and_runtime_rows(
     fmt, bf16_x, per_token, tiles, n, k, few_programs
@@ -172,7 +203,9 @@ def test_expert_mm_masking_and_runtime_rows(
 
 
 @pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
-@pytest.mark.parametrize("tokens", [0, 1, 8, 17, 128, 1023, 1024, 1025])
+# No tokens, one, a partial second row tile, and both sides of the switch to
+# prefill tiles at 1024 tokens.
+@pytest.mark.parametrize("tokens", [0, 1, 17, 1023, 1024])
 # Ragged widths take the masked loop; 256-wide ones whole ring tiles.
 @pytest.mark.parametrize("hidden,intermediate", [(160, 96), (256, 256)])
 def test_registered_routes_preserve_bf16_boundaries(fmt, tokens, hidden, intermediate):

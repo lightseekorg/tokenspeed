@@ -138,7 +138,7 @@ def _case(
     retain_input=True,
     stamp_capacity=None,
     arena_step=2,
-    gate_error=None,
+    both_gates=False,
     state_dtype=torch.float32,
     output_norm=False,
 ):
@@ -320,11 +320,8 @@ def _case(
             )
             return verified(**inputs)
 
-        if gate_error:
-            if gate_error == "both":
-                kwargs.update(raw_g=gate, f_a_out=f_a, f_b_weight=f_b)
-            else:
-                kwargs.update(raw_g=None, f_a_out=f_a, f_b_weight=None)
+        if both_gates:
+            kwargs.update(raw_g=gate, f_a_out=f_a, f_b_weight=f_b)
             with pytest.raises(ValueError, match="gate"):
                 verify(**kwargs)
             return history
@@ -560,10 +557,12 @@ def test_retained_smoke_gfx1250():
     )
 
 
+# A count at capacity - width fits; one past it folds even when the request is
+# shorter than the window (test_retained_rounds folds a full-window overflow).
 @pytest.mark.parametrize(
     "capacity,initial_length,cross_page",
-    [(8, 4, False), (8, 6, False), (8, 7, False), (16, 3, True)],
-    ids=["equal", "short_window", "overflow", "source"],
+    [(8, 4, False), (8, 6, False), (16, 3, True)],
+    ids=["equal", "short_window", "source"],
 )
 def test_retained_capacity_and_source_gfx1250(capacity, initial_length, cross_page):
     _case(
@@ -579,13 +578,18 @@ def test_retained_capacity_and_source_gfx1250(capacity, initial_length, cross_pa
     )
 
 
+# Each geometry (fitting, width 1, exactly full, overflowing) and each of the
+# input modes (dense, strided unbounded, strided projected) runs at least once.
 @pytest.mark.parametrize(
-    "capacity,width,initial_length,accepted_rounds",
-    [(8, 4, 2, (2, 4)), (16, 1, 5, (0, 1)), (32, 4, 28, (4, 0)), (8, 4, 6, (2, 4))],
-)
-@pytest.mark.parametrize(
-    "strided,projected,lower_bound",
-    [(False, False, -5.0), (True, False, None), (True, True, -5.0)],
+    "capacity,width,initial_length,accepted_rounds,strided,projected,lower_bound",
+    [
+        pytest.param(8, 4, 2, (2, 4), False, False, -5.0, id="fits-dense"),
+        pytest.param(8, 4, 2, (2, 4), True, True, -5.0, id="fits-projected"),
+        pytest.param(16, 1, 5, (0, 1), True, False, None, id="width1-unbounded"),
+        pytest.param(32, 4, 28, (4, 0), True, True, -5.0, id="full-projected"),
+        pytest.param(8, 4, 6, (2, 4), False, False, -5.0, id="overflow-dense"),
+        pytest.param(8, 4, 6, (2, 4), True, False, None, id="overflow-unbounded"),
+    ],
 )
 def test_retained_rounds(
     capacity, width, initial_length, accepted_rounds, strided, projected, lower_bound
@@ -602,7 +606,8 @@ def test_retained_rounds(
     )
 
 
-@pytest.mark.parametrize("accepted", [0, 2, 4, 99, -1])
+# None, part, past every row's draft (clamped to each), and a negative count.
+@pytest.mark.parametrize("accepted", [0, 2, 99, -1])
 def test_retained_shared_source(accepted):
     _case(
         8,
@@ -649,8 +654,7 @@ def test_retained_gfx950_large_projected_gate():
     )
 
 
-@pytest.mark.parametrize("stamped", [False, True])
-def test_retained_unstamped_diagnostic(stamped):
+def test_retained_unstamped_diagnostic():
     _case(
         8,
         1,
@@ -660,7 +664,7 @@ def test_retained_unstamped_diagnostic(stamped):
         strided=False,
         projected=False,
         lower_bound=None,
-        stamped=stamped,
+        stamped=False,
     )
 
 
@@ -786,8 +790,8 @@ def test_retained_runtime_scalar_geometry_does_not_recompile(width):
         )
 
 
-@pytest.mark.parametrize("gate_error", ["both", "missing"])
-def test_retained_gate_selection_is_explicit(gate_error):
+def test_retained_gate_selection_is_explicit():
+    # A raw gate and a projected one together must not silently drop one.
     _case(
         8,
         1,
@@ -797,13 +801,20 @@ def test_retained_gate_selection_is_explicit(gate_error):
         strided=False,
         projected=False,
         lower_bound=None,
-        gate_error=gate_error,
+        both_gates=True,
     )
 
 
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+# BF16 state over each base (fitting, folded, cross-page); FP32 on the
+# cross-page base, whose second round reads the first round's live page.
 @pytest.mark.parametrize(
-    "cross_page,initial_length", [(False, 2), (False, 6), (True, 2)]
+    "cross_page,initial_length,state_dtype",
+    [
+        pytest.param(False, 2, torch.bfloat16, id="False-2-state_dtype0"),
+        pytest.param(False, 6, torch.bfloat16, id="False-6-state_dtype0"),
+        pytest.param(True, 2, torch.bfloat16, id="True-2-state_dtype0"),
+        pytest.param(True, 2, torch.float32, id="True-2-state_dtype1"),
+    ],
 )
 def test_retained_dense_base_rounds_only_when_materialized(
     state_dtype, cross_page, initial_length
@@ -821,8 +832,15 @@ def test_retained_dense_base_rounds_only_when_materialized(
     )
 
 
-@pytest.mark.parametrize("width", [1, 4])
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+# With test_retained_output_norm_smoke_gfx1250 (width 1, BF16 state), three of
+# the four width and state dtype pairs.
+@pytest.mark.parametrize(
+    "width,state_dtype",
+    [
+        pytest.param(4, torch.bfloat16, id="state_dtype0-4"),
+        pytest.param(1, torch.float32, id="state_dtype1-1"),
+    ],
+)
 def test_public_retained_verify_preserves_output_norm(width, state_dtype):
     _case(
         8,

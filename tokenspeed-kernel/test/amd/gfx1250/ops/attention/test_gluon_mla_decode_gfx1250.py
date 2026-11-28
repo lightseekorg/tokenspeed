@@ -318,13 +318,15 @@ def test_query_block_support_on_cdna5():
     )
 
 
-@pytest.mark.parametrize("use_gate", [False, True], ids=["no-gate", "gate"])
+# Kimi K3 verify at one request and 128 splits over a 50k context, and four
+# requests at 64 splits. The gate only scales the final store, so each split
+# count runs with or without it once.
 @pytest.mark.parametrize(
-    "batch_size,cache_length",
-    # Kimi K3 verify at one request and 128 splits over a 50k context, and
-    # four requests at 64 splits.
-    [(1, 50_250), (4, 4097)],
-    ids=["c1-50k", "c4-4k"],
+    "batch_size,cache_length,use_gate",
+    [
+        pytest.param(1, 50_250, True, id="c1-50k-gate"),
+        pytest.param(4, 4097, False, id="c4-4k-no-gate"),
+    ],
 )
 def test_query_block_projected_value_fuses_merge_and_projection(
     batch_size: int, cache_length: int, use_gate: bool

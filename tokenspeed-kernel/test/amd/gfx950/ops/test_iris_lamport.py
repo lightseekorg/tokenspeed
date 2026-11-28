@@ -39,8 +39,16 @@ def _require_iris():
     pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
 
 
-@pytest.mark.parametrize("rank", range(8))
-@pytest.mark.parametrize("fused_moe", (False, True))
+# Every rank's binary once, and both kernels on the first and last rank, whose
+# peer offsets and local-term position in the sum differ the most.
+@pytest.mark.parametrize(
+    "fused_moe,rank",
+    [
+        pytest.param(fused_moe, rank, id=f"{fused_moe}-{rank}")
+        for fused_moe, ranks in ((False, (0, 1, 3, 5, 7)), (True, (0, 2, 4, 6, 7)))
+        for rank in ranks
+    ],
+)
 def test_lamport_buffer_polling_codegen(rank, fused_moe, tmp_path):
     """Cache flags alone do not prevent a future compiler from hoisting loads.
 

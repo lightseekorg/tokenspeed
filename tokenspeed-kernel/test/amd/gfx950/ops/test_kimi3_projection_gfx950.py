@@ -59,24 +59,20 @@ if not is_cdna4():
     )
 
 
+# Each path once (see the dispatch boundaries below): the single-row GEMV in
+# both directions, the decode GEMM, a row count left to hipBLASLt, the
+# medium-M GEMM in both directions and the large-M GEMM in both directions.
 @pytest.mark.parametrize(
     "input_size,output_size,num_tokens",
     [
         (7168, 3584, 1),
         (3584, 7168, 1),
-        (3584, 7168, 2),
         (3584, 7168, 4),
         (7168, 3584, 128),
-        (3584, 7168, 128),
         (7168, 3584, 768),
-        (7168, 3584, 1024),
         (3584, 7168, 384),
-        (3584, 7168, 512),
         (3584, 7168, 2048),
         (7168, 3584, 4096),
-        (3584, 7168, 4096),
-        (7168, 3584, 8192),
-        (3584, 7168, 8192),
     ],
 )
 def test_kimi3_latent_projection_matches_torch(
@@ -172,7 +168,8 @@ def test_kimi3_latent_projection_writes_out_and_captures(
     torch.testing.assert_close(output, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 16, 24, 32, 64])
+# One row, each fused-addend decode bucket (4, 8, 16, 32) and the fallback.
+@pytest.mark.parametrize("num_tokens", [1, 2, 8, 16, 24, 64])
 def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     num_tokens: int,
 ) -> None:
@@ -200,7 +197,9 @@ def test_kimi3_latent_projection_add3_matches_torch_and_captures(
     torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 4, 16, 17, 32, 64])
+# The fused norm kernel (1-2 rows), the norm then fused add3 (3-32 rows, one
+# row count per bucket) and the composed fallback.
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 16, 17, 64])
 def test_kimi3_rmsnorm_linear_add_matches_composed_and_captures(
     num_tokens: int,
 ) -> None:

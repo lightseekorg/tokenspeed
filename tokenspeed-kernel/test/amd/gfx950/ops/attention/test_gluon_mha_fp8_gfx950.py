@@ -129,8 +129,16 @@ DECODE_CASES = [
 ]
 
 
-@pytest.mark.parametrize("has_sink", [False, True])
-@pytest.mark.parametrize("window_left,others,other_logit,max_seqlen_q", DECODE_CASES)
+# Every final store runs with the sink; full attention also without it.
+@pytest.mark.parametrize(
+    "window_left,others,other_logit,max_seqlen_q,has_sink",
+    [
+        pytest.param(*case.values, has_sink, id=f"{case.id}-{has_sink}")
+        for case in DECODE_CASES
+        for has_sink in (False, True)
+        if has_sink or case.id == "full-q1"
+    ],
+)
 def test_decode_keeps_small_fp8_probabilities(
     window_left, others, other_logit, max_seqlen_q, has_sink
 ):
@@ -163,9 +171,19 @@ def test_decode_keeps_small_fp8_probabilities(
     _check(out, expected, has_sink)
 
 
-@pytest.mark.parametrize("head_dim", EXTEND_HEAD_DIMS)
-@pytest.mark.parametrize("has_sink", [False, True])
-@pytest.mark.parametrize("window_left", [-1, OTHER_KEYS + 64])
+# Every head dim under full attention (split) and a window (single pass);
+# the sink alternates so each path runs with and without it.
+@pytest.mark.parametrize(
+    "window_left,has_sink,head_dim",
+    [
+        (-1, False, 64),
+        (OTHER_KEYS + 64, True, 64),
+        (-1, True, 128),
+        (OTHER_KEYS + 64, False, 128),
+        (-1, False, 256),
+        (OTHER_KEYS + 64, True, 256),
+    ],
+)
 def test_extend_keeps_small_fp8_probabilities(window_left, has_sink, head_dim):
     rows = 32
     num_keys = 1 + OTHER_KEYS + rows
@@ -213,9 +231,21 @@ PREFILL_CASES = [
 ]
 
 
-@pytest.mark.parametrize("head_dim", HEAD_DIMS)
-@pytest.mark.parametrize("has_sink", [False, True])
-@pytest.mark.parametrize("others,other_logit,first_checked_row", PREFILL_CASES)
+# The sink alternates across the head dims of each case.
+@pytest.mark.parametrize(
+    "others,other_logit,first_checked_row,has_sink,head_dim",
+    [
+        pytest.param(
+            *case.values, has_sink, head_dim, id=f"{case.id}-{has_sink}-{head_dim}"
+        )
+        for case, sink_by_head_dim in zip(
+            PREFILL_CASES,
+            (((True, 64), (False, 128)), ((False, 64), (True, 128))),
+            strict=True,
+        )
+        for has_sink, head_dim in sink_by_head_dim
+    ],
+)
 def test_prefill_keeps_small_fp8_probabilities(
     others, other_logit, first_checked_row, has_sink, head_dim
 ):
@@ -262,9 +292,29 @@ def _random_fp8(*shape: int, scale: float, seed: int) -> torch.Tensor:
     return x.to(FP8)
 
 
-@pytest.mark.parametrize("head_dim", EXTEND_HEAD_DIMS)
-@pytest.mark.parametrize("window_left", [-1, 255])
-@pytest.mark.parametrize("prefix,rows", [(0, 1024), (2048, 32), (2048, 1024)])
+# Every head dim and window runs a short extend over a prefix (64-row tile)
+# and one 1024-row case (128-row tile), with or without a prefix in turn.
+@pytest.mark.parametrize(
+    "prefix,rows,window_left,head_dim",
+    [
+        pytest.param(
+            prefix,
+            rows,
+            window_left,
+            head_dim,
+            id=f"{head_dim}-{window_left}-{prefix}-{rows}",
+        )
+        for head_dim, window_left, long_prefix in (
+            (64, -1, 0),
+            (64, 255, 2048),
+            (128, -1, 2048),
+            (128, 255, 0),
+            (256, -1, 0),
+            (256, 255, 2048),
+        )
+        for prefix, rows in ((2048, 32), (long_prefix, 1024))
+    ],
+)
 def test_extend_matches_reference_on_random_fp8(prefix, rows, window_left, head_dim):
     num_keys = prefix + rows
     k = _random_fp8(num_keys, KV_HEADS, head_dim, scale=1.0, seed=1)
@@ -376,8 +426,9 @@ def test_balanced_decode_matches_reference_on_random_fp8(max_seqlen_q):
         assert _rel_l2(out[rows], expected) < RANDOM_INPUT_REL_L2
 
 
-@pytest.mark.parametrize("scale", ["q_scale", "k_scale", "v_scale"])
-def test_decode_and_extend_reject_block_scales(scale):
+def test_decode_and_extend_reject_block_scales():
+    # Ignoring a block scale would silently mis-scale every product.
+    scale = "k_scale"
     k, v = _keys_and_values(PAGE_SIZE, 0.0, 64)
     k_cache, v_cache, page_table = _paged(k, v)
     q = _queries(1, 64)

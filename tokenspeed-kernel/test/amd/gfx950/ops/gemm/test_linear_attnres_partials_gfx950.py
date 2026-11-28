@@ -99,9 +99,11 @@ def _check(hidden, weight, blocks, scores, scratch, out):
         )
 
 
+# Block counts are a runtime argument (the four-token test below sweeps them);
+# one block and several.
 @pytest.mark.parametrize("output_size", [3648, 6288])
 @pytest.mark.parametrize("tokens", [1, 2, 4])
-@pytest.mark.parametrize("num_blocks", [1, 8, 11])
+@pytest.mark.parametrize("num_blocks", [1, 11])
 def test_projection_and_attnres_partials_match_torch(
     output_size: int, tokens: int, num_blocks: int
 ) -> None:
@@ -165,9 +167,11 @@ def _assert_bitwise(out, scratch, expected_out, expected_scratch):
             assert torch.equal(a.view(torch.int32), e.view(torch.int32))
 
 
+# Token and block counts are runtime arguments: a partial and a full 16-row
+# tile, one block and several.
 @pytest.mark.parametrize("output_size", [3648, 3808, 6288])
-@pytest.mark.parametrize("tokens", [5, 8, 16])
-@pytest.mark.parametrize("num_blocks", [1, 6, 11])
+@pytest.mark.parametrize("tokens", [5, 16])
+@pytest.mark.parametrize("num_blocks", [1, 11])
 def test_gemv_tokens_match_unfused_projection_and_partials_bitwise(
     output_size: int, tokens: int, num_blocks: int
 ) -> None:

@@ -117,20 +117,46 @@ def _plan(splits: int, rows: int, chain: int) -> Plan:
     )
 
 
-@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("requests", [1, 2])
-@pytest.mark.parametrize("rows", [1, 8])
+_LENGTHS = [
+    (6, 2048, SLIDING_SPLITS),
+    (3000, 2048, SLIDING_SPLITS),
+    # Fewer keys than one chunk: only split 0 has cached keys, and the
+    # last split, which takes the launch's tokens, has none.
+    (6, 0, FULL_SPLITS),
+    (3000, 0, FULL_SPLITS),
+    (9000, 0, FULL_SPLITS),
+]
+# (rows, requests) of a launch in two halves: one decode row or a verify's 8
+# chained rows, of one request or two. Each length runs one half with a BF16
+# cache and the other with FP8, swapping from one length to the next: every
+# length runs every (rows, requests), and each kind of layer every (rows,
+# requests) with both cache dtypes (each a compiled specialization).
+_LAUNCHES = (((1, 1), (8, 2)), ((1, 2), (8, 1)))
+
+
+def _attention_cases() -> list:
+    cases = []
+    for i, (length, window, splits) in enumerate(_LENGTHS):
+        for d, (kv_dtype, name) in enumerate(
+            ((torch.bfloat16, "bf16"), (torch.float8_e4m3fn, "fp8"))
+        ):
+            for rows, requests in _LAUNCHES[(i + d) % 2]:
+                cases.append(
+                    pytest.param(
+                        length,
+                        window,
+                        splits,
+                        rows,
+                        requests,
+                        kv_dtype,
+                        id=f"{length}-{window}-{splits}-{rows}-{requests}-{name}",
+                    )
+                )
+    return cases
+
+
 @pytest.mark.parametrize(
-    "length,window,splits",
-    [
-        (6, 2048, SLIDING_SPLITS),
-        (3000, 2048, SLIDING_SPLITS),
-        # Fewer keys than one chunk: only split 0 has cached keys, and the
-        # last split, which takes the launch's tokens, has none.
-        (6, 0, FULL_SPLITS),
-        (3000, 0, FULL_SPLITS),
-        (9000, 0, FULL_SPLITS),
-    ],
+    "length, window, splits, rows, requests, kv_dtype", _attention_cases()
 )
 def test_attention_matches_the_regular_path_math(
     length, window, splits, rows, requests, kv_dtype

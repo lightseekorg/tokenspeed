@@ -364,6 +364,10 @@ def test_mxfp8_expert_stages_equal_regular_routes(dims, rows, chain):
     local = ((ids >= base) & (ids < base + LOCAL)).view(-1)
     got_hq = hq_routes.bfloat16()[local].view(torch.int16)
     assert torch.equal(got_hq, regular_hq[local].view(torch.int16))
+    # Every route has the regular GEMMs' bits; the GEMMs' torch math (an
+    # expert's dequantized weights a route) is checked on the first and last
+    # rows' routes, which cover the shared and the varying experts.
+    math_rows = (0, rows - 1)
     for r in range(rows):
         for k in range(8):
             e = int(ids[r, k]) - base
@@ -372,16 +376,16 @@ def test_mxfp8_expert_stages_equal_regular_routes(dims, rows, chain):
             assert (
                 scratch[plan.offset("hq_flag") + r * plan.row_pairs + k] >> 32
             ) == tag
-            w13 = up_values(e).cpu()
             gate_up = _route_pairs(scratch, plan, "gate_up", r, k, INTER, tag)
-            _assert_dot_close(gate_up, xq[r : r + 1], w13)
+            if r in math_rows:
+                _assert_dot_close(gate_up, xq[r : r + 1], up_values(e).cpu())
             assert torch.equal(gate_up, regular_up[r * 8 + k]), (r, k)
             # From the kernel's gate_up on: h, its quantization and w2.
             hq = _mxfp8_reference(_swiglu(gate_up, weights[r, k]).view(1, -1))[0]
             assert torch.equal(hq_routes[r * 8 + k], hq), (r, k)
-            w2 = down_values(e).cpu()
             got = _route_pairs(scratch, plan, "ex2", r, k, H // 2, tag)
-            _assert_dot_close(got, hq.view(1, -1), w2)
+            if r in math_rows:
+                _assert_dot_close(got, hq.view(1, -1), down_values(e).cpu())
             assert torch.equal(got, regular_down[r * 8 + k]), (r, k)
 
 

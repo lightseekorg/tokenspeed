@@ -59,7 +59,8 @@ def run(args, candidate):
     )
 
 
-@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 64, 128, 256, 848, 896, 8192])
+# Rows are a runtime argument; the row-count test below sweeps them.
+@pytest.mark.parametrize("rows", [1, 33, 8192])
 @pytest.mark.parametrize("strided", [False, True])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_queries_and_unchanged_keys_are_byte_exact(rows, strided, dtype):

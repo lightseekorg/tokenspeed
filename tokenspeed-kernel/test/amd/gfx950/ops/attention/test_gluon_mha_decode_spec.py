@@ -149,9 +149,13 @@ def check_output(actual, expected):
     torch.testing.assert_close(actual.float(), expected, atol=0.006, rtol=0.006)
 
 
-@pytest.mark.parametrize("concurrency", [1, 2, 4, 8, 16])
+# One request, the most that keep short-window splits per request, and more.
+@pytest.mark.parametrize("concurrency", [1, 4, 16])
 @pytest.mark.parametrize("mode", ["full", "window", "draft"])
-@pytest.mark.parametrize("context", [17, 63, 64, 65, 8192, 50000])
+# One key before the block, one full page, a page and one key, and nearly the
+# page table's width. Requests past the first are 1-3 keys shorter, so 63 and
+# 62 keys run too.
+@pytest.mark.parametrize("context", [17, 64, 65, 50000])
 def test_spec_decode_graph_replay(concurrency, mode, context):
     if not is_cdna4():
         pytest.skip("requires gfx950")
@@ -218,9 +222,18 @@ def assert_uniform_groups_bitwise(inputs, groups):
         assert torch.equal(grouped.view(torch.int16), rows.view(torch.int16)), solution
 
 
-@pytest.mark.parametrize("running", [8, 12, 16])
-@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.bfloat16])
-@pytest.mark.parametrize("window", [2047, -1])
+# 12 requests take each length once; 8 and 16 drop or repeat some.
+@pytest.mark.parametrize(
+    "running,kv_dtype,window",
+    [
+        pytest.param(12, torch.float8_e4m3fn, 2047, id="12-fp8-2047"),
+        pytest.param(12, torch.bfloat16, 2047, id="12-bf16-2047"),
+        pytest.param(12, torch.float8_e4m3fn, -1, id="12-fp8-full"),
+        pytest.param(12, torch.bfloat16, -1, id="12-bf16-full"),
+        pytest.param(8, torch.bfloat16, 2047, id="8-bf16-2047"),
+        pytest.param(16, torch.float8_e4m3fn, -1, id="16-fp8-full"),
+    ],
+)
 def test_uniform_row_groups_keep_every_bit_at_draft_shapes(running, kv_dtype, window):
     """A block drafter's attention (8 positions, 16 query / 2 KV heads, dim 128)
     over ragged lengths: tiny, around a page boundary, around the window edge

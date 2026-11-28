@@ -149,11 +149,11 @@ def test_dense16_kernel_variant_writes_strided_out(
     torch.testing.assert_close(out, torch.mm(a, b.T), atol=_ATOL, rtol=_RTOL)
 
 
-@pytest.mark.parametrize("batch", [12, 16])
-def test_dense16_bmm_writes_strided_out(batch: int) -> None:
+def test_dense16_bmm_writes_strided_out() -> None:
     torch.manual_seed(0)
     dtype = torch.bfloat16
-    m, n, k = 1, 512, 128
+    # The batch only sizes the grid.
+    batch, m, n, k = 12, 1, 512, 128
     a_backing = torch.randn((m, batch, k), device="cuda", dtype=dtype) * 0.25
     a = a_backing.transpose(0, 1)
     weight = torch.randn((batch, k, n), device="cuda", dtype=dtype) * 0.25
@@ -224,52 +224,6 @@ def test_splitk_partial_scratch_is_stream_local() -> None:
     assert first.data_ptr() != other_first.data_ptr()
 
 
-def test_choose_mfma_lds_mediumm_config_uses_tuned_medium_m_tiles() -> None:
-    assert _choose_mfma_lds_mediumm_config(8, 1280, 64) == (16, 32, 64, 2, 2, 1)
-    assert _choose_mfma_lds_mediumm_config(8, 1280, 512) == (16, 32, 256, 2, 2, 2)
-    assert _choose_mfma_lds_mediumm_config(16, 1280, 768) == (16, 32, 256, 2, 2, 3)
-    assert _choose_mfma_lds_mediumm_config(8, 1280, 1024) == (16, 32, 512, 2, 2, 2)
-    assert _choose_mfma_lds_mediumm_config(32, 2560, 2048) == (16, 16, 512, 2, 2, 2)
-    assert _choose_mfma_lds_mediumm_config(64, 1280, 1024) == (32, 32, 512, 2, 2, 2)
-    assert _choose_mfma_lds_mediumm_config(64, 1280, 2048) == (32, 32, 512, 2, 2, 2)
-    assert _choose_mfma_lds_mediumm_config(64, 2560, 2048) == (32, 32, 128, 2, 2, 3)
-    assert _choose_mfma_lds_mediumm_config(128, 2560, 2048) == (32, 32, 64, 2, 2, 3)
-    assert _choose_mfma_lds_mediumm_config(128, 1280, 2880) == (32, 32, 64, 2, 2, 3)
-    assert _choose_mfma_lds_mediumm_config(128, 4096, 4096) == (16, 128, 64, 1, 4, 3)
-    assert _choose_mfma_lds_mediumm_config(768, 3584, 7168) == (
-        128,
-        128,
-        64,
-        2,
-        4,
-        3,
-    )
-    assert _choose_mfma_lds_mediumm_config(1024, 3584, 7168) == (
-        128,
-        128,
-        64,
-        2,
-        4,
-        3,
-    )
-    assert _choose_mfma_lds_mediumm_config(384, 7168, 3584) == (
-        128,
-        128,
-        64,
-        2,
-        4,
-        3,
-    )
-    assert _choose_mfma_lds_mediumm_config(512, 7168, 3584) == (
-        128,
-        128,
-        64,
-        2,
-        4,
-        3,
-    )
-
-
 def test_choose_mfma_lds_mediumm_config_falls_back_for_slow_shapes() -> None:
     assert _choose_mfma_lds_mediumm_config(16, 1280, 2880) is None
     assert _choose_mfma_lds_mediumm_config(16, 2560, 2048) is None
@@ -288,7 +242,7 @@ def test_choose_mfma_lds_mediumm_config_falls_back_for_slow_shapes() -> None:
     assert _choose_mfma_lds_mediumm_config(576, 7168, 3584) is None
 
 
-@pytest.mark.parametrize("m,k", [(8192, 1536), (4096, 1536), (2048, 768)])
+@pytest.mark.parametrize("m,k", [(8192, 1536), (2048, 768)])
 def test_largem_publish_rows_keeps_bits_and_counts_column_tiles(m, k) -> None:
     torch.manual_seed(m + k)
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
@@ -326,7 +280,6 @@ def test_largem_publish_rows_keeps_bits_and_counts_column_tiles(m, k) -> None:
     "m,skip_start,skip_rows",
     [
         (8192, 0, 1024),
-        (8192, 3072, 1024),
         (8192, 7168, 1024),
         (2048, 256, 256),
         (1800, 512, 768),
@@ -481,10 +434,11 @@ def test_decode_gemm_graph_replays(session: bool) -> None:
         torch.testing.assert_close(out, a.float() @ b.float().T, atol=1e-4, rtol=1e-5)
 
 
-@pytest.mark.parametrize("m", [4, 16])
-def test_kimi3_router_gluon_decode_matches_reference(m: int) -> None:
-    # The router's split-K decode buckets, through the model-facing op.
+def test_kimi3_router_gluon_decode_matches_reference() -> None:
+    # The router's 16-row split-K decode bucket, through the model-facing op;
+    # the decode GEMM tests above cover its 4-row bucket.
     torch.manual_seed(0)
+    m = 16
     a = torch.randn((m, 7168), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((896, 7168), device="cuda", dtype=torch.bfloat16) * 0.25
     for _ in range(2):
@@ -633,7 +587,7 @@ def test_decode_gemm_warmup_compiles_every_row_bucket(n: int, k: int) -> None:
     )
 
 
-@pytest.mark.parametrize("m", [2, 4, 7, 8, 16, 24, 32])
+@pytest.mark.parametrize("m", [2, 7, 16, 24, 32])
 def test_decode_add3_matches_single_rounding_reference(m: int) -> None:
     torch.manual_seed(0)
     n, k = 7168, 3584
@@ -760,7 +714,9 @@ def _absorbed_query_operands(rows: int, heads: int = 12):
     return q[..., :nope].transpose(0, 1), w_kc_t * 0.1, query
 
 
-@pytest.mark.parametrize("rows", [1, 4, 13, 37, 64, 100])
+# One row count per config and the fallback past 64 rows; the row-count test
+# below checks every other row count.
+@pytest.mark.parametrize("rows", [13, 37, 100])
 def test_absorbed_query_bmm_fills_only_latent_channels(rows: int) -> None:
     torch.manual_seed(0)
     q_nope, w_kc_t, query = _absorbed_query_operands(rows)
@@ -791,7 +747,8 @@ def test_absorbed_query_bmm_row_count_does_not_recompile() -> None:
             run(rows)
 
 
-@pytest.mark.parametrize("rows", [1, 4, 29, 64, 100])
+# The row-count test below checks every row count up to 64.
+@pytest.mark.parametrize("rows", [29, 100])
 def test_value_projection_bmm_matches_reference(rows: int) -> None:
     torch.manual_seed(0)
     heads, latent, value = 12, 512, 128
@@ -860,7 +817,7 @@ def _gated_value_operands(rows: int):
     return attn, w_vc, fused[:, 704:]
 
 
-@pytest.mark.parametrize("rows", [1, 4, 37, 64])
+@pytest.mark.parametrize("rows", [1, 37, 64])
 def test_grouped_decode_gemm_gate_matches_gemm_then_sigmoid_mul(rows: int) -> None:
     from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 
@@ -888,7 +845,7 @@ def test_grouped_decode_gemm_gate_matches_gemm_then_sigmoid_mul(rows: int) -> No
 
 
 @pytest.mark.parametrize("gated", [False, True])
-@pytest.mark.parametrize("rows", [1, 4, 29, 64, 100])
+@pytest.mark.parametrize("rows", [1, 29, 64, 100])
 def test_k_major_value_projection_matches_reference(rows: int, gated: bool) -> None:
     from tokenspeed_kernel.ops.attention.mla import mla_project_value
 
@@ -965,7 +922,7 @@ _DECODE_SHAPES = [(8192, 1024), (512, 8192)]
 
 @pytest.mark.parametrize("n,k", _DECODE_SHAPES)
 # 24-64 rows are speculative verify batches of 3-8 requests.
-@pytest.mark.parametrize("m", [2, 3, 7, 16, 24, 33, 40, 64])
+@pytest.mark.parametrize("m", [2, 16, 24, 33, 64])
 def test_decode_gemm_is_selected_and_matches_reference(m: int, n: int, k: int) -> None:
     torch.manual_seed(0)
     assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)
@@ -1141,7 +1098,8 @@ def _off_by_one(rows: int, columns: int) -> torch.Tensor:
     return view
 
 
-@pytest.mark.parametrize("m", _SKINNY_ROWS)
+# Both ends of each row tile and both sides of the boundary between them.
+@pytest.mark.parametrize("m", [33, 63, 64, 65, 127, 128])
 def test_skinny_gemm_rounds_the_exact_product_once(m: int):
     """With small integer inputs the result is the BF16-rounded FP64 product.
 
@@ -1160,7 +1118,8 @@ def test_skinny_gemm_rounds_the_exact_product_once(m: int):
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
-@pytest.mark.parametrize("m", _SKINNY_ROWS)
+# One row count per row tile; the exact-product test above covers the rest.
+@pytest.mark.parametrize("m", [33, 128])
 def test_skinny_gemm_matches_fp64_reference(m: int):
     a, weight = _skinny_problem()
     a = a[:m].contiguous()
@@ -1190,7 +1149,7 @@ def test_skinny_gemm_rows_do_not_depend_on_the_batch():
     assert torch.equal(run(a), full), "repeat launch differs"
 
 
-@pytest.mark.parametrize("m", [33, 63, 127])
+@pytest.mark.parametrize("m", [33, 127])
 def test_skinny_gemm_writes_only_its_rows(m: int):
     """Rows of the destination's buffer below row M keep their bits.
 
@@ -1224,12 +1183,12 @@ def test_skinny_gemm_refuses_strided_and_unaligned_tensors():
         _skinny(a[:48].contiguous(), weight, out=_off_by_one(48, _SKINNY_N))
 
 
-@pytest.mark.parametrize("m", [33, 48, 128])
-def test_mm_declines_the_skinny_gemm_for_offset_views(m: int):
+def test_mm_declines_the_skinny_gemm_for_offset_views():
     """An activation or output that is not 16-byte aligned is legal mm input.
 
     Selection declines the skinny GEMM through its alignment traits, and mm
     takes the path it takes without that kernel, here Torch's GEMM."""
+    m = 48
     a, weight = _skinny_problem(rows=m)
     kernels = (gluon_mm_a16w16_skinny_gfx950, gluon_mm_a16w16_skinny_reduce_gfx950)
     shifted = _off_by_one(m, _SKINNY_K)

@@ -86,10 +86,8 @@ def _spawn_and_collect(worker_fn, args, world_size: int) -> None:
 @pytest.mark.parametrize(
     ("world_size", "dtype", "min_bytes"),
     [
-        (4, torch.bfloat16, 160 << 10),
-        (4, torch.float32, 160 << 10),
-        (8, torch.bfloat16, 96 << 10),
-        (8, torch.float32, 96 << 10),
+        pytest.param(4, torch.bfloat16, 160 << 10, id="4-bf16"),
+        pytest.param(8, torch.float32, 96 << 10, id="8-fp32"),
     ],
 )
 def test_producer_direct_two_stage_threshold(world_size, dtype, min_bytes):

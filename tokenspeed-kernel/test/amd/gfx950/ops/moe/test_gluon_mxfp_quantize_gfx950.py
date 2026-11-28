@@ -394,7 +394,8 @@ def test_swiglu_quantize_layout_specialization_is_bit_exact_gfx950(
     # single workgroup materialising next_power_of_2(numel) elements; 32 and 48
     # survived only by spilling, at up to 50x the cost of the small widths.
     # 4 and 5 straddle the single-pass bound at hidden 3584 (16,384 vs 32,768 padded).
-    [1, 4, 5, 8, 16, 18, 19, 32, 48, 49, 64, 128, 1024],
+    # 18 and 19 straddle a power-of-two partial count (8 vs 9 partials).
+    [1, 4, 5, 18, 19, 32, 49, 64, 128, 1024],
 )
 def test_dynamic_fp8_quantize_scales_past_one_workgroup_gfx950(
     num_tokens: int,

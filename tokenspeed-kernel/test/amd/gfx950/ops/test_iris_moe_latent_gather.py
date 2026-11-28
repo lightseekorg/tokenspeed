@@ -47,9 +47,16 @@ def _require_iris():
     pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
 
 
-@pytest.mark.parametrize("routed", (False, True))
-@pytest.mark.parametrize("quantize", (False, True))
-@pytest.mark.parametrize("rank", (0, 7))
+# Both kernels with and without quantization; each on the first and last rank.
+@pytest.mark.parametrize(
+    "rank,quantize,routed",
+    (
+        pytest.param(0, False, False, id="0-False-False"),
+        pytest.param(7, True, False, id="7-True-False"),
+        pytest.param(7, False, True, id="7-False-True"),
+        pytest.param(0, True, True, id="0-True-True"),
+    ),
+)
 def test_latent_input_gather_codegen(rank, quantize, routed, tmp_path):
     """Publishers store whole words; the gathering retry rereads its words and
     votes with one lane mask, also in the routed kernel, which adds the router

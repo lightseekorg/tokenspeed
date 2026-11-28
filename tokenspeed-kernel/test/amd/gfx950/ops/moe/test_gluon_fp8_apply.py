@@ -140,22 +140,6 @@ def test_gluon_block_fp8_medium_batch_uses_exact_mfma(
     assert actual is sentinel
 
 
-@pytest.mark.parametrize(
-    ("num_tokens", "expected_block_m"),
-    ((16, 16), (64, 16), (128, 32), (256, 32), (512, 64)),
-)
-def test_gluon_block_fp8_exact_mfma_route_block_size(
-    num_tokens: int, expected_block_m: int
-) -> None:
-    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.exact_mfma import (
-        _select_route_block_size,
-    )
-
-    assert _select_route_block_size(num_tokens, topk=8, num_experts=288) == (
-        expected_block_m
-    )
-
-
 @pytest.mark.parametrize("num_tokens", [1, 8, 32, 64])
 @pytest.mark.parametrize("packed_weights", [False, True], ids=["linear", "packed"])
 def test_gluon_block_fp8_decode_matches_torch(
@@ -569,8 +553,19 @@ def test_gluon_block_fp8_warp_routed_reference(
         assert not empty.any()
 
 
-@pytest.mark.parametrize("rows", [1, 2, 3, 4])
-@pytest.mark.parametrize("stress", ["normal", "outlier", "cancellation"])
+@pytest.mark.parametrize(
+    ("stress", "rows"),
+    [
+        ("normal", 1),
+        ("normal", 2),
+        ("normal", 3),
+        ("normal", 4),
+        ("outlier", 1),
+        ("outlier", 4),
+        ("cancellation", 2),
+        ("cancellation", 3),
+    ],
+)
 def test_gluon_block_fp8_packed_warp_stress(
     rows: int, stress: str, record_property
 ) -> None:

@@ -65,9 +65,17 @@ def _reference(x, q, scale):
     return exact.to(x.dtype)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+# BF16 on every row tile (BLOCK_M 16 at one and seven rows, 32, 64, 128) of
+# every shape; FP16 changes only the MFMA operand type, so it takes the single
+# row and one multi-row tile.
+@pytest.mark.parametrize(
+    "m,dtype",
+    [
+        *(pytest.param(m, torch.bfloat16, id=f"{m}-bf16") for m in (1, 7, 24, 64, 128)),
+        *(pytest.param(m, torch.float16, id=f"{m}-fp16") for m in (1, 24)),
+    ],
+)
 @pytest.mark.parametrize("n,k", _SHAPES)
-@pytest.mark.parametrize("m", [1, 7, 24, 64, 128])
 def test_gemv_matches_reference(m, n, k, dtype):
     torch.manual_seed(n + k + m)
     x = torch.randn(m, k, device="cuda", dtype=dtype)
