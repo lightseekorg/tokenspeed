@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "tenant_prefix": "l3serving",
+  "mooncake": {
+    "protocol": "tcp",
+    "device_name": "",
+    "metadata_server": "P2PHANDSHAKE",
+    "local_hostname": "localhost"
+  },
+  "provider": {
+    "segment_bytes": 268435456
+  },
+  "timeouts": {
+    "engine_startup_seconds": 3600,
+    "request_seconds": 600,
+    "put_evidence_seconds": 300,
+    "metrics_poll_interval_seconds": 2
+  },
+  "async_overrides": {
+    "wait_timeout_ms": 30000,
+    "ready_timeout_ms": 5000,
+    "max_prefetch_tokens": 2048
+  },
+  "cases": [
+    {
+      "name": "qwen3-dense",
+      "model_path": "Qwen/Qwen3-0.6B",
+      "dtype": "bfloat16",
+      "extra_engine_args": [],
+      "page_granularity_tokens": 64,
+      "chunked_prefill_tokens": 512,
+      "min_prefix_tokens": 1024,
+      "max_model_len": 4096,
+      "max_num_seqs": 4,
+      "max_prefill_tokens": 512,
+      "gpu_memory_utilization": 0.7,
+      "kvstore_ratio": 2.0,
+      "seed": 42,
+      "writer_max_new_tokens": 4,
+      "suffix_max_new_tokens": 24,
+      "min_output_tokens": 8,
+      "max_token_mismatches": 0,
+      "logprob_atol": 0.0001,
+      "min_put_success_keys": 1,
+      "min_put_success_bytes": 4096,
+      "min_get_success_keys": 1,
+      "min_get_success_bytes": 4096,
+      "min_l3_query_hit_tokens": 1024
+    }
+  ]
+}

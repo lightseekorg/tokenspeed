@@ -64,6 +64,15 @@ export default defineConfig({
           { text: "Weight Memory Policies", link: "/serving/weight-memory" },
           { text: "Ascend Memory Saver", link: "/serving/ascend-memory-saver" }
         ]
+      },
+      {
+        text: "Operations",
+        items: [
+          {
+            text: "Native Mooncake L3 Validation",
+            link: "/operations/native-l3-validation"
+          }
+        ]
       }
     ],
     search: {
