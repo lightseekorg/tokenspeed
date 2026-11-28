@@ -56,6 +56,7 @@ def _config(monkeypatch, device, backend_name, **overrides):
             device=lambda name: SimpleNamespace(type=name),
             bfloat16=torch.bfloat16,
             int8=torch.int8,
+            uint8=torch.uint8,
         ),
     )
     packed_width = overrides.pop("packed_width", 576)
@@ -205,6 +206,7 @@ _K31_SPARSE_LEAF = dict(
     qcp_group=(0,),
     data_type=torch.bfloat16,
     q_data_type=torch.bfloat16,
+    kv_cache_mxfp4=False,
     qk_nope_head_dim=128,
     kv_lora_rank=512,
     qk_rope_head_dim=64,

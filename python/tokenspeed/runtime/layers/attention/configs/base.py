@@ -120,6 +120,12 @@ def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
     elif kv_cache_dtype_str == "mxfp8":
         # fp8-e4m3 data; the UE8M0 scale sidecar lives in the pool's scale buffers (kv_cache_mxfp8)
         return torch.float8_e4m3fn
+    elif kv_cache_dtype_str == "mxfp4":
+        # Packed MLA latent rows only (MLAConfig.generate); no dtype names them.
+        raise ValueError(
+            "--kv-cache-dtype mxfp4 stores packed MLA latent rows; only DSA "
+            "MLA attention (Kimi-K3.1) takes it"
+        )
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {kv_cache_dtype_str!r}")
 
@@ -194,6 +200,9 @@ class AttnConfig:
     kv_cache_quant_method: str
     # MXFP8 KV: UE8M0 vec-32 scale sidecar in pool buffers; kv_cache_dtype alone can't express it
     kv_cache_mxfp8: bool = False
+    # MXFP4 MLA latent rows (kv_cache_dtype uint8): E2M1 latent codes, a UE8M0
+    # exponent per 32 of them and the BF16 RoPE key (ops.kvcache.mla_mxfp4).
+    kv_cache_mxfp4: bool = False
     # Tokens covered by one attention-kernel page. None picks the backend's
     # per-kernel default (flexible kernels use their group's block
     # granularity; fixed-page kernels use their own constant). For the
@@ -256,6 +265,38 @@ class AttnConfig:
             )
         if self.kv_cache_dtype == torch.int8:
             raise ValueError("INT8 KV cache is not supported by the runtime")
+        # MXFP4 latent rows are bytes. uint8 alone does not mean MXFP4: the
+        # DeepSeek V4.1 config stores its packed rows as uint8 too.
+        if self.kv_cache_mxfp4 and self.kv_cache_dtype != torch.uint8:
+            raise ValueError(
+                "MXFP4 MLA latent rows are uint8, got kv_cache_dtype "
+                f"{self.kv_cache_dtype}"
+            )
+        if self.kv_cache_mxfp4:
+            softmax = softmax_components[0]
+            # A hybrid model's config names the composite backend; the
+            # registry checks the full-attention leaf it resolves.
+            if not softmax.is_dsa or softmax.backend_name not in (
+                None,
+                "dsa",
+                "hybrid_linear_attn",
+            ):
+                raise ValueError(
+                    "--kv-cache-dtype mxfp4 is read by the GPU DSA sparse MLA "
+                    f"attention only; got backend {softmax.backend_name!r} "
+                    f"(dsa={softmax.is_dsa})"
+                )
+            if self.kv_cache_quant_method not in (None, "none"):
+                raise ValueError(
+                    "--kv-cache-dtype mxfp4 carries its own scales; got "
+                    f"--kv-cache-quant-method {self.kv_cache_quant_method!r}"
+                )
+            if self.kvp_size > 1:
+                # The DCP decode, history gathers and partial combines read
+                # BF16/FP8 latent rows.
+                raise ValueError(
+                    "--kv-cache-dtype mxfp4 does not support --kv-parallel-size > 1"
+                )
         if self.qcp_size > 1:
             softmax = softmax_components[0]
             # DSA gathers paged history; V4.1 publishes its packed KV from
@@ -360,6 +401,7 @@ def model_wide_kwargs(
     *,
     kv_cache_dtype: torch.dtype,
     kv_cache_mxfp8: bool = False,
+    kv_cache_mxfp4: bool = False,
     draft_block_decode: bool = False,
     draft_block_causal: bool = False,
     speculative_num_draft_tokens: int | None = None,
@@ -390,6 +432,7 @@ def model_wide_kwargs(
         dtype=model_config.dtype,
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_mxfp8=kv_cache_mxfp8,
+        kv_cache_mxfp4=kv_cache_mxfp4,
         kv_cache_quant_method=server_args.kv_cache_quant_method,
         context_len=model_config.context_len + server_args.spec_context_pad,
         max_bs=max_bs,

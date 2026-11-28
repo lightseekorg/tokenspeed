@@ -578,6 +578,7 @@ def _records_leaf(dsa, group, rank, query_layout):
     leaf.prefill_kernel_plan = None
     leaf.slot_order = "selection"
     leaf.data_type = torch.float8_e4m3fn
+    leaf.kv_cache_mxfp4 = False
     leaf.kv_lora_rank = 512
     leaf.qk_nope_head_dim = 128
     leaf.qk_rope_head_dim = 64

@@ -28,6 +28,10 @@ from tokenspeed_kernel.ops.attention.prologue import (
     LatentKVCache,
     PerTokenHeadPlanes,
 )
+from tokenspeed_kernel.ops.kvcache.mla_mxfp4 import (
+    dequant_gather_mla_latent_mxfp4,
+    quantize_store_mla_latent_mxfp4,
+)
 from tokenspeed_kernel.ops.kvcache.per_token_head import store_latent_per_token_head
 from tokenspeed_kernel.ops.kvcache.triton import (
     get_mla_kv_buffer_triton,
@@ -76,6 +80,13 @@ class MLATokenToKVPool(CachePool):
         self.layer_num = layer_num
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
         self._bind_layer_planes()
+
+    @property
+    def latent_mxfp4(self) -> bool:
+        # MXFP4 rows are bytes: e2m1 latent codes, UE8M0 scales, BF16 rope
+        # (``tokenspeed_kernel.ops.kvcache.mla_mxfp4``); the config only
+        # resolves the cache dtype to uint8 for ``--kv-cache-dtype mxfp4``.
+        return self.dtype == torch.uint8
 
     # Quantized MLA splits one logical cache into three planes, so its
     # per-layer entry is a tuple; the plain path is a single latent plane.
@@ -188,6 +199,15 @@ class MLATokenToKVPool(CachePool):
                 cache_k_rope,
                 sanitize=sanitize,
             )
+        elif self.latent_mxfp4:
+            quantize_store_mla_latent_mxfp4(
+                cache_k_nope,
+                cache_k_rope,
+                self.get_key_buffer(layer_id),
+                loc,
+                write_mask=write_mask,
+                sanitize=sanitize,
+            )
         else:
             # An FP8 view of the byte arena lets the scatter quantize as it stores.
             set_mla_kv_buffer_triton(
@@ -206,7 +226,7 @@ class MLATokenToKVPool(CachePool):
         dst_dtype: torch.dtype | None = None,
     ):
         layer_id = layer.layer_id
-        dst_dtype = dst_dtype or self.dtype
+        dst_dtype = dst_dtype or (self.model_dtype if self.latent_mxfp4 else self.dtype)
 
         if self.quant_method == "per_token_head":
             k_lora_cache, k_scale_cache, k_rope_cache = self.get_key_buffer(layer_id)
@@ -225,6 +245,20 @@ class MLATokenToKVPool(CachePool):
         """Split rows ``loc`` of a ``[slots, 1, kv_cache_dim]`` latent plane in
         the cache dtype -- this pool's own, or rows gathered from page owners
         -- into ``dst_dtype`` latent and RoPE keys."""
+        if self.latent_mxfp4:
+            decoded = torch.empty(
+                (loc.shape[0], self.kv_cache_dim),
+                dtype=dst_dtype,
+                device=rows.device,
+            )
+            dequant_gather_mla_latent_mxfp4(
+                rows, loc, decoded, kv_lora_rank=self.kv_lora_rank
+            )
+            decoded = decoded.unsqueeze(1)
+            return (
+                decoded[..., : self.kv_lora_rank].contiguous(),
+                decoded[..., self.kv_lora_rank :].contiguous(),
+            )
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),
             dtype=dst_dtype,

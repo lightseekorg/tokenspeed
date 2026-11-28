@@ -96,6 +96,7 @@ def _backend(
     backend.slot_order = "selection"
     backend.data_type = torch.bfloat16
     backend.q_data_type = torch.bfloat16
+    backend.kv_cache_mxfp4 = False
     backend.kv_lora_rank = KV_DIM - 2
     backend.qk_nope_head_dim = 4
     backend.qk_rope_head_dim = 2

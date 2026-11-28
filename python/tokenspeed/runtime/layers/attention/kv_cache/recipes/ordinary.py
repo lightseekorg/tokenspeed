@@ -382,6 +382,10 @@ def _mla_layer_fields(config, rows: int, layer_id: int, occurrence: int):
     spec = config.component(SoftmaxAttnConfig)
     if rows <= 0:
         raise ValueError("MLA full-attention geometry must be positive")
+    if config.kv_cache_mxfp4:
+        raise ValueError(
+            "--kv-cache-dtype mxfp4 is wired for the Kimi-K3.1 cache recipe only"
+        )
     if config.kv_cache_quant_method != "per_token_head":
         latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
         return (

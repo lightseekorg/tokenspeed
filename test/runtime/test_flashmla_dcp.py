@@ -860,6 +860,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     backend.decode_kernel_plan = None
     backend.slot_order = "selection"
     backend.data_type = torch.bfloat16
+    backend.kv_cache_mxfp4 = False
     backend.kv_lora_rank = 128
     backend.qk_nope_head_dim = 128
     backend.qk_rope_head_dim = 0
@@ -998,6 +999,7 @@ def test_dsa_prefill_partitions_candidates_and_merges_gathered_heads(
     backend.decode_kernel_plan = None
     backend.slot_order = "selection"
     backend.data_type = torch.bfloat16
+    backend.kv_cache_mxfp4 = False
     backend.kv_lora_rank = 128
     backend.qk_nope_head_dim = 128
     backend.qk_rope_head_dim = 0

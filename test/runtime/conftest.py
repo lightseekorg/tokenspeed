@@ -47,6 +47,7 @@ def kimi_recipe(
     mamba_ssm_dtype: str = "float32",
     dsa_index_k_format: str | None = None,
     kda_history_capacity: int | None = None,
+    kv_cache_mxfp4: bool = False,
 ):
     """A Kimi-K3 recipe over the reference config, with tiny scheduler limits.
 
@@ -109,10 +110,17 @@ def kimi_recipe(
             index_n_heads=32,
             index_k_format=dsa_index_k_format,
         )
+        if kv_cache_mxfp4:
+            # As the server composes it: the registry resolves (and checks)
+            # the full-attention leaf behind the hybrid backend.
+            target_softmax = dataclasses.replace(
+                target_softmax, backend_name="hybrid_linear_attn"
+            )
     attn_config = AttnConfig(
         device="cpu",
         dtype=torch.bfloat16,
         kv_cache_dtype=kv_cache_dtype,
+        kv_cache_mxfp4=kv_cache_mxfp4,
         kv_cache_quant_method=None,
         max_bs=max_bs,
         max_resident_requests=(

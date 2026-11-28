@@ -265,6 +265,21 @@ class DSAConfig(MLAConfig):
                     "auto or bfloat16 on this platform, got "
                     f"{server_args.kv_cache_dtype}."
                 )
+        if config.kv_cache_mxfp4:
+            # The sparse core's latent q.k is gfx950's block-scaled MFMA
+            # (ops.attention.dsa.mxfp4).
+            if not current_platform().is_cdna4:
+                raise ValueError("--kv-cache-dtype mxfp4 requires AMD gfx950 (CDNA4)")
+            if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
+                raise ValueError(
+                    "--kv-cache-dtype mxfp4 has no batch-invariant sparse core; "
+                    f"got --numerics {global_server_args_dict['numerics']}"
+                )
+            if global_server_args_dict["dsa_slot_order"] != "selection":
+                raise ValueError(
+                    "--kv-cache-dtype mxfp4 reduces slots in selection order; "
+                    f"got --dsa-slot-order {global_server_args_dict['dsa_slot_order']}"
+                )
         return config
 
     def cache_cell_size(self, config: AttnConfig) -> int:

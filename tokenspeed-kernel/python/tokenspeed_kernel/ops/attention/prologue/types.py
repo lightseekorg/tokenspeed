@@ -52,6 +52,9 @@ class KVCacheFormat(Enum):
     MXFP8 = "mxfp8"
     FP8_PER_TENSOR = "fp8_per_tensor"
     FP8_PER_TOKEN_HEAD = "fp8_per_token_head"
+    # MLA latent rows of nibble-packed E2M1 codes, one UE8M0 exponent per 32
+    # latent values and the BF16 RoPE key (ops.kvcache.mla_mxfp4).
+    MXFP4 = "mxfp4"
 
 
 @dataclass(frozen=True)
@@ -299,8 +302,9 @@ class LatentKVCache:
 
     Attributes:
         kv_cache: ``[slots, 1, kv_lora_rank + rope_dim]`` FP8 e4m3 or native
-            rows, a strided [pages, page_size, 1, width] view of those rows,
-            or the planes of an FP8_PER_TOKEN_HEAD cache.
+            rows, uint8 ``[slots, 1, mla_mxfp4_row_bytes]`` MXFP4 rows, a
+            strided [pages, page_size, 1, width] view of those rows, or the
+            planes of an FP8_PER_TOKEN_HEAD cache.
         sanitize: Replace NaN/Inf with finite values before storing.
         slots: Dense 1-D destination slot of each written row.
         write_mask: True for each row to store, or None to store every row;
@@ -318,6 +322,8 @@ class LatentKVCache:
             return KVCacheFormat.FP8_PER_TOKEN_HEAD
         if self.kv_cache.dtype == torch.float8_e4m3fn:
             return KVCacheFormat.FP8
+        if self.kv_cache.dtype == torch.uint8:
+            return KVCacheFormat.MXFP4
         return KVCacheFormat.NATIVE
 
 

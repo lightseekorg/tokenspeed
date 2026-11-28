@@ -320,6 +320,7 @@ def main() -> None:
     backend.prefill_kernel_plan = None
     backend.decode_kernel_plan = None
     backend.data_type = torch.bfloat16
+    backend.kv_cache_mxfp4 = False
     backend.kv_lora_rank = 128
     backend.qk_nope_head_dim = 128
     backend.qk_rope_head_dim = 0
