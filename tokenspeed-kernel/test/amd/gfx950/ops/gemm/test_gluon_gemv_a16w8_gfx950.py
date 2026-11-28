@@ -44,11 +44,14 @@ _RTOL = {torch.bfloat16: 2**-7, torch.float16: 2**-10}
 _ATOL = 1e-3
 
 # (N, K): a draft MLP's gate/up and down at TP8, an LM-head shard (several
-# programs a CU), ragged N, a K tail inside the last iteration, and a tiny N.
+# programs a CU), a ragged whole-vocabulary-wide output (64-column programs
+# from 256 columns a CU on 256 CUs), ragged N, a K tail inside the last
+# iteration, and a tiny N.
 _SHAPES = [
     (7168, 8192),
     (8192, 3584),
     (25256, 8192),
+    (65601, 512),
     (1000, 1040),
     (300, 8208),
     (8, 64),

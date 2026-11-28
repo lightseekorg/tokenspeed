@@ -32,6 +32,7 @@ from tokenspeed.runtime.execution.model_executor import (
     ModelExecutorConfig,
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.execution.weight_loader import weights_region
 from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
 from tokenspeed.runtime.layers.logits_processor import (
     should_apply_lm_head_quant_method,
@@ -214,6 +215,20 @@ def configure_draft_target(
         )
     if DrafterImpl.shares_target_embed_head:
         _share_target_embed_and_head(model_runner, draft_model)
+    if server_args.speculative_draft_lm_head_quantization != "none":
+        # The draft's quantized copy of the shared head is draft weight memory:
+        # allocated like the draft's loaded weights, before the KV-cache
+        # budget is profiled. ServerArgs admits the flag only for drafts
+        # with quantize_lm_head (DRAFT_QUANTIZATION_ARCHITECTURES).
+        with weights_region(
+            draft_model_runner.memory_saver_adapter,
+            server_args,
+            device=draft_model_runner.device,
+            is_draft_worker=True,
+        ):
+            draft_model.quantize_lm_head(
+                server_args.speculative_draft_lm_head_quantization
+            )
     if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS:
         # capture the layers the draft was trained on, not the default
         aux_layer_ids = server_args.eagle3_layers_to_capture or _eagle_aux_layer_ids(

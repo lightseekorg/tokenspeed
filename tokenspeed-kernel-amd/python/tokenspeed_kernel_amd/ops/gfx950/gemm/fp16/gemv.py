@@ -141,6 +141,13 @@ _RMSNORM_MAX_ITERS = 3
 # several programs a CU instead of one tile too large for its registers.
 A16W8_MAX_M = 128
 _A16W8_MAX_BLOCK_N = 32
+# Outputs at least this many columns per CU (a whole-vocabulary LM head) take
+# 64 columns a program instead: every program re-reads all M activation rows
+# from L2, and with hundreds of columns per CU the halved re-reads outweigh
+# the coarser balance. Measured 2-17% faster at 1-32 rows on the 248320 x
+# 2560 Qwen3.8 head (MI350X, cold-weight graph replay).
+_A16W8_WIDE_COLUMNS_PER_CU = 256
+_A16W8_WIDE_BLOCK_N = 64
 # Per wave and K iteration, the activation tile (BLOCK_M x BLOCK_K 16-bit)
 # and the weight tile (BLOCK_N x BLOCK_K bytes) each stay within 128 B a
 # lane (32 VGPRs; the next iteration's copies double that).
@@ -965,7 +972,13 @@ def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int, 
 def _a16w8_config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int]:
     """``(rows, BLOCK_M, BLOCK_N, BLOCK_K, num_warps)`` of the FP8-weight
     GEMV with ``m`` rows and ``n`` outputs on ``cus`` CUs."""
-    rows = min(triton.cdiv(n, cus), _A16W8_MAX_BLOCK_N)
+    per_cu = triton.cdiv(n, cus)
+    max_block_n = (
+        _A16W8_WIDE_BLOCK_N
+        if per_cu >= _A16W8_WIDE_COLUMNS_PER_CU
+        else _A16W8_MAX_BLOCK_N
+    )
+    rows = min(per_cu, max_block_n)
     block_n = max(triton.next_power_of_2(rows), _MFMA_MIN_BLOCK_N)
     block_m = max(triton.next_power_of_2(m), _MFMA_BLOCK_M)
     num_warps = _MFMA_LONG_K_WARPS if k >= _MFMA_LONG_K else NUM_WARPS

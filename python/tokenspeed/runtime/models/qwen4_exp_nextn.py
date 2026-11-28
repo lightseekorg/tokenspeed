@@ -23,7 +23,8 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterable
+import re
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import torch
@@ -42,11 +43,16 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
+from tokenspeed.runtime.layers.dense.fp8_weight_only import Fp8WeightOnlyLMHead
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
-from tokenspeed.runtime.layers.linear import ReplicatedLinear
+from tokenspeed.runtime.layers.linear import LinearBase, ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
+from tokenspeed.runtime.layers.quantization.mxfp4 import (
+    Mxfp4Config,
+    quantize_bf16_to_mxfp4,
+)
 from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
     should_ignore_quant_layer,
@@ -92,6 +98,100 @@ def _resolve_mtp_quant_config(
     ):
         return None
     return quant_config
+
+
+# The MTP layer's MoE block: the one module the draft's MXFP4 expert config
+# quantizes (its routed experts).
+_MTP_MOE_PREFIX = "mtp.layers.0.mlp"
+# A routed expert projection of the MTP layer in the checkpoint.
+_MTP_EXPERT_WEIGHT = re.compile(
+    r"mtp\.layers\.0\.mlp\.experts\.\d+\.(gate|up|down)_proj\.weight"
+)
+
+
+def _mtp_mxfp4_experts_config(quant_config: QuantizationConfig | None) -> Mxfp4Config:
+    """The quantization config of a draft whose BF16 routed experts quantize
+    to MXFP4 at load (``--speculative-draft-moe-quantization mxfp4``).
+
+    It is the target's Quark MXFP4 scheme (weights and, when the target has
+    them, dynamic MXFP4 or FP8 activations), with every module but the MTP
+    layer's MoE block ignored: the routed experts take the target's MXFP4 MoE
+    kernels, and every other draft module stays BF16 as the checkpoint
+    holds it.
+    """
+    if (
+        not isinstance(quant_config, Mxfp4Config)
+        or quant_config.quant_method != "quark"
+        or _resolve_mtp_quant_config(quant_config) is not None
+    ):
+        raise ValueError(
+            "--speculative-draft-moe-quantization mxfp4 needs an AMD Quark MXFP4 "
+            "target whose checkpoint keeps the MTP layer BF16, got "
+            f"{type(quant_config).__name__}"
+        )
+    return Mxfp4Config(
+        ignored_layers=[f"re:(?!{re.escape(_MTP_MOE_PREFIX)}$)"],
+        is_checkpoint_mxfp4_serialized=True,
+        is_w4a8_fp8=quant_config.is_w4a8_fp8,
+        use_dynamic_mxfp4_activations=quant_config.use_dynamic_mxfp4_activations,
+        quant_method=quant_config.quant_method,
+        fp8_layer_patterns=[],
+    )
+
+
+def _draft_quant_config(
+    quant_config: QuantizationConfig | None, moe_quantization: str
+) -> QuantizationConfig | None:
+    """The MTP draft's quantization config under
+    ``--speculative-draft-moe-quantization`` (``moe_quantization``)."""
+    if moe_quantization == "none":
+        return _resolve_mtp_quant_config(quant_config)
+    if moe_quantization == "mxfp4":
+        return _mtp_mxfp4_experts_config(quant_config)
+    raise ValueError(f"unknown draft MoE quantization {moe_quantization!r}")
+
+
+def quantize_mtp_experts_to_mxfp4(
+    weights: Iterable[tuple[str, torch.Tensor]], device: torch.device
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Serialize the MTP layer's BF16 routed experts as MXFP4 in the stream.
+
+    Each expert projection's ``weight`` becomes the packed E2M1 codes and a
+    ``weight_scale`` of E8M0 exponents, as the target's Quark experts are
+    stored (:func:`quantize_bf16_to_mxfp4`), so the MoE loader takes them like
+    the target's. Every other tensor passes through.
+
+    Args:
+        weights: The checkpoint's ``(name, tensor)`` stream.
+        device: Where to quantize.
+    """
+    for name, weight in weights:
+        if _MTP_EXPERT_WEIGHT.fullmatch(name) is None:
+            yield name, weight
+            continue
+        if weight.dtype != torch.bfloat16:
+            raise ValueError(
+                f"{name}: MXFP4 draft experts quantize the BF16 checkpoint "
+                f"weights, got {weight.dtype}"
+            )
+        packed, scales = quantize_bf16_to_mxfp4(weight.to(device))
+        yield name, packed
+        yield f"{name}_scale", scales
+
+
+def _check_only_experts_quantized(model: nn.Module) -> None:
+    """Fail unless the MXFP4 expert config left every dense linear BF16."""
+    quantized = [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, LinearBase)
+        and not isinstance(module.quant_method, UnquantizedLinearMethod)
+    ]
+    if quantized:
+        raise RuntimeError(
+            "the MXFP4 draft expert config quantized dense draft modules "
+            f"{quantized}; only the routed experts take MXFP4"
+        )
 
 
 def _mtp_index_sharing_enabled(config) -> bool:
@@ -238,7 +338,9 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         super().__init__()
         self._checkpoint_dir: str | None = None
         config = copy.deepcopy(getattr(config, "text_config", config))
-        quant_config = _resolve_mtp_quant_config(quant_config)
+        # --speculative-draft-moe-quantization, declared on every draft config.
+        self.moe_quantization: str = config.draft_moe_quantization
+        quant_config = _draft_quant_config(quant_config, self.moe_quantization)
         config.num_hidden_layers = 1
         config.layer_types = ["full_attention"]
         config.ple_layer_ids = []
@@ -277,6 +379,8 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         )
         for indexer in self.model.qsa_indexers:
             indexer.share_topk_for_mtp_iteration = self.index_share_for_mtp_iteration
+        if self.moe_quantization != "none":
+            _check_only_experts_quantized(self)
         self.lm_head = _build_mtp_lm_head(config, mapping, quant_config, prefix)
         # Set by post_quant_warmup when the draft layer runs the decode
         # monokernel: the kernel that runs _fuse_inputs in one launch for a
@@ -333,6 +437,22 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         self.lm_head = lm_head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+    def quantize_lm_head(self, quantization: str) -> None:
+        """Project the draft steps through a quantized copy of the shared head.
+
+        Under ``--speculative-draft-lm-head-quantization fp8_weight_only``,
+        called once after the target shares its head
+        (``set_embed_and_head_module``): the draft's head becomes a
+        weight-only FP8 copy of it (half the bytes each draft step streams),
+        and the target's verify keeps the 16-bit head.
+
+        Args:
+            quantization: The flag's value, ``fp8_weight_only``.
+        """
+        if quantization != "fp8_weight_only":
+            raise ValueError(f"unknown draft LM head quantization {quantization!r}")
+        self.lm_head = Fp8WeightOnlyLMHead(self.lm_head)
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
@@ -484,6 +604,10 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
                 return "lm_head.weight"
             return name.replace("mtp.", "model.", 1)
 
+        if self.moe_quantization == "mxfp4":
+            weights = quantize_mtp_experts_to_mxfp4(
+                weights, self.model.layers[0].mlp.experts.w13_weight.device
+            )
         return load_qwen4_exp_weights(
             self,
             self.config,

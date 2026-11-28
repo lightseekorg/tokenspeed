@@ -146,6 +146,11 @@ def load_model_config(
             list(getattr(draft_of.hf_config, "architectures", None) or []),
             list(getattr(config.hf_config, "architectures", None) or []),
         )
+        # Declared on every draft's config as well; only a draft that
+        # ServerArgs admits for it (DRAFT_QUANTIZATION_ARCHITECTURES) reads it.
+        config.hf_text_config.draft_moe_quantization = (
+            server_args.speculative_draft_moe_quantization
+        )
     return config
 
 
