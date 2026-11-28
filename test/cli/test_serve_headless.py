@@ -138,7 +138,7 @@ class TestHeadlessDispatch:
         called = {}
         # Keep the test pure-python: the real snapshot imports the full
         # runtime stack. --model routes via _FANOUT_FLAGS regardless.
-        monkeypatch.setattr(_argsplit, "_engine_recognized_flags", lambda: set())
+        monkeypatch.setattr(_argsplit, "_engine_recognized_flags", lambda: (set(), {}))
         monkeypatch.setattr(serve_smg, "print_logo", lambda: None)
         monkeypatch.setattr(serve_smg, "_check_serve_extra_installed", lambda: None)
         monkeypatch.setattr(serve_smg, "_prewarm_hf_tokenizer", lambda _: None)

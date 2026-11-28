@@ -135,6 +135,25 @@ def test_multi_value_capture_sizes_route_to_engine():
         assert r.gateway == []
 
 
+@pytest.mark.parametrize(
+    "flag, values",
+    [
+        ("--prefix-cache-gds-prefill-cost", ["9.39e-06", "4.771e-07"]),
+        ("--prefix-cache-gds-disk-read-cost", ["1e-06", "2e-07"]),
+        ("--disk-tier-paths", ["/mnt/a", "/mnt/b"]),
+    ],
+)
+def test_engine_nargs_flags_keep_all_values(flag, values):
+    r = _split([flag, *values, "--dp-sampling"])
+    assert r.engine == [flag, *values, "--dp-sampling"]
+    assert r.gateway == []
+
+
+def test_fixed_arity_engine_flag_rejects_extra_values():
+    with pytest.raises(ValueError, match="unexpected positional arg: '3'"):
+        _split(["m", "--prefix-cache-gds-prefill-cost", "1", "2", "3"])
+
+
 def test_unknown_flag_falls_through_to_gateway():
     """smg's clap is the final authority on these."""
     r = _split(["--policy", "cache_aware"])
