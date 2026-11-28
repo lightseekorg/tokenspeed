@@ -2187,7 +2187,8 @@ def qwen4_exp_qsa_selected_slots(
         page_table.stride(0),
         output.stride(0),
     )
-    pdl = {"launch_pdl": True} if enable_pdl else {}
+    use_pdl = _is_nvidia and enable_pdl
+    pdl = {"launch_pdl": True} if use_pdl else {}
     row_layout = (
         _qwen4_exp_qsa_selected_slot_rows_kernel,
         (rows,),
@@ -2197,7 +2198,7 @@ def qwen4_exp_qsa_selected_slots(
             "RATIO_P2": ratio_p2,
             "PAGE_SIZE": page_size,
             "BLOCKS": blocks,
-            "ENABLE_PDL": enable_pdl,
+            "ENABLE_PDL": use_pdl,
             # One warp per 1024 tile entries, between two and eight.
             "num_warps": min(max(blocks * ratio_p2 // 1024, 2), 8),
             **pdl,
@@ -2212,7 +2213,7 @@ def qwen4_exp_qsa_selected_slots(
             "PAGE_SIZE": page_size,
             "WIDTH": width,
             "BLOCK": _SELECTED_SLOT_COLUMN_BLOCK,
-            "ENABLE_PDL": enable_pdl,
+            "ENABLE_PDL": use_pdl,
             "num_warps": _SELECTED_SLOT_COLUMN_WARPS,
             **pdl,
         },
