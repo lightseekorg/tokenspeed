@@ -1740,7 +1740,12 @@ def dsa_merge_candidates(
         "attention",
         "dsa_merge_candidates",
         _attention_format_signature(records=records),
-        traits={"topk": topk},
+        # Leaves gate on the sizes through their problem filters.
+        traits={
+            "topk": topk,
+            "ranks": int(records.shape[0]),
+            "candidates": int(records.shape[2]),
+        },
         solution=solution,
     )
     with kernel_scope(

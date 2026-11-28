@@ -20,10 +20,12 @@
 
 """GFX950 Qwen4 gated hyper-connection mix kernels.
 
-The mix runs as two launches instead of two GEMMs and two epilogues: a split-K
-down projection whose last split applies the projection scale and SiLU (and
-emits the inject logits), and an up projection whose epilogue gates and sums
-the normalized branches.
+Decode batches run the mix as two launches instead of two GEMMs and two
+epilogues: a split-K down projection whose last split applies the projection
+scale and SiLU (and emits the inject logits), and an up projection whose
+epilogue gates and sums the normalized branches. Prefill batches keep the
+down projection a GEMM and run the gated up projection as one pipelined
+launch, so the ``[rows, 4 * H]`` gate tensor never reaches memory.
 """
 
 from __future__ import annotations
@@ -33,14 +35,19 @@ from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import gl, gluon
 
 cdna4 = gl.amd.cdna4
+async_copy = gl.amd.cdna4.async_copy
 
 __all__ = [
     "launch_gluon_hyperconnection_mix_gfx950",
+    "launch_gluon_hyperconnection_mix_up_prefill_gfx950",
     "supports_gluon_hyperconnection_mix_gfx950",
+    "supports_gluon_hyperconnection_mix_up_prefill_gfx950",
 ]
 
-# Above this many rows the GEMM-plus-epilogue path is faster.
-MAX_ROWS = 256
+# Above this many rows the split-K pair loses to a GEMM down projection plus
+# the pipelined up projection: past 192 rows the pair needs a fourth 64-row
+# tile.
+MAX_ROWS = 192
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _workspaces: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -354,6 +361,198 @@ def gluon_hyperconnection_mix_up_gfx950(
     )
 
 
+@gluon.constexpr_function
+def _prefill_a_layout(block_m, block_k, num_warps):
+    """16-byte lanes along K; each warp copies whole contiguous K rows."""
+    lanes_k = min(64, block_k // 8)
+    return gl.BlockedLayout([1, 8], [64 // lanes_k, lanes_k], [num_warps, 1], [1, 0])
+
+
+@gluon.constexpr_function
+def _prefill_b_layout(block_k, block_n, num_warps):
+    """16-byte lanes along K of each weight row."""
+    lanes_k = min(64, block_k // 8)
+    return gl.BlockedLayout([8, 1], [lanes_k, 64 // lanes_k], [1, num_warps], [0, 1])
+
+
+@gluon.constexpr_function
+def _prefill_shared_a(block_m, block_k):
+    """K-contiguous rows, padded by 16 elements every 512 against bank conflicts."""
+    bases = [[0, 1 << i] for i in range(block_k.bit_length() - 1)]
+    bases += [[1 << i, 0] for i in range(block_m.bit_length() - 1)]
+    return gl.PaddedSharedLayout([[512, 16]], bases, [], [block_m, block_k])
+
+
+@gluon.constexpr_function
+def _prefill_shared_b(block_k, block_n):
+    bases = [[1 << i, 0] for i in range(block_k.bit_length() - 1)]
+    bases += [[0, 1 << i] for i in range(block_n.bit_length() - 1)]
+    return gl.PaddedSharedLayout([[512, 16]], bases, [], [block_k, block_n])
+
+
+@gluon.constexpr_function
+def _branch_layout(hc, block_h, num_warps):
+    """``[rows, branch, hidden]`` with every branch of 8 hidden columns in a lane.
+
+    Loads of the normalized branches are 16 bytes per lane and the branch sum
+    stays inside each lane.
+    """
+    lanes_h = min(64, block_h // 8)
+    return gl.BlockedLayout(
+        [1, hc, 8], [64 // lanes_h, 1, lanes_h], [num_warps, 1, 1], [2, 1, 0]
+    )
+
+
+@gluon.jit(
+    launch_metadata=_mix_up_launch_metadata,
+    do_not_specialize=("M",),
+)
+def gluon_hyperconnection_mix_up_prefill_gfx950(
+    act_ptr,
+    up_ptr,
+    normalized_ptr,
+    out_ptr,
+    M,
+    stride_actm,
+    stride_nm,
+    stride_om,
+    R: gl.constexpr,
+    H: gl.constexpr,
+    HC: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_H: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    STAGES: gl.constexpr,
+    WARPS_M: gl.constexpr,
+    WARPS_N: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+):
+    """Pipelined up projection with the gated branch sum as its epilogue.
+
+    Program ``(m_tile, h_tile)`` computes ``act @ up[b * H + h].T`` for hidden
+    columns ``h`` of every branch ``b`` as one ``BLOCK_M x HC * BLOCK_H`` MFMA
+    tile, streaming the rank in ``BLOCK_K`` slices through ``STAGES`` LDS
+    buffers while the normalized branches load into registers. It rounds the
+    gate logits to the input dtype as a standalone GEMM would and writes
+    ``mean_b(sigmoid(gate_b) * normalized[:, b * H + h])``.
+    """
+    pid = gl.program_id(0)
+    H_TILES: gl.constexpr = H // BLOCK_H
+    gl.static_assert(H_TILES % NUM_XCDS == 0, "hidden tiles must split over XCDs")
+    # Hardware places program i on XCD i % NUM_XCDS; give each XCD a
+    # contiguous range of hidden tiles so it reads its weight slice once.
+    PER_XCD: gl.constexpr = H_TILES // NUM_XCDS
+    local = pid // NUM_XCDS
+    h_tile = (pid % NUM_XCDS) * PER_XCD + local % PER_XCD
+    m_tile = local // PER_XCD
+    BLOCK_N: gl.constexpr = HC * BLOCK_H
+    NUM_WARPS: gl.constexpr = WARPS_M * WARPS_N
+    K_ITERS: gl.constexpr = R // BLOCK_K
+    gl.static_assert(K_ITERS * BLOCK_K == R, "rank must be a multiple of BLOCK_K")
+    gl.static_assert(K_ITERS >= STAGES, "rank must fill every LDS stage")
+
+    mfma: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[WARPS_M, WARPS_N],
+    )
+    dot_a: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=8)
+    dot_b: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=8)
+    a_layout: gl.constexpr = _prefill_a_layout(BLOCK_M, BLOCK_K, NUM_WARPS)
+    b_layout: gl.constexpr = _prefill_b_layout(BLOCK_K, BLOCK_N, NUM_WARPS)
+    smem_a = gl.allocate_shared_memory(
+        act_ptr.dtype.element_ty,
+        [STAGES, BLOCK_M, BLOCK_K],
+        _prefill_shared_a(BLOCK_M, BLOCK_K),
+    )
+    smem_b = gl.allocate_shared_memory(
+        up_ptr.dtype.element_ty,
+        [STAGES, BLOCK_K, BLOCK_N],
+        _prefill_shared_b(BLOCK_K, BLOCK_N),
+    )
+
+    # Row offsets grow with the token count: step the bases in int64 once,
+    # then index inside the tile with int32 buffer offsets.
+    row_base = m_tile * BLOCK_M
+    tile_rows = M - row_base
+    act_ptr += row_base.to(gl.int64) * stride_actm
+    normalized_ptr += row_base.to(gl.int64) * stride_nm
+    out_ptr += row_base.to(gl.int64) * stride_om
+
+    a_r = gl.arange(0, BLOCK_M, gl.SliceLayout(1, a_layout))
+    a_mask = gl.expand_dims(a_r < tile_rows, 1)
+    a_offs = gl.expand_dims(a_r * stride_actm, 1) + gl.expand_dims(
+        gl.arange(0, BLOCK_K, gl.SliceLayout(0, a_layout)), 0
+    )
+    # Tile column c is hidden column h_tile * BLOCK_H + c % BLOCK_H of
+    # branch c // BLOCK_H.
+    b_c = gl.arange(0, BLOCK_N, gl.SliceLayout(0, b_layout))
+    b_rows = (b_c // BLOCK_H) * H + h_tile * BLOCK_H + b_c % BLOCK_H
+    b_offs = gl.expand_dims(
+        gl.arange(0, BLOCK_K, gl.SliceLayout(1, b_layout)), 1
+    ) + gl.expand_dims(b_rows * R, 0)
+    for t in gl.static_range(STAGES):
+        async_copy.buffer_load_to_shared(
+            smem_a.index(t), act_ptr, a_offs + t * BLOCK_K, mask=a_mask
+        )
+        async_copy.buffer_load_to_shared(smem_b.index(t), up_ptr, b_offs + t * BLOCK_K)
+        async_copy.commit_group()
+
+    # Issued after the first slices so their waits do not cover it.
+    branch: gl.constexpr = _branch_layout(HC, BLOCK_H, NUM_WARPS)
+    e_r = gl.arange(0, BLOCK_M, gl.SliceLayout(1, gl.SliceLayout(2, branch)))
+    e_b = gl.arange(0, HC, gl.SliceLayout(0, gl.SliceLayout(2, branch)))
+    e_h = h_tile * BLOCK_H + gl.arange(
+        0, BLOCK_H, gl.SliceLayout(0, gl.SliceLayout(1, branch))
+    )
+    rows3 = gl.expand_dims(gl.expand_dims(e_r, 1), 2)
+    normalized = cdna4.buffer_load(
+        normalized_ptr,
+        rows3 * stride_nm
+        + gl.expand_dims(gl.expand_dims(e_b * H, 0), 2)
+        + gl.expand_dims(gl.expand_dims(e_h, 0), 1),
+        mask=rows3 < tile_rows,
+        other=0.0,
+    )
+
+    acc = gl.zeros([BLOCK_M, BLOCK_N], gl.float32, mfma)
+    for t in gl.static_range(K_ITERS):
+        if K_ITERS - 1 - t < STAGES - 1:
+            async_copy.wait_group(K_ITERS - 1 - t)
+        else:
+            async_copy.wait_group(STAGES - 1)
+        a = smem_a.index(t % STAGES).load(dot_a)
+        b = smem_b.index(t % STAGES).load(dot_b)
+        if t + STAGES < K_ITERS:
+            async_copy.buffer_load_to_shared(
+                smem_a.index(t % STAGES),
+                act_ptr,
+                a_offs + (t + STAGES) * BLOCK_K,
+                mask=a_mask,
+            )
+            async_copy.buffer_load_to_shared(
+                smem_b.index(t % STAGES), up_ptr, b_offs + (t + STAGES) * BLOCK_K
+            )
+            async_copy.commit_group()
+        acc = cdna4.mfma(a, b, acc)
+
+    gate = gl.convert_layout(
+        gl.reshape(acc.to(out_ptr.dtype.element_ty), [BLOCK_M, HC, BLOCK_H]), branch
+    ).to(gl.float32)
+    gated = normalized.to(gl.float32) / (1.0 + gl.exp(-gate))
+    mixed = gl.sum(gated, axis=1) / HC
+    out_layout: gl.constexpr = gl.SliceLayout(1, branch)
+    o_r = gl.arange(0, BLOCK_M, gl.SliceLayout(1, out_layout))
+    o_h = h_tile * BLOCK_H + gl.arange(0, BLOCK_H, gl.SliceLayout(0, out_layout))
+    cdna4.buffer_store(
+        mixed.to(out_ptr.dtype.element_ty),
+        out_ptr,
+        gl.expand_dims(o_r * stride_om, 1) + gl.expand_dims(o_h, 0),
+        mask=gl.expand_dims(o_r < tile_rows, 1),
+    )
+
+
 def _workspace(
     device: torch.device, split_k: int, block_m: int, block_n: int, n_tiles: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -543,3 +742,100 @@ def launch_gluon_hyperconnection_mix_gfx950(
         num_warps=warps_m * hc_count,
     )
     return mixed, inject
+
+
+# Cold-cache sweeps at the Qwen3.8 HC4/H2560/R320 shapes from 193 to 8192
+# rows: (BLOCK_M, BLOCK_H, BLOCK_K, STAGES, WARPS_M, WARPS_N). 128-row by
+# 4 x 32-column tiles keep three four-wave programs resident per CU, so one
+# program's epilogue overlaps the others' weight and activation slices.
+_PREFILL_UP_CONFIG = (128, 32, 32, 3, 2, 2)
+_NUM_XCDS = 8
+
+
+def supports_gluon_hyperconnection_mix_up_prefill_gfx950(
+    hc_count: int, hidden_size: int, lowrank: int
+) -> bool:
+    """Whether the pipelined up projection supports this shape."""
+    _, block_h, block_k, stages, _, _ = _PREFILL_UP_CONFIG
+    return (
+        hc_count == 4
+        and hidden_size % (block_h * _NUM_XCDS) == 0
+        and lowrank % block_k == 0
+        and lowrank // block_k >= stages
+    )
+
+
+def launch_gluon_hyperconnection_mix_up_prefill_gfx950(
+    activated: torch.Tensor,
+    up_weight: torch.Tensor,
+    normalized: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+) -> torch.Tensor:
+    """Gate and sum normalized branches with one pipelined up projection.
+
+    Args:
+        activated: ``[rows, lowrank]`` mix-down activation, unit inner stride.
+        up_weight: Contiguous ``[hc_count * hidden_size, lowrank]`` weight.
+        normalized: ``[rows, hc_count * hidden_size]`` branches, unit inner
+            stride.
+        hc_count: Number of branches.
+        hidden_size: Width of one branch.
+        lowrank: Rank of the mix gate bottleneck.
+
+    Returns:
+        ``mean_b(sigmoid(round(activated @ up_b.T)) * normalized_b)`` shaped
+        ``[rows, hidden_size]`` in the input dtype, where ``round`` is the
+        rounding to that dtype a standalone GEMM applies.
+    """
+    rows, wide = normalized.shape
+    if (
+        normalized.dtype not in _SUPPORTED_DTYPES
+        or activated.dtype != normalized.dtype
+        or up_weight.dtype != normalized.dtype
+        or activated.shape != (rows, lowrank)
+        or up_weight.shape != (wide, lowrank)
+        or wide != hc_count * hidden_size
+        or not up_weight.is_contiguous()
+        or activated.stride(1) != 1
+        or normalized.stride(1) != 1
+        or not supports_gluon_hyperconnection_mix_up_prefill_gfx950(
+            hc_count, hidden_size, lowrank
+        )
+    ):
+        raise ValueError(
+            "GFX950 prefill hyper-connection up projection requires FP16/BF16 "
+            "tensors with unit inner strides, four branches, a branch width "
+            "divisible by 256 and a rank divisible by 32 of at least 96"
+        )
+    mixed = torch.empty(
+        (rows, hidden_size), dtype=normalized.dtype, device=normalized.device
+    )
+    if rows == 0:
+        return mixed
+    block_m, block_h, block_k, stages, warps_m, warps_n = _PREFILL_UP_CONFIG
+    gluon_hyperconnection_mix_up_prefill_gfx950[
+        (-(-rows // block_m) * (hidden_size // block_h),)
+    ](
+        activated,
+        up_weight,
+        normalized,
+        mixed,
+        rows,
+        activated.stride(0),
+        normalized.stride(0),
+        mixed.stride(0),
+        R=lowrank,
+        H=hidden_size,
+        HC=hc_count,
+        BLOCK_M=block_m,
+        BLOCK_H=block_h,
+        BLOCK_K=block_k,
+        STAGES=stages,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_XCDS=_NUM_XCDS,
+        num_warps=warps_m * warps_n,
+    )
+    return mixed
