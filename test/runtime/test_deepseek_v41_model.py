@@ -563,6 +563,39 @@ def test_generation_token_blacklist_uses_global_ids_on_vocab_shards(rank, monkey
     assert output.next_token_logits.argmax(-1).item() == 3
 
 
+@pytest.mark.parametrize("batch_sizes", [(1, 5, 0), (3,)])
+def test_generation_token_blacklist_scatter_matches_index_fill_across_batches(
+    batch_sizes, monkeypatch
+):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", False
+    )
+    config = _config()
+    config.vocab_size = 129280
+    config.hidden_size = 1
+    adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+    nn.Module.__init__(adapter)
+    adapter.mapping = _mapping(0, 1, 1)
+    with torch.device("cpu"):
+        adapter.lm_head = adapter.resolve_lm_head(
+            SimpleNamespace(text_config=config), None, ""
+        )
+    blocked = [0, 2, 129262, 129263, 129264]
+    with torch.no_grad():
+        adapter.lm_head.weight.copy_(
+            torch.arange(config.vocab_size, dtype=torch.float32).unsqueeze(-1)
+        )
+    processor = adapter.resolve_logits_processor(SimpleNamespace(text_config=config))
+    blocked_idx = torch.tensor(blocked, dtype=torch.int64)
+    for rows in batch_sizes:
+        hidden = torch.ones(rows, 1)
+        logits = processor._project_logits(hidden, adapter.lm_head, None)
+        expected = F.linear(hidden, adapter.lm_head.weight).index_fill(
+            -1, blocked_idx, float("-inf")
+        )
+        torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+
 def test_hc_post_rejects_unfinished_reduction():
     x = torch.zeros(1, 4)
     pending = v41.V41HCPost(x, x, x, object())

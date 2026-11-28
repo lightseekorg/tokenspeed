@@ -138,7 +138,10 @@ def _pack_kernel(
     SCALE_BYTES: tl.constexpr,
     FORMAT: tl.constexpr,
     SCATTER: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     # The row reads a caller-sized input, so its offset is 64-bit like the
     # gather's output offset; the cache side is already 64-bit through slot.
     row = tl.program_id(0).to(tl.int64)
@@ -229,6 +232,8 @@ def _pack_kernel(
                 base + _planar_offset(scale_byte_offset + s, CR, CB, ROW_BYTES),
                 tl.where(s < QUANTIZED // GROUP, scale_byte, 0),
             )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -408,6 +413,7 @@ def _pack(rows, cache, slots, cache_format):
     if slots is not None:
         _integers(slots, (rows.shape[0],), "slots")
     if rows.shape[0]:
+        enable_pdl = pdl_enabled()
         _pack_kernel[(rows.shape[0],)](
             rows,
             cache,
@@ -424,8 +430,10 @@ def _pack(rows, cache, slots, cache_format):
             SCALE_BYTES=_scale_bytes(cache_format),
             FORMAT=cache_format,
             SCATTER=slots is not None,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
 
 
@@ -544,7 +552,10 @@ def _compressor_tail_scatter_kernel(
     # Rows the destination holds; it follows the buffer's size, which can
     # track the batch, so it stays a runtime bound.
     CAPACITY,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     slot = tl.load(Slots + row * LS).to(tl.int64)
     if slot >= 0 and slot < CAPACITY:
@@ -552,6 +563,8 @@ def _compressor_tail_scatter_kernel(
         base = Tail + slot // 2 * TP + slot % 2 * TR + d * TD
         tl.store(base, tl.load(Content + row * CS0 + d * CS1))
         tl.store(base + TK, tl.load(Scores + row * SS0 + d * SS1))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -580,6 +593,7 @@ def compressor_tail_scatter(content, scores, tail, slots):
     _same_device(content, (scores, tail, slots))
     _integers(slots, (content.shape[0],), "slots")
     if content.shape[0]:
+        enable_pdl = pdl_enabled()
         _compressor_tail_scatter_kernel[(content.shape[0],)](
             content,
             scores,
@@ -590,7 +604,9 @@ def compressor_tail_scatter(content, scores, tail, slots):
             *tail.stride(),
             slots.stride(0),
             CAPACITY=tail.shape[0] * 2,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
 
 
@@ -1053,7 +1069,10 @@ def _finish_topk_kernel(
     BLOCK_SIZE: tl.constexpr,
     HAS_CANDIDATES: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     i = tl.arange(0, BLOCK)
     taken = i < WIDTH
@@ -1076,6 +1095,8 @@ def _finish_topk_kernel(
         i < K,
     )
     tl.store(Lens + row, tl.sum(live.to(tl.int32), axis=0))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _finish_topk(scores, ids, output, lengths, candidates=None):
@@ -1089,6 +1110,7 @@ def _finish_topk(scores, ids, output, lengths, candidates=None):
     rows, width = scores.shape
     if rows == 0:
         return
+    enable_pdl = pdl_enabled()
     _finish_topk_kernel[(rows,)](
         scores,
         ids,
@@ -1104,7 +1126,9 @@ def _finish_topk(scores, ids, output, lengths, candidates=None):
         BLOCK_SIZE=8,
         HAS_CANDIDATES=candidates is not None,
         BLOCK=triton.next_power_of_2(max(1, output.shape[1])),
+        ENABLE_PDL=enable_pdl,
         num_warps=8,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -1320,7 +1344,10 @@ def _compressor_pool(
     O0: tl.constexpr,
     O1: tl.constexpr,
     PAGES,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     channels = tl.arange(0, 512)
     live = tl.load(ACTIVE + row * A0)
@@ -1356,6 +1383,8 @@ def _compressor_pool(
         pooled = pooled * inv_rms
         pooled = pooled * tl.load(NORM + channels).to(tl.float32)
     tl.store(OUT + row * O0 + channels * O1, pooled)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -1414,6 +1443,7 @@ def compressor_pool(
     ):
         raise ValueError("Compressor output must not alias projection or tail storage")
     if count:
+        enable_pdl = pdl_enabled()
         _compressor_pool[(count,)](
             content,
             scores,
@@ -1434,8 +1464,10 @@ def compressor_pool(
             *tail.stride(),
             *out.stride(),
             tail.shape[0],
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return out
 
@@ -1473,7 +1505,10 @@ def _swa_rope_insert(
     VALUES: tl.constexpr,
     SCALE_BYTES: tl.constexpr,
     HAS_OUT: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     token = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, 512)
     position = tl.maximum(tl.load(POS + token * POS0).to(tl.int64), 0)
@@ -1542,6 +1577,8 @@ def _swa_rope_insert(
         tl.where(s < VALUES // GROUP, exponent, 0).to(tl.uint8),
         live,
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -1597,6 +1634,7 @@ def triton_dsv41_swa_rope_scatter(
     )
     if values.shape[0] == 0:
         return
+    enable_pdl = pdl_enabled()
     _swa_rope_insert[(values.shape[0],)](
         values,
         norm_weight,
@@ -1622,9 +1660,11 @@ def triton_dsv41_swa_rope_scatter(
         value_bytes,
         _scale_bytes(cache_format),
         out is not None,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         enable_fp_fusion=False,
         debug=True,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -1663,7 +1703,10 @@ def _rope_inplace_kernel(
     W1,
     WEIGHT_SCALE,
     SCALE_WEIGHTS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1) * HB + tl.arange(0, HB)
     live = head < H
@@ -1688,6 +1731,8 @@ def _rope_inplace_kernel(
     out_odd = _rotate_interleaved(odd, even, cosine, sine, True)
     tl.store(base, out_even.to(even.dtype), mask)
     tl.store(base + 1, out_odd.to(odd.dtype), mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @_register_rope("dsv41_rope_inplace")
@@ -1712,6 +1757,7 @@ def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
     fused_weights = None if scale_separately else weights
     # A program per token and 8 heads: one head's tail is too little work for a program.
     heads_per_program = min(triton.next_power_of_2(heads), 8)
+    enable_pdl = pdl_enabled()
     _rope_inplace_kernel[(values.shape[0], triton.cdiv(heads, heads_per_program))](
         values[..., -rotary_dim:],
         positions,
@@ -1730,9 +1776,11 @@ def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
         0 if fused_weights is None else fused_weights.stride(1),
         weight_scale,
         fused_weights is not None,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         enable_fp_fusion=False,
         debug=True,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     if scale_separately:
         weights.mul_(weight_scale)
@@ -1753,7 +1801,10 @@ def _rope_pad_query(
     HP: tl.constexpr,
     R: tl.constexpr,
     MAX_POS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
     d = tl.arange(0, 512)
@@ -1773,6 +1824,8 @@ def _rope_pad_query(
     value = tl.where(tail, rotated.to(x.dtype), x)
     value = tl.where(live, value, 0.0)
     tl.store(OUT + (token * HP + head) * 512 + d, value)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @_register_rope("dsv41_rope_pad_query")
@@ -1787,6 +1840,7 @@ def _launch_query(values, positions, cache, output, heads_to_write):
     n, h, _ = values.shape
     hp = output.shape[1]
     if n:
+        enable_pdl = pdl_enabled()
         _rope_pad_query[(n, heads_to_write)](
             values,
             positions,
@@ -1800,9 +1854,11 @@ def _launch_query(values, positions, cache, output, heads_to_write):
             hp,
             cache.shape[1],
             cache.shape[0],
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
             debug=True,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return output
 
@@ -2068,7 +2124,10 @@ def _dspark_rows_kernel(
     HAS_ROPE: tl.constexpr,
     HAS_WINDOW: tl.constexpr,
     HAS_OUT: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     token = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, 512)
     restored = _dspark_row_value(
@@ -2094,6 +2153,8 @@ def _dspark_rows_kernel(
         page = tl.maximum(slot, 0) // P
         row = tl.maximum(slot, 0) % P
         tl.store(WINDOW + page * W0 + row * W1 + d, restored, live)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -2157,6 +2218,7 @@ def triton_dsv41_dspark_rows(
     _same_device(values, (norm_weight, positions, cos_sin_cache, window, slots, out))
     if tokens == 0:
         return
+    enable_pdl = pdl_enabled()
     _dspark_rows_kernel[(tokens,)](
         values,
         norm_weight if has_norm else values,
@@ -2181,9 +2243,11 @@ def triton_dsv41_dspark_rows(
         has_rope,
         has_window,
         out is not None,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         enable_fp_fusion=False,
         debug=True,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -2233,7 +2297,10 @@ def _dspark_workspace_kernel(
     EPS: tl.constexpr,
     HAS_NORM: tl.constexpr,
     HAS_ROPE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     request = tl.program_id(0).to(tl.int64)
     column = tl.program_id(1).to(tl.int64)
     d = tl.arange(0, 512)
@@ -2264,6 +2331,8 @@ def _dspark_workspace_kernel(
             HAS_ROPE,
         )
     tl.store(OUT + request * O0 + column * 512 + d, value)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -2342,6 +2411,7 @@ def triton_dsv41_dspark_workspace(
         (batch, history + block_size, 512), dtype=torch.bfloat16, device=values.device
     )
     if batch:
+        enable_pdl = pdl_enabled()
         _dspark_workspace_kernel[(batch, history + block_size)](
             values,
             norm_weight if norm_weight is not None else values,
@@ -2370,9 +2440,11 @@ def triton_dsv41_dspark_workspace(
             EPS=norm_eps if norm_weight is not None else 0.0,
             HAS_NORM=norm_weight is not None,
             HAS_ROPE=has_rope,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
             debug=True,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return out
 
@@ -2392,7 +2464,10 @@ def _dspark_anchors_kernel(
     WIDTH: tl.constexpr,
     SPEC: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     one = tl.arange(0, 1)
     decode = row >= EXTENDS
@@ -2418,6 +2493,8 @@ def _dspark_anchors_kernel(
     anchor_mask = decode & (one == 0)
     anchor = tl.load(POSITIONS + offset + accepted - 1 + one, anchor_mask, -1)
     tl.store(START + index + one, anchor.to(tl.int64), anchor_mask)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -2444,6 +2521,7 @@ def triton_dsv41_dspark_anchors(
     rows = accept_lengths.shape[0]
     if rows == 0:
         return
+    enable_pdl = pdl_enabled()
     _dspark_anchors_kernel[(rows,)](
         output_tokens,
         accept_lengths,
@@ -2458,7 +2536,9 @@ def triton_dsv41_dspark_anchors(
         WIDTH=width,
         SPEC=next_tokens.shape[1],
         BLOCK=triton.next_power_of_2(next_tokens.shape[1]),
+        ENABLE_PDL=enable_pdl,
         num_warps=1,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -2486,7 +2566,10 @@ def _dspark_block_kernel(
     BLOCK_P2: tl.constexpr,
     HC_P2: tl.constexpr,
     WIDTH_P2: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     request = tl.program_id(0).to(tl.int64)
     j = tl.arange(0, BLOCK_P2)
     in_block = j < BLOCK
@@ -2522,6 +2605,8 @@ def _dspark_block_kernel(
         tl.broadcast_to(value[None, :], (BLOCK_P2, WIDTH_P2)),
         in_block[:, None] & in_width[None, :],
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -2553,6 +2638,7 @@ def triton_dsv41_dspark_block(
         (requests * block_size, window + block_size), dtype=torch.int32, device=device
     )
     if requests:
+        enable_pdl = pdl_enabled()
         _dspark_block_kernel[(requests,)](
             bonus,
             start_pos,
@@ -2576,7 +2662,9 @@ def triton_dsv41_dspark_block(
             BLOCK_P2=triton.next_power_of_2(block_size),
             HC_P2=triton.next_power_of_2(hc_mult),
             WIDTH_P2=triton.next_power_of_2(window + block_size),
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return ids, positions, pre_mix, request_indices, page, row, indices
 
@@ -2596,8 +2684,14 @@ def _pack_index_query_row(X, V, S, X0, X1, X2, row, HEADS: tl.constexpr):
 
 
 @triton.jit(do_not_specialize=["X0", "X1", "X2"])
-def _pack_index_queries(X, V, S, X0, X1, X2, HEADS: tl.constexpr):
+def _pack_index_queries(
+    X, V, S, X0, X1, X2, HEADS: tl.constexpr, ENABLE_PDL: tl.constexpr
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     _pack_index_query_row(X, V, S, X0, X1, X2, tl.program_id(0).to(tl.int64), HEADS)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit(do_not_specialize=["X0", "X1", "X2"])
@@ -2896,7 +2990,10 @@ def _quantize_index_queries_kernel(
     F0,
     F1,
     D: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
     d = tl.arange(0, D)
@@ -2908,6 +3005,8 @@ def _quantize_index_queries_kernel(
     tl.store(QOut + row * O0 + head * O1 + d, quantized.to(tl.float8e4nv))
     weight = tl.load(W + row * W0 + head * W1).to(tl.float32)
     tl.store(WOut + row * F0 + head * F1, weight * scale)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def quantize_index_queries(index_q, weights):
@@ -2929,6 +3028,7 @@ def quantize_index_queries(index_q, weights):
     )
     folded = torch.empty((tokens, heads), dtype=torch.float32, device=index_q.device)
     if tokens:
+        enable_pdl = pdl_enabled()
         _quantize_index_queries_kernel[(tokens, heads)](
             index_q,
             weights,
@@ -2939,8 +3039,10 @@ def quantize_index_queries(index_q, weights):
             *quantized.stride()[:2],
             *folded.stride(),
             D=dim,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return quantized, folded
 
@@ -2961,14 +3063,17 @@ def pack_index_queries(values):
         # projection would not flatten to rows without a copy.
         heads = values.shape[-2] if values.ndim > 2 else 1
         rows = values.reshape(-1, heads, 128)
+        enable_pdl = pdl_enabled()
         _pack_index_queries[(rows.shape[0] * heads,)](
             rows,
             data,
             scales,
             *rows.stride(),
             HEADS=heads,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return data, scales
 
@@ -3163,8 +3268,22 @@ def index_k_layernorm_scatter_and_pack_query(
     do_not_specialize=["T0", "T1", "L0", "TC", "NP", "CAP"],
 )
 def _safe_metadata(
-    T, L, OT, OL, T0, T1, L0, TC, NP, CAP, P: tl.constexpr, B: tl.constexpr
+    T,
+    L,
+    OT,
+    OL,
+    T0,
+    T1,
+    L0,
+    TC,
+    NP,
+    CAP,
+    P: tl.constexpr,
+    B: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
     column = tile * B + tl.arange(0, B)
     page = tl.load(T + row * T0 + column * T1, column < TC, other=0).to(tl.int64)
@@ -3175,12 +3294,15 @@ def _safe_metadata(
             tl.maximum(tl.load(L + row * L0), 0), tl.minimum(CAP, TC * P)
         )
         tl.store(OL + row, length.to(tl.int32))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def safe_metadata(table, lengths, pages, capacity, page_size):
     safe_table = torch.empty(table.shape, dtype=torch.int32, device=table.device)
     safe_lengths = torch.empty(lengths.shape, dtype=torch.int32, device=lengths.device)
     if lengths.numel():
+        enable_pdl = pdl_enabled()
         _safe_metadata[(table.shape[0], triton.cdiv(table.shape[1], 256))](
             table,
             lengths,
@@ -3194,7 +3316,9 @@ def safe_metadata(table, lengths, pages, capacity, page_size):
             capacity,
             page_size,
             256,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return safe_table, safe_lengths
 
@@ -3219,7 +3343,10 @@ def _clean_logits(
     PAGED: tl.constexpr,
     LIVE_TILES_ONLY: tl.constexpr,
     B: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), CAP)
     # A row's programs stride over its tiles. A live-only clean visits just the
@@ -3240,6 +3367,8 @@ def _clean_logits(
         # Write the entire last live 1024-value tile, including its -inf tail.
         # DeepSelect can prefetch the last 512-value segment before masking it.
         tl.store(O + row * O0 + column, value, column < O0)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def clean_logits(values, lengths, table, pages, capacity, page_size):
@@ -3253,8 +3382,22 @@ def clean_logits(values, lengths, table, pages, capacity, page_size):
     do_not_specialize=["X0", "L0", "T0", "S0", "TC", "NP"],
 )
 def _mask_invalid_pages(
-    X, L, T, S, X0, L0, T0, S0, TC, NP, P: tl.constexpr, B: tl.constexpr
+    X,
+    L,
+    T,
+    S,
+    X0,
+    L0,
+    T0,
+    S0,
+    TC,
+    NP,
+    P: tl.constexpr,
+    B: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     # One program per query row, looping only over its live pages.
     row = tl.program_id(0).to(tl.int64)
     end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), TC * P)
@@ -3271,6 +3414,8 @@ def _mask_invalid_pages(
             column = page_index[:, None] * P + tl.arange(0, P)[None, :]
             value = tl.full((B, P), float("-inf"), X.dtype.element_ty)
             tl.store(X + row * X0 + column, value, invalid[:, None] & (column < end))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def mask_invalid_pages(values, lengths, history_pages, starts, pages, page_size):
@@ -3294,6 +3439,7 @@ def mask_invalid_pages(values, lengths, history_pages, starts, pages, page_size)
         raise RuntimeError("DeepGEMM returned incompatible score geometry")
     width = values.shape[1] // page_size
     if values.shape[0] and width:
+        enable_pdl = pdl_enabled()
         _mask_invalid_pages[(values.shape[0],)](
             values,
             lengths,
@@ -3307,7 +3453,9 @@ def mask_invalid_pages(values, lengths, history_pages, starts, pages, page_size)
             pages,
             page_size,
             256,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return values
 
@@ -3316,8 +3464,22 @@ def mask_invalid_pages(values, lengths, history_pages, starts, pages, page_size)
     do_not_specialize=["X0", "L0", "T0", "TC", "NP"],
 )
 def _mask_invalid_table_pages(
-    X, L, T, X0, L0, T0, T1, TC, NP, P: tl.constexpr, B: tl.constexpr, G: tl.constexpr
+    X,
+    L,
+    T,
+    X0,
+    L0,
+    T0,
+    T1,
+    TC,
+    NP,
+    P: tl.constexpr,
+    B: tl.constexpr,
+    G: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     # Program (row, chunk) checks table pages [chunk * B, chunk * B + B) of its
     # row, so a long row's chunks run in parallel instead of one CTA looping
     # over them; chunks at or past the row's end do nothing. T1 is left
@@ -3347,6 +3509,8 @@ def _mask_invalid_table_pages(
                     float("-inf"),
                     hole[:, None] & (column < end),
                 )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def mask_invalid_table_pages(values, lengths, table, pages, page_size):
@@ -3374,6 +3538,7 @@ def mask_invalid_table_pages(values, lengths, table, pages, page_size):
         # 1024 pages per program keeps a 1M-token table (16385 pages) at 17
         # programs per row, under one wave for 96 rows; 16-page store groups
         # keep the kernel at about 30 registers.
+        enable_pdl = pdl_enabled()
         _mask_invalid_table_pages[(values.shape[0], triton.cdiv(table.shape[1], 1024))](
             values,
             lengths,
@@ -3387,7 +3552,9 @@ def mask_invalid_table_pages(values, lengths, table, pages, page_size):
             page_size,
             1024,
             max(1, 1024 // page_size),
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return values
 
@@ -3502,7 +3669,10 @@ def _prepare_dense(
     W,
     SW,
     B: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1)
     p = tile * B + tl.arange(0, B)
     end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), W)
@@ -3510,6 +3680,8 @@ def _prepare_dense(
     tl.store(S + row * S0 + p, value, p < SW)
     if tile == 0:
         tl.store(E + row, end)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit(
@@ -3532,7 +3704,10 @@ def _reduce_blocks(
     FULL_WIDTH: tl.constexpr,
     ALIGNMENT: tl.constexpr,
     B: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row, tile = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     lane = tl.arange(0, GROUP)
     end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), W)
@@ -3564,6 +3739,8 @@ def _reduce_blocks(
         tl.store(S + row * S0 + block, scores, block < stop)
     if tile == 0:
         tl.store(E + row, count)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit(
@@ -3662,7 +3839,10 @@ def _finish_selection(
     HAS_CANDIDATES: tl.constexpr,
     POSITION_SORT: tl.constexpr,
     B: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     i = tl.arange(0, B)
     selected = tl.load(I + row * I0 + i, i < K, other=-1)
@@ -3679,6 +3859,8 @@ def _finish_selection(
     if POSITION_SORT:
         position = tl.sort(position, descending=False)
     tl.store(O + row * K + i, tl.where(position != 2147483647, position, -1), i < K)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit(
@@ -3728,6 +3910,7 @@ def prepare_native_block_scores(logits, lengths, block_size, alignment):
     )
     ends = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
     if logits.shape[0]:
+        enable_pdl = pdl_enabled()
         _reduce_blocks[(logits.shape[0], 32)](
             logits,
             lengths,
@@ -3745,6 +3928,8 @@ def prepare_native_block_scores(logits, lengths, block_size, alignment):
             False,
             alignment,
             128,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return scores, ends
 
@@ -3757,6 +3942,7 @@ def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
     dtype = logits.dtype if block_size == 1 and not pin_newest else torch.float32
     scores = torch.empty((logits.shape[0], stride), dtype=dtype, device=logits.device)
     end = torch.empty(logits.shape[0], dtype=torch.int32, device=logits.device)
+    enable_pdl = pdl_enabled()
     if block_size == 1 and not pin_newest:
         _prepare_dense[(logits.shape[0], triton.cdiv(stride, 1024))](
             logits,
@@ -3770,6 +3956,8 @@ def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
             width,
             stride,
             1024,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     else:
         _reduce_blocks[(logits.shape[0], triton.cdiv(stride, 128))](
@@ -3789,6 +3977,8 @@ def prepare_scores(logits, lengths, block_size, alignment, pin_newest):
             True,
             alignment,
             128,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return scores, end
 
@@ -3859,6 +4049,7 @@ def finish_selection(
     Selection width is runtime data; only its power-of-two tile specializes.
     """
     output = torch.empty(indices.shape, dtype=torch.int32, device=indices.device)
+    enable_pdl = pdl_enabled()
     kernel_launcher(_finish_selection, (indices.shape[0],))(
         indices,
         scores,
@@ -3874,7 +4065,9 @@ def finish_selection(
         candidates is not None,
         sort_positions,
         triton.next_power_of_2(indices.shape[1]),
+        ENABLE_PDL=enable_pdl,
         num_warps=8,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
     return output
 
@@ -3896,7 +4089,10 @@ def _write_selection(
     C,
     ROW_BLOCK: tl.constexpr,
     CANDIDATE_BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     k = tl.arange(0, ROW_BLOCK)
     ids = tl.load(Selected + row * selected_stride + k, k < K, other=-1)
@@ -3913,6 +4109,8 @@ def _write_selection(
         candidates = tl.where(candidates == 2147483647, -1, candidates)
         tl.store(Blocks + row * C + c, candidates, c < C)
     tl.store(BlockLengths + row, count)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def write_selection(selected, candidates, out):
@@ -3924,6 +4122,7 @@ def write_selection(selected, candidates, out):
     rows, lengths, blocks, block_lengths = out
     if selected.shape[0] == 0:
         return
+    enable_pdl = pdl_enabled()
     kernel_launcher(_write_selection, (selected.shape[0],))(
         selected,
         candidates if candidates is not None else selected,
@@ -3937,7 +4136,9 @@ def write_selection(selected, candidates, out):
         blocks.shape[1],
         triton.next_power_of_2(rows.shape[1]),
         triton.next_power_of_2(max(1, blocks.shape[1])),
+        ENABLE_PDL=enable_pdl,
         num_warps=8,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -4043,7 +4244,10 @@ def _finish_write_selection(
     RS: tl.constexpr,
     ROW_BLOCK: tl.constexpr,
     POOL_BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     # Program (row, 0) finishes the row picks; (row, 1) the candidate-block
     # picks of a pass that sources a pool, concurrently.
     row = tl.program_id(0).to(tl.int64)
@@ -4090,6 +4294,8 @@ def _finish_write_selection(
             ids = _finished_ids(J, T, F, J, row, c, J0, T0, 0, CK, 0, 1, False, False)
             tl.store(Blocks + row * CK + c, ids, c < CK)
             tl.store(BlockLengths + row, tl.sum((ids >= 0).to(tl.int32)))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def finish_write_selection(rows, pool, out, slots, short_rows_unscored):
@@ -4137,6 +4343,7 @@ def finish_write_selection(rows, pool, out, slots, short_rows_unscored):
     if n == 0:
         return
     table = slots.table if slots is not None else indices
+    enable_pdl = pdl_enabled()
     kernel_launcher(_finish_write_selection, (n, 1 if pool is None else 2))(
         indices,
         scores,
@@ -4174,7 +4381,9 @@ def finish_write_selection(rows, pool, out, slots, short_rows_unscored):
         slots.requests.stride(0) if slots is not None else 1,
         triton.next_power_of_2(k),
         triton.next_power_of_2(pool_k) if pool is not None else 1,
+        ENABLE_PDL=enable_pdl,
         num_warps=8,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )
 
 
@@ -4194,7 +4403,10 @@ def _decode_rows_kernel(
     RAGGED: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     token = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     row = token // WIDTH
     offset = token % WIDTH
@@ -4231,6 +4443,8 @@ def _decode_rows_kernel(
     pool = tl.load(Req + token, live_request, other=-1)
     tl.store(Lengths + token, length, token < BS)
     tl.store(PoolRows + token, pool, token < BS)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -4257,6 +4471,7 @@ def decode_rows(
     """Refresh request vectors and packed token coordinates, including padding."""
     extent = max(positions.numel(), lengths.numel())
     if extent:
+        enable_pdl = pdl_enabled()
         _decode_rows_kernel[(triton.cdiv(extent, 256),)](
             seq_lens,
             request_pool_indices,
@@ -4272,6 +4487,8 @@ def decode_rows(
             RAGGED=query_start_loc is not None,
             WIDTH=width,
             BLOCK=256,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
 
 
@@ -4293,7 +4510,10 @@ def _decode_window_kernel(
     PS: tl.constexpr,
     RS: tl.constexpr,
     SWA_PAGES,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     pos = tl.load(Positions + row * PS).to(tl.int64)
     req = tl.load(Requests + row * RS)
@@ -4309,6 +4529,8 @@ def _decode_window_kernel(
     tl.store(Write + row, write)
     tl.store(Read + row * 128 + offsets, slots)
     tl.store(ReadLen + row, tl.minimum(tl.maximum(pos + 1, 0), 128))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -4336,6 +4558,7 @@ def decode_window(
     is overwritten, so the buffers are reusable under graphs.
     """
     if positions.numel():
+        enable_pdl = pdl_enabled()
         _decode_window_kernel[(positions.numel(),)](
             positions,
             requests,
@@ -4350,7 +4573,9 @@ def decode_window(
             positions.stride(0),
             requests.stride(0),
             swa_pages,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
 
 
@@ -4377,7 +4602,10 @@ def _global_slots_kernel(
     RATIO: tl.constexpr,
     PAGES,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     row = i // K
     logical = tl.load(Rows + row * LS0 + i % K * LS1, i < N, other=-1)
@@ -4390,6 +4618,8 @@ def _global_slots_kernel(
     )
     slots = resolve_group_slot(Table, raw, req, TR, TC, TS0, TS1, 64, RATIO, 1, PAGES)
     tl.store(Out + i, slots, i < N)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -4405,6 +4635,7 @@ def global_slots(rows, positions, requests, table, ratio, pages):
     """Map selected logical rows, applying per-query causality and page bounds."""
     out = torch.empty(rows.shape, device=rows.device, dtype=torch.int32)
     if rows.numel():
+        enable_pdl = pdl_enabled()
         _global_slots_kernel[(triton.cdiv(rows.numel(), 256),)](
             rows,
             positions,
@@ -4421,6 +4652,8 @@ def global_slots(rows, positions, requests, table, ratio, pages):
             ratio,
             pages,
             BLOCK=256,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return out
 
@@ -4534,7 +4767,10 @@ def _selection_table_kernel(
     RS: tl.constexpr,
     RATIO: tl.constexpr,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     req = tl.load(Req + row * RS)
@@ -4544,6 +4780,8 @@ def _selection_table_kernel(
     tl.store(Out + row * TC + col, tl.where(page > 0, page, -1), col < TC)
     if tl.program_id(1) == 0:
         tl.store(Lens + row, tl.maximum((pos + 1) // RATIO, 0))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -4561,6 +4799,7 @@ def selection_table(positions, requests, table, ratio):
     out = torch.empty((n, table.shape[1]), dtype=torch.int32, device=table.device)
     lengths = torch.empty(n, dtype=torch.int32, device=table.device)
     if n:
+        enable_pdl = pdl_enabled()
         kernel_launcher(
             _selection_table_kernel, (n, max(1, triton.cdiv(table.shape[1], 256)))
         )(
@@ -4577,6 +4816,8 @@ def selection_table(positions, requests, table, ratio):
             requests.stride(0),
             ratio,
             BLOCK=256,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return out, lengths
 
@@ -4606,7 +4847,10 @@ def _compressor_metadata(
     TS1,
     PAGES,
     BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     position = tl.load(Positions + row * P0, row < N, -1).to(tl.int64)
     request = tl.load(Requests + row * R0, row < N, -1).to(tl.int64)
@@ -4636,6 +4880,8 @@ def _compressor_metadata(
     tl.store(Previous + row, previous, row < N)
     tl.store(ReadSlots + row, read_slot, row < N)
     tl.store(WriteSlots + row, write_slot, row < N)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -4679,6 +4925,7 @@ def compressor_metadata(
     if any(not value.is_contiguous() for value in out):
         raise ValueError("Compressor metadata outputs must be contiguous")
     if n:
+        enable_pdl = pdl_enabled()
         _compressor_metadata[(triton.cdiv(n, 256),)](
             positions,
             requests,
@@ -4691,7 +4938,9 @@ def compressor_metadata(
             *table.stride(),
             pages,
             BLOCK=256,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
 
 
@@ -4707,7 +4956,10 @@ def _block_maxima_kernel(
     visible_stride,
     blocks,
     TILE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     block = tl.program_id(1) * TILE + tl.arange(0, TILE)
     col = block[:, None] * 8 + tl.arange(0, 8)[None, :]
@@ -4729,6 +4981,8 @@ def _block_maxima_kernel(
         (block == newest) & (maxima > -float("inf")), float("inf"), maxima
     )
     tl.store(Output + row * blocks + block, maxima, mask=block < blocks)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def block_maxima(logits: torch.Tensor, visible: torch.Tensor) -> torch.Tensor:
@@ -4755,6 +5009,7 @@ def block_maxima_with_lengths(
     output = torch.empty((rows, blocks), dtype=logits.dtype, device=logits.device)
     ends = torch.empty((rows,), dtype=torch.int32, device=logits.device)
     if rows:
+        enable_pdl = pdl_enabled()
         _block_maxima_kernel[(rows, triton.cdiv(blocks, 128))](
             logits,
             visible,
@@ -4766,6 +5021,8 @@ def block_maxima_with_lengths(
             visible.stride(0),
             blocks,
             128,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return output, ends
 
@@ -4800,7 +5057,10 @@ def _clean_block_maxima_kernel(
     blocks,
     workers,
     TILE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     worker = tl.program_id(1)
     length = tl.minimum(tl.maximum(tl.load(Lengths + row * length_stride), 0), width)
@@ -4830,6 +5090,8 @@ def _clean_block_maxima_kernel(
             (block == end - 1) & (maximum > -float("inf")), float("inf"), maximum
         )
         tl.store(Maxima + row * blocks + block, maximum, block < end)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def clean_block_maxima(
@@ -4862,6 +5124,7 @@ def clean_block_maxima(
     maxima = torch.empty((rows, blocks), device=scores.device, dtype=torch.float32)
     ends = torch.empty((rows,), device=scores.device, dtype=torch.int32)
     if rows:
+        enable_pdl = pdl_enabled()
         _clean_block_maxima_kernel[(rows, workers)](
             scores,
             visible,
@@ -4879,6 +5142,8 @@ def clean_block_maxima(
             blocks,
             workers,
             1024,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return cleaned, maxima, ends
 
@@ -4899,7 +5164,10 @@ def _pack_index_inputs(
     W1: tl.constexpr,
     CONVERT_WEIGHTS: tl.constexpr,
     ROWS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = (tl.program_id(0) * ROWS + tl.arange(0, ROWS)).to(tl.int64)
     d = tl.arange(0, 128)
     token, head = row // H, row % H
@@ -4918,6 +5186,8 @@ def _pack_index_inputs(
     if CONVERT_WEIGHTS:
         weight = tl.load(W + token * W0 + head * W1, row < N, other=0).to(tl.float32)
         tl.store(OW + row, weight, row < N)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def pack_index_inputs(values, weights, weights_dtype):
@@ -4946,6 +5216,7 @@ def pack_index_inputs(values, weights, weights_dtype):
     count = values.shape[0] * values.shape[1]
     if count:
         rows = 4 if values.shape[0] <= 64 else 8
+        enable_pdl = pdl_enabled()
         _pack_index_inputs[(triton.cdiv(count, rows),)](
             values,
             weights,
@@ -4958,8 +5229,10 @@ def pack_index_inputs(values, weights, weights_dtype):
             *weights.stride(),
             convert,
             rows,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return (data, scales), output_weights
 
@@ -5093,8 +5366,19 @@ def _index_select_all(
 
 @triton.jit(do_not_specialize=["K", "S0", "S1", "LS"])
 def _compact_slots_kernel(
-    Slots, Lengths, Out, Counts, K, S0, S1, LS, BLOCK: tl.constexpr
+    Slots,
+    Lengths,
+    Out,
+    Counts,
+    K,
+    S0,
+    S1,
+    LS,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0)
     i = tl.arange(0, BLOCK)
     length = tl.load(Lengths + row * LS)
@@ -5106,6 +5390,8 @@ def _compact_slots_kernel(
     tl.store(Out + row * K + prefix - 1, value, valid)
     tl.store(Out + row * K + i, -1, (i < K) & (i >= count))
     tl.store(Counts + row, count)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -5172,6 +5458,7 @@ def _clean_logits_output(
         # tiles: the live tiles of a wide capacity are a small prefix.
         tiles = triton.cdiv(stride, 1024)
         programs = min(tiles, max(16, triton.cdiv(2048, values.shape[0])))
+        enable_pdl = pdl_enabled()
         _clean_logits[(values.shape[0], programs)](
             values,
             lengths,
@@ -5189,7 +5476,9 @@ def _clean_logits_output(
             table is not None,
             live_tiles_only,
             1024,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return output
 
@@ -5597,6 +5886,7 @@ def compact_slots(slots, lengths):
     out = torch.empty(slots.shape, dtype=slots.dtype, device=slots.device)
     counts = torch.empty(slots.shape[0], dtype=torch.int32, device=slots.device)
     if slots.shape[0]:
+        enable_pdl = pdl_enabled()
         _compact_slots_kernel[(slots.shape[0],)](
             slots,
             lengths,
@@ -5606,6 +5896,8 @@ def compact_slots(slots, lengths):
             *slots.stride(),
             lengths.stride(0),
             BLOCK=triton.next_power_of_2(max(1, slots.shape[1])),
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return out, counts
 
@@ -5652,7 +5944,10 @@ def _verify_layout_kernel(
     BLOCK: tl.constexpr,
     USE_LATEST: tl.constexpr,
     HAS_ACTIVE_COUNT: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     index = tl.arange(0, BLOCK).to(tl.int64)
     request = index // DRAFT
     column = index % DRAFT
@@ -5715,6 +6010,8 @@ def _verify_layout_kernel(
     total = tl.sum(counts, 0)
     rows = owner.to(tl.int64) * (DRAFT + 1) + index - before
     tl.store(Rows + index, tl.where(index < total, rows, 0), index < CAPACITY)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -5740,6 +6037,7 @@ def triton_dsv41_verify_layout(
 ):
     bs, draft = scores.shape
     block = triton.next_power_of_2(bs * (draft + 1))
+    enable_pdl = pdl_enabled()
     _verify_layout_kernel[(1,)](
         scores,
         latest_scores,
@@ -5758,5 +6056,7 @@ def triton_dsv41_verify_layout(
         BLOCK=block,
         USE_LATEST=latest_scores is not None,
         HAS_ACTIVE_COUNT=active_count is not None,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
+        **({"launch_pdl": True} if enable_pdl else {}),
     )

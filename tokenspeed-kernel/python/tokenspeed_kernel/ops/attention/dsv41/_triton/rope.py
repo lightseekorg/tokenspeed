@@ -35,7 +35,7 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _same_device,
     _ue8m0_word,
 )
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -101,13 +101,18 @@ def _index_key_norm_rope(
     R: tl.constexpr,
     MAX_POS: tl.constexpr,
     ROWS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     d = tl.arange(0, 128)
     result = _normalized_index_keys(
         X, W, POS, CS, N, X0, X1, P0, CS0, EPS, R, MAX_POS, ROWS
     )
     tl.store(OUT + rows[:, None] * 128 + d[None, :], result, rows[:, None] < N)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _validate_index_key_inputs(values, weight, positions, cos_sin_cache, eps):
@@ -181,6 +186,7 @@ def triton_dsv41_index_key_norm_rope(
     _validate_index_key_inputs(values, weight, positions, cos_sin_cache, eps)
     out = torch.empty(values.shape, dtype=values.dtype, device=values.device)
     if values.shape[0]:
+        enable_pdl = pdl_enabled()
         _index_key_norm_rope[(triton.cdiv(values.shape[0], 4),)](
             values,
             weight,
@@ -195,9 +201,11 @@ def triton_dsv41_index_key_norm_rope(
             cos_sin_cache.shape[1],
             cos_sin_cache.shape[0],
             4,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
             debug=True,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return out
 
@@ -218,7 +226,10 @@ def _index_query_rope_weights(
     CS0: tl.constexpr,
     SCALE: tl.constexpr,
     MAX_POS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
     position = tl.maximum(tl.load(POS + token * P0).to(tl.int64), 0)
@@ -239,6 +250,8 @@ def _index_query_rope_weights(
     # Match Torch's FP32 multiplication followed by BF16 rounding.
     scaled = (weight * tl.full((), SCALE, tl.float32)).to(tl.bfloat16)
     tl.store(OUT + token * tl.num_programs(1) + head, scaled)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _validate_index_query_inputs(query, head_weights, positions, cos_sin_cache):
@@ -307,6 +320,7 @@ def triton_dsv41_index_query_rope_weights(
         raise ValueError("Index query must not have broadcast writes")
     out = torch.empty(query.shape[:2], dtype=query.dtype, device=query.device)
     if query.shape[0]:
+        enable_pdl = pdl_enabled()
         _index_query_rope_weights[(query.shape[0], query.shape[1])](
             query,
             head_weights,
@@ -319,9 +333,11 @@ def triton_dsv41_index_query_rope_weights(
             cos_sin_cache.stride(0),
             weight_scale,
             cos_sin_cache.shape[0],
+            ENABLE_PDL=enable_pdl,
             num_warps=1,
             enable_fp_fusion=False,
             debug=True,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return query, out
 
@@ -348,7 +364,10 @@ def _index_key_norm_rope_scatter(
     R: tl.constexpr,
     MAX_POS: tl.constexpr,
     ROWS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     rows = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
     values = (
         _normalized_index_keys(X, W, POS, CS, N, X0, X1, P0, CS0, EPS, R, MAX_POS, ROWS)
@@ -375,6 +394,8 @@ def _index_key_norm_rope_scatter(
         exponent.to(tl.uint8),
         valid[:, None],
     )
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -399,6 +420,7 @@ def triton_dsv41_index_key_norm_rope_scatter(
     _integers(slots, (values.shape[0],), "slots")
     _same_device(values, (cache, slots))
     if values.shape[0]:
+        enable_pdl = pdl_enabled()
         _index_key_norm_rope_scatter[(triton.cdiv(values.shape[0], 4),)](
             values,
             weight,
@@ -417,9 +439,11 @@ def triton_dsv41_index_key_norm_rope_scatter(
             cos_sin_cache.shape[1],
             cos_sin_cache.shape[0],
             4,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
             debug=True,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
 
 
@@ -444,7 +468,10 @@ def _index_query_rope_quant(
     SCALE: tl.constexpr,
     MAX_POS: tl.constexpr,
     ROWS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     rows = (tl.program_id(0) * ROWS + tl.arange(0, ROWS)).to(tl.int64)
     token, head = rows // H, rows % H
     d = tl.arange(0, 128)
@@ -477,6 +504,8 @@ def _index_query_rope_quant(
     weight = tl.load(W + token * W0 + head * W1, rows < N, 0).to(tl.float32)
     scaled = (weight * tl.full((), SCALE, tl.float32)).to(tl.bfloat16)
     tl.store(WEIGHTS + rows, scaled.to(tl.float32), rows < N)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -504,6 +533,7 @@ def triton_dsv41_index_query_rope_quant(
     weights = torch.empty(query.shape[:2], dtype=output_dtype, device=query.device)
     count = query.shape[0] * query.shape[1]
     if count:
+        enable_pdl = pdl_enabled()
         _index_query_rope_quant[(triton.cdiv(count, 4),)](
             query,
             head_weights,
@@ -521,9 +551,11 @@ def triton_dsv41_index_query_rope_quant(
             weight_scale,
             cos_sin_cache.shape[0],
             4,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
             debug=True,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     return (data, scales), weights
 
@@ -545,7 +577,10 @@ def _global_rope_scatter(
     C2: tl.constexpr,
     S0: tl.constexpr,
     MAX_POS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     token = tl.program_id(0).to(tl.int64)
     position = tl.maximum(tl.load(POS + token * POS0).to(tl.int64), 0)
     position_valid = position < MAX_POS
@@ -579,6 +614,8 @@ def _global_rope_scatter(
         tl.store(base + _planar_offset(payload, C1, C2, 288), lo | (hi << 4))
         scales = 64 * 256 + page_row * 32 + tl.arange(0, 32)
         tl.store(base + _planar_offset(scales, C1, C2, 288), scale_bytes)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @register_kernel(
@@ -636,6 +673,7 @@ def triton_dsv41_global_rope_scatter(
     ):
         raise ValueError("Global cache must not have broadcast writes")
     if values.shape[0]:
+        enable_pdl = pdl_enabled()
         _global_rope_scatter[(values.shape[0],)](
             values,
             positions,
@@ -649,7 +687,9 @@ def triton_dsv41_global_rope_scatter(
             *cache.stride(),
             slots.stride(0),
             cos_sin_cache.shape[0],
+            ENABLE_PDL=enable_pdl,
             num_warps=4 if values.shape[0] <= 512 else 1,
             enable_fp_fusion=False,
             debug=True,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )

@@ -38,7 +38,26 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.dsv41 import rope_quantize_fp8_grouped
+from tokenspeed_kernel.ops.attention.dsv41 import (
+    compressor_pool,
+    dspark_rows,
+    dspark_workspace,
+    global_rope_scatter,
+    index_key_norm_rope,
+    index_key_norm_rope_scatter,
+    index_query_rope_quant,
+    rope_pad_query,
+    rope_quantize_fp8_grouped,
+    swa_rope_scatter,
+    verify_layout,
+)
+from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import (
+    clean_logits_and_block_max,
+)
+from tokenspeed_kernel.ops.attention.dsv41.triton import (
+    block_maxima_with_lengths,
+    clean_logits,
+)
 from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (
     stage_mxfp4_mega_moe_inputs,
 )
@@ -296,6 +315,250 @@ def _case_stage_mxfp4_mega_moe_inputs():
     return real, run
 
 
+def _dsv41_cos_sin_cache(rotary_dim: int = 64) -> torch.Tensor:
+    angles = torch.arange(4096, device=DEVICE)[:, None].float() * torch.exp(
+        -torch.arange(rotary_dim // 2, device=DEVICE).float() / 4
+    )
+    return torch.cat((angles.cos(), -angles.sin()), dim=-1)
+
+
+def _case_dsv41_index_key_norm_rope():
+    torch.manual_seed(109)
+    tokens = 32
+    real = torch.randn(tokens, 128, dtype=torch.bfloat16, device=DEVICE)
+    weight = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(tokens, device=DEVICE) * 3
+    cache = _dsv41_cos_sin_cache()
+
+    def run(values):
+        return (index_key_norm_rope(values, weight, positions, cache, 1e-6),)
+
+    return real, run
+
+
+def _case_dsv41_index_key_norm_rope_scatter():
+    torch.manual_seed(110)
+    tokens = 64
+    real = torch.randn(tokens, 128, dtype=torch.bfloat16, device=DEVICE)
+    weight = torch.randn(128, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(tokens, device=DEVICE)
+    slots = torch.arange(tokens, dtype=torch.int32, device=DEVICE)
+    cache = _dsv41_cos_sin_cache()
+
+    def run(values):
+        field = torch.empty(1, 64, 68, dtype=torch.uint8, device=DEVICE)
+        index_key_norm_rope_scatter(
+            values, weight, positions, cache, 1e-6, field, slots
+        )
+        return (field,)
+
+    return real, run
+
+
+def _case_dsv41_index_query_rope_quant():
+    torch.manual_seed(111)
+    tokens, heads = 16, 64
+    real = torch.randn(tokens, heads, 128, dtype=torch.bfloat16, device=DEVICE)
+    head_weights = torch.randn(tokens, heads, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(tokens, device=DEVICE) * 2
+    cache = _dsv41_cos_sin_cache()
+
+    def run(query):
+        (codes, scales), scaled_weights = index_query_rope_quant(
+            query, head_weights, positions, cache, 0.25, torch.float32
+        )
+        return (codes, scales, scaled_weights)
+
+    return real, run
+
+
+def _case_dsv41_global_rope_scatter():
+    torch.manual_seed(112)
+    tokens = 64
+    real = torch.randn(tokens, 512, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(tokens, device=DEVICE)
+    slots = torch.arange(tokens, dtype=torch.int32, device=DEVICE)
+    cache = _dsv41_cos_sin_cache()
+
+    def run(values):
+        field = torch.empty(1, 64, 288, dtype=torch.uint8, device=DEVICE)
+        global_rope_scatter(values, positions, cache, field, slots)
+        return (field,)
+
+    return real, run
+
+
+def _case_dsv41_swa_rope_scatter():
+    torch.manual_seed(113)
+    tokens = 64
+    real = torch.randn(tokens, 512, dtype=torch.bfloat16, device=DEVICE)
+    norm_weight = torch.randn(512, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(tokens, device=DEVICE)
+    slots = torch.arange(64, 128, dtype=torch.int32, device=DEVICE)
+    cache = _dsv41_cos_sin_cache()
+
+    def run(values):
+        field = torch.empty(2, 64, 528, dtype=torch.uint8, device=DEVICE)
+        out = torch.empty(tokens, 512, dtype=torch.bfloat16, device=DEVICE)
+        swa_rope_scatter(
+            values, positions, cache, field, slots, "swa", out, norm_weight, 1e-6
+        )
+        return (out, field[1].contiguous())
+
+    return real, run
+
+
+def _case_dsv41_compressor_pool():
+    torch.manual_seed(114)
+    tokens = 32
+    real = torch.randn(tokens, 512, dtype=torch.float32, device=DEVICE)
+    scores = torch.randn(tokens, 512, dtype=torch.float32, device=DEVICE)
+    previous = torch.arange(-1, tokens - 1, dtype=torch.int32, device=DEVICE)
+    tail = torch.randn(4, 2, 2, 512, dtype=torch.float32, device=DEVICE)
+    tail_slots = torch.full((tokens,), 2, dtype=torch.int32, device=DEVICE)
+    active = torch.ones(tokens, dtype=torch.bool, device=DEVICE)
+    norm_weight = torch.randn(512, dtype=torch.bfloat16, device=DEVICE)
+
+    def run(content):
+        out = torch.empty(tokens, 512, dtype=torch.bfloat16, device=DEVICE)
+        compressor_pool(
+            content, scores, previous, tail, tail_slots, active, out, norm_weight, 1e-6
+        )
+        return (out,)
+
+    return real, run
+
+
+def _case_dsv41_dspark_rows():
+    torch.manual_seed(115)
+    tokens = 32
+    real = torch.randn(tokens, 512, dtype=torch.bfloat16, device=DEVICE)
+    norm_weight = torch.randn(512, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(tokens, device=DEVICE)
+    cache = _dsv41_cos_sin_cache()
+
+    def run(values):
+        out = torch.empty(tokens, 512, dtype=torch.bfloat16, device=DEVICE)
+        dspark_rows(values, norm_weight, 1e-6, positions, cache, None, None, out)
+        return (out,)
+
+    return real, run
+
+
+def _case_dsv41_dspark_workspace():
+    torch.manual_seed(116)
+    batch, history, block_size = 2, 8, 6
+    real = torch.randn(batch * block_size, 512, dtype=torch.bfloat16, device=DEVICE)
+    norm_weight = torch.randn(512, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(batch * block_size, device=DEVICE)
+    cache = _dsv41_cos_sin_cache()
+    window = torch.randn(2, 64, 512, dtype=torch.bfloat16, device=DEVICE)
+    page = torch.ones(batch, history, dtype=torch.int64, device=DEVICE)
+    row = (
+        torch.arange(history, dtype=torch.int64, device=DEVICE)
+        .unsqueeze(0)
+        .expand(batch, -1)
+        .contiguous()
+    )
+
+    def run(values):
+        out = dspark_workspace(
+            values, norm_weight, 1e-6, positions, cache, window, page, row, block_size
+        )
+        return (out,)
+
+    return real, run
+
+
+def _case_dsv41_rope_pad_query():
+    torch.manual_seed(117)
+    tokens, heads = 16, 48
+    real = torch.randn(tokens, heads, 512, dtype=torch.bfloat16, device=DEVICE)
+    positions = torch.arange(tokens, device=DEVICE)
+    cache = _dsv41_cos_sin_cache()
+
+    def run(values):
+        return (rope_pad_query(values, positions, cache, None),)
+
+    return real, run
+
+
+def _case_dsv41_clean_logits():
+    torch.manual_seed(118)
+    rows, width = 8, 1024
+    real = torch.randn(rows, width, dtype=torch.float32, device=DEVICE)
+    lengths = torch.full((rows,), 517, dtype=torch.int32, device=DEVICE)
+    table = (
+        torch.arange(16, dtype=torch.int32, device=DEVICE)
+        .remainder(3)
+        .unsqueeze(0)
+        .expand(rows, -1)
+        .contiguous()
+    )
+
+    def run(values):
+        return (clean_logits(values, lengths, table, 3, width, 64),)
+
+    return real, run
+
+
+def _case_dsv41_clean_logits_block_max():
+    torch.manual_seed(119)
+    rows, width = 8, 1024
+    real = torch.randn(rows, width, dtype=torch.float32, device=DEVICE)
+    lengths = torch.full((rows,), 517, dtype=torch.int32, device=DEVICE)
+    table = (
+        torch.arange(16, dtype=torch.int32, device=DEVICE)
+        .remainder(3)
+        .unsqueeze(0)
+        .expand(rows, -1)
+        .contiguous()
+    )
+
+    def run(values):
+        return clean_logits_and_block_max(values, lengths, table, 3, width, 64, 512)
+
+    return real, run
+
+
+def _case_dsv41_block_maxima():
+    torch.manual_seed(120)
+    rows, width = 8, 1024
+    real = torch.randn(rows, width, dtype=torch.float32, device=DEVICE)
+    lengths = torch.full((rows,), 517, dtype=torch.int32, device=DEVICE)
+
+    def run(values):
+        return block_maxima_with_lengths(values, lengths)
+
+    return real, run
+
+
+def _case_dsv41_verify_layout():
+    torch.manual_seed(121)
+    bs, draft_width, capacity = 16, 5, 48
+    real = torch.randn(bs, draft_width, dtype=torch.float32, device=DEVICE)
+
+    def run(scores):
+        rows_out = torch.empty(capacity, dtype=torch.int64, device=DEVICE)
+        indptr_out = torch.empty(bs + 1, dtype=torch.int64, device=DEVICE)
+        counts_out = torch.empty(bs, dtype=torch.int64, device=DEVICE)
+        valid_out = torch.empty((), dtype=torch.bool, device=DEVICE)
+        verify_layout(
+            scores,
+            query_capacity=capacity,
+            rows_out=rows_out,
+            indptr_out=indptr_out,
+            counts_out=counts_out,
+            valid_out=valid_out,
+            latest_scores=None,
+            request_slots=None,
+            active_count=None,
+        )
+        return (rows_out, indptr_out, counts_out, valid_out)
+
+    return real, run
+
+
 _CASES = {
     "mhc_post_hc4": _case_mhc_post,
     "mhc_pre_mix_hc4": _case_mhc_pre_mix,
@@ -304,6 +567,19 @@ _CASES = {
     "rmsnorm_fp8_group32_ue8m0": _case_rmsnorm_fp8_group32_swizzled,
     "dsv41_rope_quantize_fp8_grouped": _case_rope_quantize_fp8_grouped,
     "stage_mxfp4_mega_moe_inputs": _case_stage_mxfp4_mega_moe_inputs,
+    "dsv41_index_key_norm_rope": _case_dsv41_index_key_norm_rope,
+    "dsv41_index_key_norm_rope_scatter": _case_dsv41_index_key_norm_rope_scatter,
+    "dsv41_index_query_rope_quant": _case_dsv41_index_query_rope_quant,
+    "dsv41_global_rope_scatter": _case_dsv41_global_rope_scatter,
+    "dsv41_swa_rope_scatter": _case_dsv41_swa_rope_scatter,
+    "dsv41_compressor_pool": _case_dsv41_compressor_pool,
+    "dsv41_dspark_rows": _case_dsv41_dspark_rows,
+    "dsv41_dspark_workspace": _case_dsv41_dspark_workspace,
+    "dsv41_rope_pad_query": _case_dsv41_rope_pad_query,
+    "dsv41_clean_logits": _case_dsv41_clean_logits,
+    "dsv41_clean_logits_block_max": _case_dsv41_clean_logits_block_max,
+    "dsv41_block_maxima": _case_dsv41_block_maxima,
+    "dsv41_verify_layout": _case_dsv41_verify_layout,
 }
 
 

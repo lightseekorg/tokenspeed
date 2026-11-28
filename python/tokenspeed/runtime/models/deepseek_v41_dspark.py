@@ -58,6 +58,7 @@ from tokenspeed.runtime.models.deepseek_v41 import (
     _merged,
     _norm,
     _replicated,
+    _v41_hc_input,
     v41_hc_pre,
     v41_mxfp8_config,
     v41_quantize_fp8,
@@ -498,18 +499,19 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
             )
         if pending_post is not None:
             h = pending_post.finish(h)
+        if confidence_hidden_out is None:
+            return _v41_hc_input(h, pre_mix, self.norm).reshape(
+                batch, self.block_size, -1
+            )
         combined = v41_hc_pre(h, pre_mix)
         features = combined.reshape(batch, self.block_size, -1)
-        if confidence_hidden_out is not None:
-            if (
-                confidence_hidden_out.shape != features.shape
-                or confidence_hidden_out.dtype != combined.dtype
-                or confidence_hidden_out.device != combined.device
-            ):
-                raise ValueError(
-                    "DSpark confidence capture must match pre-norm features"
-                )
-            confidence_hidden_out.copy_(features)
+        if (
+            confidence_hidden_out.shape != features.shape
+            or confidence_hidden_out.dtype != combined.dtype
+            or confidence_hidden_out.device != combined.device
+        ):
+            raise ValueError("DSpark confidence capture must match pre-norm features")
+        confidence_hidden_out.copy_(features)
         return _norm(combined, self.norm).reshape(batch, self.block_size, -1)
 
     def confidence_logits(

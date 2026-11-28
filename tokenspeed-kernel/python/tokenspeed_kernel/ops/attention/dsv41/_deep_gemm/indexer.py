@@ -27,6 +27,7 @@ from functools import lru_cache
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexGeometry, IndexMetadata
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
 
 
@@ -51,7 +52,10 @@ def _clean_logits_block_max(
     PAGE: tl.constexpr,
     PAGED: tl.constexpr,
     BLOCKS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     row = tl.program_id(0).to(tl.int64)
     tile = tl.program_id(1)
     end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), CAP)
@@ -76,6 +80,8 @@ def _clean_logits_block_max(
     tl.store(S + row * STRIDE + block, maxima, block < STRIDE)
     if tile == 0:
         tl.store(E + row, tl.cdiv(end, 8))
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def clean_logits_and_block_max(
@@ -114,6 +120,7 @@ def clean_logits_and_block_max(
         # Alignment can extend block scores beyond the final logits tile.
         # Those programs initialize the entire native-prefetch padding to -inf.
         tiles = max(triton.cdiv(capacity, 1024), triton.cdiv(stride, 128))
+        enable_pdl = pdl_enabled()
         _clean_logits_block_max[(values.shape[0], tiles)](
             values,
             lengths,
@@ -132,7 +139,9 @@ def clean_logits_and_block_max(
             page_size,
             table is not None,
             128,
+            enable_pdl,
             num_warps=4,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
     elif values.shape[0]:
         ends.zero_()

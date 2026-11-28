@@ -2999,7 +2999,7 @@ class DeepseekV41Model(nn.Module):
                     h = pending_post.finish(h)
         if h.shape[0] == 0:
             return h[:, 0, :], captured
-        return _norm(v41_hc_pre(h, pre_mix), self.norm), captured
+        return _v41_hc_input(h, pre_mix, self.norm), captured
 
     def finish_forward(
         self,
@@ -3177,7 +3177,10 @@ class _DeepseekV41LogitsProcessor(LogitsProcessor):
             )
         indices = self._blocked_token_indices[key]
         if indices is not None:
-            logits.index_fill_(-1, indices, float("-inf"))
+            blocked = indices.view(*([1] * (logits.ndim - 1)), -1).expand(
+                *logits.shape[:-1], -1
+            )
+            logits.scatter_(-1, blocked, float("-inf"))
         return logits
 
 
