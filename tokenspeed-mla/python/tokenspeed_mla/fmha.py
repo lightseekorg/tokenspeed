@@ -431,7 +431,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         stride_b_q = Int64(h_r) * h_k * s_q * d if cum_seqlen_q is None else 0
         stride_b_o = Int64(h_r) * h_k * s_q * dv if cum_seqlen_q is None else 0
         stride_b_k = Int64(h_k) * s_k * d if cum_seqlen_k is None else 0
-        stride_b_v = Int64(h_k) * s_v * dv if cum_seqlen_k is None else 0
+        stride_b_v = Int64(v_tensor.stride[0]) if cum_seqlen_k is None else 0
         stride_b_lse = Int64(h_r) * h_k * s_lse if cum_seqlen_q is None else 0
 
         # (b, s_q, h_k, h_r, d) -> (s_q, d, ((h_r, h_k), b))
@@ -449,7 +449,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         # (b, s_v, h_k, 1, dv) -> (dv, s_v, ((1, h_k), b)), 0-stride for h_r to broadcast
         v_layout = cute.make_layout(
             (dv, s_v, ((h_r, h_k), b)),
-            stride=(1, Int64(dv) * h_k, ((0, Int64(dv)), stride_b_v)),
+            stride=(
+                1,
+                Int64(v_tensor.stride[1]),
+                ((0, Int64(v_tensor.stride[2])), stride_b_v),
+            ),
         )
         v = cute.make_tensor(v_tensor.iterator, v_layout)
         # (b, s_q, h_k, h_r, dv) -> (s_q, dv, ((h_r, h_k), b))
