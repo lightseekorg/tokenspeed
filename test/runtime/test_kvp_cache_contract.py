@@ -134,6 +134,93 @@ def test_host_ownership_uses_each_tiers_packing_and_bounds(rank):
             )
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_owned_group_pairs_matches_owned_positions_and_validates(rank):
+    layout = CacheTransferLayout(
+        num_lcm_blocks=4,
+        groups=(
+            CacheGroupLayout("sharded", 4, (CacheField("kv", 0, 0, 32, 32),)),
+            CacheGroupLayout("replicated", 4, (CacheField("state", 0, 0, 80, 80),)),
+        ),
+        buffers=(object(),),
+        consumers=(("kv", "state"),),
+    )
+    contract = _contract(parents=4, packing=4, shard_count=2)
+    owners = BlockOwnerTranslation.for_host_pool(
+        layout,
+        contract,
+        num_host_lcm_blocks=4,
+        host_group_packing=(2, 1),
+        rank=rank,
+    )
+    # Mix both groups and single-group batches to cover both fast paths.
+    for rows in (
+        [],
+        [(0, 1, 1), (0, 2, 2), (0, 3, 3), (0, 4, 4)],
+        [(1, 4, 2), (0, 8, 12), (0, 1, 5), (1, 12, 6), (0, 22, 14)],
+    ):
+        g_col = [r[0] for r in rows]
+        d_col = [r[1] for r in rows]
+        h_col = [r[2] for r in rows]
+        d_groups, h_groups = owners.owned_group_pairs(g_col, d_col, h_col)
+        flattened = [
+            (g, int(d), int(h))
+            for g, (da, ha) in enumerate(zip(d_groups, h_groups, strict=True))
+            for d, h in zip(da.tolist(), ha.tolist(), strict=True)
+        ]
+        assert flattened == [row for _, row in owners.owned_positions(rows)]
+
+    with pytest.raises(ValueError, match="null block"):
+        owners.owned_group_pairs([0], [0], [1])
+    with pytest.raises(IndexError, match="unknown group"):
+        owners.owned_group_pairs([2], [1], [1])
+    with pytest.raises(IndexError):
+        owners.owned_group_pairs([0], [33], [1])
+    with pytest.raises(ValueError, match="residue class"):
+        owners.owned_group_pairs([0], [1], [2])
+
+
+def test_owned_group_pairs_handles_12k_blocks_in_sublinear_python_time():
+    import time
+
+    import numpy as np
+
+    layout = CacheTransferLayout(
+        num_lcm_blocks=4096,
+        groups=(
+            CacheGroupLayout("sharded", 4, (CacheField("kv", 0, 0, 32, 32),)),
+            CacheGroupLayout("replicated", 1, (CacheField("swa", 0, 0, 16, 16),)),
+        ),
+        buffers=(object(),),
+        consumers=(("kv", "swa"),),
+    )
+    contract = _contract(parents=4096, packing=4, shard_count=2)
+    owners = BlockOwnerTranslation.for_host_pool(
+        layout,
+        contract,
+        num_host_lcm_blocks=4096,
+        host_group_packing=(4, 1),
+        rank=0,
+    )
+    n = 12_000
+    g_arr = np.tile(np.array([0, 0, 1], dtype=np.int64), n // 3)
+    d_arr = np.arange(1, n + 1, dtype=np.int64)
+    h_arr = np.arange(1, n + 1, dtype=np.int64)
+    # Warm NumPy internals, then measure median of 5 calls.
+    owners.owned_group_pairs(g_arr, d_arr, h_arr)
+    samples_ms = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        d_groups, h_groups = owners.owned_group_pairs(g_arr, d_arr, h_arr)
+        samples_ms.append((time.perf_counter() - t0) * 1000.0)
+    assert d_groups[0].size == n // 3
+    assert d_groups[1].size == n // 3
+    assert np.array_equal(d_groups[1], np.arange(3, n + 1, 3, dtype=np.int64))
+    assert np.array_equal(h_groups[1], d_groups[1])
+    # Typically <0.5ms; 25ms ceiling catches O(N) Python regression without CI flakiness.
+    assert sorted(samples_ms)[2] < 25.0
+
+
 class TestRuntimeContractTest:
     def test_virtual_counts_scale_physical_pages_by_shard_count(self, subtests):
         for shard_count in (1, 2, 4, 8):

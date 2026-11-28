@@ -1297,3 +1297,113 @@ def _round_trip_two_ranks(io_backend, executors):
         assert bool(slot_states[rank].flag[3]) and not bool(slot_states[rank].flag[1])
         assert slot_states[rank].table[0].tolist() == [200 + rank] * 5
         assert not bool(slot_states[rank].flag[0])
+
+
+def test_multi_op_l2_writeback_and_loadback_hoist_batch_vectors_and_preserve_rows():
+    layout = _layout(8, [("full", 4), ("state", 1)])
+    executor, _, lanes = _build(layout=layout, shard_counts=[2, 1], rank=0)
+
+    class _CountingWriteBackOp:
+        def __init__(self):
+            self.accesses = {"op_ids": 0, "group_ids": 0, "src": 0, "dst": 0, "pin": 0}
+            self._op_ids = [101, 102, 103]
+            self._group_ids = [[0, 1, 0], [0, 0], [1]]
+            self._src = [[1, 2, 2], [3, 4], [5]]
+            self._dst = [[3, 2, 4], [5, 6], [6]]
+            self._pinned = [False, True, False]
+
+        @property
+        def op_ids(self):
+            self.accesses["op_ids"] += 1
+            return self._op_ids
+
+        @property
+        def group_ids(self):
+            self.accesses["group_ids"] += 1
+            return self._group_ids
+
+        @property
+        def src_pages(self):
+            self.accesses["src"] += 1
+            return self._src
+
+        @property
+        def dst_pages(self):
+            self.accesses["dst"] += 1
+            return self._dst
+
+        @property
+        def source_pinned(self):
+            self.accesses["pin"] += 1
+            return self._pinned
+
+    class _CountingLoadBackOp:
+        def __init__(self):
+            self.accesses = {"op_ids": 0, "group_ids": 0, "src": 0, "dst": 0}
+            self._op_ids = [201, 202]
+            self._group_ids = [[0, 1], [0, 0]]
+            self._src = [[3, 2], [4, 5]]
+            self._dst = [[1, 2], [2, 3]]
+
+        @property
+        def op_ids(self):
+            self.accesses["op_ids"] += 1
+            return self._op_ids
+
+        @property
+        def group_ids(self):
+            self.accesses["group_ids"] += 1
+            return self._group_ids
+
+        @property
+        def src_pages(self):
+            self.accesses["src"] += 1
+            return self._src
+
+        @property
+        def dst_pages(self):
+            self.accesses["dst"] += 1
+            return self._dst
+
+    wb_op = _CountingWriteBackOp()
+    finish = Mock()
+    finish.query.return_value = True
+    lanes["ordered"].start_d2h.return_value = finish
+    lanes["pinned"].start_d2h.return_value = finish
+    with (
+        patch.object(
+            executor_module.Cache, "WriteBackOp", _CountingWriteBackOp, create=True
+        ),
+        patch.object(
+            executor_module.Cache, "LoadBackOp", _CountingLoadBackOp, create=True
+        ),
+        patch.object(executor_module.device_module, "Event", return_value=finish),
+    ):
+        executor.submit_write_backs(
+            [wb_op], prerequisite_stream="s", fence_stream=Mock()
+        )
+        assert wb_op.accesses == {
+            "op_ids": 1,
+            "group_ids": 1,
+            "src": 1,
+            "dst": 1,
+            "pin": 1,
+        }
+        ordered_batch = lanes["ordered"].start_d2h.call_args.args[0]
+        pinned_batch = lanes["pinned"].start_d2h.call_args.args[0]
+        assert ordered_batch == [(0, 1, 2), (1, 2, 2), (1, 5, 6)]
+        assert pinned_batch == [(0, 2, 3)]
+
+        lb_op = _CountingLoadBackOp()
+        loaded = []
+        with patch.object(
+            executor,
+            "_start_loading",
+            side_effect=lambda op_ids, transfers, **kw: loaded.append(
+                (op_ids, transfers)
+            )
+            or 0,
+        ):
+            executor.submit_load_backs([lb_op], prerequisite_stream="s")
+        assert lb_op.accesses == {"op_ids": 1, "group_ids": 1, "src": 1, "dst": 1}
+        assert loaded == [([201, 202], [(0, 1, 2), (0, 3, 3), (1, 2, 2)])]

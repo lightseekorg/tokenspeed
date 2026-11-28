@@ -158,24 +158,9 @@ class BlockOwnerTranslation:
         for group, shard in enumerate(self.shard_counts):
             if not device_ids[group]:
                 continue
-            device_owned, device_local = owned_local_pages(
-                device_ids[group],
-                shard_count=shard,
-                rank=self.rank,
-                virtual_block_count=self.device_virtual_counts[group],
+            device_owned, device_local, host_local = self._translate_group_pair(
+                group, device_ids[group], host_ids[group]
             )
-            host_owned, host_local = owned_local_pages(
-                host_ids[group],
-                shard_count=shard,
-                rank=self.rank,
-                virtual_block_count=self.host_virtual_counts[group],
-            )
-            if not np.array_equal(device_owned, host_owned):
-                raise ValueError(
-                    f"cache transfer of group {group} pairs blocks owned by "
-                    "different ranks; a Host block must sit in its Device "
-                    "block's residue class"
-                )
             owned_positions = [
                 position
                 for position, is_owned in zip(positions[group], device_owned.tolist())
@@ -188,6 +173,84 @@ class BlockOwnerTranslation:
                 )
             )
         return owned
+
+    def _translate_group_pair(
+        self,
+        group: int,
+        device_ids: Sequence[int] | np.ndarray,
+        host_ids: Sequence[int] | np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        shard = self.shard_counts[group]
+        device_owned, device_local = owned_local_pages(
+            device_ids,
+            shard_count=shard,
+            rank=self.rank,
+            virtual_block_count=self.device_virtual_counts[group],
+        )
+        host_owned, host_local = owned_local_pages(
+            host_ids,
+            shard_count=shard,
+            rank=self.rank,
+            virtual_block_count=self.host_virtual_counts[group],
+        )
+        if not np.array_equal(device_owned, host_owned):
+            raise ValueError(
+                f"cache transfer of group {group} pairs blocks owned by "
+                "different ranks; a Host block must sit in its Device "
+                "block's residue class"
+            )
+        return device_owned, device_local, host_local
+
+    def owned_group_pairs(
+        self,
+        group_ids: Sequence[int] | np.ndarray,
+        device_blocks: Sequence[int] | np.ndarray,
+        host_blocks: Sequence[int] | np.ndarray,
+    ) -> tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...]]:
+        """Translate columnar ``(group_ids, device_blocks, host_blocks)`` in bulk.
+
+        Returns ``(device_groups, host_groups)`` where each entry ``g`` is a
+        1-D ``int64`` NumPy array of this rank's owned local block IDs for group
+        ``g`` in input order, preserving the validation guarantees of
+        :meth:`owned_positions` without per-row Python tuple boxing.
+        """
+        groups_arr = np.asarray(group_ids, dtype=np.int64).reshape(-1)
+        dev_arr = np.asarray(device_blocks, dtype=np.int64).reshape(-1)
+        host_arr = np.asarray(host_blocks, dtype=np.int64).reshape(-1)
+        if not (groups_arr.size == dev_arr.size == host_arr.size):
+            raise ValueError(
+                "cache transfer columns must contain the same number of rows"
+            )
+        empty = np.empty(0, dtype=np.int64)
+        device_groups = [empty] * self.num_groups
+        host_groups = [empty] * self.num_groups
+        if groups_arr.size == 0:
+            return tuple(device_groups), tuple(host_groups)
+
+        group_min = int(groups_arr.min())
+        group_max = int(groups_arr.max())
+        if group_min < 0 or group_max >= self.num_groups:
+            bad = group_min if group_min < 0 else group_max
+            raise IndexError(f"cache transfer names unknown group {bad}")
+        if int(dev_arr.min()) <= 0 or int(host_arr.min()) <= 0:
+            raise ValueError("a cache transfer cannot name the null block 0")
+
+        for group in range(self.num_groups):
+            if group_min == group_max:
+                if group != group_min:
+                    continue
+                d_slice, h_slice = dev_arr, host_arr
+            else:
+                mask = groups_arr == group
+                if not np.any(mask):
+                    continue
+                d_slice, h_slice = dev_arr[mask], host_arr[mask]
+            _, device_local, host_local = self._translate_group_pair(
+                group, d_slice, h_slice
+            )
+            device_groups[group] = device_local
+            host_groups[group] = host_local
+        return tuple(device_groups), tuple(host_groups)
 
     def owned_host_positions(
         self, rows: Sequence[tuple[int, int]]

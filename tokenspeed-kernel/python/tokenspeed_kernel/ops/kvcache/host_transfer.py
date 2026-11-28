@@ -29,6 +29,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
+import numpy as np
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
     HOST_CACHE_TRANSFER_CHUNK_BYTES,
@@ -117,6 +118,90 @@ class HostTransferMode:
 
     backend: Literal["triton", "staged_dma", "dma"]
     layer_ready: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BlockTransferBatch:
+    """Bucketed columnar block pairs ``(device_groups, host_groups)`` by cache group.
+
+    Each entry in ``device_groups`` and ``host_groups`` is a 1-D ``int64`` NumPy
+    array of 1-based local block IDs for that group. Implements ``__len__``,
+    ``__bool__``, and ``__iter__`` so existing inspection/mock consumers continue
+    to see ``(group_index, device_block_id, host_block_id)`` triples lazily while
+    workspace staging copies directly without Python tuple boxing.
+    """
+
+    device_groups: tuple[np.ndarray, ...]
+    host_groups: tuple[np.ndarray, ...]
+    group_counts: tuple[int, ...]
+    total_blocks: int
+
+    @classmethod
+    def from_group_pairs(
+        cls,
+        device_groups: Sequence[np.ndarray],
+        host_groups: Sequence[np.ndarray],
+    ) -> BlockTransferBatch:
+        if len(device_groups) != len(host_groups):
+            raise ValueError("device_groups and host_groups must cover the same groups")
+        norm_device: list[np.ndarray] = []
+        norm_host: list[np.ndarray] = []
+        counts: list[int] = []
+        total = 0
+        for device_ids, host_ids in zip(device_groups, host_groups):
+            d_arr = np.asarray(device_ids, dtype=np.int64)
+            h_arr = np.asarray(host_ids, dtype=np.int64)
+            if d_arr.ndim != 1 or h_arr.ndim != 1 or d_arr.shape != h_arr.shape:
+                raise ValueError(
+                    "per-group block IDs must be matching 1-D int64 arrays"
+                )
+            count = int(d_arr.size)
+            norm_device.append(d_arr)
+            norm_host.append(h_arr)
+            counts.append(count)
+            total += count
+        return cls(
+            device_groups=tuple(norm_device),
+            host_groups=tuple(norm_host),
+            group_counts=tuple(counts),
+            total_blocks=total,
+        )
+
+    @property
+    def num_groups(self) -> int:
+        return len(self.device_groups)
+
+    def __len__(self) -> int:
+        return self.total_blocks
+
+    def __bool__(self) -> bool:
+        return self.total_blocks > 0
+
+    def __iter__(self):
+        for group_index, (device_ids, host_ids) in enumerate(
+            zip(self.device_groups, self.host_groups)
+        ):
+            if device_ids.size == 0:
+                continue
+            for d_id, h_id in zip(device_ids.tolist(), host_ids.tolist()):
+                yield (group_index, d_id, h_id)
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, BlockTransferBatch):
+            return self.group_counts == other.group_counts and all(
+                np.array_equal(d_a, d_b) and np.array_equal(h_a, h_b)
+                for d_a, h_a, d_b, h_b in zip(
+                    self.device_groups,
+                    self.host_groups,
+                    other.device_groups,
+                    other.host_groups,
+                )
+            )
+        if isinstance(other, (list, tuple)):
+            if len(other) != self.total_blocks:
+                return False
+            return list(self) == list(other)
+        return NotImplemented
 
     def __post_init__(self) -> None:
         if self.backend != "triton" and self.layer_ready:
@@ -750,16 +835,82 @@ class HostTransferWorkspace:
                 f"for group {group_index}"
             )
 
+    def _reset_loaded_blocks(self, num_groups: int) -> tuple[int, tuple[int, ...]]:
+        group_offset_count = num_groups + 1
+        offsets = tuple(0 for _ in range(group_offset_count))
+        self._num_loaded_blocks = 0
+        self._block_group_offsets_count = group_offset_count
+        host_offsets = self._ensure_block_group_offsets_host(num_groups)
+        host_offsets[:group_offset_count].zero_()
+        return 0, offsets
+
+    def _load_columnar_block_transfers(
+        self,
+        transfers: BlockTransferBatch,
+        *,
+        geometry: HostTransferGeometry,
+    ) -> tuple[int, tuple[int, ...]]:
+        if transfers.num_groups != geometry.num_groups:
+            raise ValueError(
+                f"transfer batch groups {transfers.num_groups} != "
+                f"geometry groups {geometry.num_groups}"
+            )
+        num_blocks = transfers.total_blocks
+        if num_blocks == 0:
+            return self._reset_loaded_blocks(geometry.num_groups)
+
+        host = self._ensure_block_host(num_blocks)
+        host_np = host[:num_blocks].numpy()
+        offset = 0
+        group_offsets: list[int] = [0]
+        for group_index, (device_ids, host_ids) in enumerate(
+            zip(transfers.device_groups, transfers.host_groups)
+        ):
+            count = int(device_ids.size)
+            if count:
+                if int(device_ids.min()) <= 0 or int(host_ids.min()) <= 0:
+                    raise ValueError(
+                        "device_block_id and host_block_id must be 1-based "
+                        "positive integers"
+                    )
+                max_device = int(device_ids.max())
+                max_device_limit = geometry.max_device_block_id(group_index)
+                if max_device > max_device_limit:
+                    raise IndexError(
+                        f"device_block_id {max_device} outside "
+                        f"[1, {max_device_limit}] for group {group_index}"
+                    )
+                max_host = int(host_ids.max())
+                max_host_limit = geometry.max_host_block_id(group_index)
+                if max_host > max_host_limit:
+                    raise IndexError(
+                        f"host_block_id {max_host} outside "
+                        f"[1, {max_host_limit}] for group {group_index}"
+                    )
+                end = offset + count
+                host_np[offset:end, 0] = device_ids
+                host_np[offset:end, 1] = host_ids
+                offset = end
+            group_offsets.append(offset)
+
+        group_offset_count = geometry.num_groups + 1
+        offsets_tensor = self._ensure_block_group_offsets_host(geometry.num_groups)
+        offsets_tensor[:group_offset_count].numpy()[:] = group_offsets
+        self._num_loaded_blocks = num_blocks
+        self._block_group_offsets_count = group_offset_count
+        return num_blocks, tuple(group_offsets)
+
     def load_block_transfers(
         self,
-        transfers: Sequence[tuple[int, int, int]],
+        transfers: BlockTransferBatch | Sequence[tuple[int, int, int]],
         *,
         geometry: HostTransferGeometry,
     ) -> tuple[int, tuple[int, ...]]:
         """Load dynamic block mappings bucketed stably by cache group.
 
         Args:
-            transfers: ``(group_index, device_block_id, host_block_id)`` rows.
+            transfers: Either a columnar :class:`BlockTransferBatch` or legacy
+                ``(group_index, device_block_id, host_block_id)`` rows.
             geometry: Static bounds used to validate 1-based block IDs.
 
         Returns:
@@ -768,17 +919,10 @@ class HostTransferWorkspace:
         """
 
         self._invalidate_block_commit()
-        group_offset_count = geometry.num_groups + 1
-
+        if isinstance(transfers, BlockTransferBatch):
+            return self._load_columnar_block_transfers(transfers, geometry=geometry)
         if not transfers:
-            offsets = tuple(0 for _ in range(group_offset_count))
-            self._num_loaded_blocks = 0
-            self._block_group_offsets_count = group_offset_count
-            host_offsets = self._ensure_block_group_offsets_host(geometry.num_groups)
-            host_offsets[:group_offset_count].copy_(
-                torch.tensor(offsets, dtype=torch.int64, device="cpu")
-            )
-            return 0, offsets
+            return self._reset_loaded_blocks(geometry.num_groups)
 
         buckets: list[list[tuple[int, int]]] = [[] for _ in range(geometry.num_groups)]
         for group_index, device_block_id, host_block_id in transfers:
@@ -796,6 +940,7 @@ class HostTransferWorkspace:
             flat_rows.extend(bucket)
             group_offsets.append(len(flat_rows))
 
+        group_offset_count = geometry.num_groups + 1
         num_blocks = len(flat_rows)
         host = self._ensure_block_host(num_blocks)
         host[:num_blocks].copy_(

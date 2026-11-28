@@ -1720,3 +1720,84 @@ def test_workspace_staging_buffer_requires_explicit_binding(host_transfer_contra
     workspace = host_transfer_contract.HostTransferWorkspace()
     with pytest.raises(RuntimeError, match="bind_staging_buffer"):
         workspace.staging_buffer()
+
+
+def test_load_block_transfers_columnar_matches_legacy_and_validates(
+    host_transfer_contract,
+):
+    import time
+
+    import numpy as np
+
+    geometry = _sample_geometry(host_transfer_contract)
+    BlockTransferBatch = host_transfer_contract.BlockTransferBatch
+    workspace_col = host_transfer_contract.HostTransferWorkspace()
+    workspace_ref = host_transfer_contract.HostTransferWorkspace()
+
+    legacy = [(1, 2, 1), (0, 3, 2), (0, 64, 8), (1, 16, 2), (0, 5, 4)]
+    batch = BlockTransferBatch.from_group_pairs(
+        (np.array([3, 64, 5], dtype=np.int64), np.array([2, 16], dtype=np.int64)),
+        (np.array([2, 8, 4], dtype=np.int64), np.array([1, 2], dtype=np.int64)),
+    )
+    assert len(batch) == 5
+    assert bool(batch)
+    assert batch == [(0, 3, 2), (0, 64, 8), (0, 5, 4), (1, 2, 1), (1, 16, 2)]
+
+    n_col, off_col = workspace_col.load_block_transfers(batch, geometry=geometry)
+    n_ref, off_ref = workspace_ref.load_block_transfers(legacy, geometry=geometry)
+    assert (n_col, off_col) == (n_ref, off_ref)
+    assert torch.equal(
+        workspace_col.host_block_rows(n_col), workspace_ref.host_block_rows(n_ref)
+    )
+    assert torch.equal(
+        workspace_col.block_group_offsets_host(),
+        workspace_ref.block_group_offsets_host(),
+    )
+
+    # Reject wrong group count, null IDs, and out-of-range IDs.
+    with pytest.raises(ValueError, match="transfer batch groups"):
+        workspace_col.load_block_transfers(
+            BlockTransferBatch.from_group_pairs(
+                (np.array([1], dtype=np.int64),), (np.array([1], dtype=np.int64),)
+            ),
+            geometry=geometry,
+        )
+    with pytest.raises(ValueError, match="1-based"):
+        workspace_col.load_block_transfers(
+            BlockTransferBatch.from_group_pairs(
+                (np.array([0], dtype=np.int64), np.empty(0, dtype=np.int64)),
+                (np.array([1], dtype=np.int64), np.empty(0, dtype=np.int64)),
+            ),
+            geometry=geometry,
+        )
+    with pytest.raises(IndexError, match="device_block_id 65"):
+        workspace_col.load_block_transfers(
+            BlockTransferBatch.from_group_pairs(
+                (np.array([65], dtype=np.int64), np.empty(0, dtype=np.int64)),
+                (np.array([1], dtype=np.int64), np.empty(0, dtype=np.int64)),
+            ),
+            geometry=geometry,
+        )
+
+    # Empty batch clears state identically to ().
+    empty_batch = BlockTransferBatch.from_group_pairs(
+        (np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)),
+        (np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)),
+    )
+    assert not bool(empty_batch)
+    assert workspace_col.load_block_transfers(empty_batch, geometry=geometry) == (
+        0,
+        (0, 0, 0),
+    )
+
+    # Scale check over 12,000 blocks.
+    n = 12_000
+    g0 = np.full(n // 2, 1, dtype=np.int64)
+    g1 = np.full(n // 2, 2, dtype=np.int64)
+    large_batch = BlockTransferBatch.from_group_pairs((g0, g1), (g0, g1))
+    workspace_col.load_block_transfers(large_batch, geometry=geometry)
+    t0 = time.perf_counter()
+    count, offsets = workspace_col.load_block_transfers(large_batch, geometry=geometry)
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    assert (count, offsets) == (n, (0, n // 2, n))
+    assert elapsed_ms < 25.0
