@@ -2240,6 +2240,13 @@ def moe_plan(
     deferred_output_is_token_order = True in apply_spec.traits.get(
         "deferred_output_is_token_order", frozenset({False})
     )
+    # The kernel's own finalize sums each token's BF16 route outputs times
+    # their weights in FP32 top-k slot order and rounds to BF16 once, so a
+    # caller's finalize of its deferred routes with that arithmetic
+    # (``moe_finalize_gate_add``) reproduces it bit for bit.
+    deferred_finalize_is_slot_sum = True in apply_spec.traits.get(
+        "deferred_finalize_is_slot_sum", frozenset({False})
+    )
     supports_deferred_out = True in apply_spec.traits.get(
         "supports_deferred_out", frozenset({False})
     )
@@ -2309,6 +2316,7 @@ def moe_plan(
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
         "deferred_output_is_token_order": deferred_output_is_token_order,
+        "deferred_finalize_is_slot_sum": deferred_finalize_is_slot_sum,
         "supports_deferred_out": supports_deferred_out,
         "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,

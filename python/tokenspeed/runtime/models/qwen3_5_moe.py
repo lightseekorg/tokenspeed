@@ -31,7 +31,6 @@ from tokenspeed_kernel.ops.activation.triton import (
     moe_finalize_gate_add,
 )
 from tokenspeed_kernel.ops.moe import try_router_gemm_nvfp4
-from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen3_5_text_base_config import Qwen3_5BaseTextConfig
@@ -507,20 +506,18 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
             # The shared-expert gate add absorbs the routed finalize: one
             # latency-bound gather kernel instead of the kernel's finalize and
-            # the gate kernel, bitwise equal. Only plans that hand back
-            # (route outputs, route weights, row map) defer, and only when no
-            # post-kernel routing scale applies to the finalized output. The
-            # fold is limited to NVFP4 experts, the deferred layout it was
-            # checked against; other plans (e.g. the FP8 MTP draft experts)
-            # keep the kernel's own finalize.
+            # the gate kernel, bitwise equal. Only plans whose own finalize is
+            # the FP32 slot-order sum that ``moe_finalize_gate_add`` computes
+            # defer (they hand back route outputs, route weights and a row
+            # map, or None for token-order rows), and only when no
+            # post-kernel routing scale applies to the finalized output.
+            # Other plans (e.g. the MTP draft experts) keep their finalize.
             fuse_finalize = (
                 self.shared_expert is not None
                 and self.shared_expert_gate is not None
                 and hidden_states.shape[0] > 0
                 and hidden_states.dtype == torch.bfloat16
-                and self.experts.supports_deferred_finalize
-                and self.experts.plan.get("weight_dtype") == "nvfp4"
-                and current_platform().is_nvidia
+                and self.experts.deferred_finalize_is_slot_sum
                 and not isinstance(topk_output.output_scale, torch.Tensor)
                 and topk_output.output_scale == 1.0
             )

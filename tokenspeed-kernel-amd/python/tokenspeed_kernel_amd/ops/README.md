@@ -2721,25 +2721,69 @@ standard SwiGLU) on gfx950. It replaces the portable Triton path there.
 Four launches: activation quantization (scales stored lane-quad-major so a
 lane fetches four K steps' scales with one load), the gate/up GEMM with fused
 SiLU-and-mul and MXFP4 requantization in sorted-route order, the down GEMM
-writing BF16 per-route rows, and the slot-order combine. Up to 1024 routes,
-one extra program of the quantization launch sorts the routes into expert
-blocks (atomic per-expert cursors; order within a block does not matter): it
-first fills every routed row with the padding id, one store per 256 rows,
-and the routes overwrite their rows after a drain and barrier. Larger route
-sets run the block-aligned `gluon_moe_sorting` first. Both GEMMs are
-`e2m1 x e2m1` scaled 16x16x128 MFMAs that load weights straight into
-registers.
+writing BF16 per-route rows, and the slot-order combine (one FMA per
+route). With `do_finalize=False` the combine is skipped and the per-route
+rows return in token order; the quantization launch zeroes the rows of
+experts outside `[0, E)`, so every row is defined and no row map is needed.
+A Qwen3.5 shared-expert gate add then finalizes them with
+`moe_finalize_gate_add`, bit-identical to the combine followed by the gate
+add and one launch shorter. Both GEMMs are `e2m1 x e2m1` scaled 16x16x128
+MFMAs that load weights straight into registers. Every schedule below
+computes each route row on its own and combines in slot order, so all of
+them produce the same bits.
 
-Block height follows the average routes per expert: 16 rows up to 4 routes
-per expert (decode, including the 64-row MTP verify batches), 32 rows up to
-48, otherwise 64. Decode blocks stream each touched expert's weights once and
-load activations directly, keeping one 256-K step in flight. Larger blocks
-stage gathered activations through an LDS ring with async copies shared by
-the N-direction waves, keep each block's programs on one XCD so activations
-and an expert's weights are reused from L2, and redistribute the down GEMM
-output through LDS so each scattered route row is stored as one contiguous
-run; at 8K tokens that BF16 per-route write and its combine read dominate the
-second GEMM.
+Decode route sets (up to 8192 routes: the MTP verify batches and prefill
+chunks of up to 819 tokens, where they beat the block stages by 15-25% at
+512 tokens) run the decode stages. One extra program of the quantization launch
+groups the routes by expert: each route takes its rank from an LDS atomic
+increment of its expert's counter, and the final counts place each expert's
+routes in 16-row panels and describe each routed expert as one group
+`(first row, count, expert)`, multi-tile experts first so they start first.
+Global atomics on per-expert cursors (the previous sort) were slow here
+because a popular expert (100+ routes at 320 tokens) serializes them. Each
+decode stage program takes one (group, N tile): it
+first issues its weight fragments over the whole K (non-temporal loads; 160
+VGPRs per stage-1 wave), so every touched expert's weights are read from HBM
+exactly once and all of them are in flight together, then runs the group's
+routes 16 at a time against those registers. Grids cover the worst-case
+group count; programs past the device-side count exit. Keeping an expert's
+N tiles on one XCD made the decode stages up to 40% slower than the default
+round-robin placement, which spreads the weight streams over all XCDs.
+Combining in the down GEMM (the program that stores a token's last route
+sums it, counted with device-scope atomics over write-through stores) was
+1.3-2x slower than the separate combine: the store drain, atomic and
+uncached reads lengthen every program's tail. Dropping the quantization and
+grouping launch, with every stage program reading the top-k IDs to find its
+expert and routes and quantizing its tile's rows into LDS, was slower at
+every size: the ID scan delays each program's weight stream by a round
+trip, and the redundant
+quantization raised stage 1 to one wave per SIMD. Prefetching a group's next
+16-route tile in stage 2 measured within noise.
+
+Larger sets (prefill) run the block-aligned `gluon_moe_sorting` and block
+stages. Block height follows the average routes per expert: 32 rows up to
+48, otherwise 64. These blocks stage gathered activations through an LDS
+ring with async copies shared by the N-direction waves, keep each block's
+programs on one XCD so activations and an expert's weights are reused from
+L2 (so their weight loads keep the default cache policy), and redistribute
+the down GEMM output through LDS so each scattered route row is stored as one
+contiguous run; at 8K tokens that BF16 per-route write and its combine read
+dominate the second GEMM. The down GEMM runs 32-row tiles over the sort's
+64-row blocks: a 64-row tile needs 260 VGPRs (one wave per SIMD), and a
+tile whose first row is padding holds no route and exits (10-18% faster at
+4K-8K tokens).
+
+The block stages reach 40-55% of the HBM roofline at 4K-8K tokens. Measured
+limits on MI350X: the gate/up GEMM moves 4-5 GB through L2 at 8K tokens
+(weights re-read by every 64-route block of an expert, activations by every
+N tile), and concurrent re-reads of one expert's weights by its blocks cost
+L2 bandwidth (a pure read of the weights with 3 concurrent readers runs about
+30% slower than with one). Variants that measured no better: both operands
+through a 2- to 4-stage LDS ring (deeper rings lose occupancy and run
+slower), 128-route blocks, holding the weights in registers over a 256-route
+chunk (the decode design with LDS-shared activations: 160 weight VGPRs leave
+no room to overlap the next chunk's weight stream), deeper weight prefetch,
+forced higher occupancy (spills), and streaming store cache policies.
 
 ### gfx1250 MXFP4 experts
 
