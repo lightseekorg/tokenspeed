@@ -836,6 +836,7 @@ class ModelConfig:
         self.model_profile: ModelProfile | None = (
             resolved_profile[1] if resolved_profile is not None else None
         )
+        self.runtime_config: object | None = None
         self.spec_block_size: int | None = None
         self.draft_sample_from_anchor: bool = False
         if is_draft_worker:
@@ -1046,6 +1047,10 @@ class ModelConfig:
                 attention_family, resolve_architecture(self.hf_config), server_args
             )
         if self.model_profile is not None:
+            if self.model_profile.create_runtime_config is not None:
+                self.runtime_config = self.model_profile.create_runtime_config(
+                    self, server_args
+                )
             _apply_attention_defaults(
                 server_args,
                 name=resolve_architecture(self.hf_config),

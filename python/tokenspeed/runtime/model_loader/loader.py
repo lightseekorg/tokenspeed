@@ -169,11 +169,22 @@ def _initialize_model(
             raise ValueError(
                 "This model does not implement peer expert-weight ownership"
             )
-    # Only VLM wrappers accept these kwargs.
+    # Profiles opt into runtime policy; VLM wrappers also receive encoder settings.
     extra_kwargs: dict = {}
+    if model_config.runtime_config is not None:
+        extra_kwargs["runtime_config"] = model_config.runtime_config
     if model_config.is_multimodal:
         extra_kwargs["is_multimodal_active"] = model_config.is_multimodal_active
         extra_kwargs["mm_attention_backend"] = model_config.mm_attention_backend
+    profile = model_config.model_profile
+    if profile is not None and profile.create_model_kwargs is not None:
+        model_kwargs = profile.create_model_kwargs(model_config, load_config)
+        conflicts = extra_kwargs.keys() & model_kwargs.keys()
+        if conflicts:
+            raise ValueError(
+                f"Model constructor arguments already supplied: {sorted(conflicts)}"
+            )
+        extra_kwargs.update(model_kwargs)
     return model_class(
         config=model_config.hf_config,
         mapping=mapping,
