@@ -2809,6 +2809,8 @@ class _TinyFp8WoAModel(BaseCausalLM):
             aux_stream=None,
         )
         self.model = nn.Module()
+        self.model.config = config
+        self.model.engram_host_layout = "gpu"
         self.model.layers = nn.ModuleList([layer])
 
     def post_load_weights(self):
