@@ -660,7 +660,7 @@ def test_decode_add3_row_count_does_not_recompile() -> None:
             run(rows)
 
 
-# Qwen3.8-Flash-Next TP2 decode shapes, each at a ragged row count inside
+# Qwen3.8-Flash-Next TP2 and TP1 decode shapes, each at a ragged row count inside
 # its bucket: split-K over every K tile in flight (32-row MTP fc, indexer),
 # 64-row tiles (router), and split-K with a few buffers.
 _QWEN38_DECODE_CASES = [
@@ -671,6 +671,12 @@ _QWEN38_DECODE_CASES = [
     pytest.param((27, 640, 2560), id="indexer-all-tiles-in-flight"),
     pytest.param((16, 2560, 2560), id="mtp-fc"),
     pytest.param((21, 2560, 2560), id="mtp-fc-all-tiles-in-flight"),
+    # TP1: in_proj_qkvzba and the gated QKV over every K tile without split-K,
+    # out_proj split K six and three ways.
+    pytest.param((12, 16480, 2560), id="tp1-gdn-in-proj"),
+    pytest.param((3, 13312, 2560), id="tp1-gated-qkv"),
+    pytest.param((27, 2560, 6144), id="tp1-out-proj-split-k-6"),
+    pytest.param((50, 2560, 6144), id="tp1-out-proj-split-k-3"),
 ]
 
 
