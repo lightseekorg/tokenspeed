@@ -539,6 +539,16 @@ class VocabParallelEmbedding(torch.nn.Module):
             return all_reduce(output_parallel, self.tp_group)
         return output_parallel
 
+    def unpad_gathered_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Read rank-major full logits in token ID order, excluding both padding regions."""
+        if not self.num_added_embeddings:
+            return logits[:, : self.org_vocab_size]
+        shards = logits.unflatten(1, (self.tp_size, self.num_embeddings_per_partition))
+        base_width = self.shard_indices.num_org_elements_padded
+        base = shards[:, :, :base_width].flatten(1)[:, : self.org_vocab_size]
+        added = shards[:, :, base_width:].flatten(1)[:, : self.num_added_embeddings]
+        return torch.cat((base, added), dim=1)
+
     def _partial_lookup(self, input_: torch.Tensor) -> torch.Tensor:
         """This rank's vocab shard's contribution to every row of ``input_``:
         the embedding of ids inside the shard, zero rows for the others. The
