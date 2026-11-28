@@ -604,3 +604,108 @@ def test_save_keeps_rank_specific_tactics(monkeypatch, tmp_path):
     path = tmp_path / "configs.json"
     assert save_autotune_cache(str(path), object(), 0)
     assert json.loads(path.read_bytes()) == local | peer
+
+
+def test_runtime_max_num_tokens_stays_unclamped_below_autotune_floor(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        tuning, "_autotune_max_num_tokens", tuning._DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
+    )
+    monkeypatch.setattr(tuning, "_runtime_max_num_tokens", None)
+    assert tuning.get_runtime_max_num_tokens() == 8192
+
+    tuning.set_autotune_max_num_tokens(128)
+    assert tuning.get_autotune_max_num_tokens() == 8192
+    assert tuning.get_runtime_max_num_tokens() == 128
+
+    tuning.set_runtime_max_num_tokens(320)
+    assert tuning.get_autotune_max_num_tokens() == 8192
+    assert tuning.get_runtime_max_num_tokens() == 320
+
+    tuning.set_autotune_max_num_tokens(16384)
+    assert tuning.get_autotune_max_num_tokens() == 16384
+    assert tuning.get_runtime_max_num_tokens() == 16384
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="positive"):
+            tuning.set_autotune_max_num_tokens(bad)
+        with pytest.raises(ValueError, match="positive"):
+            tuning.set_runtime_max_num_tokens(bad)
+
+
+def test_kimi_mega_moe_runner_sizes_workspace_from_runtime_ceiling(
+    monkeypatch,
+) -> None:
+    # Stub flashinfer's internal MegaMoE modules so CPU tests can verify
+    # get_kimi_mega_moe_runner passes the unclamped capacity to KimiMegaMoERunner.
+    for mod_name in (
+        "flashinfer",
+        "flashinfer.moe_ep",
+        "flashinfer.moe_ep.kernel_src",
+        "flashinfer.moe_ep.kernel_src.sm100",
+        "flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe",
+        "flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.shim",
+        "flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.src",
+        "flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.src.helpers",
+        "flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.src.helpers.device_workspace",
+    ):
+        mod = types.ModuleType(mod_name)
+        mod.__path__ = []
+        monkeypatch.setitem(sys.modules, mod_name, mod)
+    shim = sys.modules["flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.shim"]
+    shim.runtime = types.SimpleNamespace(KimiWorkspace=object)
+    helpers = sys.modules[
+        "flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.src.helpers"
+    ]
+    helpers.epoch = types.SimpleNamespace(REGION="epoch")
+    dw = sys.modules[
+        "flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.src.helpers.device_workspace"
+    ]
+    dw.DeviceWorkspace = object
+
+    import importlib
+
+    module_name = "tokenspeed_kernel.thirdparty.flashinfer.kimi_mega_moe"
+    previous_module = sys.modules.pop(module_name, None)
+    try:
+        kimi_mega_moe = importlib.import_module(module_name)
+        created: list[int] = []
+
+        class _FakeRunner:
+            def __init__(self, *args) -> None:
+                created.append(args[7])
+
+        monkeypatch.setattr(kimi_mega_moe, "KimiMegaMoERunner", _FakeRunner)
+        monkeypatch.setattr(kimi_mega_moe, "_runners", {})
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        monkeypatch.setattr(
+            tuning,
+            "_autotune_max_num_tokens",
+            tuning._DEFAULT_AUTOTUNE_MAX_NUM_TOKENS,
+        )
+        monkeypatch.setattr(tuning, "_runtime_max_num_tokens", None)
+
+        weights = types.SimpleNamespace(
+            num_experts=896,
+            hidden_size=3584,
+            intermediate_size=3072,
+            top_k=16,
+            activation_situ_beta=1.0,
+            activation_situ_linear_beta=25.0,
+            _moe_backend_state=object(),
+        )
+        plan = {"process_group": object()}
+
+        tuning.set_autotune_max_num_tokens(128)
+        kimi_mega_moe.get_kimi_mega_moe_runner(plan, weights)
+        tuning.set_runtime_max_num_tokens(320)
+        kimi_mega_moe.get_kimi_mega_moe_runner(plan, weights)
+        tuning.set_runtime_max_num_tokens(8192)
+        kimi_mega_moe.get_kimi_mega_moe_runner(plan, weights)
+
+        assert created == [128, 512, 8192]
+    finally:
+        sys.modules.pop(module_name, None)
+        if previous_module is not None:
+            sys.modules[module_name] = previous_module

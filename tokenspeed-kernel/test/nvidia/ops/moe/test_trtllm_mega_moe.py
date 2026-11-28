@@ -57,7 +57,7 @@ from tokenspeed_kernel.ops.moe import (  # noqa: E402
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize  # noqa: E402
 from tokenspeed_kernel.ops.tuning import (  # noqa: E402
     autotune,
-    get_autotune_max_num_tokens,
+    get_runtime_max_num_tokens,
     set_autotune_max_num_tokens,
     set_autotune_process_group,
 )
@@ -406,7 +406,7 @@ def run_correctness(
     _check(output, expected, "uneven/idle rank")
 
     arena = runner.workspace
-    assert arena.capacity == 1 << (get_autotune_max_num_tokens() - 1).bit_length()
+    assert arena.capacity == 1 << (get_runtime_max_num_tokens() - 1).bit_length()
     # Every candidate must be usable without growing the reserved arena,
     # including when the normal execution path has tactic tuning disabled.
     for tactic in runner.TACTICS:
@@ -421,7 +421,7 @@ def run_correctness(
         arena.local.data_ptr(),
         arena.output.data_ptr(),
     )
-    maximum = get_autotune_max_num_tokens()
+    maximum = get_runtime_max_num_tokens()
     # Alternate single-token and wider buckets on one arena. On SM100/SM103 EP16,
     # this also tests the single-token tactic with the full K3 shape.
     capacity = 1 if capacity > 1 else min(maximum, 2)
@@ -472,7 +472,7 @@ def test_dense_routing_other_geometry(top_k, capacity, monkeypatch):
     monkeypatch.setitem(globals(), "LOCAL_EXPERTS", 40)
     monkeypatch.setitem(globals(), "TOP_K", top_k)
     monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
-    maximum = get_autotune_max_num_tokens()
+    maximum = get_runtime_max_num_tokens()
     with tempfile.TemporaryDirectory() as tmp:
         dist.init_process_group(
             "nccl",

@@ -43,7 +43,7 @@ from flashinfer.autotuner import (
     autotuner_initializer_ones,
     is_in_profile_measurement,
 )
-from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
+from tokenspeed_kernel.ops.tuning import get_runtime_max_num_tokens
 from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.input_stage import Nvfp4InputStage
 from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.megamoe_kernel import (
     Sm100MegaMoEKernel,
@@ -651,7 +651,7 @@ def get_runner(plan: dict, w: torch.nn.Module, *, prequantized: bool) -> MegaMoE
     top_k = w.top_k
     situ_beta = w.activation_situ_beta
     situ_linear_beta = w.activation_situ_linear_beta
-    max_capacity = _token_capacity(get_autotune_max_num_tokens())
+    max_capacity = _token_capacity(get_runtime_max_num_tokens())
     tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
     key = (
         id(group),

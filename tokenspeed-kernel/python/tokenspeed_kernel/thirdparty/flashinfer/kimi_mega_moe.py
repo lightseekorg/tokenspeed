@@ -44,7 +44,7 @@ from flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.src.helpers import epoc
 from flashinfer.moe_ep.kernel_src.sm100._kimi_k3_megamoe.src.helpers.device_workspace import (
     DeviceWorkspace,
 )
-from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
+from tokenspeed_kernel.ops.tuning import get_runtime_max_num_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -424,7 +424,7 @@ def get_kimi_mega_moe_runner(plan: dict, w: torch.nn.Module) -> KimiMegaMoERunne
     top_k = w.top_k
     situ_beta = w.activation_situ_beta
     situ_linear_beta = w.activation_situ_linear_beta
-    max_tokens = _token_capacity(get_autotune_max_num_tokens())
+    max_tokens = _token_capacity(get_runtime_max_num_tokens())
     key = (
         id(group),
         torch.cuda.current_device(),

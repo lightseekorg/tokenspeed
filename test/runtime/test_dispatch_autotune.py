@@ -706,12 +706,20 @@ def test_decode_only_attention_tunes_on_a_decode_step(
     monkeypatch.setattr(
         executor_module, "autotune_cache_path", lambda key: str(tmp_path / "cache.json")
     )
+    monkeypatch.setattr(tuning_module, "_runtime_max_num_tokens", None)
     max_tokens = []
+    runtime_tokens = []
     _tap(
         monkeypatch,
         executor_module,
         "set_autotune_max_num_tokens",
         lambda num_tokens: max_tokens.append(num_tokens),
+    )
+    _tap(
+        monkeypatch,
+        executor_module,
+        "set_runtime_max_num_tokens",
+        lambda num_tokens: runtime_tokens.append(num_tokens),
     )
     _tap(
         monkeypatch,
@@ -737,6 +745,9 @@ def test_decode_only_attention_tunes_on_a_decode_step(
     else:
         ModelExecutor.autotune(executor, keep_loaded_tactics=False)
     assert max_tokens == [8 * 3]
+    assert runtime_tokens == [8 * 3]
+    assert tuning_module.get_autotune_max_num_tokens() >= 8192
+    assert tuning_module.get_runtime_max_num_tokens() == 8 * 3
     assert events == [
         "load",
         ("group", None),
