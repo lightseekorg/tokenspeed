@@ -822,7 +822,7 @@ class HostCacheExecutor:
                 -- the one the plan's Device-to-Device copies and page zeroing
                 run on next.
         """
-        num_groups = len(self.layout.groups)
+        num_groups = self._num_cache_groups()
         ordered_op_ids: list[int] = []
         ordered_transfers = _BlockTransferAccumulator(num_groups)
         pinned_op_ids: list[int] = []
@@ -906,7 +906,7 @@ class HostCacheExecutor:
                 the store fence and the forwards in flight, so no earlier
                 write to a destination lands after its copy.
         """
-        num_groups = len(self.layout.groups)
+        num_groups = self._num_cache_groups()
         op_ids: list[int] = []
         transfers = _BlockTransferAccumulator(num_groups)
         restore_ops: list[RestoreOp] = []
@@ -1002,6 +1002,13 @@ class HostCacheExecutor:
                 ),
             )
 
+    def _num_cache_groups(self) -> int:
+        if self.block_owners is not None:
+            return self.block_owners.num_groups
+        if self.snapshot_block_owners is not None:
+            return self.snapshot_block_owners.num_groups
+        return len(self.layout.groups)
+
     def _translate_columnar_op(
         self,
         op_id: int,
@@ -1014,7 +1021,7 @@ class HostCacheExecutor:
     ) -> tuple[tuple[np.ndarray, ...], tuple[np.ndarray, ...]]:
         # An op with no rows at all is a malformed plan: the scheduler
         # would hold a ticket for a copy nobody performs.
-        if not groups:
+        if len(groups) == 0:
             raise ValueError(f"cache operation {op_id} carries no transfers")
         if not (len(groups) == len(sources) == len(destinations)):
             raise ValueError(f"ragged cache operation {op_id}")

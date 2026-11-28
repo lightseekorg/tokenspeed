@@ -125,7 +125,40 @@ def _load_executor_module_without_triton(*, force_isolated=False):
         executor_name = "tokenspeed.runtime.cache.l2.executor"
         if executor_name in sys.modules or util.find_spec("tokenspeed_triton"):
             return import_module("tokenspeed.runtime.cache.l2.executor")
+
+    class _StubBlockTransferBatch:
+        def __init__(self, *, device_groups, host_groups, group_counts, total_blocks):
+            self.device_groups = device_groups
+            self.host_groups = host_groups
+            self.group_counts = group_counts
+            self.total_blocks = total_blocks
+
+        @property
+        def num_groups(self) -> int:
+            return len(self.device_groups)
+
+        def __len__(self) -> int:
+            return self.total_blocks
+
+        def __bool__(self) -> bool:
+            return self.total_blocks > 0
+
+        def __iter__(self):
+            for group_index, (device_ids, host_ids) in enumerate(
+                zip(self.device_groups, self.host_groups)
+            ):
+                for d_id, h_id in zip(device_ids.tolist(), host_ids.tolist()):
+                    yield (group_index, d_id, h_id)
+
+        def __eq__(self, other: object) -> bool:
+            if isinstance(other, (list, tuple)):
+                return len(other) == self.total_blocks and list(self) == list(other)
+            if isinstance(other, _StubBlockTransferBatch):
+                return list(self) == list(other)
+            return NotImplemented
+
     host_transfer = ModuleType("tokenspeed_kernel.ops.kvcache.host_transfer")
+    host_transfer.BlockTransferBatch = _StubBlockTransferBatch
     host_transfer.HostTransferWorkspace = Mock
     host_transfer.StagingBuffer = Mock
     host_transfer.build_host_transfer_geometry = Mock()

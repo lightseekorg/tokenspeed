@@ -119,6 +119,16 @@ class HostTransferMode:
     backend: Literal["triton", "staged_dma", "dma"]
     layer_ready: bool
 
+    def __post_init__(self) -> None:
+        if self.backend != "triton" and self.layer_ready:
+            raise ValueError(
+                f"{self.backend} does not currently support layer_ready=True"
+            )
+
+    @property
+    def uses_device_tables(self) -> bool:
+        return self.backend in ("triton", "staged_dma")
+
 
 @dataclass(frozen=True, slots=True)
 class BlockTransferBatch:
@@ -202,16 +212,6 @@ class BlockTransferBatch:
                 return False
             return list(self) == list(other)
         return NotImplemented
-
-    def __post_init__(self) -> None:
-        if self.backend != "triton" and self.layer_ready:
-            raise ValueError(
-                f"{self.backend} does not currently support layer_ready=True"
-            )
-
-    @property
-    def uses_device_tables(self) -> bool:
-        return self.backend in ("triton", "staged_dma")
 
 
 class _MappedHostUnavailable(RuntimeError):

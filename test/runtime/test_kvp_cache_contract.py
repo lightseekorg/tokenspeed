@@ -157,7 +157,7 @@ def test_owned_group_pairs_matches_owned_positions_and_validates(rank):
     for rows in (
         [],
         [(0, 1, 1), (0, 2, 2), (0, 3, 3), (0, 4, 4)],
-        [(1, 4, 2), (0, 8, 12), (0, 1, 5), (1, 12, 6), (0, 22, 14)],
+        [(1, 4, 2), (0, 8, 12), (0, 1, 5), (1, 12, 4), (0, 22, 14)],
     ):
         g_col = [r[0] for r in rows]
         d_col = [r[1] for r in rows]
@@ -199,7 +199,7 @@ def test_owned_group_pairs_handles_12k_blocks_in_sublinear_python_time():
         layout,
         contract,
         num_host_lcm_blocks=4096,
-        host_group_packing=(4, 1),
+        host_group_packing=(4, 4),
         rank=0,
     )
     n = 12_000

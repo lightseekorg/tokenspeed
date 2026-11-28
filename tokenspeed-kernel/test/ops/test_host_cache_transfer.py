@@ -57,6 +57,7 @@ def _load_host_transfer_contract_module():
 def host_transfer_contract():
     module = _load_host_transfer_contract_module()
     return SimpleNamespace(
+        BlockTransferBatch=module.BlockTransferBatch,
         HostTransferGeometry=module.HostTransferGeometry,
         HostTransferMode=module.HostTransferMode,
         HostTransferWorkspace=module.HostTransferWorkspace,
