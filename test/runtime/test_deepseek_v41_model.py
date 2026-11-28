@@ -5184,7 +5184,6 @@ def test_v41_moe_placement_dispatch_and_load_recording(monkeypatch):
             routed_scaling_factor=1.0,
             hash_routing=False,
             weights_dtype=torch.float32,
-            ep_rank=1,
         )
         moe.expert_dispatch_info = ExpertLocationDispatchInfo.init_new(
             layer_id=0,
@@ -5293,7 +5292,6 @@ def test_v41_moe_static_placement_and_slot_swap_parity(monkeypatch):
                 moe.gate.weight.copy_(gate_weight)
                 moe.gate.e_score_correction_bias.copy_(bias)
             moe.experts.supports_precomputed_topk = True
-            moe.topk.ep_rank = ep_rank
             moe.expert_dispatch_info = ExpertLocationDispatchInfo.init_new(
                 layer_id=0,
                 ep_dispatch_algorithm="static",

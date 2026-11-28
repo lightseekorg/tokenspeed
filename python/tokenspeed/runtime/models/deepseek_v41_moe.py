@@ -136,7 +136,6 @@ class DeepseekV4TopK(TopK):
         routed_scaling_factor: float,
         hash_routing: bool,
         weights_dtype: torch.dtype,
-        ep_rank: int,
     ) -> None:
         super().__init__(
             top_k=top_k,
@@ -146,7 +145,6 @@ class DeepseekV4TopK(TopK):
         )
         self.hash_routing = hash_routing
         self.weights_dtype = weights_dtype
-        self.ep_rank = ep_rank
 
     def forward(
         self,
@@ -361,7 +359,6 @@ class DeepseekV4MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             hash_routing=self.gate.tid2eid is not None,
             weights_dtype=self.experts.topk_weights_dtype,
-            ep_rank=mapping.moe.ep_rank,
         )
 
     def process_weights_after_loading(self, module: nn.Module) -> None:
