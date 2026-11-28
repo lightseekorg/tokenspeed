@@ -361,9 +361,10 @@ def test_general_triton_mix_prefill_projection_padding(
     capture = ShapeCapture.get()
     capture.enabled = True
     with assert_no_triton_compile(_projection_epilogue_kernel, _mix_epilogue_kernel):
+        # Platforms with a specialized prefill mix select it by default.
         actual = _mix(
             (normalized, projection, up),
-            override=None,
+            override="triton_hyperconnection_mix",
             projection_scale=scale,
             weights_independent=False,
         )

@@ -3156,10 +3156,13 @@ whole row once.
 
 ### gfx950 Qwen4 hyper-connection mix
 
-`gluon_hyperconnection_mix_gfx950` serves `gated_residual_mix` for decode
-batches (1 to 256 rows) of the HC4 / H2560 / R320 stream in two launches,
-replacing two hipBLASLt GEMMs (one with a split-K reduction kernel) and two
-Triton epilogues.
+`gluon_hyperconnection_mix_gfx950` serves `gated_residual_mix` for the
+HC4 / H2560 / R320 stream at every row count. Decode batches (1 to 192 rows)
+run as two Gluon launches: a split-K down projection and an up projection
+whose epilogue applies the gate. Larger batches run the down projection as a
+dense GEMM followed by `gluon_hyperconnection_mix_up_prefill_gfx950`, which
+fuses the up projection with the gated branch sum so the `[rows, 4 * H]` gate
+never reaches memory.
 
 #### Contract
 
@@ -3172,8 +3175,8 @@ Triton epilogues.
   FP32 and are rounded to the input dtype before the scale/SiLU and the
   sigmoid gate, so only the accumulation order differs (at most one ulp).
   Split partials are summed in split order, so results are deterministic.
-- Row counts are runtime arguments within three tile buckets (up to 16, up
-  to 32, larger rows).
+- Row counts are runtime arguments within three decode tile buckets (up to
+  16, up to 32, up to 192 rows) and one prefill tile.
 - The split-K workspace (FP32 partials and self-resetting arrival counters)
   is shared per device and tiling, so launches must be ordered on one stream.
 
@@ -3194,6 +3197,15 @@ branches as one MFMA tile, one branch per wave, with the 320-deep reduction
 loaded as a 256 + 64 pair so every load is in flight at once. The epilogue
 multiplies `sigmoid(gate)` with the matching normalized branch and sums the
 four branches across waves, so the gate tensor never reaches memory.
+
+The prefill up projection tiles 128 rows by 32 hidden columns of all four
+branches, streaming the 320-deep rank in 32-deep slices through three LDS
+stages while the normalized branches load into registers in a layout that
+holds every branch of eight columns in one lane, so the branch sum needs no
+cross-lane traffic. Three four-wave programs share a CU, so one program's
+epilogue overlaps the others' loads; each XCD owns a contiguous range of
+hidden tiles and reads its weight slice once. Row offsets step the base
+pointers in 64-bit once per tile.
 
 ### gfx1250 mHC mixes projection
 
