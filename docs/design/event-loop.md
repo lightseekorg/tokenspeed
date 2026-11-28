@@ -930,6 +930,12 @@ registered, before CUDA capture begins. They keep their addresses and values
 across weights sleep/wake; the graph's private temporary buffers remain
 discardable under the separate `cuda_graph` tag.
 
+When deterministic RS/AG is forced and communication fusion is disabled,
+startup does not allocate unused TRTLLM IPC or MNNVL workspaces. These would
+otherwise retain ordinary allocator segments across sleep even though the
+selected collective route never consumes them. Explicit communication fusion
+still prepares its workspace before serving.
+
 A resume containing NCCL uses the same-round operation gate: it waits until
 every attention-DP engine holds its resume before entering device collectives.
 For engines with DP projections, the NCCL release drops captured graphs before
