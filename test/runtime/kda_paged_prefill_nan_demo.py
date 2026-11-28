@@ -126,6 +126,8 @@ def _run_case(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens.to("cpu", torch.int64),
         capacity=None,
+        plan=None,
+        plan_layer=0,
         lower_bound=LOWER_BOUND,
         solution="flashkda",
     )

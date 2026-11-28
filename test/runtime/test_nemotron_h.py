@@ -318,6 +318,7 @@ def test_mamba2_seams_match_the_sequential_recurrence():
         seq_len=total,
         num_real_tokens=total,
         cu_seqlens_cpu=bounds,
+        layer_id=0,
         **_UNUSED,
     )
     A = -torch.exp(A_log)
@@ -392,6 +393,7 @@ def test_seams_refuse_inputs_of_the_other_recurrence():
         seq_len=1,
         num_real_tokens=1,
         cu_seqlens_cpu=torch.tensor([0, 1]),
+        layer_id=0,
         **_UNUSED,
     )
     with pytest.raises(ValueError, match="must pass their D"):

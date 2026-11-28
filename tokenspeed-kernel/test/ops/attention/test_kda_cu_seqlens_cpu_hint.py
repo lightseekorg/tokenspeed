@@ -118,6 +118,8 @@ def test_cutedsl_original_adapter_split_matches_full_scan():
             cu_seqlens=host_boundaries.to("cuda"),
             cu_seqlens_cpu=host_boundaries,
             capacity=None,
+            plan=None,
+            plan_layer=0,
             lower_bound=-5.0,
             override=None,
             solution="cutedsl_kda",
@@ -184,6 +186,8 @@ def test_facade_requires_host_boundaries(monkeypatch):
     cu_cpu = torch.tensor([0, T], dtype=torch.int64)
     common = dict(
         capacity=None,
+        plan=None,
+        plan_layer=0,
         initial_state=torch.zeros(1, HV, K, V),
         cu_seqlens=cu,
         lower_bound=-5.0,
@@ -251,6 +255,8 @@ def test_solution_wrappers_forward_host_boundaries(monkeypatch):
     assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]
     assert implementations[-1] == "flash_kda_chunk_prefill"
 
-    cutedsl_op.cutedsl_kda_nvidia_paged_prefill(capacity=None, **dict(kwargs))
+    cutedsl_op.cutedsl_kda_nvidia_paged_prefill(
+        capacity=None, plan=None, plan_layer=0, **dict(kwargs)
+    )
     assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]
     assert implementations[-1] == "cutedsl_kda_chunk_prefill"

@@ -62,12 +62,15 @@ def metadata(device, page):
     )
 
 
-def configure_prefill(backend):
+def configure_prefill(backend, heads=8):
     backend._retained_records = None
     backend._prefill_graph_enabled = True
     backend.kda_backend = "cutedsl_kda"
     backend._prefill_metadata = {}
     backend._prefill_metadata_pool = None
+    backend._prefill_takes_plan = True
+    backend._prefill_plan_rows = {0: 0}
+    backend._prefill_plan_heads = heads
 
 
 def test_metadata_snapshot_does_not_alias():
@@ -386,6 +389,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         CAUSAL_CONV1D_BLOCK_M,
         build_causal_conv1d_prefill_metadata,
     )
+    from tokenspeed_kernel.ops.attention.kda import kda_prefill_takes_plan
     from tokenspeed_kernel.ops.attention.kda.cute_dsl import cutedsl_kda_supported
 
     from tokenspeed.runtime.execution.forward_batch_info import (
@@ -412,7 +416,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         bucket, 4 * channels + 2 * dim, device="cuda", dtype=torch.bfloat16
     )
     backend = object.__new__(KdaAttnBackend)
-    configure_prefill(backend)
+    configure_prefill(backend, heads)
     backend._descriptor_row_by_layer = {0: 0}
     backend._retained_records = torch.empty(10, 1, 3, heads, 16, dim, device="cuda")
     correction, key, decay = backend._retained_records[:, 0].unbind(1)
@@ -429,6 +433,10 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         cache_pool=object(),
         kda_backend=backend_name,
         kda_recurrent_layout="v_major",
+        # As _publish_cache_pool: only a plan-taking kernel gets a shared plan.
+        _prefill_takes_plan=kda_prefill_takes_plan(
+            torch.bfloat16, solution=backend_name
+        ),
     )
     backend.layer_state = lambda layer_id: (
         backend.forward_metadata.state_in_blocks_by_group["state"],
@@ -507,6 +515,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         lengths = torch.tensor(lengths)
         host = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
         bounds = host.to(device="cuda", dtype=torch.int32)
+        scan_bounds = bounds.long()
         pages = (
             torch.arange(lengths.numel(), device="cuda", dtype=torch.int32) + page_shift
         )
@@ -517,8 +526,10 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
             )
             % 8
             + 1,
-            scan_query_start_loc=bounds.long(),
-            query_start_loc_int64=bounds.long(),
+            scan_query_start_loc=scan_bounds,
+            query_start_loc_int64=scan_bounds,
+            # As init_forward_metadata: one plan for every layer's scan.
+            prefill_scan_plan=backend._build_prefill_scan_plan(scan_bounds),
             extend_seq_lens_cpu=lengths,
             cu_extend_seq_lens_cpu=host,
             state_in_blocks_by_group={
@@ -615,6 +626,10 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         "state_in": fixed.state_in_blocks_by_group["state"],
         "state_out": fixed.state_out_blocks_by_group["state"],
     }
+    if backend_name == "cutedsl_kda":
+        # The captured layers read the retained plan, refreshed in place.
+        retained["plan_order"] = fixed.prefill_scan_plan.sequence_order
+        retained["plan_flags"] = fixed.prefill_scan_plan.flags
     addresses = {name: tensor.data_ptr() for name, tensor in retained.items()}
     ctx = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND, bs=batch_size, num_extends=batch_size
@@ -713,6 +728,11 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
         untouched[source.state_out_blocks_by_group["state"].long()] = False
         assert torch.equal(states[untouched], initial_states[untouched])
         eager_states = states.clone()
+        # Each forward prepares its own metadata, refreshing the retained plan.
+        backend.forward_metadata = source
+        backend.prepare_prefill_metadata(
+            bucket, batch_size, ctx.forward_mode, capture=False
+        )
         reset(source)
         capture.replay(valid_rows=sum(lengths))
         assert addresses == {
