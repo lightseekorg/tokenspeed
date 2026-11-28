@@ -970,6 +970,8 @@ class DeepseekV41Indexer(nn.Module):
         qr_scale: torch.Tensor | None,
         positions: torch.Tensor,
         rotary: DeepseekV41RotaryEmbedding,
+        *,
+        precomputed_weights: torch.Tensor | None,
     ) -> tuple[torch.Tensor | IndexQueryInput, torch.Tensor]:
         """qr is BF16, or E4M3 codes with their group-32 qr_scale."""
         q, _ = self.wq_b(
@@ -978,7 +980,10 @@ class DeepseekV41Indexer(nn.Module):
             output_dtype=x.dtype if qr_scale is not None else None,
         )
         q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
-        weights, _ = self.weights_proj(x, block_scale=None, output_dtype=None)
+        if precomputed_weights is None:
+            weights, _ = self.weights_proj(x, block_scale=None, output_dtype=None)
+        else:
+            weights = precomputed_weights
         if (
             q.is_cuda
             and current_platform().is_blackwell
@@ -1181,6 +1186,7 @@ class DeepseekV41Attention(nn.Module):
         self.register_buffer("fused_q_projection_scales", None, persistent=False)
         self.register_buffer("fused_wo_a_weight", None, persistent=False)
         self.register_buffer("fused_wo_a_scales", None, persistent=False)
+        self.register_buffer("fused_wkv_weights_proj", None, persistent=False)
         self.wo_b = RowParallelLinear(
             input_size=config.o_groups * config.o_lora_rank,
             output_size=config.hidden_size,
@@ -1298,6 +1304,68 @@ class DeepseekV41Attention(nn.Module):
         )
 
     @torch.no_grad()
+    def prepare_wkv_weights_proj(self) -> None:
+        """Prepare, or refresh in place, fused BF16 weights for ratio-1 KV + indexer.
+
+        Ratio-1 compressor.wkv and indexer.weights_proj read the same BF16
+        hidden_states without quantization scales; fusing them removes one
+        hidden_states read and one tiny BF16 GEMM launch. Derived weights stay
+        persistent=False and refresh in place across sharded-state loads.
+        """
+        if (
+            self.compressor is None
+            or self.compressor.ratio != 1
+            or self.indexer is None
+            or not isinstance(self.compressor.wkv.quant_method, UnquantizedLinearMethod)
+            or not isinstance(
+                self.indexer.weights_proj.quant_method, UnquantizedLinearMethod
+            )
+            or self.compressor.wkv.bias is not None
+            or self.indexer.weights_proj.bias is not None
+        ):
+            return
+        wkv_w = self.compressor.wkv.weight
+        wp_w = self.indexer.weights_proj.weight
+        if (
+            wkv_w.device != wp_w.device
+            or wkv_w.dtype != wp_w.dtype
+            or wkv_w.shape[1] != wp_w.shape[1]
+        ):
+            return
+        total_rows = wkv_w.shape[0] + wp_w.shape[0]
+        # FlashInfer CuTe RMSNorm requires 8-element row-stride alignment.
+        padded_rows = ((total_rows + 7) // 8) * 8
+        fused = wkv_w.new_zeros((padded_rows, wkv_w.shape[1]))
+        fused[: wkv_w.shape[0]].copy_(wkv_w.detach())
+        fused[wkv_w.shape[0] : total_rows].copy_(wp_w.detach())
+        if self.fused_wkv_weights_proj is None:
+            self.fused_wkv_weights_proj = fused
+        elif (
+            self.fused_wkv_weights_proj.shape != fused.shape
+            or self.fused_wkv_weights_proj.dtype != fused.dtype
+            or self.fused_wkv_weights_proj.device != fused.device
+        ):
+            raise ValueError("V4.1 fused wkv/weights_proj weight changed layout")
+        else:
+            self.fused_wkv_weights_proj.copy_(fused)
+
+    def _project_ratio1_wkv_and_weights(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute ratio-1 compressed KV latent and indexer weights in one GEMM."""
+        if hidden_states.shape[0] == 0:
+            return (
+                hidden_states.new_empty((0, self.compressor.norm.weight.numel())),
+                hidden_states.new_empty((0, self.indexer.n_local_heads)),
+            )
+        wkv_dim = self.compressor.norm.weight.numel()
+        heads = self.indexer.n_local_heads
+        fused = F.linear(hidden_states, self.fused_wkv_weights_proj)
+        projected = fused[:, :wkv_dim]
+        weights = fused[:, wkv_dim : wkv_dim + heads]
+        return self.compressor.norm_ratio1(projected), weights
+
+    @torch.no_grad()
     def prepare_fused_decode(self) -> None:
         """Prepare, or refresh in place, the fused attention weight copies.
 
@@ -1307,6 +1375,7 @@ class DeepseekV41Attention(nn.Module):
         Refresh existing buffers in place after weight updates: captured graphs
         retain them. Q's latent norm and the indexer's projections stay canonical.
         """
+        self.prepare_wkv_weights_proj()
         if (
             self.wo_a_fp8 is not True
             or not isinstance(self.wq_b.quant_method, _ReferenceFp8LinearMethod)
@@ -1423,18 +1492,26 @@ class DeepseekV41Attention(nn.Module):
         mode,
         *,
         key_rows: QueryShardGather | None,
+        precomputed_latent: torch.Tensor | None,
     ):
         if self.compressor is None:
             return
-        latent, row_positions, row_requests = self.compressor(
-            hidden_states,
-            self.layer_id,
-            positions,
-            requests,
-            backend,
-            mode,
-            key_rows=key_rows,
-        )
+        if precomputed_latent is not None:
+            latent, row_positions, row_requests = (
+                precomputed_latent,
+                positions,
+                requests,
+            )
+        else:
+            latent, row_positions, row_requests = self.compressor(
+                hidden_states,
+                self.layer_id,
+                positions,
+                requests,
+                backend,
+                mode,
+                key_rows=key_rows,
+            )
         index_k = self.indexer.key(latent, row_positions, self.rotary_emb)
         self._finish_and_write_global_kv(
             latent, row_positions, row_requests, index_k, backend, mode
@@ -1488,13 +1565,21 @@ class DeepseekV41Attention(nn.Module):
         qr: torch.Tensor,
         rows: V41RowPlan,
         fused_decode: bool,
+        *,
+        return_normalized: bool,
     ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
         torch.Tensor | None,
         torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
         torch.Tensor | None,
     ]:
+        need_normalized = return_normalized or (
+            self.indexer is not None
+            and not isinstance(
+                self.indexer.wq_b.quant_method, _ReferenceFp8LinearMethod
+            )
+        )
         if (
             qr.shape[0] > 0
             and qr.is_cuda
@@ -1518,6 +1603,7 @@ class DeepseekV41Attention(nn.Module):
                 self.q_norm.weight,
                 self.q_norm.variance_epsilon,
                 scale_layout=self._q_scale_layout(rows, fused_decode),
+                return_normalized=need_normalized,
                 override=None,
                 solution="triton",
                 plan=self._q_norm_quant_plan,
@@ -1537,13 +1623,14 @@ class DeepseekV41Attention(nn.Module):
     def _project_queries_and_swa(
         self,
         positions: torch.Tensor,
-        qr: torch.Tensor,
+        qr: torch.Tensor | None,
         q_input: torch.Tensor,
         q_scale: torch.Tensor | None,
         swa: torch.Tensor,
         mode: ForwardMode,
         fused_decode: bool,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        out_dtype = self.q_norm.weight.dtype if qr is None else qr.dtype
         if q_input.shape[0]:
             if fused_decode and q_scale is not None and q_scale.dtype == torch.int32:
                 q = fp8_projection(
@@ -1560,7 +1647,7 @@ class DeepseekV41Attention(nn.Module):
                     self.fused_q_weight,
                     A_scales=q_scale,
                     B_scales=self.fused_q_scales,
-                    out_dtype=qr.dtype,
+                    out_dtype=out_dtype,
                     quant="mxfp8",
                     block_size=[1, 32],
                     prepacked_scales=True,
@@ -1569,10 +1656,12 @@ class DeepseekV41Attention(nn.Module):
                 q, _ = self.wq_b(
                     q_input,
                     block_scale=q_scale,
-                    output_dtype=qr.dtype if q_scale is not None else None,
+                    output_dtype=out_dtype if q_scale is not None else None,
                 )
         else:
-            q = qr.new_empty((0, self.n_local_heads * self.head_dim))
+            q = q_input.new_empty(
+                (0, self.n_local_heads * self.head_dim), dtype=out_dtype
+            )
         q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
         if (
             not fused_decode
@@ -1832,15 +1921,20 @@ class DeepseekV41Attention(nn.Module):
             )
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
         qr, q_input, q_scale, index_q_input, index_q_scale = self._quantize_q_latent(
-            qr, rows, fused_decode
+            qr, rows, fused_decode, return_normalized=False
         )
         if hidden_states.is_cuda:
             self.rotary_emb._prepare_cache(hidden_states.device)
         q, swa, swa_rope_cache, swa_norm_weight = self._project_queries_and_swa(
             positions, qr, q_input, q_scale, swa, mode, fused_decode
         )
-        latent_or_comp, index_k_proj = None, None
-        if self.compressor is not None:
+        latent_or_comp, index_k_proj, precomputed_weights = None, None, None
+        if self.fused_wkv_weights_proj is not None:
+            latent_or_comp, precomputed_weights = self._project_ratio1_wkv_and_weights(
+                hidden_states
+            )
+            index_k_proj = self.indexer.project_key(latent_or_comp)
+        elif self.compressor is not None:
             if self.compressor.ratio == 1:
                 latent_or_comp = self.compressor.norm_ratio1(
                     self.compressor.project(hidden_states)
@@ -1857,6 +1951,7 @@ class DeepseekV41Attention(nn.Module):
                     index_q_scale,
                     positions,
                     self.rotary_emb,
+                    precomputed_weights=precomputed_weights,
                 )
             else:
                 index_q = hidden_states.new_empty(
@@ -1970,6 +2065,7 @@ class DeepseekV41Attention(nn.Module):
                 backend,
                 mode,
                 key_rows=source_gather,
+                precomputed_latent=None,
             )
             return hidden_states[:0]
         if hidden_states.shape[0]:
@@ -1983,15 +2079,49 @@ class DeepseekV41Attention(nn.Module):
                 (0, self.q_norm.weight.numel() + self.head_dim)
             )
         qr, swa = qkv.split((self.q_norm.weight.numel(), self.head_dim), dim=-1)
+        index_q, index_weights, index_group, prepared = None, None, None, None
+        needs_scores = False
+        partition = None
+        if rows.keep_rows is None and self.indexer is not None:
+            needs_scores = backend.indexer_needs_scores(
+                self.layer_id,
+                rows.query.positions,
+                rows.query.request_indices,
+                mode,
+            )
+            if (
+                needs_scores
+                and rows.query_shard is None
+                and hidden_states.is_cuda
+                and mode.is_extend()
+                and not mode.is_mixed()
+            ):
+                partition = backend.plan_indexer_queries(
+                    self.layer_id, positions, requests, mode, index_group
+                )
+        need_normalized = (rows.keep_rows is not None) or (
+            partition is not None
+            and self._q_scale_layout(rows, fused_decode) != "canonical"
+        )
         qr, q_input, q_scale, index_q_input, index_q_scale = self._quantize_q_latent(
-            qr, rows, fused_decode
+            qr, rows, fused_decode, return_normalized=need_normalized
         )
         if hidden_states.is_cuda:
             # Lazy shared constants are produced before the fork event, so both
             # branches observe them even on the first eager decode after loading.
             self.rotary_emb._prepare_cache(hidden_states.device)
+        prefill_overlap = (
+            mode.is_extend()
+            and not mode.is_mixed()
+            and not is_breakable_capture_active()
+            and self.mapping.attn.kvp_size == 1
+            and rows.source_shard is None
+            and rows.query_shard is None
+            and rows.keep_rows is None
+            and partition is None
+        )
         overlap = (
-            mode.is_decode()
+            (mode.is_decode() or prefill_overlap)
             and self.is_index_source
             and hidden_states.is_cuda
             and hidden_states.numel() > 0
@@ -2001,15 +2131,28 @@ class DeepseekV41Attention(nn.Module):
         consumer = torch.cuda.current_stream() if overlap else None
         if overlap:
             for tensor in (hidden_states, qr, positions, requests):
-                tensor.record_stream(self.stream_fork.aux_stream)
+                if tensor is not None:
+                    tensor.record_stream(self.stream_fork.aux_stream)
             if index_q_scale is not None:
                 for tensor in (index_q_input, index_q_scale):
                     tensor.record_stream(self.stream_fork.aux_stream)
-        index_q, index_weights, index_group, prepared = None, None, None, None
         with self.stream_fork.scope(enable=overlap, overlap=True) as fork:
             # Submit the longer compressor/index branch first. Serial eager and
             # captured decode execute these identical operations and dependency joins.
             with fork.branch():
+                fuse_wkv = (
+                    self.fused_wkv_weights_proj is not None
+                    and needs_scores
+                    and partition is None
+                    and rows.keep_rows is None
+                    and rows.source_shard is None
+                    and hidden_states.shape[0] > 0
+                )
+                precomputed_latent, precomputed_weights = (
+                    self._project_ratio1_wkv_and_weights(hidden_states)
+                    if fuse_wkv
+                    else (None, None)
+                )
                 self._write_global_kv(
                     hidden_states,
                     source_positions,
@@ -2017,6 +2160,7 @@ class DeepseekV41Attention(nn.Module):
                     backend,
                     mode,
                     key_rows=source_gather,
+                    precomputed_latent=precomputed_latent,
                 )
                 if rows.keep_rows is not None:
                     # Preserve the projection batch: narrowing before QKV can
@@ -2051,23 +2195,25 @@ class DeepseekV41Attention(nn.Module):
                         else (rows.query.positions, rows.query.request_indices)
                     )
                 if self.indexer is not None:
-                    partition = None
-                    if backend.indexer_needs_scores(
-                        self.layer_id,
-                        rows.query.positions,
-                        rows.query.request_indices,
-                        mode,
-                    ):
+                    if rows.keep_rows is not None:
+                        needs_scores = backend.indexer_needs_scores(
+                            self.layer_id,
+                            rows.query.positions,
+                            rows.query.request_indices,
+                            mode,
+                        )
                         partition = (
                             backend.plan_indexer_queries(
                                 self.layer_id, positions, requests, mode, index_group
                             )
-                            if rows.query_shard is None
+                            if needs_scores
+                            and rows.query_shard is None
                             and hidden_states.is_cuda
                             and mode.is_extend()
                             and not mode.is_mixed()
                             else None
                         )
+                    if needs_scores:
                         index_x, index_input, index_scale, index_positions = (
                             hidden_states,
                             index_q_input,
@@ -2101,6 +2247,7 @@ class DeepseekV41Attention(nn.Module):
                                 index_scale,
                                 index_positions,
                                 self.rotary_emb,
+                                precomputed_weights=precomputed_weights,
                             )
                         else:
                             index_q = index_x.new_empty(
@@ -2147,15 +2294,33 @@ class DeepseekV41Attention(nn.Module):
         if overlap:
             # Aux-owned scratch can outlive this layer through source/reuse
             # records. Main consumers and allocator reuse both follow the join.
-            for tensor in prepared:
-                if tensor is not None:
-                    tensor.record_stream(consumer)
-            record = backend.sparse_topk.decode
-            for tensor in (record.logical_rows, record.lengths):
-                tensor.record_stream(consumer)
-            if record.candidates is not None:
-                for tensor in (record.candidates.block_ids, record.candidates.lengths):
-                    tensor.record_stream(consumer)
+            if prepared is not None:
+                for tensor in prepared:
+                    if tensor is not None:
+                        tensor.record_stream(consumer)
+            if index_q is not None:
+                if isinstance(index_q, IndexQueryInput):
+                    for tensor in (
+                        index_q.values,
+                        index_q.positions,
+                        index_q.cos_sin_cache,
+                    ):
+                        tensor.record_stream(consumer)
+                else:
+                    index_q.record_stream(consumer)
+            if index_weights is not None:
+                index_weights.record_stream(consumer)
+            if mode.is_decode():
+                record = backend.sparse_topk.decode
+                if record is not None:
+                    for tensor in (record.logical_rows, record.lengths):
+                        tensor.record_stream(consumer)
+                    if record.candidates is not None:
+                        for tensor in (
+                            record.candidates.block_ids,
+                            record.candidates.lengths,
+                        ):
+                            tensor.record_stream(consumer)
         out_rope_cache = self._out_rope_cache(q)
         out = backend.forward_v41(
             q,

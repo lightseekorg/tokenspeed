@@ -8587,6 +8587,7 @@ def test_dense_format_signature_and_fast_selection_override(
             norm_w,
             1e-6,
             scale_layout="packed",
+            return_normalized=True,
             override=None,
             solution=None,
         )
@@ -8595,6 +8596,7 @@ def test_dense_format_signature_and_fast_selection_override(
             norm_w,
             1e-6,
             scale_layout="packed",
+            return_normalized=True,
             override=None,
             solution=None,
             plan=q_plan,

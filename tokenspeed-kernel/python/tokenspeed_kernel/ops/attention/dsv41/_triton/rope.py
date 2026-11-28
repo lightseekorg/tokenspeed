@@ -202,7 +202,10 @@ def triton_dsv41_index_key_norm_rope(
     return out
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["W0"],
+    do_not_specialize_on_alignment=["W", "W0"],
+)
 def _index_query_rope_weights(
     Q,
     W,
@@ -212,7 +215,7 @@ def _index_query_rope_weights(
     Q0: tl.constexpr,
     Q1: tl.constexpr,
     Q2: tl.constexpr,
-    W0: tl.constexpr,
+    W0,
     W1: tl.constexpr,
     P0: tl.constexpr,
     CS0: tl.constexpr,
@@ -423,7 +426,10 @@ def triton_dsv41_index_key_norm_rope_scatter(
         )
 
 
-@triton.jit(do_not_specialize=["N"], do_not_specialize_on_alignment=["POS"])
+@triton.jit(
+    do_not_specialize=["N", "W0"],
+    do_not_specialize_on_alignment=["POS", "W", "W0"],
+)
 def _index_query_rope_quant(
     Q,
     W,
@@ -437,7 +443,7 @@ def _index_query_rope_quant(
     Q0: tl.constexpr,
     Q1: tl.constexpr,
     Q2: tl.constexpr,
-    W0: tl.constexpr,
+    W0,
     W1: tl.constexpr,
     P0: tl.constexpr,
     CS0: tl.constexpr,
@@ -445,7 +451,7 @@ def _index_query_rope_quant(
     MAX_POS: tl.constexpr,
     ROWS: tl.constexpr,
 ):
-    rows = (tl.program_id(0) * ROWS + tl.arange(0, ROWS)).to(tl.int64)
+    rows = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
     token, head = rows // H, rows % H
     d = tl.arange(0, 128)
     q = tl.load(

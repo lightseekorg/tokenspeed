@@ -5207,3 +5207,186 @@ def test_v41_warmup_prefill_kernels_skips_negative_kv_owners():
     )
     swa_only.set_cache_pool(backend.cache_pool)
     swa_only.warmup_prefill_kernels()
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+@torch.inference_mode()
+def test_ratio1_wkv_weights_proj_in_place_refresh_and_parity(device):
+    if device != "cpu" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    config = _config()
+    torch.manual_seed(53)
+    with torch.device(device):
+        ratio2 = DeepseekV41Attention(
+            config,
+            _mapping(0, 1, 1),
+            2,
+            v41._ced_decoder_start(config),
+            None,
+            "layers.2.attn",
+            aux_stream=None,
+        )
+        ratio1 = DeepseekV41Attention(
+            config,
+            _mapping(0, 1, 1),
+            20,
+            v41._ced_decoder_start(config),
+            None,
+            "layers.20.attn",
+            aux_stream=None,
+        )
+    _initialize(ratio2)
+    _initialize(ratio1)
+    ratio2.prepare_wkv_weights_proj()
+    ratio1.prepare_wkv_weights_proj()
+    assert ratio2.fused_wkv_weights_proj is None
+    assert ratio1.fused_wkv_weights_proj is not None
+    assert "fused_wkv_weights_proj" not in ratio1.state_dict()
+    addr = ratio1.fused_wkv_weights_proj.data_ptr()
+
+    positions = torch.arange(8, device=device)
+    requests = torch.zeros_like(positions)
+    x = torch.randn(8, config.hidden_size, dtype=torch.bfloat16, device=device)
+    b_fused = _Backend(positions, requests)
+    got = ratio1(positions, x, _ctx(b_fused, 8, ForwardMode.EXTEND), reduce_output=True)
+
+    ratio1.fused_wkv_weights_proj = None
+    b_ref = _Backend(positions, requests)
+    ref = ratio1(positions, x, _ctx(b_ref, 8, ForwardMode.EXTEND), reduce_output=True)
+    torch.testing.assert_close(got, ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        b_fused.calls[-1][4], b_ref.calls[-1][4], rtol=1e-2, atol=1e-2
+    )
+
+    # ShardedStateLoader refresh updates the same buffer address in place.
+    ratio1.prepare_wkv_weights_proj()
+    addr = ratio1.fused_wkv_weights_proj.data_ptr()
+    with torch.no_grad():
+        ratio1.compressor.wkv.weight.add_(0.05)
+        ratio1.indexer.weights_proj.weight.sub_(0.02)
+    ratio1.prepare_wkv_weights_proj()
+    assert ratio1.fused_wkv_weights_proj.data_ptr() == addr
+    b_after = _Backend(positions, requests)
+    got_after = ratio1(
+        positions, x, _ctx(b_after, 8, ForwardMode.EXTEND), reduce_output=True
+    )
+    saved = ratio1.fused_wkv_weights_proj
+    ratio1.fused_wkv_weights_proj = None
+    b_after_ref = _Backend(positions, requests)
+    ref_after = ratio1(
+        positions, x, _ctx(b_after_ref, 8, ForwardMode.EXTEND), reduce_output=True
+    )
+    ratio1.fused_wkv_weights_proj = saved
+    torch.testing.assert_close(got_after, ref_after, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_dsv41_prefill_skip_normalized_and_aux_overlap_match_eager(monkeypatch):
+    from tokenspeed.runtime.execution.breakable_cuda_graph import (
+        BreakableCapture,
+        active_forward,
+    )
+    from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", True
+    )
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    config = _config()
+    config.hidden_size = 256
+    config.num_attention_heads = config.o_groups = config.index_n_heads = 2
+    config.head_dim, config.index_head_dim = 512, 128
+    config.qk_rope_head_dim, config.q_lora_rank = 64, 128
+    config.o_lora_rank = 128
+
+    torch.manual_seed(61)
+    with torch.device("cuda:0"):
+        attn = DeepseekV41Attention(
+            config,
+            _mapping(0, 1, 1),
+            20,
+            v41._ced_decoder_start(config),
+            v41_mxfp8_config(_quant()),
+            "layers.20.attn",
+            aux_stream=torch.cuda.Stream(),
+        )
+    _initialize(attn)
+    for module in attn.modules():
+        if isinstance(module, LinearBase):
+            module.quant_method.process_weights_after_loading(module)
+            if isinstance(
+                module.quant_method, (Fp8LinearMethod, v41._ReferenceFp8LinearMethod)
+            ):
+                module.quant_method.prepare_weight_scales(module)
+    attn.prepare_output_projections()
+    attn.prepare_wkv_weights_proj()
+
+    backend = _backend("cuda:0", 2)
+    tables = _tables("cuda:0")
+    x = torch.randn(6, config.hidden_size, dtype=torch.bfloat16, device="cuda:0")
+
+    recorded = []
+    real_quantize = v41.rmsnorm_quantize_fp8_group32
+
+    def spy_quantize(*args, **kwargs):
+        recorded.append(kwargs["return_normalized"])
+        return real_quantize(*args, **kwargs)
+
+    monkeypatch.setattr(v41, "rmsnorm_quantize_fp8_group32", spy_quantize)
+
+    # Eager prefill with aux_stream overlap and fused ratio-1 wkv + weights_proj.
+    fp8_q = isinstance(attn.wq_b.quant_method, v41._ReferenceFp8LinearMethod)
+    backend.cache_pool.arena.buffer.zero_()
+    meta = _extend(backend, tables, [6], [0], [0], [6])
+    actual_overlap = attn(
+        meta.positions, x, _ctx(backend, 6, ForwardMode.EXTEND), reduce_output=True
+    )
+    if fp8_q:
+        assert recorded == [False]
+    ref_global = backend.cache_pool.global_kv(20).clone()
+
+    # Unfused serial baseline: no aux_stream overlap, no wkv/weights_proj fusion.
+    recorded.clear()
+    saved_fused = attn.fused_wkv_weights_proj
+    saved_stream = attn.stream_fork.aux_stream
+    attn.fused_wkv_weights_proj = None
+    attn.stream_fork.aux_stream = None
+    backend.cache_pool.arena.buffer.zero_()
+    meta_ref = _extend(backend, tables, [6], [0], [0], [6])
+    expected_serial = attn(
+        meta_ref.positions, x, _ctx(backend, 6, ForwardMode.EXTEND), reduce_output=True
+    )
+    if fp8_q:
+        assert recorded == [False]
+    torch.testing.assert_close(actual_overlap, expected_serial, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(
+        backend.cache_pool.global_kv(20), ref_global, rtol=0, atol=0
+    )
+
+    # Breakable captured prefill also uses return_normalized=False + fused wkv/weights_proj.
+    attn.fused_wkv_weights_proj = saved_fused
+    attn.stream_fork.aux_stream = saved_stream
+    cap = BreakableCapture()
+    with active_forward(_ctx(backend, 6, ForwardMode.EXTEND)):
+        cap.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap.stream):
+            for _ in range(2):
+                backend.cache_pool.arena.buffer.zero_()
+                m = _extend(backend, tables, [6], [0], [0], [6])
+                attn(
+                    m.positions,
+                    x,
+                    _ctx(backend, 6, ForwardMode.EXTEND),
+                    reduce_output=True,
+                )
+        cap.stream.synchronize()
+        recorded.clear()
+        backend.cache_pool.arena.buffer.zero_()
+        m = _extend(backend, tables, [6], [0], [0], [6])
+        ctx = _ctx(backend, 6, ForwardMode.EXTEND)
+        with active_forward(ctx), cap:
+            captured = attn(m.positions, x, ctx, reduce_output=True)
+    if fp8_q:
+        assert recorded == [False]
+    torch.testing.assert_close(captured, expected_serial, rtol=1e-2, atol=1e-2)

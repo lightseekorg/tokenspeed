@@ -192,7 +192,7 @@ def test_indexer_fused_forward_and_key(monkeypatch, tokens, compress_ratio):
     expected = _reference_packed_indexer(
         indexer, rotary, x, qr, latent, positions, slots
     )
-    q, weights = indexer(x, qr, None, positions, rotary)
+    q, weights = indexer(x, qr, None, positions, rotary, precomputed_weights=None)
     key = indexer.key(latent, positions, rotary)
     assert isinstance(q, dsv41.IndexQueryInput)
     assert isinstance(key, dsv41.IndexKeyInput)
@@ -214,7 +214,7 @@ def test_indexer_fused_graph_refreshes_inputs_and_positions(monkeypatch):
     cache = torch.full((1, 64, 68), 0xA7, device="cuda", dtype=torch.uint8)
 
     def run():
-        q, weights = indexer(x, qr, None, positions, rotary)
+        q, weights = indexer(x, qr, None, positions, rotary, precomputed_weights=None)
         key = indexer.key(latent, positions, rotary)
         return _consume_indexer_inputs(q, weights, key, positions, slots, cache)
 
@@ -253,7 +253,7 @@ def test_indexer_cpu_and_small_geometry_keep_portable_path(
     indexer, rotary = _make_indexer(monkeypatch, device, head_dim, heads, 1)
     x, qr, latent, positions = _indexer_inputs(3, device)
     expected = _reference_indexer(indexer, rotary, x, qr, latent, positions)
-    q, weights = indexer(x, qr, None, positions, rotary)
+    q, weights = indexer(x, qr, None, positions, rotary, precomputed_weights=None)
     key = indexer.key(latent, positions, rotary)
     _assert_indexer_outputs((q, weights, key), expected)
 
