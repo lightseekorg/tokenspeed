@@ -580,4 +580,7 @@ The query remains in the activation dtype; rotation rounds to that dtype
 before cache quantization. The composite prologue owns the masked scatter,
 including padding, with no intermediate packed tensor or persistent allocation.
 `latent_store` accepts the same descriptor after a caller gathers rotated rows.
+Every slot must be a valid cache address, including masked rows, as for other
+`LatentKVCache` layouts. Only the write mask skips a row; invalid slots are not
+silently dropped.
 Native, plain FP8 and per-token-head cache paths are unchanged.

@@ -31,7 +31,6 @@ def _store(
     Nope,
     Rope,
     Mask,
-    capacity,
     cache_stride,
     nope_stride,
     rope_stride,
@@ -45,9 +44,10 @@ def _store(
 ):
     row = tl.program_id(0).to(tl.int64)
     slot = tl.load(Slots + row).to(tl.int64)
-    valid = (slot >= 0) & (slot < capacity)
+    valid = tl.full((), True, tl.int1)
     if HAS_MASK:
-        valid = valid & tl.load(Mask + row)
+        # Some backends load torch.bool storage as a byte.
+        valid = tl.load(Mask + row).to(tl.int1)
     group = tl.arange(0, GROUPS)
     channel = group[:, None] * 32 + tl.arange(0, 32)[None, :]
     width: tl.constexpr = RANK + ROPE
@@ -84,7 +84,8 @@ def store_mxfp8_latent(cache, slots, k_nope, k_rope, *, sanitize, write_mask):
     """Write group-32 payload/scales and zero record padding at live slots.
 
     Called after descriptor validation by the prologue. The input parts may
-    be strided views; masked or out-of-range slots do not write any bytes.
+    be strided views. Every slot must be valid, including masked rows; only
+    the write mask suppresses writes, matching the LatentKVCache contract.
     No temporary or persistent device tensor is allocated.
     """
     if slots.numel() == 0:
@@ -96,7 +97,6 @@ def store_mxfp8_latent(cache, slots, k_nope, k_rope, *, sanitize, write_mask):
         k_nope,
         k_rope,
         write_mask,
-        cache.shape[0],
         cache.stride(0),
         k_nope.stride(0),
         k_rope.stride(0),

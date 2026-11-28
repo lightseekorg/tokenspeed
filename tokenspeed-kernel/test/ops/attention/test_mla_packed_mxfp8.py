@@ -90,8 +90,8 @@ def test_packed_prologue_and_gathered_store(rank, rope, dtype, style):
         -1,
     )
     expected_bytes = reference_pack(expected_k)
-    # Nonidentity slots; negative masked padding must not write the last row.
-    slots = torch.tensor([11, 3, 7, -1, 16], device=device)
+    # Nonidentity slots; masked rows retain their sentinel bytes.
+    slots = torch.tensor([11, 3, 7, 19, 16], device=device)
     mask = torch.tensor([True, False, True, False, True], device=device)
     storage = torch.full(
         (20, 1, expected_bytes.shape[-1] + 16), 0x5A, device=device, dtype=torch.uint8
@@ -195,3 +195,30 @@ def test_packed_store_graph_replay_and_token_count_no_compile():
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(cache[48:80], expected)
+
+
+def test_packed_store_writes_cache_past_int32_byte_offsets():
+    """A real pool slot times its byte stride exceeds 2^31; int32 wrapping
+    would overwrite the guard prefix instead of the final cache rows."""
+    rank, rope, record, guard = 512, 64, 608, 2**31
+    first_slot = (2**31 + record - 1) // record + 3
+    capacity = first_slot + 3
+    storage = torch.empty(guard + capacity * record, dtype=torch.uint8, device="cuda")
+    cache = storage[guard:].view(capacity, 1, record)
+    # Touch only the far end and the guard where a wrapped write would land.
+    wrapped = guard + first_slot * record - 2**32
+    guard_rows = storage[wrapped : wrapped + 3 * record].view(3, 1, record)
+    guard_rows.fill_(0x5A)
+    cache[first_slot - 1 :].fill_(0x5A)
+    latent = torch.randn(3, rank + rope, dtype=torch.bfloat16, device="cuda")
+    slots = torch.arange(first_slot, capacity, dtype=torch.int64, device="cuda")
+    mask = torch.tensor([True, False, True], device="cuda")
+    target = LatentKVCache(PackedMXFP8Rows(cache), False, slots, mask)
+    expected = reference_pack(latent)
+    expected[1].fill_(0x5A)
+
+    latent_store(latent, kv_lora_rank=rank, cache=target)
+    torch.cuda.synchronize()
+    assert torch.equal(cache[first_slot:], expected)
+    assert torch.all(cache[first_slot - 1] == 0x5A)
+    assert torch.all(guard_rows == 0x5A)
