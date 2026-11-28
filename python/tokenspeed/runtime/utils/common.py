@@ -426,7 +426,55 @@ def get_amdgpu_memory_capacity():
     return min(memory_values)
 
 
+def _get_nvgpu_memory_capacity_nvml() -> float | None:
+    """Query minimum GPU total memory in MiB via NVML without spawning nvidia-smi.
+
+    Returns ``None`` when ``pynvml`` is unavailable, when any GPU has MIG
+    enabled (preserving the existing ``nvidia-smi`` / ``torch.cuda.mem_get_info``
+    MIG slice capacity path), or when NVML raises ``NVMLError``.
+    """
+    try:
+        import pynvml
+    except ImportError:
+        return None
+    try:
+        pynvml.nvmlInit()
+        try:
+            count = pynvml.nvmlDeviceGetCount()
+            if count <= 0:
+                return None
+            memory_values: list[int] = []
+            for i in range(count):
+                handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+                try:
+                    current_mig_mode, _ = pynvml.nvmlDeviceGetMigMode(handle)
+                except pynvml.NVMLError_NotSupported:
+                    current_mig_mode = pynvml.NVML_DEVICE_MIG_DISABLE
+                if current_mig_mode == pynvml.NVML_DEVICE_MIG_ENABLE:
+                    logger.info(
+                        "MIG mode is enabled on GPU; falling back from NVML "
+                        "to nvidia-smi / torch.cuda.mem_get_info for slice capacity."
+                    )
+                    return None
+                memory_values.append(
+                    pynvml.nvmlDeviceGetMemoryInfo(handle).total // (1024 * 1024)
+                )
+            return float(min(memory_values))
+        finally:
+            pynvml.nvmlShutdown()
+    except pynvml.NVMLError as e:
+        logger.warning(
+            f"Failed to query GPU memory capacity via NVML ({e}); "
+            "falling back to nvidia-smi."
+        )
+        return None
+
+
 def get_nvgpu_memory_capacity():
+    nvml_mem = _get_nvgpu_memory_capacity_nvml()
+    if nvml_mem is not None:
+        return nvml_mem
+
     try:
         # Run nvidia-smi and capture the output
         result = subprocess.run(
