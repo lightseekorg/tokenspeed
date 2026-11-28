@@ -118,7 +118,7 @@ def _chain_ancestors(q: torch.Tensor) -> torch.Tensor:
     traits={
         "output_h": frozenset({False, True}),
         "qk_l2norm": frozenset({False, True}),
-        "state_checkpoints": frozenset({False}),
+        "state_checkpoints": frozenset({False, True}),
     },
 )
 def triton_gdn_chunk_prefill(
@@ -136,8 +136,6 @@ def triton_gdn_chunk_prefill(
     output_h: bool = False,
     state_checkpoints: GdnStateCheckpoints | None = None,
 ) -> GdnChunkPrefillResult:
-    if state_checkpoints is not None:
-        raise ValueError("triton_gdn_chunk_prefill stores no state checkpoints")
     # initial_state arrives K-last [N, H, V, K] (the shared contract); this
     # backend's FLA math needs [N, H, K, V], so transpose in (materialized:
     # the Triton kernel below has no dynamic-stride support for h0).
@@ -155,6 +153,7 @@ def triton_gdn_chunk_prefill(
         head_first=False,
         use_qk_l2norm_in_kernel=qk_l2norm,
         output_h=output_h,
+        state_checkpoints=state_checkpoints,
     )
     if output_h:
         out, final_state, h = result
