@@ -738,7 +738,7 @@ class DeepseekV41DSpark(BaseDrafter):
         if mapping.dp_size > 1:
             # PP1 is required: every attention rank participates in shared MoE.
             return tuple(range(mapping.world_size))
-        return self.tp_group
+        return self.tp_group or (int(mapping.rank),)
 
     @property
     def _verification_rank(self) -> int:
@@ -1103,6 +1103,33 @@ class DeepseekV41DSpark(BaseDrafter):
         self._verify_layout_counts = None
         self._restore_verify_calibration(graph_bs)
         self._sync_device_calibration(buffers, graph_bs)
+        if self.dp_local_graph and int(self.draft_model.mapping.attn.tp_size) == 1:
+            # Warm the serving-time device budget kernel for this captured graph_bs
+            # so finish_round never triggers Triton JIT compilation while serving.
+            with torch.cuda.stream(stream):
+                dsv41.select_verify_budget(
+                    self.confidence_scores,
+                    request_slots=torch.zeros(1, dtype=torch.int32, device=self.device),
+                    seq_lens=torch.ones(1, dtype=torch.int32, device=self.device),
+                    profile_ranges=torch.tensor(
+                        [[1, 1024]], dtype=torch.int32, device=self.device
+                    ),
+                    profile_native_ms=torch.ones(
+                        1, dtype=torch.float32, device=self.device
+                    ),
+                    profile_capacities=torch.tensor(
+                        [max(graph_bs, 1)], dtype=torch.int32, device=self.device
+                    ),
+                    profile_step_ms=torch.ones(
+                        (1, 1), dtype=torch.float32, device=self.device
+                    ),
+                    selected_out=torch.empty(3, dtype=torch.int32, device=self.device),
+                    padded_bs=graph_bs,
+                    context_advance=2 * self.spec_num_tokens,
+                    min_batch_size=self.adaptive_min_batch_size,
+                    min_gain=self.verify_budget_policy.min_gain,
+                )
+            torch.cuda.current_stream().wait_stream(stream)
 
     def _initialize_verify_cache(self) -> None:
         if self._verify_cache_initialized:

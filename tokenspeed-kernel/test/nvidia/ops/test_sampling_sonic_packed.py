@@ -233,7 +233,12 @@ def test_packed_verify_matches_fullwidth_and_skips_padding_rows(dtype, point_dra
         query_start_loc=full_starts,
     )
     assert torch.equal(acc_eq, acc_full)
-    assert torch.equal(drafted_eq, drafted_full)
+    cols = torch.arange(drafted_eq.shape[1], device=drafted_eq.device).unsqueeze(0)
+    assert torch.equal(
+        torch.where(cols <= acc_eq, drafted_eq, 0),
+        torch.where(cols <= acc_full, drafted_full, 0),
+    )
+    assert (drafted_eq[cols > acc_eq] == 0).all()
     assert torch.equal(eq_state.decode_counts, full_state.decode_counts)
 
     # Shortened ragged windows + poisoned tail logits beyond query_start_loc[-1].

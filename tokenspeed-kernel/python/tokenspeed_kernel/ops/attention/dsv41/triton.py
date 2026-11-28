@@ -5955,7 +5955,7 @@ def triton_dsv41_select_verify_budget(
         DRAFT=draft,
         BLOCK=triton.next_power_of_2(max(padded_bs * draft, 1)),
         REQ_BLOCK=triton.next_power_of_2(max(padded_bs, 1)),
-        PROF_BLOCK=triton.next_power_of_2(max(num_profiles, 1)),
-        CAP_BLOCK=triton.next_power_of_2(max(num_candidates, 1)),
+        PROF_BLOCK=triton.next_power_of_2(max(num_profiles, 16)),
+        CAP_BLOCK=triton.next_power_of_2(max(num_candidates, 128)),
         num_warps=4,
     )
