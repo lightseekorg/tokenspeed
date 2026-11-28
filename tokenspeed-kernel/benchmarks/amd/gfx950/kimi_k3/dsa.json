@@ -1,0 +1,207 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "model_profile": "kimi_k31_tp8",
+    "dtype": "bfloat16",
+    "kv_cache_dtype": "float8_e4m3fn",
+    "index_heads": 32,
+    "index_head_dim": 128,
+    "index_k_format": "mxfp4",
+    "local_attention_heads": 12,
+    "kv_lora_rank": 512,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+    "kv_page_size": 64,
+    "topk_tokens": 2048,
+    "max_context": 1048560
+  },
+  "cases": [
+    {
+      "id": "kimi_k3.attention.dsa_decode_topk/verify-t8-217k-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_decode_topk",
+        "parameters": {
+          "batch": [1, 2],
+          "q_len_per_req": 8,
+          "sequence_length": 217344
+        },
+        "cold_cache": true,
+        "seed": 4901
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "kimi_k3.attention.dsa_decode_topk/verify-t8-629k-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_decode_topk",
+        "parameters": {
+          "batch": 1,
+          "q_len_per_req": 8,
+          "sequence_length": 629184
+        },
+        "cold_cache": true,
+        "seed": 4902
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0
+      }
+    },
+    {
+      "id": "kimi_k3.attention.dsa_decode_projected_value/verify-t8-217k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_decode_projected_value",
+        "parameters": {
+          "batch": [1, 2],
+          "q_len_per_req": 8,
+          "sequence_length": 217344
+        },
+        "cold_cache": true,
+        "seed": 4911
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.5
+      }
+    },
+    {
+      "id": "kimi_k3.attention.dsa_index_candidates/kvp8-verify-t8-217k-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_index_candidates",
+        "parameters": {
+          "batch": 8,
+          "q_len_per_req": 8,
+          "sequence_length": 217344,
+          "kvp_size": 8
+        },
+        "cold_cache": true,
+        "seed": 4921
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "kimi_k3.attention.dsa_index_candidates/kvp8-verify-t6-217k-mxfp4",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_index_candidates",
+        "parameters": {
+          "batch": [8, 12, 16, 48],
+          "q_len_per_req": 6,
+          "sequence_length": 217344,
+          "kvp_size": 8
+        },
+        "cold_cache": true,
+        "seed": 4922
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 3.0
+      }
+    },
+    {
+      "id": "kimi_k3.attention.dsa_select_owned_candidates/kvp8-verify-t8-217k-float32",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_select_owned_candidates",
+        "parameters": {
+          "batch": 8,
+          "q_len_per_req": 8,
+          "sequence_length": 217344,
+          "kvp_size": 8
+        },
+        "cold_cache": true,
+        "seed": 4931
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "kimi_k3.attention.dsa_select_owned_candidates/kvp8-verify-t6-217k-float32",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_select_owned_candidates",
+        "parameters": {
+          "batch": [8, 12, 16, 48],
+          "q_len_per_req": 6,
+          "sequence_length": 217344,
+          "kvp_size": 8
+        },
+        "cold_cache": true,
+        "seed": 4932
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "kimi_k3.attention.dsa_decode_dcp_records/kvp8-verify-t8-217k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_decode_dcp_records",
+        "parameters": {
+          "batch": 8,
+          "q_len_per_req": 8,
+          "sequence_length": 217344,
+          "kvp_size": 8
+        },
+        "cold_cache": true,
+        "seed": 4941
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.5
+      }
+    },
+    {
+      "id": "kimi_k3.attention.dsa_decode_dcp_records/kvp8-verify-t6-217k-float8",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "attention",
+        "mode": "dsa_decode_dcp_records",
+        "parameters": {
+          "batch": [8, 12, 16, 48],
+          "q_len_per_req": 6,
+          "sequence_length": 217344,
+          "kvp_size": 8
+        },
+        "cold_cache": true,
+        "seed": 4942
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    }
+  ]
+}

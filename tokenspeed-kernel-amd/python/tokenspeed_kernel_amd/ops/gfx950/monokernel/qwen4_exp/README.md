@@ -1,7 +1,7 @@
 # Qwen3.8-Flash-Next decode monokernels
 
 These kernels run one decoder layer of Qwen3.8-Flash-Next (`qwen4_exp`) as one
-persistent launch, for 1 to 4 token rows. They use the building blocks in
+persistent launch, for 1 to 8 token rows. They use the building blocks in
 [`../README.md`](../README.md). That file also gives the launch contract and
 the rules for writing a stage.
 
@@ -23,7 +23,7 @@ the rules for writing a stage.
   the first layer, the input is the embedding, `[rows, HIDDEN]`: one row that
   stands for all four streams. The output is the new streams, with no pending
   residual.
-- `rows` is 1 to `MAX_ROWS` (4). `chain` is 1 for decode and `k + 1` for an
+- `rows` is 1 to `MAX_ROWS` (8). `chain` is 1 for decode and `k + 1` for an
   MTP verify of `k` draft tokens. The rows are request-major.
 - The kernels read and write the regular path's caches in place: the GDN
   conv and SSM pages, the PLE pages, the paged KV cache, and the QSA indexer
@@ -34,11 +34,13 @@ the rules for writing a stage.
 - An MTP draft step (one row per request, `draft` operand) writes the
   speculative index keys to the QSA indexer's draft scratch, not to the
   recent ring, as the regular draft path does.
-- The MTP draft's catch-up step (its first step: one request's verified rows
-  as a chain, `accepted` operand) narrows as the regular path does. Every row
-  runs up to `q2`: it writes its K / V, and its index key when the row is
-  accepted. The stages from `q3` on run only for the live row, the row of the
-  last accepted token (`layer.live_plan`). The launch outputs that one row.
+- The MTP draft's first step (the requests' verified rows as chains)
+  narrows as the regular path does, in two launches. The prefix launch
+  (`accepted` operand, a plan up to `q2`, no output) runs every row: it
+  writes its K / V, and its index key when the row is accepted. Each
+  request's live row (its last accepted token, `ctx.gather_ids`) then runs
+  as an ordinary one-row decode launch, which reads the other rows from
+  the caches. The prefix launch tags as layer slot `layers + layer`.
 - The launchers' docstrings list every operand. Row counts, positions,
   sequence lengths, and table widths are runtime values.
 
@@ -50,17 +52,21 @@ monokernel classes `Qwen4ExpMonokernelLinearDecoderLayer` and
 `Qwen4ExpMonokernelAttentionDecoderLayer`.
 
 - A layer can be packed when it has a sparse MoE with a shared expert, and
-  no attention TP or expert parallelism. The seam packs every layer once,
+  no attention TP or expert parallelism. A PLE layer also needs its n-gram table
+  on the device, unsharded: BF16, or FP8 E4M3 with its scalar scale
+  (`ple_embed_dtype` `float8_e4m3fn` without `ple_offload_embedding`), which
+  `p1` dequantizes as TokenSpeed's device lookup does,
+  `bf16(float(value) * scale)`. The seam packs every layer once,
   after the weights load. Startup fails when a layer cannot be packed, and
   the error names each such layer with its reasons.
-- A layer runs its launch when the forward is a decode step of at most 4
+- A layer runs its launch when the forward is a decode step of at most 8
   rows, padded graph rows included. Each request has one token, or `k + 1`
   tokens of a target verify with ReplaySSM. Other forwards run the regular
   layer's code.
 - The MTP draft model's one QSA layer, with its final mixer, uses the same
-  kernel for every draft step: the first step as a chain over one request's
-  verified rows (a first step of several requests uses the regular path),
-  the next steps as one row each.
+  kernel for every draft step: the first step as the prefix launch over the
+  verified rows (up to 8) and the live rows' decode launch, the next steps
+  as one row each.
 
 ## Stages
 
@@ -71,8 +77,7 @@ QSA attention layer:   a1 a2 | q1 q2 q3 q4 q4f q5 q6          | c1 | m1 m2 m3 m4
 
 Tasks are for one row. "+ per row" means that the count grows with each row.
 A stage without that note serves every row in each task and reads each weight
-once. In a draft catch-up step, the stages from `q3` on serve one row, the
-live row.
+once.
 
 | Stage | Module | Tasks | Base | Work |
 |---|---|---|---|---|
@@ -81,19 +86,19 @@ live row.
 | `a1`, `m1`, `f1` | `hc.py` | 80 + 8 per row | 0, 0 (28 with `w1`), 57 | Mixer reduce: the per-stream Gemma norm and the low-rank down projection of 16 low-rank columns of one stream, for every row; or one row's inject logit of one stream half. |
 | `a2`, `m2`, `f2` | `hc.py` | 80 | 176, 176, 0 | Mixer mix: the up projection of 32 columns of each stream. Publishes the mixed row as BF16 (`m2` also as MXFP4, the experts' input). |
 | `b1` | `gdn.py` | 256 | 0 | 64 rows of `in_proj_qkvzba`. Tasks 0 to 159 also run the causal conv. Tasks 160 to 255 also compute one `in_proj_b` / `in_proj_a` logit each. |
-| `b3` | `gdn.py` | 48 per row | 28 | The gated delta rule of one value head, then the gated RMS norm. Publishes the result as BF16. |
+| `b3` | `gdn.py` | 48 per request | 28 | The gated delta rule of one value head, then the gated RMS norm, for each token of the request in order. Publishes the result as BF16. Past 5 requests, the tasks run in rounds. |
 | `q1` | `qsa.py` | 218 | 28 | 64 rows of `qkv_proj` or `index_qk_proj`. |
 | `q2` | `qsa.py` | 31 per row | 200 | Q and K norm and MRoPE, the KV cache write, the index q heads, and the index key with its block compression. |
 | `q3` | `qsa.py` | 255 per row | 0 | Block scores `sum_h relu(q_h . k_b)`. Only when there are more complete blocks than `TOPK_BLOCKS`. |
 | `q4` | `qsa.py` | 8 per row | 20 | The top `TOPK_BLOCKS` blocks of one chunk of `SELECT_CHUNK` blocks: four 8-bit radix passes in LDS. |
 | `q4f` | `qsa.py` | 1 per row | 255 | The top blocks of the chunks' candidates, when there is more than one chunk. |
-| `q5` | `qsa.py` | 64 per row | 68 | Attention of one KV head over one of 32 splits of 128 tokens. Publishes `acc / l` and the base-2 LSE. A split past the attended tokens does nothing. The tasks are split-major: split `s` of every row comes before split `s + 1`. |
+| `q5` | `qsa.py` | 64 per row | 68 | Attention of one KV head over one of 32 splits of 128 tokens. Publishes `acc / l` and the base-2 LSE. A split past the attended tokens does nothing. The tasks are split-major: split `s` of every row comes before split `s + 1`. Past 4 rows, the tasks run in rounds; the later rounds hold the high splits. |
 | `q6` | `qsa.py` | 48 per row, up to 2 rows | 0 | The LSE merge of 128 dims of a head over the used splits, then the output gate. Publishes the result as BF16. Past 2 rows, a task also merges the same dims of the further rows. |
 | `w1` | `warm.py` | 28, past 2 rows | 0 | Reads the next layer's late first-projection weights (`layer.late_weights`) into the memory-side cache. |
 | `c1` | `out_proj.py` | 160 | 96 | The output projection of 16 hidden columns, then the gated residual combine of the 4 streams. |
 | `m3` | `moe.py` | 65 (130 past 2 rows) | 28 | Router logits of 8 experts each, for every row or (past 2 rows) for 2 rows. The last block of experts is the shared expert gate. |
 | `m4` | `moe.py` | 220 (200 + 20 / C past 1 row) | 93 | Routes, then the gate and up projection of 32 intermediate columns of one routed rank, or of `C` (`shared_blocks`) 32-column blocks of the shared expert, read once for every row. Publishes `silu(gate) * up` as MXFP4. |
-| `m5` | `moe.py` | 160 | 96 | Routes, then the down projections of 16 hidden columns of every (row, rank) chain, 16 chains per rank-3 MFMA. Combines each row's chains in rank order into the output streams. |
+| `m5` | `moe.py` | 160 | 96 | Routes, then the down projections of 16 hidden columns of every (row, rank) chain, 16 chains per rank-3 MFMA. Combines each row's chains in rank order into the output streams. Past 4 rows, it runs the rows in passes of 4 (`moe.DOWN_PASS_ROWS`). |
 
 A layer whose routed experts are BF16 (the MTP draft layer of the MXFP4
 checkpoint) runs `m3` to `m5` from `moe_bf16.py`: `m4` has 440 tasks of 16
@@ -161,7 +166,16 @@ timeline:
   splits the rows over two tasks per block of experts, so a
   task's per-row work stays short.
 - `m4` streams 2 units of weights at a time: a routed task's unit is a row's
-  expert, a shared expert task's unit is a block that every row reads.
+  expert, a shared expert task's unit is a block that every row reads. A
+  shared task's `C` blocks each take `next_power_of_2(rows)` of the 16 MFMA
+  rows (`moe.shared_blocks`): 4 blocks up to 4 rows, 2 past 4 rows.
+- Past 4 rows, `m5` runs the rows in passes of 4 rows (`moe.DOWN_PASS_ROWS`).
+  A pass has the chains, the LDS and the registers of a 4-row launch: 8 rows
+  in one pass would need about 200 KiB of LDS for the intermediates and the
+  scale runs alone. A pass reads its rows' routes from LDS and its
+  rows' regions through a mailbox of a 4-row plan (`moe.pass_mailbox`). A
+  row's chains and epilogue do not depend on the other rows of its pass, so
+  the passes give the bits of one launch.
 - `m4`'s two K-split waves of a block each take one contiguous half of K
   (`"n32h"` scales; the LDS rows hold the k-iterations in that order). One
   scale dword then serves two k-iterations of a block pair, which halves
@@ -238,8 +252,9 @@ timeline:
 - A launch of `R` rows gives bit for bit the results of `R` one-row launches.
   A verify of `k + 1` tokens gives bit for bit the results of `k + 1` decode
   steps. Draft steps give bit for bit the results of decode steps; only the
-  place of the index keys differs. A catch-up step's output is bit for bit
-  its live row's decode step output.
+  place of the index keys differs. A draft first step's output is its live
+  row's decode step output; its prefix launch writes what the verified rows'
+  decode steps write, index keys for the accepted rows only.
 
 ## Weights
 

@@ -327,7 +327,10 @@ class PleWeights:
     norm_query: torch.Tensor
     norm_conv: torch.Tensor
     conv_w: torch.Tensor  # BF16 [4 * HIDDEN, 4], depthwise conv
-    table: torch.Tensor  # BF16 [rows, 160] n-gram embedding table
+    # n-gram embedding table [rows, 160]: BF16, or FP8 E4M3 whose rows are
+    # value * table_scale
+    table: torch.Tensor
+    table_scale: float | None  # the FP8 table's scale; None for BF16
     multipliers: torch.Tensor  # int64 [3], the n-gram hash multipliers
     sizes: torch.Tensor  # int64 [16], per-head vocabulary sizes
     offsets: torch.Tensor  # int64 [16], per-head table offsets
@@ -342,6 +345,8 @@ class PleWeights:
             self.norm_conv,
             self.conv_w,
             self.table,
+            # A BF16 table reads no scale (any float).
+            1.0 if self.table_scale is None else self.table_scale,
             self.multipliers,
             self.sizes,
             self.offsets,
@@ -357,6 +362,7 @@ def pack_ple(
     norm_conv: torch.Tensor,
     conv_w: torch.Tensor,
     table: torch.Tensor,
+    table_scale: float | None,
     multipliers: torch.Tensor,
     sizes: torch.Tensor,
     offsets: torch.Tensor,
@@ -370,8 +376,12 @@ def pack_ple(
         norm_key, norm_query, norm_conv: The three Gemma norms' BF16 ``1 + w``
             ``[4 * HIDDEN]`` (``gemma_weight``).
         conv_w: Depthwise conv weight ``[4 * HIDDEN, 1, 4]`` or ``[.., 4]``.
-        table: The n-gram embedding table, BF16 ``[rows, 160]`` (device,
-            unsharded).
+        table: The n-gram embedding table ``[rows, 160]`` (device,
+            unsharded): BF16, or FP8 E4M3 (``torch.float8_e4m3fn``) that
+            the kernel dequantizes as TokenSpeed's device lookup does,
+            ``bf16(float(row) * table_scale)``.
+        table_scale: The FP8 table's scalar scale, exactly when ``table`` is
+            FP8; None for a BF16 table.
         multipliers, sizes, offsets: The n-gram hash parameters (int64 ``[3]``,
             ``[16]``, ``[16]``).
         eos: The EOS token id.
@@ -389,13 +399,16 @@ def pack_ple(
         }
     )
     if (
-        table.dtype != torch.bfloat16
+        table.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
         or table.shape[-1] != int(ple.NGRAM_DIM)
         or (not table.is_contiguous())
     ):
         raise ValueError(
-            f"n-gram table must be dense BF16 [rows, 160], got {table.dtype} {tuple(table.shape)}"
+            "n-gram table must be dense BF16 or FP8 E4M3 [rows, 160], got "
+            f"{table.dtype} {tuple(table.shape)}"
         )
+    if (table.dtype == torch.float8_e4m3fn) != (table_scale is not None):
+        raise ValueError("table_scale must be given exactly for an FP8 table")
 
     def bf16(t):
         return t.to(torch.bfloat16).contiguous()
@@ -407,6 +420,7 @@ def pack_ple(
         norm_conv=bf16(norm_conv),
         conv_w=bf16(conv_w.reshape(width, 4)),
         table=table,
+        table_scale=None if table_scale is None else float(table_scale),
         multipliers=multipliers.to(torch.int64).contiguous(),
         sizes=sizes.to(torch.int64).contiguous(),
         offsets=offsets.to(torch.int64).contiguous(),

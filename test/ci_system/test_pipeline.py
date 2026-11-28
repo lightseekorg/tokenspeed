@@ -1299,14 +1299,14 @@ def test_scan_filters_task_yaml_only_changes(
 @pytest.mark.parametrize(
     ("changed", "expected"),
     [
-        ("tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n", ["bench"]),
+        ("tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/dsa.json\n", ["bench"]),
         (
-            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/dsa.json\n"
             "test/ci/ut.yaml\n",
             ["bench", "ut"],
         ),
         (
-            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/mla.json\n"
+            "tokenspeed-kernel/benchmarks/amd/gfx950/kimi_k3/dsa.json\n"
             "tokenspeed-kernel/python/tokenspeed_kernel/benchmark/harness.py\n",
             ["bench", "ut"],
         ),
