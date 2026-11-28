@@ -440,6 +440,7 @@ class DeviceHandle:
         weight_memory: WeightMemoryState | None = None,
         forward_reloader: ForwardReloader | None = None,
         peer_outbox=None,
+        fence_l2_transfers_before_forward: bool = False,
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
@@ -472,6 +473,9 @@ class DeviceHandle:
         # With peer prefix sharing, where the host learns that a plan's
         # landings may be read (``PeerOutbox.reads_ready``); None without.
         self._peer_outbox = peer_outbox
+        self._fence_l2_transfers_before_forward: bool = (
+            fence_l2_transfers_before_forward
+        )
 
     def bind_forward_thread(self) -> None:
         """Make the calling thread the forward thread: give it the rank's
@@ -737,6 +741,9 @@ class DeviceHandle:
             # prepared here; the pull follows the round's forward below.
             self._prepare_remote_prefill_slots(remote_prefill)
 
+        if planned is not None:
+            self._fence_l2_before_forward()
+
         if planned is None:
             result = None
         elif self._role is DeviceRole.PD_PREFILL:
@@ -882,6 +889,11 @@ class DeviceHandle:
         if self._l2 is not None:
             self._l2.shutdown()
 
+    def _fence_l2_before_forward(self) -> None:
+        """Order cooperative all-SM forwards behind any in-flight L2 transfers."""
+        if self._l2 is not None and self._fence_l2_transfers_before_forward:
+            self._l2.fence_pending_transfers(self._executor.default_stream)
+
     def run_idle_forward(self, dp_metadata: DpForwardMetadata) -> None:
         """Run a zero-token forward so this DP rank joins the round's collectives.
 
@@ -891,6 +903,7 @@ class DeviceHandle:
         if self._weight_memory is not None:
             self._weight_memory.require_usable()
         self.settle()
+        self._fence_l2_before_forward()
         self._executor.execute_idle_forward(dp_metadata)
 
     def _prepare_remote_prefill_slots(self, remote_prefill) -> None:
@@ -1765,6 +1778,16 @@ def _retraction_pool_request(
     )
 
 
+def _uses_cooperative_mega_moe(server_args: ServerArgs) -> bool:
+    """Whether target or draft MoE runs cooperative all-SM MegaMoE kernels."""
+    from tokenspeed.runtime.layers.moe.utils import MoeBackend
+
+    backends = [MoeBackend(server_args.moe_backend)]
+    if server_args.draft_moe_backend is not None:
+        backends.append(MoeBackend(server_args.draft_moe_backend))
+    return any(backend.is_mega_moe() for backend in backends)
+
+
 def build_device_side(
     *,
     server_args,
@@ -2440,6 +2463,7 @@ def build_device_side(
                 else None
             ),
             peer_outbox=peer_outbox,
+            fence_l2_transfers_before_forward=_uses_cooperative_mega_moe(server_args),
         ),
     )
 

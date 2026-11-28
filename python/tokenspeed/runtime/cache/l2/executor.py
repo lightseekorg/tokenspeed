@@ -638,6 +638,8 @@ class HostCacheExecutor:
         self._ack_lock = threading.Lock()
         self._load_poisoned = False
         self._ready_load_acks: list[_Ack] = []
+        self._unretired_write_event = None
+        self._unretired_load_event = None
 
         # Resolve each buffer binding on its eventual copy stream at startup,
         # so the first serving transfer only uploads its per-operation rows.
@@ -799,15 +801,26 @@ class HostCacheExecutor:
             tail = device_module.Event()
             tail.record(self.write_stream)
             fence_stream.wait_event(tail)
+            self._unretired_write_event = None
             raise
         if fence is not None:
             fence_stream.wait_event(fence)
+            self._unretired_write_event = None
         self._start_writing(
             pinned_op_ids,
             pinned_transfers,
             lane=self._pinned_write_lane,
             prerequisite_stream=prerequisite_stream,
         )
+
+    def fence_pending_transfers(self, fence_stream) -> None:
+        """Order ``fence_stream`` behind any unfenced L2 write or load kernel."""
+        if self._unretired_write_event is not None:
+            fence_stream.wait_event(self._unretired_write_event)
+            self._unretired_write_event = None
+        if self._unretired_load_event is not None:
+            fence_stream.wait_event(self._unretired_load_event)
+            self._unretired_load_event = None
 
     def submit_load_backs(self, cache_ops: Sequence, *, prerequisite_stream) -> None:
         """Launch the plan's H2D loads; runs after the plan's page zeroing.
@@ -1260,6 +1273,8 @@ class HostCacheExecutor:
                 observations=observations,
             ),
         )
+        if l2_rows or pool_rows or ops:
+            self._unretired_load_event = finish
 
     def _start_writing(
         self,
@@ -1297,6 +1312,8 @@ class HostCacheExecutor:
                 op_ids=op_ids,
             ),
         )
+        if transfers:
+            self._unretired_write_event = finish
         return finish
 
     def _start_loading(
@@ -1465,6 +1482,7 @@ class HostCacheExecutor:
                     timing=timing,
                 ),
             )
+            self._unretired_load_event = finish
             return load_index
         except BaseException as original_error:
             self._retire_failed_load(active_trackers, flags, original_error)
@@ -1482,11 +1500,13 @@ class HostCacheExecutor:
             retirement.record(self.load_stream)
             for load_events, _ in active_trackers:
                 load_events.set_completion(retirement)
+            self._unretired_load_event = retirement
             return
         except BaseException as retirement_error:
             # If event publication fails, only stream completion permits reuse.
             try:
                 self.load_stream.synchronize()
+                self._unretired_load_event = None
             except BaseException as sync_error:
                 self._load_poisoned = True
                 add_note = getattr(original_error, "add_note", None)

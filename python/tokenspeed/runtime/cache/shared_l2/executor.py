@@ -349,6 +349,10 @@ class SharedL2LoadExecutor:
             first_ready_word += num_layers
             tracker.set_consumers(load_index)
 
+    def fence_pending_transfers(self, fence_stream) -> None:
+        """Shared L2 reads run off-SM over RDMA and need no stream fence."""
+        del fence_stream
+
     def shutdown(self) -> None:
         # The client's threads end first: a load in flight sets ready words,
         # and the pool's writes read the Device cache.
