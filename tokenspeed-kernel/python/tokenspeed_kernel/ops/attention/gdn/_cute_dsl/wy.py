@@ -516,7 +516,35 @@ class GdnWYKernel:
         tile: Int32,
         stage: cutlass.Constexpr,
     ):
-        """Issue one QKV token chunk into its own transfer buffer."""
+        """Issue TMA copies for one Q/K/V token chunk into its transfer buffer.
+
+        All CTA threads enter collectively. Warp 0 initializes the barrier array
+        when ``stage == 0``, arms the selected barrier and issues the three
+        copies; callers wait on that barrier before consuming the chunk. Stage 0
+        must run before any other stage.
+
+        Args:
+            raw_q, raw_k: Shared-memory buffers with layout
+                ``(token_chunk, 128, pipeline_stages)``.
+            raw_v: Shared-memory buffer with layout
+                ``(token_chunk, tma_value_columns, pipeline_stages)``.
+            barriers: One TMA transaction barrier per pipeline stage. Stage 0
+                initializes the full array; every call arms its own barrier once
+                and the caller waits for phase 0 before reading that stage.
+            atoms: Q/K/V TMA copy atoms for ``(token_chunk, 128)``,
+                ``(token_chunk, 128)`` and ``(token_chunk, tma_value_columns)``
+                tiles, respectively.
+            sources: Q/K/V TMA source tensors with logical layouts
+                ``(tokens, 128, heads, batch)``; the head dimension is H for Q/K
+                and HV for V.
+            batch: Request index in the source tensors.
+            head: Query/key head index.
+            hv: Value head index.
+            tile: Value tile index; columns start at ``tile * value_tile``.
+            stage: Zero-based compile-time stage index below ``pipeline_stages``;
+                selects the destination buffer and the token rows starting at
+                ``stage * token_chunk``.
+        """
         warp = cute.arch.thread_idx()[0] // 32
         qkv_barrier = cute.make_tensor(barriers.iterator + stage, cute.make_layout(1))
         if warp == 0:

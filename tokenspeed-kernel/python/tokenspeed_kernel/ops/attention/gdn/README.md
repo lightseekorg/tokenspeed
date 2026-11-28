@@ -105,10 +105,11 @@ both Q/K/V and the checkpoint support TMA and there are more than two
 request/head pairs per SM. The smaller shared-memory footprint allows more
 wide FP32 CTAs to reside on an SM. Q/K/V transfers split the token bucket in
 half, and checkpoint transfers split K=128 into four K32 chunks. The first
-two chunks are prefetched before normalization. After every state product, all warps
-release its buffer before TMA refills it two chunks ahead. The next state
-product and the value product overlap these transfers. Each buffer has an
-independent completion barrier whose phase changes on reuse. Output fragments
+two chunks are prefetched before normalization. After every state product,
+all warps finish reading the current buffer before TMA refills that buffer two
+chunks ahead. The next state product and the value product overlap these
+transfers. Each buffer has an independent completion barrier whose phase
+changes on reuse. Output fragments
 stay in registers across the four chunks, so no checkpoint chunk is reread
 for a second value fragment. Q/K/V storage stays the same size, while the
 checkpoint buffers together hold roughly half the original full-K tile.
