@@ -472,3 +472,161 @@ def test_a_missing_map_raises_instead_of_gathering_from_dispatch() -> None:
                 fabric.group_has_fabric([0, 1])
     finally:
         fabric._fabric_map = saved
+
+
+def test_symm_mem_reachability_separates_unicast_fabric_from_multicast() -> None:
+    """Unicast symmetric-memory reachability mirrors host-span and fabric checks."""
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    group = mock.Mock()
+    saved_hosts, saved_fabric = fabric._host_map, fabric._fabric_map
+    try:
+        with mock.patch.object(torch.distributed, "is_initialized", return_value=False):
+            assert fabric.symm_mem_reachable(group) is False
+
+        fabric._host_map = None
+        fabric._fabric_map = None
+        with (
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ),
+        ):
+            assert fabric.symm_mem_reachable(group) is False
+
+        # Node-local subgroup stays reachable even without fabric allocation.
+        fabric._host_map = [0, 0, 1, 1]
+        fabric._fabric_map = [False, False, False, False]
+        with (
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ),
+        ):
+            assert fabric.symm_mem_reachable(group) is True
+
+        # Cross-host group requires fabric on every rank in the subgroup.
+        with (
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 2]
+            ),
+        ):
+            fabric._fabric_map = [True, True, False, True]
+            assert fabric.symm_mem_reachable(group) is False
+            fabric._fabric_map = [True, True, True, True]
+            assert fabric.symm_mem_reachable(group) is True
+    finally:
+        fabric._host_map = saved_hosts
+        fabric._fabric_map = saved_fabric
+
+
+@pytest.mark.parametrize("symm_ok", [True, False])
+def test_unicast_comm_factories_gate_on_symm_mem_not_multicast(
+    monkeypatch, symm_ok: bool
+) -> None:
+    """Unicast peer ops follow ``symm_mem_reachable``, never ``multicast_reachable``."""
+    import contextlib
+    import importlib.util
+    import sys
+    import types
+    from unittest import mock
+
+    import tokenspeed_kernel.ops.attention.mla.cute_dsl as mla_cute_dsl
+    import tokenspeed_kernel.ops.communication.cute_dsl as comm_cute_dsl
+    import tokenspeed_kernel.ops.communication.fabric as fabric
+
+    votes_seen: list[int] = []
+    group = mock.Mock()
+    group.size.return_value = 2
+    device = torch.device("cuda", 0)
+
+    def record_vote_and_abort(tensor, op=None, group=None):
+        del op, group
+        votes_seen.append(int(tensor[0].item()))
+        tensor[0] = 0
+
+    if importlib.util.find_spec("cutlass") is None:
+        paged_mod = types.ModuleType(
+            "tokenspeed_kernel.ops.communication._cute_dsl.paged_row_all_gather"
+        )
+        paged_mod.build_paged_row_all_gather_state = mock.Mock()
+        ll_mod = types.ModuleType(
+            "tokenspeed_kernel.ops.communication._cute_dsl.ll_exchange"
+        )
+        ll_mod.build_ll_exchange_state = mock.Mock()
+        dcp_mod = types.ModuleType(
+            "tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.mla.dcp"
+        )
+        dcp_mod.DcpValueMailbox = mock.Mock()
+        monkeypatch.setitem(sys.modules, paged_mod.__name__, paged_mod)
+        monkeypatch.setitem(sys.modules, ll_mod.__name__, ll_mod)
+        monkeypatch.setitem(sys.modules, dcp_mod.__name__, dcp_mod)
+
+    saved_hosts, saved_fabric = fabric._host_map, fabric._fabric_map
+    fabric._host_map = [0, 0, 1, 1]
+    fabric._fabric_map = [True, True, symm_ok, True]
+    try:
+        monkeypatch.setattr(
+            fabric,
+            "multicast_reachable",
+            lambda _g: (_ for _ in ()).throw(
+                AssertionError("unicast factory must not query multicast_reachable")
+            ),
+        )
+        for mod in (comm_cute_dsl, mla_cute_dsl):
+            monkeypatch.setattr(
+                mod,
+                "current_platform",
+                lambda: mock.Mock(is_nvidia=True),
+            )
+            monkeypatch.setattr(mod.dist, "get_process_group_ranks", lambda _g: [0, 2])
+            monkeypatch.setattr(mod.dist, "all_reduce", record_vote_and_abort)
+        monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            torch.distributed, "get_process_group_ranks", lambda _g: [0, 2]
+        )
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _d: (10, 0))
+        monkeypatch.setattr(torch.cuda, "device", lambda _d: contextlib.nullcontext())
+        monkeypatch.setattr(comm_cute_dsl, "multimem_available", lambda: False)
+
+        assert (
+            comm_cute_dsl.create_paged_row_all_gather_state(
+                group,
+                device,
+                row_bytes=16,
+                cap_bytes=64,
+                timeout_ns=1_000_000_000,
+                modes=("peer",),
+                eligible=True,
+            )
+            is None
+        )
+        assert (
+            comm_cute_dsl.create_ll_exchange_state(
+                group,
+                device,
+                cap_bytes=64,
+                float_cap_bytes=64,
+                timeout_ns=1_000_000_000,
+                eligible=True,
+            )
+            is None
+        )
+        assert (
+            mla_cute_dsl.create_dcp_value_tail(
+                group,
+                device,
+                heads=2,
+                rows=8,
+                timeout_ns=1_000_000_000,
+                eligible=True,
+            )
+            is None
+        )
+        assert votes_seen == [int(symm_ok), int(symm_ok), int(symm_ok)]
+    finally:
+        fabric._host_map = saved_hosts
+        fabric._fabric_map = saved_fabric

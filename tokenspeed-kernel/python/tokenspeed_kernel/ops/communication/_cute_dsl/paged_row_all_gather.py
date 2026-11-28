@@ -869,7 +869,7 @@ def build_paged_row_all_gather_state(
             raise RuntimeError("the symmetric buffer does not start at the workspace")
         error = torch.zeros(ERR_WORDS, dtype=torch.int64, pin_memory=True)
         # The multicast word is unused in peer mode (the vote below picks it).
-        multicast_ptr = int(handle.multicast_ptr) if multicast else 0
+        multicast_ptr = int(handle.multicast_ptr or 0) if multicast else 0
         flags_off = 2 * degree * cap_bytes
         words = {
             _PARAM_MULTICAST: multicast_ptr,

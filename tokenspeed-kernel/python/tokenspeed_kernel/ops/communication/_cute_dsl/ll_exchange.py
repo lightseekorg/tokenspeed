@@ -311,14 +311,20 @@ class LLExchangeState:
             self.workspace, self.handle, self.peers = self._workspace(
                 group, self.cap_units * 2 * UNIT, 0, device
             )
-            self.multicast_ptr = int(self.handle.multicast_ptr) if multicast else 0
+            self.multicast_ptr = int(self.handle.multicast_ptr or 0) if multicast else 0
             # Each workspace's call count, then the CTA ticket in the low half
             # of word 1.
             self.ctrl = torch.zeros(2, dtype=torch.int64, device=device)
             self.peers_view = from_dlpack(self.peers, assumed_align=8)
             self.sms = torch.cuda.get_device_properties(device).multi_processor_count
             for gather in (True, False):
-                _compiled(self.ranks, gather, gather and multicast, False, device.index)
+                _compiled(
+                    self.ranks,
+                    gather,
+                    gather and (self.multicast_ptr != 0),
+                    False,
+                    device.index,
+                )
             # A float cap's slots start armed with the sentinel.
             self.float_workspace: torch.Tensor | None = None
             self.float_handle = None
@@ -331,10 +337,17 @@ class LLExchangeState:
                     self._workspace(group, self.float_cap_units * UNIT, 0xFF, device)
                 )
                 self.float_peers_view = from_dlpack(self.float_peers, assumed_align=8)
-                if multicast:
-                    self.float_multicast_ptr = int(self.float_handle.multicast_ptr)
+                self.float_multicast_ptr = (
+                    int(self.float_handle.multicast_ptr or 0) if multicast else 0
+                )
                 self.float_ctrl = torch.zeros(2, dtype=torch.int64, device=device)
-                _compiled(self.ranks, True, multicast, True, device.index)
+                _compiled(
+                    self.ranks,
+                    True,
+                    self.float_multicast_ptr != 0,
+                    True,
+                    device.index,
+                )
             torch.cuda.synchronize(device)
         # Every rank's workspaces are set before any peer stores into them.
         dist.barrier(group=group)
