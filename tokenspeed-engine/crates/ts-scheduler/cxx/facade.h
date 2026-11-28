@@ -63,6 +63,8 @@ struct SharedL2CheckpointView;
 struct SharedL2OpView;
 struct SharedL2ReservationView;
 struct SharedL2PoolStatsView;
+struct GdsStatsView;
+struct CacheReleaseView;
 struct PeerEventView;
 struct PeerAnswerView;
 struct PeerLookupView;
@@ -95,7 +97,7 @@ bool pin_peer_offer(tokenspeed::Scheduler& scheduler, const PeerEventView& event
 bool close_peer_offer(tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease, std::int64_t now_us);
 rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler);
 PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup,
-                                  std::size_t pending_new_leases);
+                                  std::size_t pending_new_leases, bool include_disk);
 bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup, std::int32_t num_tokens,
                       rust::Slice<const PeerPageView> pages);
 bool peer_lease_can_pin(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease);
@@ -140,6 +142,8 @@ bool can_prepare_storage_clear(const tokenspeed::Scheduler& scheduler);
 StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler);
 DiskStatsView disk_stats(const tokenspeed::Scheduler& scheduler);
 PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler);
+GdsStatsView gds_stats(const tokenspeed::Scheduler& scheduler);
+rust::Vec<CacheReleaseView> cache_release_stats(const tokenspeed::Scheduler& scheduler);
 bool clear_cache(tokenspeed::Scheduler& scheduler);
 void cancel_storage_backups(tokenspeed::Scheduler& scheduler);
 void cancel_storage_for_clear(tokenspeed::Scheduler& scheduler);

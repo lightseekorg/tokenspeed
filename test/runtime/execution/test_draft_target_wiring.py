@@ -872,6 +872,10 @@ def test_deepseek_dspark_wire_target_only_binds_resources():
 class _WeightUpdatingRunner:
     """Stands in for ModelRunner: only the distributed update path succeeds."""
 
+    def __init__(self) -> None:
+        # Without peer expert weights, DeviceHandle admits distributed updates.
+        self.model = torch.nn.Module()
+
     def init_weights_update_group(self, req):
         raise AssertionError("not the request under test")
 
@@ -894,6 +898,7 @@ def test_device_weight_update_notifies_drafter_before_returning():
     # DeviceHandle reads off it.
     executor = SimpleNamespace(
         model_runner=_WeightUpdatingRunner(),
+        draft_model_runner=SimpleNamespace(model=torch.nn.Module()),
         drafter=SimpleNamespace(
             on_target_weights_updated=lambda: refreshed.append("refreshed")
         ),

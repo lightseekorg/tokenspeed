@@ -350,3 +350,25 @@ def test_other_npu_workers_do_not_register_hccl(
             )
             is None
         )
+
+
+def test_startup_exempts_only_declared_peer_storages(saver_modules):
+    _, adapter = saver_modules
+    saver = adapter.AscendMemorySaverAdapter()
+    model = torch.nn.Module()
+    model.dense = NpuParameter(torch.arange(16).reshape(4, 4).float(), False)
+    model.routed = NpuParameter(torch.arange(32).reshape(4, 8).float(), False)
+    kv = NpuParameter(torch.zeros(128, dtype=torch.uint8), False)
+    routed_storage = model.routed.untyped_storage()
+    saver.validate_startup(
+        models=[("target", model)],
+        kv_regions={"arena": kv},
+        graphs=[],
+        peer_storages=frozenset({(routed_storage.data_ptr(), routed_storage.nbytes())}),
+    )
+    allocations, graphs = saver.inventory
+    assert graphs == []
+    names = [entry[1] for entry in allocations]
+    assert "target.dense" in names
+    assert "target.routed" not in names
+    assert "arena" in names

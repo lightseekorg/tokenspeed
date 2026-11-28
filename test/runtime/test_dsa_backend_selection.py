@@ -149,7 +149,11 @@ def test_ascend_draft_constraint_is_owned_by_the_backend(monkeypatch):
     backend = _get_backend_cls("dsa", AttentionArch.DSA)
     # CUDA CI verifies the NPU guard directly, before native ops initialize.
     if not current_platform().is_npu:
-        backend = backends.ascend_dsa.AscendDSABackend
+        from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
+            AscendDSABackend,
+        )
+
+        backend = AscendDSABackend
     with pytest.raises(ValueError, match="draft attention is disabled"):
         backend(config, spec, kernel_page_size=128)
 

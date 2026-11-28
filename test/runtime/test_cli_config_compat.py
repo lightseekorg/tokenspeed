@@ -380,7 +380,11 @@ class TestCLIConfigCompat:
         sa = self._from_cli_args_no_init(args)
         assert (sa.kv_events_config) == (config)
 
-    def test_l2_cache_options_across_engine_roles(self, subtests):
+    @pytest.mark.parametrize("in_forward", [False, True])
+    @pytest.mark.parametrize("eviction_policy", ["lru", "gds"])
+    def test_l2_cache_options_across_engine_roles(
+        self, subtests, in_forward, eviction_policy
+    ):
         for role in ("null", "prefill", "decode", "encode"):
             for io_backend in ("direct", "kernel"):
                 for disabled in (False, True):
@@ -400,10 +404,16 @@ class TestCLIConfigCompat:
                             "8",
                             "--max-num-seqs",
                             "16",
+                            "--prefix-cache-evict-policy",
+                            eviction_policy,
                         ]
+                        if in_forward:
+                            argv.append("--enable-state-checkpoint-in-forward")
+                        if eviction_policy == "gds":
+                            argv.extend(["--prefix-cache-gds-prefill-cost", "1", "0"])
                         if disabled:
                             argv.append("--disable-kvstore")
-                        if role == "decode":
+                        if role == "decode" and eviction_policy == "lru":
                             argv.append("--disable-prefix-caching")
                         sa = self._from_cli_args_no_init(self._parse_args(argv))
                         # Resolve rank-local execution capacity and decode extra
@@ -418,6 +428,18 @@ class TestCLIConfigCompat:
                         assert (sa.kvstore_io_backend) == (io_backend)
                         assert (sa.kvstore_ratio) == (3)
                         assert (sa.kvstore_size) == (8)
+                        checkpoints = sa.checkpoint_config
+                        produces = in_forward and role != "decode"
+                        assert checkpoints.production.in_forward is produces
+                        assert (
+                            checkpoints.publication.filter_covered_endpoints is produces
+                        )
+                        assert checkpoints.publication.drop_short_prompt_end is (
+                            in_forward and role == "prefill"
+                        )
+                        assert checkpoints.retention.demote_superseded is (
+                            produces and eviction_policy == "lru"
+                        )
 
     def test_speculative_draft_quantization_defaults_to_unquant(self):
         args = self._parse_args(["--model", "test/model", "--quantization", "nvfp4"])

@@ -272,6 +272,9 @@ class TestFinishTailHitCopyCudaTest:
         page_count = arena.plan.group("kv").page_count
         scheduler = ts.Scheduler(
             make_config(
+                prefix_cache_evict_policy="lru",
+                prefix_cache_gds_prefill_cost=None,
+                prefix_cache_gds_disk_block_costs=(),
                 num_device_pages=page_count,
                 max_scheduled_tokens=256,
                 max_batch_size=4,
@@ -495,6 +498,9 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
         handle.bind_forward_thread()
         try:
             scheduler_config = make_config(
+                prefix_cache_evict_policy="lru",
+                prefix_cache_gds_prefill_cost=None,
+                prefix_cache_gds_disk_block_costs=(),
                 num_device_pages=scheduler_cache_geometry_from_pool(
                     pool
                 ).num_device_pages,

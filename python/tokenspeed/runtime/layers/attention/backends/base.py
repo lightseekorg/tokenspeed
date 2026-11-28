@@ -156,6 +156,7 @@ class SparseTopKShare:
     verify window); each family stores its own record type. ``qsa_metadata``
     holds QSA's layer-invariant row geometry so it is built once per forward;
     ``qsa_selection`` retains its logical candidates alongside physical slots.
+    ``qsa_draft_rows`` memoizes the logical inputs for narrowed draft attention.
     ``write_slots`` holds the KVP-local write slots the layers resolved from
     the round's virtual write slots (``placement.resolve_write_slots``).
     """
@@ -164,14 +165,20 @@ class SparseTopKShare:
     decode: Any | None = None
     qsa_metadata: Any | None = None
     qsa_selection: Any | None = None
+    qsa_draft_rows: Any | None = None
     write_slots: list = field(default_factory=list)
 
     def clear(self) -> None:
         self.prefill = None
         self.decode = None
+        self.clear_qsa()
+        self.write_slots = []
+
+    def clear_qsa(self) -> None:
+        """Drop QSA inputs while keeping the physical slots carried to another step."""
         self.qsa_metadata = None
         self.qsa_selection = None
-        self.write_slots = []
+        self.qsa_draft_rows = None
 
 
 class CachePoolBinding:

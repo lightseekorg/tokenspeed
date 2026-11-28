@@ -23,6 +23,7 @@
 from tokenspeed_kernel_amd.ops.gfx950.attention.qsa.indexer import (
     launch_gluon_qsa_block_scores_gfx950,
     launch_gluon_qsa_block_topk_select_gfx950,
+    launch_gluon_qsa_block_topk_stream_gfx950,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.qsa.sparse_attention import (
     launch_gluon_qsa_sparse_attention_gfx950,
@@ -31,5 +32,6 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.qsa.sparse_attention import (
 __all__ = [
     "launch_gluon_qsa_block_scores_gfx950",
     "launch_gluon_qsa_block_topk_select_gfx950",
+    "launch_gluon_qsa_block_topk_stream_gfx950",
     "launch_gluon_qsa_sparse_attention_gfx950",
 ]

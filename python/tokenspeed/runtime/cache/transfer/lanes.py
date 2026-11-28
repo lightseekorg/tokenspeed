@@ -45,6 +45,7 @@ import torch
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferGeometry,
     HostTransferWorkspace,
+    StagingBuffer,
     build_host_transfer_geometry,
     transfer_cache_blocks,
 )
@@ -395,7 +396,7 @@ def build_transfer_geometry(
         num_device_lcm_blocks=layout.num_lcm_blocks,
         num_device_buffers=len(layout.buffers),
     )
-    if io_backend == "kernel" and device.type != "npu":
+    if io_backend == "kernel":
         geometry = geometry.bind(device, non_blocking=False)
     return geometry
 
@@ -413,8 +414,15 @@ class HostTransferLane:
 
     __slots__ = ("metadata_done", "workspace", "_memory_saver_adapter")
 
-    def __init__(self, memory_saver_adapter: TorchMemorySaverAdapter) -> None:
+    def __init__(
+        self,
+        memory_saver_adapter: TorchMemorySaverAdapter,
+        *,
+        staging_buffer: StagingBuffer | None = None,
+    ) -> None:
         self.workspace = HostTransferWorkspace()
+        if staging_buffer is not None:
+            self.workspace.bind_staging_buffer(staging_buffer)
         self.metadata_done = None
         self._memory_saver_adapter = memory_saver_adapter
 

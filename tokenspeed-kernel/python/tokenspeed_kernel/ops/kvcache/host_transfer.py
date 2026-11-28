@@ -22,15 +22,21 @@
 
 from __future__ import annotations
 
+import os
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
     HOST_CACHE_TRANSFER_CHUNK_BYTES,
+    STAGED_TRANSFER_BYTE_CHUNK_BYTES,
+    STAGED_TRANSFER_WORD_CHUNK_BYTES,
+)
+from tokenspeed_kernel.ops.kvcache.triton import (
+    stage_cache_blocks as _stage_cache_blocks_triton,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
     transfer_cache_blocks as _transfer_cache_blocks_triton,
@@ -40,28 +46,87 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.platform import current_platform
 
+# Default per-stream HBM staging capacity for Ascend NPU staged SDMA transfers.
+# Sized to saturate PCIe/SDMA while staying O(1) with respect to context length.
+DEFAULT_NPU_STAGING_BYTES = int(
+    os.environ.get("TOKENSPEED_NPU_HOST_STAGING_BYTES", str(32 * 1024 * 1024))
+)
+
+
+class StagingBuffer:
+    """Reusable contiguous uint8 Device staging buffer shared by one stream.
+
+    The runtime can supply an ``allocator`` callback so the staging tensor lives
+    in a memory-saver discard region (for colocated RL sleep/wake) while
+    ``tokenspeed-kernel`` stays independent of runtime lifecycle adapters.
+    """
+
+    def __init__(
+        self,
+        *,
+        allocator: Callable[[int, torch.device], torch.Tensor] | None = None,
+        default_bytes: int = DEFAULT_NPU_STAGING_BYTES,
+    ) -> None:
+        if default_bytes <= 0:
+            raise ValueError("default_bytes must be positive")
+        self._allocator: Callable[[int, torch.device], torch.Tensor] | None = allocator
+        self._default_bytes: int = int(default_bytes)
+        self._buffer: torch.Tensor | None = None
+
+    def acquire(self, min_bytes: int, device: torch.device) -> torch.Tensor:
+        """Return a contiguous uint8 tensor on ``device`` of at least ``min_bytes``."""
+        if min_bytes <= 0:
+            raise ValueError("min_bytes must be positive")
+        needed = max(self._default_bytes, int(min_bytes))
+        if (
+            self._buffer is None
+            or self._buffer.device != device
+            or self._buffer.numel() < needed
+        ):
+            if self._allocator is not None:
+                buffer = self._allocator(needed, device)
+            else:
+                buffer = torch.empty(needed, dtype=torch.uint8, device=device)
+            if (
+                buffer.device != device
+                or buffer.dtype != torch.uint8
+                or not buffer.is_contiguous()
+                or buffer.numel() < needed
+            ):
+                raise ValueError(
+                    "staging allocator must return a contiguous uint8 tensor on "
+                    f"{device} with at least {needed} bytes"
+                )
+            self._buffer = buffer
+        return self._buffer
+
 
 @dataclass(frozen=True, slots=True)
 class HostTransferMode:
     """Resolved transport and explicitly selected completion protocol.
 
     Attributes:
-        backend: Transport used for this buffer binding.
+        backend: Transport used for this buffer binding: ``"triton"`` for
+            mapped-Host GPU kernels, ``"staged_dma"`` for NPU HBM-staged
+            Triton D2D gather/scatter + batched SDMA, or ``"dma"`` for direct
+            DMA range copies.
         layer_ready: Whether H2D publishes per-layer ready flags. Currently
-            unsupported by DMA, which uses completion events instead.
+            supported only by NVIDIA mapped-Host Triton transfers; other
+            backends use completion events instead.
     """
 
-    backend: Literal["triton", "dma"]
+    backend: Literal["triton", "staged_dma", "dma"]
     layer_ready: bool
 
     def __post_init__(self) -> None:
-        # DMA currently publishes completion events, not layer-ready flags.
-        if self.backend == "dma" and self.layer_ready:
-            raise ValueError("DMA does not currently support layer_ready=True")
+        if self.backend != "triton" and self.layer_ready:
+            raise ValueError(
+                f"{self.backend} does not currently support layer_ready=True"
+            )
 
     @property
     def uses_device_tables(self) -> bool:
-        return self.backend == "triton"
+        return self.backend in ("triton", "staged_dma")
 
 
 class _MappedHostUnavailable(RuntimeError):
@@ -79,10 +144,50 @@ GeometryRow = tuple[int, int, int, int, int, int, int, int]
 LayerSlice = tuple[int, int]
 
 
+def _has_pinned_host_allocator() -> bool:
+    return bool(
+        torch.cuda.is_available()
+        or (hasattr(torch, "npu") and torch.npu.is_available())
+    )
+
+
 def _pinned_host_int64(shape: tuple[int, ...]) -> torch.Tensor:
-    if torch.cuda.is_available():
+    if _has_pinned_host_allocator():
         return torch.empty(shape, dtype=torch.int64, pin_memory=True)
     return torch.empty(shape, dtype=torch.int64, device="cpu")
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedGroupSlice:
+    """Merged contiguous Host spans for one cache group in a geometry slice."""
+
+    group_index: int
+    span_base: int
+    staged_block_bytes: int
+    spans: tuple[tuple[int, int], ...]
+    max_word_chunks: int
+    max_byte_chunks: int
+    word_aligned_geometry: bool
+    buffer_indices: tuple[int, ...]
+    packing: int
+    host_block_bytes: int
+
+
+def _merge_host_spans(
+    intervals: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    ordered = sorted(intervals)
+    merged: list[tuple[int, int]] = []
+    cur_start, cur_end = ordered[0]
+    for start, end in ordered[1:]:
+        if start <= cur_end:
+            if end > cur_end:
+                cur_end = end
+        else:
+            merged.append((cur_start, cur_end - cur_start))
+            cur_start, cur_end = start, end
+    merged.append((cur_start, cur_end - cur_start))
+    return tuple(merged)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +208,101 @@ class HostTransferGeometry:
     num_device_lcm_blocks: int
     row_work: tuple[tuple[int, int], ...]
     device_layer_slices: torch.Tensor | None
+    _staged_slice_cache: dict[tuple[int, int], tuple[_StagedGroupSlice, ...]] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+        hash=False,
+    )
+
+    def staged_group_slices(
+        self, geometry_offset: int, num_geometry_rows: int
+    ) -> tuple[_StagedGroupSlice, ...]:
+        """Return cached per-group merged Host spans for a geometry slice."""
+        key = (int(geometry_offset), int(num_geometry_rows))
+        cached = self._staged_slice_cache.get(key)
+        if cached is not None:
+            return cached
+        if num_geometry_rows <= 0:
+            self._staged_slice_cache[key] = ()
+            return ()
+        rows = self.host_rows[
+            geometry_offset : geometry_offset + num_geometry_rows
+        ].tolist()
+        grouped: dict[int, list[tuple[int, int, int, int, int, int, int]]] = {}
+        for row in rows:
+            group_index = int(row[0])
+            device_buffer_index = int(row[1])
+            device_zero = int(row[2])
+            device_stride = int(row[3])
+            host_block_bytes = int(row[4])
+            host_field_offset = int(row[5])
+            packing = int(row[6])
+            payload_bytes = int(row[7])
+            grouped.setdefault(group_index, []).append(
+                (
+                    device_buffer_index,
+                    device_zero,
+                    device_stride,
+                    host_field_offset,
+                    payload_bytes,
+                    packing,
+                    host_block_bytes,
+                )
+            )
+        slices: list[_StagedGroupSlice] = []
+        for group_index, entries in grouped.items():
+            spans = _merge_host_spans(
+                [
+                    (field_off, field_off + payload)
+                    for _, _, _, field_off, payload, _, _ in entries
+                ]
+            )
+            span_base = spans[0][0]
+            span_end = spans[-1][0] + spans[-1][1]
+            staged_block_bytes = span_end - span_base
+            max_word_chunks = max(
+                (payload + STAGED_TRANSFER_WORD_CHUNK_BYTES - 1)
+                // STAGED_TRANSFER_WORD_CHUNK_BYTES
+                for _, _, _, _, payload, _, _ in entries
+            )
+            max_byte_chunks = max(
+                (payload + STAGED_TRANSFER_BYTE_CHUNK_BYTES - 1)
+                // STAGED_TRANSFER_BYTE_CHUNK_BYTES
+                for _, _, _, _, payload, _, _ in entries
+            )
+            align_bits = staged_block_bytes
+            buffer_indices_seen: dict[int, None] = {}
+            for (
+                buf_idx,
+                dev_zero,
+                dev_stride,
+                field_off,
+                payload,
+                _,
+                _,
+            ) in entries:
+                buffer_indices_seen[buf_idx] = None
+                align_bits |= dev_zero | dev_stride | (field_off - span_base) | payload
+            packing = entries[0][5]
+            host_block_bytes = entries[0][6]
+            slices.append(
+                _StagedGroupSlice(
+                    group_index=group_index,
+                    span_base=span_base,
+                    staged_block_bytes=staged_block_bytes,
+                    spans=spans,
+                    max_word_chunks=max_word_chunks,
+                    max_byte_chunks=max_byte_chunks,
+                    word_aligned_geometry=(align_bits & 3) == 0,
+                    buffer_indices=tuple(buffer_indices_seen),
+                    packing=packing,
+                    host_block_bytes=host_block_bytes,
+                )
+            )
+        result = tuple(slices)
+        self._staged_slice_cache[key] = result
+        return result
 
     def __post_init__(self) -> None:
         if (self.device_rows is None) != (self.device_layer_slices is None):
@@ -349,6 +549,20 @@ class HostTransferWorkspace:
         self._num_layer_ready = 0
         self._backend_key = None
         self._mode: HostTransferMode | None = None
+        self._staging_buffer: StagingBuffer | None = None
+
+    def bind_staging_buffer(self, staging_buffer: StagingBuffer) -> None:
+        """Attach a shared stream-scoped staging buffer to this workspace."""
+        self._staging_buffer = staging_buffer
+
+    def staging_buffer(self) -> StagingBuffer:
+        """Return the attached stream-scoped staging buffer."""
+        if self._staging_buffer is None:
+            raise RuntimeError(
+                "staging_buffer must be bound via bind_staging_buffer() "
+                "before a staged DMA transfer"
+            )
+        return self._staging_buffer
 
     def prepare_backend(
         self,
@@ -371,10 +585,24 @@ class HostTransferWorkspace:
         if backend not in ("auto", "triton", "dma"):
             raise ValueError(f"unknown cache transfer backend {backend!r}")
         device = device_buffers[0].device
-        if backend == "dma" or device.type == "npu":
+        if backend == "dma":
+            return HostTransferMode("dma", layer_ready=False)
+        if device.type == "npu":
             if backend == "triton":
                 raise RuntimeError("mapped Host Triton transfer is unavailable on NPU")
-            return HostTransferMode("dma", layer_ready=False)
+            key = (
+                device,
+                tuple(buffer.data_ptr() for buffer in device_buffers),
+                host_buffer.data_ptr(),
+                "staged_dma",
+            )
+            if key != self._backend_key:
+                self._backend_key = key
+                self._mode = None
+            if self._mode is None:
+                self._address_table = self.bind_device_addresses(device_buffers)
+                self._mode = HostTransferMode("staged_dma", layer_ready=False)
+            return self._mode
         key = (
             device,
             tuple(buffer.data_ptr() for buffer in device_buffers),
@@ -421,6 +649,26 @@ class HostTransferWorkspace:
             raise ValueError(
                 "num_blocks must equal the number of rows loaded for this generation"
             )
+
+    def bind_device_addresses(
+        self,
+        device_buffers: Sequence[torch.Tensor],
+    ) -> torch.Tensor:
+        """Upload Device buffer base pointers without mapping Host memory."""
+        device = device_buffers[0].device
+        key = tuple(int(buffer.data_ptr()) for buffer in device_buffers) + (
+            int(device.index if device.index is not None else 0),
+        )
+        if self._address_table is None or self._address_key != key:
+            addresses = [int(buffer.data_ptr()) for buffer in device_buffers]
+            address_host = _pinned_host_int64((len(addresses),)).view(torch.uint64)
+            address_host.copy_(
+                torch.tensor(addresses, dtype=torch.uint64, device="cpu")
+            )
+            self._address_table = address_host.to(device, non_blocking=True)
+            self._address_host = address_host
+            self._address_key = key
+        return self._address_table
 
     def bind_addresses(
         self,
@@ -886,12 +1134,28 @@ def transfer_cache_blocks(
     device_module = torch.get_device_module(device_buffers[0].device)
     with device_module.stream(stream) if stream is not None else nullcontext():
         mode = workspace.prepare_backend(device_buffers, host_buffer, backend=backend)
-        if not mode.uses_device_tables:
+        if mode.backend == "dma":
             transfer_dma()
             return
         if geometry.device_rows is None:
             raise ValueError("geometry must be bound before a Triton block transfer")
         block_rows, group_offsets = workspace.committed_block_tables(num_blocks)
+        if mode.backend == "staged_dma":
+            _transfer_staged_dma(
+                direction,
+                device_buffers,
+                host_buffer,
+                geometry,
+                workspace,
+                block_rows,
+                stream,
+                num_blocks=num_blocks,
+                geometry_offset=geometry_offset,
+                num_geometry_rows=num_geometry_rows,
+                grid_cap=grid_cap,
+            )
+            _publish_dma_flags()
+            return
         triton_kwargs = {
             "geometry_offset": geometry_offset,
             "num_geometry_rows": num_geometry_rows,
@@ -919,6 +1183,227 @@ def transfer_cache_blocks(
             0 if direction == "d2h" else 1,
             **triton_kwargs,
         )
+
+
+def _ascend_stream_and_device(device: torch.device, stream) -> tuple[int, int]:
+    """Return ``(device_id, aclrtStream)`` after flushing torch_npu's task queue."""
+    device_module = torch.get_device_module(device)
+    active_stream = (
+        stream if stream is not None else device_module.current_stream(device)
+    )
+    device_id = int(
+        device.index if device.index is not None else device_module.current_device()
+    )
+    # Accessing ``.npu_stream`` drains torch_npu's host task queue before
+    # submitting directly to ``libascendcl``, preserving stream FIFO order.
+    return device_id, int(active_stream.npu_stream)
+
+
+def _copy_staging_host(
+    direction: Literal["d2h", "h2d"],
+    staging: torch.Tensor,
+    host_buffer: torch.Tensor,
+    staging_offsets: Sequence[int],
+    host_offsets: Sequence[int],
+    sizes: Sequence[int],
+    *,
+    stream,
+) -> None:
+    if not sizes:
+        return
+    if staging.device.type == "npu":
+        if not host_buffer.is_pinned():
+            raise ValueError("host_buffer must be pinned CPU memory for NPU ACL memcpy")
+        from tokenspeed_kernel.thirdparty.ascend.memcpy import (
+            ascend_memcpy_batch_async,
+        )
+
+        staging_base = int(staging.data_ptr())
+        host_base = int(host_buffer.data_ptr())
+        if direction == "d2h":
+            dst_addrs = [host_base + offset for offset in host_offsets]
+            src_addrs = [staging_base + offset for offset in staging_offsets]
+        else:
+            dst_addrs = [staging_base + offset for offset in staging_offsets]
+            src_addrs = [host_base + offset for offset in host_offsets]
+        device_id, stream_ptr = _ascend_stream_and_device(staging.device, stream)
+        ascend_memcpy_batch_async(
+            dst_addrs=dst_addrs,
+            src_addrs=src_addrs,
+            sizes=sizes,
+            direction=direction,
+            device_id=device_id,
+            stream_ptr=stream_ptr,
+        )
+        return
+
+    for staging_offset, host_offset, num_bytes in zip(
+        staging_offsets, host_offsets, sizes, strict=True
+    ):
+        staging_slice = staging[staging_offset : staging_offset + num_bytes]
+        host_slice = host_buffer[host_offset : host_offset + num_bytes]
+        if direction == "d2h":
+            host_slice.copy_(staging_slice, non_blocking=True)
+        else:
+            staging_slice.copy_(host_slice, non_blocking=True)
+
+
+def _transfer_staged_dma(
+    direction: Literal["d2h", "h2d"],
+    device_buffers: Sequence[torch.Tensor],
+    host_buffer: torch.Tensor,
+    geometry: HostTransferGeometry,
+    workspace: HostTransferWorkspace,
+    block_rows_device: torch.Tensor,
+    stream,
+    *,
+    num_blocks: int,
+    geometry_offset: int,
+    num_geometry_rows: int,
+    grid_cap: int | None,
+) -> None:
+    """Gather/scatter scattered Device fields via HBM staging and batched SDMA.
+
+    For each cache group referenced by ``(geometry_offset, num_geometry_rows)``,
+    fields are packed into the group's exact compact Host block layout inside a
+    fixed-size HBM staging buffer and moved between staging and Host in one
+    batched SDMA transfer per chunk. This collapses dozens of small per-layer /
+    per-field copies (such as 4 KB TLS metadata fields) into one contiguous
+    transfer per block while keeping HBM usage O(1) with respect to context
+    length.
+    """
+    device = device_buffers[0].device
+    if (
+        host_buffer.device.type != "cpu"
+        or host_buffer.dtype != torch.uint8
+        or not host_buffer.is_contiguous()
+        or (device.type != "cpu" and not host_buffer.is_pinned())
+    ):
+        raise ValueError("host_buffer must be contiguous pinned CPU uint8")
+    group_slices = geometry.staged_group_slices(geometry_offset, num_geometry_rows)
+    if not group_slices:
+        return
+    group_offsets = workspace.block_group_offsets_host().tolist()
+    active_slices = [
+        group_slice
+        for group_slice in group_slices
+        if int(group_offsets[group_slice.group_index + 1])
+        > int(group_offsets[group_slice.group_index])
+    ]
+    if not active_slices:
+        return
+
+    host_block_rows = workspace.host_block_rows(num_blocks)
+    max_block_bytes = max(
+        group_slice.staged_block_bytes for group_slice in active_slices
+    )
+    staging = workspace.staging_buffer().acquire(max_block_bytes, device)
+    staging_bytes = staging.numel()
+    stage_direction = 0 if direction == "d2h" else 1
+    host_lcm_bytes = geometry.host_lcm_block_bytes
+    host_numel = host_buffer.numel()
+
+    for group_slice in active_slices:
+        group_start = int(group_offsets[group_slice.group_index])
+        group_end = int(group_offsets[group_slice.group_index + 1])
+        group_count = group_end - group_start
+        host_ids = host_block_rows[group_start:group_end, 1].tolist()
+        chunk_capacity = max(1, staging_bytes // group_slice.staged_block_bytes)
+        span_base = group_slice.span_base
+        spans = group_slice.spans
+        packing = group_slice.packing
+        host_block_bytes = group_slice.host_block_bytes
+        use_words = (
+            group_slice.word_aligned_geometry
+            and (staging.data_ptr() & 3) == 0
+            and all(
+                (device_buffers[buf_idx].data_ptr() & 3) == 0
+                for buf_idx in group_slice.buffer_indices
+            )
+        )
+        max_chunks = (
+            group_slice.max_word_chunks if use_words else group_slice.max_byte_chunks
+        )
+
+        for local_start in range(0, group_count, chunk_capacity):
+            local_end = min(local_start + chunk_capacity, group_count)
+            chunk_blocks = local_end - local_start
+            staging_offsets: list[int] = []
+            host_offsets: list[int] = []
+            sizes: list[int] = []
+            for local_index in range(chunk_blocks):
+                host_zero_based = int(host_ids[local_start + local_index]) - 1
+                host_parent, host_child = divmod(host_zero_based, packing)
+                host_block_offset = (
+                    host_parent * host_lcm_bytes + host_child * host_block_bytes
+                )
+                staging_block_offset = local_index * group_slice.staged_block_bytes
+                for span_offset, span_bytes in spans:
+                    target_host_offset = host_block_offset + span_offset
+                    if target_host_offset + span_bytes > host_numel:
+                        raise IndexError(
+                            "staged cache transfer range lies outside Host buffer"
+                        )
+                    staging_offsets.append(
+                        staging_block_offset + (span_offset - span_base)
+                    )
+                    host_offsets.append(target_host_offset)
+                    sizes.append(span_bytes)
+
+            if direction == "d2h":
+                _stage_cache_blocks_triton(
+                    workspace._address_table,
+                    geometry.device_rows,
+                    block_rows_device,
+                    staging,
+                    stage_direction,
+                    geometry_offset=geometry_offset,
+                    num_geometry_rows=num_geometry_rows,
+                    target_group=group_slice.group_index,
+                    chunk_start=group_start + local_start,
+                    chunk_blocks=chunk_blocks,
+                    span_base=span_base,
+                    staged_block_bytes=group_slice.staged_block_bytes,
+                    work_items=chunk_blocks * max_chunks,
+                    use_words=use_words,
+                    grid_cap=grid_cap,
+                )
+                _copy_staging_host(
+                    direction,
+                    staging,
+                    host_buffer,
+                    staging_offsets,
+                    host_offsets,
+                    sizes,
+                    stream=stream,
+                )
+            else:
+                _copy_staging_host(
+                    direction,
+                    staging,
+                    host_buffer,
+                    staging_offsets,
+                    host_offsets,
+                    sizes,
+                    stream=stream,
+                )
+                _stage_cache_blocks_triton(
+                    workspace._address_table,
+                    geometry.device_rows,
+                    block_rows_device,
+                    staging,
+                    stage_direction,
+                    geometry_offset=geometry_offset,
+                    num_geometry_rows=num_geometry_rows,
+                    target_group=group_slice.group_index,
+                    chunk_start=group_start + local_start,
+                    chunk_blocks=chunk_blocks,
+                    span_base=span_base,
+                    staged_block_bytes=group_slice.staged_block_bytes,
+                    work_items=chunk_blocks * max_chunks,
+                    use_words=use_words,
+                    grid_cap=grid_cap,
+                )
 
 
 def _validate_ranges(
@@ -961,7 +1446,44 @@ def _transfer_dma(
     device_buffers: Sequence[torch.Tensor],
     host_buffer: torch.Tensor,
     ranges: Sequence[tuple[int, int, int, int]],
+    *,
+    stream=None,
 ) -> None:
+    if device_buffers and device_buffers[0].device.type == "npu":
+        if not host_buffer.is_pinned():
+            raise ValueError("host_buffer must be pinned CPU memory for NPU ACL memcpy")
+        from tokenspeed_kernel.thirdparty.ascend.memcpy import (
+            ascend_memcpy_batch_async,
+        )
+
+        device_bases = tuple(int(buffer.data_ptr()) for buffer in device_buffers)
+        host_base = int(host_buffer.data_ptr())
+        if direction == "d2h":
+            dst_addrs = [host_base + host_offset for _, _, host_offset, _ in ranges]
+            src_addrs = [
+                device_bases[buf_idx] + dev_offset
+                for buf_idx, dev_offset, _, _ in ranges
+            ]
+        else:
+            dst_addrs = [
+                device_bases[buf_idx] + dev_offset
+                for buf_idx, dev_offset, _, _ in ranges
+            ]
+            src_addrs = [host_base + host_offset for _, _, host_offset, _ in ranges]
+        sizes = [num_bytes for _, _, _, num_bytes in ranges]
+        device_id, stream_ptr = _ascend_stream_and_device(
+            device_buffers[0].device, stream
+        )
+        ascend_memcpy_batch_async(
+            dst_addrs=dst_addrs,
+            src_addrs=src_addrs,
+            sizes=sizes,
+            direction=direction,
+            device_id=device_id,
+            stream_ptr=stream_ptr,
+        )
+        return
+
     byte_buffers = tuple(
         buffer.view(torch.uint8).reshape(-1) for buffer in device_buffers
     )
@@ -1006,7 +1528,7 @@ def _transfer_cache_ranges(
         return
     device_module = torch.get_device_module(device_buffers[0].device)
     with device_module.stream(stream):
-        _transfer_dma(direction, device_buffers, host_buffer, ranges)
+        _transfer_dma(direction, device_buffers, host_buffer, ranges, stream=stream)
 
 
 def wait_layer_ready(flags: torch.Tensor, layer_index: int) -> None:

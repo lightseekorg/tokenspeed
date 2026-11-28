@@ -70,6 +70,7 @@ class TestQwen3OmniConfig:
         hf_config = SimpleNamespace(architectures=["Qwen3ASRForConditionalGeneration"])
         server_args = SimpleNamespace(
             mapping=None,
+            download_dir=None,
             language_model_only=False,
             disaggregation_mode="encode",
             speculative_algorithm=None,

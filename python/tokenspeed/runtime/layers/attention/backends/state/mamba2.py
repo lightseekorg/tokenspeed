@@ -44,6 +44,8 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import Mamba2Config
 from tokenspeed.runtime.utils.tensor import upload_packed
 
 if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
+
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
@@ -264,6 +266,7 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         seq_len: int,
         lower_bound: float | None,
         replay_payload: torch.Tensor | None,
+        output_norm: KdaOutputNorm | None,
     ) -> torch.Tensor:
         """SSD steps through each request's verify window; see the base seam.
 
@@ -273,6 +276,8 @@ class Mamba2AttnBackend(CapacityPrefillBackend):
         """
         if replay_payload is not None:
             raise ValueError("the Mamba2 verify scan fills no replay payload")
+        if output_norm is not None:
+            raise ValueError("Mamba2 layers have no gated output norm")
         D = _require_mamba2_inputs(
             D, b, g_raw, f_a_out, f_b_weight, beta_raw, lower_bound
         )

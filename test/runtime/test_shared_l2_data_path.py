@@ -720,10 +720,13 @@ def test_a_load_is_refused_during_graph_capture(ranks, monkeypatch):
 
 def test_a_pool_rank_runs_no_other_host_cache_op(ranks):
     reader = ranks()
-    # A scheduler with a local Host L2 plans the write-back of a prompt's
-    # pages in the plan after the one that computes them.
+    # An LRU scheduler with a local Host L2 plans the write-through copy of a
+    # prompt's pages in the plan after the one that computes them.
     scheduler = ts.Scheduler(
         make_config(
+            prefix_cache_evict_policy="lru",
+            prefix_cache_gds_prefill_cost=None,
+            prefix_cache_gds_disk_block_costs=(),
             num_device_pages=32,
             max_scheduled_tokens=64,
             max_batch_size=8,

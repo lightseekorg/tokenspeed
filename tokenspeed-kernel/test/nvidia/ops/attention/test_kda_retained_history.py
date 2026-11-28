@@ -173,7 +173,9 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
             materialized = _reconstruct(
                 base_before[1], u[0], key[0], decay[0], old_length
             )
-            old_length = 0
+        # The records the verify reads: none of a count past capacity - width,
+        # which the prepare folds into the page.
+        start = 0 if consolidated else old_length
         # Serving readies the history before every verify round.
         prepare_history(state, history, indices, starts, draft_token_num=width)
         verify_kernel(
@@ -194,6 +196,7 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
             record_metadata=None,
             record_stamps=None,
         )
+        # Only the commit writes the count.
         assert int(length[0, 0]) == old_length
         if consolidated:
             if state_dtype == torch.bfloat16:
@@ -229,19 +232,19 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
         )
         torch.testing.assert_close(out[0].float(), expected_out, atol=2e-3, rtol=5e-3)
         torch.testing.assert_close(
-            u[0, :, old_length : old_length + width],
+            u[0, :, start : start + width],
             expected_u.transpose(0, 1),
             atol=2e-6,
             rtol=2e-5,
         )
         torch.testing.assert_close(
-            key[0, :, old_length : old_length + width],
+            key[0, :, start : start + width],
             expected_k.transpose(0, 1),
             atol=2e-6,
             rtol=2e-5,
         )
         torch.testing.assert_close(
-            decay[0, :, old_length : old_length + width],
+            decay[0, :, start : start + width],
             expected_decay.transpose(0, 1),
             atol=2e-6,
             rtol=2e-5,
@@ -255,13 +258,13 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
             torch.tensor([accepted], device="cuda", dtype=torch.int32),
             width=width,
         )
-        assert int(length[0, 0]) == old_length + accepted
+        assert int(length[0, 0]) == start + accepted
         torch.testing.assert_close(state, base_before, atol=0, rtol=0)
         for actual, before in zip((u, key, decay), records_before):
             torch.testing.assert_close(actual, before, atol=0, rtol=0)
         current = expected_states[accepted - 1] if accepted else current
         torch.testing.assert_close(
-            _reconstruct(state[1], u[0], key[0], decay[0], old_length + accepted),
+            _reconstruct(state[1], u[0], key[0], decay[0], start + accepted),
             current,
             atol=2e-6,
             rtol=2e-5,
@@ -272,10 +275,9 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
 def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
     """Catch source mutation, writes by empty/null rows, and stale GPU metadata."""
     from tokenspeed_kernel.ops.attention.kda._triton.retained import (
-        retained_batched_consolidate_kernel,
         retained_batched_conv_kernel,
+        retained_batched_prepare_kernel,
         retained_batched_publish_kernel,
-        retained_batched_reset_kernel,
     )
     from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
         _kda_recoverssm_verify_kernel,
@@ -401,8 +403,7 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
             graph.replay()
         else:
             with assert_no_triton_compile(
-                retained_batched_consolidate_kernel,
-                retained_batched_reset_kernel,
+                retained_batched_prepare_kernel,
                 retained_batched_conv_kernel,
                 retained_batched_publish_kernel,
                 _kda_recoverssm_verify_kernel.fn,

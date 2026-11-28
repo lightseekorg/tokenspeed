@@ -1627,14 +1627,17 @@ def _attention_prefill(solution: str | None = None) -> object:
 
 
 def _attention_extend(
-    solution: str | None = None, dtype: torch.dtype = torch.bfloat16
+    solution: str | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 64,
+    page: int = 64,
 ) -> object:
-    q = torch.empty((4, 16, 64), dtype=dtype)
+    q = torch.empty((4, 16, head_dim), dtype=dtype)
     cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
     cu_seqlens_kv = torch.tensor([0, 64, 192], dtype=torch.int32)
-    k_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
-    v_cache = torch.empty((8, 64, 8, 64), dtype=dtype)
-    page_table = torch.empty((2, 4), dtype=torch.int32)
+    k_cache = torch.empty((8 * 64 // page, page, 8, head_dim), dtype=dtype)
+    v_cache = torch.empty((8 * 64 // page, page, 8, head_dim), dtype=dtype)
+    page_table = torch.empty((2, 4 * 64 // page), dtype=torch.int32)
     cache_seqlens = torch.tensor([64, 128], dtype=torch.int32)
     return _attention_mha_pkg.mha_extend_with_kvcache(
         q,
@@ -4192,6 +4195,7 @@ def test_qsa_indexer_selects_gluon_on_gfx950(
         for name in (
             "gluon_qsa_block_scores_gfx950",
             "gluon_qsa_block_topk_select_gfx950",
+            "gluon_qsa_block_topk_stream_gfx950",
         )
     ]
     if None in gluon_specs:
@@ -4229,11 +4233,10 @@ def test_qsa_indexer_selects_gluon_on_gfx950(
         return scores, topk, stream
 
     assert all(spec.priority == Priority.SPECIALIZED for spec in gluon_specs)
-    # Streaming top-k has only the portable implementation.
     assert select(mi350_platform) == (
         "gluon_qsa_block_scores_gfx950",
         "gluon_qsa_block_topk_select_gfx950",
-        "triton_qsa_block_topk_stream",
+        "gluon_qsa_block_topk_stream_gfx950",
     )
     assert select(mi450_platform) == (
         "triton_qsa_block_scores",
@@ -6196,6 +6199,29 @@ _CASES = [
         "mha_extend_with_kvcache",
         "gluon_mha_extend_gfx950",
         _attention_extend,
+    ),
+    # Head dim 256 (Qwen3.8 full attention) takes the Gluon extend on BF16
+    # and FP8 caches; a 16-token page has no Gluon extend and stays on Triton.
+    *(
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            "mha_extend_with_kvcache",
+            "gluon_mha_extend_gfx950",
+            partial(_attention_extend, dtype=dtype, head_dim=256),
+            id_suffix=f"hd256-{name}",
+        )
+        for name, dtype in (("bf16", torch.bfloat16), ("fp8", torch.float8_e4m3fn))
+    ),
+    _case(
+        _is_cdna4,
+        "cdna4",
+        "attention",
+        "mha_extend_with_kvcache",
+        "triton_mha_extend_with_kvcache",
+        partial(_attention_extend, head_dim=256, page=16),
+        id_suffix="hd256-page16",
     ),
     _case(
         _is_cdna4,

@@ -428,6 +428,57 @@ TEST(SharedPrefixPublicationTest, ReceiptMetadataRemainsBoundedAfterHostEviction
     EXPECT_EQ(cache.storage.NumPublishedKeys(), 256u);
 }
 
+TEST(SharedPrefixPublicationTest, SwaWithSinkRequiresSinkAndWindowBlocksInSharedPrefixKeys) {
+    // Prefix granularity = 4, SWA block granularity = 2 (2 SWA blocks/page),
+    // sliding_window = 4 (last 2 SWA blocks), sink_tokens = 2 (logical block 0).
+    // For a 12-token prompt (3 pages = 6 SWA blocks: 0..5):
+    //   - Full History (group 0): pages 0, 1, 2 (3 keys)
+    //   - SWA (group 1): sink block 0 + window blocks 4, 5 (3 keys; middle blocks 1..3 excluded)
+    const std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 4,
+         .sink_tokens = 2,
+         .cache_blocks_per_lcm_block = 2,
+         .block_granularity = 2},
+    };
+    QueryCache cache(4, specs, 32);
+    const QueryPrompt prompt(12, 4);
+    const auto prefix = prompt.Prefix(12, false);
+    const auto query = cache.coordinator.Storage().SharedPrefixKeys(prefix, 256);
+    ASSERT_EQ(query.max_tokens, 12);
+
+    const CacheKey sink_key{.group_id = 1, .content_hash = ContentHash{prompt.hashes[0]}, .page_offset = 0};
+    const CacheKey mid_key{.group_id = 1, .content_hash = ContentHash{prompt.hashes[1]}, .page_offset = 0};
+    const CacheKey win_key0{.group_id = 1, .content_hash = ContentHash{prompt.hashes[2]}, .page_offset = 0};
+    const CacheKey win_key1{.group_id = 1, .content_hash = ContentHash{prompt.hashes[2]}, .page_offset = 1};
+    EXPECT_TRUE(Has(query.keys, sink_key));
+    EXPECT_FALSE(Has(query.keys, mid_key));
+    EXPECT_TRUE(Has(query.keys, win_key0));
+    EXPECT_TRUE(Has(query.keys, win_key1));
+    EXPECT_EQ(query.keys.size(), 6u);
+
+    // L3 publication check (`SharedPrefixPublication`) must not report all
+    // dependencies published until the sink block is also published.
+    std::vector<CacheKey> non_sink;
+    for (const auto& key : query.keys) {
+        if (!(key == sink_key)) non_sink.push_back(key);
+    }
+    cache.Warm(query.keys);
+    cache.storage.QueueBackups(non_sink);
+    cache.storage.StartBackups();
+    const auto put1 = std::get<StoragePutOperation>(cache.storage.TakeCommands()[0]);
+    cache.storage.Complete({put1.op_id, std::vector<std::uint8_t>(non_sink.size(), 1), true,
+                            std::vector<std::uint8_t>(non_sink.size(), 0)});
+    EXPECT_FALSE(std::ranges::all_of(query.keys, [&](const auto& k) { return cache.storage.WasPublished(k); }));
+
+    cache.storage.QueueBackups(std::span{&sink_key, 1});
+    cache.storage.StartBackups();
+    const auto put2 = std::get<StoragePutOperation>(cache.storage.TakeCommands()[0]);
+    cache.storage.Complete({put2.op_id, {1}, true, {0}});
+    EXPECT_TRUE(std::ranges::all_of(query.keys, [&](const auto& k) { return cache.storage.WasPublished(k); }));
+}
+
 TEST(StorageQueryTest, ReservationRetriesClearKeysTailAndWarmReferences) {
     QueryCache cache(4, FullAndStates(4, 4, 1), 64);
     QueryPrompt prompt(14, 4);

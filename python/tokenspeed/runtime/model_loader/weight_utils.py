@@ -25,6 +25,7 @@ import ctypes
 import fnmatch
 import glob
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import mmap
@@ -35,6 +36,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Generator, Iterable
+from contextlib import ExitStack, contextmanager
 from typing import Any
 
 import filelock
@@ -44,6 +46,7 @@ import psutil
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from packaging.version import InvalidVersion, Version
 from safetensors import safe_open
 from tokenspeed_kernel.platform import current_platform
 from tqdm.auto import tqdm
@@ -113,9 +116,18 @@ def get_lock(
 
 def _json_folder(model_config: ModelConfig, load_config: LoadConfig) -> str:
     """Return the checkpoint folder holding its JSON files, fetched if remote."""
+    from tokenspeed.runtime.model_loader.object_store import (
+        is_object_store_uri,
+        sync_object_store_metadata,
+    )
+
     model_name_or_path = model_config.model_path
     if os.path.isdir(model_name_or_path):
         return model_name_or_path
+    if is_object_store_uri(model_name_or_path):
+        return sync_object_store_metadata(
+            model_name_or_path, cache_dir=load_config.download_dir
+        )
 
     def download_config_files() -> str:
         return snapshot_download(
@@ -407,15 +419,25 @@ def filter_safetensors_files_by_weight_names(
     with open(index_file_name) as f:
         weight_map = json.load(f)["weight_map"]
     needed_files = set()
+    needed_basenames = set()
     for weight_name, shard_name in weight_map.items():
         if weight_name_filter(weight_name):
             needed_files.add(os.path.join(hf_folder, shard_name))
+            needed_basenames.add(shard_name)
     indexed_files = {
         os.path.join(hf_folder, shard_name) for shard_name in weight_map.values()
     }
-    filtered = [
-        f for f in hf_weights_files if f in needed_files or f not in indexed_files
-    ]
+    indexed_basenames = set(weight_map.values())
+    from tokenspeed.runtime.model_loader.object_store import is_object_store_uri
+
+    filtered = []
+    for f in hf_weights_files:
+        if is_object_store_uri(f):
+            base = f.rsplit("/", 1)[-1]
+            if base in needed_basenames or base not in indexed_basenames:
+                filtered.append(f)
+        elif f in needed_files or f not in indexed_files:
+            filtered.append(f)
     if not filtered:
         logger.warning(
             f"Weight-name shard filter matched nothing in {index_file_name}; "
@@ -966,6 +988,288 @@ def _instanttensor_tensors(
         )
 
 
+_MIN_RUNAI_STREAMER_VERSION = "0.16.1"
+
+
+def _cuda_distributed_backend(backend: str) -> str:
+    """Return the backend serving CUDA from a torch.distributed backend string.
+
+    Handles both single-backend strings (``"nccl"``) and composite strings
+    such as ``"cpu:gloo,cuda:nccl"``.
+    """
+    if ":" not in backend:
+        return backend.strip().lower()
+    for entry in backend.split(","):
+        device, sep, name = entry.partition(":")
+        if sep and device.strip().lower() == "cuda":
+            return name.strip().lower()
+    return ""
+
+
+def _require_runai_streamer_version(runai_mod: Any) -> None:
+    """Verify the installed ``runai-model-streamer`` meets the minimum version."""
+    version_str = getattr(runai_mod, "__version__", None)
+    if version_str is None:
+        try:
+            version_str = importlib.metadata.version("runai-model-streamer")
+        except importlib.metadata.PackageNotFoundError as e:
+            raise ImportError(
+                f"runai_streamer requires runai-model-streamer>="
+                f"{_MIN_RUNAI_STREAMER_VERSION} with package version metadata."
+            ) from e
+    try:
+        parsed = Version(str(version_str))
+    except InvalidVersion as e:
+        raise ImportError(
+            f"runai_streamer requires runai-model-streamer>="
+            f"{_MIN_RUNAI_STREAMER_VERSION}; unable to parse installed version "
+            f"{version_str!r}."
+        ) from e
+    if parsed < Version(_MIN_RUNAI_STREAMER_VERSION):
+        raise ImportError(
+            f"runai_streamer requires runai-model-streamer>="
+            f"{_MIN_RUNAI_STREAMER_VERSION}, found {version_str!r}."
+        )
+
+
+def runai_streamer_weights_iterator(
+    hf_weights_files: list[str],
+    *,
+    distributed: bool,
+    distributed_scope: str | None,
+    weight_name_filter: Callable[[str], bool] | None,
+    index_weight_map: dict[str, str] | None,
+    concurrency: int | None = None,
+    memory_limit: int | None = None,
+    remote_file_factory: Callable[[str], Any] | None = None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Stream safetensors weights via ``runai_model_streamer.SafetensorsStreamer``.
+
+    Requires ``runai-model-streamer>=0.16.1`` (for explicit ``device`` and
+    ``is_distributed`` support on ``stream_files``). Supports local file paths
+    as well as ``gs://`` and ``s3://`` object-store URIs. When
+    ``weight_name_filter`` rejects some tensors in a remote shard (for example,
+    a large host-resident embedding table sharing a shard with small projection
+    weights), accepted tensors from that mixed shard are fetched directly via
+    byte-range reads so rejected tables are never streamed into memory.
+
+    When ``distributed`` is True, ``distributed_scope`` must be ``"local"``
+    (``RUNAI_STREAMER_DIST_GLOBAL=0``, intra-node broadcast) or ``"global"``
+    (``RUNAI_STREAMER_DIST_GLOBAL=1``, cross-host broadcast across the default
+    NCCL process group). Distributed streaming requires CUDA and a multi-rank
+    process group with NCCL serving CUDA, and sets ``RUNAI_STREAMER_DIST=1``
+    alongside ``device="cuda:<current_device>"`` so Run:ai does not fall back to
+    non-distributed streaming on composite ``torch.distributed`` backends (note
+    ``runai-model-streamer`` 0.16.1 still retains an internal free-VRAM fallback
+    when available CUDA memory is below ``2 * max_chunk``). In both distributed
+    and non-distributed modes, every yielded tensor is copied out of Run:ai's
+    reusable staging buffers to standalone CPU storage so callers that stash
+    tensors across iterations never alias overwritten memory or pin streamer
+    buffers.
+    """
+    if distributed:
+        if distributed_scope not in ("local", "global"):
+            raise ValueError(
+                "runai_streamer distributed=True requires explicit "
+                "distributed_scope ('local' or 'global'), "
+                f"got {distributed_scope!r}"
+            )
+    elif distributed_scope is not None:
+        raise ValueError(
+            "runai_streamer distributed_scope requires distributed=True, "
+            f"got {distributed_scope!r}"
+        )
+
+    try:
+        import runai_model_streamer
+        from runai_model_streamer import SafetensorsStreamer
+    except ImportError as e:
+        raise ImportError(
+            f"runai_streamer load format requires runai-model-streamer>="
+            f"{_MIN_RUNAI_STREAMER_VERSION}; install runai-model-streamer "
+            "(and runai-model-streamer-gcs or runai-model-streamer-s3 for "
+            "object-store URIs)."
+        ) from e
+    _require_runai_streamer_version(runai_model_streamer)
+
+    from tokenspeed.runtime.model_loader.object_store import (
+        RemoteSafetensorsFile,
+        is_object_store_uri,
+    )
+
+    stream_files: list[str] = []
+    range_read_shards: list[str] = []
+
+    if weight_name_filter is not None and index_weight_map is not None:
+        by_shard: dict[str, list[str]] = {}
+        for weight_name, shard_name in index_weight_map.items():
+            by_shard.setdefault(shard_name, []).append(weight_name)
+        for path in hf_weights_files:
+            if is_object_store_uri(path):
+                shard_name = path.rsplit("/", 1)[-1]
+                shard_weights = by_shard.get(shard_name)
+                if shard_weights:
+                    accepted = [w for w in shard_weights if weight_name_filter(w)]
+                    if len(accepted) < len(shard_weights):
+                        if accepted:
+                            range_read_shards.append(path)
+                        continue
+            stream_files.append(path)
+    else:
+        stream_files = list(hf_weights_files)
+
+    env_overrides: dict[str, str] = {}
+    if concurrency is not None:
+        env_overrides["RUNAI_STREAMER_CONCURRENCY"] = str(concurrency)
+    if memory_limit is not None:
+        env_overrides["RUNAI_STREAMER_MEMORY_LIMIT"] = str(memory_limit)
+
+    stream_device = "cpu"
+    if distributed:
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "runai_streamer distributed=True requires CUDA; refusing to "
+                "silently downgrade to non-distributed streaming."
+            )
+        if (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() <= 1
+        ):
+            raise RuntimeError(
+                "runai_streamer distributed=True requires an initialized "
+                "multi-rank torch.distributed process group; refusing to "
+                "silently downgrade to non-distributed streaming."
+            )
+        backend = torch.distributed.get_backend()
+        if _cuda_distributed_backend(backend) != "nccl":
+            raise RuntimeError(
+                "runai_streamer distributed=True requires an NCCL CUDA backend "
+                f"in torch.distributed, got {backend!r}."
+            )
+        stream_device = f"cuda:{torch.cuda.current_device()}"
+        env_overrides["RUNAI_STREAMER_DIST"] = "1"
+        env_overrides["RUNAI_STREAMER_DIST_GLOBAL"] = (
+            "1" if distributed_scope == "global" else "0"
+        )
+
+    if stream_files:
+        try:
+            with ExitStack() as stack:
+                # Run:ai reads these env vars when opening the streamer and
+                # scheduling files; restore process-wide os.environ before the
+                # first yield so concurrent threads do not observe mutations.
+                saved_env: dict[str, str | None] = {
+                    k: os.environ.get(k) for k in env_overrides
+                }
+                try:
+                    os.environ.update(env_overrides)
+                    streamer = stack.enter_context(SafetensorsStreamer())
+                    streamer.stream_files(
+                        stream_files,
+                        device=stream_device,
+                        is_distributed=distributed,
+                    )
+                finally:
+                    for k, prev in saved_env.items():
+                        if prev is None:
+                            os.environ.pop(k, None)
+                        else:
+                            os.environ[k] = prev
+                for name, tensor in streamer.get_tensors():
+                    if weight_name_filter is not None and not weight_name_filter(name):
+                        continue
+                    # Run:ai yields views into reusable staging buffers (bounded
+                    # CPU chunks under memory_limit, or CUDA receive buffers
+                    # under distributed broadcast) that are overwritten as
+                    # iteration advances. Copy out to standalone CPU storage so
+                    # callers that stash tensors across iterations never alias
+                    # overwritten memory and no CUDA staging buffer stays pinned.
+                    tensor = (
+                        tensor.detach().cpu()
+                        if tensor.is_cuda
+                        else tensor.detach().clone()
+                    )
+                    yield name, tensor
+        finally:
+            if distributed and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    open_remote_file = (
+        RemoteSafetensorsFile if remote_file_factory is None else remote_file_factory
+    )
+    for path in range_read_shards:
+        remote_file = open_remote_file(path)
+        # Derive accepted tensor names from the shard header rather than the
+        # index alone so tensors omitted from model.safetensors.index.json are
+        # never dropped relative to full-shard streaming or local loading.
+        accepted_names = [
+            name
+            for name in remote_file.keys()
+            if weight_name_filter is None or weight_name_filter(name)
+        ]
+        logger.info(
+            f"Reading {len(accepted_names)} filtered tensor(s) from {path} "
+            "via byte-range requests instead of full-shard streaming."
+        )
+        for name in accepted_names:
+            yield name, remote_file.get_tensor(name)
+
+
+@contextmanager
+def open_safetensors_slice(
+    checkpoint_dir: str,
+    shard_name: str,
+    tensor_name: str,
+    *,
+    remote_file_cache: dict[str, Any] | None = None,
+):
+    """Yield a lazy CPU slice handle for ``tensor_name`` in ``shard_name``.
+
+    Uses local ``safetensors.safe_open`` when the shard exists on disk; falls back
+    to byte-range object-store reads when ``checkpoint_dir`` is an object-store
+    URI or a synced metadata directory carrying its source URI. When
+    ``remote_file_cache`` is supplied, open ``RemoteSafetensorsFile`` handles are
+    reused by shard URI so repeated slice reads from the same shard download its
+    header only once.
+    """
+    from tokenspeed.runtime.model_loader.object_store import (
+        RemoteSafetensorsFile,
+        is_object_store_uri,
+        join_object_store_uri,
+        read_source_uri,
+    )
+
+    def _get_remote_file(remote_uri: str) -> RemoteSafetensorsFile:
+        if remote_file_cache is not None:
+            cached = remote_file_cache.get(remote_uri)
+            if cached is None:
+                cached = RemoteSafetensorsFile(remote_uri)
+                remote_file_cache[remote_uri] = cached
+            return cached
+        return RemoteSafetensorsFile(remote_uri)
+
+    if is_object_store_uri(checkpoint_dir):
+        remote_uri = join_object_store_uri(checkpoint_dir, shard_name)
+        yield _get_remote_file(remote_uri).get_slice(tensor_name)
+        return
+
+    local_shard = os.path.join(checkpoint_dir, shard_name)
+    if os.path.isfile(local_shard):
+        with safe_open(local_shard, framework="pt", device="cpu") as handle:
+            yield handle.get_slice(tensor_name)
+        return
+
+    source_uri = read_source_uri(checkpoint_dir)
+    if source_uri is not None:
+        remote_uri = join_object_store_uri(source_uri, shard_name)
+        yield _get_remote_file(remote_uri).get_slice(tensor_name)
+        return
+
+    raise FileNotFoundError(
+        f"Safetensors shard {shard_name!r} not found under {checkpoint_dir!r}"
+    )
+
+
 def pt_weights_iterator(
     hf_weights_files: list[str],
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -1059,6 +1363,8 @@ def initialize_dummy_weights(
     low: float = -1e-3,
     high: float = 1e-3,
     seed: int = 1234,
+    *,
+    exclude_data_ptrs: set[int] | None = None,
 ) -> None:
     """Initialize model weights with random values.
 
@@ -1071,8 +1377,19 @@ def initialize_dummy_weights(
     even if the model is partitioned across multiple devices. When the seed
     is fixed, the random values generated by this function only depends on
     the parameter's number of elements and its data type.
+
+    Non-empty parameters whose ``data_ptr()`` values appear in
+    ``exclude_data_ptrs`` are skipped without modification (matching by storage
+    pointer rather than ``Parameter`` object identity because ``state_dict()``
+    returns detached tensor views); ``None`` disables exclusions.
     """
     for param in model.state_dict().values():
+        if (
+            exclude_data_ptrs is not None
+            and param.numel()
+            and param.data_ptr() in exclude_data_ptrs
+        ):
+            continue
         if torch.is_floating_point(param):
             generator = torch.Generator(device=param.data.device)
             generator.manual_seed(seed)

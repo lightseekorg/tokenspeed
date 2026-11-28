@@ -172,6 +172,7 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
         weight_memory_policy=None,
         load_format="auto",
         download_dir=None,
+        model_loader_extra_config={},
         ext_yaml=None,
         weight_loader_prefetch_checkpoints=False,
         weight_loader_prefetch_num_threads=1,
@@ -183,7 +184,10 @@ def _device_handle(runner, drafter=None) -> DeviceHandle:
     handle = DeviceHandle.__new__(DeviceHandle)
     # No drafter round is pending for ``settle`` to finish.
     handle._executor = SimpleNamespace(
-        model_runner=runner, drafter=drafter, complete_pending_drafting=lambda: None
+        model_runner=runner,
+        draft_model_runner=None,
+        drafter=drafter,
+        complete_pending_drafting=lambda: None,
     )
     handle._l2 = None
     # No memory saver: weight loads skip the validity state.
@@ -847,6 +851,39 @@ class TestPostLoadTransforms:
 
         assert (self._transformed(layer=Repacked())) == (["layer (Repacked)"])
 
+    def test_reloadable_post_load_hooks_exempt_only_declared_hooks(self):
+        from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+
+        def checked_preprocessor(plan, w):
+            del plan, w
+
+        class Refreshable(torch.nn.Module):
+            def process_weights_after_loading(self, module) -> None:
+                del module
+
+        class Unknown(torch.nn.Module):
+            def process_weights_after_loading(self, module) -> None:
+                del module
+
+        class _ReloadableModel(BaseCausalLM):
+            def __init__(self):
+                torch.nn.Module.__init__(self)
+                self.ok = Refreshable()
+                self.experts = _moe(checked_preprocessor)
+                self.other = Unknown()
+
+            def reloadable_post_load_hooks(self):
+                return frozenset(
+                    {
+                        Refreshable.process_weights_after_loading,
+                        checked_preprocessor,
+                    }
+                )
+
+        assert loader_module.post_load_transformed_modules(_ReloadableModel()) == [
+            "other (Unknown)"
+        ]
+
     def test_unquantized_dense_layers_are_not(self):
         layers = {}
         for name, cls in (
@@ -1185,6 +1222,26 @@ def test_ascend_disk_refresh_draft_guard_applies_only_to_discard(
         torch.testing.assert_close(parameter, previous * (2 if ok else 1))
     for parameter, previous in zip(draft.parameters(), draft_before, strict=True):
         torch.testing.assert_close(parameter, previous)
+
+
+def test_non_npu_dwdp_still_rejects_online_weight_updates(tmp_path):
+    path = _write_checkpoint(tmp_path / "step-1", scale=7.0)
+    model = _TinyModel()
+    runner = _runner(model, path)
+    runner.device = "cuda"
+    runner.mapping.moe_weight_sharing_size = 8
+
+    ok_disk, msg_disk = runner.update_weights_from_disk(
+        UpdateWeightFromDiskReqInput(model_path=str(path))
+    )
+    assert not ok_disk
+    assert "immutable" in msg_disk
+
+    ok_mc, msg_mc = runner.update_weights_from_mooncake(
+        "v1", models=[model], require_complete=False
+    )
+    assert not ok_mc
+    assert "immutable" in msg_mc
 
 
 if __name__ == "__main__":

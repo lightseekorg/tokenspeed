@@ -454,8 +454,7 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
     # The ending round folded the slot's records: the live block alone holds
     # the endpoint the finish publishes.
     finish_endpoint = actual.states(tables, None)
-    for layer in _LAYERS:
-        assert actual.backend._retained_lengths[layer][source_slot].item() == 0
+    assert actual.backend._replay_length[source_slot].item() == 0
     _assert_states(finish_endpoint, reference_states[40], "ended live block")
     _assert_states(
         actual.states(prompt_end_tables, None),
@@ -1107,10 +1106,11 @@ def test_cache_pressure_restores_retained_kda_state_and_continues_decode(
                 assert scheduler.retracted_size() == 1
                 assert source_tables is not None
                 source_slot = snapshot.request_pool_index
+                # Every layer shares the slot's count.
+                length = actual.backend._replay_length[source_slot].item()
+                assert 0 < length < actual.backend._retained_capacity
                 for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True):
                     live = source_tables[group][0][STATE_LIVE_SLOT]
-                    length = actual.backend._retained_lengths[layer][source_slot].item()
-                    assert 0 < length < actual.backend._retained_capacity
                     logical_before_store[layer] = _logical_checkpoint(
                         actual.backend, layer, live, source_slot
                     )
