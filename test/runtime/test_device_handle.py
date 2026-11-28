@@ -2044,3 +2044,27 @@ def test_nccl_suspend_and_resume_reach_the_communicators(
     if device_type == "cuda" and hip is None:
         expected += ["stack.trim", ("stack.restore", 2048)]
     assert trace == [*expected, "resume"]
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "npu"])
+def test_epd_retirement_fences_execution_with_string_executor_device(device_type):
+    trace = []
+    stream = SimpleNamespace(wait_stream=lambda other: trace.append(("wait", other)))
+    event = SimpleNamespace(record=lambda stream: trace.append(("record", stream)))
+    executor = SimpleNamespace(
+        device=device_type,
+        device_module=SimpleNamespace(Event=lambda: event),
+        default_stream=object(),
+        execution_stream=stream,
+    )
+    # NPU need not be registered in this CPU-only contract test.
+    handle = object.__new__(DeviceHandle)
+    handle._executor = executor
+    handle._forward_device = SimpleNamespace(type=device_type)
+    assert handle.record_execution_event() is event
+    assert trace == [("wait", executor.default_stream), ("record", stream)]
+
+
+def test_epd_retirement_cpu_needs_no_device_event():
+    handle = DeviceHandle(SimpleNamespace(device="cpu"))
+    assert handle.record_execution_event() is None

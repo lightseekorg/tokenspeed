@@ -70,6 +70,12 @@ impl SlotPool {
                 slot_bytes: self.slot_bytes,
             });
         }
+        self.reclaim(now);
+        Ok(self.free.pop())
+    }
+
+    /// Return failed slots whose late-write quarantine has expired.
+    pub fn reclaim(&mut self, now: Instant) {
         while self
             .quarantine
             .front()
@@ -78,7 +84,6 @@ impl SlotPool {
             let (_, slot) = self.quarantine.pop_front().expect("checked");
             self.free.push(slot);
         }
-        Ok(self.free.pop())
     }
 
     /// `slot`'s rows were copied out: it takes a new transfer.

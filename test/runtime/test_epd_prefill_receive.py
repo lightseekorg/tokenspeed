@@ -28,8 +28,10 @@ are recorded instead of run, as no process group exists here.
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -184,6 +186,30 @@ def test_publish_copies_each_landed_item_out_of_its_slot():
     # Copies on the host finish at once: both slots return, once.
     assert sorted(publisher.released()) == [0, 1]
     assert publisher.released() == []
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_partial_request_reuses_one_slot_without_overwriting_published_items(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    pools = ReceivePools(slots=1, slot_bytes=8192, num_deepstack=1, device=device)
+    publisher = _publisher(pools, num_deepstack=1, device=device)
+    items = [_item(3) for _ in range(5)]
+    expected = []
+    for index in range(len(items)):
+        main, deep = _land(pools, 0, 3, num_deepstack=1, base=100.0 * index)
+        expected.append((main, deep))
+        publisher.publish([(items, [(index, 0, 0, 3, 3, False)])])
+        if device == "cuda":
+            torch.cuda.synchronize()
+        assert publisher.released() == [0]
+        assert publisher.released() == []
+        for prior, (main, deep) in zip(items, expected):
+            torch.testing.assert_close(prior.encoded.cpu(), main, rtol=0, atol=0)
+            torch.testing.assert_close(
+                prior.encoded_deepstack.cpu(), deep, rtol=0, atol=0
+            )
+        assert all(item.encoded is None for item in items[index + 1 :])
 
 
 def test_publish_takes_the_deepstack_rows_from_the_same_slot():
@@ -449,3 +475,57 @@ def test_npu_receive_publishes_rows_before_releasing_slot():
     assert publisher.released() == [0]
     assert publisher.released() == []
     assert torch.equal(item.encoded.cpu(), rows.cpu())
+
+
+def test_embedding_budget_is_reserved_only_for_active_receivers(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", "16")
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOT_MB", "256")
+    monkeypatch.setenv("TOKENSPEED_EPD_EMBEDDING_BUDGET_MB", "4096")
+    server_args = _server_args("prefill")
+    assert recv_pool.embedding_budget_bytes() == 4 << 30
+    assert recv_pool.recv_memory_bytes(server_args, True) == 8 << 30
+    assert recv_pool.recv_memory_bytes(server_args, False) == 0
+    server_args.disaggregation_mode = "decode"
+    assert recv_pool.recv_memory_bytes(server_args, True) == 0
+
+
+def test_embedding_budget_must_fit_positive_int64(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", "1")
+    monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOT_MB", "1")
+    monkeypatch.setenv("TOKENSPEED_EPD_EMBEDDING_BUDGET_MB", "0")
+    with pytest.raises(ValueError, match="positive and fit int64"):
+        recv_pool.embedding_budget_bytes()
+
+
+def test_request_retirement_waits_for_its_event_after_slot_copy():
+    pools = ReceivePools(slots=1, slot_bytes=4096, num_deepstack=0, device="cpu")
+    publisher = _publisher(pools)
+    item = _item(2)
+    _land(pools, 0, 2)
+    publisher.publish([([item], [(0, 0, 0, 2, 2, False)])])
+
+    class PendingEvent:
+        complete = False
+
+        def query(self):
+            return self.complete
+
+    event = PendingEvent()
+    encoded = item.encoded
+    encoded_ref = weakref.ref(encoded)
+    publisher.retire(["r1"], event, [encoded])
+    item.encoded = None
+    del encoded
+    gc.collect()
+
+    # The slot can return after the copy, while the request's embedding budget
+    # and tensor storage stay owned until the final device use completes.
+    assert publisher.released() == [0]
+    assert publisher.released() == []
+    assert publisher.retired() == []
+    assert encoded_ref() is not None
+    event.complete = True
+    assert publisher.retired() == ["r1"]
+    assert publisher.retired() == []
+    gc.collect()
+    assert encoded_ref() is None

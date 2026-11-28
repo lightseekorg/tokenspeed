@@ -45,7 +45,8 @@ use std::{
 
 use bytes::Bytes;
 
-use super::{parse_status, pool::SlotPool, registration_frames, shard_rows, TransferInfo};
+use super::budget::{Budget, Reservation};
+use super::{cancel_frames, parse_status, pool::SlotPool, registration_frames, shard_rows, TransferInfo};
 use crate::{
     control::{EmbeddingItem, EmbeddingReceiver, LandedItem, LandedRequest},
     http, net,
@@ -103,6 +104,8 @@ pub struct ReceiverConfig {
     /// The deepstack rows' pool, with the main pool's slot count; for a
     /// model with deepstack.
     pub deepstack_pool: Option<PoolRegion>,
+    /// Maximum live reconstructed embedding bytes per rank, before TP slicing.
+    pub embedding_budget_bytes: u64,
     /// How long a staged request may wait for its embeddings.
     pub timeout: Duration,
 }
@@ -208,6 +211,8 @@ enum Connect {
     Room(u64, String),
     /// Drop the cached resolution a failed room went through.
     Evict(EncodeRankKey),
+    /// Cancel even an item that never acquired a receive slot.
+    Cancel(u64, String),
 }
 
 struct Shared {
@@ -362,6 +367,11 @@ struct Staged {
     rid: String,
     since: Instant,
     items: Vec<StagedItem>,
+    published: usize,
+    leased: usize,
+    embedding_bytes: u64,
+    admitted: bool,
+    failure: Option<String>,
 }
 
 /// A prefill rank's receiver of the encode nodes' embeddings.
@@ -372,6 +382,12 @@ pub struct Receiver {
     config: ReceiverConfig,
     pool: Option<SlotPool>,
     staged: Vec<Staged>,
+    budget: Budget,
+    reservations: HashMap<String, Reservation>,
+    live_requests: HashSet<String>,
+    retiring: HashSet<String>,
+    /// The next request to lease; advanced only by replica-agreed grants.
+    lease_cursor: usize,
     /// Landed slots whose rows the data plane has yet to copy out.
     awaiting: HashSet<usize>,
     timeout_logged: bool,
@@ -446,6 +462,19 @@ impl Receiver {
                                 }
                                 Err(reason) => shared.state().fail(room, reason),
                             },
+                            Connect::Cancel(room, addr) => {
+                                let result = shared.connect(room, &addr).and_then(|((host, port), fanout)| {
+                                    // One member of each receiving block cancels its encode rank.
+                                    if shared.tp_rank % fanout == 0 {
+                                        shared.sockets.send(&host, port, cancel_frames(room))
+                                            .map_err(|error| error.to_string())?;
+                                    }
+                                    Ok(())
+                                });
+                                if let Err(reason) = result {
+                                    tracing::warn!(room, reason, "could not cancel EPD encode room");
+                                }
+                            }
                             Connect::Evict(key) => shared.state().evict(&key),
                         }
                     }
@@ -464,9 +493,14 @@ impl Receiver {
             shared,
             connect,
             stop,
+            budget: Budget::new(config.embedding_budget_bytes),
+            reservations: HashMap::new(),
+            live_requests: HashSet::new(),
+            retiring: HashSet::new(),
             config,
             pool,
             staged: Vec::new(),
+            lease_cursor: 0,
             awaiting: HashSet::new(),
             timeout_logged: false,
         })
@@ -483,55 +517,50 @@ impl Receiver {
         (main as u64, (main * self.config.num_deepstack) as u64)
     }
 
-    /// Advance one item: lease its slot, then send its pre-allocation once
+    /// Advance a granted item: send its pre-allocation once
     /// its encode rank is connected. Returns its room's state.
-    fn advance(&mut self, request: usize, index: usize, now: Instant) -> TransferPoll {
+    fn advance(
+        &mut self,
+        request: usize,
+        index: usize,
+    ) -> TransferPoll {
+        if index < self.staged[request].published {
+            return TransferPoll::Success;
+        }
+        let leased = self.staged[request].leased;
         let (main_bytes, deep_bytes) = self.bytes(self.staged[request].items[index].row_count);
         let item = &mut self.staged[request].items[index];
         if item.failure.is_some() {
             return TransferPoll::Failed;
         }
+        if item.row_count > 0 && self.pool.is_none() {
+            item.failure = Some(
+                "EPD receive pool is disabled (TOKENSPEED_EPD_RECV_POOL_SLOTS=0)".to_owned(),
+            );
+            return TransferPoll::Failed;
+        }
+        let main_slot = self.config.pool.map_or(0, |region| region.slot_bytes);
+        let deep_slot = self.config.deepstack_pool.map_or(0, |region| region.slot_bytes);
+        if main_bytes > main_slot || deep_bytes > deep_slot {
+            item.failure = Some(format!(
+                "EPD item's {main_bytes} main / {deep_bytes} deepstack bytes exceed \
+                 receive slot capacities {main_slot} / {deep_slot}; raise \
+                 TOKENSPEED_EPD_RECV_POOL_SLOT_MB"
+            ));
+            return TransferPoll::Failed;
+        }
+        if index >= leased {
+            return TransferPoll::Bootstrapping;
+        }
         let room = self.shared.state().rooms.get(&item.item.room).cloned();
         let Some(room) = room else {
-            return TransferPoll::Failed;
+            return TransferPoll::Bootstrapping;
         };
         if room.status == TransferPoll::Failed {
             item.failure = room
                 .failure
                 .or_else(|| Some("the encode node failed".to_owned()));
             return TransferPoll::Failed;
-        }
-        if item.slot.is_none() && item.row_count > 0 {
-            let Some(pool) = &mut self.pool else {
-                item.failure = Some(
-                    "EPD receive pool is disabled (TOKENSPEED_EPD_RECV_POOL_SLOTS=0)".to_owned(),
-                );
-                return TransferPoll::Failed;
-            };
-            let deep_slot = self
-                .config
-                .deepstack_pool
-                .map_or(0, |region| region.slot_bytes);
-            if deep_bytes > deep_slot && self.config.num_deepstack > 0 {
-                item.failure = Some(format!(
-                    "EPD item's {deep_bytes} deepstack bytes exceed the receive pool's \
-                     {deep_slot}-byte slots; raise TOKENSPEED_EPD_RECV_POOL_SLOT_MB"
-                ));
-                return TransferPoll::Failed;
-            }
-            match pool.lease(main_bytes, now) {
-                Ok(Some(slot)) => item.slot = Some(slot),
-                // Every slot is taken: wait, within the request's deadline.
-                Ok(None) => return room.status,
-                Err(oversized) => {
-                    item.failure = Some(format!(
-                        "EPD item's {} bytes exceed the receive pool's {}-byte slots; raise \
-                         TOKENSPEED_EPD_RECV_POOL_SLOT_MB",
-                        oversized.bytes, oversized.slot_bytes
-                    ));
-                    return TransferPoll::Failed;
-                }
-            }
         }
         if !item.preallocated && room.status >= TransferPoll::Bootstrapped {
             if let Some((host, port)) = &room.target {
@@ -591,6 +620,15 @@ impl Receiver {
             state.rooms.remove(&item.item.room);
         }
         drop(state);
+        if !landed {
+            // Incremental reception has not resolved or published every item.
+            // Cancelling only leased rooms leaves the encoder's ring pinned.
+            for item in &staged.items {
+                let _ = self.connect.send(Connect::Cancel(
+                    item.item.room, join_host_port(&item.item.host, item.item.port),
+                ));
+            }
+        }
         for key in failed_keys {
             let _ = self.connect.send(Connect::Evict(key));
         }
@@ -612,6 +650,14 @@ impl Drop for Receiver {
 
 impl EmbeddingReceiver for Receiver {
     fn stage(&mut self, rid: &str, items: &[EmbeddingItem]) {
+        assert!(self.live_requests.insert(rid.to_owned()), "duplicate EPD request");
+        let estimate = self.budget.request_bytes(
+            items, self.config.hidden, self.config.element_size, self.config.num_deepstack,
+        );
+        let (embedding_bytes, mut failure) = match estimate {
+            Ok(bytes) => (bytes, None),
+            Err(reason) => (0, Some(reason)),
+        };
         let sharded = self.config.shard && self.config.tp_size > 1;
         let mut staged_items = Vec::with_capacity(items.len());
         for item in items {
@@ -620,27 +666,19 @@ impl EmbeddingReceiver for Receiver {
             } else {
                 (0, item.rows)
             };
-            self.shared.state().rooms.insert(
-                item.room,
-                Room {
-                    status: TransferPoll::Bootstrapping,
-                    target: None,
-                    key: None,
-                    fanout: 0,
-                    failure: None,
-                },
-            );
-            if self
-                .connect
-                .send(Connect::Room(
-                    item.room,
-                    join_host_port(&item.host, item.port),
-                ))
-                .is_err()
-            {
-                self.shared
-                    .state()
-                    .fail(item.room, "the EPD connect thread stopped");
+            let (main_bytes, deep_bytes) = self.bytes(row_count);
+            let main_slot = self.config.pool.map_or(0, |region| region.slot_bytes);
+            let deep_slot = self.config.deepstack_pool.map_or(0, |region| region.slot_bytes);
+            if row_count > 0 && self.pool.is_none() {
+                failure.get_or_insert_with(|| {
+                    "EPD receive pool is disabled (TOKENSPEED_EPD_RECV_POOL_SLOTS=0)".to_owned()
+                });
+            } else if main_bytes > main_slot || deep_bytes > deep_slot {
+                failure.get_or_insert_with(|| format!(
+                    "EPD item's {main_bytes} main / {deep_bytes} deepstack bytes exceed \
+                     receive slot capacities {main_slot} / {deep_slot}; raise \
+                     TOKENSPEED_EPD_RECV_POOL_SLOT_MB"
+                ));
             }
             staged_items.push(StagedItem {
                 item: item.clone(),
@@ -656,17 +694,150 @@ impl EmbeddingReceiver for Receiver {
             rid: rid.to_owned(),
             since: Instant::now(),
             items: staged_items,
+            published: 0,
+            leased: 0,
+            embedding_bytes,
+            admitted: false,
+            failure,
         });
+    }
+
+    fn admission_plan(&self) -> Vec<i64> {
+        let mut available = self.budget.available();
+        let mut waiting = false;
+        self.staged.iter().map(|request| {
+            if request.failure.is_some() {
+                0
+            } else if request.admitted {
+                2
+            } else if waiting || request.embedding_bytes > available {
+                waiting = true;
+                1
+            } else {
+                available -= request.embedding_bytes;
+                2
+            }
+        }).collect()
+    }
+
+    fn admit_requests(&mut self, codes: &[i64]) {
+        assert_eq!(codes.len(), self.staged.len());
+        for (request, &code) in self.staged.iter_mut().zip(codes) {
+            if code == 0 {
+                request.admitted = false;
+                request.failure.get_or_insert_with(|| "EPD request cancelled or rejected on a replica rank".to_owned());
+            } else if code == 2 && !request.admitted {
+                let reservation = self.budget.reserve(request.embedding_bytes)
+                    .expect("replica-agreed embedding reservation fits local budget");
+                assert!(self.reservations.insert(request.rid.clone(), reservation).is_none());
+                request.admitted = true;
+            }
+        }
+    }
+
+    fn retire_pending(&mut self, rids: &[String]) {
+        self.retiring.extend(rids.iter().filter(|rid| self.live_requests.contains(*rid)).cloned());
+    }
+
+    fn retire_requests(&mut self, rids: &[String]) {
+        for rid in rids {
+            self.reservations.remove(rid);
+            self.live_requests.remove(rid);
+            self.retiring.remove(rid);
+        }
+    }
+
+    fn failure_reason(&self, rid: &str) -> Option<String> {
+        let request = self.staged.iter().find(|request| request.rid == rid)?;
+        request.failure.clone().or_else(|| {
+            request.items.iter().find_map(|item| item.failure.clone())
+        })
+    }
+
+    fn lease_capacity(&mut self) -> usize {
+        let Some(pool) = &mut self.pool else {
+            return 0;
+        };
+        pool.reclaim(Instant::now());
+        pool.free()
+    }
+
+    fn lease_items(&mut self, count: usize) {
+        let requests = self.staged.len();
+        if requests == 0 {
+            return;
+        }
+        let now = Instant::now();
+        for _ in 0..count {
+            // Only replica-identical counters determine the next item.
+            // Local transfer status, empty shards and delayed copy events
+            // must never change this order.
+            let next = (0..requests)
+                .map(|offset| (self.lease_cursor + offset) % requests)
+                .find(|&r| self.staged[r].admitted && self.staged[r].leased < self.staged[r].items.len());
+            let Some(request) = next else {
+                break;
+            };
+            let index = self.staged[request].leased;
+            let (main_bytes, _) = self.bytes(self.staged[request].items[index].row_count);
+            let item = &mut self.staged[request].items[index];
+            if item.row_count > 0 {
+                if let Some(pool) = &mut self.pool {
+                    match pool.lease(main_bytes, now) {
+                        Ok(Some(slot)) => item.slot = Some(slot),
+                        Ok(None) => panic!("replica-agreed EPD lease exceeds local capacity"),
+                        Err(_) => {} // poll reports the oversized item on every rank.
+                    }
+                }
+            }
+            self.shared.state().rooms.insert(
+                item.item.room,
+                Room {
+                    status: TransferPoll::Bootstrapping,
+                    target: None,
+                    key: None,
+                    fanout: 0,
+                    failure: None,
+                },
+            );
+            if self
+                .connect
+                .send(Connect::Room(
+                    item.item.room,
+                    join_host_port(&item.item.host, item.item.port),
+                ))
+                .is_err()
+            {
+                self.shared
+                    .state()
+                    .fail(item.item.room, "the EPD connect thread stopped");
+            }
+            self.staged[request].leased += 1;
+            self.lease_cursor = (request + 1) % requests;
+        }
     }
 
     fn poll(&mut self) -> Vec<i64> {
         let now = Instant::now();
         let mut codes = Vec::with_capacity(self.staged.len());
         for request in 0..self.staged.len() {
+            if self.staged[request].failure.is_some() {
+                codes.push(0);
+                continue;
+            }
+            if !self.staged[request].admitted {
+                codes.push(if now.duration_since(self.staged[request].since) > self.config.timeout {
+                    self.staged[request].failure = Some(
+                        "EPD request timed out waiting for reconstructed embedding budget".to_owned()
+                    );
+                    0
+                } else { 1 });
+                continue;
+            }
             let mut landed = true;
             let mut failed = false;
             for index in 0..self.staged[request].items.len() {
-                match self.advance(request, index, now) {
+                match self.advance(request, index) {
                     TransferPoll::Success => {}
                     TransferPoll::Failed => failed = true,
                     _ => landed = false,
@@ -696,6 +867,63 @@ impl EmbeddingReceiver for Receiver {
         codes
     }
 
+    fn landed_prefixes(&self) -> Vec<i64> {
+        let state = self.shared.state();
+        self.staged
+            .iter()
+            .map(|request| {
+                if !request.admitted { return 0; }
+                (request.published
+                    + request.items[request.published..]
+                        .iter()
+                        .take_while(|item| {
+                            item.failure.is_none()
+                                && state
+                                    .rooms
+                                    .get(&item.item.room)
+                                    .is_some_and(|room| room.status == TransferPoll::Success)
+                        })
+                        .count()) as i64
+            })
+            .collect()
+    }
+
+    fn publish_prefixes(&mut self, prefixes: &[i64]) -> Vec<LandedRequest> {
+        assert_eq!(prefixes.len(), self.staged.len());
+        let mut landed = Vec::new();
+        for (request, &prefix) in self.staged.iter_mut().zip(prefixes) {
+            // Zero suppresses publication for a replica-wide failed request.
+            if prefix == 0 {
+                continue;
+            }
+            let end = usize::try_from(prefix).expect("nonnegative landed prefix");
+            assert!(end >= request.published && end <= request.items.len());
+            let mut items = Vec::new();
+            for item in &mut request.items[request.published..end] {
+                let slot = item.slot.take();
+                if let Some(slot) = slot {
+                    self.awaiting.insert(slot);
+                }
+                items.push(LandedItem {
+                    index: item.item.index,
+                    slot,
+                    row_start: item.row_start,
+                    row_count: item.row_count,
+                    rows: item.item.rows,
+                    sharded: item.sharded,
+                });
+            }
+            request.published = end;
+            if !items.is_empty() {
+                landed.push(LandedRequest {
+                    rid: request.rid.clone(),
+                    items,
+                });
+            }
+        }
+        landed
+    }
+
     fn settle(&mut self, codes: &[i64]) -> Vec<LandedRequest> {
         let now = Instant::now();
         let mut landed = Vec::new();
@@ -709,6 +937,7 @@ impl EmbeddingReceiver for Receiver {
                         items: staged
                             .items
                             .into_iter()
+                            .skip(staged.published)
                             .map(|item| LandedItem {
                                 index: item.item.index,
                                 slot: item.slot,
@@ -726,7 +955,7 @@ impl EmbeddingReceiver for Receiver {
                         .iter()
                         .filter_map(|item| item.failure.as_deref())
                         .collect();
-                    tracing::warn!(rid = staged.rid, ?reasons, "EPD embedding receive failed");
+                    tracing::warn!(rid = staged.rid, reason = ?staged.failure, ?reasons, "EPD embedding receive failed");
                     self.forget(&staged, false, now);
                 }
                 _ => leftover.push(staged),
@@ -747,7 +976,7 @@ impl EmbeddingReceiver for Receiver {
     }
 
     fn awaiting_release(&self) -> bool {
-        !self.awaiting.is_empty()
+        !self.awaiting.is_empty() || !self.retiring.is_empty()
     }
 }
 

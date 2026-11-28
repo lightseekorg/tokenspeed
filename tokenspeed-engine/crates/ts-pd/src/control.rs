@@ -221,7 +221,7 @@ pub struct LandedItem {
     pub sharded: bool,
 }
 
-/// EPD: a request whose items' embeddings all landed.
+/// EPD: a request with newly landed items ready to publish.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LandedRequest {
     /// The request.
@@ -242,6 +242,40 @@ pub trait EmbeddingReceiver {
     /// failed or timed out, 1 receiving, 2 landed.
     fn poll(&mut self) -> Vec<i64>;
 
+    /// Whole-request budget admission: 0 rejected, 1 waiting, 2 reservable.
+    /// Existing reservations remain admitted. Waiting requests follow FIFO.
+    fn admission_plan(&self) -> Vec<i64>;
+
+    /// Commit replica-agreed budget admissions before any slot grants.
+    fn admit_requests(&mut self, codes: &[i64]);
+
+    /// Mark request reservations whose data-plane retirement events are pending.
+    fn retire_pending(&mut self, rids: &[String]);
+
+    /// Release a whole-request reservation after the data plane's device fence.
+    fn retire_requests(&mut self, rids: &[String]);
+
+    /// The local failure reason, when known.
+    fn failure_reason(&self, rid: &str) -> Option<String>;
+
+    /// Local free slots after expired quarantines are reclaimed. The control
+    /// plane MIN-reduces this across the replica before granting any leases.
+    fn lease_capacity(&mut self) -> usize;
+
+    /// Grant at most the replica-agreed number of item leases, in identical
+    /// request/item order on every rank. Empty shards consume a logical grant
+    /// too, but do not occupy a physical slot.
+    fn lease_items(&mut self, count: usize);
+
+    /// The contiguous landed item count of each staged request, including
+    /// items already published. Replica MIN agreement keeps shard rebuilds
+    /// ordered even when individual transfers complete out of order.
+    fn landed_prefixes(&self) -> Vec<i64>;
+
+    /// Publish newly landed items through each replica-agreed prefix, without
+    /// admitting or forgetting the request. Slots remain leased until copied.
+    fn publish_prefixes(&mut self, prefixes: &[i64]) -> Vec<LandedRequest>;
+
     /// Act on the replica-agreed `codes` (`poll` order): forget the settled
     /// requests, and return the landed ones' items for the data plane to
     /// publish. Their slots stay leased until [`EmbeddingReceiver::release`].
@@ -250,7 +284,7 @@ pub trait EmbeddingReceiver {
     /// The data plane copied these slots' rows out: they take new receives.
     fn release(&mut self, slots: &[usize]);
 
-    /// Whether a landed slot still waits for its rows to be copied out.
+    /// Whether slots or request reservations await data-plane completion.
     fn awaiting_release(&self) -> bool;
 }
 

@@ -343,7 +343,7 @@ pub trait DataPlane {
     fn epd_publish(&mut self, landed: &[LandedRequest]) -> Result<(), DataPlaneError>;
 
     /// EPD: the receive slots whose rows `epd_publish` finished copying out.
-    fn epd_released(&mut self) -> Result<Vec<usize>, DataPlaneError>;
+    fn epd_released(&mut self) -> Result<(Vec<usize>, Vec<String>), DataPlaneError>;
 
     /// EPLB: move one chunk of layers' experts into `rows`, this rank's part
     /// being `moves` (one per layer), and switch their routing tables.
@@ -1156,6 +1156,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if !released.is_empty() {
             let retirement_id = self.issue_replay_retirement();
             self.data_plane.release(&released, retirement_id)?;
+            if let Some(receiver) = self.embeddings.as_mut() {
+                receiver.retire_pending(&released);
+            }
         }
         if self.owns_frontend() {
             let sizes = self.scheduler.sizes();
@@ -1844,13 +1847,45 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             .as_ref()
             .is_some_and(|receiver| receiver.awaiting_release())
         {
-            let slots = self.data_plane.epd_released()?;
+            let (slots, retired) = self.data_plane.epd_released()?;
             if let Some(receiver) = self.embeddings.as_mut() {
                 receiver.release(&slots);
+                receiver.retire_requests(&retired);
             }
         }
         if self.staged.is_empty() {
             return Ok(());
+        }
+        let admissions = match self.embeddings.as_ref() {
+            Some(receiver) => receiver.admission_plan(),
+            None => vec![2; self.staged.len()],
+        };
+        if admissions.len() != self.staged.len() {
+            return Err(LoopError::DataPlane(DataPlaneError(
+                "EPD admission count differs from staged requests".to_owned(),
+            )));
+        }
+        let mut admissions = admissions;
+        for (submission, code) in self.staged.iter().zip(&mut admissions) {
+            if self.outputs.state(&submission.rid).is_some_and(|state| state.finished()) {
+                *code = 0;
+            }
+        }
+        let admissions = self.replica_min(admissions)?;
+        if let Some(receiver) = self.embeddings.as_mut() {
+            receiver.admit_requests(&admissions);
+        }
+        // Copy events complete independently on each rank. Agree capacity
+        // before leasing, otherwise different ranks can reserve all their
+        // slots for different images and wait forever for the other shards.
+        let capacity = match self.embeddings.as_mut() {
+            Some(receiver) => i64::try_from(receiver.lease_capacity())
+                .expect("EPD pool slot count fits i64"),
+            None => i64::MAX,
+        };
+        let capacity = self.replica_min(vec![capacity])?[0];
+        if let Some(receiver) = self.embeddings.as_mut() {
+            receiver.lease_items(usize::try_from(capacity).expect("nonnegative EPD capacity"));
         }
         // A later pipeline stage receives nothing: it agrees with whatever
         // the first decides (landed, the MIN's neutral value).
@@ -1866,15 +1901,38 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             ))));
         }
         let codes = self.replica_min(codes)?;
+        // Publish a common item prefix before the whole request lands. This
+        // drains receive slots for requests larger than the pool. Later PP
+        // stages do not receive; MAX is neutral for the prefix MIN.
+        let prefixes = match self.embeddings.as_ref() {
+            Some(receiver) => receiver.landed_prefixes(),
+            None => vec![i64::MAX; self.staged.len()],
+        };
+        if prefixes.len() != codes.len() {
+            return Err(LoopError::DataPlane(DataPlaneError(
+                "EPD landed prefix count differs from staged requests".to_owned(),
+            )));
+        }
+        let mut prefixes = self.replica_min(prefixes)?;
+        for (prefix, &code) in prefixes.iter_mut().zip(&codes) {
+            if code == 0 {
+                *prefix = 0;
+            }
+        }
+        let failure_reasons: Vec<_> = self.staged.iter().map(|submission| {
+            self.embeddings.as_ref().and_then(|receiver| receiver.failure_reason(&submission.rid))
+        }).collect();
         if let Some(receiver) = self.embeddings.as_mut() {
-            let landed = receiver.settle(&codes);
+            let mut landed = receiver.publish_prefixes(&prefixes);
+            landed.extend(receiver.settle(&codes));
+            landed.retain(|request| !request.items.is_empty());
             if !landed.is_empty() {
                 self.data_plane.epd_publish(&landed)?;
             }
         }
         let mut admitted = Vec::new();
         let mut leftover = Vec::new();
-        for (submission, code) in std::mem::take(&mut self.staged).into_iter().zip(codes) {
+        for ((submission, code), reason) in std::mem::take(&mut self.staged).into_iter().zip(codes).zip(failure_reasons) {
             match code {
                 2 => {
                     // Aborted while receiving: finish it instead of running it.
@@ -1898,7 +1956,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     }
                     let failed = self.outputs.fail_unscheduled(
                         &submission.rid,
-                        "EPD embedding receive failed or timed out",
+                        reason.as_deref().unwrap_or("EPD embedding receive failed or timed out"),
                         None,
                     );
                     outputs.extend(failed.outputs);

@@ -32,6 +32,7 @@
 //!
 //! The frames are those of the Python peers this module replaced.
 
+mod budget;
 #[cfg(test)]
 mod live_tests;
 pub mod pool;
@@ -86,6 +87,26 @@ pub fn is_registration(frames: &[Bytes]) -> bool {
     frames
         .first()
         .is_some_and(|room| room.as_ref() == REGISTER_ROOM)
+}
+
+/// Cancellation is distinct from registration and destination publication.
+const CANCEL_ROOM: &[u8] = b"EPD_CANCEL";
+
+pub(crate) fn cancel_frames(room: u64) -> Vec<Bytes> {
+    vec![Bytes::from_static(CANCEL_ROOM), ascii(room)]
+}
+
+pub(crate) fn parse_cancel(frames: &[Bytes]) -> Result<Option<u64>, WireError> {
+    if !frames.first().is_some_and(|tag| tag.as_ref() == CANCEL_ROOM) {
+        return Ok(None);
+    }
+    let [_, room] = frames else {
+        return Err(WireError("an EPD cancellation has 2 frames".to_owned()));
+    };
+    let room = std::str::from_utf8(room).ok()
+        .and_then(|text| text.parse::<u64>().ok())
+        .ok_or_else(|| WireError("invalid EPD cancellation room".to_owned()))?;
+    Ok(Some(room))
 }
 
 /// A prefill rank's request for one item's rows (`EmbeddingTransferInfo`):
@@ -214,6 +235,19 @@ pub fn parse_status(frames: &[Bytes]) -> Result<(u64, TransferPoll, i64), WireEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_frames_are_unambiguous_and_strict() {
+        assert_eq!(parse_cancel(&cancel_frames(42)).unwrap(), Some(42));
+        assert!(!is_registration(&cancel_frames(42)));
+        assert!(TransferInfo::from_frames(&cancel_frames(42)).is_err());
+        for frames in [vec![Bytes::from_static(CANCEL_ROOM)],
+            vec![Bytes::from_static(CANCEL_ROOM), ascii("-1")],
+            vec![Bytes::from_static(CANCEL_ROOM), ascii(1), ascii(2)]] {
+            assert!(parse_cancel(&frames).is_err());
+        }
+        assert_eq!(parse_cancel(&registration_frames("127.0.0.1", 1234, "s", 0, 0)).unwrap(), None);
+    }
 
     #[test]
     fn shards_tile_the_span_in_rank_order() {

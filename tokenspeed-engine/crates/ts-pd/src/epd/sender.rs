@@ -43,7 +43,7 @@ use std::{
 use bytes::Bytes;
 use serde_json::json;
 
-use super::{is_registration, status_frames, TransferInfo};
+use super::{parse_cancel, is_registration, status_frames, TransferInfo};
 use crate::{
     control::{EmbeddingChunk, EmbeddingSender},
     http,
@@ -180,6 +180,8 @@ struct Room {
     parked: Option<(EmbeddingChunk, Instant)>,
     /// A worker writes it.
     sending: bool,
+    /// Keep ownership through an already queued encode or DMA operation.
+    cancelled: bool,
 }
 
 impl Room {
@@ -190,6 +192,7 @@ impl Room {
             begun: false,
             parked: None,
             sending: false,
+            cancelled: false,
         }
     }
 
@@ -210,6 +213,23 @@ struct State {
     tombstones: HashMap<u64, Instant>,
     /// Rooms that concluded since the scheduling loop last asked.
     concluded: Vec<u64>,
+}
+
+impl State {
+    fn cancel(&mut self, room: u64, until: Instant) {
+        self.tombstones.insert(room, until);
+        let Some(entry) = self.rooms.get_mut(&room) else { return; };
+        entry.cancelled = true;
+        if entry.sending || (entry.begun && entry.parked.is_none()) {
+            // DMA and vision computation may still read/write the send slot.
+            // Their completion, not cancellation, returns it to the ring.
+            return;
+        }
+        let entry = self.rooms.remove(&room).expect("cancelled room exists");
+        if entry.parked.is_some() {
+            self.concluded.push(room);
+        }
+    }
 }
 
 struct Shared {
@@ -268,6 +288,17 @@ impl Shared {
         // push its statuses.
         if is_registration(frames) {
             return;
+        }
+        match parse_cancel(frames) {
+            Ok(Some(room)) => {
+                self.state().cancel(room, Instant::now() + self.bootstrap_timeout);
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, "dropping a malformed EPD cancellation");
+                return;
+            }
         }
         let info = match TransferInfo::from_frames(frames) {
             Ok(info) => info,
@@ -548,8 +579,11 @@ impl EmbeddingSender for Sender {
     fn begin(&mut self, room: u64) -> bool {
         let mut state = self.shared.state();
         let now = Instant::now();
+        if state.tombstones.get(&room).is_some_and(|until| *until > now) {
+            return false;
+        }
         let entry = state.rooms.entry(room).or_insert_with(|| Room::new(now));
-        if entry.begun {
+        if entry.begun || entry.cancelled {
             return false;
         }
         entry.begun = true;
@@ -559,9 +593,16 @@ impl EmbeddingSender for Sender {
     fn send(&mut self, chunk: EmbeddingChunk) {
         let mut state = self.shared.state();
         let Some(entry) = state.rooms.get_mut(&chunk.room) else {
-            // Failed while it was being encoded.
+            // Failed while being encoded: the loop attaches its send-slot
+            // ownership only at hand-over, so notify it now as well.
+            state.concluded.push(chunk.room);
             return;
         };
+        if entry.cancelled {
+            state.rooms.remove(&chunk.room);
+            state.concluded.push(chunk.room);
+            return;
+        }
         if entry.complete() {
             entry.sending = true;
             let infos = entry.infos.values().cloned().collect();
@@ -620,6 +661,28 @@ mod tests {
             row_start,
             span,
         }
+    }
+
+    #[test]
+    fn cancellation_reclaims_parked_slots_but_not_inflight_work() {
+        let mut state = State::default();
+        let now = Instant::now();
+        for room in 1..=3 {
+            let mut entry = Room::new(now);
+            entry.begun = true;
+            if room == 1 { entry.parked = Some((chunk(5, 0), now)); }
+            if room == 3 { entry.sending = true; }
+            state.rooms.insert(room, entry);
+        }
+        for room in 1..=4 {
+            state.cancel(room, now + Duration::from_secs(120));
+            state.cancel(room, now + Duration::from_secs(120));
+        }
+        assert_eq!(state.concluded, [1]);
+        assert!(!state.rooms.contains_key(&1));
+        assert!(state.rooms[&2].cancelled);
+        assert!(state.rooms[&3].cancelled && state.rooms[&3].sending);
+        assert_eq!(state.tombstones.len(), 4);
     }
 
     #[test]

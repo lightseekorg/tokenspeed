@@ -1244,8 +1244,33 @@ retires a parked transfer under the same local-forward condition.
 request whose images an encode node embeds is staged at admission; each
 round the replica MIN-reduces which staged requests' embeddings landed on
 every rank, submits those, and fails those whose receive failed or timed out
-on any. The receives settle while paused too: one that lands then is
-withheld, like any admission.
+on any. Before admission, ranks also agree the contiguous landed item prefix
+of each request and publish only its newly landed items in that order. The
+data plane copies these rows into request-owned embeddings and returns receive
+slots after the copy event completes, even while later items are still waiting.
+When a request ends, it retains those embedding tensors until a final
+execution-stream event completes; only then does the control plane release the
+whole-request budget. This budget counts the full reconstructed tensor payload
+on each rank, including deepstack, without dividing by TP size. It does not
+measure allocator-reserved memory: allocation rounding, fragmentation, transport
+workspace, and model temporaries need separate headroom. Receive workspace and
+embedding payload limits are both deducted when sizing the KV cache.
+Receive failures are MIN-agreed and terminate the request. Python publication
+errors follow the data plane's worker-fatal path (including launcher notification),
+not request-local recovery; a rank must not continue after a failed shard rebuild.
+The references keep the allocator from recycling storage
+while a queued forward can still read it. Before granting new leases, ranks
+MIN-reduce available receive slots; later
+pipeline stages contribute the neutral value. Grants follow a shared round-robin
+request order and ascending item order, including empty shards as logical grants.
+Local completion/failure timing cannot skip items or move the grant cursor.
+This prevents ranks with different copy completion times from reserving slots
+for different images and waiting cyclically for each other's destinations.
+Thus a request may contain more items than the receive pool has slots; TP shard
+rebuilds remain identically ordered on every rank. Published slots are no longer
+owned by the staged request and cannot be quarantined again on its failure. The
+receives settle while paused too: one that lands then is withheld, like any
+admission.
 
 **Grammars** (`grammar`, `--grammar-backend xgrammar`). A constrained
 request waits in the loop's grammar queue until its grammar compiled (off the
@@ -1595,3 +1620,18 @@ remaining replay ahead of later plans. The control plane tracks retirement
 fences separately from scheduler cache operations. Peer export, cache clear
 and drain wait for replica completion, including releases queued after the
 last forward's results.
+
+### EPD cancellation and encoder send slots
+
+A failed staged receive cancels every item's encode room, including items
+that have not acquired a receive slot or published a destination. The connect
+thread resolves these rooms off the scheduling loop; one prefill member per
+encode-rank fanout sends the cancellation. Cancelling only published items
+would leave other embeddings parked in the encoder ring until bootstrap expiry,
+blocking unrelated requests once the ring fills.
+
+The encoder retains a cancellation tombstone for late arrivals. A parked
+embedding can return its send slot immediately; an encode or DMA already in
+flight retains ownership until its completion. Cancellation is not a DMA
+retirement fence. Receive quarantine and device-event retirement remain in
+force. A failed cancellation delivery retains bootstrap timeout as the bound.

@@ -341,7 +341,7 @@ impl DataPlane for InstantDevice {
         unreachable!("no EPD in the benchmark")
     }
 
-    fn epd_released(&mut self) -> Result<Vec<usize>, DataPlaneError> {
+    fn epd_released(&mut self) -> Result<(Vec<usize>, Vec<String>), DataPlaneError> {
         unreachable!("no EPD in the benchmark")
     }
 

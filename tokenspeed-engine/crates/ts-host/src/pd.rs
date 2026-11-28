@@ -232,6 +232,7 @@ fn receiver_config(epd: &Bound<'_, PyAny>) -> PyResult<ReceiverConfig> {
         shard: epd.getattr("shard")?.extract()?,
         pool: region("pool_base", "slot_bytes")?,
         deepstack_pool: region("deepstack_base", "deepstack_slot_bytes")?,
+        embedding_budget_bytes: epd.getattr("embedding_budget_bytes")?.extract()?,
         timeout: seconds(epd.getattr("timeout_s")?.extract()?),
     })
 }

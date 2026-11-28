@@ -596,7 +596,7 @@ impl DataPlane for PythonDataPlane {
     }
 
     /// A completion query: the copies' events, read on this thread.
-    fn epd_released(&mut self) -> Result<Vec<usize>, DataPlaneError> {
+    fn epd_released(&mut self) -> Result<(Vec<usize>, Vec<String>), DataPlaneError> {
         self.query(|plane| {
             plane
                 .call_method0("epd_released")
