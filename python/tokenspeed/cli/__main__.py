@@ -48,6 +48,12 @@ def _reload_forward(args: argparse.Namespace) -> None:
     reload_forward_main(args)
 
 
+def _cache_budget(args: argparse.Namespace) -> None:
+    from tokenspeed.cli.cache_budget import main as cache_budget_main
+
+    cache_budget_main(args)
+
+
 def _version(args: argparse.Namespace) -> None:
     from tokenspeed.version import __version__
 
@@ -106,6 +112,17 @@ def main() -> None:
 
     add_reload_arguments(reload_parser)
     reload_parser.set_defaults(func=_reload_forward)
+
+    cache_budget_parser = subparsers.add_parser(
+        "cache-budget",
+        help="Check a deployment manifest's declared Host memory (L2, "
+        "snapshot pool, L3 client and provider buffers) against its node and "
+        "container limits, offline.",
+    )
+    from tokenspeed.cli.cache_budget import add_arguments as add_budget_arguments
+
+    add_budget_arguments(cache_budget_parser)
+    cache_budget_parser.set_defaults(func=_cache_budget)
 
     version_parser = subparsers.add_parser(
         "version",

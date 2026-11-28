@@ -1,0 +1,329 @@
+{
+  "schema_version": 1,
+  "nodes": [
+    {
+      "id": "node-a",
+      "memory_bytes": 2199023255552,
+      "system_reserved_bytes": 68719476736
+    },
+    {
+      "id": "node-b",
+      "memory_bytes": 1099511627776,
+      "system_reserved_bytes": 34359738368
+    }
+  ],
+  "containers": [
+    {"id": "prefill-0", "node": "node-a", "memory_limit_bytes": 966367641600},
+    {"id": "fused-0", "node": "node-a", "memory_limit_bytes": 429496729600},
+    {"id": "fused-1", "node": "node-a", "memory_limit_bytes": 429496729600},
+    {"id": "decode-0", "node": "node-b", "memory_limit_bytes": 751619276800},
+    {"id": "store-provider-0", "node": "node-b", "memory_limit_bytes": 279172874240}
+  ],
+  "jobs": [
+    {
+      "id": "chat-prefill",
+      "replica_count": 1,
+      "processes_per_replica": {"inference_rank": 4},
+      "replicas": [
+        {
+          "id": "0",
+          "processes": [
+            {
+              "id": "ranks",
+              "role": "inference_rank",
+              "count": 4,
+              "placement": {"container": "prefill-0"},
+              "allocations": [
+                {
+                  "id": "l2",
+                  "kind": "l2",
+                  "sharing": "private",
+                  "reservation": {
+                    "basis": "pinned_rounding",
+                    "requested_bytes": 150000000000,
+                    "round_threshold_bytes": 1073741824
+                  },
+                  "note": "--kvstore-size 150 under the launcher's 1 GiB pinned rounding threshold"
+                },
+                {
+                  "id": "snapshot",
+                  "kind": "snapshot_pool",
+                  "sharing": "private",
+                  "reservation": {"basis": "measured", "bytes": 0},
+                  "note": "the prefill role never retracts"
+                },
+                {
+                  "id": "slot-state",
+                  "kind": "slot_state",
+                  "sharing": "private",
+                  "reservation": {"basis": "measured", "bytes": 0}
+                },
+                {
+                  "id": "l3-segment",
+                  "kind": "l3_client_segment",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 0},
+                  "note": "global_segment_size 0: objects live in the provider job"
+                },
+                {
+                  "id": "l3-staging",
+                  "kind": "l3_client_staging",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 16777216}
+                },
+                {
+                  "id": "headroom",
+                  "kind": "process_headroom",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 10737418240}
+                },
+                {
+                  "id": "prefill-ipc-shm",
+                  "kind": "other",
+                  "sharing": "shared",
+                  "reservation": {"basis": "declared", "bytes": 2147483648},
+                  "note": "one shared-memory segment all four ranks map"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "chat-decode",
+      "replica_count": 1,
+      "processes_per_replica": {"inference_rank": 4},
+      "replicas": [
+        {
+          "id": "0",
+          "processes": [
+            {
+              "id": "ranks",
+              "role": "inference_rank",
+              "count": 4,
+              "placement": {"container": "decode-0"},
+              "allocations": [
+                {
+                  "id": "l2",
+                  "kind": "l2",
+                  "sharing": "private",
+                  "reservation": {"basis": "measured", "bytes": 120010000000},
+                  "note": "L2 reservation from the startup budget line, rounded up"
+                },
+                {
+                  "id": "snapshot",
+                  "kind": "snapshot_pool",
+                  "sharing": "private",
+                  "reservation": {"basis": "measured", "bytes": 32220000000},
+                  "note": "snapshot reservation from the startup budget line, rounded up; it includes the slot-state arena"
+                },
+                {
+                  "id": "slot-state",
+                  "kind": "slot_state",
+                  "sharing": "private",
+                  "reservation": {"basis": "included_in", "allocation": "snapshot"}
+                },
+                {
+                  "id": "l3-segment",
+                  "kind": "l3_client_segment",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 0},
+                  "note": "no L3 backend on the decode role"
+                },
+                {
+                  "id": "l3-staging",
+                  "kind": "l3_client_staging",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 0}
+                },
+                {
+                  "id": "headroom",
+                  "kind": "process_headroom",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 10737418240}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "batch-fused",
+      "replica_count": 2,
+      "processes_per_replica": {"inference_rank": 2},
+      "replicas": [
+        {
+          "id": "0",
+          "processes": [
+            {
+              "id": "ranks",
+              "role": "inference_rank",
+              "count": 2,
+              "placement": {"container": "fused-0"},
+              "allocations": [
+                {
+                  "id": "l2",
+                  "kind": "l2",
+                  "sharing": "private",
+                  "reservation": {
+                    "basis": "pinned_rounding",
+                    "requested_bytes": 100000000000,
+                    "round_threshold_bytes": 1073741824
+                  }
+                },
+                {
+                  "id": "snapshot",
+                  "kind": "snapshot_pool",
+                  "sharing": "private",
+                  "reservation": {
+                    "basis": "pinned_rounding",
+                    "requested_bytes": 400000000,
+                    "round_threshold_bytes": 1073741824
+                  }
+                },
+                {
+                  "id": "slot-state",
+                  "kind": "slot_state",
+                  "sharing": "private",
+                  "reservation": {
+                    "basis": "pinned_rounding",
+                    "requested_bytes": 50331648,
+                    "round_threshold_bytes": 1073741824
+                  }
+                },
+                {
+                  "id": "l3-segment",
+                  "kind": "l3_client_segment",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 17179869184},
+                  "note": "global_segment_size 32 GiB split over attention TP 2"
+                },
+                {
+                  "id": "l3-staging",
+                  "kind": "l3_client_staging",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 16777216}
+                },
+                {
+                  "id": "headroom",
+                  "kind": "process_headroom",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 10737418240}
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "1",
+          "processes": [
+            {
+              "id": "ranks",
+              "role": "inference_rank",
+              "count": 2,
+              "placement": {"container": "fused-1"},
+              "allocations": [
+                {
+                  "id": "l2",
+                  "kind": "l2",
+                  "sharing": "private",
+                  "reservation": {
+                    "basis": "pinned_rounding",
+                    "requested_bytes": 100000000000,
+                    "round_threshold_bytes": 1073741824
+                  }
+                },
+                {
+                  "id": "snapshot",
+                  "kind": "snapshot_pool",
+                  "sharing": "private",
+                  "reservation": {
+                    "basis": "pinned_rounding",
+                    "requested_bytes": 400000000,
+                    "round_threshold_bytes": 1073741824
+                  }
+                },
+                {
+                  "id": "slot-state",
+                  "kind": "slot_state",
+                  "sharing": "private",
+                  "reservation": {
+                    "basis": "pinned_rounding",
+                    "requested_bytes": 50331648,
+                    "round_threshold_bytes": 1073741824
+                  }
+                },
+                {
+                  "id": "l3-segment",
+                  "kind": "l3_client_segment",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 17179869184}
+                },
+                {
+                  "id": "l3-staging",
+                  "kind": "l3_client_staging",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 16777216}
+                },
+                {
+                  "id": "headroom",
+                  "kind": "process_headroom",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 10737418240}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "kv-store",
+      "replica_count": 1,
+      "processes_per_replica": {"auxiliary": 1, "storage_provider": 1},
+      "replicas": [
+        {
+          "id": "0",
+          "processes": [
+            {
+              "id": "provider",
+              "role": "storage_provider",
+              "count": 1,
+              "placement": {"container": "store-provider-0"},
+              "allocations": [
+                {
+                  "id": "segment",
+                  "kind": "provider_segment",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 257698037760}
+                },
+                {
+                  "id": "headroom",
+                  "kind": "process_headroom",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 4294967296}
+                }
+              ]
+            },
+            {
+              "id": "master",
+              "role": "auxiliary",
+              "count": 1,
+              "placement": {"node": "node-a"},
+              "allocations": [
+                {
+                  "id": "headroom",
+                  "kind": "process_headroom",
+                  "sharing": "private",
+                  "reservation": {"basis": "declared", "bytes": 2147483648}
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
