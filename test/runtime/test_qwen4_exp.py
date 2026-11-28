@@ -1594,6 +1594,7 @@ def test_attention_dp_mtp_shares_target_head_layout(monkeypatch, rank, attn_tp):
         rms_norm_eps=1e-6,
         num_hidden_layers=1,
         tie_word_embeddings=False,
+        draft_moe_quantization="none",
     )
     # The GPU transformer and CUDA cache management are outside this test;
     # the head, logits processors and factory layout check are real classes.
@@ -1643,6 +1644,7 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(
         rms_norm_eps=1e-6,
         num_hidden_layers=1,
         tie_word_embeddings=False,
+        draft_moe_quantization="none",
     )
     monkeypatch.setattr(qwen4_exp_nextn, "Qwen4ExpDraftModel", _EmbeddingOnlyDraft)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
@@ -4171,6 +4173,7 @@ def test_qwen4_exp_nextn_shares_unquantized_target_head(monkeypatch, attention_d
         rms_norm_eps=1e-6,
         num_hidden_layers=1,
         tie_word_embeddings=False,
+        draft_moe_quantization="none",
     )
     mapping = Mapping(
         rank=0,

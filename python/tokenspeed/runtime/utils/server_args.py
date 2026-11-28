@@ -243,6 +243,12 @@ DECODE_MONOKERNEL_ARCHITECTURES = (
 )
 # Checkpoint architectures that run --dense-fp8-small-m's FP8 projections.
 DENSE_FP8_SMALL_M_ARCHITECTURES = ("MuseSparkForConditionalGeneration",)
+# Target architectures whose MTP drafts take --speculative-draft-lm-head-
+# quantization and --speculative-draft-moe-quantization.
+DRAFT_QUANTIZATION_ARCHITECTURES = (
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
+)
 # Draft architectures with decode monokernels, and the target architectures
 # whose drafts they serve. Under --decode-monokernel such a draft of such a
 # target takes the switch too; any other draft (a Qwen3.8 target's DFlash2
@@ -279,6 +285,23 @@ def decode_monokernel_refusal(architectures: list[str]) -> str | None:
     return (
         f"--decode-monokernel: no decode monokernel for {architectures or 'this model'} "
         f"(models with one: {', '.join(DECODE_MONOKERNEL_ARCHITECTURES)})"
+    )
+
+
+def draft_quantization_refusal(
+    architectures: list[str], speculative_algorithm: str | None
+) -> str | None:
+    """Why the draft-only quantization options cannot serve a target of
+    ``architectures`` drafting with ``speculative_algorithm``, or None when
+    its MTP draft takes them."""
+    if speculative_algorithm == "MTP" and any(
+        a in DRAFT_QUANTIZATION_ARCHITECTURES for a in architectures
+    ):
+        return None
+    return (
+        f"no quantized draft for {architectures or 'this model'} with "
+        f"--speculative-algorithm {speculative_algorithm} (MTP drafts of: "
+        f"{', '.join(DRAFT_QUANTIZATION_ARCHITECTURES)})"
     )
 
 
@@ -735,6 +758,7 @@ class ServerArgs:
 
     # Hugging Face model config overrides in JSON
     hf_overrides: str = "{}"
+    extra_server_args: dict[str, object] = dataclasses.field(default_factory=dict)
 
     # Kernel backend
     attention_backend: str | None = None
@@ -826,6 +850,10 @@ class ServerArgs:
     speculative_draft_model_path: str | None = None
     speculative_draft_model_revision: str | None = None
     speculative_draft_model_quantization: str | None = "unquant"
+    # Draft-only quantization of an MTP draft's LM head and routed experts
+    # (docs/configuration/server.md); "none" keeps them as loaded.
+    speculative_draft_lm_head_quantization: str = "none"
+    speculative_draft_moe_quantization: str = "none"
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
@@ -1016,6 +1044,18 @@ class ServerArgs:
     enable_expert_parallel: bool = False
 
     # Resolved in __post_init__; not options.
+    _extra_server_args_ready: bool = dataclasses.field(
+        default=False, init=False, repr=False, compare=False
+    )
+    _extra_server_args_cache: dict = dataclasses.field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    def __getstate__(self):
+        # A worker reconstructs its shared plugin arguments from plain launch
+        # values. Do not pickle plugin classes or another process's cache.
+        return {**self.__dict__, "_extra_server_args_cache": {}}
+
     _grammar_backend_unset: bool = dataclasses.field(
         default=False, init=False, repr=False
     )
@@ -1111,6 +1151,7 @@ class ServerArgs:
         self.validate_dp_local_cuda_graph()
         self.validate_dsv41_adaptive_dspark()
         self.validate()
+        self._extra_server_args_ready = True
 
     def validate_dp_local_cuda_graph(self):
         if not self.enable_dp_local_cuda_graph:
@@ -1310,6 +1351,15 @@ class ServerArgs:
             refusal = decode_monokernel_refusal(architectures)
             if refusal is not None:
                 raise ValueError(refusal)
+        if architectures is not None:
+            for flag, value in self._draft_quantization_options():
+                if value == "none":
+                    continue
+                refusal = draft_quantization_refusal(
+                    architectures, self.speculative_algorithm
+                )
+                if refusal is not None:
+                    raise ValueError(f"{flag} {value}: {refusal}")
         if self.dense_fp8_small_m != "none" and architectures is not None:
             refusal = dense_fp8_small_m_refusal(architectures)
             if refusal is not None:
@@ -2563,6 +2613,9 @@ class ServerArgs:
         from tokenspeed.runtime.plugins import ensure_loaded
 
         ensure_loaded()
+        from tokenspeed.runtime.plugins.server_args import validate_extra_server_args
+
+        validate_extra_server_args(self)
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
         _require_choice(
             "--owned-attention-output",
@@ -2592,6 +2645,33 @@ class ServerArgs:
                 "numerics; --numerics rl-bitwise needs bf16"
             )
         resolve_numerics_envelope(self)
+        _require_choice(
+            "--speculative-draft-lm-head-quantization",
+            self.speculative_draft_lm_head_quantization,
+            ("none", "fp8_weight_only"),
+        )
+        _require_choice(
+            "--speculative-draft-moe-quantization",
+            self.speculative_draft_moe_quantization,
+            ("none", "mxfp4"),
+        )
+        for flag, value in self._draft_quantization_options():
+            if value != "none" and self.numerics in BITWISE_ENVELOPES:
+                # The batch-invariant logits path plans the dense head only,
+                # and the draft GEMV's summation order follows its row count.
+                raise ValueError(
+                    f"{flag} {value} is not batch-invariant: it cannot run "
+                    f"under --numerics {self.numerics}"
+                )
+        if self.speculative_draft_moe_quantization != "none" and self.decode_monokernel:
+            # The monokernel reads MXFP4 routed experts only next to an MXFP4
+            # shared expert, and the draft's shared expert stays BF16.
+            raise ValueError(
+                f"--speculative-draft-moe-quantization "
+                f"{self.speculative_draft_moe_quantization} cannot run with "
+                "--decode-monokernel: the draft layer's monokernel reads MXFP4 "
+                "routed experts only with an MXFP4 shared expert"
+            )
         _require_choice(
             "--dense-fp8-small-m",
             self.dense_fp8_small_m,
@@ -3190,6 +3270,19 @@ class ServerArgs:
                     "them after a discard"
                 )
 
+    def _draft_quantization_options(self) -> tuple[tuple[str, str], ...]:
+        """The draft-only quantization flags and their values."""
+        return (
+            (
+                "--speculative-draft-lm-head-quantization",
+                self.speculative_draft_lm_head_quantization,
+            ),
+            (
+                "--speculative-draft-moe-quantization",
+                self.speculative_draft_moe_quantization,
+            ),
+        )
+
     def validate_model_update_options(self):
         """Require the Model Updater SDK flags together, or none of them.
 
@@ -3227,6 +3320,16 @@ class ServerArgs:
             raise ValueError(
                 "--model-update-draft-weights must be 'retain' or 'refresh'"
             )
+        for flag, value in self._draft_quantization_options():
+            if value != "none":
+                # The draft's quantized copies are made once at startup from
+                # the target's head and the checkpoint's BF16 experts; no
+                # weight update rebuilds them.
+                raise ValueError(
+                    f"{flag} {value} cannot run with --model-update-config: "
+                    "the draft's quantized weights are made once at startup, "
+                    "and no weight update rebuilds them"
+                )
         if self.dense_fp8_small_m != "none":
             # Every weight update refuses to start while the FP8 copies exist
             # (MuseSparkForConditionalGeneration.begin_weight_update).
@@ -3732,8 +3835,10 @@ class ServerArgs:
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         from tokenspeed.runtime.plugins import ensure_loaded
+        from tokenspeed.runtime.plugins.server_args import add_extra_server_args
 
         ensure_loaded()
+        add_extra_server_args(parser)
         parser.allow_abbrev = False
 
         # Model and port args
@@ -4150,7 +4255,7 @@ class ServerArgs:
             default=ServerArgs.kv_offload_config,
             help='Sparse KV offload JSON object with explicit "layers", "hot_tokens", '
             '"host_gb" (GiB), and "overlap". Model-specific options remain in '
-            "--hf-overrides; unsupported cache recipes reject this configuration.",
+            "--extra-server-args; unsupported cache recipes reject this configuration.",
         )
         parser.add_argument(
             "--disable-kvstore",
@@ -4978,17 +5083,8 @@ class ServerArgs:
         parser.add_argument(
             "--sampling-backend",
             type=str,
-            choices=[
-                "greedy",
-                "flashinfer",
-                "flashinfer_full",
-                "triton",
-                "triton_full",
-                "ascend_full",
-                "sonic",
-            ],
             default=ServerArgs.sampling_backend,
-            help="Sampling backend. "
+            help="Sampling backend, including names registered by runtime plugins. "
             "'greedy': argmax + verify_chain_greedy, zero sampling-param plumbing. "
             "'flashinfer': temperature/top_k/top_p via fused softmax + top_k_top_p_sampling_from_probs; "
             "min_p and penalties silently ignored. "
@@ -5328,6 +5424,27 @@ class ServerArgs:
             type=str,
             default=ServerArgs.speculative_draft_model_quantization,
             help="Quantization method for the draft model. Defaults to 'unquant'.",
+        )
+        parser.add_argument(
+            "--speculative-draft-lm-head-quantization",
+            type=str,
+            default=ServerArgs.speculative_draft_lm_head_quantization,
+            choices=["none", "fp8_weight_only"],
+            help="Qwen3.8 MTP: the draft steps project through a copy of the "
+            "target's LM head with E4M3 rows and one FP32 scale per vocabulary "
+            "row (fp8_weight_only), made at startup; the target's verify keeps "
+            "its BF16 head. A draft numerics change. none shares the target's "
+            "head.",
+        )
+        parser.add_argument(
+            "--speculative-draft-moe-quantization",
+            type=str,
+            default=ServerArgs.speculative_draft_moe_quantization,
+            choices=["none", "mxfp4"],
+            help="Qwen3.8 MTP: quantize the draft layer's BF16 routed experts "
+            "to MXFP4 at load, with the Quark scheme of the target's experts "
+            "(mxfp4), so the draft runs the target's MXFP4 MoE kernels. A "
+            "draft numerics change. none keeps them BF16.",
         )
         parser.add_argument(
             "--speculative-num-steps",
@@ -6279,6 +6396,9 @@ class ServerArgs:
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
+        from tokenspeed.runtime.plugins.server_args import collect_extra_server_args
+
+        args.extra_server_args = collect_extra_server_args(args)
         args.ep_size = args.expert_parallel_size
 
         # Resolve model (positional model arg vs --model)

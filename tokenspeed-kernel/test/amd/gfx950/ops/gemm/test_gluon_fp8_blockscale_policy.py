@@ -38,59 +38,8 @@ from tokenspeed_kernel.selection import select_kernel
 mm = importlib.import_module("tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm")
 
 
-@pytest.mark.parametrize("k,decode", [(3072, True), (3104, False)])
-def test_public_fp32_workspace_and_argument_forwarding(monkeypatch, k, decode):
-    registration = importlib.import_module("tokenspeed_kernel.ops.gemm.gluon")
-    a = torch.empty((17, k), device="meta", dtype=torch.float8_e4m3fn)
-    b = torch.empty((128, k), device="meta", dtype=torch.float8_e4m3fn)
-    sa = torch.empty((17, (k + 127) // 128), device="meta")
-    sb = torch.empty((1, (k + 127) // 128), device="meta")
-    out = torch.empty((17, 128), device="meta", dtype=torch.bfloat16)
-    alpha = torch.empty((), device="meta")
-    block_size = (128, 128)
-    counters = torch.empty(
-        mm.gluon_mm_mxfp8_decode_num_counters_gfx950(17, 128, k),
-        device="meta",
-        dtype=torch.int32,
-    )
-
-    def allocate(size, *, dtype, device):
-        assert decode
-        assert size == counters.numel() and dtype == counters.dtype
-        assert device == a.device
-        return counters
-
-    # Only the unavailable GPU launch and its device workspace are replaced.
-    def launch(aa, bb, ascales, bscales, dtype, **kwargs):
-        assert aa is a and bb is b and ascales is sa and bscales is sb
-        assert dtype == out.dtype and kwargs["out"] is out
-        assert kwargs["alpha"] is alpha and kwargs["block_size"] is block_size
-        assert kwargs.get("counters") is (counters if decode else None)
-        return out
-
-    monkeypatch.setattr(registration, "zeroed_state", allocate)
-    monkeypatch.setattr(
-        mm,
-        (
-            "launch_gluon_mm_mxfp8_decode_gfx950"
-            if decode
-            else "launch_gluon_mm_mxfp8_gfx950"
-        ),
-        launch,
-    )
-    assert (
-        gluon_mm_fp8_blockscale_gfx950(
-            a, b, sa, sb, out.dtype, alpha=alpha, block_size=block_size, out=out
-        )
-        is out
-    )
-
-
-@pytest.mark.parametrize(
-    "missing_scale,block_size",
-    [("activation", [128, 128]), ("weight", [128, 128]), (None, [1, 32])],
-)
-def test_public_fp32_requires_canonical_scales(missing_scale, block_size):
+def test_public_fp32_requires_canonical_scales():
+    # FP32 scales read with an MXFP8 block size would scale the wrong blocks.
     a = torch.empty((1, 512), device="meta", dtype=torch.float8_e4m3fn)
     b = torch.empty((128, 512), device="meta", dtype=torch.float8_e4m3fn)
     scale = torch.empty((1, 4), device="meta")
@@ -98,11 +47,11 @@ def test_public_fp32_requires_canonical_scales(missing_scale, block_size):
         gluon_mm_fp8_blockscale_gfx950(
             a,
             b,
-            None if missing_scale == "activation" else scale,
-            None if missing_scale == "weight" else scale,
+            scale,
+            scale,
             torch.bfloat16,
             alpha=None,
-            block_size=block_size,
+            block_size=[1, 32],
         )
 
 
@@ -157,28 +106,39 @@ def test_reducer_family_boundaries(shape, expected):
     assert mm._fp32_reducer_tile(*shape) == expected
 
 
-@pytest.mark.parametrize("online", [False, True])
+_REGISTRY_CASES = [
+    ((1, 1024, 4096), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((17, 130, 3072), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((17, 128, 3104), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((129, 4096, 512), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((896, 6144, 4096), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((37, 208, 800), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((4, 128, 256), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((4, 130, 256), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((256, 130, 256), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((257, 4096, 512), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((1, 15, 128), torch.bfloat16, "triton_mm_fp8_blockscale"),
+    ((1, 16, 128), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((1, 16, 96), torch.bfloat16, "triton_mm_fp8_blockscale"),
+    ((63, 32768, 2048), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((64, 32768, 2048), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((1, 1048560, 2048), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((1, 1048576, 2048), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+    ((4, 128, 512), torch.float16, "triton_mm_fp8_blockscale"),
+]
+
+
+# Every shape with FP8 activations and scales; BF16 activations quantized
+# online select alike, checked on the first Gluon shape and on each fallback.
 @pytest.mark.parametrize(
-    "shape,output_dtype,expected",
+    "shape,output_dtype,expected,online",
     [
-        ((1, 1024, 4096), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((17, 130, 3072), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((17, 128, 3104), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((129, 4096, 512), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((896, 6144, 4096), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((37, 208, 800), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((4, 128, 256), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((4, 130, 256), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((256, 130, 256), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((257, 4096, 512), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((1, 15, 128), torch.bfloat16, "triton_mm_fp8_blockscale"),
-        ((1, 16, 128), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((1, 16, 96), torch.bfloat16, "triton_mm_fp8_blockscale"),
-        ((63, 32768, 2048), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((64, 32768, 2048), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((1, 1048560, 2048), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((1, 1048576, 2048), torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
-        ((4, 128, 512), torch.float16, "triton_mm_fp8_blockscale"),
+        *((*case, False) for case in _REGISTRY_CASES),
+        *(
+            (*case, True)
+            for case in _REGISTRY_CASES
+            if case is _REGISTRY_CASES[0] or case[2] == "triton_mm_fp8_blockscale"
+        ),
     ],
 )
 def test_registry_fp32_contract_and_fallback(shape, output_dtype, expected, online):

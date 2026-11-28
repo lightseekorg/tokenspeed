@@ -1022,6 +1022,7 @@ def mm(
         if is_warming_up():
             warm_tgv_decode_gemm(A, B)
             warm_gluon_mm_a16w16_skinny(A, B)
+            warm_gluon_mm_a16w16_pipelined(A, B)
             warm_gluon_mm_a16w16_decode(A, B)
         # Let the registry check the small-N policy's layout/alignment traits.
         small_n = prefer_bf16_small_n_splitk(M, N, K, enable_pdl=enable_pdl)
@@ -4662,6 +4663,7 @@ from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
     MXFP4_LINEAR_MFMA_LAYOUT,
     prepare_mxfp4_linear_mfma_weight,
     warm_gluon_mm_a16w16_decode,
+    warm_gluon_mm_a16w16_pipelined,
     warm_gluon_mm_a16w16_skinny,
 )
 from tokenspeed_kernel.ops.gemm.native import (  # noqa: E402

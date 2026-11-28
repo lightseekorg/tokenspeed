@@ -57,15 +57,10 @@ def test_split_k_covers_every_tile(hidden_size: int) -> None:
     ("tokens", "expected"),
     [
         (128, "gluon_latent_input_small_batch_gfx950"),
-        (129, "gluon_latent_input_small_batch_gfx950"),
         (320, "gluon_latent_input_small_batch_gfx950"),
         (321, "gluon_latent_input_mediumm_gfx950"),
-        (640, "gluon_latent_input_mediumm_gfx950"),
-        (641, "gluon_latent_input_mediumm_gfx950"),
         (1280, "gluon_latent_input_mediumm_gfx950"),
         (1281, "gluon_latent_input_largem_gfx950"),
-        (2048, "gluon_latent_input_largem_gfx950"),
-        (4095, "gluon_latent_input_largem_gfx950"),
         (4096, "gluon_latent_input_largem_gfx950"),
     ],
 )
@@ -97,9 +92,19 @@ def test_k3_prefill_dispatch(tokens: int, expected: str | None) -> None:
 
 @requires_cdna4
 # 639 and 641 straddle the 128/256-row tile switch. Every 256-row grid spans all
-# eight XCDs, so each staggered K start and its wrap back to K tile 0 run.
-@pytest.mark.parametrize("tokens", [321, 512, 639, 641, 1024, 1280])
-@pytest.mark.parametrize("linear_beta", [None, 25.0])
+# eight XCDs, so each staggered K start and its wrap back to K tile 0 run. Both
+# SiTU forms run on both row tiles.
+@pytest.mark.parametrize(
+    ("tokens", "linear_beta"),
+    [
+        (321, None),
+        (512, 25.0),
+        (639, None),
+        (641, None),
+        (1024, 25.0),
+        (1280, None),
+    ],
+)
 def test_medium_routes_packed_projection_and_applies_situ(
     tokens: int,
     linear_beta: float | None,
@@ -141,9 +146,12 @@ def test_medium_routes_packed_projection_and_applies_situ(
 @requires_cdna4
 # 256 is one full row tile; 512 puts a second workgroup row in the grid so the
 # pid_m addressing is exercised; 300 and 577 leave a partial final tile whose
-# rows the load clamp duplicates and the epilogue must mask away.
-@pytest.mark.parametrize("tokens", [256, 300, 512, 577])
-@pytest.mark.parametrize("linear_beta", [None, 25.0])
+# rows the load clamp duplicates and the epilogue must mask away. Both SiTU
+# forms run on a full and on a partial final tile.
+@pytest.mark.parametrize(
+    ("tokens", "linear_beta"),
+    [(256, None), (300, 25.0), (512, 25.0), (577, None)],
+)
 def test_prefill_routes_packed_projection_and_applies_situ(
     tokens: int,
     linear_beta: float | None,

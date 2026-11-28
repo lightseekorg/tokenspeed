@@ -106,9 +106,9 @@ def test_few_row_gemv_rows_match_the_single_row_gemv(n: int, k: int) -> None:
 
 
 # Qwen3.8-27B TP1 decode projections and its EAGLE-4 draft layer: gate-up,
-# down, GDN in/out, attention QKV/o_proj, draft fc and down. Each mixes the
+# down, GDN in/out, attention QKV/o_proj and draft down. Each mixes the
 # single-row GEMV, the few-row GEMV and the multi-row GEMV across these row
-# counts.
+# counts. The draft fc (5120 x 15360) routes as the MLP down projection does.
 @pytest.mark.parametrize(
     ("n", "k"),
     [
@@ -118,7 +118,6 @@ def test_few_row_gemv_rows_match_the_single_row_gemv(n: int, k: int) -> None:
         (5120, 6144),
         (14336, 5120),
         (15360, 10240),
-        (5120, 15360),
         (5120, 16384),
     ],
 )

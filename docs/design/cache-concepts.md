@@ -3388,7 +3388,7 @@ Verified end to end for this round: DeepSeek V3.2, R1, and V4-Flash, each
 **Configuration and placement.** `ServerArgs.resolve_kv_offload()` normalizes
 `--kv-offload-config`: target attention layer IDs, per-request hot capacity,
 Host GiB budget and prefetch overlap. The plugin recipe interprets model
-options, including the explicit `kv_offload_window_ring` HF override, and
+options, including `kv_offload_window_ring` from the flat `extra_server_args`, and
 declares a `KVOffloadPolicy` with field IDs, verify width, reserved/ring rows
 and selection dependencies. The common `CacheRecipe.setup()` binds request
 slots and the extend chunk bound. Recipes without offloading support reject

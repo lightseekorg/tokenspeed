@@ -60,7 +60,9 @@ def model_checkpoint_id(server_args: ServerArgs, model_config: ModelConfig) -> s
     )
 
 
-def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any]:
+def _kv_producer_options(
+    args: ServerArgs, *, draft_dtype: str, plugin_runtime_config: bool
+) -> dict[str, Any]:
     """Snapshot numerical and partition choices for the deployment identity.
 
     Target dtype is already part of the packed-cache signature. An empty
@@ -72,6 +74,14 @@ def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any
     return {
         "draft_dtype": draft_dtype,
         "numerics": args.numerics,
+        # Runtime-config hooks separate plugin execution policy from HF data.
+        # Keep a marker even with no explicit options so old checkpoint-owned
+        # policies cannot share KV with the new launch-owned policy.
+        **(
+            {"extra_server_args": dict(args.extra_server_args)}
+            if args.extra_server_args or plugin_runtime_config
+            else {}
+        ),
         "yarn_ramp_mask_device": args.yarn_ramp_mask_device,
         "yarn_frequency_device": args.yarn_frequency_device,
         "mla_lora_scale": args.mla_lora_scale,
@@ -334,6 +344,11 @@ def cache_layout_deployment_id(
         for_peer=for_peer,
         kv_producer=_kv_producer_options(
             server_args,
+            plugin_runtime_config=(
+                model_config.runtime_config is not None
+                or draft_model_config is not None
+                and draft_model_config.runtime_config is not None
+            ),
             draft_dtype=(
                 str(draft_model_config.dtype) if draft_model_config is not None else ""
             ),

@@ -94,11 +94,35 @@ def _fp64_reference(normalized, projection, up, projection_scale):
 
 # Up to MAX_ROWS (192) rows run the split-K pair; larger batches run the GEMM
 # down projection and the pipelined up projection, including partial tiles.
-@pytest.mark.parametrize("rows", [1, 7, 16, 17, 32, 33, 64, 100, 192, 193, 256, 1000])
-@pytest.mark.parametrize("projection_rows", [LOWRANK + HC_COUNT, LOWRANK])
-@pytest.mark.parametrize("projection_scale", [1.0, 0.25])
-# Serving stores the projection padded to eight rows (324 -> 328).
-@pytest.mark.parametrize("padded", [True, False])
+def _epilogue_cases():
+    """Both sides of each split-K row bucket's bound (<= 16, <= 32, up to
+    MAX_ROWS), then one partial, two whole and a multi-tile partial 128-row
+    tile past it, with and without the inject rows, padded or not; the
+    projection scale, a runtime multiplier, once per weight layout."""
+    cases = []
+    # Serving stores the projection padded to eight rows (324 -> 328).
+    for padded in (True, False):
+        for projection_rows in (LOWRANK + HC_COUNT, LOWRANK):
+            for scale, rows_list in (
+                (1.0, (1, 16, 17, 32, 33, 192, 193, 256, 1000)),
+                (0.25, (33,)),
+            ):
+                for rows in rows_list:
+                    cases.append(
+                        pytest.param(
+                            rows,
+                            projection_rows,
+                            scale,
+                            padded,
+                            id=f"{padded}-{scale}-{projection_rows}-{rows}",
+                        )
+                    )
+    return cases
+
+
+@pytest.mark.parametrize(
+    "rows,projection_rows,projection_scale,padded", _epilogue_cases()
+)
 def test_mix_matches_gemm_epilogue_path(
     rows, projection_rows, projection_scale, padded
 ):
@@ -175,7 +199,8 @@ def test_mix_workspace_is_not_first_created_under_capture(monkeypatch):
     assert hyperconnection._workspaces == {}
 
 
-@pytest.mark.parametrize("tail", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+# The largest rejected tail, the smallest accepted one and a full extra step.
+@pytest.mark.parametrize("tail", [16, 32, 256])
 def test_mix_supports_rank_tails_that_fill_an_mfma_step(tail):
     lowrank = 256 + tail
     supported = tail >= 32

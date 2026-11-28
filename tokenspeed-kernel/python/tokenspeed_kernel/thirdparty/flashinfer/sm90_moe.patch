@@ -1,58 +1,58 @@
 diff --git a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
-index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0ac34120b 100644
+index 3e418c1926bbeb16478fbf7b79c1099be16ba2a5..79501781f8eab13f14a94a9b5e6361613b9e86e1 100644
 --- a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
 +++ b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
 @@ -58,0 +59 @@
 +#include "tensorrt_llm/deep_gemm/scheduler.cuh"
-@@ -3161,0 +3163 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+@@ -3215,0 +3217 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
 +  size_t deepseek_fc2_scales_size = 0;
-@@ -3176,0 +3179,5 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+@@ -3230,0 +3233,5 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
 +    if (is_gated_activation) {
 +      deepseek_fc2_scales_size =
 +          ::deep_gemm::compute_padded_offset(num_rows * experts_per_token, num_experts_per_node) *
 +          ((inter_size + 127) / 128) * sizeof(float);
 +    }
-@@ -3219,0 +3227 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
+@@ -3274,0 +3282 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX,
 +  ADD(deepseek_fc2_scales);
-@@ -3338,0 +3347 @@ void CutlassMoeFCRunner<
+@@ -3394,0 +3403 @@ void CutlassMoeFCRunner<
 +  deepseek_fc2_scales_ = getWsPtr(float{}, "deepseek_fc2_scales");
-@@ -3411 +3420,3 @@ void CutlassMoeFCRunner<
+@@ -3467 +3476,3 @@ void CutlassMoeFCRunner<
 -                           bool enable_pdl, cudaStream_t stream) {
 +                           bool enable_pdl, cudaStream_t stream, int64_t expected_m,
 +                           float* fused_fc2_scales) {
 +  bool const fuse_swiglu_quant = fused_fc2_scales != nullptr;
-@@ -3416 +3427,5 @@ void CutlassMoeFCRunner<
+@@ -3472 +3483,5 @@ void CutlassMoeFCRunner<
 -
 +#ifdef FLASHINFER_SM90_MOE_MAX_STAGES_FC1
 +  constexpr int max_num_stages_fc1 = FLASHINFER_SM90_MOE_MAX_STAGES_FC1;
 +#else
 +  constexpr int max_num_stages_fc1 = -1;
 +#endif
-@@ -3420 +3435,3 @@ void CutlassMoeFCRunner<
+@@ -3476 +3491,3 @@ void CutlassMoeFCRunner<
 -                      quant_params.fp8_block_scaling.fc1_scales_ptrs);
 +                      quant_params.fp8_block_scaling.fc1_scales_ptrs, expected_m,
 +                      max_num_stages_fc1, /*paired_rows=*/fuse_swiglu_quant, false,
 +                      fuse_swiglu_quant ? output : nullptr, fused_fc2_scales, enable_pdl);
-@@ -3422,0 +3440,2 @@ void CutlassMoeFCRunner<
+@@ -3478,0 +3496,2 @@ void CutlassMoeFCRunner<
 +  if (fuse_swiglu_quant) return;
 +
-@@ -3453 +3472,2 @@ void CutlassMoeFCRunner<
+@@ -3509 +3528,2 @@ void CutlassMoeFCRunner<
 -                           QuantParams& quant_params, bool enable_pdl, cudaStream_t stream) {
 +                           QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
 +                           int64_t expected_m, float* fused_fc2_scales) {
-@@ -3455,0 +3476,5 @@ void CutlassMoeFCRunner<
+@@ -3511,0 +3532,5 @@ void CutlassMoeFCRunner<
 +#ifdef FLASHINFER_SM90_MOE_MAX_STAGES_FC2
 +  constexpr int max_num_stages_fc2 = FLASHINFER_SM90_MOE_MAX_STAGES_FC2;
 +#else
 +  constexpr int max_num_stages_fc2 = -1;
 +#endif
-@@ -3459,2 +3484,3 @@ void CutlassMoeFCRunner<
+@@ -3515,2 +3540,3 @@ void CutlassMoeFCRunner<
 -                      num_experts_per_node, shape_n, shape_k, stream, nullptr,
 -                      quant_params.fp8_block_scaling.fc2_scales_ptrs);
 +                      num_experts_per_node, shape_n, shape_k, stream, fused_fc2_scales,
 +                      quant_params.fp8_block_scaling.fc2_scales_ptrs, expected_m,
 +                      max_num_stages_fc2, false, fused_fc2_scales != nullptr, nullptr, nullptr, enable_pdl);
-@@ -3504,23 +3530,21 @@ template <class T, class WeightType, class OutputType, class InputType, class Ba
+@@ -3560,23 +3586,21 @@ template <class T, class WeightType, class OutputType, class InputType, class Ba
 -void CutlassMoeFCRunner<
 -    T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, Sm90Wfp4Afp8Mode,
 -    Enable>::gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
@@ -97,16 +97,16 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0
 +          bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
 +          bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
 +          bool enable_pdl, int64_t expected_m, float* fused_fc2_scales) {
-@@ -3532,2 +3556,2 @@ void CutlassMoeFCRunner<
+@@ -3588,2 +3612,2 @@ void CutlassMoeFCRunner<
 -                        num_experts_per_node, fc1_activation_type, quant_params, enable_pdl,
 -                        stream);
 +                        num_experts_per_node, fc1_activation_type, quant_params, enable_pdl, stream,
 +                        expected_m, fused_fc2_scales);
-@@ -3789 +3813,2 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+@@ -3845 +3869,2 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
 -          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
 +          int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
 +          int64_t expected_m, float* fused_fc2_scales) {
-@@ -3801,7 +3826,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+@@ -3857,7 +3882,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
 -    Self::BlockScaleFC2(*fp8_blockscale_gemm_runner, input, gemm_output, final_output,
 -                        expert_first_token_offset, fc2_expert_weights, fc2_expert_biases,
 -                        unpermuted_final_scales, unpermuted_row_to_permuted_row,
@@ -121,7 +121,7 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0
 +        num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, unpadded_hidden_size,
 +        inter_size, num_experts_per_node, k, parallelism_config, enable_alltoall, quant_params,
 +        enable_pdl, stream, expected_m, fused_fc2_scales);
-@@ -4149 +4174,9 @@ void CutlassMoeFCRunner<
+@@ -4205 +4230,9 @@ void CutlassMoeFCRunner<
 -                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream) {
 +                    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
 +                    int64_t expected_m) {
@@ -132,13 +132,13 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0
 +#endif
 +  TLLM_CHECK_WITH_INFO(expected_m == -1 || (use_deepseek_fp8_block_scale && !min_latency_mode),
 +                       "expected_m is supported only by DeepSeek FP8 block-scaled MoE");
-@@ -4353 +4386 @@ void CutlassMoeFCRunner<
+@@ -4409 +4442 @@ void CutlassMoeFCRunner<
 -                min_latency_params.active_expert_global_ids, enable_pdl);
 +                min_latency_params.active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -4369 +4402 @@ void CutlassMoeFCRunner<
+@@ -4425 +4458 @@ void CutlassMoeFCRunner<
 -                min_latency_params.active_expert_global_ids, enable_pdl);
 +                min_latency_params.active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -4446,0 +4480,18 @@ void CutlassMoeFCRunner<
+@@ -4516,0 +4550,18 @@ void CutlassMoeFCRunner<
 +    float* fused_fc2_scales = nullptr;
 +#if defined(ENABLE_FP8_BLOCK_SCALE) && defined(FLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT) && \
 +    FLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT
@@ -157,31 +157,15 @@ index 90b8c2c24c4f2aa05b8c68b5055dca0712b97b93..2737e8afbe30f994f09a5c8c144662e0
 +      gemm2_result = glu_inter_result_;
 +    }
 +#endif
-@@ -4488 +4539 @@ void CutlassMoeFCRunner<
+@@ -4558 +4609 @@ void CutlassMoeFCRunner<
 -                nullptr, enable_pdl);
 +                nullptr, enable_pdl, expected_m, fused_fc2_scales);
-@@ -4501,9 +4552,10 @@ void CutlassMoeFCRunner<
--    Self::gemm2(
--        moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
--        expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
--        fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params,
--        token_topk_unpermuted_scales, permuted_token_final_scales_, unpermuted_row_to_permuted_row,
--        permuted_row_to_unpermuted_row_, token_selected_experts, num_valid_tokens_ptr, num_rows,
--        expanded_num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
--        experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
+@@ -4579 +4630,2 @@ void CutlassMoeFCRunner<
 -        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
-+    Self::gemm2(moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
-+                expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights,
-+                fc2_expert_biases, fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_,
-+                quant_params, token_topk_unpermuted_scales, permuted_token_final_scales_,
-+                unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
-+                token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
-+                hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
-+                experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
-+                parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr,
-+                enable_pdl, expected_m, fused_fc2_scales);
++        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr,
++        enable_pdl, expected_m, fused_fc2_scales);
 diff --git a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
-index 396830dca29767fb7cff4f29126a5053c90fd485..7b3d04ef60b4121ec011a5cd364c88f1e24fd3a8 100644
+index f41a17f0cc0a3832c8f2dd294b44b756048917bb..bed8b76e48c4bc99dcc36a665ead52cfda471236 100644
 --- a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
 +++ b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
 @@ -339,0 +340,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
@@ -201,17 +185,17 @@ index 396830dca29767fb7cff4f29126a5053c90fd485..7b3d04ef60b4121ec011a5cd364c88f1
 +    TVM_FFI_ICHECK(expected_m == -1 || (mUseDeepSeekFP8BlockScaling && !min_latency_mode))
 +        << "expected_m requires DeepSeek FP8 block scaling without min-latency mode";
 +
-@@ -487 +499 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -495 +507 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 -        min_latency_mode, min_latency_params, enable_pdl, stream);
 +        min_latency_mode, min_latency_params, enable_pdl, stream, expected_m);
-@@ -488,0 +501 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -496,0 +509 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 +    TVM_FFI_ICHECK_EQ(expected_m, -1) << "expected_m requires the OSS CUTLASS MoE runner";
-@@ -783,0 +797 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -799,0 +813 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 +  /** @brief Return a named MoE execution or profiling entry point for TVM FFI. */
-@@ -845 +859 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -861 +875 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 -                 int64_t nvfp4_4over6_code) {
 +                 int64_t nvfp4_4over6_code, int64_t expected_m) {
-@@ -852 +866 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+@@ -868 +882 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
 -                   nvfp4_4over6_code);
 +                   nvfp4_4over6_code, expected_m);
 diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
@@ -1063,37 +1047,37 @@ index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..fb83c9f2f4ab1c148d47fcf8d65890c3
 +  // This call's unpadded row capacity; quantization rounds its launch up separately.
 +  int64_t shape_m_ = 0;
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
-index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..d72c3ed63270e9cd01e8de81e2fb5838deba77a1 100644
+index e2de70699f959a36c0ac86abe90fd1ff25481173..4a641f245f0162b0e93d156f334654327d1b865f 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
-@@ -1350 +1350 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
+@@ -1359 +1359 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
 -                                             num_device_sms);
 +                                             num_device_sms, false, false, -1, false);
-@@ -1354 +1354 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
+@@ -1363 +1363 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
 -        best_num_tma_multicast, deep_gemm::GemmType::Normal);
 +        best_num_tma_multicast, deep_gemm::GemmType::Normal, false, false, false, false);
-@@ -1364 +1364 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
+@@ -1373 +1373 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
 -                                             num_device_sms, false, true);
 +                                             num_device_sms, false, true, -1, false);
-@@ -1367 +1367 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
+@@ -1376 +1376 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
 -        best_num_tma_multicast, deep_gemm::GemmType::Normal, true);
 +        best_num_tma_multicast, deep_gemm::GemmType::Normal, true, false, false, false);
-@@ -1465 +1465,3 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1474 +1474,3 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -                           cudaStream_t stream, int num_device_sms = kNumDeviceSMs) {
 +                           cudaStream_t stream, int max_num_stages, bool paired_rows,
 +                           __nv_fp8_e4m3* fused_output, float* fused_scales, bool fused_fc1_input,
 +                           bool enable_pdl, int num_device_sms = kNumDeviceSMs) {
-@@ -1472,0 +1475,3 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1481,0 +1484,3 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 +  TLLM_CHECK_WITH_INFO(fused_output == nullptr ||
 +                           (paired_rows && fused_scales != nullptr && expected_m < m_per_expert_threshold),
 +                       "Fused SwiGLU quantization requires the grouped swapAB path");
-@@ -1476 +1481 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1485 +1490 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -                                             num_device_sms);
 +                                             num_device_sms, false, false, max_num_stages, false);
-@@ -1480 +1485 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1489 +1494 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset);
 +        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, false, false, false, false);
-@@ -1487,0 +1493,16 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1496,0 +1502,16 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 +    // Paired row tiles double the accumulators; keep them to the small token tiles of decode.
 +    bool paired = paired_rows && shape_n % (2 * block_k) == 0;
 +    auto config = deep_gemm::jit::get_best_gemm_config(shape_n, expected_m, shape_k, num_problems,
@@ -1110,7 +1094,7 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..d72c3ed63270e9cd01e8de81e2fb5838
 +                                                    num_device_sms, false, true, max_num_stages,
 +                                                    false);
 +    }
-@@ -1489,2 +1510,15 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1498,2 +1519,15 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -        deep_gemm::jit::get_best_gemm_config(shape_n, expected_m, shape_k, num_problems,
 -                                             num_device_sms, false, true);
 +        config;
@@ -1128,21 +1112,21 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..d72c3ed63270e9cd01e8de81e2fb5838
 +    // read before griddepcontrol.wait are already final. Other grouped GEMMs stay stream-ordered,
 +    // as upstream.
 +    bool const programmatic_launch = enable_pdl && (fused_output != nullptr || fused_fc1_input);
-@@ -1493 +1527,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1502 +1536,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, true);
 +        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, true, paired,
 +        fused_output != nullptr, prefetch_first_tile);
-@@ -1500 +1535,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1509 +1544,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -        num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded);
 +        num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded,
 +        fused_output, fused_scales, programmatic_launch);
-@@ -1509 +1545,4 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1518 +1554,4 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -                          bool internal_quantize_a = true, bool internal_quantize_b = true) {
 +                          bool internal_quantize_a, bool internal_quantize_b, int max_num_stages,
 +                          int64_t quant_shape_m, bool paired_rows,
 +                          __nv_fp8_e4m3* fused_output, float* fused_scales, bool fused_fc1_input,
 +                          bool enable_pdl) {
-@@ -1521,3 +1560,6 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1530,3 +1569,6 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -    int num_blocks = std::min(static_cast<int64_t>(kNumDeviceSMs),
 -                              div_up(max_shape_m * scales_dim_x, NumThreads / 32));
 -    // Binary search is expected to have lower complexity when max_shape_m is small
@@ -1152,22 +1136,22 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..d72c3ed63270e9cd01e8de81e2fb5838
 +        1, std::min(static_cast<int64_t>(kNumDeviceSMs),
 +                    div_up(quant_shape_m * scales_dim_x, NumThreads / 32)));
 +    // Binary search is expected to have lower complexity when quant_shape_m is small
-@@ -1525 +1567 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1534 +1576 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -        static_cast<double>(max_shape_m) * scales_dim_x /
 +        static_cast<double>(quant_shape_m) * scales_dim_x /
-@@ -1553 +1595,2 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1562 +1604,2 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -                          stream);
 +                          stream, max_num_stages, paired_rows, fused_output, fused_scales, fused_fc1_input,
 +                          enable_pdl);
-@@ -1578 +1621,2 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
+@@ -1587 +1630,2 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
 -      deep_gemm::jit::get_best_gemm_config(shape_m, shape_n, shape_k, num_problems, num_device_sms);
 +      deep_gemm::jit::get_best_gemm_config(shape_m, shape_n, shape_k, num_problems, num_device_sms,
 +                                           false, false, -1, false);
-@@ -1582 +1626 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
+@@ -1591 +1635 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
 -      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched);
 +      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched, false, false, false, false);
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
-index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..0fd87439c869dfbe11a957494e4d7fd4122b98a5 100644
+index 65f7df141ec42a26d4da27ba567740fa4a530794..333cb9a89153f187d2b62d73af6269e86bdd6a1e 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
 @@ -481,0 +482,5 @@ class CutlassMoeFCRunnerInterface {
@@ -1290,13 +1274,13 @@ index 9a6e12e23d3cd79bb179401484d4be2db1be1ae4..0fd87439c869dfbe11a957494e4d7fd4
 -      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream);
 +      bool const enable_alltoall, QuantParams& quant_params, bool enable_pdl, cudaStream_t stream,
 +      int64_t expected_m, float* fused_fc2_scales);
-@@ -1044,0 +1080 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+@@ -1045,0 +1081 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
 +  float* deepseek_fc2_scales_{};
 diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
-index 3f17afe2f8f26c9e74902850031df24f37865bd8..6a92edb1946603ea8f94292e92f053066a079a32 100644
+index 4da9974d516dba753cdf6af17d1f669fd3731ec1..4d3974a796409df4888982d5854fd79c8be2d3b5 100644
 --- a/flashinfer/fused_moe/core.py
 +++ b/flashinfer/fused_moe/core.py
-@@ -885,0 +886,23 @@
+@@ -885,0 +886,23 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 +def _validate_cutlass_moe_expected_m(
 +    expected_m: Optional[int],
 +    *,
@@ -1320,7 +1304,7 @@ index 3f17afe2f8f26c9e74902850031df24f37865bd8..6a92edb1946603ea8f94292e92f05306
 +        )
 +
 +
-@@ -887 +910,9 @@
+@@ -887 +910,9 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 -def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
 +def get_cutlass_fused_moe_module(
 +    backend: str = "100",
@@ -1331,26 +1315,26 @@ index 3f17afe2f8f26c9e74902850031df24f37865bd8..6a92edb1946603ea8f94292e92f05306
 +    """Build and cache CUTLASS MoE operations and their workspace-size query."""
 +    if enable_sm90_moe_optimizations and backend != "90":
 +        raise ValueError("SM90 MoE optimizations require the SM90 backend")
-@@ -895 +926,4 @@
+@@ -895 +926,4 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 -        module = gen_cutlass_fused_moe_sm90_module(use_fast_build).build_and_load()
 +        module = gen_cutlass_fused_moe_sm90_module(
 +            use_fast_build,
 +            enable_sm90_moe_optimizations=enable_sm90_moe_optimizations,
 +        ).build_and_load()
-@@ -1038 +1072 @@
+@@ -1038 +1072 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 -            )
 +            ) + (("sm90_grouped_optimized",) if enable_sm90_moe_optimizations else ())
-@@ -1219,0 +1254,4 @@
+@@ -1219,0 +1254,4 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 +    op_name = "flashinfer::cutlass_fused_moe"
 +    if enable_sm90_moe_optimizations:
 +        op_name += "_sm90_grouped_optimized"
 +
-@@ -1221 +1259 @@
+@@ -1221 +1259 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 -        "flashinfer::cutlass_fused_moe",
 +        op_name,
-@@ -1263,0 +1302 @@
+@@ -1263,0 +1302 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 +        expected_m: Optional[int] = None,
-@@ -1264,0 +1304,12 @@
+@@ -1264,0 +1304,12 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 +        """Execute CUTLASS MoE with the selected tactics and workspace.
 +
 +        Forward expected_m to both DeepSeek FP8 block-scale expert GEMMs for
@@ -1363,28 +1347,27 @@ index 3f17afe2f8f26c9e74902850031df24f37865bd8..6a92edb1946603ea8f94292e92f05306
 +                min_latency_mode=min_latency_mode,
 +                backend="cutlass",
 +            )
-@@ -1392,0 +1444,5 @@
+@@ -1392,0 +1444,5 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 +            *(
 +                []
 +                if min_latency_mode
 +                else [expected_m if expected_m is not None else -1]
 +            ),
-@@ -1406 +1462 @@
+@@ -1406 +1462 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 -    @register_fake_op("flashinfer::cutlass_fused_moe")
 +    @register_fake_op(op_name)
-@@ -1446,0 +1503 @@
+@@ -1446,0 +1503 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 +        expected_m: Optional[int] = None,
-@@ -1447,0 +1505,5 @@
+@@ -1447,0 +1505,5 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 +        """Infer output tensors for fake execution of the CUTLASS MoE operation.
 +
 +        Minimum-latency mode also returns expert-routing metadata. The
 +        expected_m scheduling hint does not affect output shapes or dtypes.
 +        """
-@@ -1580,0 +1643,2 @@
+@@ -1580,0 +1643,2 @@ def cutlass_fused_moe(
 +    expected_m: Optional[int] = None,
 +    enable_sm90_moe_optimizations: bool = False,
-@@ -1789,0 +1854,18 @@
-+
+@@ -1790,0 +1855,18 @@ def cutlass_fused_moe(
 +    expected_m : Optional[int]
 +        Expected number of tokens per local expert for DeepGEMM configuration selection.
 +        Supported only by CUTLASS DeepSeek FP8 block-scale MoE on SM90 with DeepGEMM
@@ -1402,7 +1385,8 @@ index 3f17afe2f8f26c9e74902850031df24f37865bd8..6a92edb1946603ea8f94292e92f05306
 +        scheduling and ignores the former ``MOE_MBU_*`` environment switches.
 +        Choose this option before warmup and CUDA graph capture. Modules, native
 +        kernel caches and tuning keys are separate for the two configurations.
-@@ -1833,0 +1916,15 @@
++
+@@ -1835,0 +1918,15 @@ def cutlass_fused_moe(
 +    if type(enable_sm90_moe_optimizations) is not bool:
 +        raise TypeError("enable_sm90_moe_optimizations must be a bool")
 +    if enable_sm90_moe_optimizations and (
@@ -1418,7 +1402,7 @@ index 3f17afe2f8f26c9e74902850031df24f37865bd8..6a92edb1946603ea8f94292e92f05306
 +            min_latency_mode=min_latency_mode,
 +            backend=backend,
 +        )
-@@ -1925 +2022,7 @@
+@@ -1940 +2037,7 @@ def cutlass_fused_moe(
 -        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
 +        if enable_sm90_moe_optimizations:
 +            module = get_cutlass_fused_moe_module(
@@ -1427,5 +1411,5 @@ index 3f17afe2f8f26c9e74902850031df24f37865bd8..6a92edb1946603ea8f94292e92f05306
 +        else:
 +            module = get_cutlass_fused_moe_module(device_arch)
 +        return module.cutlass_fused_moe(
-@@ -1963,0 +2067 @@
+@@ -1978,0 +2082 @@ def cutlass_fused_moe(
 +            expected_m=expected_m,

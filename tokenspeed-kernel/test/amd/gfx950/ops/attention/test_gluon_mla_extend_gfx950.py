@@ -22,8 +22,9 @@
 
 """Coverage for the gfx950 absorbed MLA extend kernel.
 
-Calls name the kernel through ``override`` so every dtype pair runs at every
-shape, including query lengths the registry would send to prefix replay.
+Calls name the kernel through ``override`` so both kernels run every shape,
+including query lengths the registry would send to prefix replay. A BF16 query
+over the FP8 cache only changes the query load, so it runs a subset.
 """
 
 from __future__ import annotations
@@ -145,22 +146,32 @@ def _reference(case):
     return torch.cat(refs)
 
 
-@pytest.mark.parametrize("dtypes", _DTYPES)
+_EXTEND_SHAPES = [
+    # Initial prefill and a tiny prefix, packed into one program.
+    pytest.param([3, 2], [0, 5], 12, id="packed"),
+    # Decode-like chunk over a long prefix: the KV stream is split.
+    pytest.param([16], [4000], 12, id="split"),
+    # Ragged batch with q blocks and caches ending mid-page.
+    pytest.param([37, 5, 130], [100, 3000, 64], 12, id="ragged"),
+    # Kimi K3 at TP4 / TP2 / TP1 (24 / 48 / 96 local heads).
+    pytest.param([64], [130], 24, id="heads24"),
+    pytest.param([10, 7], [8192, 0], 48, id="heads48"),
+    pytest.param([4], [2000], 96, id="heads96"),
+    # A head count without a large divisor falls back to small groups.
+    pytest.param([200, 1], [1000, 70], 7, id="heads7"),
+]
+# The BF16-query FP8-cache pair runs the split, ragged and small-group shapes.
+_BF16_Q_FP8_KV_SHAPES = ("split", "ragged", "heads7")
+
+
 @pytest.mark.parametrize(
-    "q_lens,prefix_lens,num_heads",
+    "dtypes,q_lens,prefix_lens,num_heads",
     [
-        # Initial prefill and a tiny prefix, packed into one program.
-        ([3, 2], [0, 5], 12),
-        # Decode-like chunk over a long prefix: the KV stream is split.
-        ([16], [4000], 12),
-        # Ragged batch with q blocks and caches ending mid-page.
-        ([37, 5, 130], [100, 3000, 64], 12),
-        # Kimi K3 at TP4 / TP2 / TP1 (24 / 48 / 96 local heads).
-        ([64], [130], 24),
-        ([10, 7], [8192, 0], 48),
-        ([4], [2000], 96),
-        # A head count without a large divisor falls back to small groups.
-        ([200, 1], [1000, 70], 7),
+        pytest.param(dtypes.values[0], *shape.values, id=f"{shape.id}-{dtypes.id}")
+        for dtypes in _DTYPES
+        for shape in _EXTEND_SHAPES
+        if dtypes.values[0] != (torch.bfloat16, _FP8)
+        or shape.id in _BF16_Q_FP8_KV_SHAPES
     ],
 )
 def test_mla_extend_gfx950_matches_reference(

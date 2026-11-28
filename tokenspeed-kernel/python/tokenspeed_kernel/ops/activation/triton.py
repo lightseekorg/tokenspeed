@@ -181,6 +181,7 @@ def _moe_finalize_gate_add_kernel(
     TOPK: tl.constexpr,
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
+    TOKEN_ORDER: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     token_id = tl.program_id(0).to(tl.int64)
@@ -207,7 +208,11 @@ def _moe_finalize_gate_add_kernel(
     cmask = ccols < hidden_dim
     routed = tl.zeros([CHUNK], dtype=tl.float32)
     for k in tl.static_range(TOPK):
-        row = tl.load(permuted_idx + token_id * TOPK + k).to(tl.int64)
+        if TOKEN_ORDER:
+            # Every route row is defined, at token * TOPK + k.
+            row = token_id * TOPK + k
+        else:
+            row = tl.load(permuted_idx + token_id * TOPK + k).to(tl.int64)
         scale = tl.load(expert_weights + token_id * TOPK + k).to(tl.float32)
         valid = row >= 0
         x = tl.load(
@@ -215,7 +220,10 @@ def _moe_finalize_gate_add_kernel(
             mask=cmask & valid,
             other=0.0,
         ).to(tl.float32)
-        routed = tl.where(valid, routed + scale * x, routed)
+        # An explicit FMA: contraction left to the compiler varied between
+        # code layouts on gfx950, and kernels that finalize themselves
+        # (gfx950 A4W4) issue the same FMA to match this one bit for bit.
+        routed = tl.where(valid, tl.fma(scale, x, routed), routed)
     routed = routed.to(tl.bfloat16)
     s = tl.load(shared_output_ptr + row_offset + ccols, mask=cmask)
     result = routed.to(tl.float32) + gate_val * s.to(tl.float32)
@@ -229,7 +237,7 @@ def _sm_count(device_index: int) -> int:
 
 def moe_finalize_gate_add(
     gemm2_out: torch.Tensor,
-    expanded_idx_to_permuted_idx: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor | None,
     expert_weights: torch.Tensor,
     hidden_states: torch.Tensor,
     gate_weight: torch.Tensor,
@@ -244,7 +252,10 @@ def moe_finalize_gate_add(
     Args:
         gemm2_out: ``[permuted_rows, hidden_padded]`` bf16 expert outputs from a
             ``do_finalize=False`` MoE call.
-        expanded_idx_to_permuted_idx: ``[tokens * top_k]`` int32 row map (-1: not local).
+        expanded_idx_to_permuted_idx: ``[tokens * top_k]`` int32 row map (-1: not
+            local), or None when row ``token * top_k + k`` holds route ``k`` of
+            ``token`` and every row is defined (``MoELayer``'s token-order
+            deferred output).
         expert_weights: ``[tokens, top_k]`` routing weights.
         hidden_states: ``[tokens, hidden]`` MoE input (the gate's input).
         gate_weight: ``[hidden]`` shared-expert gate weight.
@@ -279,7 +290,13 @@ def moe_finalize_gate_add(
     top_k = expert_weights.shape[-1]
     if expert_weights.ndim != 2 or expert_weights.shape[0] < num_tokens:
         raise ValueError("expert_weights must be [tokens, top_k]")
-    if expanded_idx_to_permuted_idx.numel() < num_tokens * top_k:
+    token_order = expanded_idx_to_permuted_idx is None
+    if token_order:
+        if gemm2_out.shape[0] < num_tokens * top_k:
+            raise ValueError("token-order gemm2_out must hold tokens * top_k rows")
+        # The kernel takes no row map; any int32 tensor fills the argument.
+        expanded_idx_to_permuted_idx = gemm2_out.new_empty((1,), dtype=torch.int32)
+    elif expanded_idx_to_permuted_idx.numel() < num_tokens * top_k:
         raise ValueError("expanded_idx_to_permuted_idx must hold tokens * top_k rows")
     # Only the first tokens' rows are read, densely in [token, k] order.
     expert_weights = expert_weights[:num_tokens].contiguous()
@@ -310,6 +327,7 @@ def moe_finalize_gate_add(
         TOPK=top_k,
         BLOCK=BLOCK,
         CHUNK=chunk,
+        TOKEN_ORDER=token_order,
         ENABLE_PDL=enable_pdl,
         num_warps=num_warps,
         **({"launch_pdl": True} if enable_pdl else {}),

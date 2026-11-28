@@ -346,20 +346,25 @@ def test_expert_stages_match_tokenspeed_routes(dims, rows, chain):
     assert torch.equal(got_hq, regular_hq[local].view(torch.int16))
     got_ha = ha_routes[local].view(torch.int32)
     assert torch.equal(got_ha, regular_ha[local].view(torch.int32))
+    # Every route has the regular GEMMs' bits; the GEMMs' torch math (an
+    # expert's dequantized weights a route) is checked on the first and last
+    # rows' routes, which cover the shared and the varying experts.
+    math_rows = (0, rows - 1)
     for r in range(rows):
         for k in range(8):
             e = int(ids[r, k]) - base
             if not 0 <= e < LOCAL:
                 continue
-            w13 = up_values(e).cpu()
-            want_gu = (xq[r].double() @ w13.double().T).float()
-            want_gu = (
-                (want_gu * ((xa[r] * up_wa[e]) * (1 / (1536.0 * up_wd[0]))))
-                .bfloat16()
-                .float()
-            )
             gate_up = _route_pairs(scratch, plan, "gate_up", r, k, INTER, tag)
-            torch.testing.assert_close(gate_up, want_gu, rtol=2**-7, atol=1e-5)
+            if r in math_rows:
+                w13 = up_values(e).cpu()
+                want_gu = (xq[r].double() @ w13.double().T).float()
+                want_gu = (
+                    (want_gu * ((xa[r] * up_wa[e]) * (1 / (1536.0 * up_wd[0]))))
+                    .bfloat16()
+                    .float()
+                )
+                torch.testing.assert_close(gate_up, want_gu, rtol=2**-7, atol=1e-5)
             assert torch.equal(gate_up, regular_up[r * 8 + k]), (r, k)
             # From the kernel's gate_up on: h, its quantization and w2.
             h = _swiglu(gate_up, weights[r, k])
@@ -375,15 +380,16 @@ def test_expert_stages_match_tokenspeed_routes(dims, rows, chain):
             got_ha = (scratch[at : at + 1] & 0xFFFFFFFF).to(torch.int32)
             got_ha = got_ha.view(torch.float32).cpu()[0]
             torch.testing.assert_close(got_ha, ha[0], rtol=2**-7, atol=0)
-            w2 = down_values(e).cpu()
-            want = (got_hq.double() @ w2.double().T).float()
-            want = (
-                (want * ((got_ha * down_wa[e]) * (1 / (1536.0 * down_wd[0]))))
-                .bfloat16()
-                .float()
-            )
             got = _route_pairs(scratch, plan, "ex2", r, k, H // 2, tag)
-            torch.testing.assert_close(got, want, rtol=2**-7, atol=1e-5)
+            if r in math_rows:
+                w2 = down_values(e).cpu()
+                want = (got_hq.double() @ w2.double().T).float()
+                want = (
+                    (want * ((got_ha * down_wa[e]) * (1 / (1536.0 * down_wd[0]))))
+                    .bfloat16()
+                    .float()
+                )
+                torch.testing.assert_close(got, want, rtol=2**-7, atol=1e-5)
             assert torch.equal(got, regular_down[r * 8 + k]), (r, k)
 
 

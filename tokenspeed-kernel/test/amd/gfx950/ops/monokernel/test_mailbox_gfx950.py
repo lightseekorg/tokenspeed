@@ -407,8 +407,9 @@ if is_cdna4():
         assert all(r["expected"] == 7 and r["observed"] == 0 for r in recs)
         assert all(r["trap"] > r["start"] for r in recs)
 
-    # Flags have a known payload as well as a tag. One never-raised flag
-    # retains either zero or the current tag with a zero payload.
+    # Flags have a known payload as well as a tag. The never-raised flag
+    # holds the current tag with a zero payload: a poll of the tag alone
+    # would pass it.
     _STUCK_FLAG = textwrap.dedent("""
         import sys
         import torch
@@ -453,13 +454,12 @@ if is_cdna4():
         print("the poll returned")
         """)
 
-    @pytest.mark.parametrize("matching_tag", [False, True])
-    def test_a_flag_that_is_never_raised_stops_and_records(tmp_path, matching_tag):
+    def test_a_flag_that_is_never_raised_stops_and_records(tmp_path):
         """A missing flag traps and records its pair, even if its tag matches."""
         script = tmp_path / "stuck_flag.py"
         script.write_text(_STUCK_FLAG)
         path = tmp_path / "stuck_flag.bin"
-        observed = launch_tag(5, 3) << 32 if matching_tag else 0
+        observed = launch_tag(5, 3) << 32
         result = subprocess.run(
             [sys.executable, str(script), str(path), str(observed)],
             capture_output=True,

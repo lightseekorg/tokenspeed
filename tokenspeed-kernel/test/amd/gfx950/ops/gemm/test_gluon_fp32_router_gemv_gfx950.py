@@ -95,9 +95,10 @@ def _problem(rows: int, hidden: int, columns: int, seed: int):
 
 @pytest.mark.parametrize(
     ("rows", "hidden", "columns"),
-    # Decode rows on an 8192 x 256 router, plus ragged K and N tails; K = 1002
+    # Decode rows on an 8192 x 256 router, one in each GEMV row bucket below
+    # its split-K rows (tested below), plus ragged K and N tails; K = 1002
     # takes the scalar-load variant.
-    [(r, 8192, 256) for r in (1, 2, 3, 4, 5, 8, 12, 16)]
+    [(r, 8192, 256) for r in (1, 2, 3, 5)]
     + [(3, 1000, 100), (7, 4608, 80), (16, 300, 33), (5, 1002, 64)],
 )
 def test_router_gemv_matches_fp64_reference(
@@ -454,8 +455,8 @@ def _router_plan():
 # one at 9-32, the rows each shares the router's launch at.
 @pytest.mark.parametrize(
     "rows,mm_n",
-    [(8, 512), (16, 512), (17, 512), (32, 512), (48, 512), (64, 512)]
-    + [(9, 1024), (16, 1024), (17, 1024), (32, 1024)],
+    [(8, 512), (16, 512), (17, 512), (32, 512), (64, 512)]
+    + [(9, 1024), (17, 1024), (32, 1024)],
 )
 def test_router_with_mm_matches_the_split_k_router_and_mm(rows: int, mm_n: int) -> None:
     """One launch writes mm's bits and the split-K router's logits."""

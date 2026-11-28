@@ -158,6 +158,18 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
         supports_gluon_mm_a16w16_decode_weight_gfx950 as _supports_decode_weight,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.pipelined import (
+        compile_gluon_mm_a16w16_pipelined_gfx950 as _compile_mm_a16w16_pipelined,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.pipelined import (
+        launch_gluon_mm_a16w16_pipelined_gfx950 as _mm_a16w16_pipelined_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.pipelined import (
+        supports_gluon_mm_a16w16_pipelined_gfx950 as _supports_mm_a16w16_pipelined,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.pipelined import (
+        supports_gluon_mm_a16w16_pipelined_weight_gfx950 as _supports_pipelined_weight,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.skinny import (
         compile_gluon_mm_a16w16_skinny_gfx950 as _compile_mm_a16w16_skinny,
     )
@@ -590,6 +602,47 @@ if platform.is_amd:
             ``[M, N]`` output in ``x``'s dtype.
         """
         return _mm_a16w16_skinny_impl(x, weight, out=out)
+
+    @register_kernel(
+        "gemm",
+        "mv",
+        name="gluon_mm_a16w16_pipelined_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        # Ahead of the split-K decode GEMM, behind the GEMVs: its measured
+        # rows start where theirs end.
+        priority=Priority.SPECIALIZED + 1,
+        traits={
+            "mnk_problem_filter": frozenset({_supports_mm_a16w16_pipelined}),
+            "operands_aligned_16": frozenset({True}),
+            "out_aligned_16": frozenset({True}),
+        },
+    )
+    def gluon_mm_a16w16_pipelined_gfx950(
+        x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``x @ weight.T`` in one whole-K tiled launch on measured shapes.
+
+        A row's bits do not depend on the other rows of the batch.
+
+        Args:
+            x: ``[M, K]`` contiguous bf16 activation, 16-byte aligned.
+            weight: ``[N, K]`` contiguous bf16 weight, 16-byte aligned.
+            out: optional ``[M, N]`` destination, contiguous and 16-byte
+                aligned.
+
+        Returns:
+            ``[M, N]`` output in ``x``'s dtype.
+        """
+        return _mm_a16w16_pipelined_impl(x, weight, out=out)
 
     @register_kernel(
         "gemm",
@@ -2085,6 +2138,34 @@ def warm_gluon_mm_a16w16_skinny(x: torch.Tensor, weight: torch.Tensor) -> None:
     ):
         return
     _compile_mm_a16w16_skinny(weight.detach())
+
+
+def warm_gluon_mm_a16w16_pipelined(x: torch.Tensor, weight: torch.Tensor) -> None:
+    """Compile the gfx950 pipelined GEMM's binary during startup kernel warmup.
+
+    Like :func:`warm_gluon_mm_a16w16_skinny`: the binary depends only on the
+    weight's shape, so warming it on any GEMM that meets the weight keeps
+    compilation out of graph capture and serving. Does nothing outside
+    :func:`~tokenspeed_kernel.ops.tuning.kernel_warmup`, while the current
+    stream is capturing, off gfx950, or for a weight with no pipelined config.
+
+    Args:
+        x: Activations of the encountered GEMM; only their dtype is used.
+        weight: ``[N, K]`` weight of the encountered GEMM.
+    """
+    if not is_warming_up() or not platform.is_cdna4:
+        return
+    if (
+        x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or weight.ndim != 2
+        or not weight.is_cuda
+        or not weight.is_contiguous()
+        or not _supports_pipelined_weight(weight.shape[0], weight.shape[1])
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    _compile_mm_a16w16_pipelined(weight.detach())
 
 
 def warm_gluon_mm_a16w16_decode(x: torch.Tensor, weight: torch.Tensor) -> None:

@@ -27,6 +27,10 @@ from tokenspeed_kernel.ops.gemm import mv_fp8_weight
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
+from tokenspeed.runtime.layers.vocab_parallel_embedding import (
+    UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding,
+)
 from tokenspeed.runtime.utils import set_weight_attrs
 
 # Largest finite E4M3 (float8_e4m3fn) magnitude.
@@ -104,3 +108,40 @@ class Fp8WeightOnlyLinearMethod(LinearMethodBase):
         if bias is not None:
             out = out + bias
         return out
+
+
+class Fp8WeightOnlyLMHead(torch.nn.Module):
+    """A weight-only FP8 copy of a 16-bit vocabulary-parallel LM head.
+
+    Holds this rank's head rows as E4M3 with one FP32 scale per row
+    (:func:`quantize_fp8_weight_rows`) and projects through
+    :class:`Fp8WeightOnlyLinearMethod`, so a ``LogitsProcessor`` takes it
+    like a quantized head: same vocabulary shard geometry, half the weight
+    bytes. A speculative draft projects through it while the target keeps
+    the 16-bit head it was copied from.
+
+    Args:
+        head: The 16-bit, unquantized head to copy.
+    """
+
+    def __init__(self, head: VocabParallelEmbedding) -> None:
+        super().__init__()
+        if not isinstance(head, VocabParallelEmbedding) or not isinstance(
+            head.quant_method, UnquantizedEmbeddingMethod
+        ):
+            raise ValueError(
+                "a weight-only FP8 head copies an unquantized vocabulary-parallel "
+                f"head, got {type(head).__name__}"
+            )
+        if head.weight.dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(
+                f"a weight-only FP8 head copies a 16-bit head, got {head.weight.dtype}"
+            )
+        q, scale = quantize_fp8_weight_rows(head.weight.data)
+        self.weight = Parameter(q, requires_grad=False)
+        self.weight_scale = Parameter(scale, requires_grad=False)
+        self.quant_method = Fp8WeightOnlyLinearMethod()
+        # The shard geometry the logits processor reads, as the source has it.
+        self.shard_indices = head.shard_indices
+        self.num_embeddings_per_partition = head.num_embeddings_per_partition
+        self.org_vocab_size = head.org_vocab_size

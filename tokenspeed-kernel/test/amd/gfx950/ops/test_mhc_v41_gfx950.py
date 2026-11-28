@@ -131,7 +131,8 @@ def _assert_bf16_rounding_equivalent(actual, expected, reference, magnitude) -> 
 
 
 # Above 2048 tokens the post kernel streams with non-temporal accesses.
-@pytest.mark.parametrize("tokens", [1, 6, 192, 641, 2049, 8197])
+# Cached accesses up to 2048 tokens, streaming ones past them.
+@pytest.mark.parametrize("tokens", [1, 641, 2049])
 @pytest.mark.parametrize("hidden", [16, 4096, 5120, 7168])
 def test_gluon_mhc_post_matches_triton_bitwise(tokens: int, hidden: int) -> None:
     hidden_states, residual, post, comb = _post_args(tokens, hidden, seed=tokens)

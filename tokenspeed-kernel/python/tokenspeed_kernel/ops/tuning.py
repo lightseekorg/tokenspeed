@@ -163,6 +163,7 @@ def _reuse_autotune_cache():
         inputs=None,
         *,
         require_profiling_policy: bool = False,
+        profiling_candidates=None,
         validation_profile=None,
     ):
         with tuner._lock:
@@ -181,6 +182,7 @@ def _reuse_autotune_cache():
                     tuning_config,
                     inputs=inputs,
                     require_profiling_policy=require_profiling_policy,
+                    profiling_candidates=profiling_candidates,
                     validation_profile=validation_profile,
                 )
             finally:

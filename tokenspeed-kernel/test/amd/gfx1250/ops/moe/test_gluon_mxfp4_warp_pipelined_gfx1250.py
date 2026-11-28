@@ -249,9 +249,29 @@ PREFILL_CASES = [
 ]
 
 
-@pytest.mark.parametrize("case", PREFILL_CASES, ids=str)
-@pytest.mark.parametrize("down_persistent", [False, True])
-@pytest.mark.parametrize("partitioned", [False, True])
+def _prefill_param(case: Case, down_persistent: bool, partitioned: bool):
+    return pytest.param(
+        case,
+        down_persistent,
+        partitioned,
+        id=f"{partitioned}-{down_persistent}-{case}",
+    )
+
+
+# Every case runs both down kernels. Partitioned LDS only moves where values
+# land, so it alternates rather than doubling the cases; each pair of settings
+# still occurs.
+@pytest.mark.parametrize(
+    "case,down_persistent,partitioned",
+    [
+        _prefill_param(PREFILL_CASES[0], False, False),
+        _prefill_param(PREFILL_CASES[0], True, True),
+        _prefill_param(PREFILL_CASES[1], False, True),
+        _prefill_param(PREFILL_CASES[1], True, False),
+        _prefill_param(PREFILL_CASES[2], False, False),
+        _prefill_param(PREFILL_CASES[2], True, True),
+    ],
+)
 def test_prefill_matches_reference_gfx1250(
     case: Case, down_persistent: bool, partitioned: bool
 ) -> None:

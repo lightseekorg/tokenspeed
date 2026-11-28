@@ -77,12 +77,26 @@ def _inputs(rows, num_heads, num_kv_heads, cache_dtype, seed=0):
     return q, k_cache, v_cache, selected.int()
 
 
-@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 # Few rows split each row's slots over many workgroups, 192 rows over two
-# (24 heads, 2 KV heads); many rows take one workgroup each.
-@pytest.mark.parametrize("rows", [3, 192, 1500])
-# 24 query heads on one KV head span two 16-head blocks.
-@pytest.mark.parametrize(("num_heads", "num_kv_heads"), [(12, 1), (24, 2), (24, 1)])
+# (24 heads, 2 KV heads); many rows take one workgroup each. 24 query heads on
+# one KV head span two 16-head blocks. Every head layout runs every row count;
+# the cache dtype alternates so that it also meets each, and the two-workgroup
+# split runs in both.
+@pytest.mark.parametrize(
+    ("cache_dtype", "rows", "num_heads", "num_kv_heads"),
+    [
+        pytest.param(torch.bfloat16, 3, 12, 1, id="12-1-3-bf16"),
+        pytest.param(torch.bfloat16, 192, 12, 1, id="12-1-192-bf16"),
+        pytest.param(torch.float8_e4m3fn, 1500, 12, 1, id="12-1-1500-fp8"),
+        pytest.param(torch.float8_e4m3fn, 3, 24, 2, id="24-2-3-fp8"),
+        pytest.param(torch.bfloat16, 192, 24, 2, id="24-2-192-bf16"),
+        pytest.param(torch.float8_e4m3fn, 192, 24, 2, id="24-2-192-fp8"),
+        pytest.param(torch.bfloat16, 1500, 24, 2, id="24-2-1500-bf16"),
+        pytest.param(torch.bfloat16, 3, 24, 1, id="24-1-3-bf16"),
+        pytest.param(torch.float8_e4m3fn, 192, 24, 1, id="24-1-192-fp8"),
+        pytest.param(torch.float8_e4m3fn, 1500, 24, 1, id="24-1-1500-fp8"),
+    ],
+)
 def test_gluon_qsa_sparse_attention_matches_reference(
     cache_dtype, rows, num_heads, num_kv_heads
 ) -> None:

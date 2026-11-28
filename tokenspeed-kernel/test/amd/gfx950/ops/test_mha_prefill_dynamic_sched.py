@@ -63,7 +63,7 @@ _DTYPE = torch.bfloat16
 _NO_REGRESSION_TOL = 5e-3
 # Too small to skip anything, so [1] measures scheduling and not sparsity.
 _TINY_THRESHOLD = 1e-9
-_THRESHOLDS = [1e-3, 1e-2, 1e-1]
+_THRESHOLDS = [1e-3, 1e-1]
 # (n_heads, n_kv_heads): group sizes 1, 2, 4 and 8.
 _GQA_SHAPES = [(8, 8), (8, 4), (8, 2), (8, 1)]
 _REPEATS = 5

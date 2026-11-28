@@ -349,7 +349,9 @@ def _spawn(rows: int, source_rows: int, out, present) -> None:
     )
 
 
-@pytest.mark.parametrize("rows", [1, 8, 16])
+# 8 rows: test_ffn_words_past_8_rows_match_the_tagged_pairs runs them (its
+# tagged-pairs launches, against the reference as here).
+@pytest.mark.parametrize("rows", [1, 16])
 def test_moe_tail_combines_projects_and_closes_the_layer(rows: int, tmp_path):
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
@@ -357,7 +359,8 @@ def test_moe_tail_combines_projects_and_closes_the_layer(rows: int, tmp_path):
 
 
 @pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
-@pytest.mark.parametrize("rows", [1, 8, 16])
+# 8 rows: as above, test_ffn_words_past_8_rows_match_the_tagged_pairs_on_two_gpus.
+@pytest.mark.parametrize("rows", [1, 16])
 def test_moe_tail_combines_projects_and_closes_the_layer_on_two_gpus(
     rows: int, present, tmp_path
 ):
@@ -374,7 +377,9 @@ def test_moe_tail_combines_projects_and_closes_the_layer_on_two_gpus(
 
 def test_ffn_words_past_8_rows_match_the_tagged_pairs(tmp_path):
     """16 rows hand ffn to out as words and flags, 8 rows as tagged pairs:
-    two requests of the same 8 rows give each row the 8-row launch's bits."""
+    two requests of the same 8 rows give each row the 8-row launch's bits.
+    Both launches are also checked against the reference (the 8-row case of
+    :func:`test_moe_tail_combines_projects_and_closes_the_layer`)."""
     if torch.cuda.device_count() < WORLD:
         pytest.skip(f"requires {WORLD} GPUs")
     assert moe_tail.ffn_words(16) and not moe_tail.ffn_words(8)

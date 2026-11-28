@@ -95,15 +95,9 @@ class PluginInfo:
 
 _loaded_plugins: dict[tuple[str, str, str, str], PluginInfo] = {}
 _loaded = False
-_deferred_longcat: (
-    tuple[importlib_metadata.EntryPoint, list[Callable[[], None]]] | None
+_deferred_plugins: (
+    tuple[tuple[importlib_metadata.EntryPoint, ...], list[Callable[[], None]]] | None
 ) = None
-# These callbacks have no dependency on LongCat's model or kernel registries.
-_HEADLESS_ENTRY_POINTS = {
-    "longcat": "tokenspeed_longcat:register",
-    "longcat-eval": "tokenspeed_longcat.tracing:register",
-    "pycat": "tokenspeed_metrics_pycat:register",
-}
 # Reentrant: a plugin that builds a ModelConfig while registering re-enters
 # ensure_loaded on the same thread and must observe the _loaded flag instead
 # of deadlocking on the loader lock.
@@ -157,57 +151,52 @@ def _activate_plugin(ep: importlib_metadata.EntryPoint) -> bool:
 
 def _prepare_headless_configuration(
     entries: list[importlib_metadata.EntryPoint],
-) -> None:
-    """Register CLI policies early if all enabled plugins have known dependencies."""
-    global _deferred_longcat
-    names = {ep.name: ep.value for ep in entries}
-    if (
-        len(names) != len(entries)
-        or "longcat" not in names
-        or any(
-            _HEADLESS_ENTRY_POINTS.get(name) != value for name, value in names.items()
-        )
-    ):
-        return
-    kernels = importlib_metadata.entry_points(group="tokenspeed_kernel.plugins")
-    if any(
-        (ep.name, ep.value) != ("longcat", "tokenspeed_longcat.kernels:register")
-        for ep in kernels
-    ):
-        return
+) -> tuple[tuple[importlib_metadata.EntryPoint, ...], list[Callable[[], None]]] | None:
+    """Prepare all enabled plugins only when each opts into lightweight startup.
+
+    A plugin's hook must register its complete argument policy without relying
+    on any runtime or kernel plugin's execution registrations. If any plugin
+    lacks that contract, preserve eager kernel-before-runtime activation for
+    the entire set, including plugins that might depend on each other.
+    """
+    if not entries:
+        return None
 
     from tokenspeed.runtime.plugins.registry import recording
 
-    entry = next(ep for ep in entries if ep.name == "longcat")
     try:
-        register_cli_options = getattr(
-            import_module(entry.module), "register_cli_options", None
-        )
-        if register_cli_options is None:
-            return
+        hooks = [
+            getattr(import_module(ep.module), "register_extra_server_args", None)
+            for ep in entries
+        ]
+        if any(hook is None for hook in hooks):
+            return None
         with recording() as record:
-            register_cli_options()
+            for hook in hooks:
+                hook()
     except Exception:
         logger.warning(
-            "LongCat CLI registration failed; loading the full plugin", exc_info=True
+            "Plugin server argument registration failed; loading plugins eagerly",
+            exc_info=True,
         )
-        return
-    _deferred_longcat = (entry, record.undo)
+        return None
+    return tuple(entries), record.undo
 
 
 def finish_headless_plugins() -> None:
     """Complete the supervisor's registration after independently loading ranks."""
-    global _deferred_longcat
+    global _deferred_plugins
     with _lock:
-        if _deferred_longcat is None:
+        if _deferred_plugins is None:
             return
-        ep, undo = _deferred_longcat
-        _deferred_longcat = None
+        entries, undo = _deferred_plugins
+        _deferred_plugins = None
         for unregister in reversed(undo):
             unregister()
         _discover_kernel_plugins()
-        if not _activate_plugin(ep):
-            raise RuntimeError(f"Deferred plugin {ep.name!r} failed to load")
+        for ep in entries:
+            if not _activate_plugin(ep):
+                raise RuntimeError(f"Deferred plugin {ep.name!r} failed to load")
 
 
 def ensure_loaded(*, headless_config: bool = False) -> list[PluginInfo]:
@@ -227,7 +216,7 @@ def ensure_loaded(*, headless_config: bool = False) -> list[PluginInfo]:
     Returns:
         The runtime plugins loaded in this process.
     """
-    global _loaded
+    global _loaded, _deferred_plugins
     # No unlocked fast path: _loaded is set when loading STARTS, so another
     # thread reading it outside the lock would return with registries still
     # being populated. Other threads block here until the load completes.
@@ -244,17 +233,17 @@ def ensure_loaded(*, headless_config: bool = False) -> list[PluginInfo]:
             key=lambda ep: ep.name,
         )
         if headless_config:
-            _prepare_headless_configuration(
+            _deferred_plugins = _prepare_headless_configuration(
                 [ep for ep in entry_points if ep.name not in disabled]
             )
-        if _deferred_longcat is None:
-            _discover_kernel_plugins()
+        if _deferred_plugins is not None:
+            return list_plugins()
+        _discover_kernel_plugins()
         for ep in entry_points:
             if ep.name in disabled:
                 logger.info(f"Skipping disabled plugin {ep.name!r}")
                 continue
-            if _deferred_longcat is None or ep is not _deferred_longcat[0]:
-                _activate_plugin(ep)
+            _activate_plugin(ep)
     return list_plugins()
 
 

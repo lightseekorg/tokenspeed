@@ -63,6 +63,7 @@ def _check_mix_workspaces_survive_release(
     """Release and resume eager-grown and warmed fused mix workspaces on CUDA."""
     from tokenspeed_kernel.ops.residual import cute_fused
     from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
     from tokenspeed_kernel.selection import kernel_override
 
     from tokenspeed.runtime.layers.hyperconnection import (
@@ -120,12 +121,20 @@ def _check_mix_workspaces_survive_release(
                 mixed, residuals = mixer.mix(hyper_input[:rows], normalized=None)
         return mixed.cpu(), residuals[2].cpu()
 
+    sm107_qwen = (hc_count, hidden_size, lowrank) == (4, 2560, 320) and (
+        current_platform().arch_version == ArchVersion(10, 7)
+    )
+    streaming = cute_fused._SM107_HC_STREAM_GROUPS
+    dims = (hc_count, hidden_size, lowrank, projection_rows)
     expected: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     # Phases: (rows, kernel warmup walks every row count, layouts grow).
     for rows, warm, grows in phases:
         layouts = len(cute_fused._WORKSPACES)
         expected[rows] = forward(rows, warm)
         assert (len(cute_fused._WORKSPACES) > layouts) == grows
+        if sm107_qwen and not warm and cute_fused._streams_in_one_round(rows, *dims):
+            # SM107 grows the streaming layout lazily once it fits one resident round.
+            assert cute_fused._model_tactic(rows, *dims)[-1] == streaming
         tensors = {
             tensor.data_ptr(): tensor
             for workspace in cute_fused._WORKSPACES.values()

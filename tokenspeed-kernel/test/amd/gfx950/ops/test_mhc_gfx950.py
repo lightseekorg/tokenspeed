@@ -31,8 +31,12 @@ if not is_cdna4():
     pytest.skip("AMD CDNA4 is required for the mHC test", allow_module_level=True)
 
 
-@pytest.mark.parametrize("num_tokens", [8, 16, 32, 64])
-@pytest.mark.parametrize("hidden_size", [4096, 7168])
+# Token counts are a runtime argument: counts on and off multiples of 16, and
+# 64 tokens, which at hidden 4096 take the wider reduction block.
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size"),
+    [(8, 4096), (16, 4096), (64, 4096), (8, 7168), (64, 7168)],
+)
 def test_gluon_mhc_pre_multitoken_matches_reference(
     num_tokens: int, hidden_size: int
 ) -> None:
@@ -139,11 +143,13 @@ def _prefill_args(num_tokens: int, hidden_size: int) -> tuple[object, ...]:
     return residual, fn, hc_scale, hc_base, 1e-6, 1e-6, 20
 
 
+# A ragged last token block on each split count (8, 4, 2 and 1 splits) and
+# the largest token count of eight splits.
 @pytest.mark.parametrize(
     ("num_tokens", "hidden_size"),
     [
         (tokens, hidden)
-        for tokens in (257, 1024, 1025, 2048, 2049, 4096, 4097, 8192, 8193)
+        for tokens in (257, 2048, 2049, 4097, 8193)
         for hidden in (4096, 7168)
     ],
 )
@@ -216,9 +222,16 @@ def test_gluon_mhc_prefill_token_count_does_not_recompile() -> None:
             launch(num_tokens)
 
 
-@pytest.mark.parametrize("hidden_size", [4096, 7168])
-@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("strided_weight", [False, True])
+# Each pair of hidden size, weight dtype and weight stride.
+@pytest.mark.parametrize(
+    ("hidden_size", "weight_dtype", "strided_weight"),
+    [
+        (4096, torch.bfloat16, False),
+        (4096, torch.float32, True),
+        (7168, torch.bfloat16, True),
+        (7168, torch.float32, False),
+    ],
+)
 def test_gluon_mhc_prefill_output_normalization(
     hidden_size, weight_dtype, strided_weight
 ) -> None:

@@ -191,14 +191,9 @@ def _workspace_for_plan(
                         "fused CuTe HC workspace is not initialized for CUDA graph "
                         "capture; warm up this workspace layout before capture"
                     )
-                # Ordered BF16/FP16 calls reuse opaque 16-bit storage through
-                # an invocation-typed view. Reducers overwrite every consumed
-                # post-SiLU activation.
                 # Persistent scratch can be reused by calls made outside the
                 # inference-mode context that first warmed this layout.
                 workspace_rows = workers * slot_rows
-                activation_shape = (workspace_rows, lowrank)
-                partials_shape = (workspace_rows, partial_stride * reduction_groups)
                 if workspace_rows * lowrank * 2 > _MAX_LAYOUT_BYTES or (
                     reduction_groups > 1
                     and workspace_rows * partial_stride * reduction_groups * 4
@@ -206,29 +201,53 @@ def _workspace_for_plan(
                 ):
                     raise ValueError("fused CuTe HC workspace exceeds 32-bit offsets")
                 with torch.inference_mode(False), _WORKSPACE_REGION():
-                    activation_storage = torch.empty(
-                        activation_shape, device=device, dtype=torch.int16
+                    workspace = _workspace_tensors(
+                        device,
+                        partial_stride,
+                        workers,
+                        clusters,
+                        grid_clusters,
+                        slot_rows,
+                        lowrank,
+                        reduction_groups,
                     )
-                    partials = (
-                        torch.empty(
-                            partials_shape,
-                            device=device,
-                            dtype=torch.float32,
-                        )
-                        if reduction_groups > 1
-                        else activation_storage
-                    )
-                    epochs = torch.zeros(
-                        2 * workers * grid_clusters
-                        + workers
-                        * (clusters // reduction_groups)
-                        * int(reduction_groups > 1),
-                        device=device,
-                        dtype=torch.int64,
-                    )
-                workspace = (activation_storage, partials, epochs)
                 _WORKSPACES[key] = workspace
     return workspace
+
+
+def _workspace_tensors(
+    device: torch.device,
+    partial_stride: int,
+    workers: int,
+    clusters: int,
+    grid_clusters: int,
+    slot_rows: int,
+    lowrank: int,
+    reduction_groups: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate one layout's activation storage, partials and epochs."""
+    # Ordered BF16/FP16 calls reuse opaque 16-bit storage through
+    # an invocation-typed view. Reducers overwrite every consumed
+    # post-SiLU activation.
+    activation_storage = torch.empty(
+        (workers * slot_rows, lowrank), device=device, dtype=torch.int16
+    )
+    partials = (
+        torch.empty(
+            (workers * slot_rows, partial_stride * reduction_groups),
+            device=device,
+            dtype=torch.float32,
+        )
+        if reduction_groups > 1
+        else activation_storage
+    )
+    epochs = torch.zeros(
+        2 * workers * grid_clusters
+        + workers * (clusters // reduction_groups) * int(reduction_groups > 1),
+        device=device,
+        dtype=torch.int64,
+    )
+    return activation_storage, partials, epochs
 
 
 def _checked(result):
@@ -283,14 +302,44 @@ _SM107_HC_ROW_TILES = (
 _SM107_HC_ONE_ROUND_TILES = (8, 64, 64, 5)
 # Generic tactic that SM107 runs as split-K 16 at 17-64 rows.
 _SM107_S16_GENERIC = (8, 64, 32, 1, 1, 5, 32)
+# Streaming (split_k, M_proj, B_mma, max Down stages); 16 groups imply S1 and M64.
+_SM107_HC_STREAM_TILES = (1, 64, 64, 5)
+_SM107_HC_STREAM_GROUPS = 16
+# Fewest B_mma token tiles at which streaming measured faster than split-K.
+_SM107_HC_STREAM_MIN_TILES = 2
 
 
-def _one_round_rows(projection_rows: int, split_k: int, m: int, n: int) -> int:
-    """Rows one resident round of a split_k x (m, n) plan covers on this stream."""
+def _one_round_rows(
+    projection_rows: int,
+    split_k: int,
+    m: int,
+    n: int,
+    reduction_groups: int,
+    pipelines_per_cta: int,
+) -> int:
+    """Rows that one resident round of a plan covers on this stream.
+
+    Each n-row token tile takes a split_k-CTA cluster per M tile of the
+    projection rows and per reduction group; ``pipelines_per_cta`` groups
+    share a CTA.
+    """
     index = torch.cuda.current_device()
     stream = int(torch.cuda.current_stream(index).cuda_stream)
-    clusters = (projection_rows + m - 1) // m
+    clusters = (projection_rows + m - 1) // m * reduction_groups // pipelines_per_cta
     return n * (_cluster_capacity_hint(index, stream, split_k) // clusters)
+
+
+def _streams_in_one_round(
+    rows: int, hc_count: int, hidden_size: int, lowrank: int, projection_rows: int
+) -> bool:
+    """Whether the SM107 streaming tactic has enough token tiles and one round."""
+    split_k, m, n, _ = _SM107_HC_STREAM_TILES
+    groups = _SM107_HC_STREAM_GROUPS
+    pipes, _, _ = _local_pipeline_parameters(n, hc_count, hidden_size, lowrank, groups)
+    tiles = (rows + n - 1) // n
+    return tiles >= _SM107_HC_STREAM_MIN_TILES and rows <= _one_round_rows(
+        projection_rows, split_k, m, n, groups, pipes
+    )
 
 
 def _tactic(rows: int, projection_rows: int):
@@ -587,8 +636,12 @@ def _up_token_parts_tactic(
 
 @cache
 def _local_pipeline_parameters(
-    token_tile: int, hc_count: int, hidden_size: int, lowrank: int
-):
+    token_tile: int,
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+    reduction_groups: int,
+) -> tuple[int, int, int]:
     """Choose shared and TMEM capacity for finite native tile buckets."""
     if (
         token_tile in (96, 256)
@@ -599,25 +652,30 @@ def _local_pipeline_parameters(
         return 1, 256, 227 * 1024
     if token_tile == 8 and hc_count == 4 and hidden_size == 8192 and lowrank == 1024:
         return 2, 128, 111 * 1024
-    groups = _reduction_groups(hc_count, hidden_size, lowrank)
     branch_tile = min(4, hc_count & -hc_count)
-    if token_tile >= 16 and groups > 1 and branch_tile == hc_count:
+    if token_tile >= 16 and reduction_groups > 1 and branch_tile == hc_count:
         return 2, 128, 111 * 1024
     return 1, 256, 227 * 1024
 
 
 @cache
 def _activation_tactic(
-    hc_count, hidden_size, lowrank, projection_rows, tactic, tile_batches, rows
-):
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+    projection_rows: int,
+    tactic: tuple[int, int, int, int, int, int, int],
+    tile_batches: int,
+    reduction_groups: int,
+) -> tuple[int, int, int, int, int, int, int, bool, bool]:
     """Choose fixed operand lifetimes within the native tactic's shared budget."""
     split_k, m, n, lp, lb, stages, f = tactic
     pipes, up_columns, shared_budget = _local_pipeline_parameters(
-        n, hc_count, hidden_size, lowrank
+        n, hc_count, hidden_size, lowrank, reduction_groups
     )
     reuse = (
         n > 16
-        or _reduction_groups(hc_count, hidden_size, lowrank) > 1
+        or reduction_groups > 1
         or _legacy_up_tactic(hc_count, hidden_size, lowrank, n, split_k)
     )
     if not _AVAILABLE:
@@ -658,13 +716,7 @@ def _activation_tactic(
             projection_rows=projection_rows,
             partial_stride=((projection_rows + 31) // 32) * 32,
             split_k=split_k,
-            reduction_groups=(
-                4
-                if (hc_count, hidden_size, lowrank) == (4, 8192, 1024)
-                and rows > 128
-                and n <= 64
-                else _reduction_groups(hc_count, hidden_size, lowrank)
-            ),
+            reduction_groups=reduction_groups,
             projection_tiles=lp,
             batch_tiles=lb,
             token_tile_batches=tile_batches,
@@ -689,13 +741,7 @@ def _activation_tactic(
                 split_k,
                 m,
                 pipes,
-                (
-                    4
-                    if (hc_count, hidden_size, lowrank) == (4, 8192, 1024)
-                    and rows > 128
-                    and n <= 64
-                    else _reduction_groups(hc_count, hidden_size, lowrank)
-                ),
+                reduction_groups,
                 1,
                 1,
                 lp,
@@ -738,7 +784,7 @@ def _activation_tactic(
         return (*tactic, False, reuse)
     required_weights = (
         min(stages, baseline.up_stages)
-        if n <= 16 and _reduction_groups(hc_count, hidden_size, lowrank) > 1
+        if n <= 16 and reduction_groups > 1
         else baseline.up_stages if n <= 16 else min(2, baseline.up_stages)
     )
     # Streaming ranks benefit from a complete retained activation and a deeper
@@ -762,8 +808,8 @@ def _activation_tactic(
 
 def _model_tactic(
     rows: int, hc_count: int, hidden_size: int, lowrank: int, projection_rows: int
-):
-    """Apply model geometry to the finite native CTA tactics."""
+) -> tuple[int, int, int, int, int, int, int, bool, bool, int]:
+    """Apply model geometry to the finite native CTA tactics and reduction groups."""
     wide_native = (
         hc_count == 4 and hidden_size == 8192 and lowrank == 1024 and 65 <= rows <= 256
     )
@@ -776,9 +822,13 @@ def _model_tactic(
         # S8/N32 keeps this model's token groups in one resident round.
         split_k, n = 8, 32
     measured_dims = (hc_count, hidden_size, lowrank) == (4, 2560, 320)
+    streams = False
     if measured_dims and current_platform().arch_version == ArchVersion(10, 7):
         # Only the generic tactic of a range is replaced, not a forced one.
-        if 16 < rows <= 64 and (split_k, m, n, lp, lb, stages, f) == _SM107_S16_GENERIC:
+        generic_tactic = (
+            16 < rows <= 64 and (split_k, m, n, lp, lb, stages, f) == _SM107_S16_GENERIC
+        )
+        if generic_tactic:
             # Fused HC needs six resident 16-CTA clusters: one S16 round holds 64 rows.
             split_k, n = 16, 32 if rows <= 32 else 64
         for first, last, generic, otherwise in _SM107_HC_ROW_TILES:
@@ -787,12 +837,19 @@ def _model_tactic(
                 and (last is None or rows <= last)
                 and (split_k, m, n, lp, lb, stages, f) == generic
             ):
+                generic_tactic = True
                 one_round = _SM107_HC_ONE_ROUND_TILES
-                if rows <= _one_round_rows(projection_rows, *one_round[:3]):
+                if rows <= _one_round_rows(projection_rows, *one_round[:3], 1, 1):
                     split_k, m, n, stages = one_round
                 elif otherwise is not None:
                     split_k, m, n, stages = otherwise
                 break
+        streams = generic_tactic and _streams_in_one_round(
+            rows, hc_count, hidden_size, lowrank, projection_rows
+        )
+        if streams:
+            # Up then waits per activation K tile instead of one global READY.
+            split_k, m, n, stages = _SM107_HC_STREAM_TILES
     if projection_rows > 6 * m:
         # Four-CTA clusters expose more Up output work at the resident limit.
         # Keep enough independent projection tiles while buffering their K loop.
@@ -806,13 +863,17 @@ def _model_tactic(
         and not wide_native
         else _reduction_groups(hc_count, hidden_size, lowrank)
     )
+    if streams:
+        reduction_groups = _SM107_HC_STREAM_GROUPS
     if wide_native:
         n = 96 if rows <= 96 else 128 if rows <= 128 else 192 if rows <= 192 else 256
         stages = 8 if n == 96 else 6 if n == 128 else 4
     if hc_count == 4 and hidden_size == 8192 and lowrank == 1024 and 16 < rows <= 24:
         # A finite 24-token bucket avoids the eight padded rows of N32.
         n = 24
-    pipes, _, _ = _local_pipeline_parameters(n, hc_count, hidden_size, lowrank)
+    pipes, _, _ = _local_pipeline_parameters(
+        n, hc_count, hidden_size, lowrank, reduction_groups
+    )
     if reduction_groups > 1:
         split_k, m = 1, 64 if pipes > 1 else 128
     k_blocks = (hc_count * hidden_size + 127) // 128
@@ -844,26 +905,37 @@ def _model_tactic(
             and n <= 64
             else 1
         ),
-        rows,
+        reduction_groups,
     )
-    return _down_tactic(hc_count, hidden_size, lowrank, projection_rows, tactic)
+    return (
+        *_down_tactic(
+            hc_count, hidden_size, lowrank, projection_rows, tactic, reduction_groups
+        ),
+        reduction_groups,
+    )
 
 
 @cache
-def _down_tactic(hc_count, hidden_size, lowrank, projection_rows, tactic):
+def _down_tactic(
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+    projection_rows: int,
+    tactic: tuple[int, int, int, int, int, int, int, bool, bool],
+    reduction_groups: int,
+) -> tuple[int, int, int, int, int, int, int, bool, bool]:
     """Pair a larger Down K tile with stages that fit the existing arena."""
     split_k, m, n, lp, lb, stages, f, pin, reuse = tactic
-    groups = _reduction_groups(hc_count, hidden_size, lowrank)
     pipes, up_columns, shared_budget = _local_pipeline_parameters(
-        n, hc_count, hidden_size, lowrank
+        n, hc_count, hidden_size, lowrank, reduction_groups
     )
     if (
         (hc_count == 4 and hidden_size == 8192 and lowrank == 1024 and n > 64)
         or pipes > 1
         or not _AVAILABLE
-        or groups == 1
+        or reduction_groups == 1
         or not reuse
-        or hc_count * hidden_size % (split_k * groups * 256)
+        or hc_count * hidden_size % (split_k * reduction_groups * 256)
     ):
         return tactic
     down_stages = min(stages, 3 if n <= 16 else 2)
@@ -892,7 +964,7 @@ def _down_tactic(hc_count, hidden_size, lowrank, projection_rows, tactic):
         projection_rows=projection_rows,
         partial_stride=((projection_rows + 31) // 32) * 32,
         split_k=split_k,
-        reduction_groups=groups,
+        reduction_groups=reduction_groups,
         projection_tiles=lp,
         batch_tiles=lb,
         token_tile_batches=1,
@@ -917,7 +989,7 @@ def _down_tactic(hc_count, hidden_size, lowrank, projection_rows, tactic):
             split_k,
             m,
             pipes,
-            groups,
+            reduction_groups,
             1,
             1,
             lp,
@@ -964,7 +1036,7 @@ def prefers_fused_hc(rows: int, hc_count: int, hidden_size: int, lowrank: int) -
         # Preserve the existing model's validated automatic row bound.
         return True
     projection_rows = lowrank + hc_count
-    s, m, n, lp, lb, stages, f, pin, reuse = _model_tactic(
+    s, m, n, lp, lb, stages, f, pin, reuse, _ = _model_tactic(
         rows, hc_count, hidden_size, lowrank, projection_rows
     )
     clusters = (projection_rows + m * lp - 1) // (m * lp)
@@ -1184,19 +1256,12 @@ if _AVAILABLE:
             tactic = _model_tactic(
                 rows, hc_count, hidden_size, lowrank, projection_rows
             )
-            split_k, m, n, lp, lb, stages, f, pin, reuse = tactic
+            split_k, m, n, lp, lb, stages, f, pin, reuse, reduction_groups = tactic
             pipes, up_columns, shared_budget = _local_pipeline_parameters(
-                n, hc_count, hidden_size, lowrank
+                n, hc_count, hidden_size, lowrank, reduction_groups
             )
             single_tile = rows <= n and lb == 1 and pipes == 1
             full_tiles = rows % n == 0
-            reduction_groups = (
-                4
-                if (hc_count, hidden_size, lowrank) == (4, 8192, 1024)
-                and rows > 128
-                and n <= 64
-                else _reduction_groups(hc_count, hidden_size, lowrank)
-            )
             token_tile_batches = (
                 2
                 if (hc_count, hidden_size, lowrank) == (4, 8192, 1024)
@@ -1214,7 +1279,6 @@ if _AVAILABLE:
                 hidden_size,
                 lowrank,
                 tactic,
-                reduction_groups,
                 token_tile_batches,
                 single_tile,
                 full_tiles,
@@ -1244,15 +1308,15 @@ if _AVAILABLE:
                 _USE_NATIVE64_DOWN_X_RETENTION,
             )
 
-            def operands_for(kernel):
+            def operands_for(
+                kernel: FusedGatedResidualKernel, launch: bool
+            ) -> tuple[object, ...]:
                 workers = (
                     (rows + n * lb - 1) // (n * lb)
                     if kernel.clusters == 1
                     else kernel.workers
                 )
-                activation_storage, partials, epochs = _workspace_for_plan(
-                    normalized.device,
-                    projection_rows,
+                layout = (
                     kernel.partial_stride,
                     workers,
                     kernel.clusters,
@@ -1260,8 +1324,18 @@ if _AVAILABLE:
                     kernel.slot_rows,
                     lowrank,
                     kernel.reduction_groups,
-                    kernel.split_k,
-                    kernel.projection_tiles,
+                )
+                # Compiles see a transient layout; only launches keep a workspace.
+                activation_storage, partials, epochs = (
+                    _workspace_for_plan(
+                        normalized.device,
+                        projection_rows,
+                        *layout,
+                        kernel.split_k,
+                        kernel.projection_tiles,
+                    )
+                    if launch
+                    else _workspace_tensors(normalized.device, *layout)
                 )
                 values = (
                     normalized.unsqueeze(-1),
@@ -1410,7 +1484,9 @@ if _AVAILABLE:
                     ),
                     up_token_tail_overlap=token_tail_overlap,
                 )
-                compiled = cute_ext.compile(kernel, *operands_for(kernel), stream)
+                compiled = cute_ext.compile(
+                    kernel, *operands_for(kernel, False), stream
+                )
                 return kernel, compiled
 
             def capacity_for(plan_key, plan, validate_grid):
@@ -1505,5 +1581,5 @@ if _AVAILABLE:
                 )
                 capacity_for(round_key, plan, True)
                 kernel, compiled = plan
-            compiled(*operands_for(kernel), stream)
+            compiled(*operands_for(kernel, True), stream)
         return out, inject
