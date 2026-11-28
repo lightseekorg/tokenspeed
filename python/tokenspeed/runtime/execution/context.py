@@ -171,8 +171,10 @@ class ForwardContext:
     global_num_tokens: list[int] | None = None
     global_bs: list[int] | None = None
     global_num_decodes: list[int] | None = None
+    global_decoder_rows: list[int] | None = None
     all_decode_or_idle: bool = False
     all_extend: bool = False
+    all_extend_or_idle: bool = False
     # --- query context parallelism ---
     # The rows this rank computes of a sharded extend forward (its zigzag
     # segments of every request); None means every rank computes every row. ``input_num_tokens``
@@ -235,8 +237,10 @@ class ForwardContext:
         self.global_num_tokens = metadata.global_num_tokens
         self.global_bs = metadata.global_batch_size
         self.global_num_decodes = metadata.global_num_decodes
+        self.global_decoder_rows = metadata.global_decoder_rows
         self.all_decode_or_idle = metadata.all_decode_or_idle
         self.all_extend = metadata.all_extend
+        self.all_extend_or_idle = metadata.all_extend_or_idle
 
 
 @contextmanager

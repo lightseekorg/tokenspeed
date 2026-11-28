@@ -181,6 +181,8 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
     )
     executor._model_input_kwargs = lambda num_tokens, bs, rows: {}
     executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
+    executor.prefill_graph = SimpleNamespace(can_run_idle=lambda ctx: False)
+    executor.dspark_context_producer = None
     executor.drafter = drafter
 
     executor.execute_idle_forward(
@@ -192,6 +194,8 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
             all_decode_or_idle=True,
             all_extend=False,
             need_idle_forward=True,
+            all_extend_or_idle=False,
+            global_decoder_rows=[0, 8],
         )
     )
     return target_calls

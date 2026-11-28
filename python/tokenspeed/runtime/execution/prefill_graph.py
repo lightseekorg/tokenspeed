@@ -53,7 +53,9 @@ decoder-row bucket (``decoder_forward`` from a fixed-row static state). The
 decoder graphs depend only on their row count, so they are shared by every
 token bucket; a forward whose narrowed rows exceed the largest decoder bucket
 runs its decoder stage eager after the encoder replay. Under attention DP the
-narrowed row count is rank-local, so the split graph is disabled there.
+control plane carries every rank's narrowed decoder row count in the existing
+DP gather, so every rank agrees on the encoder bucket, decoder bucket (or
+eager/skip decoder), and idle-rank replay without an extra collective.
 """
 
 from __future__ import annotations
@@ -518,24 +520,7 @@ class PrefillGraph:
                 config.data_parallel_size > 1
                 and model_runner.model_config.is_multimodal_active
             )
-            # The narrowed row count is rank-local (which prompts complete on
-            # this rank), so the decoder bucket -- and the collective shapes
-            # its graph bakes -- would differ across ranks; the stages also
-            # size their collectives from their own rows, which the DP
-            # gather does not carry. Until narrowed counts are exchanged,
-            # the split graph stays off under attention DP.
-            or (config.data_parallel_size > 1 and self._narrowing is not None)
         )
-        if (
-            self._narrowing is not None
-            and config.data_parallel_size > 1
-            and not config.enforce_eager
-            and not config.disable_prefill_graph
-        ):
-            logger.info(
-                "Prefill CUDA graphs disabled: the narrowing prefill model's "
-                "decoder rows are rank-local under attention DP"
-            )
 
         self.decoder_buckets: list[int] = (
             get_decoder_row_buckets(
@@ -914,7 +899,10 @@ class PrefillGraph:
         """
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(
-            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
+            pool=self._pool,
+            stream=stream,
+            handoff_storage=self._handoff_storage,
+            run_segments_while_capturing=True,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -942,6 +930,7 @@ class PrefillGraph:
             pool=self._pool,
             stream=stream,
             handoff_storage=self._encoder_handoff_storage,
+            run_segments_while_capturing=True,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -971,7 +960,10 @@ class PrefillGraph:
         """
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(
-            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
+            pool=self._pool,
+            stream=stream,
+            handoff_storage=self._handoff_storage,
+            run_segments_while_capturing=True,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -984,8 +976,12 @@ class PrefillGraph:
                     )
                 )
             self._reserve_outputs(spec)
+            # Rearm on the capture stream before synchronizing: under DP > 1,
+            # the narrowing stage runs eager EP/TP NCCL collectives whose
+            # background ProcessGroupNCCL event-query callbacks invalidate a
+            # global CUDA stream capture if left in flight across capture_begin.
+            rearm()
         torch.cuda.synchronize()
-        rearm()
         with observer, cap:
             output = self._land_output(
                 CapturedForward(*self._narrowing.decoder_forward(statics, self._ctx))
@@ -1294,6 +1290,8 @@ class PrefillGraph:
         if self.dp_size > 1:
             ctx.global_num_tokens = [num_tokens] * self.config.world_size
             ctx.global_bs = [bs] * self.config.world_size
+            ctx.all_extend = True
+            ctx.all_extend_or_idle = True
         # Every backend gets the same kwargs; V4 reads num_tokens/positions
         # for its packed rows, the others absorb them via **kwargs.
         extra_metadata_kwargs: dict = {
@@ -1373,6 +1371,13 @@ class PrefillGraph:
                     forward_mode=ForwardMode.EXTEND,
                     **extend_kwargs,
                 )
+        if self.dp_size > 1:
+            decoder_rows = (
+                self._narrowing.decoder_rows(ctx)
+                if self._narrowing is not None
+                else num_tokens
+            )
+            ctx.global_decoder_rows = [decoder_rows] * self.config.world_size
         return ctx
 
     # ------------------------------------------------------------------
@@ -1389,6 +1394,44 @@ class PrefillGraph:
         if multimodal_context is not None and self._multimodal_input_embeds is None:
             return False
         return self._replay_bucket(ctx) is not None
+
+    def can_run_idle(self, ctx: ForwardContext) -> bool:
+        """Whether an attention-DP idle rank replays the narrowing prefill graph."""
+        return self._replay_idle_bucket(ctx) is not None
+
+    def replay_idle(self, ctx: ForwardContext) -> None:
+        """Replay the narrowing prefill graph on an idle DP rank (0 real rows).
+
+        Scrubs the static input buffers so every captured encoder segment sees
+        zeroed filler rows, runs the eager narrowing layer with 0 rows to match
+        active peers' collectives, and joins the agreed decoder bucket (or the
+        eager/skip decoder path).
+        """
+        bucket = self._replay_idle_bucket(ctx)
+        assert bucket is not None, "replay_idle() called without can_run_idle()"
+        self._log_engaged_once(bucket, ctx, False)
+        self._input_embeds_buf[:bucket].zero_()
+        self.input_buffers.fill_dummy_decode_buffers(batch_size=0, total_tokens=bucket)
+        live_global_num_tokens = (
+            list(ctx.global_num_tokens)
+            if ctx.global_num_tokens is not None
+            else [0] * self.config.world_size
+        )
+        tracker = self.token_to_kv_pool.layerwise_load_tracker
+        whole_load_waited = tracker is not None and not (
+            self.token_to_kv_pool.layer_accesses_wait_for_load
+            and tracker is self._captured_load_tracker
+        )
+        if whole_load_waited:
+            tracker.wait_for_all_layers()
+        self._replay_narrowed(
+            bucket,
+            ctx,
+            0,
+            live_global_num_tokens=live_global_num_tokens,
+            noted_waits_done=whole_load_waited,
+            is_idle=True,
+        )
 
     def replay(
         self,
@@ -1462,7 +1505,12 @@ class PrefillGraph:
             tracker.wait_for_all_layers()
         if self._narrowing is not None:
             hidden_states, aux_hidden_states = self._replay_narrowed(
-                bucket, ctx, num_tokens, noted_waits_done=whole_load_waited
+                bucket,
+                ctx,
+                num_tokens,
+                live_global_num_tokens=live_global_num_tokens,
+                noted_waits_done=whole_load_waited,
+                is_idle=False,
             )
         else:
             cap, output = self._captures[bucket, None]
@@ -1524,29 +1572,29 @@ class PrefillGraph:
         ctx: ForwardContext,
         num_tokens: int,
         *,
+        live_global_num_tokens: list[int] | None = None,
         noted_waits_done: bool,
+        is_idle: bool,
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
-        """Encoder replay, eager narrowing, decoder replay (or eager decoder).
+        """Encoder replay, eager narrowing, decoder replay (or eager/skip decoder).
 
-        The whole sequence runs under the padded ambient context so the eager
-        breaks and the narrowing stage see the live forward; the narrowing and
-        decoder stages size their own collectives from their row counts. The
-        decoder graph replays with the narrowed row count as its valid rows,
-        so its breaks scrub the static state's padded tail; a row count above
-        the largest decoder bucket runs the decoder stage eager.
-
-        The expert load counters are not told about this path's filler rows:
-        the encoder bucket and the narrowed decoder bucket pad differently,
-        and no model that opts into expert placement narrows.
+        The encoder replay and eager narrowing run under ``_padded_to(ctx, bucket)``
+        so encoder breaks and collectives match the captured token bucket while
+        ``ctx.global_decoder_rows`` stays unpinned for narrowing. The decoder
+        stage then either replays the agreed ``decoder_bucket`` under
+        ``_padded_decoder_to(ctx, decoder_bucket)`` (with ``valid_rows=rows`` so
+        breaks scrub the padded tail) or runs ``decoder_forward`` eagerly on the
+        unpinned live context (skipping decoder layers when every rank has 0
+        decoder rows, or running eager when max decoder rows exceed the ladder).
         """
         model = self._narrowing
         encoder = self._encoders[bucket]
-        if self.dp_size == 1 and self.attn_backend.step_counter is None:
+        if not is_idle and self.dp_size == 1 and self.attn_backend.step_counter is None:
             self.attn_backend.prepare_prefill_metadata(
                 bucket, ctx.bs, ctx.forward_mode, capture=False
             )
-        rows = model.decoder_rows(ctx)
-        decoder_bucket = self._decoder_bucket(rows)
+        rows = 0 if is_idle else model.decoder_rows(ctx)
+        decoder_bucket = self._select_decoder_bucket(ctx, rows)
         route = "decoder graph" if decoder_bucket is not None else "decoder eager"
         if route not in self._engaged_logged:
             self._engaged_logged.add(route)
@@ -1554,26 +1602,77 @@ class PrefillGraph:
                 f"prefill breakable graph {route!s} ENGAGED: bucket={bucket:d} "
                 f"rows={rows:d} decoder_bucket={decoder_bucket!s}"
             )
+        if live_global_num_tokens is None:
+            live_global_num_tokens = (
+                list(ctx.global_num_tokens)
+                if ctx.global_num_tokens is not None
+                else [num_tokens] * self.config.world_size
+            )
+        live_global_decoder_rows = (
+            list(ctx.global_decoder_rows)
+            if ctx.global_decoder_rows is not None
+            else [rows] * self.config.world_size
+        )
         with self._padded_to(ctx, bucket):
+            if self._expert_load_rows is not None:
+                self._expert_load_rows.mark_padded(
+                    padded_global_num_tokens=[bucket] * self.config.world_size,
+                    live_global_num_tokens=live_global_num_tokens,
+                )
             encoder.capture.replay(
                 valid_rows=num_tokens, noted_waits_done=noted_waits_done
             )
+            if self._expert_load_rows is not None:
+                self._expert_load_rows.clear()
             narrowed = model.narrowing_forward(encoder.state, ctx)
             if narrowed.rows != rows:
                 raise RuntimeError(
                     f"prefill narrowing yielded {narrowed.rows} rows; the model "
                     f"reported {rows} for this forward"
                 )
-            if decoder_bucket is None:
-                hidden, captured = model.decoder_forward(narrowed, ctx)
-            else:
-                decoder = self._decoders[decoder_bucket]
-                narrowed.land_into(decoder.statics)
+        if decoder_bucket is None:
+            hidden, captured = model.decoder_forward(narrowed, ctx)
+        else:
+            decoder = self._decoders[decoder_bucket]
+            narrowed.land_into(decoder.statics)
+            with self._padded_decoder_to(ctx, decoder_bucket):
+                if self._expert_load_rows is not None:
+                    self._expert_load_rows.mark_padded(
+                        padded_global_num_tokens=[decoder_bucket]
+                        * self.config.world_size,
+                        live_global_num_tokens=live_global_decoder_rows,
+                    )
                 decoder.capture.replay(
                     valid_rows=rows, noted_waits_done=noted_waits_done
                 )
-                hidden, captured = decoder.output.sliced(rows)
+                if self._expert_load_rows is not None:
+                    self._expert_load_rows.clear()
+            hidden, captured = decoder.output.sliced(rows)
+        if is_idle:
+            return hidden, None
         return model.finish_forward(hidden, list(captured), ctx)
+
+    def _select_decoder_bucket(
+        self, ctx: ForwardContext, local_rows: int
+    ) -> int | None:
+        """Decoder-row bucket agreed across DP ranks, or ``None`` for eager/skip.
+
+        Under attention DP every rank must replay the same decoder bucket (or
+        all take the eager/skip path) so decoder collectives match. Decide from
+        the replicated ``ctx.global_decoder_rows`` gathered on the control plane
+        and fail fast if this rank's local count disagrees with what was
+        published.
+        """
+        if self.dp_size <= 1 or ctx.global_decoder_rows is None:
+            return self._decoder_bucket(local_rows)
+        published = ctx.global_decoder_rows[self.config.global_rank]
+        if published != local_rows:
+            raise RuntimeError(
+                f"prefill decoder rows disagree with DP metadata: rank "
+                f"{self.config.global_rank} computed {local_rows} rows, "
+                f"control plane gathered {published}"
+            )
+        return self._decoder_bucket(max(ctx.global_decoder_rows))
 
     def _decoder_bucket(self, rows: int) -> int | None:
         """Smallest decoder bucket >= ``rows``, or ``None`` to run the decoder eager."""
@@ -1639,6 +1738,15 @@ class PrefillGraph:
         bucket = self._select_bucket(ctx)
         if bucket is None or not self._has_bucket(bucket):
             return None
+        if self._narrowing is not None:
+            # Narrowing models never capture inline (tokens, bs) variants, so
+            # active and idle DP ranks always pick the identical bucket without
+            # consulting rank-local ctx.bs.
+            if self._captures:
+                raise RuntimeError(
+                    "narrowing prefill graphs never capture inline (tokens, bs) variants"
+                )
+            return bucket
         # A full token bucket may have no room for padded native scan slots.
         # Reuse the next existing token bucket; never capture while serving.
         for candidate in sorted(
@@ -1650,6 +1758,23 @@ class PrefillGraph:
         ):
             if self._merged_capture_bs(candidate, ctx) is not None:
                 return candidate
+        return bucket
+
+    def _replay_idle_bucket(self, ctx: ForwardContext) -> int | None:
+        """Captured encoder bucket an attention-DP idle rank replays, or ``None``."""
+        if (
+            self.disable
+            or self._narrowing is None
+            or self.dp_size <= 1
+            or ctx.forward_mode is None
+            or not ctx.forward_mode.is_idle()
+            or ctx.draft_narrowing is not None
+            or ctx.capture_hidden_mode != self._captured_hidden_mode
+        ):
+            return None
+        bucket = self._select_bucket(ctx)
+        if bucket is None or not self._has_bucket(bucket):
+            return None
         return bucket
 
     def _has_bucket(self, bucket: int) -> bool:
@@ -1665,15 +1790,17 @@ class PrefillGraph:
         across ALL ranks, sized from a replicated per-rank token list. The captured
         graph bakes a uniform ``[bucket]*world_size`` layout, so every rank must
         replay the SAME bucket or the collective desyncs (NCCL deadlock). Decide
-        purely from replicated global state -- the all-extend flag and the global
+        purely from replicated global state -- the all-extend (or, for narrowing
+        models, all-extend-or-idle with gathered decoder rows) flag and the global
         max token count -- so all ranks reach the identical decision/bucket with no
-        extra sync (mirrors the decode graph). Idle ranks run a DECODE forward, so
-        ``all_extend`` is False whenever any rank is idle and the graph stays off
-        (e.g. warmup), correctly falling back to eager.
+        extra sync (mirrors the decode graph).
         """
         if self.dp_size <= 1 or ctx.global_num_tokens is None:
             return self._padded_bucket(ctx.input_num_tokens)
-        if not ctx.all_extend:
+        if self._narrowing is not None:
+            if not ctx.all_extend_or_idle or ctx.global_decoder_rows is None:
+                return None
+        elif not ctx.all_extend:
             return None
         return self._padded_bucket(max(ctx.global_num_tokens))
 
@@ -1716,6 +1843,36 @@ class PrefillGraph:
                 yield
         finally:
             ctx.input_num_tokens, ctx.global_num_tokens, ctx.global_bs = saved
+
+    @contextmanager
+    def _padded_decoder_to(self, ctx: ForwardContext, decoder_bucket: int):
+        """Pin ``ctx`` to ``decoder_bucket`` for a captured decoder-stage replay.
+
+        Pins ``global_decoder_rows`` alongside ``global_num_tokens`` so both
+        ordinary and fused EP decoder collectives see the captured uniform
+        ``[decoder_bucket] * world_size`` layout.
+        """
+        saved = (
+            ctx.input_num_tokens,
+            ctx.global_num_tokens,
+            ctx.global_decoder_rows,
+            ctx.global_bs,
+        )
+        ctx.input_num_tokens = decoder_bucket
+        if self.dp_size > 1 and ctx.global_num_tokens is not None:
+            ctx.global_num_tokens = [decoder_bucket] * self.config.world_size
+            ctx.global_decoder_rows = [decoder_bucket] * self.config.world_size
+            ctx.global_bs = [1] * self.config.world_size
+        try:
+            with active_forward(ctx):
+                yield
+        finally:
+            (
+                ctx.input_num_tokens,
+                ctx.global_num_tokens,
+                ctx.global_decoder_rows,
+                ctx.global_bs,
+            ) = saved
 
     def _log_engaged_once(
         self, bucket: int, ctx: ForwardContext, is_multimodal: bool

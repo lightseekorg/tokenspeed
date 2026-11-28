@@ -878,6 +878,7 @@ fn run(
                     dp.num_tokens,
                     dp.batch_sizes,
                     dp.num_extends,
+                    dp.decoder_rows,
                     dp.idle_forward,
                 )
             });
@@ -944,7 +945,12 @@ fn run(
             let ran = plane
                 .call_method1(
                     "idle_forward",
-                    ((dp.num_tokens, dp.batch_sizes, dp.num_extends),),
+                    ((
+                        dp.num_tokens,
+                        dp.batch_sizes,
+                        dp.num_extends,
+                        dp.decoder_rows,
+                    ),),
                 )
                 .map(drop)
                 .map_err(python);

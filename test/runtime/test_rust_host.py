@@ -721,7 +721,7 @@ def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
 
     pending = plane.execute(
         _plan_with_one_request("r1"),
-        ([3, 0], [1, 0], [1, 0], False),
+        ([3, 0], [1, 0], [1, 0], [2, 0], False),
         None,
         None,
         (None, 0),
@@ -731,10 +731,13 @@ def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
     assert plane.complete(pending)[0] == [100]
     (metadata,) = executor.dp_metadata
     assert metadata.global_num_tokens == [3, 0]
+    assert metadata.global_decoder_rows == [2, 0]
     assert metadata.global_forward_mode == [
         int(ForwardMode.EXTEND),
         int(ForwardMode.IDLE),
     ]
+    assert not metadata.all_extend
+    assert metadata.all_extend_or_idle
     assert not metadata.need_idle_forward
     assert executor.idle_forwards == []
 
@@ -747,7 +750,7 @@ def test_an_idle_data_parallel_rank_runs_an_idle_forward(executor):
     assert (
         plane.execute(
             _plan_with_one_request("r1"),
-            ([0, 6], [0, 2], [0, 0], True),
+            ([0, 6], [0, 2], [0, 0], [0, 6], True),
             None,
             None,
             None,
@@ -760,7 +763,17 @@ def test_an_idle_data_parallel_rank_runs_an_idle_forward(executor):
     (metadata,) = executor.idle_forwards
     assert metadata.need_idle_forward
     assert metadata.global_num_decodes == [0, 2]
+    assert metadata.global_decoder_rows == [0, 6]
     assert metadata.all_decode_or_idle
+    assert not metadata.all_extend_or_idle
+
+    # Frozen-round idle_forward carries the gathered decoder rows as well.
+    plane.idle_forward(([0, 128], [0, 1], [0, 1], [0, 64]))
+    idle_extend = executor.idle_forwards[-1]
+    assert idle_extend.need_idle_forward
+    assert idle_extend.global_decoder_rows == [0, 64]
+    assert idle_extend.all_extend_or_idle
+    assert not idle_extend.all_decode_or_idle
 
 
 def test_a_plan_without_a_batch_runs_no_forward(executor):

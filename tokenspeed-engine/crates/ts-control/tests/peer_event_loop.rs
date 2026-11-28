@@ -211,6 +211,7 @@ fn loop_config(in_flight_depth: usize) -> LoopConfig {
         epd_receive_enabled: false,
         eager_grammar: false,
         prefill_delay: None,
+        narrowing_decoder_window: None,
     }
 }
 

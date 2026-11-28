@@ -409,7 +409,9 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
         attention,
         positions,
         hidden,
-        SimpleNamespace(attn_backend=None, forward_mode=object()),
+        SimpleNamespace(
+            attn_backend=None, forward_mode=SimpleNamespace(is_idle=lambda: False)
+        ),
         reduce_output=True,
     )
     assert output.shape == (0, 8)

@@ -534,6 +534,10 @@ class AttentionBackend(CachePoolBinding, ABC):
     # Static CUDA-graph capability of this class; the executor AND-composes
     # it over the target+draft trees (resolve_cuda_graph_support).
     cuda_graph_support: CudaGraphSupport = CudaGraphSupport()
+    # Per-request decoder row cap of a narrowing prefill backend (e.g.
+    # DeepSeek V4.1's ``spec.sliding_window_tokens``); ``None`` when the
+    # backend does not narrow.
+    narrowing_decoder_window: int | None = None
     # This backend forwards each layer's ``sliding_window_size`` to its kernels.
     # Left False, a declared window silently widens to full-history attention.
     supports_layer_sliding_window: bool = False

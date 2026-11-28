@@ -348,6 +348,9 @@ struct HostConfig {
     /// any_interval)` in rounds plus `--prefill-single-round`, when
     /// `--prefill-attempt-interval` is set.
     prefill_delay: Option<PrefillDelay>,
+    /// Per-request decoder row cap for a narrowing prefill model; `None` when
+    /// the model does not narrow.
+    narrowing_decoder_window: Option<usize>,
 }
 
 /// `rust_host.HostConfig.eplb`.
@@ -659,6 +662,17 @@ impl HostConfig {
                         single_round,
                     })
                 }
+            },
+            narrowing_decoder_window: match config
+                .getattr("narrowing_decoder_window")?
+                .extract::<Option<usize>>()?
+            {
+                Some(0) => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "narrowing_decoder_window must be positive or None",
+                    ));
+                }
+                other => other,
             },
             metrics: Metrics::from_python(config)?,
             batch_log: BatchLogConfig {
@@ -1018,6 +1032,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         epd_receive_enabled: config.epd_receive_enabled,
         eager_grammar: config.eager_grammar,
         prefill_delay: config.prefill_delay,
+        narrowing_decoder_window: config.narrowing_decoder_window,
     };
     tracing::info!(
         rank = config.rank,

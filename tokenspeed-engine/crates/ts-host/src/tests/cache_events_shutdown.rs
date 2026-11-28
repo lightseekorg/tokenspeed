@@ -148,6 +148,7 @@ class CpuConfig:
     epd_receive_enabled: bool = False
     eager_grammar: bool = False
     prefill_delay: object = None
+    narrowing_decoder_window: object = None
     metrics_prometheus_dir: object = None
     metrics_relay_endpoint: object = None
     engine_metrics: bool = False
