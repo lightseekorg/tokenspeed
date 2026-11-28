@@ -33,6 +33,7 @@ import time
 import tokenspeed_engine
 
 from tokenspeed.runtime.cache.shared_l2.wire import OwnerConnection
+from tokenspeed.runtime.ipv6 import enable_mooncake_ipv6_for_host
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ def run_provider(
                 f"{library} is missing: a shared L2 provider needs a "
                 "tokenspeed-mooncake build with the TokenSpeed C entry points"
             )
+    enable_mooncake_ipv6_for_host(hostname)
     # The engine host's transfer engine (``ts-mooncake``).
     engine = tokenspeed_engine.TransferEngine(
         library=library,

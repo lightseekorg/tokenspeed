@@ -28,6 +28,8 @@ import os
 import socket
 import warnings
 
+from tokenspeed.runtime.ipv6 import is_valid_ipv6_address  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
 
@@ -54,14 +56,6 @@ def get_free_port():
         with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
             s.bind(("", 0))
             return s.getsockname()[1]
-
-
-def is_valid_ipv6_address(address: str) -> bool:
-    try:
-        ipaddress.IPv6Address(address)
-        return True
-    except ValueError:
-        return False
 
 
 def join_host_port(host: str, port: int | str) -> str:

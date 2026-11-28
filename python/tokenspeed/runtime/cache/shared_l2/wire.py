@@ -52,6 +52,8 @@ class OwnerConnection:
     def __init__(self, address: str, *, timeout_ms: int):
         self._socket = zmq.Context.instance().socket(zmq.REQ)
         self._socket.setsockopt(zmq.LINGER, 0)
+        # Dual-stack REQ so IPv6 and hostname-resolved IPv6 peers connect.
+        self._socket.setsockopt(zmq.IPV6, 1)
         self._socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
         self._socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
         # A timed-out request leaves the socket usable for the next one,
