@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
   "common_parameters": {
-    "model_profile": "qwen38_flash_tp2"
+    "model_profile": "qwen38_flash_tp1"
   },
   "cases": [
     {
-      "id": "qwen38_flash.residual.hyperconnection_mix/decode-bfloat16",
+      "id": "qwen38_flash.residual.hyperconnection_mix/tp1-decode-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
@@ -13,8 +13,13 @@
         "mode": "hyperconnection_mix",
         "parameters": {
           "tokens": [
-            16,
-            64
+            1,
+            4,
+            8,
+            32,
+            64,
+            128,
+            256
           ],
           "inject": [
             true,
@@ -26,7 +31,7 @@
           "dtype": "bfloat16"
         },
         "cold_cache": true,
-        "seed": 5105
+        "seed": 5144
       },
       "policy": {
         "max_regression_relative": 0.08,
@@ -34,14 +39,14 @@
       }
     },
     {
-      "id": "qwen38_flash.residual.hyperconnection_mix/prefill-bfloat16",
+      "id": "qwen38_flash.residual.hyperconnection_mix/tp1-prefill-bfloat16",
       "comparison_epoch": 1,
       "definition": {
         "family": "residual",
         "mode": "hyperconnection_mix",
         "parameters": {
           "tokens": [
-            8192
+            4096
           ],
           "inject": true,
           "hc_count": 4,
@@ -50,7 +55,7 @@
           "dtype": "bfloat16"
         },
         "cold_cache": true,
-        "seed": 5106
+        "seed": 5145
       },
       "policy": {
         "max_regression_relative": 0.05,

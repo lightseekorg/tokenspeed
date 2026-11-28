@@ -65,6 +65,7 @@ _IMPLEMENTED_MODEL_PROFILES = frozenset(
         "glm53_flash_tp4",
         "kimi_k3_tp8",
         "muse_spark_tp8",
+        "qwen38_flash_tp1",
         "qwen38_flash_tp2",
         "beam_fp8_tp4",
     }
