@@ -33,7 +33,11 @@ from tokenspeed_kernel.ops.attention.mha import (
     mha_plan,
     mha_prefill,
 )
-from tokenspeed_kernel.ops.attention.tree import tree_window_attention
+from tokenspeed_kernel.ops.attention.tree import (
+    tree_decode_attention,
+    tree_decode_query_dtype,
+    tree_window_attention,
+)
 from tokenspeed_kernel.ops.layernorm import weightless_rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
 from tokenspeed_kernel.ops.tuning import is_warming_up
@@ -213,6 +217,10 @@ class MHAAttnBackend(PagedAttentionBackend):
             self.draft_block_decode and not self.draft_block_causal
         )
 
+        # Query dtype of the one-pass tree decode per (head dim, sliding), or
+        # None where none serves this cache (see _tree_decode_query_dtype).
+        self._tree_query_dtypes: dict[tuple[int, bool], torch.dtype | None] = {}
+
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
         # The per-forward split schedule (see the class docstring), whether
@@ -275,9 +283,40 @@ class MHAAttnBackend(PagedAttentionBackend):
     ) -> torch.dtype:
         # Decode reads an FP8 cache with FP8 queries. A fresh prefill attends
         # the activation-dtype K/V rows instead, so extend converts its own.
-        if self.is_fp8 and forward_mode.is_decode():
-            return self.kv_cache_dtype
-        return activation
+        # A bound draft tree reads it with the query its tree decode takes
+        # (see _tree_cascade).
+        if not self.is_fp8 or not forward_mode.is_decode():
+            return activation
+        if self.tree_verify is not None or self.tree_lane_step_active:
+            return (
+                self._tree_decode_query_dtype(
+                    layer.qk_head_dim, layer.sliding_window_size >= 0
+                )
+                or activation
+            )
+        return self.kv_cache_dtype
+
+    def _tree_decode_query_dtype(
+        self, head_dim: int, sliding: bool
+    ) -> torch.dtype | None:
+        """The query dtype of the one-pass tree decode (tree_decode_attention)
+        over this cache, or None where none serves it: an MXFP8 cache, a
+        pinned kernel solution without one, or another platform."""
+        key = (head_dim, sliding)
+        if key not in self._tree_query_dtypes:
+            self._tree_query_dtypes[key] = (
+                None
+                if self.is_mxfp8
+                else tree_decode_query_dtype(
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    activation_dtype=self.qkv_dtype,
+                    head_dim=head_dim,
+                    page_size=self.kernel_page_size,
+                    sliding_window=sliding,
+                    solution=self.kernel_solution,
+                )
+            )
+        return self._tree_query_dtypes[key]
 
     # ------------------------------------------------------------------
     # Metadata
@@ -610,14 +649,27 @@ class MHAAttnBackend(PagedAttentionBackend):
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def tree_support(self) -> TreeSupport:
-        if self.kv_cache_dtype == self.qkv_dtype:
+        # The Triton cascade reads model-dtype K/V; the one-pass tree decode
+        # (gfx950 Gluon) also reads a unit-scale FP8 E4M3 cache.
+        if self.kv_cache_dtype == self.qkv_dtype or (
+            self.kv_cache_dtype == torch.float8_e4m3fn
+            and all(
+                self._tree_decode_query_dtype(self.head_dim, sliding) is not None
+                for sliding in (False, True)
+            )
+        ):
             return TreeSupport(verify_blocker=None, draft_blocker=None)
         name = type(self).__name__
+        kv = (
+            f"kv_cache_dtype {self.kv_cache_dtype}{' (MXFP8)' if self.is_mxfp8 else ''}"
+        )
         return TreeSupport(
-            verify_blocker=f"{name} reads the verify window K/V in the model dtype; "
-            f"kv_cache_dtype {self.kv_cache_dtype} is not supported",
-            draft_blocker=f"{name} reads the lane window K/V in the model dtype; "
-            f"kv_cache_dtype {self.kv_cache_dtype} is not supported",
+            verify_blocker=f"{name} reads the verify window K/V in the model dtype, "
+            f"or unit-scale FP8 E4M3 through a tree decode kernel; {kv} is not "
+            "supported here",
+            draft_blocker=f"{name} reads the lane window K/V in the model dtype, "
+            f"or unit-scale FP8 E4M3 through a tree decode kernel; {kv} is not "
+            "supported here",
         )
 
     def _tree_cascade(
@@ -629,11 +681,17 @@ class MHAAttnBackend(PagedAttentionBackend):
         *,
         sinks: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Draft-tree attention (verify nodes or drafting lanes): a causal
-        ``rows``-token pass over the committed prefix with its log-sum-exp,
-        then the tree window and the prefix tail merged into it
-        (``tree_window_attention``); the trtllm leaf's cascade with a portable
-        prefix half.
+        """Draft-tree attention (verify nodes or drafting lanes).
+
+        Where a tree decode kernel serves this cache (gfx950 Gluon), one pass
+        over each request's keys: every row sees the committed prefix and its
+        tree-mask bits of the window (``tree_decode_attention``). It reads an
+        FP8 E4M3 cache under the query dtype query_dtype returned for it.
+
+        Otherwise a causal ``rows``-token pass over the committed prefix with
+        its log-sum-exp, then the tree window and the prefix tail merged into
+        it (``tree_window_attention``); the trtllm leaf's cascade with a
+        portable prefix half.
 
         A sliding-window draft layer sees the window frozen at the round's
         prefix end: each lane decodes the prefix alone (its query placed at the
@@ -647,7 +705,30 @@ class MHAAttnBackend(PagedAttentionBackend):
             )
         if layer.logit_cap:
             raise NotImplementedError("draft trees have no logit-cap path yet")
+        if layer.fp8_kv_scales is not None:
+            raise NotImplementedError(
+                "draft trees read a unit-scale FP8 cache only; per-tensor "
+                "scales have no tree path yet"
+            )
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        q_dtype = self._tree_decode_query_dtype(layer.qk_head_dim, not causal_prefix)
+        if q_dtype is not None:
+            out = tree_decode_attention(
+                # A no-op on the prologue's query (see query_dtype).
+                q.to(q_dtype),
+                k_cache,
+                v_cache,
+                tree.page_table,
+                tree.seq_lens,
+                tree.mask,
+                rows_per_req=tree.rows,
+                window=tree.window,
+                max_seqlen_k=self.max_context_len,
+                window_left=layer.sliding_window_size,
+                sm_scale=layer.scaling,
+                solution=self.kernel_solution,
+            )
+            return out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         if causal_prefix:
             # Pinned to Triton, bypassing selection: its causal mask keeps row r
             # at key P - R + r even when the prefix P is shorter than the R rows

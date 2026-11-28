@@ -18,10 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Draft-tree attention on the portable MHA leaf (the ROCm default;
-docs/design/tree-speculation.md): the Triton causal prefix extend plus
-``tree_window_attention``, reached through the verify and lane dispatch,
-against an fp32 reference."""
+"""Draft-tree attention on the MHA leaf (the ROCm default;
+docs/design/tree-speculation.md), reached through the verify and lane
+dispatch, against an fp32 reference: the one-pass ``tree_decode_attention``
+where a kernel serves the cache (gfx950 Gluon, also over a unit-scale FP8 E4M3
+cache), else the Triton causal prefix decode plus ``tree_window_attention``."""
 
 import os
 import sys
@@ -32,6 +33,9 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
+from tokenspeed_kernel.ops.attention.tree import (  # noqa: E402
+    tree_decode_query_dtype,
+)
 
 from tokenspeed.runtime.execution.drafter.eagle_harness.lanes import (  # noqa: E402
     Eagle4TreeLanes,
@@ -52,9 +56,36 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 PAGE = 64
 HQ, HKV = 16, 4
+# The FP8 E4M3 cases run where a tree decode kernel reads that cache.
+KV_DTYPES = [torch.bfloat16, torch.float8_e4m3fn]
 
 
-def _backend(num_draft_tokens: int, max_bs: int, is_draft: bool, dim: int):
+def _fp8_tree_served(dim: int, sliding: bool) -> bool:
+    return (
+        tree_decode_query_dtype(
+            kv_cache_dtype=torch.float8_e4m3fn,
+            activation_dtype=torch.bfloat16,
+            head_dim=dim,
+            page_size=PAGE,
+            sliding_window=sliding,
+        )
+        is not None
+    )
+
+
+def _require(kv_dtype: torch.dtype, dim: int, sliding: bool = False):
+    if kv_dtype != torch.bfloat16 and not _fp8_tree_served(dim, sliding):
+        pytest.skip(f"no tree decode kernel reads a {kv_dtype} cache here")
+
+
+def _backend(
+    num_draft_tokens: int,
+    max_bs: int,
+    is_draft: bool,
+    dim: int,
+    kv_dtype: torch.dtype = torch.bfloat16,
+    mxfp8: bool = False,
+):
     spec = MHAConfig(
         backend_name="mha",
         num_attention_heads=HQ,
@@ -65,7 +96,8 @@ def _backend(num_draft_tokens: int, max_bs: int, is_draft: bool, dim: int):
     cfg = AttnConfig(
         device="cuda",
         dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype=kv_dtype,
+        kv_cache_mxfp8=mxfp8,
         kernel_page_size=PAGE,
         context_len=2048,
         max_bs=max_bs,
@@ -92,21 +124,33 @@ def _layer(dim: int, sliding_window_size: int = -1):
         scaling=dim**-0.5,
         logit_cap=0.0,
         sliding_window_size=sliding_window_size,
+        fp8_kv_scales=None,
     )
 
 
-def _problem(seq_lens, rows, window, max_pages, gen, dim, poison=None, window_left=-1):
-    """Paged K/V rows for every request's keys, queries, window masks, and the
-    fp32 reference: row r sees the prefix and window key j when bit j % 64 of
-    its mask word j // 64 is set. With ``window_left`` the row decodes at the
-    prefix end and sees only the last ``window_left + 1`` prefix keys."""
+def _problem(
+    seq_lens,
+    rows,
+    window,
+    max_pages,
+    gen,
+    dim,
+    poison=None,
+    window_left=-1,
+    kv_dtype=torch.bfloat16,
+):
+    """Paged K/V rows for every request's keys (stored in ``kv_dtype``),
+    queries, window masks, and the fp32 reference over the stored K/V: row r
+    sees the prefix and window key j when bit j % 64 of its mask word j // 64
+    is set. With ``window_left`` the row decodes at the prefix end and sees
+    only the last ``window_left + 1`` prefix keys."""
     bs = len(seq_lens)
     pages = (max(seq_lens) + PAGE - 1) // PAGE
     table = torch.zeros(bs, max_pages, dtype=torch.int32)
     table[:, :pages] = (torch.randperm(bs * pages, generator=gen) + 1).view(bs, pages)
     rows_shape = ((bs * pages + 1) * PAGE, HKV, dim)
-    k_rows = torch.randn(rows_shape, generator=gen).bfloat16()
-    v_rows = torch.randn(rows_shape, generator=gen).bfloat16()
+    k_rows = torch.randn(rows_shape, generator=gen).to(kv_dtype)
+    v_rows = torch.randn(rows_shape, generator=gen).to(kv_dtype)
     q = torch.randn(bs * rows, HQ, dim, generator=gen).bfloat16()
     words = (window + 63) // 64
     if words == 1:
@@ -169,16 +213,18 @@ def _problem(seq_lens, rows, window, max_pages, gen, dim, poison=None, window_le
     return table.cuda(), q.cuda(), bits.cuda(), pool, ref
 
 
+@pytest.mark.parametrize("kv_dtype", KV_DTYPES)
 @pytest.mark.parametrize("dim", [128, 256])
 @pytest.mark.parametrize("nodes", [4, 16, 64])
-def test_tree_verify_matches_reference(nodes, dim):
+def test_tree_verify_matches_reference(nodes, dim, kv_dtype):
+    _require(kv_dtype, dim)
     gen = torch.Generator().manual_seed(nodes + dim)
     # Long and short committed prefixes, including ones shorter than the window.
     committed = [700, 1, nodes - 2, 130]
     seq_lens = [c + nodes for c in committed]
-    backend = _backend(nodes, max_bs=8, is_draft=False, dim=dim)
+    backend = _backend(nodes, max_bs=8, is_draft=False, dim=dim, kv_dtype=kv_dtype)
     table, q, bits, pool, ref = _problem(
-        seq_lens, nodes, nodes, backend.max_num_pages, gen, dim
+        seq_lens, nodes, nodes, backend.max_num_pages, gen, dim, kv_dtype=kv_dtype
     )
     mask = torch.zeros(8 * nodes, dtype=torch.int64, device="cuda")
     mask[: len(seq_lens) * nodes] = bits
@@ -195,17 +241,26 @@ def test_tree_verify_matches_reference(nodes, dim):
     )
 
 
+@pytest.mark.parametrize("kv_dtype", KV_DTYPES)
 @pytest.mark.parametrize("poison", [None, float("nan")])
 @pytest.mark.parametrize("topk,steps", [(2, 7), (4, 4), (8, 5)])
-def test_tree_lanes_match_reference(topk, steps, poison):
+def test_tree_lanes_match_reference(topk, steps, poison, kv_dtype):
     dim = 128
+    _require(kv_dtype, dim)
     gen = torch.Generator().manual_seed(topk * 10 + steps)
     window = (steps - 1) * topk
     frontier = [700, 1, 3, 130]
     seq_lens = [f + window for f in frontier]
-    backend = _backend(window, max_bs=8, is_draft=True, dim=dim)
+    backend = _backend(window, max_bs=8, is_draft=True, dim=dim, kv_dtype=kv_dtype)
     table, q, bits, pool, ref = _problem(
-        seq_lens, topk, window, backend.max_num_pages, gen, dim, poison
+        seq_lens,
+        topk,
+        window,
+        backend.max_num_pages,
+        gen,
+        dim,
+        poison,
+        kv_dtype=kv_dtype,
     )
     lanes = TreeDraftInputs(topk, steps, 8, torch.device("cuda"))
     backend.bind_tree_draft(lanes)
@@ -224,21 +279,31 @@ def test_tree_lanes_match_reference(topk, steps, poison):
 
 
 # 80 slots: two mask words per row, the second partly used.
-@pytest.mark.parametrize("topk,steps", [(4, 5), (8, 11)])
+@pytest.mark.parametrize("kv_dtype", KV_DTYPES)
+@pytest.mark.parametrize("topk,steps", [(4, 5), (4, 12), (8, 11)])
 @pytest.mark.parametrize("window_left", [-1, 40])
-def test_eagle4_lanes_match_reference(window_left, topk, steps):
+def test_eagle4_lanes_match_reference(window_left, topk, steps, kv_dtype):
     """EAGLE-4 lanes: a sliding-window draft layer decodes each lane row's
     prefix alone (per-row tables), then its window ancestors; windows past 64
     slots read the ancestors from the next mask word."""
     dim = 128
+    _require(kv_dtype, dim, window_left >= 0)
     gen = torch.Generator().manual_seed(window_left + topk * steps)
     window = (steps - 1) * topk
     # Prefixes past, at, and inside the sliding window.
     frontier = [700, 41, 3, 130]
     seq_lens = [f + window for f in frontier]
-    backend = _backend(window, max_bs=8, is_draft=True, dim=dim)
+    backend = _backend(window, max_bs=8, is_draft=True, dim=dim, kv_dtype=kv_dtype)
     table, q, bits, pool, ref = _problem(
-        seq_lens, topk, window, backend.max_num_pages, gen, dim, None, window_left
+        seq_lens,
+        topk,
+        window,
+        backend.max_num_pages,
+        gen,
+        dim,
+        None,
+        window_left,
+        kv_dtype=kv_dtype,
     )
     lanes = Eagle4TreeLanes(
         topk, steps, 8, torch.device("cuda"), slides=window_left >= 0
@@ -261,19 +326,21 @@ def test_eagle4_lanes_match_reference(window_left, topk, steps):
     )
 
 
+@pytest.mark.parametrize("kv_dtype", KV_DTYPES)
 @pytest.mark.parametrize("lane_rows", [False, True], ids=["verify", "lanes"])
-def test_tree_cascade_graph_replay_matches_eager(lane_rows):
+def test_tree_cascade_graph_replay_matches_eager(lane_rows, kv_dtype):
     """One graph captured at the capture seeding replays prefixes of zero,
     short and long length and padding requests: every replay refreshes the
     cascade metadata (the verify prefix lengths, the lane frontiers) in place,
     and its live rows equal an eager forward of the same inputs."""
     dim, graph_bs = 128, 4
+    _require(kv_dtype, dim)
     if lane_rows:
         topk, steps = 4, 5
         rows, window = topk, (steps - 1) * topk
     else:
         rows = window = 16
-    backend = _backend(window, max_bs=8, is_draft=lane_rows, dim=dim)
+    backend = _backend(window, max_bs=8, is_draft=lane_rows, dim=dim, kv_dtype=kv_dtype)
     pages = backend.max_num_pages
     lanes = None
     if lane_rows:
@@ -287,7 +354,7 @@ def test_tree_cascade_graph_replay_matches_eager(lane_rows):
         )
     # The graph reads these buffers; each replay copies a new problem in.
     rows_shape = ((graph_bs * pages + 1) * PAGE, HKV, dim)
-    k_buf = torch.zeros(rows_shape, dtype=torch.bfloat16, device="cuda")
+    k_buf = torch.zeros(rows_shape, dtype=kv_dtype, device="cuda")
     v_buf = torch.zeros_like(k_buf)
     pool = SimpleNamespace(
         get_key_buffer=lambda _: k_buf, get_value_buffer=lambda _: v_buf
@@ -333,7 +400,7 @@ def test_tree_cascade_graph_replay_matches_eager(lane_rows):
         live = len(committed)
         seq_lens = [c + window for c in committed]
         table, q, bits, case_pool, ref = _problem(
-            seq_lens, rows, window, pages, gen, dim
+            seq_lens, rows, window, pages, gen, dim, kv_dtype=kv_dtype
         )
         case_k = case_pool.get_key_buffer(0)
         k_buf.zero_()
@@ -390,29 +457,20 @@ def test_tree_verify_refuses_a_sliding_window_layer():
         backend.forward_decode(q, None, None, _layer(dim, 16), None, pool, bs)
 
 
-def test_tree_support_blocks_an_fp8_cache():
-    """The window kernel reads the cache unscaled, so a scaled FP8 cache has no tree path."""
-    spec = MHAConfig(
-        backend_name="mha",
-        num_attention_heads=HQ,
-        num_kv_heads=HKV,
-        head_dim=128,
-        attn_tp_size=1,
+@pytest.mark.parametrize("kv_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_tree_support_follows_the_fp8_tree_kernel(kv_dtype, mxfp8):
+    """A unit-scale FP8 E4M3 cache has a tree path where a tree decode kernel
+    reads it for the full and sliding layers; E5M2 and MXFP8 never do."""
+    if mxfp8 and kv_dtype != torch.float8_e4m3fn:
+        pytest.skip("MXFP8 stores E4M3")
+    support = _backend(4, 8, False, 128, kv_dtype=kv_dtype, mxfp8=mxfp8).tree_support()
+    served = (
+        kv_dtype == torch.float8_e4m3fn
+        and not mxfp8
+        and _fp8_tree_served(128, False)
+        and _fp8_tree_served(128, True)
     )
-    cfg = AttnConfig(
-        device="cuda",
-        dtype=torch.bfloat16,
-        kv_cache_dtype=torch.float8_e4m3fn,
-        kernel_page_size=PAGE,
-        context_len=2048,
-        max_bs=8,
-        max_resident_requests=8,
-        kv_cache_quant_method="none",
-        speculative_num_steps=3,
-        speculative_num_draft_tokens=4,
-        is_draft=False,
-        components=(spec,),
-    )
-    support = MHAAttnBackend(cfg, spec, kernel_page_size=PAGE).tree_support()
-    assert support.verify_blocker is not None and support.draft_blocker is not None
+    assert (support.verify_blocker is None) == served
+    assert (support.draft_blocker is None) == served
     assert _backend(4, 8, False, 128).tree_support().verify_blocker is None

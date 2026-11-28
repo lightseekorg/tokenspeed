@@ -228,14 +228,39 @@ def test_measurement_counts_rounds_from_the_last_prefill_and_ends_with_eos(
         ),
     ],
 )
-def test_attention_samples_cover_the_context_grid(attention_backend) -> None:
+@pytest.mark.parametrize("kv_cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_attention_samples_cover_the_context_grid(
+    attention_backend, kv_cache_dtype
+) -> None:
+    from tokenspeed_kernel.ops.attention.tree import tree_decode_query_dtype
+
     from tokenspeed.runtime.execution.drafter.eagle_harness.measure_run import (
         attention_samples,
     )
 
     for sliding_window in (0, 256):
+        # An FP8 cache times only where serving reads it in a tree: the mha
+        # leaf's tree decode kernel.
+        served = kv_cache_dtype == torch.bfloat16 or (
+            attention_backend == "mha"
+            and tree_decode_query_dtype(
+                kv_cache_dtype=kv_cache_dtype, activation_dtype=torch.bfloat16,
+                head_dim=128, page_size=64, sliding_window=sliding_window > 0,
+            ) is not None
+        )  # fmt: skip
+        if not served:
+            with pytest.raises(ValueError, match="cache"):
+                attention_samples(
+                    attention_backend=attention_backend, kv_cache_dtype=kv_cache_dtype,
+                    batch_size=2, rows=4, window=16, num_q_heads=8, num_kv_heads=2,
+                    head_dim=128, sliding_window=sliding_window, context_step=64,
+                    context_stop=1024, fast=True, repeat=2, widths=[1, 4],
+                    category="cache_llm",
+                )  # fmt: skip
+            continue
         records = attention_samples(
-            attention_backend=attention_backend, batch_size=2, rows=4, window=16, num_q_heads=8, num_kv_heads=2,
+            attention_backend=attention_backend, kv_cache_dtype=kv_cache_dtype,
+            batch_size=2, rows=4, window=16, num_q_heads=8, num_kv_heads=2,
             head_dim=128, sliding_window=sliding_window, context_step=64,
             context_stop=1024, fast=True, repeat=2, widths=[1, 4],
             category="cache_llm",

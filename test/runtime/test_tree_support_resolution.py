@@ -78,10 +78,15 @@ def _trtllm(kv_cache_dtype=torch.bfloat16):
     return leaf
 
 
-def _mha(cls=MHAAttnBackend, kv_cache_dtype=torch.bfloat16):
+def _mha(cls=MHAAttnBackend, kv_cache_dtype=torch.bfloat16, is_mxfp8=False):
     leaf = object.__new__(cls)
     leaf.kv_cache_dtype = kv_cache_dtype
     leaf.qkv_dtype = torch.bfloat16
+    leaf.is_mxfp8 = is_mxfp8
+    leaf.head_dim = 128
+    leaf.kernel_page_size = 64
+    leaf.kernel_solution = None
+    leaf._tree_query_dtypes = {}
     return leaf
 
 
@@ -158,6 +163,31 @@ def test_mamba2_target_verifies_trees(replay_ssm):
     )
 
 
+@pytest.mark.parametrize("served", [False, True])
+def test_mha_fp8_trees_follow_the_tree_decode_kernel(monkeypatch, served):
+    """An FP8 E4M3 cache has a tree path on the MHA leaf exactly where a
+    tree_decode kernel (the gfx950 Gluon one) reads it, for both the full and
+    the sliding draft layers."""
+    asked = []
+
+    def query_dtype(**kwargs):
+        asked.append(kwargs["sliding_window"])
+        return torch.bfloat16 if served else None
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.layers.attention.backends.paged.mha."
+        "tree_decode_query_dtype",
+        query_dtype,
+    )
+    target = _router(_mha(kv_cache_dtype=torch.float8_e4m3fn))
+    if served:
+        resolve_tree_support(target, _router(_mha(kv_cache_dtype=torch.float8_e4m3fn)))
+        assert sorted(set(asked)) == [False, True]
+    else:
+        with pytest.raises(NotImplementedError, match="verify: .*float8_e4m3fn"):
+            resolve_tree_support(target, _router(_trtllm()))
+
+
 def test_draft_with_linear_layers_is_refused():
     with pytest.raises(NotImplementedError, match="draft: .*linear-attention"):
         resolve_tree_support(_router(_trtllm()), _hybrid(_router(_trtllm()), _mamba()))
@@ -167,8 +197,12 @@ def test_draft_with_linear_layers_is_refused():
     "target, blocker",
     [
         (
-            lambda: _router(_mha(kv_cache_dtype=torch.float8_e4m3fn)),
+            lambda: _router(_mha(kv_cache_dtype=torch.float8_e5m2)),
             "MHAAttnBackend .* kv_cache_dtype",
+        ),
+        (
+            lambda: _router(_mha(kv_cache_dtype=torch.float8_e4m3fn, is_mxfp8=True)),
+            "MHAAttnBackend .* kv_cache_dtype .*MXFP8",
         ),
         (lambda: _router(_mha(QSAAttnBackend)), "QSAAttnBackend has no tree verify"),
         (lambda: _router(_trtllm(torch.float8_e5m2)), "kv_cache_dtype"),

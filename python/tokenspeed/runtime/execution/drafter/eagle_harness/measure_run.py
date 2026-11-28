@@ -24,7 +24,7 @@
         --model <target> --draft-model <EAGLE-4 draft> --run-dir <dir> \\
         --tp-size 4 --compute-intensity chain_intensity --topk 1 \\
         --num-steps 15 --num-draft-tokens 16 --max-bs 8 --mamba-ssm-dtype float32 \\
-        --attention-backend trtllm
+        --attention-backend trtllm --kv-cache-dtype auto
 
 For each sampled batch size the driver writes ``config/measure_config.json``,
 serves that many identical greedy requests on an exec-mode-2 engine (whose
@@ -36,7 +36,7 @@ lanes over the context range with the kernels serving runs
 converge is measured again (three retries).
 
 Serving reads the run directory as its ``--speculative-data-path``, with the
-same draft shape, TP size, attention backends and state dtype.
+same draft shape, TP size, attention backends, KV-cache dtype and state dtype.
 """
 
 from __future__ import annotations
@@ -52,7 +52,11 @@ from tokenspeed_kernel.ops.attention.mha import mha_decode_with_kvcache
 from tokenspeed_kernel.ops.attention.mha.flashinfer import (
     trtllm_batch_decode_with_kv_cache,
 )
-from tokenspeed_kernel.ops.attention.tree import tree_window_attention
+from tokenspeed_kernel.ops.attention.tree import (
+    tree_decode_attention,
+    tree_decode_query_dtype,
+    tree_window_attention,
+)
 
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
     check_chain_measure_shape,
@@ -76,6 +80,8 @@ from tokenspeed.runtime.layers.attention.backends.paged.trtllm import (
 )
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import TRTLLM_MHA_PAGE_SIZE
 
+# The KV-cache dtype each --kv-cache-dtype stores (fp8_e4m3 at unit scale).
+_KV_CACHE_DTYPES = {"auto": torch.bfloat16, "fp8_e4m3": torch.float8_e4m3fn}
 # Tokens a measured request may emit; the engine ends the batch with an EOS well before.
 _MAX_NEW_TOKENS = 1024
 _WORKSPACE_BYTES = 256 << 20
@@ -91,6 +97,7 @@ _PROMPT = (
 def attention_samples(
     *,
     attention_backend: str,
+    kv_cache_dtype: torch.dtype,
     batch_size: int,
     rows: int,
     window: int,
@@ -111,7 +118,9 @@ def attention_samples(
     its ``window``-key tree window. The prefix half is the one
     ``attention_backend`` serves with: ``trtllm`` the trtllm-gen decode,
     ``mha`` the Triton decode, with the sliding-window lanes folded into it as
-    query heads (``MHAAttnBackend._tree_cascade``).
+    query heads (``MHAAttnBackend._tree_cascade``). Where a ``tree_decode``
+    kernel serves the cache (``mha`` on gfx950), serving and this timing run
+    it instead: one pass over the prefix and the window.
 
     Serving forwards all ``rows`` whatever the round's width, so one timing
     per context stands for every swept width.
@@ -132,11 +141,13 @@ def attention_samples(
     k_rows = torch.randn(
         (num_pages * page, num_kv_heads, head_dim), device=device, dtype=dtype
     )
-    v_rows = torch.randn_like(k_rows)
-
     if attention_backend not in ("trtllm", "mha"):
         raise ValueError(f"no tree cascade timing for {attention_backend!r}")
     trtllm = attention_backend == "trtllm"
+    if trtllm and kv_cache_dtype != dtype:
+        raise ValueError("the trtllm tree cascade times a model-dtype cache only")
+    k_rows = k_rows.to(kv_cache_dtype)
+    v_rows = torch.randn_like(k_rows, dtype=dtype).to(kv_cache_dtype)
 
     def paged(rows_: torch.Tensor) -> torch.Tensor:
         cache = rows_.view(-1, page, num_kv_heads, head_dim)
@@ -155,6 +166,20 @@ def attention_samples(
     workspace = torch.zeros(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
     scale = head_dim**-0.5
     causal = sliding_window <= 0
+    tree_q_dtype = (
+        None
+        if trtllm
+        else tree_decode_query_dtype(
+            kv_cache_dtype=kv_cache_dtype,
+            activation_dtype=dtype,
+            head_dim=head_dim,
+            page_size=page,
+            sliding_window=not causal,
+        )
+    )
+    if tree_q_dtype is None and kv_cache_dtype != dtype:
+        # The cascade's prefix decode reads the cache in the query's dtype.
+        raise ValueError(f"no tree decode kernel serves a {kv_cache_dtype} cache")
     # Row r sees its path's window keys: a chain for verify rows, one ancestor per depth for lanes.
     if causal:
         bits = [(1 << (r + 1)) - 1 for r in range(rows)]
@@ -246,6 +271,14 @@ def attention_samples(
             )
 
         def layer() -> torch.Tensor:
+            if tree_q_dtype is not None:
+                return tree_decode_attention(
+                    q.to(tree_q_dtype), k_cache, v_cache, page_table, seq_lens, mask,
+                    rows_per_req=rows, window=window,
+                    max_seqlen_k=context_stop + window,
+                    window_left=-1 if causal else sliding_window - 1,
+                    sm_scale=scale,
+                )  # fmt: skip
             out, lse = prefix_half()
             return tree_window_attention(
                 q, k_rows, v_rows, page_table, seq_lens, mask, out, lse,
@@ -334,7 +367,8 @@ def measure_batch(args, engine, input_ids, batch_size, target_cfg, draft_cfg) ->
          (d_heads, d_kv_heads, d_head_dim), d_window),
     ):  # fmt: skip
         records = attention_samples(
-            attention_backend=args.attention_backend, batch_size=batch_size, rows=rows, window=window,
+            attention_backend=args.attention_backend,
+            kv_cache_dtype=_KV_CACHE_DTYPES[args.kv_cache_dtype], batch_size=batch_size, rows=rows, window=window,
             num_q_heads=shape[0] // tp, num_kv_heads=max(1, shape[1] // tp),
             head_dim=shape[2], sliding_window=sliding, context_step=args.context_step,
             context_stop=args.context_stop, fast=args.fast, repeat=repeat,
@@ -379,6 +413,12 @@ def main(argv: list[str] | None = None) -> None:
         required=True,
         choices=["trtllm", "mha"],
         help="the target's and draft's attention backend, as serving runs it",
+    )
+    parser.add_argument(
+        "--kv-cache-dtype",
+        required=True,
+        choices=sorted(_KV_CACHE_DTYPES),
+        help="the target's and draft's KV-cache dtype, as serving runs it",
     )
     parser.add_argument(
         "--compute-intensity",
@@ -449,6 +489,7 @@ def main(argv: list[str] | None = None) -> None:
             "--model", args.model, "--attn-tp-size", str(args.tp_size),
             "--dtype", "bfloat16", "--max-model-len", str(max_model_len),
             "--max-num-seqs", str(args.max_bs), "--attention-backend", args.attention_backend,
+            "--kv-cache-dtype", args.kv_cache_dtype,
             "--sampling-backend", "greedy", "--disable-kvstore",
             "--speculative-algorithm", "EAGLE4",
             "--speculative-draft-model-path", args.draft_model,
