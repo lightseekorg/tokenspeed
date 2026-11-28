@@ -3979,13 +3979,15 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         # past the fused paths' rows takes another layout). Two rows is the
         # fewest that take the GEMM rather than the one-row GEMV, so one
         # two-row GEMM a weight shape, inside the scope, compiles the tiles
-        # those kernels warm for that weight.
+        # those kernels warm for that weight. A replicated projection (the
+        # post-expert one) and the Q/K/V/gate projection reach mm the same way
+        # at verify row counts, and the warm forwards may project them only
+        # through the owned-row layout, which does not call mm.
         projection_shapes = set()
         for layer in self.model.layers:
             for projection in (layer.mlp.pre_expert_proj, layer.mlp.post_expert_proj):
-                if (
-                    not isinstance(projection, _MuseGatheredLinear)
-                    or projection.workspace is None
+                if not isinstance(projection, _MuseGatheredLinear) or (
+                    projection.workspace is None and not projection.replicated
                 ):
                     continue
                 weight = projection._local_weight()
@@ -3993,6 +3995,16 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                     continue
                 projection_shapes.add(tuple(weight.shape))
                 projection.warm_local_gemm()
+        for layer in self.model.layers:
+            qkv = layer.self_attn.qkv_proj
+            if not isinstance(qkv, QKVOGateParallelLinear):
+                continue
+            weight = qkv._local_weight()
+            if tuple(weight.shape) in projection_shapes:
+                continue
+            projection_shapes.add(tuple(weight.shape))
+            with kernel_warmup(enabled=True):
+                qkv(weight.new_zeros((2, weight.shape[1])))
         # Each layer's router shares a launch with its pre-expert columns at
         # few rows (MuseSparkMoE's gather, RMSNorm and top-k path); compile
         # that launch for every row count it serves, once a weight shape.

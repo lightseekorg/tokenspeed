@@ -2860,8 +2860,8 @@ def test_gathered_projection_warmup_covers_its_gemms(
     After its local-GEMM warm-up, its GEMM at any row count compiles no decode
     or skinny GEMM binary: the pre-expert projection's [1024, 8192] columns at
     TP4 (the decode GEMM at 9-32 rows, with another config from 17 rows, and
-    the skinny GEMM at 33-128) and [512, 8192] at TP8 (the decode GEMM
-    only)."""
+    the skinny GEMM at 33-128) and [512, 8192] at TP8 (the decode GEMM up to
+    64 rows and the skinny GEMM at 65-128)."""
     import importlib.util
     from pathlib import Path
 
@@ -2899,6 +2899,70 @@ def test_gathered_projection_warmup_covers_its_gemms(
 
     def project(rows: int) -> None:
         linear._project(torch.randn(rows, hidden, device="cuda"), weight, None)
+
+    helpers.assert_warmup_covers(
+        (
+            mm.gluon_mm_a16w16_medium_gfx950,
+            skinny.gluon_mm_a16w16_skinny_gfx950,
+            skinny.gluon_mm_a16w16_skinny_reduce_gfx950,
+        ),
+        linear.warm_local_gemm,
+        project,
+        range(2, 129),
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4, reason="the skinny BF16 GEMM is gfx950-only"
+)
+@pytest.mark.parametrize("ranks", [4, 8])
+def test_replicated_post_expert_warmup_covers_its_gemms(
+    monkeypatch: pytest.MonkeyPatch, bf16_default_dtype, ranks: int
+) -> None:
+    """The replicated post-expert projection's warm-up covers its GEMMs.
+
+    The projection has no gather workspace, and the communication runtime
+    warms it like a gathered one: after that, its [8192, 4096] GEMM at any
+    row count up to 128 compiles no decode or skinny GEMM binary (the skinny
+    GEMM takes 49-73 rows)."""
+    import importlib.util
+    from pathlib import Path
+
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import mm, skinny
+
+    helper_path = (
+        Path(__file__).resolve().parents[3] / "tokenspeed-kernel/test/utils.py"
+    )
+    spec = importlib.util.spec_from_file_location("kernel_test_utils", helper_path)
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+
+    monkeypatch.setattr(
+        module.process_group_manager, "get_device_process_group", lambda group: group
+    )
+    monkeypatch.setattr(module.KimiK3LatentDownOp, "initialize", lambda **kwargs: None)
+    hidden, latent = 8192, 4096
+    with torch.device("cuda"):
+        linear = module._MuseGatheredLinear(
+            input_size=latent,
+            output_size=hidden,
+            prefix="model.layers.0.mlp.post_expert_proj",
+            tp_rank=1,
+            tp_size=ranks,
+            tp_group=tuple(range(ranks)),
+            layer_id=0,
+            layer_count=2,
+            replicate_for_owned_rows=False,
+            workspace_rows=module._GATHER_WORKSPACE_ROWS,
+        )
+    with torch.no_grad():
+        linear.weight.normal_(std=latent**-0.5)
+    assert linear.replicated and linear.workspace is None
+    weight = linear._local_weight()
+    assert tuple(weight.shape) == (hidden, latent)
+
+    def project(rows: int) -> None:
+        linear._project(torch.randn(rows, latent, device="cuda"), weight, None)
 
     helpers.assert_warmup_covers(
         (

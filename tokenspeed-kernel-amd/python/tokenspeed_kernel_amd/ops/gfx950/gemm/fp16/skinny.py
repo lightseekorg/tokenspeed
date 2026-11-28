@@ -424,6 +424,16 @@ class _SkinnyConfig(NamedTuple):
 _SKINNY_CONFIGS: dict[tuple[int, int], _SkinnyConfig] = {
     # An 8192-wide hidden state projected to a quarter of a 4096-wide latent.
     (1024, 8192): _SkinnyConfig(split_k=16, num_xcds=8, first_m=33, last_m=128),
+    # Muse Spark at TP8. 512 columns of that latent: below 65 rows the
+    # projection shares the MoE router's launch, which writes mm's bits.
+    (512, 8192): _SkinnyConfig(split_k=16, num_xcds=8, first_m=65, last_m=128),
+    # A rank's packed Q/K/V/output-gate projection (16 query heads, 2 KV heads
+    # and the gate, head_dim 64). From 64 rows hipBLASLt is as fast.
+    (2304, 8192): _SkinnyConfig(split_k=4, num_xcds=4, first_m=31, last_m=63),
+    # The 4096-wide latent back to the hidden state. Below 49 rows the medium
+    # Gluon GEMM and hipBLASLt are as fast; from 74 rows the tuned BLAS
+    # solution (_hipblaslt/configs) is.
+    (8192, 4096): _SkinnyConfig(split_k=2, num_xcds=4, first_m=49, last_m=73),
 }
 
 
