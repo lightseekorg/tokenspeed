@@ -5291,7 +5291,6 @@ def test_v41_moe_static_placement_and_slot_swap_parity(monkeypatch):
             with torch.no_grad():
                 moe.gate.weight.copy_(gate_weight)
                 moe.gate.e_score_correction_bias.copy_(bias)
-            moe.experts.supports_precomputed_topk = True
             moe.expert_dispatch_info = ExpertLocationDispatchInfo.init_new(
                 layer_id=0,
                 ep_dispatch_algorithm="static",
