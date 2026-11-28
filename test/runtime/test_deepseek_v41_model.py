@@ -5079,16 +5079,22 @@ def test_v41_moe_fused_router_and_capture_guard(monkeypatch):
         def is_cuda(self) -> bool:
             return True
 
+    class _FakeGate(nn.Module):
+        def __init__(self, weight: torch.Tensor):
+            super().__init__()
+            self.weight = weight
+            self.e_score_correction_bias = torch.zeros(4)
+            self.bias_vl = torch.ones(4)
+            self.tid2eid = None
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return torch.matmul(hidden_states, self.weight.t())
+
     def _make_moe(router_topk: str):
         moe = v41.DeepseekV41MoE.__new__(v41.DeepseekV41MoE)
         nn.Module.__init__(moe)
         gate_w = torch.randn(4, 256, dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
-        moe.gate = SimpleNamespace(
-            weight=gate_w,
-            e_score_correction_bias=torch.zeros(4),
-            bias_vl=torch.ones(4),
-            tid2eid=None,
-        )
+        moe.gate = _FakeGate(gate_w)
         moe.experts = SimpleNamespace(supports_precomputed_topk=True)
         moe.topk = v4.DeepseekV4TopK(
             top_k=2,
@@ -5217,7 +5223,6 @@ def test_v41_moe_fused_router_parity(monkeypatch):
         moe.gate.weight.copy_(gate_weight)
         moe.gate.e_score_correction_bias.copy_(bias)
         moe.gate.bias_vl = nn.Parameter(bias_vl, requires_grad=False)
-    moe.experts.supports_precomputed_topk = True
 
     for mask in (None, img_mask):
         moe.topk.topk_config.router_topk = "fused"
