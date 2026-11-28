@@ -30,6 +30,8 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_subgroup_any,
     _iris_wait_lamport_slots,
     iris_lamport_twoshot_ag_push,
+    iris_lamport_twoshot_clear_phase,
+    iris_lamport_twoshot_rs_push,
     iris_lamport_twoshot_rs_wait_reduce,
 )
 from tokenspeed_kernel.platform import current_platform
@@ -505,6 +507,313 @@ def iris_fused_lamport_allreduce_muse_attntail(
     # memory wait is needed.
     gl.barrier()
     gl.store(epoch, (stage + 1) % 3)
+
+
+# ---------------------------------------------------------------------------
+# TP4 Lamport two-shot all-reduce + boundary, past the one-shot boundary's rows
+# ---------------------------------------------------------------------------
+
+# BF16 elements a lane moves in a two-shot tile (64 lanes x 2 = 128 elements).
+_TWOSHOT_VECTOR = gl.constexpr(2)
+
+
+@gluon.jit
+def _iris_muse_twoshot_send_tiles(
+    input_ptr,
+    region_sym_ptr,
+    sender_epochs,
+    regions,
+    sender,
+    ROWS,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    WIDTH: gl.constexpr,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Push one sender's tiles through the two-shot, as its tile programs do.
+
+    Sender s covers shard-local elements [s * 128 * NUM_WARPS, ...) of every
+    shard, one 128-element tile a subgroup, and runs the two-shot tile's
+    steps unchanged (at TP4 the FP32 sum (r0 + r1) + (r2 + r3), one BF16
+    rounding). It also stores the reduced tile in this rank's own all-gather
+    slot, which this rank's finishers poll like a peer's. It stores no output,
+    never waits for the all-gather, and restores only the reduce-scatter
+    markers it consumed.
+    """
+    NUM_STAGES: gl.constexpr = 3
+    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, _TWOSHOT_VECTOR], [64, 1], [NUM_WARPS, 1], [0, 1]
+    )
+    pack = sender * (64 * NUM_WARPS) + gl.arange(
+        0, 64 * NUM_WARPS, layout=gl.SliceLayout(1, layout)
+    )
+    element = gl.arange(0, _TWOSHOT_VECTOR, layout=gl.SliceLayout(0, layout))
+    offsets = pack[:, None] * _TWOSHOT_VECTOR + element[None, :]
+    shard = (ROWS // WORLD_SIZE) * WIDTH
+    epoch = sender_epochs + sender
+    stage = gl.load(epoch).to(gl.uint32).to(gl.uint64) % NUM_STAGES
+    # chunks[delta] is this rank's part of shard (RANK + delta) % WORLD_SIZE.
+    chunks = ()
+    for delta in gl.static_range(WORLD_SIZE):
+        owner = (RANK + delta) % WORLD_SIZE
+        source = input_ptr + owner * shard.to(gl.int64)
+        chunks += (
+            _iris_sanitize_lamport_bf16(gl.amd.cdna4.buffer_load(source, offsets)),
+        )
+    iris_lamport_twoshot_rs_push(
+        chunks[1:],
+        regions,
+        stage,
+        offsets,
+        None,
+        sender,
+        RANK,
+        WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
+        PEER_SIGNAL_STORE_CACHE,
+    )
+    valid = gl.full([64 * NUM_WARPS], True, gl.int1, gl.SliceLayout(1, layout))
+    reduced = iris_lamport_twoshot_rs_wait_reduce(
+        region_sym_ptr,
+        stage,
+        chunks[0],
+        offsets,
+        valid,
+        RANK,
+        WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
+        layout,
+    )
+    iris_lamport_twoshot_ag_push(
+        reduced,
+        regions,
+        stage,
+        offsets,
+        None,
+        sender,
+        RANK,
+        WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
+        PEER_SIGNAL_STORE_CACHE,
+    )
+    # A local publication: write-through, as stores into the local heap are.
+    gl.amd.cdna4.buffer_store(
+        reduced,
+        region_sym_ptr + stage * (2 * PHASE) + PHASE + RANK * MAX_SHARD_ELEMENTS,
+        offsets,
+        cache=".wt",
+    )
+    iris_lamport_twoshot_clear_phase(
+        region_sym_ptr, stage, offsets, 0, RANK, WORLD_SIZE, MAX_SHARD_ELEMENTS
+    )
+    # Every subgroup has used its stage before the barrier.
+    gl.barrier()
+    gl.store(epoch, ((stage + 1) % NUM_STAGES).to(gl.int32))
+
+
+@gluon.jit
+def _iris_muse_twoshot_finish_row(
+    region_sym_ptr,
+    stream_ptr,
+    alpha_ptr,
+    beta_ptr,
+    pre_weight_ptr,
+    out_stream_ptr,
+    pre_fp32_ptr,
+    pre_bf16_ptr,
+    finisher_epochs,
+    row,
+    ROWS,
+    WORLD_SIZE: gl.constexpr,
+    WIDTH: gl.constexpr,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    MAX_LOCAL_ROWS: gl.constexpr,
+    POST_EPS: gl.constexpr,
+    PRE_EPS: gl.constexpr,
+    PRE_WEIGHT_OFFSET: gl.constexpr,
+    ELEMENTS_PER_THREAD: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Wait for one reduced row in the all-gather slots, then apply the boundary.
+
+    Row r = owner * ROWS / WORLD_SIZE + slot_row lies in shard owner, so it
+    is row slot slot_row of all-gather source owner. The poll reads 32-bit
+    words past every cache (peers' and this rank's write-through stores);
+    thread t's words are the boundary layout's elements of thread t.
+    """
+    NUM_STAGES: gl.constexpr = 3
+    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
+    WORDS_PER_THREAD: gl.constexpr = ELEMENTS_PER_THREAD // 2
+    THREADS: gl.constexpr = 64 * NUM_WARPS
+    local_rows = ROWS // WORLD_SIZE
+    owner = row // local_rows
+    slot_row = row % local_rows
+    epoch = finisher_epochs + owner * MAX_LOCAL_ROWS + slot_row
+    stage = gl.load(epoch).to(gl.uint32).to(gl.uint64) % NUM_STAGES
+    layout: gl.constexpr = gl.BlockedLayout(
+        [ELEMENTS_PER_THREAD], [64], [NUM_WARPS], [0]
+    )
+    columns = gl.arange(0, WIDTH, layout=layout)
+    # Row bases in int64; the in-row offsets stay int32.
+    row_base = row.to(gl.int64) * WIDTH
+    # Overlap the residual and coefficient reads with the wait.
+    stream, alpha, beta, pre_weight = _iris_muse_attntail_inputs(
+        stream_ptr + row_base, alpha_ptr, beta_ptr, pre_weight_ptr, 0, columns, WIDTH
+    )
+    slot = (
+        region_sym_ptr
+        + stage * (2 * PHASE)
+        + PHASE
+        + owner * MAX_SHARD_ELEMENTS
+        + slot_row * WIDTH
+    )
+    words_ptr = gl.multiple_of(slot.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
+    words_layout: gl.constexpr = gl.BlockedLayout(
+        [1, WORDS_PER_THREAD], [64, 1], [NUM_WARPS, 1], [1, 0]
+    )
+    thread = gl.arange(0, THREADS, layout=gl.SliceLayout(1, words_layout))
+    word = gl.arange(0, WORDS_PER_THREAD, layout=gl.SliceLayout(0, words_layout))
+    word_offsets = thread[:, None] * WORDS_PER_THREAD + word[None, :]
+    # Each subgroup polls on its own (no workgroup barrier in the loop).
+    # Payloads never hold negative zero, so a word is empty exactly when its
+    # high half is 0x8000.
+    words = gl.amd.cdna4.buffer_load(words_ptr, word_offsets, cache=".cv")
+    empty = gl.max(((words >> 16) == 0x8000).to(gl.int32), 1)
+    while _iris_subgroup_any(empty):
+        words = gl.amd.cdna4.buffer_load(words_ptr, word_offsets, cache=".cv")
+        empty = gl.max(((words >> 16) == 0x8000).to(gl.int32), 1)
+    low = (words & 0xFFFF).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+    high = (words >> 16).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+    branch = gl.convert_layout(gl.reshape(gl.join(low, high), [WIDTH]), layout)
+    _iris_muse_attntail(
+        branch.to(gl.float32),
+        stream,
+        alpha,
+        beta,
+        pre_weight,
+        None,
+        out_stream_ptr + row_base,
+        pre_fp32_ptr + row_base,
+        pre_bf16_ptr + row_base,
+        0,
+        columns,
+        WIDTH,
+        POST_EPS,
+        0.0,
+        PRE_EPS,
+        PRE_WEIGHT_OFFSET,
+        False,
+    )
+    # Restore the consumed all-gather markers (low half +0, high half -0:
+    # 0x80000000). Write-through stores reach memory before the launch ends,
+    # and peers rewrite this slot only three uses later.
+    gl.amd.cdna4.buffer_store(
+        gl.full([THREADS, WORDS_PER_THREAD], 0x80000000, gl.uint32, words_layout),
+        words_ptr,
+        word_offsets,
+        cache=".wt",
+    )
+    gl.barrier()
+    gl.store(epoch, ((stage + 1) % NUM_STAGES).to(gl.int32))
+
+
+@gluon.jit(do_not_specialize=["ROWS"])
+def iris_fused_lamport_twoshot_muse_attntail(
+    input_ptr,
+    region_sym_ptr,
+    stream_ptr,
+    alpha_ptr,
+    beta_ptr,
+    pre_weight_ptr,
+    out_stream_ptr,
+    pre_fp32_ptr,
+    pre_bf16_ptr,
+    sender_epochs,
+    finisher_epochs,
+    regions,
+    ROWS,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    WIDTH: gl.constexpr,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    MAX_LOCAL_ROWS: gl.constexpr,
+    POST_EPS: gl.constexpr,
+    PRE_EPS: gl.constexpr,
+    PRE_WEIGHT_OFFSET: gl.constexpr,
+    ELEMENTS_PER_THREAD: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Reduce [ROWS, WIDTH] BF16 rows with the TP4 two-shot, then apply the boundary.
+
+    The boundary is Muse's attention boundary on every row. This is bitwise
+    equivalent to iris_lamport_twoshot_bf16_allreduce followed by
+    _post_norm_residual_pre_norm_kernel without a post-norm weight. With
+    ROWS % WORLD_SIZE == 0 each shard of the two-shot is whole rows.
+
+    Grid (2 * ROWS,): senders [0, ROWS) run _iris_muse_twoshot_send_tiles;
+    finishers [ROWS, 2 * ROWS), one per row, run
+    _iris_muse_twoshot_finish_row. Senders never wait on finishers, and
+    workgroups dispatch in order, so every sender is dispatched before any
+    finisher spins.
+
+    region_sym_ptr / regions: this rank's [3][2][WORLD_SIZE][MAX_SHARD_ELEMENTS]
+    mailbox region and every rank's address of it, used by no other kernel.
+    sender_epochs[s] and finisher_epochs[owner][slot_row] advance once in
+    each launch that uses them. A launch uses a row slot's senders and its
+    WORLD_SIZE finishers together, so their stages stay equal without either
+    reading the other's.
+    """
+    gl.static_assert(WORLD_SIZE == 4)
+    gl.static_assert(WIDTH == ELEMENTS_PER_THREAD * 64 * NUM_WARPS)
+    # ROWS senders cover every shard: a shard of ROWS / WORLD_SIZE rows is
+    # ROWS sender spans of _TWOSHOT_VECTOR * 64 * NUM_WARPS elements.
+    gl.static_assert(WIDTH == WORLD_SIZE * _TWOSHOT_VECTOR * 64 * NUM_WARPS)
+    gl.static_assert(MAX_SHARD_ELEMENTS == MAX_LOCAL_ROWS * WIDTH)
+    # Region offsets are int32.
+    gl.static_assert(3 * 2 * WORLD_SIZE * MAX_SHARD_ELEMENTS < 2**31)
+    program = gl.program_id(0)
+    if program < ROWS:
+        _iris_muse_twoshot_send_tiles(
+            input_ptr,
+            region_sym_ptr,
+            sender_epochs,
+            regions,
+            program,
+            ROWS,
+            RANK,
+            WORLD_SIZE,
+            WIDTH,
+            MAX_SHARD_ELEMENTS,
+            NUM_WARPS,
+            PEER_SIGNAL_STORE_CACHE,
+        )
+    else:
+        _iris_muse_twoshot_finish_row(
+            region_sym_ptr,
+            stream_ptr,
+            alpha_ptr,
+            beta_ptr,
+            pre_weight_ptr,
+            out_stream_ptr,
+            pre_fp32_ptr,
+            pre_bf16_ptr,
+            finisher_epochs,
+            program - ROWS,
+            ROWS,
+            WORLD_SIZE,
+            WIDTH,
+            MAX_SHARD_ELEMENTS,
+            MAX_LOCAL_ROWS,
+            POST_EPS,
+            PRE_EPS,
+            PRE_WEIGHT_OFFSET,
+            ELEMENTS_PER_THREAD,
+            NUM_WARPS,
+        )
 
 
 # ---------------------------------------------------------------------------

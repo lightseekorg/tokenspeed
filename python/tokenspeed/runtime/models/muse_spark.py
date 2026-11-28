@@ -3022,6 +3022,10 @@ class MuseSparkDecoderLayer(nn.Module):
                 pre_norm = self.pre_feedforward_layernorm
                 post_norm = self.post_attention_layernorm
                 alpha, beta = self.post_attention_residual_gate._gate_coefficients()
+                # Not a registry dispatch: the fused all-reduce + boundary
+                # kernels exchange through mailboxes on the Iris symmetric
+                # heap, which only the prepared state sizes and owns, so the
+                # state picks the kernel.
                 if iris is not None and iris.can_all_reduce_symmetric_boundary(
                     attention_output,
                     hidden_states,
