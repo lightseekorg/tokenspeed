@@ -569,14 +569,11 @@ Padding rows still pass through the MoE layers, and under attention DP every
 rank's filler is interleaved with the real rows in the all-gathered MoE
 input. The expert load counters (`--expert-distribution-recorder-mode stat`)
 therefore read a device-side live-row mask (`ExpertLoadRowMask`, one
-`[max_rows]` bool buffer reserved before the first forward, paired with a
-local-rank `[max_rows]` bool buffer exposed via `.local_view()` for all-to-all
-EP routers such as DeepEP, Gluon Petit, and DeepGEMM MegaMoE that route only
-this rank's post-attention rows) that the graph owners mark from the host's
-padded/live counts before a padded replay — the decode graph in
-`ForwardStepRunner`, the bucket in `PrefillGraph.replay` — and clear right
-after it, on the same stream. Eager forwards are unpadded and read the
-all-True mask; the router counts a route if and only if its row is marked.
+`[max_rows]` bool buffer reserved before the first forward) that the graph
+owners mark from the host's padded/live counts before a padded replay — the
+decode graph in `ForwardStepRunner`, the bucket in `PrefillGraph.replay` —
+and clear right after it, on the same stream. Eager forwards are unpadded
+and read the all-True mask; the router counts a route if and only if its row is marked.
 
 DeepGEMM MegaMoE also routes no experts for the filler rows of a padded
 decode replay. `ForwardStepRunner` writes the replay's live and padded
@@ -595,9 +592,7 @@ per-stream barrier stays off the ordinary allocator pool, and capturing on an
 uninitialized stream fails closed. Inputs are padded to canonical warmed power-of-two
 buckets (`1`, `16..65536`, warmed upfront via `mega_gate_warmup_token_counts` up
 to `65536`; unchunked batches above `65536` fall back cleanly to the unfused
-router) so arbitrary serving batch sizes never compile new `bf16_mega_gate` cubins. Under static all-to-all EP, it reads
-`partial_logical_to_rank_dispatch_physical_map.unsqueeze(-1)` with `count=1`
-so fused and unfused paths select identical per-rank physical replicas. Direct
+router) so arbitrary serving batch sizes never compile new `bf16_mega_gate` cubins. Direct
 `mega_mhc -> symm_buffer` activation staging only fires on uncaptured forwards
 where `mega_mhc` runs (eager prefill); `PrefillGraph` (`BreakableCapture`) and
 decode CUDA graphs do not invoke `mega_mhc` and continue staging activations

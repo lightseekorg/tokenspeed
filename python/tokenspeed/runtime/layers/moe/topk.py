@@ -80,10 +80,6 @@ class ExpertLocationDispatchInfo:
     # (num_logical_experts,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
-    # All-ones [num_logical_experts] replica counts pairing with
-    # ``partial_logical_to_rank_dispatch_physical_map.unsqueeze(-1)`` so
-    # fused static all-to-all routers pick the exact per-rank replica.
-    static_replica_counts: torch.Tensor | None
     # Rank-agnostic replica tables for replicated-input EP; None under
     # all-to-all EP, where the per-rank static map applies.
     replica_dispatch: ExpertDispatch | None
@@ -137,11 +133,6 @@ class ExpertLocationDispatchInfo:
             partial_logical_to_all_physical_map=replicas,
             partial_logical_to_all_physical_map_num_valid=num_replicas,
             num_physical_experts=expert_location_metadata.num_physical_experts,
-            static_replica_counts=(
-                expert_location_metadata.static_replica_counts
-                if static and all_to_all_ep
-                else None
-            ),
             replica_dispatch=(
                 ExpertDispatch(replicas, num_replicas)
                 if static and not all_to_all_ep
@@ -150,11 +141,7 @@ class ExpertLocationDispatchInfo:
             load=(
                 LayerExpertLoad(
                     expert_location_metadata.physical_load[layer_id],
-                    (
-                        expert_location_metadata.load_rows.local_view()
-                        if all_to_all_ep
-                        else expert_location_metadata.load_rows
-                    ),
+                    expert_location_metadata.load_rows,
                 )
                 if expert_location_metadata.physical_load is not None
                 else None
