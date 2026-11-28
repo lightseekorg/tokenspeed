@@ -1,0 +1,42 @@
+api_version: ci.tokenspeed.io/v1
+# EAGLE-4 speculative decoding of Qwen3.8-27B on one MI355 GPU with the MHA
+# attention backend, in three modes served one after another: a static chain
+# (top-k 1, 7 steps, 8 draft tokens), a static tree (top-k 4, 5 steps, 16 draft
+# tokens) and EAGLE-Harness (exec mode 0, top-k 4, 12 steps, 16 draft tokens).
+# The harness cost table is measured first on the same GPU for batch sizes up
+# to 8 (about 6 minutes), since it depends on the GPU and the kernels.
+#
+# Each mode serves 16 prompts with 8 requests in flight, so the JIT compile and
+# data-plane sync checks see batched draft, verify and commit rounds. The task
+# fails when a request fails or a mode's mean acceptance length is below 1.5.
+name: server-smoke-qwen3.8-27b-eagle4-mi355
+type: server_smoke
+workflow_stage: unit-test
+triggers:
+  - per-commit
+  - manual
+# The modules the target model (qwen3_5*, qwen3_vision) and the EAGLE-4 draft
+# model (llama, nemotron_h, through llama_eagle4 and llama_eagle3) import.
+# Changes to EAGLE draft modules (shared) and to code outside models/ always
+# run this task; only PRs changing nothing but other models' modules skip it.
+model_sources:
+  - python/tokenspeed/runtime/models/llama.py
+  - python/tokenspeed/runtime/models/nemotron_h.py
+  - python/tokenspeed/runtime/models/qwen3_5.py
+  - python/tokenspeed/runtime/models/qwen3_5_moe.py
+  - python/tokenspeed/runtime/models/qwen3_vision.py
+runner:
+  labels:
+    - amd-mi355-1gpu
+# Non-blocking until runs on the CI runners confirm it.
+optional: true
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+smoke:
+  command: >-
+    python3 test/eagle4_serving/eagle4_check.py smoke
+    --out-dir .ci-artifacts/published/eagle4-smoke
+report:
+  github_step_summary: true

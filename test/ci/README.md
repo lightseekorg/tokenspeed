@@ -105,6 +105,37 @@ confirm it. The benchmark
 writes per-request records under
 `.ci-artifacts/published/gsm8k-single-request`.
 
+Three optional tasks cover EAGLE-4 speculative decoding of Qwen3.8-27B on one
+MI355 GPU with the MHA attention backend
+(`test/eagle4_serving/eagle4_check.py`). Each serves three modes:
+
+- static chain (top-k 1, 7 steps, 8 draft tokens);
+- static tree (top-k 4, 5 steps, 16 draft tokens);
+- EAGLE-Harness (`--speculative-exec-mode 0`, top-k 4, 12 steps, 16 draft
+  tokens).
+
+EAGLE-Harness needs a cost table measured on the serving hardware. The table
+for the full batch range is too large to keep in the repository. The script
+therefore runs `eagle_harness.measure_run --fast` for batch sizes up to the
+server's `--max-num-seqs` (8) first, which takes about six minutes. The
+measurement retries a batch whose timings stay unstable, so it needs a GPU no
+other job is using.
+
+- The server smoke task sends 16 chat prompts to each mode, eight at a time,
+  and fails when a request fails or a mode's mean acceptance length is below
+  1.5.
+- The greedy parity eval decodes the same prompts with each mode and without
+  speculation, and compares tokens up to the first difference. A difference
+  passes as a numerical tie in either of two cases:
+  - the reference server's logprobs of the two tokens differ by at most 0.13;
+  - when the target model recomputes that position in fp32, the mode's token is
+    the argmax or within 2 bf16 ulps of the reference token.
+- The perf task serves EAGLE-Harness and sends 64 GSM8K questions one at a time
+  and then four at a time. It requires an accuracy of at least 0.90, and the
+  server log's mean acceptance length must stay at or above 6.0.
+  `perf_reference` gates the per-request decode rate. The reference is the
+  median of three runs on an MI355X, rounded down.
+
 The long-context performance report accepts both current EvalScope metrics
 (`Avg TPOT (ms)`, `Avg Decoded Tok/Iter`) and their older names. Missing or
 invalid TPOT fails collection instead of producing a zero-throughput report.

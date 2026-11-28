@@ -1,0 +1,75 @@
+api_version: ci.tokenspeed.io/v1
+# Decode speed and acceptance length of EAGLE-4 EAGLE-Harness (exec mode 0,
+# top-k 4, 12 steps, 16 draft tokens) for Qwen3.8-27B on one MI355 GPU with
+# the MHA attention backend. The managed server measures the harness cost
+# table for batch sizes up to 8 first (about 6 minutes), then serves.
+#
+# The benchmark sends the first 64 GSM8K test questions (greedy, thinking off)
+# one at a time, then four at a time, and fails below 0.90 accuracy (0.953 on
+# an MI355X). perf_reference gates each run's decode rate; it is the median of
+# three runs on an MI355X, rounded down. A drafter or verify change that
+# lowers acceptance lowers the rate too. The mean acceptance length over all
+# requests is read from the server log and must stay at or above 6.0 (7.37 on
+# an MI355X).
+name: perf-qwen3.8-27b-eagle4-harness-gsm8k-mi355
+type: perf
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+# The modules the target model (qwen3_5*, qwen3_vision) and the EAGLE-4 draft
+# model (llama, nemotron_h, through llama_eagle4 and llama_eagle3) import.
+# Changes to EAGLE draft modules (shared) and to code outside models/ always
+# run this task; only PRs changing nothing but other models' modules skip it.
+model_sources:
+  - python/tokenspeed/runtime/models/llama.py
+  - python/tokenspeed/runtime/models/nemotron_h.py
+  - python/tokenspeed/runtime/models/qwen3_5.py
+  - python/tokenspeed/runtime/models/qwen3_5_moe.py
+  - python/tokenspeed/runtime/models/qwen3_vision.py
+runner:
+  labels:
+    - amd-mi355-1gpu
+# Non-blocking until later runs confirm perf_reference.
+optional: true
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    python3 test/eagle4_serving/eagle4_check.py serve
+    --mode harness
+    --out-dir .ci-artifacts/published/eagle4-perf
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/single-request-bench && python3 -m uv pip install --python /tmp/single-request-bench/bin/python 'huggingface_hub==2.3.0' 'pyarrow==26.0.0'
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/single-request-bench/bin/python -I test/single_request_benchmark/gsm8k_decode.py
+    --base-url http://127.0.0.1:8000
+    --model Qwen/Qwen3.8-27B
+    --config qwen3.8-27b-eagle4-harness
+    --num-prompts 64
+    --concurrency 1 4
+    --max-tokens 1024
+    --chat-template-kwargs '{"enable_thinking": false}'
+    --min-accuracy 0.90
+    --num-gpus 1
+    --timeout-s 600
+    --output .ci-artifacts/published/gsm8k-eagle4-harness/requests.jsonl
+    && python3 test/eagle4_serving/eagle4_check.py accept-length
+    --server-log .ci-artifacts/server.log
+    --min-accept-length 6.0
+report:
+  github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Throughput (tps/gpu)].
+perf_reference:
+  1: [397, 354]
+  4: [317, 1030]
