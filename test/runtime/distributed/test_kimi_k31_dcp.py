@@ -143,7 +143,12 @@ def _prepare_value_tail():
         "gloo", group, dist.new_group(backend="gloo")
     )
     comm.prepare_decode_exchange(
-        group, 120, value_heads=_HEADS, decode_rows=64, float_words=True
+        group,
+        120,
+        value_heads=_HEADS,
+        decode_rows=64,
+        float_words=True,
+        float_row_bytes=None,
     )
     return mock.patch.object(
         DcpValueTail, "__call__", autospec=True, side_effect=DcpValueTail.__call__

@@ -56,9 +56,41 @@ logger = logging.getLogger(__name__)
 # exchanges up to 64 rows (eight requests of eight tokens) fit; larger ones,
 # and prefill's, keep the generic collectives, which win from about this size.
 DECODE_EXCHANGE_CAP_BYTES = 1 << 20
-# Largest per-rank gather of float words: the owned decode top-k's scores and
-# query rider at 64 requests of eight tokens.
+# Default per-rank float-word gather cap when the caller does not supply a
+# per-row byte bound (the owned decode top-k's scores and query rider at 64
+# requests of eight tokens).
 DECODE_FLOAT_EXCHANGE_CAP_BYTES = 8 << 20
+# Upper bound when sizing the float-word gather workspace dynamically from
+# decode_rows * float_row_bytes: covers high-concurrency KVP=8 decode (e.g.
+# bs=128, width=6..8 with FP8 KV) while bounding symmetric memory to 256 MiB
+# per rank at KVP=8 (2 * 8 * 16 MiB) and deferring larger gathers to NCCL.
+DECODE_FLOAT_EXCHANGE_MAX_BYTES = 16 << 20
+
+
+def decode_float_exchange_cap_bytes(
+    decode_rows: int, *, float_row_bytes: int | None
+) -> int:
+    """Per-rank float-word gather capacity for a KVP group's decode exchange.
+
+    Args:
+        decode_rows: Most rows of one decode forward.
+        float_row_bytes: Per-rank float-word bytes gathered per decode row
+            (owned top-k scores plus any query rider), or None to retain
+            ``DECODE_FLOAT_EXCHANGE_CAP_BYTES``.
+
+    Returns:
+        A 16-byte-aligned capacity in ``[16, DECODE_FLOAT_EXCHANGE_MAX_BYTES]``.
+    """
+    if float_row_bytes is None:
+        return DECODE_FLOAT_EXCHANGE_CAP_BYTES
+    if decode_rows <= 0 or float_row_bytes <= 0:
+        raise ValueError(
+            "decode float exchange sizing requires positive decode_rows and "
+            f"float_row_bytes, got {decode_rows} and {float_row_bytes}"
+        )
+    needed = (decode_rows * float_row_bytes + 15) // 16 * 16
+    return min(needed, DECODE_FLOAT_EXCHANGE_MAX_BYTES)
+
 
 # Each KVP group's fused decode value tail, when prepared.
 _VALUE_TAILS: dict[tuple[int, ...], DcpValueTail] = {}
@@ -84,6 +116,7 @@ def prepare_decode_exchange(
     value_heads: int | None,
     decode_rows: int,
     float_words: bool,
+    float_row_bytes: int | None,
 ) -> bool:
     """Collectively prepare the KVP group's one-hop exchange of small payloads.
 
@@ -103,10 +136,16 @@ def prepare_decode_exchange(
         decode_rows: Most rows of one decode forward.
         float_words: Whether a decode gathers float words; without, no float
             workspace is allocated.
+        float_row_bytes: Optional per-rank float-word bytes gathered per decode
+            row; when supplied with ``float_words=True``, sizes the float
+            workspace to ``decode_rows * float_row_bytes`` up to
+            ``DECODE_FLOAT_EXCHANGE_MAX_BYTES``.
 
     Returns:
         Whether the group exchanges through it.
     """
+    if not float_words and float_row_bytes is not None:
+        raise ValueError("float_row_bytes requires float_words=True")
     timeout_ns = int((timeout_s - 30 if timeout_s >= 90 else timeout_s / 2) * 1e9)
     if value_heads is not None and group not in _VALUE_TAILS:
         tail = create_dcp_value_tail(
@@ -119,14 +158,20 @@ def prepare_decode_exchange(
         )
         if tail is not None:
             _VALUE_TAILS[group] = tail
-    float_cap = DECODE_FLOAT_EXCHANGE_CAP_BYTES if float_words else 0
+    float_cap = (
+        decode_float_exchange_cap_bytes(decode_rows, float_row_bytes=float_row_bytes)
+        if float_words
+        else 0
+    )
     prepared = prepare_small_exchange(
         group, DECODE_EXCHANGE_CAP_BYTES, float_cap, timeout_ns
     )
     if torch.distributed.get_rank() == group[0]:
+        float_info = f" and {float_cap >> 10} KiB float words" if float_cap else ""
         logger.info(
-            f"KVP group {group} exchanges up to {DECODE_EXCHANGE_CAP_BYTES >> 10} KiB "
-            f"per rank {'in one hop' if prepared else 'through its collectives'}"
+            f"KVP group {group} exchanges up to {DECODE_EXCHANGE_CAP_BYTES >> 10} KiB"
+            f"{float_info} per rank "
+            f"{'in one hop' if prepared else 'through its collectives'}"
         )
     return prepared
 

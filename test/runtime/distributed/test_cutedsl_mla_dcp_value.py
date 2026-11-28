@@ -117,7 +117,12 @@ def _prepare_value_tail(group: tuple[int, ...], rows: int) -> None:
         "gloo", group, dist.new_group(backend="gloo")
     )
     comm.prepare_decode_exchange(
-        group, 120, value_heads=_HEADS, decode_rows=rows, float_words=False
+        group,
+        120,
+        value_heads=_HEADS,
+        decode_rows=rows,
+        float_words=False,
+        float_row_bytes=None,
     )
 
 
