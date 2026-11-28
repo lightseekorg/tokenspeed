@@ -68,6 +68,7 @@ fn shared(native: &NativeLibrary) -> Shared {
         deferred: false,
         interval_fields: vec![],
         metadata_ready: Condvar::new(),
+        incast: IncastConfig::default(),
     }
 }
 

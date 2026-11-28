@@ -492,6 +492,160 @@ struct Shared {
     interval_fields: Vec<Option<BTreeSet<String>>>,
     /// Signaled when a layerwise room's bootstrap payload arrives.
     metadata_ready: Condvar,
+    /// RoCE many-to-one full-transfer incast pacing knobs, parsed at startup.
+    incast: IncastConfig,
+}
+
+/// Default RoCE many-to-one pacing target in gigabytes per second (GB/s = 1e9
+/// bytes/s; 6.0 GB/s ≈ 48 Gb/s on a 100 Gb/s RoCE NIC).
+const DEFAULT_INCAST_PACE_GBYTES_PER_SEC: f64 = 6.0;
+const DEFAULT_INCAST_MIN_STAGGER_US: u64 = 2_000;
+const MAX_INCAST_PER_RANK_US: u64 = 50_000;
+const INCAST_SLEEP_SLICE: Duration = Duration::from_millis(5);
+
+#[derive(Debug, Clone, Copy)]
+struct IncastConfig {
+    /// Optional pacing rate override in GB/s (gigabytes per second, 1e9 bytes/s).
+    /// `Some(0.0)` disables pacing; `None` uses `DEFAULT_INCAST_PACE_GBYTES_PER_SEC` on RoCE.
+    pace_gbytes_per_sec_override: Option<f64>,
+    min_stagger_us: u64,
+}
+
+impl Default for IncastConfig {
+    fn default() -> Self {
+        Self {
+            pace_gbytes_per_sec_override: None,
+            min_stagger_us: DEFAULT_INCAST_MIN_STAGGER_US,
+        }
+    }
+}
+
+impl IncastConfig {
+    fn parse_values(
+        pace_gbytes_per_sec_raw: Option<&str>,
+        min_stagger_us_raw: Option<&str>,
+    ) -> Result<Self, String> {
+        let pace_gbytes_per_sec_override = match pace_gbytes_per_sec_raw {
+            None => None,
+            Some(raw) => {
+                let parsed = raw.trim().parse::<f64>().map_err(|_| {
+                    format!(
+                        "TOKENSPEED_PD_INCAST_PACE_GBYTES_PER_SEC must be a non-negative finite number in GB/s (gigabytes per second, 1e9 bytes/s; 0 disables), got {raw:?}"
+                    )
+                })?;
+                if !parsed.is_finite() || parsed < 0.0 {
+                    return Err(format!(
+                        "TOKENSPEED_PD_INCAST_PACE_GBYTES_PER_SEC must be a non-negative finite number in GB/s (gigabytes per second, 1e9 bytes/s; 0 disables), got {raw:?}"
+                    ));
+                }
+                Some(parsed)
+            }
+        };
+        let min_stagger_us = match min_stagger_us_raw {
+            None => DEFAULT_INCAST_MIN_STAGGER_US,
+            Some(raw) => {
+                let parsed = raw.trim().parse::<u64>().map_err(|_| {
+                    format!(
+                        "TOKENSPEED_PD_INCAST_MIN_STAGGER_US must be an integer in 0..={MAX_INCAST_PER_RANK_US}, got {raw:?}"
+                    )
+                })?;
+                if parsed > MAX_INCAST_PER_RANK_US {
+                    return Err(format!(
+                        "TOKENSPEED_PD_INCAST_MIN_STAGGER_US must be an integer in 0..={MAX_INCAST_PER_RANK_US}, got {parsed}"
+                    ));
+                }
+                parsed
+            }
+        };
+        Ok(Self {
+            pace_gbytes_per_sec_override,
+            min_stagger_us,
+        })
+    }
+
+    fn from_env() -> Result<Self, StartError> {
+        let pace_raw = match std::env::var("TOKENSPEED_PD_INCAST_PACE_GBYTES_PER_SEC") {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => {
+                return Err(StartError::Config(format!(
+                    "TOKENSPEED_PD_INCAST_PACE_GBYTES_PER_SEC: {error}"
+                )))
+            }
+        };
+        let min_raw = match std::env::var("TOKENSPEED_PD_INCAST_MIN_STAGGER_US") {
+            Ok(v) => Some(v),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => {
+                return Err(StartError::Config(format!(
+                    "TOKENSPEED_PD_INCAST_MIN_STAGGER_US: {error}"
+                )))
+            }
+        };
+        Self::parse_values(pace_raw.as_deref(), min_raw.as_deref()).map_err(StartError::Config)
+    }
+}
+
+/// Bandwidth-aware per-rank stagger for many-to-one (`src_tp > dst_tp`, e.g.
+/// `P(TP8) -> D(TP1)`) RoCE full-KV RDMA WRITEs to eliminate switch incast drops
+/// and multi-second QP retry timeouts.
+///
+/// Applied once per room in `transfer_full` (skipped on `transfer_layerwise`,
+/// where producer-step pacing already spreads writes across intervals).
+/// Strictly disabled by default on lossless InfiniBand and non-RoCE transports
+/// unless explicitly enabled via `TOKENSPEED_PD_INCAST_PACE_GBYTES_PER_SEC`
+/// (in GB/s = 1e9 bytes/s).
+fn compute_pd_incast_stagger<'a>(
+    room: u64,
+    tp_rank: i64,
+    src_tp: i64,
+    dst_tp: i64,
+    copies: impl IntoIterator<Item = &'a Copy>,
+    is_roce: bool,
+    cfg: IncastConfig,
+) -> Duration {
+    let pace_gbytes_per_sec = match cfg.pace_gbytes_per_sec_override {
+        Some(v) => v,
+        None => {
+            if is_roce {
+                DEFAULT_INCAST_PACE_GBYTES_PER_SEC
+            } else {
+                0.0
+            }
+        }
+    };
+    if !pace_gbytes_per_sec.is_finite()
+        || pace_gbytes_per_sec <= 0.0
+        || dst_tp <= 0
+        || src_tp <= dst_tp
+    {
+        return Duration::ZERO;
+    }
+    let fanin = src_tp / dst_tp;
+    if fanin <= 1 {
+        return Duration::ZERO;
+    }
+    let slot = (tp_rank.rem_euclid(fanin) as u64).wrapping_add(room) % (fanin as u64);
+    if slot == 0 {
+        return Duration::ZERO;
+    }
+    let mut total_bytes: u64 = 0;
+    let mut total_spans: usize = 0;
+    for copy in copies {
+        total_bytes = total_bytes.saturating_add(copy.bytes());
+        if let Copy::Spans { lengths, .. } = copy {
+            total_spans = total_spans.saturating_add(lengths.len());
+        }
+    }
+    if total_bytes < 262_144 && total_spans < 256 {
+        return Duration::ZERO;
+    }
+    // bytes / (GB/s * 1e3) == microseconds at `pace_gbytes_per_sec` GB/s (1e9 bytes/s).
+    let bw_us = ((total_bytes as f64) / (pace_gbytes_per_sec * 1_000.0)) as u64;
+    let per_rank_us = bw_us
+        .max(cfg.min_stagger_us.min(MAX_INCAST_PER_RANK_US))
+        .min(MAX_INCAST_PER_RANK_US);
+    Duration::from_micros(slot.saturating_mul(per_rank_us))
 }
 
 impl Shared {
@@ -1172,6 +1326,44 @@ impl Shared {
             .collect()
     }
 
+    /// Apply RoCE many-to-one incast pacing once per room before a full-KV
+    /// transfer begins. Skipped on `transfer_layerwise` (where producer-step
+    /// pacing already spreads writes) and kept outside `write_copies` so
+    /// multi-destination rooms do not multiply the stagger and transfer-latency
+    /// metrics record only the actual `write_cache` duration.
+    fn pace_full_transfer(
+        &self,
+        room: u64,
+        prepared: &[(Registration, Vec<Copy>)],
+    ) -> Result<(), String> {
+        let Some((first, _)) = prepared.first() else {
+            return Ok(());
+        };
+        let stagger = compute_pd_incast_stagger(
+            room,
+            self.layout.tp_rank,
+            self.layout.tp_size,
+            first.decode_tp_size,
+            prepared.iter().flat_map(|(_, copies)| copies.iter()),
+            self.transport.is_roce(),
+            self.incast,
+        );
+        if stagger.is_zero() {
+            return Ok(());
+        }
+        let deadline = Instant::now() + stagger;
+        loop {
+            if self.state().ended(room) {
+                return Err("CachePD transfer room was cancelled or ended".to_owned());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            thread::sleep(remaining.min(INCAST_SLEEP_SLICE));
+        }
+    }
+
     fn write_copies(
         &self,
         room: u64,
@@ -1403,6 +1595,7 @@ impl Shared {
                 .unwrap_or_default();
             prepared.push((registration, copies));
         }
+        self.pace_full_transfer(room, &prepared)?;
         for (registration, copies) in &prepared {
             self.write_copies(room, registration, copies)?;
         }
@@ -1917,6 +2110,7 @@ impl PrefillPeer {
     /// Start the transfer engine, register the cache, open the control
     /// socket, start the threads and register with the bootstrap server.
     pub fn start(config: PrefillConfig) -> Result<(Self, PrefillOutbox), StartError> {
+        let incast = IncastConfig::from_env()?;
         let (incoming, messages) = mpsc::channel();
         let transport = Transport::start(&config.peer, incoming)?;
         let port = transport.sockets.port();
@@ -1936,6 +2130,7 @@ impl PrefillPeer {
             deferred: config.bootstrap_payload["decode_allocation_policy"] == "deferred",
             interval_fields,
             metadata_ready: Condvar::new(),
+            incast,
         });
         let stop = Arc::new(AtomicBool::new(false));
         {
@@ -2647,6 +2842,141 @@ mod tests {
         state.clear(5);
         assert!(state.take_cancellation_replies().is_empty());
         assert!(state.cancellation_replies.contains_key(&key));
+    }
+
+    #[test]
+    fn pd_incast_stagger_only_applies_to_roce_many_to_one_transfers() {
+        let default_cfg = IncastConfig {
+            pace_gbytes_per_sec_override: None,
+            min_stagger_us: DEFAULT_INCAST_MIN_STAGGER_US,
+        };
+        let big_span = Copy::Spans {
+            sources: vec![0; 512],
+            destinations: vec![0; 512],
+            lengths: vec![256; 512],
+        };
+        let tiny_span = Copy::Spans {
+            sources: vec![0; 16],
+            destinations: vec![0; 16],
+            lengths: vec![256; 16],
+        };
+
+        // Disabled by default on non-RoCE (e.g. lossless InfiniBand).
+        assert_eq!(
+            compute_pd_incast_stagger(
+                0,
+                3,
+                8,
+                1,
+                std::slice::from_ref(&big_span),
+                false,
+                default_cfg
+            ),
+            Duration::ZERO
+        );
+        // Disabled for equal or one-to-many TP layouts even on RoCE.
+        assert_eq!(
+            compute_pd_incast_stagger(
+                0,
+                3,
+                8,
+                8,
+                std::slice::from_ref(&big_span),
+                true,
+                default_cfg
+            ),
+            Duration::ZERO
+        );
+        // Disabled for tiny transfers below threshold.
+        assert_eq!(
+            compute_pd_incast_stagger(
+                0,
+                3,
+                8,
+                1,
+                std::slice::from_ref(&tiny_span),
+                true,
+                default_cfg
+            ),
+            Duration::ZERO
+        );
+        // Enabled on RoCE 8->1 fan-in; slot rotates by room and slot 0 has zero wait.
+        assert_eq!(
+            compute_pd_incast_stagger(
+                0,
+                0,
+                8,
+                1,
+                std::slice::from_ref(&big_span),
+                true,
+                default_cfg
+            ),
+            Duration::ZERO
+        );
+        assert_eq!(
+            compute_pd_incast_stagger(
+                0,
+                3,
+                8,
+                1,
+                std::slice::from_ref(&big_span),
+                true,
+                default_cfg
+            ),
+            Duration::from_micros(3 * DEFAULT_INCAST_MIN_STAGGER_US)
+        );
+        assert_eq!(
+            compute_pd_incast_stagger(
+                5,
+                3,
+                8,
+                1,
+                std::slice::from_ref(&big_span),
+                true,
+                default_cfg
+            ),
+            Duration::ZERO
+        );
+        // Explicit override 0 disables even on RoCE; explicit >0 enables even on non-RoCE.
+        let disabled = IncastConfig {
+            pace_gbytes_per_sec_override: Some(0.0),
+            min_stagger_us: DEFAULT_INCAST_MIN_STAGGER_US,
+        };
+        assert_eq!(
+            compute_pd_incast_stagger(0, 3, 8, 1, std::slice::from_ref(&big_span), true, disabled),
+            Duration::ZERO
+        );
+        let forced = IncastConfig {
+            pace_gbytes_per_sec_override: Some(20.0),
+            min_stagger_us: 1_000,
+        };
+        assert_eq!(
+            compute_pd_incast_stagger(0, 2, 8, 1, std::slice::from_ref(&big_span), false, forced),
+            Duration::from_micros(2_000)
+        );
+    }
+
+    #[test]
+    fn incast_config_rejects_malformed_and_out_of_range_values() {
+        let default = IncastConfig::parse_values(None, None).unwrap();
+        assert_eq!(default.pace_gbytes_per_sec_override, None);
+        assert_eq!(default.min_stagger_us, DEFAULT_INCAST_MIN_STAGGER_US);
+
+        let disabled = IncastConfig::parse_values(Some("0"), Some("0")).unwrap();
+        assert_eq!(disabled.pace_gbytes_per_sec_override, Some(0.0));
+        assert_eq!(disabled.min_stagger_us, 0);
+
+        let custom = IncastConfig::parse_values(Some("8.5"), Some("3000")).unwrap();
+        assert_eq!(custom.pace_gbytes_per_sec_override, Some(8.5));
+        assert_eq!(custom.min_stagger_us, 3_000);
+
+        assert!(IncastConfig::parse_values(Some("6,0"), None).is_err());
+        assert!(IncastConfig::parse_values(Some(""), None).is_err());
+        assert!(IncastConfig::parse_values(Some("-1.0"), None).is_err());
+        assert!(IncastConfig::parse_values(Some("NaN"), None).is_err());
+        assert!(IncastConfig::parse_values(Some("inf"), None).is_err());
+        assert!(IncastConfig::parse_values(None, Some("abc")).is_err());
+        assert!(IncastConfig::parse_values(None, Some("50001")).is_err());
     }
 }
 

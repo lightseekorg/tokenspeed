@@ -204,3 +204,29 @@ fn replacing_cache_sender_preserves_the_advertised_epd_receiver() {
         .unwrap();
     assert_eq!(embedding_pool, embedding);
 }
+
+#[test]
+fn small_span_burst_splits_cleanly_and_preserves_every_byte() {
+    let library = NativeLibrary::new();
+    let span_count = DEFAULT_SPAN_DESCRIPTOR_BATCH * 3 + 7;
+    let span_len = 256usize;
+    let total = span_count * span_len;
+    let source: Vec<u8> = (0..total).map(|i| ((i * 31 + 17) & 0xff) as u8).collect();
+    let destination = vec![0u8; total];
+    let sender = transport(&library, &source);
+    let receiver = transport(&library, &destination);
+    let session = receiver.session_id();
+    let copies = [Copy::Spans {
+        sources: (0..span_count)
+            .map(|i| source.as_ptr() as u64 + (i * span_len) as u64)
+            .collect(),
+        destinations: (0..span_count)
+            .map(|i| destination.as_ptr() as u64 + (i * span_len) as u64)
+            .collect(),
+        lengths: vec![span_len as u64; span_count],
+    }];
+    sender
+        .write_cache(&session, "small-span-burst", &copies)
+        .unwrap();
+    assert_eq!(destination, source);
+}
