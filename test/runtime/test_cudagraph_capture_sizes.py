@@ -105,8 +105,9 @@ def test_the_ladder_ascends_whatever_order_the_sizes_come_in(
     "disable_padding,max_capture,top",
     [
         # Padded: every 16 past the default's 160, ending on the cap.
-        (False, 200, [152, 160, 176, 192, 200]),
-        (False, 256, [160, 176, 192, 208, 224, 240, 256]),
+        (False, 200, [152, 160, 168, 176, 184, 192, 200]),
+        (False, 256, [160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256]),
+        (False, 480, [440, 448, 464, 480]),
         # Unpadded: every 32, like the default's own top.
         (True, 256, [128, 160, 192, 224, 256]),
         # At the default cap the default ladder is unchanged.
@@ -118,7 +119,7 @@ def test_the_default_ladder_reaches_a_capture_cap_above_160(
 ) -> None:
     config = _config(
         None,
-        max_num_seqs=256,
+        max_num_seqs=max(256, max_capture),
         max_capture=max_capture,
         disable_padding=disable_padding,
     )

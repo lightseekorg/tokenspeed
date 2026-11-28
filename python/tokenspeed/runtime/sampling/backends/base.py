@@ -128,6 +128,7 @@ class SamplingBackendConfig:
     # Attention TP group for sampler-output broadcast (rank 0 wins).
     tp_group: tuple[int, ...] | None = None
     enable_tp_sync: bool = True
+    enable_packed_verify: bool = False
 
     @classmethod
     def from_server_args(
@@ -174,6 +175,7 @@ class SamplingBackendConfig:
             random_seed=random_seed,
             tp_group=tp_group,
             enable_tp_sync=not server_args.disable_sampling_tp_sync,
+            enable_packed_verify=server_args.enable_dsv41_adaptive_dspark,
         )
 
 

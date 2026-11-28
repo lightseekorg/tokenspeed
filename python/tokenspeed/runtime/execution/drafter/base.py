@@ -41,6 +41,7 @@ from tokenspeed.runtime.execution.slot_state import (
 )
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution._draft_overlap import DecodeGraphOverlap
@@ -162,6 +163,15 @@ class BaseDrafter:
         # None keeps the argmax proposal.
         self.draft_sampler: DraftProposalSampler | None = None
         self.decode_overlap: DecodeGraphOverlap | None = None
+        self.memory_saver_adapter: TorchMemorySaverAdapter = (
+            TorchMemorySaverAdapter.create(enable=False, device="cpu")
+        )
+
+    def bind_memory_saver_adapter(
+        self, memory_saver_adapter: TorchMemorySaverAdapter
+    ) -> None:
+        """Bind the executor's memory-saver adapter for persistent drafter buffers."""
+        self.memory_saver_adapter = memory_saver_adapter
 
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """Take a replacement pool; a drafter that caches views rebuilds them."""

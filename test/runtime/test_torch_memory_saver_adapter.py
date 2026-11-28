@@ -1479,3 +1479,181 @@ def test_sampled_drafting_state_survives_sleep_with_zero_ordinary_bytes(sparse):
             check=True,
             timeout=90,
         )
+
+
+def _check_dspark_adaptive_budget_buffers_on_cuda():
+    """Keep DeepseekV41DSpark's persistent and lazy calibration buffers out of (0, 0)."""
+    import gc
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
+        DeepseekV41DSpark,
+    )
+    from tokenspeed.runtime.execution.drafter.verify_calibration import (
+        VerifyCalibration,
+    )
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    vocab, pool_rows, width, steps, max_bs = 64, 8, 6, 5, 4
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
+    mapping = Mapping(rank=0, world_size=1)
+    draft_model = SimpleNamespace(
+        mapping=mapping,
+        model=SimpleNamespace(
+            block_size=steps,
+            target_layer_ids=(0,),
+            hidden_size=128,
+            markov_projection=SimpleNamespace(num_embeddings_per_partition=vocab),
+            embed_tokens=SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16)),
+        ),
+    )
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(global_server_args_dict, "enable_dsv41_adaptive_dspark", True)
+        patch.setitem(global_server_args_dict, "dsv41_dspark_min_batch_size", 2)
+        with saver.named_region("runtime_states"):
+            states = RuntimeStates(
+                req_pool_size=pool_rows,
+                input_vocab_size=vocab,
+                vocab_size=vocab,
+                output_length=width,
+                device="cuda",
+            )
+            ib = InputBuffers(
+                max_bs=max_bs,
+                max_num_tokens=max_bs * width,
+                state_write_padding_pool_index=pool_rows,
+                device="cuda",
+            )
+            drafter = DeepseekV41DSpark(
+                spec_num_tokens=width,
+                spec_num_steps=steps,
+                draft_model_runner=SimpleNamespace(model=draft_model, device="cuda"),
+                attn_backend=None,
+                token_to_kv_pool=None,
+                runtime_states=states,
+                input_buffers=ib,
+                vocab_size=vocab,
+            )
+            drafter.bind_memory_saver_adapter(saver)
+
+    drafter.dp_local_graph = True
+    drafter.verify_graph_token_step = 4
+    drafter._verify_cache_initialized = True
+    ib.req_pool_indices_buf[:max_bs].copy_(
+        torch.tensor([1, 2, 3, 4], dtype=torch.int32, device="cuda")
+    )
+    ib.seq_lens_buf[:max_bs].fill_(128)
+    drafter.next_tokens_buf.copy_(
+        torch.arange(max_bs * width, dtype=torch.int32, device="cuda").view(
+            max_bs, width
+        )
+    )
+    drafter.start_pos_buf.copy_(torch.arange(max_bs, dtype=torch.int64, device="cuda"))
+    drafter.confidence_scores[1] = 8.0
+    drafter.confidence_scores[2:5] = -8.0
+
+    stream = torch.cuda.Stream()
+    pool = torch.cuda.graph_pool_handle()
+    drafter.capture_round_graphs(4, stream=stream, pool=pool)
+    drafter.install_verify_calibration(
+        (VerifyCalibration(4, 1, 8192, 6, 100.0, ((12, 1.0),), 8),),
+        policy_ms=0.0,
+    )
+    buffers = drafter._verify_budget_buffers[4]
+    buffers.scores.fill_(1.25)
+    buffers.counts.fill_(2)
+    buffers.valid.fill_(True)
+    buffers.device_decision.copy_(
+        torch.tensor([12, 1, 8192], dtype=torch.int32, device="cuda")
+    )
+    retained = [
+        drafter.next_tokens_buf,
+        drafter.start_pos_buf,
+        drafter.confidence_scores,
+        drafter._verify_rows,
+        drafter._verify_indptr,
+        drafter.confidence_features,
+        buffers.scores,
+        buffers.counts,
+        buffers.valid,
+        buffers.packet,
+        buffers.device_decision,
+        buffers.device_cal.ranges,
+        buffers.device_cal.native_ms,
+        buffers.device_cal.capacities,
+        buffers.device_cal.step_ms,
+    ]
+    snapshots = [(t, t.data_ptr(), t.cpu()) for t in retained]
+    for _ in range(3):
+        torch.cuda.synchronize()
+        saver.pause(tag="weights")
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.cuda.empty_cache()
+        ordinary_bytes = sum(
+            segment["total_size"]
+            for segment in torch.cuda.memory_snapshot()
+            if segment["device"] == torch.cuda.current_device()
+            and tuple(segment["segment_pool_id"]) == (0, 0)
+        )
+        assert ordinary_bytes == 0, ordinary_bytes
+        saver.resume(tag="weights")
+        for tensor, pointer, reference in snapshots:
+            assert tensor.data_ptr() == pointer
+            torch.testing.assert_close(tensor.cpu(), reference, rtol=0, atol=0)
+
+    # Post-resume execution and calibration replacement keep (0, 0) empty too.
+    drafter.install_verify_calibration(
+        (
+            VerifyCalibration(4, 1, 8192, 6, 100.0, ((12, 1.0),), 8),
+            VerifyCalibration(4, 8193, 16384, 6, 100.0, ((16, 1.0),), 8),
+        ),
+        policy_ms=0.0,
+    )
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=4,
+        num_extends=0,
+        input_num_tokens=24,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, 4, 6),
+    )
+    drafter.prepare_request_state([101, 102, 103, 104], [1, 2, 3, 4], num_extends=0)
+    drafter.confidence_scores[1] = 8.0
+    drafter.confidence_scores[2:5] = -8.0
+    drafter.finish_round(ctx, graph_bs=4)
+    torch.cuda.synchronize()
+    # finish_round retires step-level request state before the next prepare.
+    drafter.prepare_request_state([101, 102, 103, 104], [1, 2, 3, 4], num_extends=0)
+    assert (
+        drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4) == 12
+    )
+    drafter._verify_budget_graphs.clear()
+    drafter.release_round_graphs()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires native CUDA VMM memory-saver hooks",
+)
+def test_dspark_adaptive_budget_buffers_survive_sleep_with_zero_ordinary_bytes():
+    memory_saver = pytest.importorskip("torch_memory_saver")
+    with memory_saver.configure_subprocess():
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from test.runtime.test_torch_memory_saver_adapter import "
+                "_check_dspark_adaptive_budget_buffers_on_cuda; "
+                "_check_dspark_adaptive_budget_buffers_on_cuda()",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            check=True,
+            timeout=90,
+        )

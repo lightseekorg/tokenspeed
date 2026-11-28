@@ -75,6 +75,7 @@ nothing tunes at startup.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from typing import TYPE_CHECKING
 
@@ -195,6 +196,7 @@ class SonicSamplingBackend(SamplingBackend):
 
     _HAS_POOL_STATE = True
     _SUPPORTS_DP_VERIFY = False
+    supports_packed_verify = True
     supports_tree_verify = True
     # Forced lengths over sonic's verify; see ``_synthetic_outputs``.
     _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
@@ -427,6 +429,7 @@ class SonicSamplingBackend(SamplingBackend):
             shifted = torch.zeros((self.max_bs + 1,), dtype=torch.int64)[1:]
             offsets = torch.zeros((self.pool_rows,), dtype=torch.int64)
             cand = torch.zeros((self.max_bs, self.n_max), dtype=torch.int32)
+            indptr = torch.empty((self.max_bs + 1,), dtype=torch.int64)
         for slots in (slot, shifted):
             for bs in range(1, self.max_bs + 1):
                 self._fused_singular(logits[:bs], slots[:bs], offsets, shard=shard)
@@ -443,6 +446,24 @@ class SonicSamplingBackend(SamplingBackend):
                         if self._synthetic_lengths is not None:
                             self._synthetic_outputs(
                                 cand[:bs], slots[:bs], offsets, *verified, row_offset=0
+                            )
+                        if self.config.enable_packed_verify:
+                            step_rows = max(self.n_max - 1, 1)
+                            packed_rows = bs * step_rows
+                            indptr[: bs + 1].copy_(
+                                torch.arange(
+                                    bs + 1, dtype=torch.int64, device=self.device
+                                )
+                                * step_rows
+                            )
+                            self._fused_multistep(
+                                logits[:packed_rows],
+                                slots[:bs],
+                                offsets,
+                                cand[:bs],
+                                shard=shard,
+                                draft_probs=table,
+                                query_start_loc=indptr[: bs + 1],
                             )
         self.reset_capture_state()
 
@@ -488,6 +509,7 @@ class SonicSamplingBackend(SamplingBackend):
             # The dtype of the base class's offsets pool, which serving passes.
             offsets = torch.zeros((self.pool_rows,), dtype=torch.int64)
             cand = torch.zeros((self.max_bs, self.n_max), dtype=torch.int32)
+            indptr = torch.empty((self.max_bs + 1,), dtype=torch.int64)
             nodes = torch.arange(self.n_max, dtype=torch.int32)
             chain_parents = (nodes - 1).repeat(self.max_bs, 1)
             chain_depths = nodes.repeat(self.max_bs, 1)
@@ -514,6 +536,24 @@ class SonicSamplingBackend(SamplingBackend):
 
                             self._synthetic_outputs(
                                 cand[:bs], slots[:bs], offsets, *verified, row_offset=0
+                            )
+
+                        if self.config.enable_packed_verify:
+                            step_rows = max(self.n_max - 1, 1)
+                            packed_rows = bs * step_rows
+                            indptr[: bs + 1].copy_(
+                                torch.arange(
+                                    bs + 1, dtype=torch.int64, device=self.device
+                                )
+                                * step_rows
+                            )
+                            self._fused_multistep(
+                                logits[:packed_rows],
+                                slots[:bs],
+                                offsets,
+                                cand[:bs],
+                                draft_probs=draft_probs,
+                                query_start_loc=indptr[: bs + 1],
                             )
 
                 if self.tree:
@@ -653,10 +693,13 @@ class SonicSamplingBackend(SamplingBackend):
         slot_mapping: torch.Tensor,
         bs: int,
         n: int,
+        *,
+        query_start_loc: torch.Tensor | None = None,
+        logits_rows: int | None = None,
     ) -> None:
-        """Scatter xgrammar's row-indexed ``[bs*n, W]`` bitmask (row ``i*n+j`` =
-        request ``i``, position ``j``) into the slot-indexed ``grammar`` buffer
-        ``[pool_rows, n_max, W]``, both int32 with the same bit semantics (SET =
+        """Scatter xgrammar's row-indexed ``[bs*n, W]`` (or packed ``[Q, W]``) bitmask
+        (row ``i*n+j`` = request ``i``, position ``j``) into the slot-indexed ``grammar``
+        buffer ``[pool_rows, n_max, W]``, both int32 with the same bit semantics (SET =
         allowed; token ``t`` -> word ``t//32``, bit ``t%32``), so it's a plain
         copy. Captured/graph-safe (same pattern as the draft-probs scatter).
 
@@ -679,6 +722,29 @@ class SonicSamplingBackend(SamplingBackend):
                 f"buffer width {w} (vocab mismatch: backend vocab vs config "
                 f"vocab_size={self.vocab_size})"
             )
+
+        if query_start_loc is not None:
+            expected_rows = bs * n if logits_rows is None else logits_rows
+            if vocab_mask.shape[0] != expected_rows:
+                raise RuntimeError(
+                    f"packed grammar bitmask rows {vocab_mask.shape[0]} != "
+                    f"logits rows = {expected_rows}"
+                )
+            if expected_rows == 0:
+                self.grammar[slot_mapping, :n] = -1
+                return
+            counts = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64)
+            cols = torch.arange(n, device=vocab_mask.device, dtype=torch.int64)[None, :]
+            valid = cols < counts[:, None]
+            starts = query_start_loc[:-1, None].to(torch.int64)
+            safe_rows = torch.where(valid, starts + cols, 0).clamp(
+                max=expected_rows - 1
+            )
+            gathered = vocab_mask.index_select(0, safe_rows.view(-1)).view(bs, n, w)
+            self.grammar[slot_mapping, :n] = torch.where(
+                valid[:, :, None], gathered, -1
+            )
+            return
 
         # Row-count guard for the mixed-round misalignment described above.
         if vocab_mask.shape[0] != bs * n:
@@ -842,15 +908,17 @@ class SonicSamplingBackend(SamplingBackend):
         config: SonicConfig | None = None,
         shard: SampledVocabShard | None = None,
         draft_probs: torch.Tensor | None = None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One ``verify`` launch over ``[bs * n, V]`` logits; returns ``(drafted, accepted)``.
+        """One ``verify`` launch over ``[rows, V]`` logits; returns ``(drafted, accepted)``.
 
         ``drafted[:, :γ]`` holds the γ proposals and is the output too: the
         kernel stores only the corrected token at the
         rejection offset (the rest of the row must already be the drafts), so
         this keeps sonic's in-place semantics with a stable captured pointer
-        (the default would clone-allocate). The trailing bonus column is
-        output-only: the kernel masks it out of the draft load and
+        (the default would clone-allocate). When ``query_start_loc`` is passed,
+        columns past the emitted tokens are zeroed cleanly. The trailing bonus
+        column is output-only: the kernel masks it out of the draft load and
         short-circuits the residual correction there. Without ``draft_probs``
         (point-draw drafts) sonic's masked-rejection regime accepts iff
         u <= p(draft), residual = p with the drafted token zeroed; with the
@@ -860,6 +928,11 @@ class SonicSamplingBackend(SamplingBackend):
         state = self._check_logits(logits, shard)
 
         bs, n = candidates.shape
+        rows = logits.shape[0]
+        if rows > self.scratchpad.shape[0]:
+            raise RuntimeError(
+                f"verify logits rows {rows} > scratchpad capacity {self.scratchpad.shape[0]}"
+            )
         gamma = n - 1
 
         drafted = self.v_drafted[:bs]
@@ -874,15 +947,16 @@ class SonicSamplingBackend(SamplingBackend):
             offsets,
             drafted,
             accepted,
-            self.scratchpad[: bs * n],
-            self.values[: bs * n],
-            self.indices[: bs * n],
-            config or pick(logits.shape[1], bs * n),
+            self.scratchpad[:rows],
+            self.values[:rows],
+            self.indices[:rows],
+            config or pick(logits.shape[1], max(rows, 1)),
             enable_pdl=pdl_enabled(),
             shard=None if shard is None else self._vocab_shard(shard),
             draft_probs=draft_probs,
             reject_threshold=self.config.spec_reject_draft_prob_threshold,
             candidate_drafts=self._candidate_drafts,
+            query_start_loc=query_start_loc,
         )
 
         return drafted, accepted
@@ -929,6 +1003,67 @@ class SonicSamplingBackend(SamplingBackend):
         drafted.scatter_(1, (lengths - 1).long()[:, None], tokens[:, None])
         accepted.copy_((lengths - 1)[:, None])
 
+    def _verify_packed_n1(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        bs: int,
+        query_start_loc: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-token packed verification for ``N == 1`` with optional empty intervals."""
+        shard = logits_output.vocab_shard
+        logits = logits_output.next_token_logits if shard is None else shard.logits
+        if query_start_loc.shape != (bs + 1,):
+            raise ValueError("packed verification requires query_start_loc [bs + 1]")
+        if bs == 0:
+            if self.config.enable_output_logprobs:
+                logits_output.next_token_logprobs = logits.new_empty(
+                    0, dtype=torch.float32
+                )
+            return (
+                logits.new_empty(0, dtype=torch.int32),
+                logits.new_empty(0, dtype=torch.int32),
+            )
+        counts = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64)
+        rows = logits.shape[0]
+        if rows == 0:
+            sampled = self.out_tok[:bs, 0]
+            sampled.zero_()
+            lengths = self.lengths_buf[:bs]
+            lengths.zero_()
+            if self.config.enable_output_logprobs:
+                logits_output.next_token_logprobs = logits.new_zeros(
+                    bs, dtype=torch.float32
+                )
+            return sampled, lengths
+        starts = query_start_loc[:-1].to(torch.int64)
+        safe_rows = torch.where(counts > 0, starts.clamp(max=rows - 1), 0)
+        row_logits = logits.index_select(0, safe_rows)
+        slot_mapping = torch.where(
+            counts > 0, sampling_info.req_pool_indices[:bs], self.pool_rows - 1
+        )
+        log_info = sampling_info
+        if sampling_info.vocab_mask is not None:
+            row_mask = sampling_info.vocab_mask.index_select(0, safe_rows)
+            masked = torch.where(counts[:, None] > 0, row_mask, -1)
+            self._scatter_grammar(masked, slot_mapping, bs, 1)
+            log_info = dataclasses.replace(sampling_info, vocab_mask=masked)
+        sampled = self._fused_singular(
+            row_logits,
+            slot_mapping,
+            self._prepare_sampling_offsets(sampling_info),
+            shard=shard,
+        ).view(-1)
+        if shard is None:
+            self.maybe_broadcast(sampled)
+        sampled.masked_fill_(counts == 0, 0)
+        self._write_logprob_outputs(logits_output, row_logits, log_info, sampled)
+        if logits_output.next_token_logprobs is not None:
+            logits_output.next_token_logprobs.masked_fill_(counts == 0, 0.0)
+        lengths = self.lengths_buf[:bs]
+        lengths.copy_((counts > 0).to(torch.int32))
+        return sampled, lengths
+
     @override
     @nvtx_range("sampling:verify", color="yellow")
     def verify(
@@ -938,6 +1073,7 @@ class SonicSamplingBackend(SamplingBackend):
         candidates: torch.Tensor,
         *,
         tree: TreeVerifyBatch | None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Chain speculative verification via sonic's ``verify``.
 
@@ -949,6 +1085,9 @@ class SonicSamplingBackend(SamplingBackend):
         one pipeline via per-row indicators; the drafts are point draws, handled
         natively by sonic's masked-rejection regime (``draft_probabilities=None``:
         accept iff u <= p(draft), residual = p with the drafted token zeroed).
+        When ``query_start_loc`` is passed, ``logits`` holds CSR-packed target
+        rows (possibly with trailing padding) while ``candidates`` and
+        returned ``predict`` retain the fixed ``[bs, n]`` width.
 
         ``n == 1`` is non-speculative decode (the runtime's unified sampling
         rule): nothing to accept, one token to draw, ``accept_length == 1`` —
@@ -957,13 +1096,17 @@ class SonicSamplingBackend(SamplingBackend):
         n_max]``). A draft tree takes ``_verify_tree``."""
 
         if tree is not None:
-
+            if query_start_loc is not None:
+                raise ValueError("tree verification does not support packed queries")
             return self._verify_tree(logits_output, sampling_info, candidates, tree)
 
         bs, n = candidates.shape
 
         if n == 1:
-
+            if query_start_loc is not None:
+                return self._verify_packed_n1(
+                    logits_output, sampling_info, bs, query_start_loc
+                )
             return self._sample_rows(logits_output, sampling_info)
 
         if n != self.n_max:
@@ -972,16 +1115,40 @@ class SonicSamplingBackend(SamplingBackend):
                 f"verify candidates width {n} != configured n_max {self.n_max}"
             )
 
-        # Flat [bs * n, V], or this rank's [bs * n, V_s] shard.
+        if query_start_loc is not None and self._synthetic_lengths is not None:
+            raise ValueError(
+                "synthetic acceptance does not support packed verification"
+            )
+
+        # Flat [rows, V], or this rank's [rows, V_s] shard.
         shard = logits_output.vocab_shard
         logits = logits_output.next_token_logits if shard is None else shard.logits
+
+        if bs == 0:
+            if query_start_loc is not None and query_start_loc.shape != (1,):
+                raise ValueError("packed verification requires query_start_loc [1]")
+            if self.config.enable_output_logprobs:
+                logits_output.next_token_logprobs = logits.new_empty(
+                    0, dtype=torch.float32
+                )
+            return (
+                logits.new_empty(0, dtype=torch.int32),
+                logits.new_empty(0, dtype=torch.int32),
+            )
 
         slot_mapping = sampling_info.req_pool_indices[:bs]
 
         # Native per-draft-position grammar: scatter then mask in-fused.
         if sampling_info.vocab_mask is not None:
 
-            self._scatter_grammar(sampling_info.vocab_mask, slot_mapping, bs, n)
+            self._scatter_grammar(
+                sampling_info.vocab_mask,
+                slot_mapping,
+                bs,
+                n,
+                query_start_loc=query_start_loc,
+                logits_rows=logits.shape[0],
+            )
 
         offsets = self._prepare_sampling_offsets(sampling_info)
         predict, accepted = self._fused_multistep(
@@ -991,6 +1158,7 @@ class SonicSamplingBackend(SamplingBackend):
             candidates,
             shard=shard,
             draft_probs=sampling_info.draft_probs,
+            query_start_loc=query_start_loc,
         )
 
         # Benchmark acceptance replaces the outcome after the verify ran for its cost.
@@ -1012,7 +1180,39 @@ class SonicSamplingBackend(SamplingBackend):
         if shard is None:
             self.maybe_broadcast(predict, accept_lengths)
 
-        self._write_logprob_outputs(logits_output, logits, sampling_info, predict)
+        if query_start_loc is not None and self.config.enable_output_logprobs:
+            counts = (query_start_loc[1:] - query_start_loc[:-1]).to(torch.int64)
+            rows = logits.shape[0]
+            if rows == 0:
+                logits_output.next_token_logprobs = logits.new_zeros(
+                    bs * n, dtype=torch.float32
+                )
+            else:
+                cols = torch.arange(n, device=logits.device, dtype=torch.int64)[None, :]
+                path_cols = torch.where(
+                    cols < accept_lengths[:, None].to(torch.int64), cols, 0
+                )
+                path_cols = torch.minimum(path_cols, (counts - 1).clamp_min(0)[:, None])
+                starts = (
+                    query_start_loc[:-1].to(torch.int64).clamp(max=rows - 1)[:, None]
+                )
+                path_rows = (starts + path_cols).view(-1)
+                path_logits = logits.index_select(0, path_rows)
+                path_info = sampling_info
+                if sampling_info.vocab_mask is not None:
+                    path_info = dataclasses.replace(
+                        sampling_info,
+                        vocab_mask=sampling_info.vocab_mask.index_select(0, path_rows),
+                    )
+                self._write_logprob_outputs(
+                    logits_output, path_logits, path_info, predict
+                )
+                if logits_output.next_token_logprobs is not None:
+                    logits_output.next_token_logprobs.view(bs, n).masked_fill_(
+                        counts[:, None] == 0, 0.0
+                    )
+        else:
+            self._write_logprob_outputs(logits_output, logits, sampling_info, predict)
 
         return predict, accept_lengths
 

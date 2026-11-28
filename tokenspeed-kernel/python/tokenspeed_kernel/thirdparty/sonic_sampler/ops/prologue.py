@@ -487,6 +487,7 @@ def whole_block(
     vocab_size: tl.constexpr,
     shard_offset: tl.constexpr,
     lookahead: tl.constexpr,
+    req_timesteps,
     indirection: tl.constexpr,
     tokens: tl.constexpr,
     singular: tl.constexpr,
@@ -526,6 +527,7 @@ def whole_block(
 
     key = philox_key(h_ptr, l_ptr, batch_id, draw_step)
 
+    req_lookahead = req_timesteps - 1
     if singular:
 
         draft = -1
@@ -533,8 +535,10 @@ def whole_block(
     else:
 
         # The bonus row has no draft.
-        draft = tl.load(t_ptr + margin + tl.minimum(step_id, lookahead - 1))
-        draft = tl.where(step_id < lookahead, draft, -1)
+        draft = tl.load(
+            t_ptr + margin + tl.minimum(step_id, tl.maximum(req_lookahead - 1, 0))
+        )
+        draft = tl.where(step_id < req_lookahead, draft, -1)
 
     best = tl.full((), minima, tl.float32)
     column = tl.full((), 0, tl.int32)
@@ -812,9 +816,12 @@ def resolve_indices(
 
         batch_id = row_id
         margin = row_id
+        draft_margin = row_id
 
         step_id = 0
         timesteps = 1
+        req_timesteps = 1
+        row_valid = True
 
     elif varlen:
 
@@ -826,15 +833,17 @@ def resolve_indices(
         lengths = tl.load(q_ptr + row_ids, mask=row_mask, other=0, cache_modifier=".cv")
         marked = ((lengths <= row_id) & row_mask).to(tl.uint32)
 
-        batch_id = tl.sum(marked, axis=0) - 1
-        margin = tl.load(q_ptr + batch_id)
-
-        # Padded batch handling requires skipping tail end of row(s).
-
-        # skipped = (batch_id >= batch_size)
+        raw_batch = tl.sum(marked, axis=0).to(tl.int32) - 1
+        row_valid = (raw_batch >= 0) & (raw_batch < batch_size)
+        safe_batch = tl.maximum(tl.minimum(raw_batch, batch_size - 1), 0)
+        margin = tl.load(q_ptr + safe_batch, mask=row_valid, other=0).to(tl.int32)
+        upper = tl.load(q_ptr + safe_batch + 1, mask=row_valid, other=0).to(tl.int32)
 
         step_id = row_id - margin
+        req_timesteps = upper - margin
         timesteps = lookahead + 1
+        draft_margin = safe_batch * timesteps
+        batch_id = safe_batch
 
     else:
 
@@ -844,12 +853,15 @@ def resolve_indices(
         step_id = row_id % timesteps
 
         margin = batch_id * timesteps
+        draft_margin = margin
+        req_timesteps = timesteps
+        row_valid = True
 
     if slotted:
 
-        batch_id = tl.load(s_ptr + batch_id)
+        batch_id = tl.load(s_ptr + batch_id, mask=row_valid, other=0)
 
-    return batch_id, step_id, margin, timesteps
+    return batch_id, step_id, margin, draft_margin, req_timesteps, row_valid, timesteps
 
 
 @jit
@@ -946,106 +958,114 @@ def bitpacked_reduction_kernel(
 
         gdc_wait()
 
-    batch_id, step_id, margin, timesteps = resolve_indices(
-        q_ptr,
-        s_ptr,
-        row_id,
-        lookahead,
-        batch_size,
-        slotted,
-        singular,
-        varlen,
-        block_q,
+    batch_id, step_id, margin, draft_margin, req_timesteps, row_valid, timesteps = (
+        resolve_indices(
+            q_ptr,
+            s_ptr,
+            row_id,
+            lookahead,
+            batch_size,
+            slotted,
+            singular,
+            varlen,
+            block_q,
+        )
     )
 
-    # Load the bit-indicator(s), then the logits of the rows reduced here.
+    if row_valid:
 
-    indicator = tl.load(z_ptr + batch_id)
+        # Load the bit-indicator(s), then the logits of the rows reduced here.
 
-    if whole_row(indicator, whole, singular):
+        indicator = tl.load(z_ptr + batch_id)
 
-        # Reduced by ``whole_reduction_kernel``.
+        if whole_row(indicator, whole, singular):
 
-        pass
+            # Reduced by ``whole_reduction_kernel``.
 
-    else:
-
-        logits = tl.load(x_ptr + offsets, mask=mask, other=-float("inf"))
-        logits = head_logits(logits, mask, logit_scale, softcap)
-
-        logits = transform(
-            logits,
-            indicator,
-            cols,
-            mask,
-            m_ptr,
-            g_ptr,
-            c_ptr,
-            d_ptr,
-            t_ptr,
-            r_ptr,
-            f_ptr,
-            p_ptr,
-            b_ptr,
-            e_ptr,
-            batch_id,
-            step_id,
-            margin,
-            timesteps,
-            shard_offset,
-            lookahead,
-            indirection,
-            tokens,
-            singular,
-            stride_g,
-            stride_c,
-            stride_t,
-            block_t,
-            block_n,
-            value_dtype,
-        )
-
-        if (indicator & 0x40) > 0:
-
-            # Greedy (Top-1) selection.
-
-            if exact:
-
-                exact_maximum(
-                    y_ptr,
-                    row_id,
-                    col_id,
-                    tl.num_programs(axis=1),
-                    shift,
-                    logits,
-                    enable_pdl,
-                    stride_y,
-                )
-
-            else:
-
-                greedy_reduction(
-                    y_ptr, row_id, col_id, logits, enable_pdl, stride_y, block_n
-                )
+            pass
 
         else:
 
-            # Top-K selection by bf16 keys; exact logits are re-read at the candidates.
+            logits = tl.load(x_ptr + offsets, mask=mask, other=minima)
+            logits = head_logits(logits, mask, logit_scale, softcap)
 
-            top_k_reduction(
-                y_ptr,
-                row_id,
-                col_id,
-                logits.to(tl.bfloat16),
-                steps,
-                max_k,
-                scale,
-                enable_adaptive,
-                enable_radix,
-                enable_pdl,
-                stride_y,
+            logits = transform(
+                logits,
+                indicator,
+                cols,
+                mask,
+                m_ptr,
+                g_ptr,
+                c_ptr,
+                d_ptr,
+                t_ptr,
+                r_ptr,
+                f_ptr,
+                p_ptr,
+                b_ptr,
+                e_ptr,
+                batch_id,
+                step_id,
+                draft_margin,
+                timesteps,
+                shard_offset,
+                lookahead,
+                indirection,
+                tokens,
+                singular,
+                stride_g,
+                stride_c,
+                stride_t,
+                block_t,
                 block_n,
+                value_dtype,
             )
+
+            if (indicator & 0x40) > 0:
+
+                # Greedy (Top-1) selection.
+
+                if exact:
+
+                    exact_maximum(
+                        y_ptr,
+                        row_id,
+                        col_id,
+                        tl.num_programs(axis=1),
+                        shift,
+                        logits,
+                        enable_pdl,
+                        stride_y,
+                    )
+
+                else:
+
+                    greedy_reduction(
+                        y_ptr, row_id, col_id, logits, enable_pdl, stride_y, block_n
+                    )
+
+            else:
+
+                # Top-K selection by bf16 keys; exact logits are re-read at the candidates.
+
+                top_k_reduction(
+                    y_ptr,
+                    row_id,
+                    col_id,
+                    logits.to(tl.bfloat16),
+                    steps,
+                    max_k,
+                    scale,
+                    enable_adaptive,
+                    enable_radix,
+                    enable_pdl,
+                    stride_y,
+                    block_n,
+                )
+
+    elif enable_pdl:
+
+        gdc_launch_dependents()
 
 
 @triton.jit(do_not_specialize=["batch_size", "group_blocks"])
@@ -1094,6 +1114,9 @@ def whole_reduction_kernel(
     logit_scale=None,  # Logit Scale of a Vocabulary Shard's Raw Head Logits.
     softcap=None,  # Final Logit Softcap of a Vocabulary Shard's Raw Head Logits.
     u_ptr=None,  # Draw Steps -> [ L ] int32, each row's noise step (else its step in the window).
+    q_ptr=None,  # Cumulative Lengths -> [ B + 1 ].
+    varlen: tl.constexpr = False,  # Variable-Length Lookahead Flag.
+    block_q: tl.constexpr = None,  # Block Size of Cumulative Length(s).
 ) -> None:
     """
     The first stage of the rows ``bitpacked_reduction_kernel`` leaves out under
@@ -1115,66 +1138,81 @@ def whole_reduction_kernel(
 
         gdc_wait()
 
-    batch_id, step_id, margin, timesteps = resolve_indices(
-        None, s_ptr, row_id, lookahead, batch_size, slotted, singular, False, None
+    batch_id, step_id, margin, draft_margin, req_timesteps, row_valid, timesteps = (
+        resolve_indices(
+            q_ptr,
+            s_ptr,
+            row_id,
+            lookahead,
+            batch_size,
+            slotted,
+            singular,
+            varlen,
+            block_q,
+        )
     )
 
-    # The noise's step: the row's own in the window, or the one ``u_ptr`` gives it.
-    draw_step = step_id
+    if row_valid:
 
-    if u_ptr is not None:
+        # The noise's step: the row's own in the window, or the one ``u_ptr`` gives it.
+        draw_step = step_id
 
-        draw_step = tl.load(u_ptr + row_id)
+        if u_ptr is not None:
 
-    indicator = tl.load(z_ptr + batch_id)
+            draw_step = tl.load(u_ptr + row_id)
 
-    if whole_row(indicator, True, singular):
+        indicator = tl.load(z_ptr + batch_id)
 
-        first = group_id * group_blocks
+        if whole_row(indicator, True, singular):
 
-        for block_id in tl.range(first, tl.minimum(first + group_blocks, vocab_blocks)):
+            first = group_id * group_blocks
 
-            whole_block(
-                x_ptr,
-                y_ptr,
-                h_ptr,
-                l_ptr,
-                m_ptr,
-                g_ptr,
-                c_ptr,
-                d_ptr,
-                t_ptr,
-                r_ptr,
-                f_ptr,
-                p_ptr,
-                b_ptr,
-                e_ptr,
-                indicator,
-                row_id,
-                block_id,
-                vocab_blocks,
-                batch_id,
-                step_id,
-                draw_step,
-                margin,
-                timesteps,
-                vocab_size,
-                shard_offset,
-                lookahead,
-                indirection,
-                tokens,
-                singular,
-                stride_x,
-                stride_g,
-                stride_c,
-                stride_t,
-                stride_y,
-                block_n,
-                block_t,
-                value_dtype,
-                logit_scale,
-                softcap,
-            )
+            for block_id in tl.range(
+                first, tl.minimum(first + group_blocks, vocab_blocks)
+            ):
+
+                whole_block(
+                    x_ptr,
+                    y_ptr,
+                    h_ptr,
+                    l_ptr,
+                    m_ptr,
+                    g_ptr,
+                    c_ptr,
+                    d_ptr,
+                    t_ptr,
+                    r_ptr,
+                    f_ptr,
+                    p_ptr,
+                    b_ptr,
+                    e_ptr,
+                    indicator,
+                    row_id,
+                    block_id,
+                    vocab_blocks,
+                    batch_id,
+                    step_id,
+                    draw_step,
+                    draft_margin,
+                    timesteps,
+                    vocab_size,
+                    shard_offset,
+                    lookahead,
+                    req_timesteps,
+                    indirection,
+                    tokens,
+                    singular,
+                    stride_x,
+                    stride_g,
+                    stride_c,
+                    stride_t,
+                    stride_y,
+                    block_n,
+                    block_t,
+                    value_dtype,
+                    logit_scale,
+                    softcap,
+                )
 
     if enable_pdl:
 

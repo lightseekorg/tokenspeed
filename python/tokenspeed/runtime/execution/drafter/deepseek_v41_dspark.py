@@ -36,9 +36,10 @@ from __future__ import annotations
 
 import math
 import os
+from collections import deque
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib import metadata
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -92,15 +93,60 @@ if TYPE_CHECKING:
 logger = get_colorful_logger(__name__)
 
 
+_BUDGET_HOST_RING_SLOTS = 4
+
+
+@dataclass(frozen=True)
+class _VerifyDeviceCalibration:
+    ranges: torch.Tensor
+    native_ms: torch.Tensor
+    capacities: torch.Tensor
+    step_ms: torch.Tensor
+
+
+@dataclass
+class _PendingDeviceBudget:
+    ready: torch.cuda.Event
+    host: torch.Tensor
+    snapshot: tuple[FeedbackSnapshot, ...]
+    padded_bs: int
+    calibrations: tuple[VerifyCalibration, ...]
+    policy_ms: float
+    version: int
+
+
+@dataclass(frozen=True)
+class _CompletedDeviceBudget:
+    selected_q: int
+    context_bounds: tuple[int, int]
+    snapshot: tuple[FeedbackSnapshot, ...]
+    padded_bs: int
+    calibrations: tuple[VerifyCalibration, ...]
+    policy_ms: float
+
+
 @dataclass
 class _VerifyBudgetBuffers:
-    """Persistent budget state; pinned upload packets stay per-round for DMA safety."""
+    """Persistent budget state; async DMA slots rotate via non-blocking rings."""
 
     scores: torch.Tensor
     counts: torch.Tensor
     valid: torch.Tensor
     packet: torch.Tensor
     peers: torch.Tensor
+    device_decision: torch.Tensor
+    free_device_slots: deque[torch.Tensor]
+    pending_device: deque[_PendingDeviceBudget] = field(default_factory=deque)
+    completed_device: _CompletedDeviceBudget | None = None
+    device_cal: _VerifyDeviceCalibration | None = None
+    valid_version: int = 0
+    packet_hosts: tuple[torch.Tensor, ...] = ()
+    packet_events: list[torch.cuda.Event | None] = field(default_factory=list)
+    packet_index: int = 0
+    feedback_free: deque[tuple[torch.Tensor, torch.Tensor]] = field(
+        default_factory=deque
+    )
+    last_active_bs: int | None = None
 
 
 @dataclass
@@ -109,6 +155,8 @@ class _PendingVerifyFeedback:
     scores: torch.Tensor
     contexts: torch.Tensor
     snapshot: tuple[FeedbackSnapshot, ...]
+    owner_buffers: _VerifyBudgetBuffers | None = None
+    feedback_slot: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class DeepseekV41DSpark(BaseDrafter):
@@ -293,6 +341,7 @@ class DeepseekV41DSpark(BaseDrafter):
         super().import_slot_state(slot, src, stream, admission_id=admission_id)
         if self.verify_feedback is not None:
             self.verify_feedback.invalidate()
+        self._invalidate_device_budget()
         if self.confidence_scores is not None:
             self._confidence_admission_ids[slot] = admission_id
 
@@ -304,6 +353,7 @@ class DeepseekV41DSpark(BaseDrafter):
         self._verify_calibrations = ()
         if self.verify_feedback is not None:
             self.verify_feedback.invalidate()
+        self._invalidate_device_budget()
         if self.confidence_scores is not None:
             self.confidence_scores.fill_(float("inf"))
 
@@ -563,6 +613,124 @@ class DeepseekV41DSpark(BaseDrafter):
                     raise ValueError("ambiguous calibration context coverage")
         self._verify_calibrations = tuple(profiles)
         self._verify_policy_ms = policy_ms
+        self._invalidate_device_budget()
+        self._sync_all_device_calibrations()
+
+    def _invalidate_device_budget(self) -> None:
+        for buffers in self._verify_budget_buffers.values():
+            buffers.valid_version += 1
+            buffers.completed_device = None
+
+    def _sync_device_calibration(
+        self, buffers: _VerifyBudgetBuffers, graph_bs: int
+    ) -> None:
+        policy_ms = self._verify_policy_ms
+        matching = sorted(
+            (p for p in self._verify_calibrations if p.batch_size == graph_bs),
+            key=lambda p: p.min_context,
+        )
+        capacities = tuple(
+            sorted(self.decode_graph_query_capacities(graph_bs)[:-1], reverse=True)
+        )
+        if not matching or policy_ms is None or not capacities:
+            buffers.device_cal = None
+            return
+        with self.memory_saver_adapter.named_region("runtime_states"):
+            ranges = torch.tensor(
+                [[p.min_context, p.max_context] for p in matching],
+                dtype=torch.int32,
+                device=self.device,
+            )
+            native_ms = torch.tensor(
+                [float(p.native_step_ms) for p in matching],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            capacities_t = torch.tensor(
+                capacities, dtype=torch.int32, device=self.device
+            )
+            step_rows = []
+            for profile in matching:
+                step_map = dict(profile.adaptive_step_ms)
+                step_rows.append(
+                    [
+                        (
+                            float(step_ms) + float(policy_ms)
+                            if (step_ms := step_map.get(cap)) is not None
+                            else -1.0
+                        )
+                        for cap in capacities
+                    ]
+                )
+            step_ms_t = torch.tensor(step_rows, dtype=torch.float32, device=self.device)
+        buffers.device_cal = _VerifyDeviceCalibration(
+            ranges=ranges,
+            native_ms=native_ms,
+            capacities=capacities_t,
+            step_ms=step_ms_t,
+        )
+
+    def _sync_all_device_calibrations(self) -> None:
+        for graph_bs, buffers in self._verify_budget_buffers.items():
+            self._sync_device_calibration(buffers, graph_bs)
+
+    def _next_host_packet(
+        self, buffers: _VerifyBudgetBuffers
+    ) -> tuple[torch.Tensor, int | None]:
+        for offset in range(len(buffers.packet_hosts)):
+            idx = (buffers.packet_index + offset) % len(buffers.packet_hosts)
+            event = buffers.packet_events[idx]
+            if event is None or event.query():
+                buffers.packet_index = (idx + 1) % len(buffers.packet_hosts)
+                return buffers.packet_hosts[idx], idx
+        return (
+            torch.empty(
+                buffers.packet.shape, dtype=torch.float32, device="cpu", pin_memory=True
+            ),
+            None,
+        )
+
+    def _poll_device_budget(self, buffers: _VerifyBudgetBuffers) -> None:
+        while buffers.pending_device:
+            pending = buffers.pending_device[0]
+            if not pending.ready.query():
+                break
+            buffers.pending_device.popleft()
+            selected_q, min_ctx, max_ctx = pending.host.tolist()
+            buffers.free_device_slots.append(pending.host)
+            if pending.version == buffers.valid_version:
+                buffers.completed_device = _CompletedDeviceBudget(
+                    selected_q=selected_q,
+                    context_bounds=(min_ctx, max_ctx + 2 * self.spec_num_tokens),
+                    snapshot=pending.snapshot,
+                    padded_bs=pending.padded_bs,
+                    calibrations=pending.calibrations,
+                    policy_ms=pending.policy_ms,
+                )
+
+    def _matching_device_budget(
+        self, buffers: _VerifyBudgetBuffers, *, actual_bs: int, padded_bs: int
+    ) -> _CompletedDeviceBudget | None:
+        completed = buffers.completed_device
+        if completed is None or self.verify_feedback is None:
+            return None
+        if (
+            completed.padded_bs != padded_bs
+            or completed.calibrations != self._verify_calibrations
+            or completed.policy_ms != self._verify_policy_ms
+        ):
+            return None
+        current = self.verify_feedback.snapshot()
+        if len(current) != actual_bs or len(completed.snapshot) != actual_bs:
+            return None
+        for now, prev in zip(current, completed.snapshot, strict=True):
+            if (
+                now.slot != prev.slot
+                or now.epoch != prev.epoch
+                or not 1 <= now.generation - prev.generation <= 2
+            ):
+                return None
+        return completed
 
     @property
     def _verification_group(self) -> tuple[int, ...]:
@@ -570,7 +738,7 @@ class DeepseekV41DSpark(BaseDrafter):
         if mapping.dp_size > 1:
             # PP1 is required: every attention rank participates in shared MoE.
             return tuple(range(mapping.world_size))
-        return self.tp_group
+        return self.tp_group or (int(mapping.rank),)
 
     @property
     def _verification_rank(self) -> int:
@@ -623,9 +791,8 @@ class DeepseekV41DSpark(BaseDrafter):
         buffers = self._verify_budget_buffers[batch_size]
         scores = self.verify_feedback.scores()
         bounds = self.verify_feedback.context_bounds()
-        packet = torch.full(
-            buffers.packet.shape, float("nan"), dtype=torch.float32, pin_memory=True
-        )
+        packet, packet_slot = self._next_host_packet(buffers)
+        packet.fill_(float("nan"))
         packet[2] = actual_bs
         if actual_bs == 0:
             packet[:2] = 0
@@ -684,6 +851,10 @@ class DeepseekV41DSpark(BaseDrafter):
                     break
         if selected != full:
             buffers.packet.copy_(packet, non_blocking=True)
+            if packet_slot is not None:
+                event = torch.cuda.Event()
+                event.record()
+                buffers.packet_events[packet_slot] = event
             history = buffers.packet[3:].view(batch_size, self.block_size)
             self.prepare_verify_budget_layout(
                 history, batch_size=batch_size, query_capacity=selected
@@ -707,9 +878,49 @@ class DeepseekV41DSpark(BaseDrafter):
         )
         if not admitted or padded_bs not in self._verify_budget_buffers:
             return full
-        self._poll_verify_feedback()
         buffers = self._verify_budget_buffers[padded_bs]
         tp = int(self.draft_model.mapping.attn.tp_size)
+        if self.dp_local_graph and tp == 1:
+            self._poll_device_budget(buffers)
+            completed = self._matching_device_budget(
+                buffers, actual_bs=actual_bs, padded_bs=padded_bs
+            )
+            if completed is not None:
+                selected = completed.selected_q
+                bounds = completed.context_bounds
+                if selected != full:
+                    reason = "packed"
+                    if buffers.last_active_bs != actual_bs:
+                        buffers.packet[2:3].fill_(actual_bs)
+                        buffers.last_active_bs = actual_bs
+                    graph = self._verify_budget_graphs.get((padded_bs, selected))
+                    if graph is None:
+                        raise ValueError(
+                            "verification allocation graph was not prepared"
+                        )
+                    graph.replay()
+                    self._verify_layout_counts = None
+                elif bounds[1] <= 2 * self.spec_num_tokens:
+                    reason = "feedback_unavailable"
+                elif any(
+                    profile.covers(
+                        batch_size=padded_bs,
+                        min_context=bounds[1],
+                        max_context=bounds[1],
+                    )
+                    for profile in self._verify_calibrations
+                ):
+                    reason = "full"
+                else:
+                    reason = "uncalibrated"
+                self._record_verify_budget(
+                    batch_size=padded_bs,
+                    query_capacity=selected,
+                    reason=reason,
+                    context_bounds=bounds,
+                )
+                return selected
+        self._poll_verify_feedback()
         rank = int(self.draft_model.mapping.attn.tp_rank)
         selected = full
         scores = None
@@ -738,7 +949,8 @@ class DeepseekV41DSpark(BaseDrafter):
                         break
         # One authoritative packet aligns graph choice and allocation scores.
         # All TP ranks participate even when their local async feedback is late.
-        packet = torch.zeros(buffers.packet.shape, dtype=torch.float32, pin_memory=True)
+        packet, packet_slot = self._next_host_packet(buffers)
+        packet.zero_()
         packet[0] = selected
         packet[2] = actual_bs
         if rank == 0 and selected != full:
@@ -756,6 +968,10 @@ class DeepseekV41DSpark(BaseDrafter):
             selected = int(packet[0].item())
         if selected != full:
             buffers.packet.copy_(packet, non_blocking=True)
+            if packet_slot is not None:
+                event = torch.cuda.Event()
+                event.record()
+                buffers.packet_events[packet_slot] = event
             source = buffers.packet[3:].view(padded_bs, self.block_size)
             self.prepare_verify_budget_layout(
                 source, batch_size=padded_bs, query_capacity=selected
@@ -782,35 +998,66 @@ class DeepseekV41DSpark(BaseDrafter):
             return
         if graph_bs in self._verify_budget_buffers:
             return
-        if len(self._verification_group) > 1:
+        if self._verification_group and len(self._verification_group) > 1:
             pg_manager.init_process_group(
                 self._verification_group,
                 backend="gloo",
                 name="dsv41_verify_metadata",
             )
-        if len(self.tp_group) > 1:
+        if self.tp_group and len(self.tp_group) > 1:
             pg_manager.init_process_group(
                 self.tp_group, backend="gloo", name="dsv41_verify_tp_metadata"
             )
-        buffers = _VerifyBudgetBuffers(
-            scores=torch.zeros(
-                (graph_bs, self.block_size), dtype=torch.float32, device=self.device
-            ),
-            counts=torch.empty(graph_bs, dtype=torch.int64, device=self.device),
-            valid=torch.empty((), dtype=torch.bool, device=self.device),
-            packet=torch.empty(
-                3 + graph_bs * self.block_size, dtype=torch.float32, device=self.device
-            ),
-            peers=torch.empty(
-                (
-                    len(self._verification_group),
-                    3 + graph_bs * self.block_size,
+        packet_size = 3 + graph_bs * self.block_size
+        with self.memory_saver_adapter.named_region("runtime_states"):
+            buffers = _VerifyBudgetBuffers(
+                scores=torch.zeros(
+                    (graph_bs, self.block_size),
+                    dtype=torch.float32,
+                    device=self.device,
                 ),
-                dtype=torch.float32,
-                device="cpu",
-            ),
-        )
-        buffers.packet[2].fill_(graph_bs)
+                counts=torch.empty(graph_bs, dtype=torch.int64, device=self.device),
+                valid=torch.empty((), dtype=torch.bool, device=self.device),
+                packet=torch.empty(
+                    packet_size, dtype=torch.float32, device=self.device
+                ),
+                peers=torch.empty(
+                    (
+                        len(self._verification_group),
+                        packet_size,
+                    ),
+                    dtype=torch.float32,
+                    device="cpu",
+                ),
+                device_decision=torch.empty(3, dtype=torch.int32, device=self.device),
+                free_device_slots=deque(
+                    torch.empty(3, dtype=torch.int32, device="cpu", pin_memory=True)
+                    for _ in range(_BUDGET_HOST_RING_SLOTS)
+                ),
+                packet_hosts=tuple(
+                    torch.empty(
+                        packet_size, dtype=torch.float32, device="cpu", pin_memory=True
+                    )
+                    for _ in range(_BUDGET_HOST_RING_SLOTS)
+                ),
+                packet_events=[None] * _BUDGET_HOST_RING_SLOTS,
+                feedback_free=deque(
+                    (
+                        torch.empty(
+                            (graph_bs, self.block_size),
+                            dtype=torch.float32,
+                            device="cpu",
+                            pin_memory=True,
+                        ),
+                        torch.empty(
+                            graph_bs, dtype=torch.int32, device="cpu", pin_memory=True
+                        ),
+                    )
+                    for _ in range(_BUDGET_HOST_RING_SLOTS)
+                ),
+                last_active_bs=graph_bs,
+            )
+            buffers.packet[2].fill_(graph_bs)
         self._verify_budget_buffers[graph_bs] = buffers
         for capacity in self.decode_graph_query_capacities(graph_bs):
             if capacity == graph_bs * self.spec_num_tokens:
@@ -855,6 +1102,34 @@ class DeepseekV41DSpark(BaseDrafter):
             self._verify_budget_graphs[(graph_bs, capacity)] = graph
         self._verify_layout_counts = None
         self._restore_verify_calibration(graph_bs)
+        self._sync_device_calibration(buffers, graph_bs)
+        if self.dp_local_graph and int(self.draft_model.mapping.attn.tp_size) == 1:
+            # Warm the serving-time device budget kernel for this captured graph_bs
+            # so finish_round never triggers Triton JIT compilation while serving.
+            with torch.cuda.stream(stream):
+                dsv41.select_verify_budget(
+                    self.confidence_scores,
+                    request_slots=torch.zeros(1, dtype=torch.int32, device=self.device),
+                    seq_lens=torch.ones(1, dtype=torch.int32, device=self.device),
+                    profile_ranges=torch.tensor(
+                        [[1, 1024]], dtype=torch.int32, device=self.device
+                    ),
+                    profile_native_ms=torch.ones(
+                        1, dtype=torch.float32, device=self.device
+                    ),
+                    profile_capacities=torch.tensor(
+                        [max(graph_bs, 1)], dtype=torch.int32, device=self.device
+                    ),
+                    profile_step_ms=torch.ones(
+                        (1, 1), dtype=torch.float32, device=self.device
+                    ),
+                    selected_out=torch.empty(3, dtype=torch.int32, device=self.device),
+                    padded_bs=graph_bs,
+                    context_advance=2 * self.spec_num_tokens,
+                    min_batch_size=self.adaptive_min_batch_size,
+                    min_gain=self.verify_budget_policy.min_gain,
+                )
+            torch.cuda.current_stream().wait_stream(stream)
 
     def _initialize_verify_cache(self) -> None:
         if self._verify_cache_initialized:
@@ -1042,6 +1317,7 @@ class DeepseekV41DSpark(BaseDrafter):
         ):
             raise ValueError("confidence scores do not match the prepared allocation")
         buffers.scores.copy_(scores)
+        buffers.last_active_bs = None
         graph.replay()
         self._verify_layout_counts = None
 
@@ -1058,6 +1334,8 @@ class DeepseekV41DSpark(BaseDrafter):
                 self.verify_feedback.publish(
                     pending.snapshot, pending.scores.tolist(), context_lengths=lengths
                 )
+            if pending.owner_buffers is not None and pending.feedback_slot is not None:
+                pending.owner_buffers.feedback_free.append(pending.feedback_slot)
 
     def finish_round(self, ctx: ForwardContext, graph_bs: int | None) -> None:
         # Runs on the forward thread, outside capture, after draft writes.
@@ -1077,6 +1355,53 @@ class DeepseekV41DSpark(BaseDrafter):
             )
         ):
             return
+        buffers = self._verify_budget_buffers.get(graph_bs)
+        if (
+            self.dp_local_graph
+            and int(self.draft_model.mapping.attn.tp_size) == 1
+            and buffers is not None
+            and buffers.device_cal is not None
+        ):
+            self._poll_device_budget(buffers)
+            if not buffers.free_device_slots:
+                return
+            snapshot = self.verify_feedback.snapshot()
+            if len(snapshot) != ctx.bs:
+                raise RuntimeError(
+                    "verification feedback does not match the active batch"
+                )
+            slots = self.input_buffers.req_pool_indices_buf[: ctx.bs]
+            seq_lens = self.input_buffers.seq_lens_buf[: ctx.bs]
+            dsv41.select_verify_budget(
+                self.confidence_scores,
+                request_slots=slots,
+                seq_lens=seq_lens,
+                profile_ranges=buffers.device_cal.ranges,
+                profile_native_ms=buffers.device_cal.native_ms,
+                profile_capacities=buffers.device_cal.capacities,
+                profile_step_ms=buffers.device_cal.step_ms,
+                selected_out=buffers.device_decision,
+                padded_bs=graph_bs,
+                context_advance=2 * self.spec_num_tokens,
+                min_batch_size=self.adaptive_min_batch_size,
+                min_gain=self.verify_budget_policy.min_gain,
+            )
+            host = buffers.free_device_slots.popleft()
+            host.copy_(buffers.device_decision, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+            buffers.pending_device.append(
+                _PendingDeviceBudget(
+                    ready=event,
+                    host=host,
+                    snapshot=snapshot,
+                    padded_bs=graph_bs,
+                    calibrations=self._verify_calibrations,
+                    policy_ms=float(self._verify_policy_ms),
+                    version=buffers.valid_version,
+                )
+            )
+            return
         self._poll_verify_feedback()
         if len(self._pending_verify_feedback) >= 3:
             return
@@ -1085,21 +1410,37 @@ class DeepseekV41DSpark(BaseDrafter):
             raise RuntimeError("verification feedback does not match the active batch")
         slots = self.input_buffers.req_pool_indices_buf[: ctx.bs]
         scores = self.confidence_scores.index_select(0, slots)
-        host = torch.empty(
-            scores.shape, dtype=scores.dtype, device="cpu", pin_memory=True
-        )
+        feedback_slot = None
+        if buffers is not None:
+            if not buffers.feedback_free:
+                return
+            feedback_slot = buffers.feedback_free.popleft()
+            scores_buf, contexts_buf = feedback_slot
+            host = scores_buf[: ctx.bs]
+            contexts = contexts_buf[: ctx.bs]
+        else:
+            host = torch.empty(
+                scores.shape, dtype=scores.dtype, device="cpu", pin_memory=True
+            )
+            contexts = torch.empty(
+                ctx.bs,
+                dtype=self.input_buffers.seq_lens_buf.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
         host.copy_(scores, non_blocking=True)
-        contexts = torch.empty(
-            ctx.bs,
-            dtype=self.input_buffers.seq_lens_buf.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
         contexts.copy_(self.input_buffers.seq_lens_buf[: ctx.bs], non_blocking=True)
         event = torch.cuda.Event()
         event.record()
         self._pending_verify_feedback.append(
-            _PendingVerifyFeedback(event, host, contexts, snapshot)
+            _PendingVerifyFeedback(
+                event,
+                host,
+                contexts,
+                snapshot,
+                owner_buffers=buffers if feedback_slot is not None else None,
+                feedback_slot=feedback_slot,
+            )
         )
 
     def _draft_decode_rows(

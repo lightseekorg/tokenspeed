@@ -296,13 +296,17 @@ def _reduce(
     shard: VocabShard | None,
     ancestors: Tensor | None = None,
     steps: Tensor | None = None,
+    query_start_loc: Tensor | None = None,
 ) -> None:
     """The first stage: each block's keys (greedy maximum, or best perturbed value of a whole-vocabulary row) in ``scratchpad``; ``drafted`` is None for one row per request. ``tree_targets`` also passes ``ancestors``, the tokens each row's penalties count, and ``steps``, which key each row's noise."""
     exact = _exact(logits)
     rows, vocab_size = logits.shape
+    if rows == 0:
+        return
     blocks = triton.cdiv(vocab_size, config.block_n)
     singular = drafted is None
     tokens, stride_t = drafted, None
+    varlen = query_start_loc is not None
     if singular:
         batch_size, gamma, block_g = rows, 0, None
         stride_g = state.grammar.stride(0)
@@ -313,11 +317,12 @@ def _reduce(
         batch_size, timesteps = drafted.shape
         gamma, block_g = timesteps - 1, next_power_of_2(timesteps)
         stride_g = state.grammar.flatten(0, -2).stride(0)
+    block_q = next_power_of_2(batch_size + 1) if varlen else None
     bitpacked_reduction_kernel[(rows, blocks)](
         logits,
         state.indicators,
         slots,
-        None,
+        query_start_loc,
         None,
         state.grammar,
         state.context_counts,
@@ -339,7 +344,7 @@ def _reduce(
         tokens is not None,
         True,
         singular,
-        False,
+        varlen,
         False,
         config.radix,
         enable_pdl,
@@ -349,7 +354,7 @@ def _reduce(
         stride_t,
         scratchpad.stride(0),
         config.block_n,
-        None,
+        block_q,
         block_g,
         exact,
         tl.float32 if exact else tl.bfloat16,
@@ -401,6 +406,9 @@ def _reduce(
         logit_scale=None if shard is None else shard.logit_scale,
         softcap=None if shard is None else shard.softcap,
         u_ptr=steps,
+        q_ptr=query_start_loc,
+        varlen=varlen,
+        block_q=block_q,
         num_warps=4,
     )
 
@@ -422,6 +430,7 @@ def shard_candidates(
     config: SonicConfig,
     enable_pdl: bool,
     draft_probs: Tensor | None = None,
+    query_start_loc: Tensor | None = None,
 ) -> Tensor:
     """This rank's best ``MAX_K`` candidates per logits row, for the ranks' gather.
 
@@ -437,6 +446,8 @@ def shard_candidates(
         enable_pdl: Launch with programmatic dependent launch.
         draft_probs: ``[P, >= g, V_s]`` fp32 draft probabilities this rank
             recorded over its shard's columns, for a verify launch, or None.
+        query_start_loc: Optional ``[B + 1]`` int32/int64 CSR row boundaries
+            into packed ``logits`` (for verify launches).
 
     Returns:
         Contiguous ``[rows, 2 * MAX_K]`` fp32 view of ``shard.pairs``: each
@@ -455,7 +466,16 @@ def shard_candidates(
     """
     _check_offsets(logits, scratchpad)
     _reduce(
-        logits, state, slots, offsets, drafted, scratchpad, config, enable_pdl, shard
+        logits,
+        state,
+        slots,
+        offsets,
+        drafted,
+        scratchpad,
+        config,
+        enable_pdl,
+        shard,
+        query_start_loc=query_start_loc,
     )
     exact = _exact(logits)
     rows, vocab_size = logits.shape
@@ -463,11 +483,16 @@ def shard_candidates(
     block_v = next_power_of_2(blocks)
     width = (2 if draft_probs is None else 3) * MAX_K
     pairs = shard.pairs.view(-1)[: rows * width].view(rows, width)
+    if rows == 0:
+        return pairs
+    varlen = drafted is not None and query_start_loc is not None
     if drafted is None:
-        gamma, block_g, stride_g = 0, None, state.grammar.stride(0)
+        batch_size, gamma, block_g, stride_g = rows, 0, None, state.grammar.stride(0)
     else:
+        batch_size = drafted.shape[0]
         gamma, block_g = drafted.shape[1] - 1, next_power_of_2(drafted.shape[1])
         stride_g = state.grammar.flatten(0, -2).stride(0)
+    block_q = next_power_of_2(batch_size + 1) if varlen else None
     shard_candidates_kernel[(rows,)](
         scratchpad,
         state.indicators,
@@ -506,6 +531,10 @@ def shard_candidates(
         stride_d=None if draft_probs is None else draft_probs.stride(0),
         stride_dg=None if draft_probs is None else draft_probs.stride(1),
         whole=True,
+        q_ptr=query_start_loc if varlen else None,
+        batch_size=batch_size,
+        varlen=varlen,
+        block_q=block_q,
         num_warps=config.second_warps,
     )
     return pairs
@@ -522,11 +551,21 @@ def _merged(
     config: SonicConfig,
     enable_pdl: bool,
     draft_probs: Tensor | None = None,
+    query_start_loc: Tensor | None = None,
 ) -> dict:
     """The selection kernels' candidate arguments: none for whole rows, else every rank's gathered candidates (with ``draft_probs``, carrying them), which they merge."""
     if shard is None:
         _reduce(
-            logits, state, slots, offsets, drafted, scratchpad, config, enable_pdl, None
+            logits,
+            state,
+            slots,
+            offsets,
+            drafted,
+            scratchpad,
+            config,
+            enable_pdl,
+            None,
+            query_start_loc=query_start_loc,
         )
         return {}
     pairs = shard.gather(
@@ -541,6 +580,7 @@ def _merged(
             config,
             enable_pdl,
             draft_probs,
+            query_start_loc=query_start_loc,
         )
     )
     ranks = pairs.shape[0]
@@ -795,6 +835,7 @@ def verify(
     draft_probs: Tensor | None = None,
     reject_threshold: float | None = None,
     candidate_drafts: Tensor | None = None,
+    query_start_loc: Tensor | None = None,
 ) -> None:
     """Verify each request's drafts against its slot's distribution by rejection sampling.
 
@@ -807,17 +848,20 @@ def verify(
     the slot's decode counts.
 
     Args:
-        logits: ``[B * (g + 1), V]`` bf16 or fp32 logits, request-major, or
-            this rank's ``[B * (g + 1), V_s]`` raw head logits with ``shard``.
+        logits: ``[rows, V]`` bf16 or fp32 logits (``rows = B * (g + 1)``
+            request-major, or CSR-packed with ``query_start_loc``), or this
+            rank's ``[rows, V_s]`` raw head logits with ``shard``.
         state: The slot state; fp32 scalars with fp32 logits.
         slots: ``[B]`` int64 slot of each request.
         offsets: ``[P]`` int64 Philox offset of each slot (its first row's position).
         drafted: ``[B, g + 1]`` int32 drafts in the first ``g`` columns; on
-            return the accepted prefix and the next token.
-        accepted: ``[B, 1]`` int32 output: accepted drafts per request.
-        scratchpad: ``[B * (g + 1), >= scratchpad_columns(V)]`` uint32 keys.
-        values: ``[B * (g + 1), MAX_K]`` fp32 candidate probabilities (scratch).
-        indices: ``[B * (g + 1), MAX_K]`` int32 candidate tokens (scratch).
+            return the accepted prefix and the next token (zero-padded past it
+            when ``query_start_loc`` is passed; all zero for empty intervals).
+        accepted: ``[B, 1]`` int32 output: accepted drafts per request (``-1``
+            for zero-row requests under ``query_start_loc``).
+        scratchpad: ``[rows, >= scratchpad_columns(V)]`` uint32 keys.
+        values: ``[rows, MAX_K]`` fp32 candidate probabilities (scratch).
+        indices: ``[rows, MAX_K]`` int32 candidate tokens (scratch).
         config: The launch config (``pick``, over the shard's columns with ``shard``).
         enable_pdl: Launch with programmatic dependent launch.
         shard: This rank's vocabulary slice when the logits are sharded;
@@ -831,21 +875,43 @@ def verify(
         reject_threshold: Recorded probabilities above it mark a slot with
             no proposal: its draft is rejected and the token drawn from ``p``.
             Required with ``draft_probs``.
-        candidate_drafts: ``[B * (g + 1), MAX_K]`` fp32 scratch for the
+        candidate_drafts: ``[rows, MAX_K]`` fp32 scratch for the
             candidates' carried draft probabilities; required with
             shard-local ``draft_probs``.
+        query_start_loc: Optional ``[B + 1]`` int32/int64 CSR row boundaries
+            into packed ``logits``; intervals fit ``[0, g + 1]`` and rows past
+            ``query_start_loc[-1]`` are ignored as padding.
 
     Raises:
         ValueError: The logits are neither bf16 nor fp32, a row offset
-            would pass ``MAX_OFFSET``, or ``draft_probs`` rows are not dense
-            rows over the whole vocabulary or this rank's shard, come without
-            ``reject_threshold``, or are shard-local without
-            ``candidate_drafts``.
+            would pass ``MAX_OFFSET``, ``query_start_loc`` is invalid, or
+            ``draft_probs`` rows are not dense rows over the whole vocabulary or
+            this rank's shard, come without ``reject_threshold``, or are
+            shard-local without ``candidate_drafts``.
     """
     _check_offsets(logits, scratchpad)
     exact = _exact(logits)
     rows, vocab_size = logits.shape
     batch_size, timesteps = drafted.shape
+    if timesteps > MAX_K:
+        raise ValueError(
+            f"sonic verify candidate width {timesteps} exceeds MAX_K {MAX_K}"
+        )
+    varlen = query_start_loc is not None
+    if varlen and (
+        query_start_loc.ndim != 1
+        or query_start_loc.shape != (batch_size + 1,)
+        or query_start_loc.dtype not in (torch.int32, torch.int64)
+        or query_start_loc.device != logits.device
+        or not query_start_loc.is_contiguous()
+    ):
+        raise ValueError(
+            f"sonic query_start_loc must be contiguous int32/int64 [{batch_size + 1}] "
+            f"on {logits.device}, got {query_start_loc.dtype} "
+            f"{tuple(query_start_loc.shape)} on {query_start_loc.device}"
+        )
+    if batch_size == 0:
+        return
     stride_c = state.decode_counts.stride(0)
     if draft_probs is not None and reject_threshold is None:
         raise ValueError(
@@ -884,81 +950,84 @@ def verify(
     gamma = timesteps - 1
     blocks = triton.cdiv(vocab_size, config.block_n)
     block_v, block_g = next_power_of_2(blocks), next_power_of_2(timesteps)
+    block_q = next_power_of_2(batch_size + 1) if varlen else None
     stride_x, stride_y = logits.stride(0), scratchpad.stride(0)
     stride_g = state.grammar.flatten(0, -2).stride(0)
 
-    merged = _merged(
-        logits,
-        state,
-        slots,
-        offsets,
-        drafted,
-        scratchpad,
-        shard,
-        config,
-        enable_pdl,
-        draft_probs if local else None,
-    )
-    if local:
-        merged["m_ptr"] = candidate_drafts
-    cumulative_unpack_kernel[(rows,)](
-        scratchpad,
-        state.indicators,
-        slots,
-        None,
-        state.top_k,
-        state.top_p,
-        state.min_p,
-        values,
-        indices,
-        blocks,
-        1,
-        vocab_size,
-        gamma,
-        MAX_K,
-        None,
-        batch_size,
-        block_v,
-        block_v * MAX_K,
-        False,
-        True,
-        False,
-        False,
-        not config.radix,
-        enable_pdl,
-        stride_y,
-        None,
-        None,
-        config.block_n,
-        block_v,
-        None,
-        logits if exact else None,
-        state.grammar if exact else None,
-        state.context_counts if exact else None,
-        state.decode_counts if exact else None,
-        drafted,
-        state.repetition if exact else None,
-        state.frequency if exact else None,
-        state.presence if exact else None,
-        state.logit_bias if exact else None,
-        state.temperature if exact else None,
-        vocab_size,
-        0,
-        stride_x,
-        stride_g,
-        stride_c,
-        block_g,
-        exact,
-        **merged,
-        whole=True,
-        num_warps=config.second_warps,
-    )
+    if rows > 0:
+        merged = _merged(
+            logits,
+            state,
+            slots,
+            offsets,
+            drafted,
+            scratchpad,
+            shard,
+            config,
+            enable_pdl,
+            draft_probs if local else None,
+            query_start_loc=query_start_loc,
+        )
+        if local:
+            merged["m_ptr"] = candidate_drafts
+        cumulative_unpack_kernel[(rows,)](
+            scratchpad,
+            state.indicators,
+            slots,
+            query_start_loc,
+            state.top_k,
+            state.top_p,
+            state.min_p,
+            values,
+            indices,
+            blocks,
+            1,
+            vocab_size,
+            gamma,
+            MAX_K,
+            None,
+            batch_size,
+            block_v,
+            block_v * MAX_K,
+            False,
+            True,
+            varlen,
+            False,
+            not config.radix,
+            enable_pdl,
+            stride_y,
+            None,
+            None,
+            config.block_n,
+            block_v,
+            block_q,
+            logits if exact else None,
+            state.grammar if exact else None,
+            state.context_counts if exact else None,
+            state.decode_counts if exact else None,
+            drafted,
+            state.repetition if exact else None,
+            state.frequency if exact else None,
+            state.presence if exact else None,
+            state.logit_bias if exact else None,
+            state.temperature if exact else None,
+            vocab_size,
+            0,
+            stride_x,
+            stride_g,
+            stride_c,
+            block_g,
+            exact,
+            **merged,
+            whole=True,
+            num_warps=config.second_warps,
+        )
     chain_speculative_verification_kernel[(batch_size,)](
         values,
         indices,
         state.indicators,
         slots,
-        None,
+        query_start_loc,
         drafted,
         None if local else draft_probs,
         None,
@@ -975,7 +1044,7 @@ def verify(
         gamma,
         MAX_K,
         True,
-        False,
+        varlen,
         enable_pdl,
         True,
         False,

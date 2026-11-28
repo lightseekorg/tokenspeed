@@ -269,7 +269,10 @@ def test_dp_local_cuda_graph_sampled_path_keeps_adaptive_validation():
         (["--enforce-eager"], "require CUDA graphs"),
         (["--disaggregation-mode", "prefill"], "decode-capable worker"),
         (["--disaggregation-mode", "encode"], "decode-capable worker"),
-        (["--sampling-backend", "flashinfer"], "greedy sampling or adaptive"),
+        (
+            ["--sampling-backend", "flashinfer"],
+            "require greedy or sonic sampling, or adaptive",
+        ),
         (["--tensor-parallel-size", "2"], "attention/dense/MoE/LM-head TP1"),
         (
             ["--world-size", "2", "--data-parallel-size", "2"],
@@ -462,3 +465,28 @@ def test_gds_refuses_disabled_prefix_cache(flags):
         ["--model", "x", "--disable-prefix-caching", "--disable-kvstore"]
     )
     assert not args.enable_prefix_caching
+
+
+@pytest.mark.parametrize("adaptive", [False, True])
+def test_dp_local_cuda_graph_accepts_sonic(adaptive):
+    argv = _dp_local_graph_args() + ["--sampling-backend", "sonic"]
+    if adaptive:
+        argv.extend(["--enable-dsv41-adaptive-dspark", "--disable-prefill-graph"])
+    args = prepare_server_args(argv)
+    assert args.enable_dp_local_cuda_graph is True
+    assert args.sampling_backend == "sonic"
+    assert args.enable_dsv41_adaptive_dspark is adaptive
+    assert args.enable_speculative_sampling is False
+
+
+def test_adaptive_dspark_rejects_sonic_with_speculative_sampling():
+    with pytest.raises(ValueError):
+        prepare_server_args(
+            _dp_local_graph_args()
+            + [
+                "--sampling-backend",
+                "sonic",
+                "--enable-dsv41-adaptive-dspark",
+                "--enable-speculative-sampling",
+            ]
+        )

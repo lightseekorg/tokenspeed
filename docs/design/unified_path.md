@@ -2935,9 +2935,14 @@ Grammar verify candidates are copied to pinned storage on the main stream before
 its fork event, so the side-stream host fill reads pre-packing tokens even when
 packed verification later rewrites `input_ids_buf` in place.
 The same packed row indices gather request-major xgrammar bitmask rows into
-target-logit order. Greedy and sampled FlashInfer verification apply those
-masks and support selected-token output logprobs, as does sampled prefill;
-cumulative output probabilities remain rejected at startup. Chain
+target-logit order. Greedy, Sonic, and sampled FlashInfer verification
+apply those masks and support selected-token output logprobs, as does sampled
+prefill; cumulative output probabilities remain rejected at startup. With
+`enable_dsv41_adaptive_dspark`, `--sampling-backend sonic` enables packed
+verify (`query_start_loc`) for chain sampling (`candidates`, `predicts`,
+`vocab_mask`, `output_logprobs`) while sampled speculative DSpark
+(`--enable-speculative-sampling`) remains restricted to FlashInfer; `--enable-dp-local-cuda-graph`
+supports both `greedy` and `sonic` without requiring adaptive DSpark. Chain
 `accept_index` entries stay flat `request * width + column` values. Output
 logprob scoring subtracts the request base before adding the packed CSR start.
 A `-1` tail entry uses the request anchor and remains excluded by the accepted
@@ -2963,10 +2968,15 @@ counts rather than fabricated peer extents; MegaMoE's fixed-capacity symmetric
 buffer supplies the common communication geometry. Scheduler write reservations
 are unchanged.
 
-Serving and startup profiling use the same budget policy. Local DP graphs
-select from local N-2 confidence and context feedback, including padded local
-request buckets; missing local feedback retains only that rank's full width.
-This serving decision has no cross-DP collective. Shared graphs retain agreement.
+Serving and startup profiling use the same budget policy. Local DP graphs at TP1
+select budgets on GPU in `finish_round` (`dsv41.select_verify_budget`) from live
+slot confidence scores and context lengths with a `2 * verify_width` headroom,
+stream back a 3-`int32` `[selected_q, min_ctx, max_ctx]` header over a
+pre-allocated pinned ring buffer, and replay the matching captured
+`verify_layout` graph directly from GPU `confidence_scores` with zero score
+D2H/H2D transfers or Gloo collectives. Requests missing valid prior-step device
+decisions (such as new extends or startup calibration) fall back to full width
+or host `VerifyFeedback`. Shared graphs retain host feedback and agreement.
 DP budget metadata uses the global attention host group; TP-only metadata
 uses a TP-local host group. Startup's authoritative TP packet broadcast also
 uses a TP-local host group: different DP groups must not supply different roots

@@ -156,3 +156,24 @@ and `L - 1` accepted drafts. The target token is either given per row or read
 from the row's target predictions at column `L - 1`, and `L` past the verify
 width counts as the width. One Triton program writes one row, so a captured
 step pays one launch for the override; the CPU path is the torch reference.
+
+## Packed chain verification (`sonic`)
+
+`sonic.verify` accepts an optional CSR `query_start_loc` (`[B + 1]`, int32/int64)
+alongside packed target logits `[rows, V]` and fixed-width `[B, g + 1]` /
+`[B, 1]` control tensors (`drafted`, `accepted`; exposed by
+`SonicSamplingBackend.verify` as `(predict, accept_lengths)`). Reduction,
+multistep bitpack/unpack, TP candidate sharding, and verification resolve
+`(batch_id, step_id)` from `query_start_loc` without host compaction:
+
+* Target logit rows `r >= query_start_loc[batch_size]` (graph padding tail) and
+  requests with `query_start_loc[b + 1] <= query_start_loc[b]` skip target reads;
+  empty requests write `accepted = -1` and zeroed `drafted` (which
+  `SonicSamplingBackend.verify` exposes as `accept_lengths = 0` and zeroed
+  `predict`).
+* Shortened request windows `1 <= c_b < g + 1` evaluate steps `0..c_b - 1`, keep
+  step `c_b - 1` as the bonus target step without drafting past
+  `candidates[b, c_b - 1]`, and zero unused trailing columns `drafted[b, c_b:]`.
+* Sampling metadata (`vocab_mask`, `draft_probs`, `top_p`, `min_p`, `top_k`,
+  `temperature`, penalties) remains compatible in both whole-vocab and TP-sharded
+  paths, and Triton compiles stay invariant to runtime `query_start_loc` extents.

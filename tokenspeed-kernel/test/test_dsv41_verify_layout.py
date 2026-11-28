@@ -18,9 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import math
+
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.dsv41 import verify_layout
+from tokenspeed_kernel.ops.attention.dsv41 import select_verify_budget, verify_layout
 
 
 def reference_layout(
@@ -415,3 +417,258 @@ def test_padded_layout_replay_tracks_live_count_without_compiling():
                 torch.testing.assert_close(out[name], expected[name], atol=0, rtol=0)
             assert out["counts_out"][count:].tolist() == [1] * (8 - count)
     graph.reset()
+
+
+def _reference_select_verify_budget(
+    latest_scores: torch.Tensor,
+    request_slots: torch.Tensor,
+    seq_lens: torch.Tensor,
+    profiles: list[tuple[int, int, float, dict[int, float]]],
+    capacities: list[int],
+    *,
+    padded_bs: int,
+    context_advance: int,
+    min_batch_size: int,
+    min_gain: float,
+    policy_ms: float,
+) -> tuple[int, int, int]:
+    bs = int(request_slots.shape[0])
+    draft = int(latest_scores.shape[1])
+    full = padded_bs * (draft + 1)
+    seq_vals = [int(v) for v in seq_lens.tolist()]
+    min_ctx = min(seq_vals) if seq_vals else 0
+    max_ctx = max(seq_vals) if seq_vals else 0
+    if bs < min_batch_size or bs <= 0 or any(v <= 0 for v in seq_vals):
+        return full, min_ctx, max_ctx
+    rows = []
+    for slot in request_slots.tolist():
+        if slot < 0 or slot >= latest_scores.shape[0]:
+            return full, min_ctx, max_ctx
+        row = latest_scores[slot].tolist()
+        if any(not math.isfinite(v) for v in row):
+            return full, min_ctx, max_ctx
+        rows.append(row)
+    upper_ctx = max_ctx + context_advance
+    chosen = None
+    for p_min, p_max, native_ms, step_map in profiles:
+        if p_min <= upper_ctx <= p_max:
+            chosen = (native_ms, step_map)
+            break
+    if chosen is None or not math.isfinite(chosen[0]) or chosen[0] <= 0:
+        return full, min_ctx, max_ctx
+    native_ms, step_map = chosen
+    gains = []
+    for row in rows:
+        survival = 1.0
+        for score in row:
+            exp = math.exp(-abs(score))
+            survival *= 1.0 / (1.0 + exp) if score >= 0.0 else exp / (1.0 + exp)
+            gains.append(survival)
+    gains.sort(reverse=True)
+    prefix = [0.0]
+    for g in gains:
+        prefix.append(prefix[-1] + g)
+    full_reward = float(bs) + prefix[len(gains)]
+    best_q = full
+    best_rate = (full_reward / native_ms) * (1.0 + min_gain)
+    for q in sorted(capacities, reverse=True):
+        if q == full or q < padded_bs or q >= full:
+            continue
+        step_ms = step_map.get(q)
+        if step_ms is None or not math.isfinite(step_ms) or step_ms <= 0:
+            continue
+        reward = float(bs) + prefix[min(max(q - padded_bs, 0), len(gains))]
+        rate = reward / (step_ms + policy_ms)
+        if rate > best_rate:
+            best_q, best_rate = q, rate
+    return best_q, min_ctx, max_ctx
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_select_verify_budget_matches_policy_and_edge_cases():
+    draft = 5
+    slots_total = 32
+    torch.manual_seed(7)
+    latest = torch.randn(slots_total, draft, dtype=torch.float32, device="cuda")
+    # Distinct score rows so selection tests both packing and context boundaries.
+    latest[:4] = 8.0
+    latest[4:8] = -8.0
+
+    capacities = [36, 28, 20, 12]
+    profiles = [
+        (1, 8192, 10.0, {36: 8.0, 28: 6.0, 20: 4.0, 12: 2.5}),
+        (8193, 32768, 12.0, {36: 9.0, 28: 8.5, 20: 9.5}),
+    ]
+    policy_ms = 0.25
+    prof_ranges = torch.tensor(
+        [[p[0], p[1]] for p in profiles], dtype=torch.int32, device="cuda"
+    )
+    prof_native = torch.tensor(
+        [p[2] for p in profiles], dtype=torch.float32, device="cuda"
+    )
+    prof_caps = torch.tensor(capacities, dtype=torch.int32, device="cuda")
+    prof_step = torch.tensor(
+        [
+            [p[3][c] + policy_ms if c in p[3] else -1.0 for c in capacities]
+            for p in profiles
+        ],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    out = torch.empty(3, dtype=torch.int32, device="cuda")
+
+    def check(slot_list, ctx_list, *, padded_bs=8, adv=12, min_bs=2, min_gain=0.02):
+        # Trailing padded slots hold non-finite poison that must be ignored past bs.
+        all_slots = torch.tensor(
+            slot_list + [slots_total - 1] * (padded_bs - len(slot_list)),
+            dtype=torch.int32,
+            device="cuda",
+        )[: len(slot_list)]
+        seq_lens = torch.tensor(ctx_list, dtype=torch.int32, device="cuda")
+        select_verify_budget(
+            latest,
+            request_slots=all_slots,
+            seq_lens=seq_lens,
+            profile_ranges=prof_ranges,
+            profile_native_ms=prof_native,
+            profile_capacities=prof_caps,
+            profile_step_ms=prof_step,
+            selected_out=out,
+            padded_bs=padded_bs,
+            context_advance=adv,
+            min_batch_size=min_bs,
+            min_gain=min_gain,
+        )
+        expected = _reference_select_verify_budget(
+            latest,
+            all_slots,
+            seq_lens,
+            profiles,
+            capacities,
+            padded_bs=padded_bs,
+            context_advance=adv,
+            min_batch_size=min_bs,
+            min_gain=min_gain,
+            policy_ms=policy_ms,
+        )
+        assert tuple(out.tolist()) == expected
+
+    # Poison tail row not referenced by active slice; ensures padded_bs > bs skips tail.
+    latest[slots_total - 1] = float("nan")
+    check(list(range(8)), [4000] * 8)
+    check([0, 1, 4, 5, 6], [100, 200, 300, 8180, 128])
+    check([0, 1, 4, 5, 6], [100, 200, 300, 8181, 128])
+    # Uncalibrated upper bound -> native full width (8 * 6 = 48).
+    check([0, 1, 4, 5], [100, 200, 300, 32760])
+    # Below min_batch_size or zero seq_len -> native full width.
+    check([0], [500], min_bs=2)
+    check([0, 1], [500, 0])
+    # Empty batch -> full width, [0, 0] bounds.
+    check([], [])
+    # Non-finite active slot -> native full width.
+    latest[2, 3] = float("inf")
+    check([0, 1, 2, 3], [500] * 4)
+
+    for empty_ranges, empty_native, empty_caps, empty_step in (
+        (prof_ranges[:0], prof_native[:0], prof_caps, prof_step[:0]),
+        (prof_ranges, prof_native, prof_caps[:0], prof_step[:, :0]),
+    ):
+        with pytest.raises(ValueError, match="non-empty"):
+            select_verify_budget(
+                latest,
+                request_slots=torch.arange(4, dtype=torch.int32, device="cuda"),
+                seq_lens=torch.full((4,), 100, dtype=torch.int32, device="cuda"),
+                profile_ranges=empty_ranges,
+                profile_native_ms=empty_native,
+                profile_capacities=empty_caps,
+                profile_step_ms=empty_step,
+                selected_out=out,
+                padded_bs=4,
+                context_advance=8,
+                min_batch_size=1,
+                min_gain=0.02,
+            )
+
+    # Tie on rate selects largest capacity (prof_caps descending order).
+    tie_latest = torch.full((4, 3), -60.0, dtype=torch.float32, device="cuda")
+    tie_ranges = torch.tensor([[1, 1000]], dtype=torch.int32, device="cuda")
+    tie_native = torch.tensor([100.0], dtype=torch.float32, device="cuda")
+    tie_caps = torch.tensor([12, 8], dtype=torch.int32, device="cuda")
+    tie_step = torch.tensor([[10.0, 10.0]], dtype=torch.float32, device="cuda")
+    select_verify_budget(
+        tie_latest,
+        request_slots=torch.arange(4, dtype=torch.int32, device="cuda"),
+        seq_lens=torch.full((4,), 100, dtype=torch.int32, device="cuda"),
+        profile_ranges=tie_ranges,
+        profile_native_ms=tie_native,
+        profile_capacities=tie_caps,
+        profile_step_ms=tie_step,
+        selected_out=out,
+        padded_bs=4,
+        context_advance=8,
+        min_batch_size=1,
+        min_gain=0.02,
+    )
+    assert out.tolist() == [12, 100, 100]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_select_verify_budget_runtime_shapes_do_not_compile():
+    from tokenspeed_kernel.ops.attention.dsv41.triton import (
+        _select_verify_budget_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    draft = 5
+    latest_full = torch.randn(64, draft, dtype=torch.float32, device="cuda")
+    ranges_full = torch.tensor(
+        [[1, 4096], [4097, 16384], [16385, 65536]], dtype=torch.int32, device="cuda"
+    )
+    native_full = torch.tensor([10.0, 12.0, 15.0], dtype=torch.float32, device="cuda")
+    caps_full = torch.tensor([64, 48, 32, 24], dtype=torch.int32, device="cuda")
+    step_full = torch.tensor(
+        [
+            [6.0, 5.0, 4.0, 3.0],
+            [7.0, 6.0, 5.0, 4.0],
+            [11.0, 10.0, 9.0, 8.0],
+        ],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    out = torch.empty(3, dtype=torch.int32, device="cuda")
+    slots = torch.arange(16, dtype=torch.int32, device="cuda")
+    seq_lens = torch.full((16,), 1024, dtype=torch.int32, device="cuda")
+
+    select_verify_budget(
+        latest_full,
+        request_slots=slots,
+        seq_lens=seq_lens,
+        profile_ranges=ranges_full,
+        profile_native_ms=native_full,
+        profile_capacities=caps_full,
+        profile_step_ms=step_full,
+        selected_out=out,
+        padded_bs=16,
+        context_advance=12,
+        min_batch_size=1,
+        min_gain=0.02,
+    )
+    with assert_no_triton_compile(_select_verify_budget_kernel):
+        for bs in (1, 5, 11, 16):
+            for n_prof in (1, 2, 3):
+                for n_cap in (1, 2, 4):
+                    select_verify_budget(
+                        latest_full[:32] if bs <= 5 else latest_full,
+                        request_slots=slots[:bs],
+                        seq_lens=seq_lens[:bs],
+                        profile_ranges=ranges_full[:n_prof],
+                        profile_native_ms=native_full[:n_prof],
+                        profile_capacities=caps_full[:n_cap],
+                        profile_step_ms=step_full[:n_prof, :n_cap].contiguous(),
+                        selected_out=out,
+                        padded_bs=16,
+                        context_advance=6,
+                        min_batch_size=2,
+                        min_gain=0.05,
+                    )
+        assert out[0].item() > 0

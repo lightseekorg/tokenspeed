@@ -44,22 +44,24 @@ def resolve_shift_margin(
 ):
 
     batch_id = block_id
+    draft_margin = block_id * (lookahead + 1)
 
     if varlen:
 
-        margin, upper = tl.split(tl.load(q_ptr + block_id + tl.arange(0, 2)))
+        margin = tl.load(q_ptr + block_id).to(tl.int32)
+        upper = tl.load(q_ptr + block_id + 1).to(tl.int32)
         timesteps = upper - margin
 
     else:
 
         timesteps = lookahead + 1
-        margin = block_id * timesteps
+        margin = draft_margin
 
     if slotted:
 
         batch_id = tl.load(f_ptr + batch_id)
 
-    return batch_id, margin, timesteps
+    return batch_id, margin, draft_margin, timesteps
 
 
 @jit
@@ -355,7 +357,7 @@ def chain_speculative_verification_kernel(
 
     # Extract the batch id from program id and load the indicator.
 
-    batch_id, margin, timesteps = resolve_shift_margin(
+    batch_id, margin, draft_margin, timesteps = resolve_shift_margin(
         q_ptr,
         f_ptr,
         block_id,
@@ -364,35 +366,16 @@ def chain_speculative_verification_kernel(
         varlen,
     )
 
-    indicator = tl.load(z_ptr + batch_id)
-
-    # Set-up the token and column-wise span(s).
-
     span = tl.arange(0, block_g)
-    cols = tl.arange(0, max_k)
 
-    # Define the (γ + 1) steps mask and the γ draft mask.
+    if timesteps <= 0:
 
-    steps_mask = span < timesteps
-    draft_mask = span < (timesteps - 1)
-
-    # Load the drafted tokens block.
-
-    drafted = tl.load(t_ptr + margin + span, mask=draft_mask, other=0)
-
-    if (indicator & 0x40) > 0:
-
-        # Apply greedy verification.
-
-        token, accepted, selections = verify_greedy(
-            j_ptr,
-            margin,
-            span,
-            drafted,
-            steps_mask,
-            draft_mask,
-            max_k,
+        tl.store(
+            o_ptr + draft_margin + span,
+            tl.zeros((block_g,), dtype=tl.int32),
+            mask=span < (lookahead + 1),
         )
+        tl.store(a_ptr + block_id, -1)
 
         if enable_pdl:
 
@@ -400,122 +383,175 @@ def chain_speculative_verification_kernel(
 
     else:
 
-        # Load target token indices and probabilities -> [ T, M ].
+        indicator = tl.load(z_ptr + batch_id)
 
-        probabilities, indices = load_targets(
-            v_ptr, j_ptr, margin, span, cols, steps_mask, max_k
-        )
+        # Set-up the token and column-wise span(s).
 
-        if m_ptr is not None:
+        cols = tl.arange(0, max_k)
 
-            # Each candidate's draft probability, carried from the rank that holds its column.
-            offsets = ((margin + span) * max_k)[:, None] + cols[None, :]
-            proposals = tl.load(m_ptr + offsets, mask=steps_mask[:, None], other=0)
+        # Define the (γ + 1) steps mask and the γ draft mask.
+
+        steps_mask = span < timesteps
+        draft_mask = span < (timesteps - 1)
+
+        # Load the drafted tokens block.
+
+        drafted = tl.load(t_ptr + draft_margin + span, mask=draft_mask, other=0)
+
+        if (indicator & 0x40) > 0:
+
+            # Apply greedy verification.
+
+            token, accepted, selections = verify_greedy(
+                j_ptr,
+                margin,
+                span,
+                drafted,
+                steps_mask,
+                draft_mask,
+                max_k,
+            )
+
+            if enable_pdl:
+
+                gdc_launch_dependents()
 
         else:
 
-            proposals = None
+            # Load target token indices and probabilities -> [ T, M ].
 
-        # Verify the drafted tokens against the target probabilities.
+            probabilities, indices = load_targets(
+                v_ptr, j_ptr, margin, span, cols, steps_mask, max_k
+            )
 
-        accepted, targets, matches = verify_drafted(
-            d_ptr,
-            proposals,
-            u_ptr,
-            h_ptr,
-            l_ptr,
-            batch_id,
-            indicator,
-            span,
-            drafted,
-            probabilities,
-            indices,
-            draft_mask,
-            block_g,
-            stride_c,
-            stride_d,
-            stride_u,
-            reject_threshold,
-        )
+            if m_ptr is not None:
 
-        # Rejection-sample the next token and conditionally update selected token(s) and score(s).
+                # Each candidate's draft probability, carried from the rank that holds its column.
+                offsets = ((margin + span) * max_k)[:, None] + cols[None, :]
+                proposals = tl.load(m_ptr + offsets, mask=steps_mask[:, None], other=0)
 
-        token, targets, selections = rejection_sample(
-            d_ptr,
-            proposals,
-            e_ptr,
-            h_ptr,
-            l_ptr,
-            batch_id,
-            timesteps,
-            indicator,
-            span,
-            drafted,
-            accepted,
-            targets,
-            matches,
-            probabilities,
-            indices,
-            block_g,
-            max_k,
-            update_counts,
-            logprobs,
-            stride_c,
-            stride_d,
-            stride_e,
-            reject_threshold,
-        )
+            else:
 
-        if logprobs:
+                proposals = None
 
-            # Compute selected token log-probabilities.
+            # Verify the drafted tokens against the target probabilities.
 
-            log_scores = fast_logf(targets)
-            span_mask = span <= accepted
+            accepted, targets, matches = verify_drafted(
+                d_ptr,
+                proposals,
+                u_ptr,
+                h_ptr,
+                l_ptr,
+                batch_id,
+                indicator,
+                span,
+                drafted,
+                probabilities,
+                indices,
+                draft_mask,
+                block_g,
+                stride_c,
+                stride_d,
+                stride_u,
+                reject_threshold,
+            )
 
-            if (indicator & 0x400) > 0:
+            # Rejection-sample the next token and conditionally update selected token(s) and score(s).
 
-                # Extract top-k token indices and compute their corresponding log-probabilities.
+            token, targets, selections = rejection_sample(
+                d_ptr,
+                proposals,
+                e_ptr,
+                h_ptr,
+                l_ptr,
+                batch_id,
+                timesteps,
+                indicator,
+                span,
+                drafted,
+                accepted,
+                targets,
+                matches,
+                probabilities,
+                indices,
+                block_g,
+                max_k,
+                update_counts,
+                logprobs,
+                stride_c,
+                stride_d,
+                stride_e,
+                reject_threshold,
+            )
 
-                logprobs_ids = tl.arange(0, block_z)[None, :].broadcast_to(
-                    (block_g, block_z)
-                )
+            if logprobs:
 
-                logprobs_mask = (logprobs_ids < tl.load(r_ptr + batch_id)) & span_mask[
-                    :, None
-                ]
-                offsets = ((margin + span)[:, None] * stride_z) + logprobs_ids
+                # Compute selected token log-probabilities.
 
-                top_logprobs = tl.gather(probabilities, logprobs_ids, axis=1).to(
-                    tl.float32
-                )
+                log_scores = fast_logf(targets)
+                span_mask = span <= accepted
 
-                top_tokens = tl.gather(indices, logprobs_ids, axis=1)
+                if (indicator & 0x400) > 0:
 
-                if enable_pdl:
+                    # Extract top-k token indices and compute their corresponding log-probabilities.
+
+                    logprobs_ids = tl.arange(0, block_z)[None, :].broadcast_to(
+                        (block_g, block_z)
+                    )
+
+                    logprobs_mask = (
+                        logprobs_ids < tl.load(r_ptr + batch_id)
+                    ) & span_mask[:, None]
+                    offsets = ((margin + span)[:, None] * stride_z) + logprobs_ids
+
+                    top_logprobs = tl.gather(probabilities, logprobs_ids, axis=1).to(
+                        tl.float32
+                    )
+
+                    top_tokens = tl.gather(indices, logprobs_ids, axis=1)
+
+                    if enable_pdl:
+
+                        gdc_launch_dependents()
+
+                    tl.store(
+                        y_ptr + offsets, fast_logf(top_logprobs), mask=logprobs_mask
+                    )
+                    tl.store(k_ptr + offsets, top_tokens, mask=logprobs_mask)
+
+                elif enable_pdl:
 
                     gdc_launch_dependents()
 
-                tl.store(y_ptr + offsets, fast_logf(top_logprobs), mask=logprobs_mask)
-                tl.store(k_ptr + offsets, top_tokens, mask=logprobs_mask)
+                tl.store(w_ptr + margin + span, log_scores, mask=span_mask)
 
             elif enable_pdl:
 
                 gdc_launch_dependents()
 
-            tl.store(w_ptr + margin + span, log_scores, mask=span_mask)
+        if update_counts:
 
-        elif enable_pdl:
+            # Increment the decode count(s) for the accepted and selected token(s).
 
-            gdc_launch_dependents()
+            decode_update(c_ptr, batch_id, span, selections, accepted, stride_c)
 
-    if update_counts:
+        # Store the rejection-sampled / next seed token and the total accepted.
 
-        # Increment the decode count(s) for the accepted and selected token(s).
+        if varlen:
 
-        decode_update(c_ptr, batch_id, span, selections, accepted, stride_c)
+            out_tokens = tl.where(
+                span == accepted,
+                token.broadcast_to((block_g,)),
+                tl.where(
+                    span < accepted, drafted, tl.zeros((block_g,), dtype=tl.int32)
+                ),
+            )
+            tl.store(
+                o_ptr + draft_margin + span, out_tokens, mask=span < (lookahead + 1)
+            )
 
-    # Store the rejection-sampled / next seed token and the total accepted.
+        else:
 
-    tl.store(o_ptr + margin + accepted[None], token)
-    tl.store(a_ptr + block_id, accepted)
+            tl.store(o_ptr + draft_margin + accepted[None], token)
+
+        tl.store(a_ptr + block_id, accepted)

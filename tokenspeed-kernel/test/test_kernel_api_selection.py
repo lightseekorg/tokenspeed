@@ -7480,6 +7480,8 @@ def selected_kernel_spy(monkeypatch):
                 )
             if case.mode == "dsa_plan":
                 return torch.empty((1, 4), dtype=torch.int32)
+            if case.mode == "dsv41_select_verify_budget":
+                return None
             if case.mode == "dsv41_index_topk":
                 index_q = args[0]
                 topk = args[6]
@@ -8299,6 +8301,46 @@ def test_dsv41_index_topk_fp8_rows_select_triton(
         registry.clear_cache()
         case.invoke()
         assert calls == [case.expected]
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
+def test_dsv41_select_verify_budget_selects_triton(
+    b300_platform, mi350_platform, selected_kernel_spy
+):
+    case = _case(
+        lambda _platform: True,
+        "portable",
+        "attention",
+        "dsv41_select_verify_budget",
+        "triton_dsv41_select_verify_budget",
+        lambda: _attention_dsv41_pkg.select_verify_budget(
+            torch.zeros((8, 5), dtype=torch.float32),
+            request_slots=torch.arange(4, dtype=torch.int32),
+            seq_lens=torch.full((4,), 128, dtype=torch.int32),
+            profile_ranges=torch.tensor([[1, 8192]], dtype=torch.int32),
+            profile_native_ms=torch.tensor([10.0], dtype=torch.float32),
+            profile_capacities=torch.tensor([12], dtype=torch.int32),
+            profile_step_ms=torch.tensor([[2.0]], dtype=torch.float32),
+            selected_out=torch.empty((3,), dtype=torch.int32),
+            padded_bs=4,
+            context_advance=12,
+            min_batch_size=1,
+            min_gain=0.02,
+        ),
+    )
+    active_case, calls = selected_kernel_spy
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        for platform in (b300_platform, mi350_platform):
+            calls.clear()
+            active_case["case"] = case
+            Platform.override(platform)
+            registry.clear_cache()
+            case.invoke()
+            assert calls == [case.expected]
     finally:
         Platform.override(host_platform)
         registry.clear_cache()

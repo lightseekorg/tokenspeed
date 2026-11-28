@@ -1159,9 +1159,12 @@ class ServerArgs:
                 "DP-local CUDA graphs require attention/dense/MoE/LM-head TP1, "
                 "no head TP, PP1/KVP1/DCP1/QCP1 and no DP sampling"
             )
-        if self.sampling_backend != "greedy" and not self.enable_dsv41_adaptive_dspark:
+        if (
+            self.sampling_backend not in ("greedy", "sonic")
+            and not self.enable_dsv41_adaptive_dspark
+        ):
             raise ValueError(
-                "DP-local CUDA graphs require greedy sampling "
+                "DP-local CUDA graphs require greedy or sonic sampling, "
                 "or adaptive DSpark sampling"
             )
 
@@ -1182,10 +1185,11 @@ class ServerArgs:
         if self.speculative_algorithm != "DSPARK" or self.sampling_backend not in (
             "greedy",
             "flashinfer",
+            "sonic",
         ):
             raise ValueError(
-                "V4.1 adaptive verification requires DSPARK and greedy "
-                "or flashinfer sampling"
+                "V4.1 adaptive verification requires DSPARK and greedy, "
+                "flashinfer, or sonic sampling"
             )
         if self.sampling_backend == "flashinfer" and (
             not self.enable_speculative_sampling
@@ -1225,7 +1229,10 @@ class ServerArgs:
                 "--enable-output-cumulative-probs"
             )
         if (
-            (self.enable_speculative_sampling and self.sampling_backend == "greedy")
+            (
+                self.enable_speculative_sampling
+                and self.sampling_backend in ("greedy", "sonic")
+            )
             or self.speculative_draft_tree
             or envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get()
             or self.disable_sampling_tp_sync
