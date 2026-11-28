@@ -103,8 +103,8 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.layer_hash_index = layer_id - 37
 
-        def forward(self, hidden, hashes, mask, *, query_shard=None):
-            assert query_shard is None
+        def forward(self, hidden, hashes, mask, *, query_shard=None, prefetched=None):
+            assert query_shard is None and prefetched is None
             events.append(("engram", self.layer_id))
             assert hashes.tolist() == [[self.layer_hash_index] * 3] * 2
             assert mask.tolist() == [True, True]
@@ -160,6 +160,9 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
     )
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
+    target.model.engram_stream = None
+    target.model._engram_fork_event = None
+    target.model._engram_join_event = None
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
     target.model.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-6)
     target.set_dspark_layers_to_capture([37, 38, 39])
