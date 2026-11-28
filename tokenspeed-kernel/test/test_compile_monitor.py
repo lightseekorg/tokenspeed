@@ -18,15 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import importlib
 import importlib.machinery
 import importlib.util
+import json
 import logging
 import os
 
 import pytest
 import tokenspeed_kernel.compile_monitor as compile_monitor
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import _IS_NPU, tl, triton
 from tokenspeed_kernel.compile_monitor import (
     CompileMonitor,
     ServingJitError,
@@ -57,6 +59,63 @@ def _record(monitor, n, block=64, site=SITE):
 
 def _warnings(caplog):
     return [r.message for r in caplog.records if r.levelno == logging.WARNING]
+
+
+class _GluonCompileTimeObject:
+    """A Gluon-marked compile-time object with a stable specialization key."""
+
+    __triton_builtin__ = True
+
+    def __init__(self, key):
+        self._key = key
+
+    @property
+    def cache_key(self):
+        return f"gluon.template:{self._key}"
+
+
+class _LaunchOptions:
+    def __init__(self):
+        self.num_warps = 4
+
+
+class _LaunchTarget:
+    def __init__(self):
+        self.arch = "gfx950"
+
+
+def _serialize(jit_module, constants):
+    return jit_module.serialize_specialization_data(
+        "gluon_kernel",
+        "*fp32",
+        constants,
+        {},
+        _LaunchOptions(),
+        ("k", ()),
+        _LaunchTarget(),
+    )
+
+
+def test_gluon_constexprs_are_serialized_by_cache_key():
+    if _IS_NPU:
+        pytest.skip("Triton JIT hooks are unavailable on NPU")
+    jit_module = importlib.import_module(f"{triton.__name__}.runtime.jit")
+    original = jit_module.serialize_specialization_data
+    constants = {"Kernel": _GluonCompileTimeObject("stage1")}
+
+    with pytest.raises(TypeError):
+        _serialize(jit_module, constants)
+
+    compile_monitor.install_compile_monitor("warn")
+    try:
+        payload = json.loads(_serialize(jit_module, constants))
+    finally:
+        compile_monitor.uninstall_compile_monitor()
+
+    assert payload["constant_vals"] == [{"constexpr": "gluon.template:stage1"}]
+    assert jit_module.serialize_specialization_data is original
+    with pytest.raises(TypeError):
+        _serialize(jit_module, constants)
 
 
 def test_startup_compiles_are_counted_but_not_reported(caplog):
