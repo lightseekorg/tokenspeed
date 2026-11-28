@@ -702,7 +702,10 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch, sampled):
             expected = forward()
             expected_features = confidence_features.clone()
             ordinary = model.forward_backbone(bonus, starts, history, pool, ctx)
-            torch.testing.assert_close(ordinary, expected, rtol=0, atol=0)
+            # ``confidence_hidden_out=None`` fuses HC collapse + RMSNorm via
+            # ``_v41_hc_input``, whose FP32 accumulation order can differ from
+            # unfused ``_norm(v41_hc_pre(...))`` by one BF16 ULP.
+            torch.testing.assert_close(ordinary, expected, rtol=2e-2, atol=2e-2)
             values = expected_features.float()
             normalized = (
                 values
@@ -712,6 +715,7 @@ def test_draft_forward_graph_and_context_seeding(monkeypatch, sampled):
                 * model.norm.weight.float()
             ).to(expected.dtype)
             torch.testing.assert_close(expected, normalized)
+            torch.testing.assert_close(ordinary, normalized, rtol=2e-2, atol=2e-2)
             graph.replay()
             torch.testing.assert_close(
                 confidence_features, expected_features, rtol=0, atol=0

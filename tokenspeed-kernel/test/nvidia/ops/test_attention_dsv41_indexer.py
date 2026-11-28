@@ -57,7 +57,7 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     prepare_scores,
     write_selection,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
 from utils import assert_no_triton_compile
 
@@ -1153,6 +1153,7 @@ def test_live_logits_masks_prefetched_tail_for_selection(poison):
         )
 
     def run():
+        enable_pdl = pdl_enabled()
         _clean_logits[(4, triton.cdiv(capacity, 1024))](
             values,
             lengths,
@@ -1169,7 +1170,9 @@ def test_live_logits_masks_prefetched_tail_for_selection(poison):
             True,
             True,
             1024,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
+            **({"launch_pdl": True} if enable_pdl else {}),
         )
         return select(output)
 
