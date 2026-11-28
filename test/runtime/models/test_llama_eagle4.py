@@ -20,8 +20,9 @@
 
 """EAGLE-4 llama draft: the low-rank candidate head and the static trees
 ranking it (on a GPU); the draft config check, the strict checkpoint loader,
-and the Nemotron-style draft layer (NoPE, the ``eh_proj`` input merge and the
-latent squared-ReLU MoE)."""
+the Nemotron-style draft layer (NoPE, the ``eh_proj`` input merge and the
+latent squared-ReLU MoE), and which drafts and draft steps the draft decode
+monokernel serves."""
 
 from __future__ import annotations
 
@@ -43,6 +44,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.eagle_harness.drafter import Eagle4
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.layers.attention.backends.paged.router import (
@@ -53,8 +55,18 @@ from tokenspeed.runtime.layers.moe import utils as moe_utils
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.models.llama_eagle4 import (
     CandidateHeads,
+    Eagle4LlamaModel,
+    Eagle4MonokernelLlamaModel,
     LlamaForCausalLMEagle4,
     validate_draft_config,
+)
+from tokenspeed.runtime.models.llama_eagle4_monokernel import (
+    NOT_BF16_KV,
+    OTHER_LAYER,
+    OTHER_SHAPE,
+    enable_eagle4_draft_monokernel,
+    model_reasons,
+    takes_monokernel,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -346,6 +358,75 @@ def test_eagle4_accepts_the_decode_monokernel_key_startup_sets_on_drafts() -> No
     validate_draft_config(_qwen38_draft_config(decode_monokernel=False))
     with pytest.raises(ValueError, match="decode_monokernel"):
         validate_draft_config(_qwen38_draft_config(decode_monokernel=True))
+
+
+def test_eagle4_accepts_the_draft_decode_monokernel_key_startup_sets_on_drafts() -> (
+    None
+):
+    # Startup declares draft_decode_monokernel on every draft config, on or off.
+    for switch in (False, True):
+        validate_draft_config(_qwen38_draft_config(draft_decode_monokernel=switch))
+    with pytest.raises(ValueError, match="draft_decode_monokernel"):
+        validate_draft_config(_qwen38_draft_config(draft_decode_monokernel=1))
+
+
+def test_eagle4_draft_decode_monokernel_builds_the_monokernel_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for switch, body in ((False, Eagle4LlamaModel), (True, Eagle4MonokernelLlamaModel)):
+        config = _qwen38_draft_config(draft_decode_monokernel=switch)
+        model = _build_model(monkeypatch, config, "meta")
+        assert type(model.model) is body
+    # Packed after loading (post_quant_warmup), not at construction.
+    assert model.model.draft_monokernel is None
+
+
+def test_eagle4_draft_monokernel_names_why_a_draft_layer_is_not_served(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kernel bakes in the Qwen3.8 draft's dimensions and layer: a draft
+    of other dimensions, an eh_proj input merge or another window is
+    refused with its reasons, and the switch then fails startup."""
+    monkeypatch.setitem(global_server_args_dict, "kv_cache_dtype", "auto")
+    small = _build_model(
+        monkeypatch,
+        _qwen38_draft_config(draft_decode_monokernel=True, sliding_window=4096),
+        "meta",
+    )
+    assert model_reasons(small.model) == [OTHER_SHAPE]
+    with pytest.raises(ValueError, match="--draft-decode-monokernel: no monokernel"):
+        enable_eagle4_draft_monokernel(small.model)
+    monkeypatch.setitem(global_server_args_dict, "kv_cache_dtype", "fp8_e4m3")
+    assert model_reasons(small.model) == [OTHER_SHAPE, NOT_BF16_KV]
+    monkeypatch.setitem(global_server_args_dict, "kv_cache_dtype", "auto")
+    nemotron = _build_model(
+        monkeypatch, _nemotron_draft_config(draft_decode_monokernel=True), "meta"
+    )
+    assert model_reasons(nemotron.model) == [OTHER_SHAPE, OTHER_LAYER]
+
+
+def _draft_ctx(mode: ForwardMode, bs: int, rows: int) -> ForwardContext:
+    return ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=bs,
+        num_extends=bs if mode.is_extend() else 0,
+        input_num_tokens=rows,
+        forward_mode=mode,
+        output_layout=ForwardOutputLayout(0, 0, bs, rows // bs),
+    )
+
+
+def test_eagle4_draft_monokernel_serves_chain_draft_steps_only() -> None:
+    """A chain draft step (one row a request) of 1 to 16 requests takes the
+    launch; draft-tree lanes (several rows a request), more requests and the
+    first draft step (an extend) keep the regular path."""
+    decode = ForwardMode.DECODE
+    assert takes_monokernel(1, _draft_ctx(decode, 1, 1))
+    assert takes_monokernel(16, _draft_ctx(decode, 16, 16))
+    assert not takes_monokernel(8, _draft_ctx(decode, 2, 8))
+    assert not takes_monokernel(17, _draft_ctx(decode, 17, 17))
+    assert not takes_monokernel(8, _draft_ctx(ForwardMode.EXTEND, 1, 8))
 
 
 @pytest.mark.parametrize(

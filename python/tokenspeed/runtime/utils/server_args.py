@@ -277,6 +277,29 @@ def draft_takes_decode_monokernel(
     )
 
 
+# Draft architectures with a draft-only decode monokernel
+# (--draft-decode-monokernel): the draft's decode steps take it whatever the
+# target, which keeps its regular path.
+DRAFT_DECODE_MONOKERNEL_ARCHITECTURES = ("LlamaForCausalLMEagle4",)
+
+
+def draft_decode_monokernel_refusal(
+    draft_architectures: list[str] | None,
+) -> str | None:
+    """Why ``--draft-decode-monokernel`` cannot serve a draft checkpoint of
+    ``draft_architectures`` (None: the server has no draft model), or None
+    when a draft monokernel exists for one of them."""
+    if draft_architectures is not None and any(
+        a in DRAFT_DECODE_MONOKERNEL_ARCHITECTURES for a in draft_architectures
+    ):
+        return None
+    draft = "no draft model" if draft_architectures is None else draft_architectures
+    return (
+        f"--draft-decode-monokernel: no draft decode monokernel for {draft} "
+        f"(drafts with one: {', '.join(DRAFT_DECODE_MONOKERNEL_ARCHITECTURES)})"
+    )
+
+
 def decode_monokernel_refusal(architectures: list[str]) -> str | None:
     """Why ``--decode-monokernel`` cannot serve a checkpoint of
     ``architectures``, or None when a monokernel exists for one of them."""
@@ -819,6 +842,10 @@ class ServerArgs:
     # Run each decoder layer's small decode steps as one persistent
     # monokernel launch (DECODE_MONOKERNEL_ARCHITECTURES). Off by default.
     decode_monokernel: bool = False
+    # Run the speculative draft's chain decode steps as one persistent
+    # monokernel launch per draft layer (DRAFT_DECODE_MONOKERNEL_ARCHITECTURES),
+    # independent of decode_monokernel. Off by default.
+    draft_decode_monokernel: bool = False
     # A directory for each rank's decode monokernel stuck-poll record file
     # (None: the records stay in pinned memory).
     monokernel_stuck_record_dir: str | None = None
@@ -1360,6 +1387,22 @@ class ServerArgs:
                 )
                 if refusal is not None:
                     raise ValueError(f"{flag} {value}: {refusal}")
+        if self.draft_decode_monokernel:
+            draft_architectures = (
+                None
+                if self.speculative_draft_model_path is None
+                else _checkpoint_architectures(
+                    self.speculative_draft_model_path,
+                    self.speculative_draft_model_revision,
+                    download,
+                )
+            )
+            # An unreadable draft config (None from an existing path) is
+            # checked again when the engine calls this with ``download``.
+            if self.speculative_draft_model_path is None or draft_architectures:
+                refusal = draft_decode_monokernel_refusal(draft_architectures)
+                if refusal is not None:
+                    raise ValueError(refusal)
         if self.dense_fp8_small_m != "none" and architectures is not None:
             refusal = dense_fp8_small_m_refusal(architectures)
             if refusal is not None:
@@ -5263,6 +5306,22 @@ class ServerArgs:
                 )
                 + "); every other draft keeps the regular path. Other steps "
                 "keep the regular path."
+            ),
+        )
+        parser.add_argument(
+            "--draft-decode-monokernel",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.draft_decode_monokernel,
+            help=(
+                "Run the speculative draft's chain decode steps (draft steps "
+                "1 and later, one token per request, up to 16 requests) as one "
+                "persistent monokernel launch of the draft layer and its final "
+                "norm. Drafts: "
+                f"{', '.join(DRAFT_DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950, "
+                "TP1, BF16. Independent of --decode-monokernel: the target "
+                "keeps its own path. Startup fails when the draft layer cannot "
+                "be packed; other draft forwards (the first step, draft trees, "
+                "larger batches) keep the regular path."
             ),
         )
         parser.add_argument(

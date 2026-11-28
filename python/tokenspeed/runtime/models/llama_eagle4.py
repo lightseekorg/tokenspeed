@@ -60,6 +60,10 @@ from tokenspeed.runtime.models.llama_eagle3 import (
     LlamaForCausalLMEagle3,
     _draft_window_left,
 )
+from tokenspeed.runtime.models.llama_eagle4_monokernel import (
+    Eagle4DraftMonokernelModel,
+    enable_eagle4_draft_monokernel,
+)
 from tokenspeed.runtime.models.nemotron_h import (
     NemotronHMoE,
     expert_checkpoint_loader,
@@ -115,8 +119,10 @@ _STRUCTURAL_KEYS = frozenset(
         "moe_router_bias_update_rate",
         # candidate LM head
         "efficient_lm_head_config",
-        # set on every draft config at startup (rank_setup); EAGLE-4 has no decode monokernel
+        # set on every draft config at startup (rank_setup): EAGLE-4 takes no
+        # --decode-monokernel, only its own --draft-decode-monokernel
         "decode_monokernel",
+        "draft_decode_monokernel",
         # retired structures, accepted only when off
         "enable_2hs",
         "enable_defa",
@@ -236,6 +242,7 @@ def validate_draft_config(config: LlamaConfig) -> None:
     _expect(config, "input_fuse_type", ("concat",))
     _expect(config, "num_aux_hidden_states", (3,))
     _expect(config, "decode_monokernel", (False,))
+    _expect(config, "draft_decode_monokernel", (True, False))
     # The candidate head scores the target vocabulary.
     _expect(config, "draft_vocab_size", (None, config.vocab_size))
     # fc_norm is read (enable_fc_norm is its alias); the fc input is three draft-width aux states.
@@ -475,6 +482,12 @@ class Eagle4LlamaModel(Eagle3LlamaModel):
     layer_cls = Eagle4DecoderLayer
 
 
+class Eagle4MonokernelLlamaModel(Eagle4DraftMonokernelModel, Eagle4LlamaModel):
+    """The draft body under ``--draft-decode-monokernel``: its chain draft
+    steps run the draft layer and final norm as one launch
+    (``llama_eagle4_monokernel``)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class CandidateHeads:
     """The three weights of the low-rank candidate head."""
@@ -663,6 +676,29 @@ class LlamaForCausalLMEagle4(LlamaForCausalLMEagle3):
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,
         )
+
+    def resolve_model(
+        self,
+        config: LlamaConfig,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> Eagle4LlamaModel:
+        model_cls = (
+            Eagle4MonokernelLlamaModel
+            if getattr(config, "draft_decode_monokernel", False)
+            else Eagle4LlamaModel
+        )
+        return model_cls(
+            config,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+
+    def post_quant_warmup(self) -> None:
+        if isinstance(self.model, Eagle4MonokernelLlamaModel):
+            enable_eagle4_draft_monokernel(self.model)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Load the draft checkpoint: every tensor must reach a parameter and

@@ -105,6 +105,18 @@ when a piece of it cannot be packed, startup fails and names each piece and
 why. Every other draft keeps the regular path. The model's layer loop is the
 same with and without the switch.
 
+`--draft-decode-monokernel` is the one exception, a second switch that only a
+draft takes (`DRAFT_DECODE_MONOKERNEL_ARCHITECTURES` in `server_args.py`: the
+EAGLE-4 draft). It is independent of `--decode-monokernel`, so the target
+keeps whichever path its own switch selects. The EAGLE-4 draft is one decoder
+layer and the final norm, run once per draft step, so its launch covers the
+whole draft body: under the switch the draft builds its body from a
+monokernel body class (`Eagle4DraftMonokernelModel` before the regular one),
+which runs a chain draft step that the launch serves and every other draft
+forward (the first step, draft-tree lanes, more requests) with the regular
+body's code. The rule is the same: startup fails when the draft layer cannot
+be packed.
+
 **Deadlock freedom comes from the plan.** Each stage reads only regions that
 an earlier stage writes, and the plan checks this when it is constructed.
 Every CTA runs its tasks in plan order, and all CTAs are resident (at most one
