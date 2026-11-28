@@ -429,6 +429,7 @@ if current_platform().is_amd:
         traits={
             "buffer_offsets_fit_int32": frozenset({True}),
             "hc_mult": frozenset({4}),
+            "supports_direct_staging": frozenset({False}),
         },
         priority=Priority.SPECIALIZED,
     )
@@ -644,6 +645,7 @@ if current_platform().is_amd:
         traits={
             "buffer_offsets_fit_int32": frozenset({True}),
             "hc_mult": frozenset({4}),
+            "supports_direct_staging": frozenset({False}),
         },
         priority=Priority.SPECIALIZED,
     )

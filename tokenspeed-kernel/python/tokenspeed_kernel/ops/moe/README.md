@@ -1010,14 +1010,15 @@ preserving caller `mask=None` vs explicit `mask` presence so padding never
 triggers a hidden mask specialization. Graph capture on an uninitialized stream
 raises immediately instead of allocating the barrier inside the graph pool. Callers
 with a fused MegaMoE shared expert can supply `out=(topk_weights, topk_idx)`
-(FP32 / INT64 views into `symm_buffer`) across eager and captured paths, and on
-uncaptured forwards where `mega_mhc` runs can pair them with direct
-`try_mhc_shifted_post_pre_norm_quantize_fp8` targets from
-`moe_prepare_mega_moe_staging_buffers`: `deep_gemm_mxfp4_mega_moe_apply` skips
-`stage_mxfp4_mega_moe_inputs` completely when both pre-staged activations and
-routing buffers are supplied, or runs `stage_mega_moe_routing_inputs` alone when
-only activations were pre-staged (used during eager prefill; `PrefillGraph` and
-decode graphs keep `stage_mxfp4_mega_moe_inputs`).
+(FP32 / INT64 views into `symm_buffer`) across eager and captured paths, and
+pre-stage FP8 activations + scales either via
+`try_mhc_shifted_post_pre_norm_quantize_fp8` on uncaptured prefill/decode when
+eligible or via `mhc_apply_pre_quantize_fp8` (for captured graphs and overlap
+decode): `deep_gemm_mxfp4_mega_moe_apply` skips `_stage_mxfp4_mega_moe_inputs_kernel`
+completely when both pre-staged activations and routing buffers are supplied,
+skips `topk_ids.to(torch.int32)` when routing is pre-staged, runs
+`stage_mxfp4_mega_moe_activations` when only routing was pre-staged, or runs
+`stage_mega_moe_routing_inputs` alone when only activations were pre-staged.
 
 
 ## Router projection with NVFP4 input

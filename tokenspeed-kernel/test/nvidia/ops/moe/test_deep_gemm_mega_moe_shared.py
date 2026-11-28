@@ -492,3 +492,86 @@ def test_direct_mega_mhc_and_router_staging_skips_stage_kernel(monkeypatch):
         )
     assert stage_calls == {"full": 0, "routing": 1}
     torch.testing.assert_close(routing_fallback_out, direct_out, atol=0, rtol=0)
+
+
+@pytest.mark.usefixtures("process_group")
+def test_activation_only_staging_with_pre_staged_routing(monkeypatch):
+    """When routing was already written into symm_buffer (e.g. bf16_mega_gate)
+    and activations were not pre-staged, only activation staging runs."""
+    from tokenspeed_kernel.ops.moe._deep_gemm import mega_moe_stage
+    from utils import assert_no_triton_compile
+
+    plan = {
+        "persistent_max_num_tokens_per_gpu": 128,
+        "process_group": None,
+        "fast_math": True,
+    }
+    w = _Experts()
+    mega_moe.deep_gemm_mxfp4_mega_moe_process_weights(plan, w)
+    gate_up, gate_up_scale, down, down_scale = _shared_weights(17)
+    assert mega_moe.fuse_deep_gemm_mxfp4_mega_moe_shared_expert(
+        plan, w, gate_up, gate_up_scale, down, down_scale
+    )
+    mega_moe.warmup_deep_gemm_mxfp4_mega_moe(plan, w)
+
+    tokens = 19
+    g = torch.Generator(device="cuda").manual_seed(29)
+    x = torch.randn(tokens, HIDDEN, device="cuda", dtype=torch.bfloat16, generator=g)
+    ids = torch.stack(
+        [
+            torch.randperm(EXPERTS, device="cuda", generator=g)[:TOP_K]
+            for _ in range(tokens)
+        ]
+    ).to(torch.int64)
+    weights = torch.rand(tokens, TOP_K, device="cuda", dtype=torch.float32, generator=g)
+    buf = mega_moe.deep_gemm_mxfp4_mega_moe_apply._tokenspeed_prepare_mega_moe_buffers(
+        plan, w, tokens
+    )
+    assert buf is not None
+    expected = _apply(plan, w, x, weights, ids.to(torch.int32)).clone()
+
+    stage_calls = {"full": 0, "routing": 0, "activations": 0}
+    orig_full = mega_moe.stage_mxfp4_mega_moe_inputs
+    orig_routing = mega_moe.stage_mega_moe_routing_inputs
+    orig_acts = mega_moe.stage_mxfp4_mega_moe_activations
+
+    def _track(key, fn):
+        def _wrapped(*args, **kwargs):
+            stage_calls[key] += 1
+            return fn(*args, **kwargs)
+
+        return _wrapped
+
+    monkeypatch.setattr(
+        mega_moe, "stage_mxfp4_mega_moe_inputs", _track("full", orig_full)
+    )
+    monkeypatch.setattr(
+        mega_moe, "stage_mega_moe_routing_inputs", _track("routing", orig_routing)
+    )
+    monkeypatch.setattr(
+        mega_moe, "stage_mxfp4_mega_moe_activations", _track("activations", orig_acts)
+    )
+
+    routing_view = buf.routing_only()
+    assert routing_view.x_quantized is None
+    buf.topk_idx.copy_(ids)
+    buf.topk_weights.copy_(weights)
+    with assert_no_triton_compile(mega_moe_stage._stage_mxfp4_mega_moe_inputs_kernel):
+        got = mega_moe.deep_gemm_mxfp4_mega_moe_apply(
+            plan,
+            x,
+            w,
+            None,
+            buf.topk_weights,
+            buf.topk_idx,
+            None,
+            None,
+            True,
+            False,
+            x_quantized=routing_view.x_quantized,
+            routing_prepared=routing_view.routing_out,
+        )
+    assert stage_calls == {"full": 0, "routing": 0, "activations": 1}
+    torch.testing.assert_close(buf.topk_idx, ids, atol=0, rtol=0)
+    torch.testing.assert_close(buf.topk_weights, weights, atol=0, rtol=0)
+    torch.testing.assert_close(got, expected, atol=0, rtol=0)

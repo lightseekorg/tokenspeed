@@ -35,3 +35,14 @@ Token counts are runtime scalars of the kernels.
 Source count, hidden width, query count, and normalization policy are model properties.
 CPU tests cover equations, boundary transitions, and rounding against an FP64 host reference.
 Shared GPU tests compare the kernels with the CPU equations.
+
+## mHC pre-reduction with group-32 FP8 quantization (`mhc_apply_pre_fp8_group32`)
+
+`triton_mhc_apply_pre_fp8_group32` fuses the 4-stream `pre` reduction, RMSNorm,
+and group-32 UE8M0 quantization (`1e-4` amax floor) for both canonical `(uint8)`
+scales and direct MegaMoE symmetric-buffer writes (`y_fp8_out`, `y_routed_sf_out`,
+and MN-major UTCCP `y_shared_sf_out` indexed by runtime `shared_sf_block_m`).
+Global row and UTCCP scale column offsets use 64-bit arithmetic while inner
+channel tile offsets remain 32-bit. Runtime row counts, `shared_sf_block_m`,
+and row/scale strides stay unspecialized (`do_not_specialize`), preserving zero
+recompilations across decode graph bucket sizes.

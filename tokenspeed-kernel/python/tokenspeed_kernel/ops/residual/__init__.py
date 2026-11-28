@@ -851,6 +851,58 @@ def try_mhc_shifted_post_pre_norm(
     )
 
 
+def _validate_direct_fp8_staging_targets(
+    tokens: int,
+    hidden: int,
+    device: _torch.device,
+    *,
+    y_fp8_out: _torch.Tensor | None,
+    y_routed_sf_out: _torch.Tensor | None,
+    y_shared_sf_out: _torch.Tensor | None,
+    shared_sf_block_m: int,
+) -> bool:
+    """Validate optional MegaMoE symmetric-buffer targets; return True if given."""
+    has_direct_targets = any(
+        t is not None for t in (y_fp8_out, y_routed_sf_out, y_shared_sf_out)
+    )
+    if not has_direct_targets:
+        if shared_sf_block_m != 0:
+            raise ValueError(
+                "shared_sf_block_m must be zero unless direct MegaMoE targets are given"
+            )
+        return False
+    min_shared_rows = (
+        ((tokens + shared_sf_block_m - 1) // shared_sf_block_m)
+        * ((shared_sf_block_m + 127) // 128 * 128)
+        if shared_sf_block_m > 0
+        else 0
+    )
+    if (
+        hidden % 128 != 0
+        or y_fp8_out is None
+        or y_routed_sf_out is None
+        or y_shared_sf_out is None
+        or shared_sf_block_m <= 0
+        or y_fp8_out.shape != (tokens, hidden)
+        or y_fp8_out.dtype != _torch.float8_e4m3fn
+        or not y_fp8_out.is_contiguous()
+        or y_fp8_out.device != device
+        or y_routed_sf_out.shape != (tokens, hidden // 128)
+        or y_routed_sf_out.dtype != _torch.int32
+        or not y_routed_sf_out.is_contiguous()
+        or y_routed_sf_out.device != device
+        or y_shared_sf_out.shape != (tokens, hidden // 128)
+        or y_shared_sf_out.dtype != _torch.int32
+        or y_shared_sf_out.stride(0) != 1
+        or y_shared_sf_out.stride(1) < min_shared_rows
+        or y_shared_sf_out.device != device
+    ):
+        raise ValueError(
+            "Invalid MegaMoE FP8 destination targets for direct mHC quantization"
+        )
+    return True
+
+
 def try_mhc_shifted_post_pre_norm_quantize_fp8(
     x: _torch.Tensor,
     residual: _torch.Tensor,
@@ -902,45 +954,21 @@ def try_mhc_shifted_post_pre_norm_quantize_fp8(
         x, residual, pre, post, comb, weight, scale, base, sinkhorn_iters, norm_weight
     ):
         return None
-    has_direct_targets = any(
-        t is not None for t in (y_fp8_out, y_routed_sf_out, y_shared_sf_out)
+    if (
+        any(t is not None for t in (y_fp8_out, y_routed_sf_out, y_shared_sf_out))
+        and not mega_mhc_direct_staging_eligible()
+    ):
+        return None
+    tokens, hidden = x.shape
+    has_direct_targets = _validate_direct_fp8_staging_targets(
+        tokens,
+        hidden,
+        x.device,
+        y_fp8_out=y_fp8_out,
+        y_routed_sf_out=y_routed_sf_out,
+        y_shared_sf_out=y_shared_sf_out,
+        shared_sf_block_m=shared_sf_block_m,
     )
-    if has_direct_targets:
-        if not mega_mhc_direct_staging_eligible():
-            return None
-        tokens, hidden = x.shape
-        min_shared_rows = (
-            ((tokens + shared_sf_block_m - 1) // shared_sf_block_m)
-            * ((shared_sf_block_m + 127) // 128 * 128)
-            if shared_sf_block_m > 0
-            else 0
-        )
-        if (
-            y_fp8_out is None
-            or y_routed_sf_out is None
-            or y_shared_sf_out is None
-            or shared_sf_block_m <= 0
-            or y_fp8_out.shape != (tokens, hidden)
-            or y_fp8_out.dtype != _torch.float8_e4m3fn
-            or not y_fp8_out.is_contiguous()
-            or y_fp8_out.device != x.device
-            or y_routed_sf_out.shape != (tokens, hidden // 128)
-            or y_routed_sf_out.dtype != _torch.int32
-            or not y_routed_sf_out.is_contiguous()
-            or y_routed_sf_out.device != x.device
-            or y_shared_sf_out.shape != (tokens, hidden // 128)
-            or y_shared_sf_out.dtype != _torch.int32
-            or y_shared_sf_out.stride(0) != 1
-            or y_shared_sf_out.stride(1) < min_shared_rows
-            or y_shared_sf_out.device != x.device
-        ):
-            raise ValueError(
-                "Invalid MegaMoE FP8 destination targets for shifted mHC quantization"
-            )
-    elif shared_sf_block_m != 0:
-        raise ValueError(
-            "shared_sf_block_m must be zero unless direct MegaMoE targets are given"
-        )
     try:
         kernel = select_kernel(
             "residual",
@@ -1028,25 +1056,53 @@ def mhc_apply_pre_quantize_fp8(
     pre: _torch.Tensor,
     norm_weight: _torch.Tensor,
     norm_eps: float,
+    *,
+    y_fp8_out: _torch.Tensor | None = None,
+    y_routed_sf_out: _torch.Tensor | None = None,
+    y_shared_sf_out: _torch.Tensor | None = None,
+    shared_sf_block_m: int = 0,
 ) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor]:
     """``mhc_apply_pre`` with RMSNorm that also quantizes its output.
 
     The output is quantized like ``quantize_fp8(granularity="token_group",
     group_size=32, scale_encoding="ue8m0")``. A fused kernel is used when one
-    is registered; otherwise the two ops run back to back.
+    is registered; otherwise the two ops run back to back (when direct staging
+    targets are omitted).
 
     Args:
         residual: Contiguous BF16 residual streams ``[..., hc_mult, H]``.
         pre: Contiguous FP32 pre coefficients ``[..., hc_mult]``.
         norm_weight: RMSNorm weight ``[H]``.
         norm_eps: RMSNorm epsilon.
+        y_fp8_out: Optional destination E4M3 matrix ``[tokens, H]`` for
+            direct MegaMoE symmetric-buffer staging.
+        y_routed_sf_out: Optional packed int32 UE8M0 routed scales ``[tokens, H // 128]``.
+        y_shared_sf_out: Optional MN-major UTCCP int32 shared scales ``[tokens, H // 128]``.
+        shared_sf_block_m: MegaMoE ``BLOCK_M`` when direct targets are supplied; ``0`` otherwise.
 
     Returns:
-        BF16 layer input ``[..., H]``, E4M3 codes ``[tokens, H]`` and uint8
-        UE8M0 scales ``[tokens, H / 32]``.
+        BF16 layer input ``[..., H]``, E4M3 codes ``[tokens, H]``, and either
+        uint8 UE8M0 scales ``[tokens, H / 32]`` or ``y_routed_sf_out``.
     """
-    if pre.shape != residual.shape[:-1]:
+    if residual.ndim < 2 or pre.shape != residual.shape[:-1]:
         raise ValueError("mhc_apply_pre requires pre shaped like residual[..., :, 0]")
+    tokens = residual[..., 0, 0].numel()
+    hidden = residual.shape[-1]
+    has_direct_targets = _validate_direct_fp8_staging_targets(
+        tokens,
+        hidden,
+        residual.device,
+        y_fp8_out=y_fp8_out,
+        y_routed_sf_out=y_routed_sf_out,
+        y_shared_sf_out=y_shared_sf_out,
+        shared_sf_block_m=shared_sf_block_m,
+    )
+    traits: dict[str, object] = {
+        "buffer_offsets_fit_int32": residual.numel() < 2**31,
+        "hc_mult": int(residual.shape[-2]),
+    }
+    if has_direct_targets:
+        traits["supports_direct_staging"] = True
     try:
         kernel = select_kernel(
             "residual",
@@ -1055,14 +1111,13 @@ def mhc_apply_pre_quantize_fp8(
                 residual=dense_tensor_format(residual.dtype),
                 pre=dense_tensor_format(pre.dtype),
             ),
-            traits={
-                "buffer_offsets_fit_int32": residual.numel() < 2**31,
-                "hc_mult": int(residual.shape[-2]),
-            },
+            traits=traits,
             override=None,
             solution=None,
         )
     except NoKernelFoundError:
+        if has_direct_targets:
+            raise
         out = mhc_apply_pre(residual, pre, norm_weight=norm_weight, norm_eps=norm_eps)
         codes, scales = quantize_fp8(
             out.reshape(-1, out.shape[-1]),
@@ -1074,6 +1129,17 @@ def mhc_apply_pre_quantize_fp8(
             solution=None,
         )
         return out, codes, scales
+    if has_direct_targets:
+        return kernel(
+            residual,
+            pre,
+            norm_weight,
+            norm_eps,
+            y_fp8_out=y_fp8_out,
+            y_routed_sf_out=y_routed_sf_out,
+            y_shared_sf_out=y_shared_sf_out,
+            shared_sf_block_m=shared_sf_block_m,
+        )
     return kernel(residual, pre, norm_weight, norm_eps)
 
 

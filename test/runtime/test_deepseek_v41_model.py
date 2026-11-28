@@ -5244,3 +5244,264 @@ def test_v41_moe_fused_router_parity(monkeypatch):
             atol=2e-3,
             rtol=2e-3,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_v41_decoder_layer_decode_direct_staging_and_routing_fallback(monkeypatch):
+    from tokenspeed_kernel.ops.moe.deep_gemm import (
+        DeepGemmMegaMoeBuffers,
+        DeepGemmMegaMoeRoutingBuffers,
+    )
+    from tokenspeed_kernel.ops.residual.triton import triton_mhc_apply_pre
+
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    monkeypatch.setitem(global_server_args_dict, "moe_runner_backend", "triton")
+    config = _config()
+    config.hidden_size = 256
+    config.moe_intermediate_size = 256
+    config.n_routed_experts = 4
+    config.num_experts_per_tok = 2
+    tokens = 6
+    mapping = _mapping(0, 1, 1)
+    with torch.device("cuda"):
+        layer = DeepseekV41DecoderLayer(
+            config,
+            mapping,
+            0,
+            0,
+            _quant(),
+            "layers.0",
+            None,
+            torch.cuda.Stream(),
+            False,
+            "gpu",
+            None,
+        )
+    _initialize(layer)
+    # Use a real DeepseekV41MoE layer (subclass of DeepseekV4MoE) for FFN.
+    layer.ffn.use_mega_moe = True
+    layer.ffn.shared_expert_fused = True
+    layer.ffn.owns_ep_communication = True
+    layer.ffn.topk.topk_config.router_topk = "fused"
+
+    shared_backing = torch.zeros((2, 128), dtype=torch.int32, device="cuda")
+    buf = DeepGemmMegaMoeBuffers(
+        x=torch.empty(
+            (tokens, config.hidden_size), dtype=torch.float8_e4m3fn, device="cuda"
+        ),
+        x_sf=torch.empty(
+            (tokens, config.hidden_size // 128), dtype=torch.int32, device="cuda"
+        ),
+        shared_x_sf=shared_backing[:, :tokens].transpose(0, 1),
+        shared_block_m=64,
+        topk_idx=torch.empty(
+            (tokens, config.num_experts_per_tok), dtype=torch.int64, device="cuda"
+        ),
+        topk_weights=torch.empty(
+            (tokens, config.num_experts_per_tok), dtype=torch.float32, device="cuda"
+        ),
+    )
+    monkeypatch.setattr(layer.ffn, "mega_moe_staging_buffers", lambda _n: buf)
+    received_staging = []
+
+    def fake_ffn_forward(
+        hidden_states, input_ids, total, maximum, *, ctx, comm_manager, staging=None
+    ):
+        received_staging.append((hidden_states.clone(), staging))
+        return hidden_states
+
+    monkeypatch.setattr(layer.ffn, "forward", fake_ffn_forward)
+    monkeypatch.setattr(
+        layer.comm_manager, "get_num_tokens", lambda _ctx: (tokens, tokens)
+    )
+    monkeypatch.setattr(
+        layer.comm_manager, "moe_output_all_reduced", lambda _ctx: False
+    )
+
+    positions = torch.arange(tokens, device="cuda")
+    empty = torch.empty(0, dtype=torch.int64, device="cuda")
+    query = SimpleNamespace(positions=empty, request_indices=empty)
+    backend = _Backend(
+        positions,
+        torch.zeros_like(positions),
+        V41DecoderView(query, None, (), None, None),
+    )
+    ctx = _ctx(backend, tokens, ForwardMode.DECODE)
+    hidden = (
+        torch.randn(tokens, 4, config.hidden_size, device="cuda") * 0.4
+    ).bfloat16()
+    pre = torch.full((tokens, 4), 0.25, device="cuda")
+    attn_out = torch.randn(
+        tokens, config.hidden_size, dtype=torch.bfloat16, device="cuda"
+    )
+    monkeypatch.setattr(
+        layer.attn,
+        "forward",
+        lambda pos, h, ctx, reduce_output, hidden_codes=None, hidden_scales=None: attn_out,
+    )
+
+    layer(
+        hidden,
+        pre,
+        positions,
+        None,
+        ctx,
+        pending_post=None,
+        allow_ffn_reduce_fusion=False,
+        capture_input=False,
+    )
+    # Decode with aux_stream (prefer_overlap=True) skipped MegaMHC, yet FFN still
+    # received pre-staged symm_buffer targets written by _v41_hc_input_mxfp8.
+    assert len(received_staging) == 1
+    got_x, got_staging = received_staging[-1]
+    assert got_staging is buf
+    res_expected, _, _, _ = v41._v41_hc_post_pre(
+        hidden,
+        pre,
+        None,
+        hc_weights=(layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base),
+        norm=layer.attn_norm,
+        hc_norm_eps=layer.norm_eps,
+        hc_eps=layer.hc_eps,
+        sinkhorn_iters=layer.hc_sinkhorn_iters,
+        prefer_overlap=True,
+        quantize_fp8=False,
+    )
+    mix_attn = v41.v41_hc_mixes(
+        res_expected,
+        layer.hc_attn_fn,
+        layer.hc_attn_scale,
+        layer.hc_attn_base,
+        layer.norm_eps,
+        layer.hc_eps,
+        layer.hc_sinkhorn_iters,
+    )
+    res_ffn = v41.v41_hc_post(attn_out, res_expected, mix_attn[1], mix_attn[2])
+    expected_x = triton_mhc_apply_pre(
+        res_ffn,
+        mix_attn[0],
+        norm_weight=layer.ffn_norm.weight,
+        norm_eps=layer.ffn_norm.variance_epsilon,
+    )
+    torch.testing.assert_close(got_x, expected_x, atol=0, rtol=0)
+
+    from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (
+        stage_mxfp4_mega_moe_inputs,
+    )
+
+    ref_x = torch.empty_like(buf.x)
+    ref_x_sf = torch.empty_like(buf.x_sf)
+    ref_backing = torch.zeros((2, 128), dtype=torch.int32, device="cuda")
+    ref_shared = ref_backing[:, :tokens].transpose(0, 1)
+    dummy_ids = torch.zeros(
+        (tokens, config.num_experts_per_tok), dtype=torch.int32, device="cuda"
+    )
+    dummy_w = torch.ones(
+        (tokens, config.num_experts_per_tok), dtype=torch.float32, device="cuda"
+    )
+    stage_mxfp4_mega_moe_inputs(
+        expected_x,
+        dummy_w,
+        dummy_ids,
+        ref_x,
+        ref_x_sf,
+        torch.empty_like(buf.topk_idx),
+        torch.empty_like(buf.topk_weights),
+        ref_shared,
+        buf.shared_block_m,
+        None,
+    )
+    torch.testing.assert_close(
+        buf.x.view(torch.uint8), ref_x.view(torch.uint8), atol=0, rtol=0
+    )
+    torch.testing.assert_close(buf.x_sf, ref_x_sf, atol=0, rtol=0)
+    torch.testing.assert_close(shared_backing, ref_backing, atol=0, rtol=0)
+
+    # Bypassing fused routing (simulate_routing or torch router) disables direct
+    # staging so MegaMoE uses its single fused activation+routing stage kernel.
+    layer.ffn.topk.simulate_routing = True
+    layer(
+        hidden,
+        pre,
+        positions,
+        None,
+        ctx,
+        pending_post=None,
+        allow_ffn_reduce_fusion=False,
+        capture_input=False,
+    )
+    assert received_staging[-1][1] is None
+    layer.ffn.topk.simulate_routing = False
+    layer.ffn.topk.topk_config.router_topk = "torch"
+    assert layer.ffn.direct_mega_moe_staging_buffers(tokens, None) is None
+    layer.ffn.topk.topk_config.router_topk = "fused"
+
+    # When _v41_hc_input_mxfp8 falls back cleanly, FFN keeps routing_only().
+    monkeypatch.setattr(
+        v41,
+        "_v41_hc_input_mxfp8",
+        lambda x, pre_w, norm, staging: (v41._v41_hc_input(x, pre_w, norm), None),
+    )
+    layer(
+        hidden,
+        pre,
+        positions,
+        None,
+        ctx,
+        pending_post=None,
+        allow_ffn_reduce_fusion=False,
+        capture_input=False,
+    )
+    fallback_staging = received_staging[-1][1]
+    assert isinstance(fallback_staging, DeepGemmMegaMoeRoutingBuffers)
+    assert fallback_staging.x_quantized is None
+    assert fallback_staging.routing_out[0] is buf.topk_weights
+    assert fallback_staging.routing_out[1] is buf.topk_idx
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_v41_post_quant_warmup_warms_mhc_apply_pre_fp8(monkeypatch):
+    from tokenspeed_kernel.ops import residual as residual_ops
+
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", None)
+    monkeypatch.setitem(global_server_args_dict, "moe_runner_backend", "triton")
+    config = _config()
+    config.hidden_size = 256
+    config.moe_intermediate_size = 256
+    with torch.device("cuda"):
+        layer = DeepseekV41DecoderLayer(
+            config,
+            _mapping(0, 1, 1),
+            0,
+            0,
+            _quant(),
+            "layers.0",
+            None,
+            None,
+            False,
+            "gpu",
+            None,
+        )
+    _initialize(layer)
+    layer.ffn.use_mega_moe = True
+    layer.ffn.shared_expert_fused = True
+    # Avoid invoking DeepseekV41MoE/DeepseekV41Attention warmups unrelated to this check.
+    monkeypatch.setattr(layer.ffn, "warmup", lambda: None)
+    wrapper = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+    nn.Module.__init__(wrapper)
+    wrapper.model = nn.Module()
+    wrapper.model.layers = nn.ModuleList([layer])
+    wrapper.post_load_weights = lambda: None
+    wrapper.modules = lambda: [wrapper, layer, layer.ffn_norm]
+
+    warmed_calls = []
+    orig = residual_ops.mhc_apply_pre_quantize_fp8
+
+    def tracked(*args, **kwargs):
+        warmed_calls.append(kwargs.get("shared_sf_block_m"))
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(residual_ops, "mhc_apply_pre_quantize_fp8", tracked)
+    DeepseekV41ForCausalLM.post_quant_warmup(wrapper)
+    assert warmed_calls == [64]

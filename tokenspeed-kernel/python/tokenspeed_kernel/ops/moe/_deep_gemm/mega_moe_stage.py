@@ -61,6 +61,7 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
     GROUP_K: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
     STAGE_ACTIVATIONS: tl.constexpr,
+    STAGE_ROUTING: tl.constexpr,
     HAS_SHARED: tl.constexpr,
     HAS_LIVE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -132,7 +133,7 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
                 mask=token_mask,
             )
 
-    if k_block_id == 0:
+    if k_block_id == 0 and STAGE_ROUTING:
         topk_offsets = tl.arange(0, BLOCK_TOPK)
         topk_mask = token_mask[:, None] & (topk_offsets[None, :] < top_k)
 
@@ -189,6 +190,7 @@ def _stage_block_m(num_tokens: int) -> int:
 def _launch_stage_kernel(
     *,
     stage_activations: bool,
+    stage_routing: bool,
     hidden_states: torch.Tensor,
     x_fp8: torch.Tensor,
     x_sf: torch.Tensor,
@@ -200,27 +202,44 @@ def _launch_stage_kernel(
     shared_block_m: int | None,
     live_requests: torch.Tensor | None,
 ) -> None:
-    num_tokens = topk_ids.shape[0]
+    if stage_activations:
+        num_tokens, hidden_size = hidden_states.shape
+        if (shared_x_sf is None) != (shared_block_m is None):
+            raise ValueError("shared_x_sf and shared_block_m go together")
+        if hidden_size % _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE != 0:
+            raise ValueError(
+                "DeepSeek V4 MegaMoE input staging requires hidden_size to be "
+                f"a multiple of {_DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE}."
+            )
+    else:
+        num_tokens = topk_ids.shape[0]
+        hidden_size = _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE
     if num_tokens == 0:
         return
-    if topk_weights.shape != topk_ids.shape:
-        raise ValueError(
-            "DeepSeek V4 MegaMoE input staging requires topk_weights and "
-            "topk_ids to have the same shape."
-        )
+    if stage_routing:
+        if topk_weights.shape != topk_ids.shape:
+            raise ValueError(
+                "DeepSeek V4 MegaMoE input staging requires topk_weights and "
+                "topk_ids to have the same shape."
+            )
+        if stage_activations and topk_ids.shape[0] != num_tokens:
+            raise ValueError(
+                "DeepSeek V4 MegaMoE input staging requires hidden_states and "
+                "topk_ids to have the same token count."
+            )
     if live_requests is not None and (
         live_requests.shape != (2,) or live_requests.dtype != torch.int32
     ):
         raise ValueError("live_requests must be an int32 (live, padded) pair")
 
-    hidden_size = hidden_states.shape[1] if stage_activations else 128
     block_k = _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE
     block_m = _stage_block_m(num_tokens)
     grid = (
         triton.cdiv(num_tokens, block_m),
         triton.cdiv(hidden_size, block_k) if stage_activations else 1,
     )
-    block_topk = triton.next_power_of_2(topk_ids.shape[1])
+    top_k = topk_ids.shape[1] if stage_routing else 1
+    block_topk = triton.next_power_of_2(top_k) if stage_routing else 1
     enable_pdl = pdl_enabled()
     _stage_mxfp4_mega_moe_inputs_kernel[grid](
         hidden_states,
@@ -242,23 +261,24 @@ def _launch_stage_kernel(
         x_sf.stride(1) if stage_activations else 0,
         shared_x_sf.stride(0) if shared_x_sf is not None else 0,
         shared_x_sf.stride(1) if shared_x_sf is not None else 0,
-        topk_ids.stride(0),
-        topk_ids.stride(1),
-        topk_weights.stride(0),
-        topk_weights.stride(1),
-        topk_idx_out.stride(0),
-        topk_idx_out.stride(1),
-        topk_weights_out.stride(0),
-        topk_weights_out.stride(1),
+        topk_ids.stride(0) if stage_routing else 0,
+        topk_ids.stride(1) if stage_routing else 0,
+        topk_weights.stride(0) if stage_routing else 0,
+        topk_weights.stride(1) if stage_routing else 0,
+        topk_idx_out.stride(0) if stage_routing else 0,
+        topk_idx_out.stride(1) if stage_routing else 0,
+        topk_weights_out.stride(0) if stage_routing else 0,
+        topk_weights_out.stride(1) if stage_routing else 0,
         hidden_size,
-        topk_ids.shape[1],
+        top_k,
         BLOCK_M=block_m,
         BLOCK_K=block_k,
         GROUP_K=32,
         BLOCK_TOPK=block_topk,
         STAGE_ACTIVATIONS=stage_activations,
+        STAGE_ROUTING=stage_routing,
         HAS_SHARED=stage_activations and shared_x_sf is not None,
-        HAS_LIVE=live_requests is not None,
+        HAS_LIVE=stage_routing and live_requests is not None,
         ENABLE_PDL=enable_pdl,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),
@@ -290,18 +310,9 @@ def stage_mxfp4_mega_moe_inputs(
     shard of it (see ``mega_moe_live_requests``). Codes and scales are staged
     for every row. None routes every row.
     """
-    num_tokens, hidden_size = hidden_states.shape
-    if (shared_x_sf is None) != (shared_block_m is None):
-        raise ValueError("shared_x_sf and shared_block_m go together")
-    if num_tokens == 0:
-        return
-    if hidden_size % _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE != 0:
-        raise ValueError(
-            "DeepSeek V4 MegaMoE input staging requires hidden_size to be "
-            f"a multiple of {_DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE}."
-        )
     _launch_stage_kernel(
         stage_activations=True,
+        stage_routing=True,
         hidden_states=hidden_states,
         x_fp8=x_fp8,
         x_sf=x_sf,
@@ -315,6 +326,31 @@ def stage_mxfp4_mega_moe_inputs(
     )
 
 
+def stage_mxfp4_mega_moe_activations(
+    hidden_states: torch.Tensor,
+    x_fp8: torch.Tensor,
+    x_sf: torch.Tensor,
+    shared_x_sf: torch.Tensor | None,
+    shared_block_m: int | None,
+) -> None:
+    """Write only FP8 activations and scales into MegaMoE's symmetric buffer."""
+    dummy = x_sf[:1, :1]
+    _launch_stage_kernel(
+        stage_activations=True,
+        stage_routing=False,
+        hidden_states=hidden_states,
+        x_fp8=x_fp8,
+        x_sf=x_sf,
+        topk_weights=dummy,
+        topk_ids=dummy,
+        topk_idx_out=dummy,
+        topk_weights_out=dummy,
+        shared_x_sf=shared_x_sf,
+        shared_block_m=shared_block_m,
+        live_requests=None,
+    )
+
+
 def stage_mega_moe_routing_inputs(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -325,6 +361,7 @@ def stage_mega_moe_routing_inputs(
     """Write only routing ids and weights into MegaMoE's symmetric buffer."""
     _launch_stage_kernel(
         stage_activations=False,
+        stage_routing=True,
         hidden_states=topk_weights,
         x_fp8=topk_idx_out,
         x_sf=topk_idx_out,

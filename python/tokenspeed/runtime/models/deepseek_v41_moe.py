@@ -431,6 +431,13 @@ class DeepseekV4MoE(nn.Module):
             return None
         return self.experts.mega_moe_staging_buffers(num_tokens)
 
+    def direct_mega_moe_staging_buffers(
+        self, num_tokens: int, image_mask: torch.Tensor | None
+    ) -> object | None:
+        """Return MegaMoE staging buffers only when routing stages in place."""
+        del num_tokens, image_mask
+        return None
+
     def _compute_topk_output(
         self,
         hidden_states: torch.Tensor,

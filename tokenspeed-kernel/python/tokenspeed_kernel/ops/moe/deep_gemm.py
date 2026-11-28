@@ -62,6 +62,7 @@ if _HAS_DEEP_GEMM:
     )
     from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (
         stage_mega_moe_routing_inputs,
+        stage_mxfp4_mega_moe_activations,
         stage_mxfp4_mega_moe_inputs,
     )
     from tokenspeed_kernel.thirdparty.cuda.mega_gate import (
@@ -84,6 +85,22 @@ _warmed_configs: set[
 
 
 @dataclass(frozen=True)
+class DeepGemmMegaMoeRoutingBuffers:
+    """Symmetric-buffer routing views populated ahead of MegaMoE."""
+
+    topk_idx: torch.Tensor
+    topk_weights: torch.Tensor
+
+    @property
+    def x_quantized(self) -> None:
+        return None
+
+    @property
+    def routing_out(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return (self.topk_weights, self.topk_idx)
+
+
+@dataclass(frozen=True)
 class DeepGemmMegaMoeBuffers:
     """Symmetric-buffer input views populated directly ahead of MegaMoE."""
 
@@ -101,6 +118,13 @@ class DeepGemmMegaMoeBuffers:
     @property
     def routing_out(self) -> tuple[torch.Tensor, torch.Tensor]:
         return (self.topk_weights, self.topk_idx)
+
+    def routing_only(self) -> DeepGemmMegaMoeRoutingBuffers:
+        """Return a view carrying only pre-staged routing buffers."""
+        return DeepGemmMegaMoeRoutingBuffers(
+            topk_idx=self.topk_idx,
+            topk_weights=self.topk_weights,
+        )
 
 
 @dataclass(frozen=True)
@@ -508,11 +532,11 @@ def _run_mega_moe(
         _validate_symm_routing(
             symm_buffer, num_tokens, topk_ids.shape[1], routing_prepared
         )
-    if x_quantized is None:
+    if x_quantized is None and routing_prepared is None:
         stage_mxfp4_mega_moe_inputs(
             x,
             topk_weights,
-            topk_ids.to(torch.int32),
+            topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
             symm_buffer.x[:num_tokens],
             symm_buffer.x_sf[:num_tokens],
             symm_buffer.topk_idx[:num_tokens],
@@ -523,10 +547,18 @@ def _run_mega_moe(
             # captured graphs replay.
             mega_moe_live_requests(x.device),
         )
+    elif x_quantized is None:
+        stage_mxfp4_mega_moe_activations(
+            x,
+            symm_buffer.x[:num_tokens],
+            symm_buffer.x_sf[:num_tokens],
+            shared_x_sf,
+            shared_block_m,
+        )
     elif routing_prepared is None:
         stage_mega_moe_routing_inputs(
             topk_weights,
-            topk_ids.to(torch.int32),
+            topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32),
             symm_buffer.topk_idx[:num_tokens],
             symm_buffer.topk_weights[:num_tokens],
             mega_moe_live_requests(x.device),
@@ -592,6 +624,66 @@ def _warmup_mega_moe_jit(
             activation_clamp,
             fast_math,
         )
+    live_dummy = torch.ones((2,), dtype=torch.int32, device=state.device)
+    for bucket_tokens in (1, 64, 1024):
+        if bucket_tokens > max_num_tokens:
+            continue
+        hidden_bucket = torch.zeros(
+            (bucket_tokens, hidden_size), dtype=torch.bfloat16, device=state.device
+        )
+        ids_bucket = torch.zeros(
+            (bucket_tokens, top_k), dtype=torch.int32, device=state.device
+        )
+        weights_bucket = torch.full(
+            (bucket_tokens, top_k),
+            1.0 / top_k,
+            dtype=torch.float32,
+            device=state.device,
+        )
+        bucket_shared_sf = (
+            symm_buffer.shared_l1_acts_sf[:bucket_tokens]
+            if state.num_shared_experts
+            else None
+        )
+        bucket_shared_block_m = (
+            get_block_m_for_mega_moe(
+                symm_buffer.group.size(),
+                symm_buffer.num_experts,
+                symm_buffer.num_max_tokens_per_rank,
+                bucket_tokens,
+                symm_buffer.num_topk,
+                symm_buffer.mma_type,
+            )
+            if state.num_shared_experts
+            else None
+        )
+        stage_mxfp4_mega_moe_activations(
+            hidden_bucket,
+            symm_buffer.x[:bucket_tokens],
+            symm_buffer.x_sf[:bucket_tokens],
+            bucket_shared_sf,
+            bucket_shared_block_m,
+        )
+        for live in (None, live_dummy):
+            stage_mxfp4_mega_moe_inputs(
+                hidden_bucket,
+                weights_bucket,
+                ids_bucket,
+                symm_buffer.x[:bucket_tokens],
+                symm_buffer.x_sf[:bucket_tokens],
+                symm_buffer.topk_idx[:bucket_tokens],
+                symm_buffer.topk_weights[:bucket_tokens],
+                bucket_shared_sf,
+                bucket_shared_block_m,
+                live,
+            )
+            stage_mega_moe_routing_inputs(
+                weights_bucket,
+                ids_bucket,
+                symm_buffer.topk_idx[:bucket_tokens],
+                symm_buffer.topk_weights[:bucket_tokens],
+                live,
+            )
 
     torch.cuda.synchronize()
 

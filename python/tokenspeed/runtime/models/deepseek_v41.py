@@ -752,6 +752,31 @@ def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Te
     )
 
 
+def _v41_hc_input_mxfp8(
+    x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm, staging: object
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None]:
+    """Collapse mHC residual with norm and stage MegaMoE FP8 activations in place."""
+    if not x.is_cuda:
+        return _v41_hc_input(x, pre, norm), None
+    from tokenspeed_kernel.ops.residual import mhc_apply_pre_quantize_fp8
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    try:
+        out, _, _ = mhc_apply_pre_quantize_fp8(
+            x,
+            pre,
+            norm.weight,
+            norm.variance_epsilon,
+            y_fp8_out=staging.x,
+            y_routed_sf_out=staging.x_sf,
+            y_shared_sf_out=staging.shared_x_sf,
+            shared_sf_block_m=staging.shared_block_m,
+        )
+    except NoKernelFoundError:
+        return _v41_hc_input(x, pre, norm), None
+    return out, staging.x_quantized
+
+
 def _max_forward_tokens() -> int:
     """The most tokens one forward carries, as execution/device.py sizes it."""
     args = global_server_args_dict
@@ -1930,6 +1955,18 @@ class DeepseekV41MoE(DeepseekV4MoE):
             kwargs["image_token_mask"] = image_mask
         return kwargs
 
+    def direct_mega_moe_staging_buffers(
+        self, num_tokens: int, image_mask: torch.Tensor | None
+    ) -> object | None:
+        """Return MegaMoE staging buffers only when fused routing writes them in place."""
+        if (
+            num_tokens <= 0
+            or num_tokens > 65536
+            or self._fused_router_call_kwargs(image_mask) is None
+        ):
+            return None
+        return self.mega_moe_staging_buffers(num_tokens)
+
     def _compute_topk_output(self, hidden_states, image_mask, routing_out=None):
         config = self.topk.topk_config
         kwargs = (
@@ -2356,15 +2393,16 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
+        ffn_staging = (
+            self.ffn.direct_mega_moe_staging_buffers(residual.shape[0], image_mask)
+            if isinstance(self.ffn, DeepseekV4MoE)
+            else None
+        )
         can_mega_mhc_ffn = (
-            not (decode_hc and can_overlap)
+            ffn_staging is not None
+            and not (decode_hc and can_overlap)
             and not is_breakable_capture_active()
             and not (residual.is_cuda and torch.cuda.is_current_stream_capturing())
-        )
-        ffn_staging = (
-            self.ffn.mega_moe_staging_buffers(residual.shape[0])
-            if can_mega_mhc_ffn and isinstance(self.ffn, DeepseekV4MoE)
-            else None
         )
         residual, x, ffn_mixes, ffn_quantized = _v41_hc_post_pre(
             residual,
@@ -2381,11 +2419,16 @@ class DeepseekV41DecoderLayer(nn.Module):
             hc_eps=self.hc_eps,
             sinkhorn_iters=self.hc_sinkhorn_iters,
             prefer_overlap=decode_hc and can_overlap,
-            quantize_fp8=ffn_staging is not None,
-            fp8_staging=ffn_staging,
+            quantize_fp8=can_mega_mhc_ffn,
+            fp8_staging=ffn_staging if can_mega_mhc_ffn else None,
         )
         if x is None:
-            x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
+            if ffn_staging is not None:
+                x, ffn_quantized = _v41_hc_input_mxfp8(
+                    residual, attn_pre, self.ffn_norm, ffn_staging
+                )
+            else:
+                x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
         ffn_overlap = (
             can_overlap
             and ffn_mixes is None
@@ -2407,6 +2450,13 @@ class DeepseekV41DecoderLayer(nn.Module):
         )
         if ffn_overlap:
             residual.record_stream(self.hc_stream_fork.aux_stream)
+        moe_staging = (
+            None
+            if ffn_staging is None
+            else (
+                ffn_staging if ffn_quantized is not None else ffn_staging.routing_only()
+            )
+        )
         with self.hc_stream_fork.scope(enable=ffn_overlap, overlap=True) as fork:
             # Submit independent coefficients before the sublayer, also in eager.
             with fork.branch():
@@ -2425,7 +2475,7 @@ class DeepseekV41DecoderLayer(nn.Module):
                 image_mask,
                 ctx,
                 defer_reduce=defer_moe,
-                staging=ffn_staging if ffn_quantized is not None else None,
+                staging=moe_staging,
             )
             ffn_pre, post, comb = ffn_mixes
             if ffn_overlap:
@@ -3911,6 +3961,53 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                             max_tokens = _max_forward_tokens()
                         module.warmup_router(max_tokens)
                         warmed_routers.add(router_key)
+        warmed_mhc_fp8: set[tuple[torch.device, int, float]] = set()
+        for module in self.modules():
+            if not isinstance(module, DeepseekV41DecoderLayer):
+                continue
+            if not (
+                isinstance(module.ffn, DeepseekV4MoE)
+                and module.ffn.use_mega_moe
+                and module.ffn.shared_expert_fused
+                and module.ffn_norm.weight.is_cuda
+            ):
+                continue
+            mhc_key = (
+                module.ffn_norm.weight.device,
+                module.ffn_norm.weight.numel(),
+                float(module.ffn_norm.variance_epsilon),
+            )
+            if mhc_key in warmed_mhc_fp8:
+                continue
+            warmed_mhc_fp8.add(mhc_key)
+            hidden_size = mhc_key[1]
+            if hidden_size % 128 != 0:
+                continue
+            from tokenspeed_kernel.ops.residual import mhc_apply_pre_quantize_fp8
+            from tokenspeed_kernel.selection import NoKernelFoundError
+
+            device = mhc_key[0]
+            try:
+                mhc_apply_pre_quantize_fp8(
+                    torch.zeros(
+                        (1, 4, hidden_size), dtype=torch.bfloat16, device=device
+                    ),
+                    torch.zeros((1, 4), dtype=torch.float32, device=device),
+                    module.ffn_norm.weight,
+                    mhc_key[2],
+                    y_fp8_out=torch.empty(
+                        (1, hidden_size), dtype=torch.float8_e4m3fn, device=device
+                    ),
+                    y_routed_sf_out=torch.empty(
+                        (1, hidden_size // 128), dtype=torch.int32, device=device
+                    ),
+                    y_shared_sf_out=torch.empty(
+                        (hidden_size // 128, 128), dtype=torch.int32, device=device
+                    )[:, :1].transpose(0, 1),
+                    shared_sf_block_m=64,
+                )
+            except NoKernelFoundError:
+                pass
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens

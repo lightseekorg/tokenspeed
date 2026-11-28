@@ -1979,6 +1979,252 @@ def triton_mhc_apply_pre(
     return out
 
 
+@triton.jit(
+    do_not_specialize=[
+        "shared_block_m",
+        "residual_stride_m",
+        "residual_stride_hc",
+        "pre_stride_m",
+        "y_out_stride_m",
+        "y_fp8_stride_m",
+        "y_sf_stride_m",
+        "y_shared_sf_stride_m",
+        "y_shared_sf_stride_k",
+    ]
+)
+def _mhc_apply_pre_fp8_group32_kernel(
+    pre_mix,
+    residual,
+    weight,
+    y_out,
+    y_fp8,
+    y_sf,
+    y_shared_sf,
+    shared_block_m,
+    residual_stride_m,
+    residual_stride_hc,
+    pre_stride_m,
+    y_out_stride_m,
+    y_fp8_stride_m,
+    y_sf_stride_m,
+    y_shared_sf_stride_m,
+    y_shared_sf_stride_k,
+    hidden_size: tl.constexpr,
+    eps: tl.constexpr,
+    block_h: tl.constexpr,
+    PACKED_SCALES: tl.constexpr,
+    HAS_SHARED: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+    row_id = tl.program_id(0).to(tl.int64)
+    hidden_offsets = tl.arange(0, block_h)
+    hidden_mask = hidden_offsets < hidden_size
+
+    pre_base = pre_mix + row_id * pre_stride_m
+    res_base = residual + row_id * residual_stride_m
+    layer_input = tl.zeros((block_h,), tl.float32)
+    for hc_id in tl.static_range(0, 4):
+        pre = tl.load(pre_base + hc_id).to(tl.float32)
+        residual_values = tl.load(
+            res_base + hc_id * residual_stride_hc + hidden_offsets,
+            mask=hidden_mask,
+            other=0.0,
+        ).to(tl.float32)
+        layer_input += pre * residual_values
+
+    # Preserve the BF16 rounding boundary before RMSNorm and quantization.
+    layer_input = layer_input.to(tl.bfloat16).to(tl.float32)
+    variance = tl.sum(layer_input * layer_input, axis=0) / hidden_size
+    norm_scale = tl.rsqrt(variance + eps)
+    norm_weight = tl.load(weight + hidden_offsets, mask=hidden_mask, other=0.0).to(
+        tl.float32
+    )
+    normed = (layer_input * norm_scale * norm_weight).to(tl.bfloat16)
+    tl.store(
+        y_out + row_id * y_out_stride_m + hidden_offsets,
+        normed,
+        mask=hidden_mask,
+    )
+
+    normed_f32 = tl.where(hidden_mask, normed.to(tl.float32), 0.0)
+    num_block_groups: tl.constexpr = block_h // 32
+    normed_groups = tl.reshape(normed_f32, [num_block_groups, 32])
+    amax = tl.max(tl.abs(normed_groups), axis=1)
+    amax = tl.maximum(amax, 1.0e-4)
+
+    scale = amax / 448.0
+    scale_bits = scale.to(tl.uint32, bitcast=True)
+    scale_exp = ((scale_bits >> 23) & 0xFF) + ((scale_bits & 0x7FFFFF) != 0).to(
+        tl.uint32
+    )
+    scale_exp = tl.minimum(tl.maximum(scale_exp, 1), 254)
+    rounded_scale = (scale_exp << 23).to(tl.float32, bitcast=True)
+
+    scaled = tl.reshape(normed_groups * (1.0 / rounded_scale)[:, None], [block_h])
+    tl.store(
+        y_fp8 + row_id * y_fp8_stride_m + hidden_offsets,
+        scaled.to(tl.float8e4nv),
+        mask=hidden_mask,
+    )
+
+    if PACKED_SCALES:
+        num_packed_k: tl.constexpr = block_h // 128
+        scale_quads = tl.reshape(scale_exp, [num_packed_k, 4])
+        shifts = tl.arange(0, 4) * 8
+        packed_scale = tl.sum(scale_quads << shifts[None, :], axis=1).to(tl.int32)
+        packed_offsets = tl.arange(0, num_packed_k)
+        packed_mask = packed_offsets < (hidden_size // 128)
+        tl.store(
+            y_sf + row_id * y_sf_stride_m + packed_offsets,
+            packed_scale,
+            mask=packed_mask,
+        )
+        if HAS_SHARED:
+            m_block = row_id // shared_block_m
+            m_in_block = row_id % shared_block_m
+            shared_row = m_block * ((shared_block_m + 127) // 128 * 128) + (
+                m_in_block // 128 * 128 + m_in_block % 32 * 4 + m_in_block % 128 // 32
+            )
+            tl.store(
+                y_shared_sf
+                + shared_row * y_shared_sf_stride_m
+                + packed_offsets.to(tl.int64) * y_shared_sf_stride_k,
+                packed_scale,
+                mask=packed_mask,
+            )
+    else:
+        group_offsets = tl.arange(0, num_block_groups)
+        group_mask = group_offsets < (hidden_size // 32)
+        tl.store(
+            y_sf + row_id * y_sf_stride_m + group_offsets,
+            scale_exp.to(tl.uint8),
+            mask=group_mask,
+        )
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+@register_kernel(
+    "residual",
+    "mhc_apply_pre_fp8_group32",
+    name="triton_mhc_apply_pre_fp8_group32",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                residual=dense_tensor_format(torch.bfloat16),
+                pre=dense_tensor_format(torch.float32),
+            )
+        }
+    ),
+    traits={
+        "buffer_offsets_fit_int32": frozenset({False, True}),
+        "hc_mult": frozenset({4}),
+        "supports_direct_staging": frozenset({False, True}),
+    },
+    priority=Priority.PORTABLE,
+)
+def triton_mhc_apply_pre_fp8_group32(
+    residual: torch.Tensor,
+    pre: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    *,
+    y_fp8_out: torch.Tensor | None = None,
+    y_routed_sf_out: torch.Tensor | None = None,
+    y_shared_sf_out: torch.Tensor | None = None,
+    shared_sf_block_m: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Collapse 4 residual streams with RMSNorm and quantize to group-32 FP8.
+
+    When direct MegaMoE staging targets (``y_fp8_out``, ``y_routed_sf_out``,
+    ``y_shared_sf_out`` with ``shared_sf_block_m > 0``) are provided, writes
+    E4M3 codes, packed int32 UE8M0 scales, and MN-major UTCCP shared-expert
+    scales directly in place instead of returning freshly allocated canonical
+    tensors.
+    """
+    if residual.ndim < 2 or residual.shape[-2] != 4 or pre.shape != residual.shape[:-1]:
+        raise ValueError("mhc_apply_pre_fp8_group32 requires 4 streams matching pre")
+    hidden_size = residual.shape[-1]
+    if hidden_size <= 0 or hidden_size % 32 != 0:
+        raise ValueError(
+            f"mhc_apply_pre_fp8_group32 requires positive hidden_size % 32 == 0, got {hidden_size}"
+        )
+    if norm_weight.shape != (hidden_size,) or not norm_weight.is_contiguous():
+        raise ValueError("mhc_apply_pre_fp8_group32 requires contiguous weight [H]")
+    tokens = residual[..., 0, 0].numel()
+    if (
+        residual.ndim == 3
+        and residual.stride(1) == hidden_size
+        and residual.stride(2) == 1
+    ):
+        residual_stride_m = residual.stride(0)
+        residual_stride_hc = residual.stride(1)
+    else:
+        if not residual.is_contiguous():
+            raise ValueError("mhc_apply_pre_fp8_group32 requires contiguous residual")
+        residual_stride_m = 4 * hidden_size
+        residual_stride_hc = hidden_size
+    if pre.ndim == 2 and pre.stride(1) == 1:
+        pre_stride_m = pre.stride(0)
+    else:
+        if not pre.is_contiguous():
+            raise ValueError("mhc_apply_pre_fp8_group32 requires contiguous pre")
+        pre_stride_m = 4
+
+    y_out = residual.new_empty((*residual.shape[:-2], hidden_size))
+    packed_scales = y_fp8_out is not None
+    if packed_scales:
+        if y_routed_sf_out is None or y_shared_sf_out is None or shared_sf_block_m <= 0:
+            raise ValueError(
+                "Direct FP8 staging requires y_fp8_out, y_routed_sf_out, y_shared_sf_out, and shared_sf_block_m > 0"
+            )
+        if hidden_size % 128 != 0:
+            raise ValueError("Packed MegaMoE scales require hidden_size % 128 == 0")
+        y_fp8, y_sf, y_shared_sf = y_fp8_out, y_routed_sf_out, y_shared_sf_out
+    else:
+        y_fp8 = residual.new_empty((tokens, hidden_size), dtype=torch.float8_e4m3fn)
+        y_sf = residual.new_empty((tokens, hidden_size // 32), dtype=torch.uint8)
+        y_shared_sf = y_sf
+
+    if tokens == 0:
+        return y_out, y_fp8, y_sf
+
+    block_h = triton.next_power_of_2(hidden_size)
+    enable_pdl = pdl_enabled()
+    _mhc_apply_pre_fp8_group32_kernel[(tokens,)](
+        pre,
+        residual,
+        norm_weight,
+        y_out,
+        y_fp8,
+        y_sf,
+        y_shared_sf,
+        shared_sf_block_m or 1,
+        residual_stride_m,
+        residual_stride_hc,
+        pre_stride_m,
+        hidden_size,
+        y_fp8.stride(0),
+        y_sf.stride(0),
+        y_shared_sf.stride(0) if packed_scales else 1,
+        y_shared_sf.stride(1) if packed_scales else 1,
+        hidden_size=hidden_size,
+        eps=norm_eps,
+        block_h=block_h,
+        PACKED_SCALES=packed_scales,
+        HAS_SHARED=packed_scales,
+        ENABLE_PDL=enable_pdl,
+        num_warps=8,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return y_out, y_fp8, y_sf
+
+
 @triton.jit
 def _normalized_dot_gate_kernel(
     H,
