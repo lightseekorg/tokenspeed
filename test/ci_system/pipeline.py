@@ -16,6 +16,7 @@ import socket
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 from urllib.error import URLError
@@ -23,6 +24,17 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from process_group_manager import ProcessGroupManager, make_manager
+
+# runtime_suite.py imports the CI helpers through the ci_system package under
+# test/, as test/runtime/run_ci_suite.py does.
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from ci_system.runtime_suite import (
+    collect_runtime_tests,
+    parse_changed_paths,
+    plan_suite,
+    suite_invocation,
+    tests_reached,
+)
 
 try:
     import yaml
@@ -2525,6 +2537,60 @@ def attach_changed_paths(
             entry["changed_paths"] = paths
 
 
+def drop_tasks_without_tests(
+    include: List[Dict[str, Any]], repo_root: Path
+) -> List[Dict[str, Any]]:
+    """Drop the entries whose runtime suites would run no test file.
+
+    An entry qualifies when it carries the changed paths (``changed_paths``)
+    and every unit-test command of its task is a ``run_ci_suite.py``
+    invocation. ``plan_suite`` names the files each invocation runs on the
+    entry's runner with those paths, as the task would; the entry goes when it
+    names none. Any other command keeps the entry, since the scan cannot tell
+    what it runs.
+    """
+    invocations: Dict[str, List[Optional[argparse.Namespace]]] = {}
+    registered = None
+    reached_by_paths: Dict[str, Optional[set[str]]] = {}
+    kept: List[Dict[str, Any]] = []
+    for entry in include:
+        if "changed_paths" not in entry:
+            kept.append(entry)
+            continue
+        config = entry["config"]
+        if config not in invocations:
+            task = normalize_task(repo_root / config, repo_root)
+            commands = task.get("ut", {}).get("commands", [])
+            invocations[config] = [suite_invocation(command) for command in commands]
+        suites = invocations[config]
+        if not suites or any(args is None for args in suites):
+            kept.append(entry)
+            continue
+        if registered is None:
+            # run_ci_suite.py itself warns about the files without a registration.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                registered = collect_runtime_tests(repo_root)
+        paths = entry["changed_paths"]
+        if paths not in reached_by_paths:
+            reached_by_paths[paths] = tests_reached(
+                registered, parse_changed_paths(paths), repo_root
+            )
+        reached = reached_by_paths[paths]
+        if any(
+            plan_suite(registered, args, entry["runner"], reached, repo_root).tests
+            for args in suites
+        ):
+            kept.append(entry)
+        else:
+            print(
+                f"Dropping {entry['name']} ({entry['runner']}): "
+                "its suites run no test file for these changes",
+                file=sys.stderr,
+            )
+    return kept
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
     if args.command == "scan":
@@ -2568,6 +2634,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                     matrix["include"], changed, repo_root, root
                 )
                 attach_changed_paths(matrix["include"], changed, repo_root)
+                matrix["include"] = drop_tasks_without_tests(
+                    matrix["include"], repo_root
+                )
         print(json.dumps(matrix, separators=(",", ":")))
         return 0
 
