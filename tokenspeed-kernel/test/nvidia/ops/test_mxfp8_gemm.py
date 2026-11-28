@@ -711,6 +711,8 @@ def test_mm_mxfp8_cutedsl_fast_path_matches_loglevel_fallback(
     b_q, b_s = _quantize_mxfp8(
         torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
     )
+    a_s = swizzle_mxfp8_scale(a_s.contiguous(), 32, 256)
+    b_s = swizzle_mxfp8_scale(b_s.contiguous(), 128, 256)
     monkeypatch.delenv("FLASHINFER_LOGLEVEL", raising=False)
     fast = mm_mxfp8(
         a_q,

@@ -3443,6 +3443,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             None,
             None,
             None,
+            index_metadata=None,
             slots=slots,
         )
         # 2) Dense Full candidate-source prefill (SPARSE=False, SLOTS=False, POOL=True)
@@ -3460,7 +3461,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             8,
             None,
             None,
-            dsv41.new_index_metadata(table, visible_lens, None, history_rows=(1,)),
+            None,
+            index_metadata=dsv41.new_index_metadata(
+                table, visible_lens, None, history_rows=(1,)
+            ),
             slots=None,
         )
         # 3) Paged Full candidate-source decode <=64K (SPARSE=False, SLOTS=True, POOL=True)
@@ -3479,6 +3483,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             None,
             None,
             None,
+            index_metadata=None,
             slots=slots,
         )
 

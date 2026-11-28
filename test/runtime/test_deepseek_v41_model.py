@@ -5125,70 +5125,69 @@ def test_dsv41_attention_inner_breakpoint_captures_projections_and_matches_eager
     backend = _backend("cuda:0", 2)
     tables = _tables("cuda:0")
     x = torch.randn(4, config.hidden_size, dtype=torch.bfloat16, device="cuda:0")
-    capturing_at_wo_b: list[bool] = []
-    hook = attn.wo_b.register_forward_pre_hook(
-        lambda *_args: capturing_at_wo_b.append(
-            torch.cuda.is_current_stream_capturing()
-        )
+    capturing_at_out_proj: list[bool] = []
+    orig_output_projections = attn._output_projections
+
+    def tracked_output_projections(*args, **kwargs):
+        capturing_at_out_proj.append(torch.cuda.is_current_stream_capturing())
+        return orig_output_projections(*args, **kwargs)
+
+    monkeypatch.setattr(attn, "_output_projections", tracked_output_projections)
+    cap = BreakableCapture()
+    with active_forward(_ctx(backend, 4, ForwardMode.EXTEND)):
+        cap.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap.stream):
+            for _ in range(2):
+                backend.cache_pool.arena.buffer.zero_()
+                meta = _extend(backend, tables, [4], [0], [0], [4])
+                attn(
+                    meta.positions,
+                    x,
+                    _ctx(backend, 4, ForwardMode.EXTEND),
+                    reduce_output=True,
+                )
+        cap.stream.synchronize()
+        capturing_at_out_proj.clear()
+        backend.cache_pool.arena.buffer.zero_()
+        meta = _extend(backend, tables, [4], [0], [0], [4])
+        ctx = _ctx(backend, 4, ForwardMode.EXTEND)
+        with active_forward(ctx), cap:
+            captured = attn(meta.positions, x, ctx, reduce_output=True)
+    # Segment 0 (pre-attn projections) -> break (_sparse_attention_and_kv) -> Segment 2 (_output_projections).
+    assert len(cap.segments) == 3
+    assert capturing_at_out_proj == [True]
+
+    backend.cache_pool.arena.buffer.zero_()
+    meta = _extend(backend, tables, [4], [0], [0], [4])
+    with active_forward(_ctx(backend, 4, ForwardMode.EXTEND)):
+        cap.replay()
+    torch.cuda.synchronize()
+
+    backend.cache_pool.arena.buffer.zero_()
+    meta = _extend(backend, tables, [4], [0], [0], [4])
+    expected = attn(
+        meta.positions, x, _ctx(backend, 4, ForwardMode.EXTEND), reduce_output=True
     )
-    try:
-        cap = BreakableCapture()
-        with active_forward(_ctx(backend, 4, ForwardMode.EXTEND)):
-            cap.stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(cap.stream):
-                for _ in range(2):
-                    backend.cache_pool.arena.buffer.zero_()
-                    meta = _extend(backend, tables, [4], [0], [0], [4])
-                    attn(
-                        meta.positions,
-                        x,
-                        _ctx(backend, 4, ForwardMode.EXTEND),
-                        reduce_output=True,
-                    )
-            cap.stream.synchronize()
-            capturing_at_wo_b.clear()
-            backend.cache_pool.arena.buffer.zero_()
-            meta = _extend(backend, tables, [4], [0], [0], [4])
-            ctx = _ctx(backend, 4, ForwardMode.EXTEND)
-            with active_forward(ctx), cap:
-                captured = attn(meta.positions, x, ctx, reduce_output=True)
-        # Segment 0 (pre-attn projections) -> break (_sparse_attention_and_kv) -> Segment 2 (wo_a/wo_b).
-        assert len(cap.segments) == 3
-        assert capturing_at_wo_b == [True]
+    torch.testing.assert_close(captured, expected, rtol=1e-2, atol=1e-2)
 
-        backend.cache_pool.arena.buffer.zero_()
-        meta = _extend(backend, tables, [4], [0], [0], [4])
-        with active_forward(_ctx(backend, 4, ForwardMode.EXTEND)):
-            cap.replay()
-        torch.cuda.synchronize()
-
-        backend.cache_pool.arena.buffer.zero_()
-        meta = _extend(backend, tables, [4], [0], [0], [4])
-        expected = attn(
-            meta.positions, x, _ctx(backend, 4, ForwardMode.EXTEND), reduce_output=True
+    for fused_flag in (False, True):
+        idle_out = attn._sparse_attention_and_kv(
+            _ctx(backend, 0, ForwardMode.IDLE),
+            x.new_empty((0, attn.n_local_heads, attn.head_dim)),
+            x.new_empty((0, attn.head_dim)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            fused_flag,
         )
-        torch.testing.assert_close(captured, expected, rtol=1e-2, atol=1e-2)
-
-        for fused_flag in (False, True):
-            idle_out = attn._sparse_attention_and_kv(
-                _ctx(backend, 0, ForwardMode.IDLE),
-                x.new_empty((0, attn.n_local_heads, attn.head_dim)),
-                x.new_empty((0, attn.head_dim)),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                fused_flag,
-            )
-            if fused_flag:
-                assert idle_out[0].shape[0] == 0 and idle_out[1].shape[0] == 0
-            else:
-                assert idle_out.shape == (0, attn.n_local_heads, attn.head_dim)
-    finally:
-        hook.remove()
+        if fused_flag:
+            assert idle_out[0].shape[0] == 0 and idle_out[1].shape[0] == 0
+        else:
+            assert idle_out.shape == (0, attn.n_local_heads, attn.head_dim)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
