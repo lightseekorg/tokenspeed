@@ -2376,7 +2376,7 @@ def test_sonic_fixed_width_dspark_drafter_runs_sampled_and_cuda_graph(monkeypatc
         torch.int32
     )
 
-    def run(order, *, state_write_slots=None):
+    def prepare_run(order, *, state_write_slots=None):
         positions = torch.cat(
             [torch.arange(starts[i], starts[i] + width, device="cuda:0") for i in order]
         )
@@ -2397,7 +2397,6 @@ def test_sonic_fixed_width_dspark_drafter_runs_sampled_and_cuda_graph(monkeypatc
         ctx.bs, ctx.num_extends = n, 0
         ctx.output_layout = ForwardOutputLayout(0, 0, n, width)
         ctx.attn_backend, ctx.token_to_kv_pool = backend, pool
-        windows.zero_()
         slots = torch.tensor([i + 1 for i in order], device="cuda:0")
         write_slots = (
             slots
@@ -2406,16 +2405,29 @@ def test_sonic_fixed_width_dspark_drafter_runs_sampled_and_cuda_graph(monkeypatc
         )
         ib.req_pool_indices_buf[:n].copy_(slots)
         ib.state_write_req_pool_indices_buf[:n].copy_(write_slots)
-        return drafter.run(
-            base_ctx=ctx,
-            logits_output=SimpleNamespace(
+        return (
+            ctx,
+            SimpleNamespace(
                 hidden_states=hidden[order].reshape(-1, drafter.hidden_width)
             ),
-            output_tokens=tokens[order].reshape(-1),
-            accept_lengths=torch.tensor(
+            tokens[order].reshape(-1),
+            torch.tensor(
                 [accepts[i] for i in order], device="cuda:0", dtype=torch.int32
             ),
         )
+
+    def run_prepared(prepared):
+        ctx, logits_out, out_tokens, accept_lens = prepared
+        windows.zero_()
+        return drafter.run(
+            base_ctx=ctx,
+            logits_output=logits_out,
+            output_tokens=out_tokens,
+            accept_lengths=accept_lens,
+        )
+
+    def run(order, *, state_write_slots=None):
+        return run_prepared(prepare_run(order, state_write_slots=state_write_slots))
 
     forward = run([0, 1, 2]).clone()
     proposal_laws = states.draft_probs[1:4, :block].clone()
@@ -2424,9 +2436,10 @@ def test_sonic_fixed_width_dspark_drafter_runs_sampled_and_cuda_graph(monkeypatc
     )
     assert (proposal_laws.gather(-1, forward[:, 1:, None].long()) > 0).all()
 
+    capture_inputs = prepare_run([0, 1, 2])
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = run([0, 1, 2])
+        captured = run_prepared(capture_inputs)
     states.draft_probs[1:4, :block].zero_()
     graph.replay()
     torch.testing.assert_close(captured, forward, rtol=0, atol=0)
