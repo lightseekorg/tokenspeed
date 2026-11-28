@@ -619,6 +619,35 @@ class CudaPeerWeightStore:
         self._reader = None
         self._reader_stream = None
 
+    @property
+    def released(self) -> bool:
+        return False
+
+    def owned_weights(self, layer: int) -> dict[str, torch.Tensor]:
+        raise NotImplementedError("CUDA peer weight stores are immutable")
+
+    def vmm_managed_tensors(self) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            self._views[layer.index][field.name]
+            for layer in self._layers.values()
+            for field in layer.fields
+            if field.layout is not None and layer.index in self._views
+        )
+
+    def prepare_weight_update(self) -> None:
+        raise NotImplementedError("CUDA peer weight stores are immutable")
+
+    def refresh_weights(self) -> None:
+        raise NotImplementedError("CUDA peer weight stores are immutable")
+
+    def release_storage(self, *, backup: bool) -> None:
+        del backup
+        raise NotImplementedError("CUDA peer weight stores do not support release")
+
+    def resume_storage(self, *, backup: bool) -> None:
+        del backup
+        raise NotImplementedError("CUDA peer weight stores do not support resume")
+
     def close(self) -> None:
         if self._closed:
             return

@@ -19,7 +19,8 @@
 # SOFTWARE.
 
 """GFX950 DCP selection: the row-bounded logical top-k over owned rows of a
-table-wide buffer, and each rank's owned share of the merged selection."""
+table-wide buffer, the merge of every rank's candidates, and each rank's owned
+share of the merged selection."""
 
 from __future__ import annotations
 
@@ -33,6 +34,7 @@ if not is_cdna4():
     )
 
 from tokenspeed_kernel.ops.attention.dsa import (  # isort: skip
+    dsa_merge_candidates,
     dsa_select_owned_candidates,
     dsa_select_owned_candidates_supported,
 )
@@ -46,6 +48,11 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (  # isort: skip
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (  # isort: skip
     compact_owned_slots,
     virtual_slots_to_local,
+)
+from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.candidate_merge import (  # isort: skip
+    gluon_dsa_merge_candidates_gfx950,
+    launch_gluon_dsa_merge_candidates_gfx950,
+    merge_candidates_supported,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.owned_selection import (  # isort: skip
     _select_owned_from_gathered_kernel,
@@ -349,3 +356,114 @@ def test_owned_selection_refuses_gathered_scores_it_cannot_take():
         assert not dsa_select_owned_candidates_supported(
             ranks=ranks, rows=1, topk=2048, rank_stride=rank_stride
         )
+
+
+def _merge_records(degree: int, rows: int, width: int, band: str, seed: int):
+    """Every rank's (position, FP32 score bits) candidates as the all-gather
+    lays them out, with invalid, mandatory, signed-zero, short and empty
+    rows."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    shape = (degree, rows, width)
+    ids = torch.randperm(1 << 24, device="cuda", generator=generator)
+    ids = ids[: degree * rows * width].int().view(shape) + (1 << 24)
+    if band == "tied":
+        # The cutoff falls inside a run of equal scores spanning the ranks.
+        scores = torch.randint(0, 4, shape, device="cuda", generator=generator)
+        scores = scores.float()
+    elif band == "single":
+        scores = torch.full(shape, 2.5, device="cuda")
+    elif band == "signed":
+        # Negative and positive scores sharing their leading bits.
+        scores = torch.randn(shape, device="cuda", generator=generator) * 1e-3 + 5
+        scores = torch.where(scores > 5, scores, -scores)
+    else:
+        scores = torch.rand(shape, device="cuda", generator=generator)
+    if rows:
+        # Row 0: an invalid offset, then +inf, -inf, NaN, both zeros, +inf.
+        ids[:, 0, -1] = -1
+        special = torch.tensor(
+            [torch.inf, -torch.inf, torch.nan, -0.0, 0.0, torch.inf], device="cuda"
+        )
+        scores[:, 0, : min(width, 6)] = special[: min(width, 6)]
+        # The last row is short: at most four live candidates per rank.
+        scores[:, -1, 4:] = -torch.inf
+    if rows > 2:
+        # Row 1 has none, as an exchange's padding rows.
+        ids[:, 1] = -1
+    return torch.stack((ids, scores.view(torch.int32)), dim=-1)
+
+
+def _threshold_merge(records: torch.Tensor, topk: int):
+    """The merge's selection: candidates above the k-th largest score of an
+    exact top-k and the first tied ones, in candidate order."""
+    scores = rank_major_scores(records)
+    order = torch.topk(scores, topk, dim=-1).indices
+    return select_through_threshold(records, scores, order, topk=topk)
+
+
+@pytest.mark.parametrize(
+    "degree,rows,width,topk",
+    [
+        (8, 64, 2048, 2048),
+        (16, 5, 2048, 2048),
+        (2, 33, 512, 512),
+        (4, 7, 1024, 1024),
+        (8, 7, 2053, 2049),
+        (3, 9, 16, 8),
+        (1, 1, 16, 8),
+        (8, 0, 2048, 2048),
+    ],
+)
+@pytest.mark.parametrize("band", ["uniform", "tied", "single", "signed"])
+def test_merge_is_the_threshold_selection(degree, rows, width, topk, band):
+    records = _merge_records(degree, rows, width, band, seed=degree * 100 + rows)
+    expected, expected_counts = _threshold_merge(records, topk)
+
+    positions, counts = dsa_merge_candidates(records, topk=topk, solution="gluon")
+
+    torch.testing.assert_close(positions, expected, atol=0, rtol=0)
+    torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)
+
+
+def test_merge_reads_records_past_int32_offsets():
+    # Every rank's rows of 2048 candidates, the last rows of the last rank
+    # past 2**31 records; only those rows hold real candidates.
+    degree, width, topk = 8, 2048, 2048
+    rows = 2**31 // (degree * width) + 2
+    tail = _merge_records(degree, 2, width, "tied", seed=29)
+    expected, expected_counts = _threshold_merge(tail, topk)
+    records = torch.empty((degree, rows, width, 2), device="cuda", dtype=torch.int32)
+    records[:, -2:] = tail
+    assert ((degree - 1) * rows + rows - 1) * width > 2**31
+
+    positions, counts = launch_gluon_dsa_merge_candidates_gfx950(records, topk=topk)
+
+    torch.testing.assert_close(positions[-2:], expected, atol=0, rtol=0)
+    torch.testing.assert_close(counts[-2:], expected_counts, atol=0, rtol=0)
+
+
+def test_merge_launches_one_specialization_across_batch_rows():
+    def merge(rows):
+        dsa_merge_candidates(
+            _merge_records(8, rows, 2048, "uniform", seed=rows),
+            topk=2048,
+            solution="gluon",
+        )
+
+    merge(1)
+    with assert_no_triton_compile(gluon_dsa_merge_candidates_gfx950):
+        for rows in (3, 8, 37, 64):
+            merge(rows)
+
+
+def test_merge_refuses_rows_past_the_registers():
+    assert merge_candidates_supported(ranks=16, candidates=2048)
+    # Such merges keep the portable kernel.
+    assert not merge_candidates_supported(ranks=32, candidates=2048)
+    records = _merge_records(32, 2, 2048, "uniform", seed=31)
+    with pytest.raises(ValueError, match="register-resident"):
+        launch_gluon_dsa_merge_candidates_gfx950(records, topk=2048)
+    positions, counts = dsa_merge_candidates(records, topk=2048, solution=None)
+    expected, expected_counts = _threshold_merge(records, 2048)
+    torch.testing.assert_close(positions, expected, atol=0, rtol=0)
+    torch.testing.assert_close(counts, expected_counts, atol=0, rtol=0)

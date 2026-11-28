@@ -23,7 +23,9 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from tokenspeed_kernel.ops.residual.triton import (
+    _launch_projection_epilogue,
     _mhc_mixes_impl,
     _mhc_pre_impl,
     _mhc_pre_layer_triton_kernel,
@@ -311,6 +313,7 @@ if current_platform().is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.hyperconnection import (
         launch_gluon_hyperconnection_mix_gfx950,
+        launch_gluon_hyperconnection_mix_up_prefill_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.mhc import (
         launch_gluon_mhc_apply_pre_gfx950,
@@ -450,9 +453,6 @@ if current_platform().is_amd:
             {torch.bfloat16, torch.float16},
         ),
         traits={
-            # Larger batches keep the GEMM-plus-epilogue path, which is faster
-            # once the weights are no longer the dominant traffic.
-            "num_tokens": frozenset(range(1, _HC_MIX_MAX_ROWS + 1)),
             "hc_count": frozenset({4}),
             "hidden_size": frozenset({2560}),
             "lowrank": frozenset({320}),
@@ -474,22 +474,39 @@ if current_platform().is_amd:
         weights_independent: bool,
         packed_up_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the split-K down projection and gated up projection launches.
+        """Mix through the split-K decode launches or the prefill up projection.
+
+        Up to ``MAX_ROWS`` rows run the split-K down projection and the gated
+        up projection. Larger batches, where the weights are no longer the
+        dominant traffic, keep the down projection a GEMM with its scale/SiLU
+        epilogue and fuse the up projection with the gated branch sum, so the
+        ``[rows, hc_count * hidden_size]`` gate never reaches memory.
 
         ``weights_independent`` only matters to PDL producers, which GFX950
         does not have; the result is deterministic either way.
         """
         del weights_independent
-        return launch_gluon_hyperconnection_mix_gfx950(
-            normalized,
-            projection_weight,
-            up_weight,
-            hc_count,
-            hidden_size,
-            lowrank,
-            projection_rows,
-            projection_scale,
+        rows = normalized.shape[0]
+        if rows <= _HC_MIX_MAX_ROWS:
+            return launch_gluon_hyperconnection_mix_gfx950(
+                normalized,
+                projection_weight,
+                up_weight,
+                hc_count,
+                hidden_size,
+                lowrank,
+                projection_rows,
+                projection_scale,
+            )
+        # Model loading aligns the GEMM output width; drop only the padding.
+        projected = F.linear(normalized, projection_weight)[:, :projection_rows]
+        activated, inject = _launch_projection_epilogue(
+            projected, lowrank, hc_count, projection_scale
         )
+        mixed = launch_gluon_hyperconnection_mix_up_prefill_gfx950(
+            activated, up_weight, normalized, hc_count, hidden_size, lowrank
+        )
+        return mixed, inject
 
 
 if current_platform().is_amd:
