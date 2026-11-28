@@ -865,7 +865,7 @@ race the load, and in an eager break it would no longer run after the whole
 load. So a replay relies on the noted waits only on a pool whose class declares
 `layer_accesses_wait_for_load` (a subclass does not inherit it), set after
 auditing its accessors and the code that reaches them in a replay (the Kimi-K3
-pool). A replay on any other pool, or of a graph captured against another
+and DeepSeek V4.1 pools). A replay on any other pool, or of a graph captured against another
 tracker than the pool's current one, or none, waits for the pool's whole Host
 load (its tracker's last layer) before the first segment instead, and skips the
 noted waits. A replay that relies on the noted waits has, like an eager forward,

@@ -21,6 +21,7 @@
 """Strided V4.1 FlatKV views over the scheduler-owned shared arena."""
 
 from collections.abc import Mapping
+from typing import ClassVar
 
 import numpy as np
 import torch
@@ -46,6 +47,14 @@ class DeepseekV41CachePool(CachePool):
 
     requires_page_zeroing = True
     layer_plane_bindings = {"swa": "swa_buffers"}
+    #: Every cache read and write in DeepseekV41AttentionBackend and
+    #: DeepseekV41DSparkModel reaches arena views through ``swa``,
+    #: ``global_kv``, ``index_k``, ``compressor_tail``, ``dspark_kv``, or the
+    #: ``get_*_buffer`` methods, all of which route through ``_field`` and call
+    #: ``layerwise_load_tracker.wait_for_layer`` (recording per-segment waits
+    #: under BreakableCapture). ``swa_buffers`` is bound only for CachePool
+    #: plane metadata and is not indexed directly during forwards.
+    layer_accesses_wait_for_load: ClassVar[bool] = True
 
     def __init__(
         self,

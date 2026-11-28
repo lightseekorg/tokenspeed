@@ -1675,24 +1675,357 @@ def test_owner_topology_and_reject_invalid_recipes():
 def test_pool_strides_owner_fences_and_no_redundant_fields():
     backend = _backend("cpu", 2)
     pool = backend.cache_pool
-    tracker = Mock()
-    pool.layerwise_load_tracker = tracker
-    for view, shape, stride, owner in (
-        (pool.swa(7), (64, 528), 1_382_400, 7),
-        (pool.global_kv(8), (64, 288), 69_120, 8),
-        (pool.index_k(20), (64, 68), 23_040, 20),
-        (pool.compressor_tail(14), (2, 2, 512), 25_600, 14),
+    waited: list[int] = []
+
+    class _Tracker:
+        def wait_for_layer(self, layer_index: int) -> None:
+            waited.append(layer_index)
+
+    pool.layerwise_load_tracker = _Tracker()
+    for get_view, shape, stride, owner in (
+        (lambda: pool.swa(7), (64, 528), 1_382_400, 7),
+        (lambda: pool.global_kv(8), (64, 288), 69_120, 8),
+        (lambda: pool.index_k(20), (64, 68), 23_040, 20),
+        (lambda: pool.compressor_tail(14), (2, 2, 512), 25_600, 14),
     ):
+        view = get_view()
         assert tuple(view.shape[1:]) == shape
         assert view.stride(0) * view.element_size() == stride
         assert (
             view.untyped_storage().data_ptr()
             == pool.arena.buffer.untyped_storage().data_ptr()
         )
-        tracker.wait_for_layer.assert_any_call(owner)
+        assert waited[-1] == owner
+    assert waited == [7, 8, 20, 14]
+    waited.clear()
+    pool.get_key_buffer(3)
+    pool.get_value_buffer(5)
+    pool.get_kv_buffer(9)
+    assert waited == [3, 5, 9]
     with pytest.raises(ValueError, match="not planned"):
         pool.global_kv(24)
     assert pool.history_group_by_layer() == {layer: SWA for layer in range(40)}
+
+    dspark_pool = _pool(_dspark_recipe("cpu"), "cpu")
+    dspark_waited: list[int] = []
+
+    class _DsparkTracker:
+        def wait_for_layer(self, layer_index: int) -> None:
+            dspark_waited.append(layer_index)
+
+    dspark_pool.layerwise_load_tracker = _DsparkTracker()
+    dspark_pool.dspark_kv(0)
+    dspark_pool.dspark_kv(2)
+    assert dspark_waited == [39, 39]
+
+
+@pytest.mark.parametrize(
+    ("tracker_at_capture", "declared"), [(True, True), (False, True), (True, False)]
+)
+def test_prefill_graph_replay_writes_loaded_global_page_after_host_load(
+    tracker_at_capture, declared
+):
+    """A Host tail hit loads the global R1 block into page 2 while a captured
+    prefill segment writes new rows into its upper half via ``write_global``.
+    With the H2D held back on the load stream, the replay must wait before the
+    segment (using the noted layerwise wait when declared and captured with the
+    tracker, or the whole-load wait otherwise) so the late H2D never overwrites
+    the written rows.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    ts = pytest.importorskip("tokenspeed_engine.scheduler")
+    from unittest.mock import patch
+
+    from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+    from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.device import DeviceHandle
+    from tokenspeed.runtime.execution.memory_delta import (
+        NULL_MEMORY_DELTA_OBSERVER,
+    )
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+    from tokenspeed.runtime.utils.common import maybe_inference_mode
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    class WriteBackOp:
+        def __init__(self, op_id, groups, src, dst):
+            self.op_ids = [op_id]
+            self.group_ids = [list(groups)]
+            self.src_pages = [[src] * len(groups)]
+            self.dst_pages = [[dst] * len(groups)]
+            self.source_pinned = [False]
+
+    class LoadBackOp:
+        def __init__(self, op_id, groups, src, dst):
+            self.op_ids = [op_id]
+            self.group_ids = [list(groups)]
+            self.src_pages = [[src] * len(groups)]
+            self.dst_pages = [[dst] * len(groups)]
+
+    owner_layer = 20
+    page, hit, bucket = 2, 32, 32
+    backend = _backend("cuda", 2)
+    pool = backend.cache_pool
+    executor = HostCacheExecutor(
+        pool,
+        draft_pool=None,
+        l2_tier=True,
+        host_ratio=1.0,
+        host_size_gb=0,
+        snapshot_pool=RetractionPoolRequest(
+            host_gb=0.0,
+            ratio=0.0,
+            max_retracted_requests=0,
+            tail_lcm_blocks_per_request=0,
+        ),
+        slot_state_exporters=None,
+        io_backend="kernel",
+        attn_tp_rank=0,
+        kvp_rank=0,
+        nprocs_per_node=1,
+        world_cpu_group=None,
+        block_alignment=1,
+    )
+    model_executor = ModelExecutor.__new__(ModelExecutor)
+    model_executor.device = "cuda"
+    model_executor.device_module = torch.cuda
+    model_executor.default_stream = torch.cuda.default_stream()
+    model_executor.execution_stream = torch.cuda.Stream()
+    model_executor.token_to_kv_pool = pool
+    model_executor.draft_token_to_kv_pool = None
+    model_executor._cache_runtime_contract = pool.arena.runtime_contract
+    model_executor._cache_kvp_rank = 0
+    model_executor.drafter = None
+    handle = DeviceHandle(model_executor, host_cache_executor=executor)
+    handle.bind_forward_thread()
+
+    groups = [group.group_id for group in executor.layout.groups]
+    r1_group = groups.index(R1)
+    ctx = ForwardContext(
+        attn_backend=backend,
+        token_to_kv_pool=pool,
+        bs=1,
+        num_extends=1,
+        output_layout=ForwardOutputLayout(1, 1, 0, 1),
+        input_num_tokens=bucket,
+        forward_mode=ForwardMode.EXTEND,
+    )
+    owner = object.__new__(PrefillGraph)
+    owner.disable = False
+    owner.capture_buckets = [bucket]
+    owner.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
+    owner.num_warmup = 1
+    owner._narrowing = None
+    owner._expert_load_rows = None
+    owner._engaged_logged = set()
+    owner._route_counts = {}
+    owner._ctx = None
+    owner._pool = None
+    owner._handoff_storage = {}
+    owner._outputs = None
+    owner._captures = {}
+    owner._encoders = {}
+    owner._decoders = {}
+    owner._captured_load_tracker = None
+    owner.dp_size = 1
+    owner.attn_backend = backend
+    owner.token_to_kv_pool = pool
+    owner.config = SimpleNamespace(
+        world_size=1,
+        model_is_mrope=False,
+        global_rank=0,
+        device="cuda",
+        gpu_id=torch.cuda.current_device(),
+        context_len=512,
+        max_num_seqs=1,
+        data_parallel_size=1,
+        prefill_graph_capture_batch_sizes=None,
+    )
+    owner.input_buffers = SimpleNamespace(
+        input_ids_buf=torch.ones(bucket, dtype=torch.int64)
+    )
+    owner.make_dummy_batch = lambda num_tokens, bs: ctx
+    owner._replay_bucket = lambda _ctx: bucket
+    owner.inner_model = SimpleNamespace(embed_tokens=torch.nn.Embedding(2, 4))
+    owner._compute_input_embeddings = (
+        lambda ids, _ctx, *, request_token_history: owner.inner_model.embed_tokens(ids)
+    )
+    owner.text_model = SimpleNamespace(
+        lm_head=None, logits_processor=lambda ids, hidden, *args: hidden
+    )
+
+    try:
+        with (
+            patch.object(ts.Cache, "WriteBackOp", WriteBackOp),
+            patch.object(ts.Cache, "LoadBackOp", LoadBackOp),
+            patch(
+                "tokenspeed.runtime.execution.prefill_graph.LogitsMetadata."
+                "from_forward_context",
+                return_value=None,
+            ),
+        ):
+            # Warm the transfer table and waiter kernels for every layer (both
+            # owner_layer and the whole-load fallback layer_num - 1) before
+            # holding back the load stream below.
+            handle.execute(
+                ts.ExecutionPlan(),
+                None,
+                cache_ops=[LoadBackOp(1, [r1_group], 1, 3)],
+            )
+            for layer_id in range(pool.layer_num):
+                pool.layerwise_load_tracker.wait_for_layer(layer_id)
+
+            torch.manual_seed(37)
+            src_slots = torch.arange(64, 128, dtype=torch.int32, device="cuda")
+            host_main_in = torch.randn(64, 512, dtype=torch.bfloat16, device="cuda")
+            host_index_in = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
+            raw_global = pool.arena.field(f"layer.{owner_layer}.global_kv")
+            raw_index = pool.arena.field(f"layer.{owner_layer}.index_k")
+            dsv41.cache_scatter(
+                host_main_in, raw_global, src_slots, backend.global_format
+            )
+            dsv41.cache_scatter(
+                host_index_in, raw_index, src_slots, backend.index_format
+            )
+            expected_hit_main = dsv41.cache_gather(
+                raw_global, src_slots[:hit], backend.global_format, None
+            )
+            expected_hit_index = dsv41.cache_gather(
+                raw_index, src_slots[:hit], backend.index_format, None
+            )
+
+            ref_slots = torch.arange(
+                4 * 64, 4 * 64 + hit, dtype=torch.int32, device="cuda"
+            )
+            new_main = torch.randn(hit, 512, dtype=torch.bfloat16, device="cuda") + 2.0
+            new_index = torch.randn(hit, 128, dtype=torch.bfloat16, device="cuda") - 2.0
+            dsv41.cache_scatter(new_main, raw_global, ref_slots, backend.global_format)
+            dsv41.cache_scatter(new_index, raw_index, ref_slots, backend.index_format)
+            expected_tail_main = dsv41.cache_gather(
+                raw_global, ref_slots, backend.global_format, None
+            )
+            expected_tail_index = dsv41.cache_gather(
+                raw_index, ref_slots, backend.index_format, None
+            )
+            torch.cuda.synchronize()
+
+            handle.execute(
+                ts.ExecutionPlan(),
+                None,
+                cache_ops=[WriteBackOp(2, [r1_group], 1, 1)],
+            )
+            torch.cuda.synchronize()
+            assert sorted(int(ack.op_id) for ack in handle.poll_cache_results()) == [
+                1,
+                2,
+            ]
+
+            tables = _tables("cuda")
+            tables[R1][0, 0] = page
+            meta = _extend(backend, tables, [hit], [hit], [0], [64])
+            tail_slots = backend.cache_slots(
+                R1, meta.positions, meta.request_indices, ForwardMode.EXTEND
+            )
+            hidden = torch.ones(bucket, 4, device="cuda")
+
+            def forward():
+                if declared:
+                    backend.write_global(
+                        owner_layer,
+                        new_main,
+                        new_index,
+                        meta.positions,
+                        meta.request_indices,
+                        ForwardMode.EXTEND,
+                        main_rope_cache=None,
+                    )
+                else:
+                    # Around the fence, as an undeclared pool's accessor may write.
+                    dsv41.cache_scatter(
+                        new_main, raw_global, tail_slots, backend.global_format
+                    )
+                    dsv41.cache_scatter(
+                        new_index, raw_index, tail_slots, backend.index_format
+                    )
+                return hidden * 2
+
+            owner._run_inner = lambda _bucket: (forward(), None)
+            with patch.object(
+                pool,
+                "layerwise_load_tracker",
+                pool.layerwise_load_tracker if tracker_at_capture else None,
+            ):
+                owner.capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
+
+            capture, _ = owner._captures[bucket, None]
+            if tracker_at_capture and declared:
+                assert len(capture.segment_waits) == 1
+                assert [layer for _, layer in capture.segment_waits[0]] == [owner_layer]
+            else:
+                assert [bool(waits) for waits in capture.segment_waits] == [False]
+
+            pool.arena.zero_blocks({R1: np.asarray([page])})
+            with torch.cuda.stream(executor.load_stream):
+                torch.cuda._sleep(200_000_000)
+            handle.execute(
+                ts.ExecutionPlan(),
+                None,
+                cache_ops=[LoadBackOp(3, [r1_group], 1, page)],
+            )
+            v41_pool_class = type(pool)
+            if not declared:
+
+                class Undeclared(v41_pool_class):
+                    pass
+
+                pool.__class__ = Undeclared
+            try:
+                with maybe_inference_mode():
+                    result = owner.replay(
+                        ctx,
+                        torch.ones(bucket, dtype=torch.int64),
+                        request_token_history=None,
+                    )
+            finally:
+                pool.__class__ = v41_pool_class
+
+            assert not executor.load_stream.query()
+            torch.cuda.synchronize()
+            assert [int(ack.op_id) for ack in handle.poll_cache_results()] == [3]
+            assert torch.equal(result, hidden * 2)
+
+            hit_slots = torch.arange(
+                page * 64, page * 64 + hit, dtype=torch.int32, device="cuda"
+            )
+            assert torch.equal(
+                dsv41.cache_gather(raw_global, hit_slots, backend.global_format, None),
+                expected_hit_main,
+            )
+            assert torch.equal(
+                dsv41.cache_gather(raw_global, tail_slots, backend.global_format, None),
+                expected_tail_main,
+            )
+            assert torch.equal(
+                dsv41.cache_gather(raw_index, hit_slots, backend.index_format, None),
+                expected_hit_index,
+            )
+            assert torch.equal(
+                dsv41.cache_gather(raw_index, tail_slots, backend.index_format, None),
+                expected_tail_index,
+            )
+
+            assert pool.layerwise_load_tracker.consumer_indices
+            handle.execute(ts.ExecutionPlan(), None, cache_ops=[])
+            assert pool.layerwise_load_tracker.consumer_indices == ()
+    finally:
+        handle.shutdown_cache()
 
 
 def test_refresh_pointer_stability_padding_and_mapping():
