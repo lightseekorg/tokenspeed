@@ -2242,3 +2242,36 @@ def test_dspark_warmup_extend_compiles_anchors_and_rows(monkeypatch):
             pool,
         )
     assert windows[:, 1, :2].count_nonzero() > 0
+
+
+def test_window_attention_supports_pd_cache_step_during_forward_backbone(monkeypatch):
+    from test.runtime.test_deepseek_v41_model import _DenseFFN, _initialize
+
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    config = _draft_config()
+    model = DeepseekV41DSparkModel(config, _mapping(0, 1, 1), None, "mtp")
+    _initialize(model)
+    windows = torch.randn(3, 4, 16, config.head_dim, dtype=torch.bfloat16)
+    pool = SimpleNamespace(dspark_kv=lambda stage: windows[stage])
+    bonus = torch.tensor([3, 4], dtype=torch.int64)
+    starts = torch.tensor([4, 4], dtype=torch.int64)
+    history = _history_slots(starts, config.sliding_window, 16)
+    ctx = _ctx(None, bonus.numel() * config.dspark_block_size, ForwardMode.DECODE)
+    out = model.forward_backbone(bonus, starts, history, pool, ctx)
+    assert out.shape == (2, config.dspark_block_size, config.hidden_size)
+    assert torch.isfinite(out).all()
+
+    backend = _window_backend(
+        torch.arange(config.dspark_block_size, dtype=torch.int64),
+        windows[0],
+        history[:1],
+        config.dspark_block_size,
+        16,
+    )
+    assert backend.defer_final_pd_cache_step is False
+    for mode in (ForwardMode.DECODE, ForwardMode.EXTEND, ForwardMode.IDLE):
+        with model.layers[-1].attn._pd_cache_step(
+            _ctx(backend, config.dspark_block_size, mode),
+            writes_in_call=True,
+        ):
+            pass
