@@ -65,6 +65,12 @@ _SORT_MIN_ROWS = 32768
 # so more of them are in flight while each waits on the host link. Unsorted
 # lookups are small and run one row per program.
 _ROWS_PER_PROGRAM = 4
+# Canonical UE8M0 exponent for an all-zero / invalid row under the 1e-4 amax
+# floor: ceil_log2(1e-4 / 448.0) + 127 = 105 (2^-22).
+_FLOOR_EXPONENT = 105
+# Bound per-launch row span during in-place table canonicalization so a 100+ GB
+# host table completes in short kernels without tripping GPU watchdogs.
+_CANONICALIZE_CHUNK_ROWS = 4_194_304
 
 
 # The entry count varies per batch; keep it out of the specialization key.
@@ -85,14 +91,19 @@ def _host_mxfp8_row_gather_kernel(
     DIM: tl.constexpr,
     ROWS: tl.constexpr,
     SORTED: tl.constexpr,
+    CANONICAL: tl.constexpr,
+    FLOOR_EXPONENT: tl.constexpr,
 ):
-    # Each program handles ROWS lookup entries. An entry loads a packed
-    # [codes | scales] row, rebuilds its FP32 values and quantizes them again
-    # with the group-32 UE8M0 rule (1e-4 amax floor), as quantizing the
-    # dequantized BF16 row would. SORTED entries come in table-row order and
-    # only the first entry of each run of equal ids (head[e] == e) reads the
-    # host; it writes its output row dst[e], which
-    # _copy_duplicate_rows_kernel then copies to the rest of the run.
+    # Each program handles ROWS lookup entries. When CANONICAL is False, an
+    # entry loads a packed [codes | scales] row, rebuilds its FP32 values and
+    # quantizes them again with the group-32 UE8M0 rule (1e-4 amax floor), as
+    # quantizing the dequantized BF16 row would. When CANONICAL is True, the
+    # table was already canonicalized in place once after load, so valid rows
+    # copy their bytes directly and invalid ids emit zero codes with the floor
+    # exponent. SORTED entries come in table-row order and only the first entry
+    # of each run of equal ids (head[e] == e) reads the host; it writes its
+    # output row dst[e], which _copy_duplicate_rows_kernel then copies to the
+    # rest of the run.
     entry = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
     live = entry < n_entries
     if SORTED:
@@ -115,8 +126,70 @@ def _host_mxfp8_row_gather_kernel(
     cols = tl.arange(0, DIM)
     groups = tl.arange(0, DIM // 32)
     codes = tl.load(host_rows[:, None] + cols[None, :], mask=valid[:, None], other=0)
+    if CANONICAL:
+        exponents = tl.load(
+            host_rows[:, None] + DIM + groups[None, :],
+            mask=valid[:, None],
+            other=FLOOR_EXPONENT,
+        )
+        tl.store(
+            codes_ptr + dst[:, None] * DIM + cols[None, :],
+            codes,
+            mask=live[:, None],
+        )
+        tl.store(
+            scales_ptr + dst[:, None] * (DIM // 32) + groups[None, :],
+            exponents,
+            mask=live[:, None],
+        )
+    else:
+        exponents = tl.load(
+            host_rows[:, None] + DIM + groups[None, :], mask=valid[:, None], other=0
+        )
+        scale = (exponents.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        values = tl.reshape(
+            codes.to(tl.float8e4nv, bitcast=True).to(tl.float32), (ROWS, DIM // 32, 32)
+        ) * tl.expand_dims(scale, 2)
+        amax = tl.maximum(tl.max(tl.abs(values), 2), 1.0e-4)
+        bits = (amax * (1.0 / 448.0)).to(tl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        inverse_scale = 1.0 / (exponent << 23).to(tl.float32, bitcast=True)
+        quantized = (values * tl.expand_dims(inverse_scale, 2)).to(tl.float8e4nv)
+        tl.store(
+            codes_ptr + dst[:, None] * DIM + cols[None, :],
+            tl.reshape(quantized.to(tl.uint8, bitcast=True), (ROWS, DIM)),
+            mask=live[:, None],
+        )
+        tl.store(
+            scales_ptr + dst[:, None] * (DIM // 32) + groups[None, :],
+            exponent.to(tl.uint8),
+            mask=live[:, None],
+        )
+
+
+# Row bounds vary per table and chunk; keep them out of the compile key.
+@triton.jit(do_not_specialize=["start_row", "end_row"])
+def _canonicalize_mxfp8_table_kernel(
+    table_ptr,
+    start_row,
+    end_row,
+    table_stride,
+    DIM: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    # Canonicalize [codes | scales] rows in place to the group-32 UE8M0
+    # activation rule (1e-4 amax floor), matching _host_mxfp8_row_gather_kernel
+    # bit for bit so canonical_mxfp8_row_gather needs no runtime requantization.
+    row = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS) + start_row
+    live = row < end_row
+    host_rows = tl.cast(
+        table_ptr + tl.where(live, row, 0) * table_stride, tl.pointer_type(tl.uint8)
+    )
+    cols = tl.arange(0, DIM)
+    groups = tl.arange(0, DIM // 32)
+    codes = tl.load(host_rows[:, None] + cols[None, :], mask=live[:, None], other=0)
     exponents = tl.load(
-        host_rows[:, None] + DIM + groups[None, :], mask=valid[:, None], other=0
+        host_rows[:, None] + DIM + groups[None, :], mask=live[:, None], other=0
     )
     scale = (exponents.to(tl.int32) << 23).to(tl.float32, bitcast=True)
     values = tl.reshape(
@@ -128,12 +201,12 @@ def _host_mxfp8_row_gather_kernel(
     inverse_scale = 1.0 / (exponent << 23).to(tl.float32, bitcast=True)
     quantized = (values * tl.expand_dims(inverse_scale, 2)).to(tl.float8e4nv)
     tl.store(
-        codes_ptr + dst[:, None] * DIM + cols[None, :],
+        host_rows[:, None] + cols[None, :],
         tl.reshape(quantized.to(tl.uint8, bitcast=True), (ROWS, DIM)),
         mask=live[:, None],
     )
     tl.store(
-        scales_ptr + dst[:, None] * (DIM // 32) + groups[None, :],
+        host_rows[:, None] + DIM + groups[None, :],
         exponent.to(tl.uint8),
         mask=live[:, None],
     )
@@ -176,20 +249,13 @@ def _copy_duplicate_rows_kernel(
     )
 
 
-@register_kernel(
-    "embedding",
-    "host_mxfp8_row_gather",
-    name="triton_host_mxfp8_row_gather",
-    solution="triton",
-    capability=_CAPABILITY,
-    signatures=_SIGNATURES,
-    priority=Priority.PORTABLE,
-)
-def triton_host_mxfp8_row_gather(
+def _launch_mxfp8_row_gather(
     table: torch.Tensor,
     indices: torch.Tensor,
     codes: torch.Tensor,
     scales: torch.Tensor,
+    *,
+    canonical: bool,
 ) -> None:
     dim = table.shape[1] // 33 * 32
     entries = indices.shape[0] * indices.shape[1]
@@ -214,6 +280,8 @@ def triton_host_mxfp8_row_gather(
             DIM=dim,
             ROWS=1,
             SORTED=False,
+            CANONICAL=canonical,
+            FLOOR_EXPONENT=_FLOOR_EXPONENT,
         )
         return
     # Everything below stays on the device: no host sync on the number of
@@ -240,6 +308,8 @@ def triton_host_mxfp8_row_gather(
         DIM=dim,
         ROWS=_ROWS_PER_PROGRAM,
         SORTED=True,
+        CANONICAL=canonical,
+        FLOOR_EXPONENT=_FLOOR_EXPONENT,
     )
     _copy_duplicate_rows_kernel[grid](
         dst,
@@ -250,6 +320,76 @@ def triton_host_mxfp8_row_gather(
         DIM=dim,
         ROWS=_ROWS_PER_PROGRAM,
     )
+
+
+@register_kernel(
+    "embedding",
+    "host_mxfp8_row_gather",
+    name="triton_host_mxfp8_row_gather",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=_SIGNATURES,
+    priority=Priority.PORTABLE,
+)
+def triton_host_mxfp8_row_gather(
+    table: torch.Tensor,
+    indices: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+) -> None:
+    _launch_mxfp8_row_gather(table, indices, codes, scales, canonical=False)
+
+
+@register_kernel(
+    "embedding",
+    "host_canonical_mxfp8_row_gather",
+    name="triton_host_canonical_mxfp8_row_gather",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=_SIGNATURES,
+    priority=Priority.PORTABLE,
+)
+def triton_host_canonical_mxfp8_row_gather(
+    table: torch.Tensor,
+    indices: torch.Tensor,
+    codes: torch.Tensor,
+    scales: torch.Tensor,
+) -> None:
+    _launch_mxfp8_row_gather(table, indices, codes, scales, canonical=True)
+
+
+@register_kernel(
+    "embedding",
+    "host_canonicalize_mxfp8_table",
+    name="triton_host_canonicalize_mxfp8_table",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=_SIGNATURES,
+    priority=Priority.PORTABLE,
+)
+def triton_host_canonicalize_mxfp8_table(
+    table: torch.Tensor,
+    start_row: int,
+    end_row: int,
+    device: torch.device,
+) -> None:
+    dim = table.shape[1] // 33 * 32
+    if start_row >= end_row:
+        return
+    table_ptr = current_platform().device_visible_data_ptr(table)
+    table_stride = table.stride(0)
+    with torch.cuda.device(device):
+        for chunk_start in range(start_row, end_row, _CANONICALIZE_CHUNK_ROWS):
+            chunk_end = min(chunk_start + _CANONICALIZE_CHUNK_ROWS, end_row)
+            grid = (triton.cdiv(chunk_end - chunk_start, _ROWS_PER_PROGRAM),)
+            _canonicalize_mxfp8_table_kernel[grid](
+                table_ptr=table_ptr,
+                start_row=chunk_start,
+                end_row=chunk_end,
+                table_stride=table_stride,
+                DIM=dim,
+                ROWS=_ROWS_PER_PROGRAM,
+            )
 
 
 def _next_power_of_2(n: int) -> int:

@@ -68,6 +68,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import weakref
 from dataclasses import dataclass
 
@@ -730,6 +731,7 @@ class RowShardedEngramEmbedding(nn.Module):
         self.layer_id = layer_id
         self._mmap_keep: list[object] = []
         self._host_gpu_registered = False
+        self._mxfp8_canonical = False
         # A host table holding every row its rank looks up (one shared copy, or
         # a single attention-TP rank) needs no reduction, so its rows can feed
         # wkv as MXFP8 directly.
@@ -897,6 +899,7 @@ class RowShardedEngramEmbedding(nn.Module):
             rows = rows.view(torch.uint8)
         elif rows.dtype != torch.float8_e4m3fn:
             raise TypeError("Engram table weights must stay FP8 E4M3")
+        self._mxfp8_canonical = False
         param.data[local_start : local_start + rows.shape[0]].copy_(rows)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -937,6 +940,9 @@ class RowShardedEngramEmbedding(nn.Module):
         """
         if parameter_name not in ("weight", "scale") or chunk_rows < 1:
             raise ValueError("Expected weight/scale and a positive row chunk size")
+        # Clear on every rank, including followers that skip the host copy, so
+        # a later prepare_mxfp8_rows() enters any shared barrier in lockstep.
+        self._mxfp8_canonical = False
         if self.host_table and not self._shared_writer:
             return
         param = getattr(self, parameter_name)
@@ -949,6 +955,69 @@ class RowShardedEngramEmbedding(nn.Module):
                 raise ValueError("Open Engram safetensors on CPU before slicing")
             self._copy_rows(param, rows, start - self.row_start)
 
+    def prepare_mxfp8_rows(self, *, device: torch.device, sync: bool) -> bool:
+        """Canonicalize packed host rows in place once after loading.
+
+        Rewrites ``self.packed`` in place to the group-32 UE8M0 activation
+        contract (1e-4 amax floor) with zero extra persistent host memory, so
+        :meth:`mxfp8_rows` can copy bytes directly on every forward instead of
+        dequantizing and re-quantizing every looked-up row.
+
+        Args:
+            device: Explicit execution device (``cuda`` for GPU-UVA in-place
+                canonicalization; ``cpu`` only for explicit CPU callers/tests).
+            sync: When True and ``host_layout == "shared"`` in a multi-rank
+                process group, runs a distributed barrier after the writer
+                completes. Callers preparing multiple layers should pass
+                ``sync=False`` and synchronize once after all layers so
+                layouts with different per-rank Engram sets cannot deadlock.
+
+        Returns:
+            True if canonicalization ran on this call, False if skipped.
+        """
+        if (
+            not self.serves_mxfp8_rows
+            or self._mxfp8_canonical
+            or self.packed is None
+            or self.packed.device.type == "meta"
+        ):
+            return False
+        exec_device = torch.device(device)
+        if exec_device.type == "cuda" and not self._host_gpu_registered:
+            raise RuntimeError(
+                f"Engram layer {self.layer_id}: host table is not GPU-registered "
+                "for CUDA UVA canonicalization"
+            )
+        local_rows = self.row_end - self.row_start
+        if self._shared_writer and local_rows > 0:
+            t0 = time.perf_counter()
+            host_gather.canonicalize_mxfp8_table(
+                self.packed,
+                start_row=0,
+                end_row=local_rows,
+                device=exec_device,
+            )
+            if exec_device.type == "cuda":
+                # Flush UVA stores to host memory before peers or CPU read them.
+                torch.cuda.synchronize(exec_device)
+            elapsed = time.perf_counter() - t0
+            nbytes = local_rows * self.packed.shape[1]
+            bw_gbs = (2.0 * nbytes / elapsed / 1e9) if elapsed > 0 else 0.0
+            logger.info(
+                f"Engram layer {self.layer_id}: canonicalized "
+                f"{nbytes / 2**30:.2f} GiB host table in place on "
+                f"{exec_device} in {elapsed:.2f}s ({bw_gbs:.1f} GB/s R+W)"
+            )
+        if (
+            sync
+            and self.host_layout == "shared"
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            torch.distributed.barrier()
+        self._mxfp8_canonical = True
+        return True
+
     def mxfp8_rows(self, indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Gather CUDA [T, hash columns] IDs as the MXFP8 input of wkv.
 
@@ -959,6 +1028,10 @@ class RowShardedEngramEmbedding(nn.Module):
         """
         if not self.serves_mxfp8_rows:
             raise RuntimeError("This Engram table needs its rows reduced across TP")
+        if self._mxfp8_canonical:
+            return host_gather.canonical_mxfp8_row_gather(
+                self.packed, indices, None, None
+            )
         return host_gather.mxfp8_row_gather(self.packed, indices, None, None)
 
     def forward(
@@ -972,6 +1045,13 @@ class RowShardedEngramEmbedding(nn.Module):
         and host-sharded tables expand only local rows and reduce.
         Dequantization uses the same FP8/E8M0 torch casts in both paths.
         """
+        if self._mxfp8_canonical:
+            raise RuntimeError(
+                f"Engram layer {self.layer_id}: host table was canonicalized "
+                "in place for MXFP8 gathers (1e-4 amax floor) and cannot serve "
+                "the BF16 dequantization path; call mxfp8_rows() with 2D CUDA "
+                "indices instead"
+            )
         sharded = query_shard is not None and query_shard.size > 1
         if sharded:
             if indices.ndim != 2 or indices.shape[0] != query_shard.local_rows:
@@ -1144,6 +1224,25 @@ class DeepseekV41Engram(nn.Module):
                     f"{prefix!s}: one-shot all-reduce lane of width {width:d} not "
                     "armed; the Engram embedding reduce falls back to NCCL"
                 )
+
+    def prepare_mxfp8_rows(self, *, sync: bool) -> bool:
+        """Canonicalize a GPU-registered host table in place for MXFP8 gathers.
+
+        Skips canonicalization when CUDA is unavailable rather than falling
+        back to a slow host-CPU pass over full Engram tables (only the 2D CUDA
+        ``mxfp8_rows`` path consumes the canonicalized representation).
+        """
+        if (
+            self.embed.serves_mxfp8_rows
+            and isinstance(self.wkv.quant_method, Fp8LinearMethod)
+            and torch.cuda.is_available()
+            and self.embed._host_gpu_registered
+        ):
+            return self.embed.prepare_mxfp8_rows(
+                device=torch.device("cuda", torch.cuda.current_device()),
+                sync=sync,
+            )
+        return False
 
     def checkpoint_weight_aliases(self) -> dict[str, str]:
         """Return raw layers.<id>.engram checkpoint names to runtime param paths.

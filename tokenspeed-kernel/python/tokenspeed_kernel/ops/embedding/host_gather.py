@@ -33,7 +33,14 @@ import torch
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["mxfp8_row_gather", "uint8_row_gather"]
+__all__ = [
+    "canonical_mxfp8_row_gather",
+    "canonicalize_mxfp8_table",
+    "mxfp8_row_gather",
+    "uint8_row_gather",
+]
+
+_CPU_CANONICALIZE_CHUNK_ROWS = 65536
 
 
 def uint8_row_gather(
@@ -87,6 +94,116 @@ def uint8_row_gather(
     return kernel(table, indices, out)
 
 
+def _validate_mxfp8_table(table: torch.Tensor) -> int:
+    if table.dtype != torch.uint8 or table.ndim != 2 or table.stride(1) != 1:
+        raise TypeError("MXFP8 row gather requires a 2D uint8 table with unit stride")
+    if table.shape[1] == 0 or table.shape[1] % 33:
+        raise ValueError("MXFP8 table rows must be D codes and D/32 scales")
+    return table.shape[1] // 33 * 32
+
+
+def _prepare_mxfp8_row_gather(
+    table: torch.Tensor,
+    indices: torch.Tensor,
+    codes: torch.Tensor | None,
+    scales: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dim = _validate_mxfp8_table(table)
+    if indices.ndim != 2 or indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError("MXFP8 row gather takes int32/int64 [tokens, columns] ids")
+    if not indices.is_cuda:
+        raise ValueError("MXFP8 row gather runs on CUDA ids")
+    tokens, columns = indices.shape
+    if (codes is None) != (scales is None):
+        raise ValueError("Pass both MXFP8 row gather outputs or neither")
+    if codes is None:
+        codes = torch.empty(
+            tokens, columns * dim, dtype=torch.float8_e4m3fn, device=indices.device
+        )
+        scales = torch.empty(
+            tokens, columns * dim // 32, dtype=torch.uint8, device=indices.device
+        )
+    elif (
+        codes.shape != (tokens, columns * dim)
+        or codes.dtype != torch.float8_e4m3fn
+        or not codes.is_contiguous()
+        or scales.shape != (tokens, columns * dim // 32)
+        or scales.dtype != torch.uint8
+        or not scales.is_contiguous()
+    ):
+        raise ValueError("MXFP8 row gather outputs have the wrong shape or dtype")
+    return codes, scales
+
+
+def canonicalize_mxfp8_table(
+    table: torch.Tensor,
+    *,
+    device: torch.device | str,
+    start_row: int = 0,
+    end_row: int | None = None,
+) -> torch.Tensor:
+    """Canonicalize packed ``[D E4M3 codes | D/32 UE8M0 scales]`` rows in place.
+
+    Rewrites rows ``[start_row, end_row)`` in place to the group-32 UE8M0
+    activation rule (1e-4 amax floor) without allocating a second table copy.
+    Rows canonicalized here can be gathered with
+    :func:`canonical_mxfp8_row_gather` bit-for-bit identically to
+    :func:`mxfp8_row_gather`.
+
+    Args:
+        table: Host (GPU-visible when ``device`` is CUDA) or device uint8
+            ``[rows, D + D / 32]`` with unit inner stride; D divisible by 32.
+        device: Execution device (``"cpu"`` or a CUDA device); no default.
+        start_row: Optional inclusive first row to canonicalize (default 0).
+        end_row: Optional exclusive last row (default ``table.shape[0]``).
+
+    Returns:
+        ``table``, updated in place.
+    """
+    dim = _validate_mxfp8_table(table)
+    rows = table.shape[0]
+    stop = rows if end_row is None else end_row
+    if not 0 <= start_row <= stop <= rows:
+        raise ValueError(
+            f"canonicalize row slice [{start_row}, {stop}) is outside [0, {rows})"
+        )
+    exec_device = torch.device(device)
+    if table.is_cuda and exec_device.type == "cpu":
+        raise ValueError("Cannot canonicalize a CUDA table on CPU")
+    if start_row == stop:
+        return table
+    if exec_device.type == "cpu":
+        for chunk_start in range(start_row, stop, _CPU_CANONICALIZE_CHUNK_ROWS):
+            chunk_end = min(chunk_start + _CPU_CANONICALIZE_CHUNK_ROWS, stop)
+            chunk = table[chunk_start:chunk_end]
+            codes = chunk[:, :dim].contiguous().view(torch.float8_e4m3fn).float()
+            exponents = chunk[:, dim:].to(torch.int32)
+            # Match Triton's bitcast: exponent byte 0 gives +0.0 (preserving
+            # sign bits on underflow to +-0 under the 1e-4 amax floor).
+            scale = (exponents << 23).view(torch.float32)
+            values = codes.unflatten(-1, (-1, 32)) * scale.unsqueeze(-1)
+            amax = values.abs().amax(-1).clamp_min(1.0e-4)
+            bits = (amax * (1.0 / 448.0)).view(torch.int32)
+            exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+            inverse_scale = 1.0 / (exponent << 23).view(torch.float32)
+            quantized = (values * inverse_scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
+            chunk[:, :dim].copy_(quantized.view(torch.uint8).flatten(-2))
+            chunk[:, dim:].copy_(exponent.to(torch.uint8))
+        return table
+    kernel = select_kernel(
+        "embedding",
+        "host_canonicalize_mxfp8_table",
+        format_signature(x=dense_tensor_format(torch.uint8)),
+        features=None,
+        platform=None,
+        traits=None,
+        solution=None,
+        override=None,
+    )
+    kernel(table, start_row, stop, exec_device)
+    return table
+
+
 def mxfp8_row_gather(
     table: torch.Tensor,
     indices: torch.Tensor,
@@ -113,37 +230,51 @@ def mxfp8_row_gather(
     Returns:
         ``(codes, scales)``, allocated on ``indices.device`` when omitted.
     """
-    if table.dtype != torch.uint8 or table.ndim != 2 or table.stride(1) != 1:
-        raise TypeError("MXFP8 row gather requires a 2D uint8 table with unit stride")
-    if table.shape[1] % 33:
-        raise ValueError("MXFP8 table rows must be D codes and D/32 scales")
-    if indices.ndim != 2 or indices.dtype not in (torch.int32, torch.int64):
-        raise TypeError("MXFP8 row gather takes int32/int64 [tokens, columns] ids")
-    if not indices.is_cuda:
-        raise ValueError("MXFP8 row gather runs on CUDA ids")
-    dim = table.shape[1] // 33 * 32
-    tokens, columns = indices.shape
-    if (codes is None) != (scales is None):
-        raise ValueError("Pass both MXFP8 row gather outputs or neither")
-    if codes is None:
-        codes = torch.empty(
-            tokens, columns * dim, dtype=torch.float8_e4m3fn, device=indices.device
-        )
-        scales = torch.empty(
-            tokens, columns * dim // 32, dtype=torch.uint8, device=indices.device
-        )
-    elif (
-        codes.shape != (tokens, columns * dim)
-        or codes.dtype != torch.float8_e4m3fn
-        or not codes.is_contiguous()
-        or scales.shape != (tokens, columns * dim // 32)
-        or scales.dtype != torch.uint8
-        or not scales.is_contiguous()
-    ):
-        raise ValueError("MXFP8 row gather outputs have the wrong shape or dtype")
+    codes, scales = _prepare_mxfp8_row_gather(table, indices, codes, scales)
     kernel = select_kernel(
         "embedding",
         "host_mxfp8_row_gather",
+        format_signature(x=dense_tensor_format(torch.uint8)),
+        features=None,
+        platform=None,
+        traits=None,
+        solution=None,
+        override=None,
+    )
+    kernel(table, indices, codes, scales)
+    return codes, scales
+
+
+def canonical_mxfp8_row_gather(
+    table: torch.Tensor,
+    indices: torch.Tensor,
+    codes: torch.Tensor | None,
+    scales: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather pre-canonicalized packed MXFP8 rows without runtime requantization.
+
+    Requires ``table`` rows to have been canonicalized with
+    :func:`canonicalize_mxfp8_table`. Valid rows copy their packed E4M3 codes
+    and UE8M0 scales directly; negative or out-of-range ids emit zero codes and
+    the canonical 1e-4 amax-floor exponent, matching :func:`mxfp8_row_gather`
+    bit for bit.
+
+    Args:
+        table: Host (GPU-visible, see ``uint8_row_gather``) or device uint8
+            ``[rows, D + D / 32]`` canonicalized by
+            :func:`canonicalize_mxfp8_table`.
+        indices: CUDA int32/int64 ``[tokens, columns]`` row ids, any strides.
+        codes: Optional contiguous E4M3 ``[tokens, columns * D]`` output.
+        scales: Optional contiguous uint8 ``[tokens, columns * D / 32]`` output.
+            Pass both outputs or neither.
+
+    Returns:
+        ``(codes, scales)``, allocated on ``indices.device`` when omitted.
+    """
+    codes, scales = _prepare_mxfp8_row_gather(table, indices, codes, scales)
+    kernel = select_kernel(
+        "embedding",
+        "host_canonical_mxfp8_row_gather",
         format_signature(x=dense_tensor_format(torch.uint8)),
         features=None,
         platform=None,
