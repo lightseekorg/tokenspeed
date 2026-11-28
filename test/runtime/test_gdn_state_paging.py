@@ -34,8 +34,19 @@ def test_state_helpers_use_shared_implementations():
 
 
 class _ContractPool:
-    def __init__(self, components):
+    def __init__(self, components, *, virtual_block_counts=None):
         # The arena publishes the contract; a view only names its arena.
+        if virtual_block_counts is None:
+            counts: dict[str, int] = {}
+            for group_id, conv_state, recurrent_state in components.values():
+                layer_blocks = min(
+                    int(conv_state.shape[0]), int(recurrent_state.shape[0])
+                )
+                prev = counts.get(group_id)
+                counts[group_id] = (
+                    layer_blocks if prev is None else min(prev, layer_blocks)
+                )
+            virtual_block_counts = counts
         contract = SimpleNamespace(
             prefix_granularity=64,
             group_specs=tuple(
@@ -44,6 +55,7 @@ class _ContractPool:
                     group_id for group_id, _, _ in components.values()
                 )
             ),
+            virtual_block_counts=dict(virtual_block_counts),
         )
         self.arena = SimpleNamespace(runtime_contract=contract)
         self._components = components
@@ -361,6 +373,24 @@ class TestCacheContractMetadataTest:
         assert (md.query_start_loc_int64.tolist()) == ([0, 8])
         assert (md.conv_prefill_metadata.batch_indices.tolist()) == ([0])
         assert (md.conv_prefill_metadata.chunk_offsets.tolist()) == ([0])
+
+    def test_validate_cache_pool_rejects_pool_smaller_than_contract(self):
+        torch = self.torch
+        original_pool = self.backend.kv_pool
+        for conv_blocks, ssm_blocks, contract_blocks in ((12, 10, 11), (9, 12, 10)):
+            undersized = _ContractPool(
+                {
+                    0: (
+                        "linear_attention",
+                        torch.zeros(conv_blocks, 3),
+                        torch.zeros(ssm_blocks, 5),
+                    )
+                },
+                virtual_block_counts={"linear_attention": contract_blocks},
+            )
+            with pytest.raises(ValueError, match="smaller than runtime contract"):
+                self.backend.set_kv_pool(undersized)
+            assert self.backend.kv_pool is original_pool
 
     def test_mixed_metadata_pads_decode_rows(self):
         torch = self.torch

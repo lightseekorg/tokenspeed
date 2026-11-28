@@ -96,13 +96,15 @@ class CacheBatchMetadata:
         """Check the tables against the contract, pack once, and retain
         operation provenance.
 
-        The group set, dtype, shape and row count are always checked. With
-        ``validate_page_ids`` every page ID is also scanned against its
-        group's virtual block count: tables built outside the scheduler
-        (prefill-graph capture) always ask for it, scheduler-built ones under
-        ``TOKENSPEED_VALIDATE_PAGE_IDS``. ``host_tables`` also keeps a host
-        copy for ``tables_cpu``: a forward with extends plans from it, a pure
-        decode never reads it.
+        The group set, dtype, shape and row count are always checked. State
+        groups (``spec.attn_kind == "state"``, fixed 2-3 columns per request)
+        are always scanned on the CPU against their group's virtual block count
+        before upload (zero GPU sync). With ``validate_page_ids`` every other
+        group's page IDs are scanned as well: tables built outside the
+        scheduler (prefill-graph capture) always ask for it, scheduler-built
+        ones under ``TOKENSPEED_VALIDATE_PAGE_IDS``. ``host_tables`` also keeps
+        a host copy for ``tables_cpu``: a forward with extends plans from it, a
+        pure decode never reads it.
         """
         if forward_op is None:
             raise ValueError("forward_op must not be None")
@@ -115,6 +117,11 @@ class CacheBatchMetadata:
                 counts[group_id] - 1,
             )
             for group_id in group_ids
+        }
+        state_max_page_ids = {
+            spec.group_id: max_page_ids[spec.group_id]
+            for spec in contract.group_specs
+            if spec.attn_kind == "state"
         }
         if (
             not group_ids
@@ -138,8 +145,12 @@ class CacheBatchMetadata:
                     contract.group_specs, key=lambda spec: spec.attn_kind == "state"
                 )
             ),
-            # The packer scans every page ID against bounds it is given.
+            # Full validation scans every group; otherwise state groups still
+            # scan unconditionally on CPU before upload.
             max_page_ids=max_page_ids if validate_page_ids else None,
+            required_max_page_ids=(
+                None if validate_page_ids else (state_max_page_ids or None)
+            ),
         )
         return cls._from_validated_tables(
             group_ids=group_ids,

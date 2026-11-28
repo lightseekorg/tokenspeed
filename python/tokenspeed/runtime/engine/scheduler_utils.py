@@ -846,6 +846,7 @@ def block_tables_from_forward_op(
     expected_group_ids: tuple[str, ...] | None = None,
     max_page_id: int | None = None,
     max_page_ids: Mapping[str, int] | None = None,
+    required_max_page_ids: Mapping[str, int] | None = None,
 ) -> dict[str, torch.Tensor]:
     """The device tables of :func:`packed_block_tables_from_forward_op`."""
     return packed_block_tables_from_forward_op(
@@ -856,6 +857,7 @@ def block_tables_from_forward_op(
         expected_group_ids=expected_group_ids,
         max_page_id=max_page_id,
         max_page_ids=max_page_ids,
+        required_max_page_ids=required_max_page_ids,
     ).tables
 
 
@@ -868,6 +870,7 @@ def packed_block_tables_from_forward_op(
     expected_group_ids: tuple[str, ...] | None = None,
     max_page_id: int | None = None,
     max_page_ids: Mapping[str, int] | None = None,
+    required_max_page_ids: Mapping[str, int] | None = None,
 ) -> PackedBlockTables:
     """Bridge the per-group block tables to GPU int32 tensors: absolute
     page indices, null hole = 0 preserved, ragged-row padding -1. No
@@ -899,7 +902,11 @@ def packed_block_tables_from_forward_op(
         expected_group_ids: Optional pack order and exact key set; the
             packed buffer and the returned views follow it.
         max_page_id: Optional common inclusive upper bound for page IDs.
-        max_page_ids: Optional per-group inclusive upper bounds.
+        max_page_ids: Optional per-group inclusive upper bounds covering every
+            cache group.
+        required_max_page_ids: Optional per-group inclusive upper bounds for a
+            subset of cache groups that must always be scanned (e.g., fixed-width
+            state groups) without scanning unlisted groups.
 
     Returns:
         Device and (with ``host_tables``) host per-group tensor views in
@@ -910,12 +917,21 @@ def packed_block_tables_from_forward_op(
         ValueError: If strict contract validation or a row span fails before
             device transfer.
     """
-    if max_page_id is not None and max_page_ids is not None:
-        raise ValueError("pass max_page_id or max_page_ids, not both")
+    if (
+        sum(
+            arg is not None
+            for arg in (max_page_id, max_page_ids, required_max_page_ids)
+        )
+        > 1
+    ):
+        raise ValueError(
+            "pass at most one of max_page_id, max_page_ids, or required_max_page_ids"
+        )
     strict_validation = (
         expected_group_ids is not None
         or max_page_id is not None
         or max_page_ids is not None
+        or required_max_page_ids is not None
     )
     if strict_validation and num_reqs is not None:
         require_positive_int("num_reqs", num_reqs)
@@ -961,6 +977,13 @@ def packed_block_tables_from_forward_op(
         ordered_items = [windows_by_id[group_id] for group_id in expected_group_ids]
     else:
         ordered_items = window_items
+    if required_max_page_ids is not None:
+        actual_group_ids = {group_id for group_id, _, _ in ordered_items}
+        unknown_groups = sorted(set(required_max_page_ids) - actual_group_ids)
+        if unknown_groups:
+            raise ValueError(
+                f"required_max_page_ids contains unknown cache groups: {unknown_groups}"
+            )
     if strict_validation:
         for group_id, arr, _ in ordered_items:
             if not isinstance(arr, np.ndarray):
@@ -972,11 +995,16 @@ def packed_block_tables_from_forward_op(
             if arr.shape[0] == 0:
                 raise ValueError(f"cache group {group_id!r} has zero rows")
             # rows-vs-num_reqs is checked once in the packing loop below.
-            group_max_page_id = (
-                max_page_ids.get(group_id) if max_page_ids is not None else max_page_id
-            )
-            if max_page_ids is not None and group_max_page_id is None:
-                raise ValueError(f"max_page_ids is missing cache group {group_id!r}")
+            if max_page_ids is not None:
+                group_max_page_id = max_page_ids.get(group_id)
+                if group_max_page_id is None:
+                    raise ValueError(
+                        f"max_page_ids is missing cache group {group_id!r}"
+                    )
+            elif required_max_page_ids is not None:
+                group_max_page_id = required_max_page_ids.get(group_id)
+            else:
+                group_max_page_id = max_page_id
             if group_max_page_id is not None:
                 if group_max_page_id < -1:
                     raise ValueError(
@@ -984,9 +1012,12 @@ def packed_block_tables_from_forward_op(
                     )
                 invalid = (arr < -1) | (arr > group_max_page_id)
                 if bool(invalid.any()):
+                    bad_row, bad_col = np.argwhere(invalid)[0]
+                    bad_id = int(arr[bad_row, bad_col])
                     raise ValueError(
                         f"cache group {group_id!r} contains a page ID outside "
-                        f"-1..{group_max_page_id}"
+                        f"-1..{group_max_page_id} "
+                        f"(row {int(bad_row)}, col {int(bad_col)}: {bad_id})"
                     )
     device = torch.device(device) if isinstance(device, str) else device
     out: dict[str, torch.Tensor] = {}
@@ -1023,8 +1054,13 @@ def packed_block_tables_from_forward_op(
         if bool(((pages - released) > width).any()):
             raise ValueError(f"block_table_windows[{key}] omits live entries")
         first = np.maximum(pages.astype(np.int64) - width, 0)
-        if max_page_id is not None or max_page_ids is not None:
-            maximum = max_page_ids[key] if max_page_ids is not None else max_page_id
+        if max_page_ids is not None:
+            maximum = max_page_ids[key]
+        elif required_max_page_ids is not None:
+            maximum = required_max_page_ids.get(key)
+        else:
+            maximum = max_page_id
+        if maximum is not None:
             if maximum < 0 and bool((released > 0).any()):
                 raise ValueError(
                     f"cache group {key!r} contains a page ID outside -1..{maximum}"

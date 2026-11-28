@@ -261,7 +261,10 @@ class TestBlockTablesBridgeTest:
                 num_reqs=1,
                 max_page_ids={"full": 31},
             )
-        with pytest.raises(ValueError, match="not both"):
+        with pytest.raises(
+            ValueError,
+            match="at most one of max_page_id, max_page_ids, or required_max_page_ids",
+        ):
             self.bridge(
                 scheduler_forward_op,
                 "cpu",
@@ -924,3 +927,88 @@ def test_forward_tables_match_through_retraction():
         "assertions above still ran on every forward op, but the retraction "
         "+ restore path specifically is uncovered by this test"
     )
+
+
+def test_required_max_page_ids_scans_only_named_groups():
+    """``required_max_page_ids`` validates the named subset on CPU while
+    leaving unlisted groups unscanned."""
+    import numpy as np
+
+    from tokenspeed.runtime.engine.scheduler_utils import (
+        block_tables_from_forward_op,
+        packed_block_tables_from_forward_op,
+    )
+
+    def _op(arrays, spans=None):
+        s = whole_row_spans(arrays) if spans is None else spans
+        return SimpleNamespace(
+            block_table_windows=lambda: whole_row_windows(arrays),
+            block_table_spans=lambda: s,
+        )
+
+    kv = np.array([[99, 100], [50, 60]], dtype=np.int32)
+    valid = _op({"full": kv, "state": np.array([[-1, -1], [0, 4]], dtype=np.int32)})
+    packed = packed_block_tables_from_forward_op(
+        valid,
+        "cpu",
+        host_tables=False,
+        num_reqs=2,
+        expected_group_ids=("full", "state"),
+        required_max_page_ids={"state": 4},
+    )
+    assert packed.tables["full"].tolist() == [[99, 100], [50, 60]]
+    assert packed.tables["state"].tolist() == [[-1, -1], [0, 4]]
+    assert block_tables_from_forward_op(
+        valid, "cpu", num_reqs=2, required_max_page_ids={"state": 4}
+    )["state"].tolist() == [[-1, -1], [0, 4]]
+
+    for bad_rows, match in (
+        ([[0, 5], [1, 2]], r"outside -1\.\.4.*row 0, col 1: 5"),
+        ([[-2, 4], [1, 2]], r"outside -1\.\.4.*row 0, col 0: -2"),
+    ):
+        oob = _op({"full": kv, "state": np.array(bad_rows, dtype=np.int32)})
+        with pytest.raises(ValueError, match=match):
+            packed_block_tables_from_forward_op(
+                oob,
+                "cpu",
+                host_tables=False,
+                num_reqs=2,
+                required_max_page_ids={"state": 4},
+            )
+
+    bad_span = _op(
+        {"full": kv[:1], "state": np.array([[1, 2]], dtype=np.int32)},
+        spans={
+            "full": np.array([[0, 2]], dtype=np.int32),
+            "state": np.array([[0, 1]], dtype=np.int32),
+        },
+    )
+    with pytest.raises(ValueError, match="outside its row spans"):
+        packed_block_tables_from_forward_op(
+            bad_span,
+            "cpu",
+            host_tables=False,
+            num_reqs=1,
+            required_max_page_ids={"state": 4},
+        )
+    with pytest.raises(ValueError, match="unknown cache groups"):
+        packed_block_tables_from_forward_op(
+            valid,
+            "cpu",
+            host_tables=False,
+            num_reqs=2,
+            required_max_page_ids={"missing": 4},
+        )
+    for extra in ({"max_page_id": 4}, {"max_page_ids": {"full": 100, "state": 4}}):
+        with pytest.raises(
+            ValueError,
+            match="at most one of max_page_id, max_page_ids, or required_max_page_ids",
+        ):
+            packed_block_tables_from_forward_op(
+                valid,
+                "cpu",
+                host_tables=False,
+                num_reqs=2,
+                required_max_page_ids={"state": 4},
+                **extra,
+            )

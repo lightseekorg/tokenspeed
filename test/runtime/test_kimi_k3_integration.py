@@ -67,37 +67,65 @@ class _ForwardTables:
         return whole_row_spans(self.arrays)
 
 
-def test_metadata_scans_page_ids_only_when_asked() -> None:
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_metadata_scans_kv_only_when_asked_but_always_bounds_state_groups(
+    device: str,
+) -> None:
+    import torch
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("cuda device unavailable")
+
     contract = make_kimi_pool("cpu", usable_pages=2).arena.runtime_contract
-    arrays = {group_id: np.array([[1]], dtype=np.int32) for group_id in KIMI_GROUP_IDS}
-    arrays["linear_attention_0"] = np.array([[3]], dtype=np.int32)
-    forward_op = _ForwardTables(arrays)
+    # KV groups (full_attention, 0..24) stay opt-in under validate_page_ids.
+    kv_oob = {group_id: np.array([[1]], dtype=np.int32) for group_id in KIMI_GROUP_IDS}
+    kv_oob["full_attention"] = np.array([[25]], dtype=np.int32)
+    kv_oob_op = _ForwardTables(kv_oob)
+    kw = dict(device=device, contract=contract, num_requests=1, host_tables=False)
 
-    metadata = CacheBatchMetadata.from_forward_op(
-        forward_op,
-        device="cpu",
-        contract=contract,
-        num_requests=1,
-        validate_page_ids=False,
-        host_tables=False,
-    )
-    tables = metadata.tables(active_forward_op=forward_op)
-    assert tables["linear_attention_0"].item() == 3
+    if device == "cuda":
+        # Warm up packing kernel before enabling strict sync checks.
+        CacheBatchMetadata.from_forward_op(kv_oob_op, validate_page_ids=False, **kw)
 
-    with pytest.raises(ValueError, match="outside -1..2"):
-        CacheBatchMetadata.from_forward_op(
-            forward_op,
-            device="cpu",
-            contract=contract,
-            num_requests=1,
-            validate_page_ids=True,
-            host_tables=False,
+    previous = torch.cuda.get_sync_debug_mode() if device == "cuda" else None
+    try:
+        if device == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+        metadata = CacheBatchMetadata.from_forward_op(
+            kv_oob_op, validate_page_ids=False, **kw
         )
+        # State groups (linear_attention_0/1/2, 0..2) are always bounded on CPU
+        # with zero GPU sync even when validate_page_ids=False.
+        for state_group in (
+            "linear_attention_0",
+            "linear_attention_1",
+            "linear_attention_2",
+        ):
+            for bad_id in (-2, 3):
+                state_oob = {
+                    group_id: np.array([[1]], dtype=np.int32)
+                    for group_id in KIMI_GROUP_IDS
+                }
+                state_oob[state_group] = np.array([[bad_id]], dtype=np.int32)
+                with pytest.raises(ValueError, match="outside -1..2"):
+                    CacheBatchMetadata.from_forward_op(
+                        _ForwardTables(state_oob), validate_page_ids=False, **kw
+                    )
+    finally:
+        if device == "cuda":
+            torch.cuda.set_sync_debug_mode(previous)
+
+    assert metadata.tables(active_forward_op=kv_oob_op)["full_attention"].item() == 25
+
+    with pytest.raises(ValueError, match="outside -1..24"):
+        CacheBatchMetadata.from_forward_op(kv_oob_op, validate_page_ids=True, **kw)
+
     # The structural checks run either way.
     with pytest.raises(ValueError, match="rows"):
         CacheBatchMetadata.from_forward_op(
-            forward_op,
-            device="cpu",
+            kv_oob_op,
+            device=device,
             contract=contract,
             num_requests=2,
             validate_page_ids=False,
