@@ -326,7 +326,9 @@ def _ld_acquire_i32(ptr):
     )
 
 
-@triton.jit
+# Layer index changes across every consumer layer; specializing on it
+# compiles one spin kernel per layer during serving.
+@triton.jit(do_not_specialize=["layer_index"])
 def _wait_layer_ready_kernel(flag_ptr, layer_index):
     pending = _ld_acquire_i32(flag_ptr + layer_index)
     while pending == 0:

@@ -688,17 +688,21 @@ class HostCacheExecutor:
             self._write_staging.acquire(min_staging_bytes, device)
             self._load_staging.acquire(min_staging_bytes, device)
 
-        if (snapshot_lcm_blocks or device.type == "npu") and io_backend == "kernel":
+        if (
+            l2_tier or snapshot_lcm_blocks or device.type == "npu"
+        ) and io_backend == "kernel":
             self._warmup_restore_transfers()
 
     def _warmup_restore_transfers(self) -> None:
-        """Warm each Host tier's unflagged H2D restore, preserving Device bytes."""
+        """Warm each Host tier's unflagged and layer-ready transfers cleanly."""
         # Host blocks must still be unassigned for this scratch round trip.
         # Warm one field-bearing group at a time so compact Host-parent writes
         # never overlap while every group's alignment variant compiles at init.
         group_indices = [
             i for i, group in enumerate(self.layout.groups) if group.fields
         ]
+        if not group_indices or self.layout.num_lcm_blocks < 1:
+            return
         for storage, geometry, lane in (
             (self.host_storage, self._transfer_geometry, self._restore_l2_lane),
             (
@@ -707,7 +711,7 @@ class HostCacheExecutor:
                 self._restore_pool_lane,
             ),
         ):
-            if storage is None:
+            if storage is None or storage.num_host_lcm_blocks < 1:
                 continue
             launch = dict(
                 device_buffers=self.layout.buffers,
@@ -717,10 +721,62 @@ class HostCacheExecutor:
                 prerequisite_stream=device_module.current_stream(),
                 backend=self.transfer_backend,
             )
+            warmed_layer_ready = False
             for group_index in group_indices:
                 lane.start_d2h([(group_index, 1, 1)], **launch)
                 lane.start_h2d([(group_index, 1, 1)], **launch)
                 self.load_stream.synchronize()
+                if (
+                    not warmed_layer_ready
+                    and storage is self.host_storage
+                    and self._load_workspaces
+                    and geometry.layer_slices
+                ):
+                    warmed_layer_ready = True
+                    self._warmup_l2_layer_ready(group_index, storage, geometry)
+
+    def _warmup_l2_layer_ready(self, group_index: int, storage, geometry) -> None:
+        """Warm the L2 layer-ready H2D kernel and layer spin waiter at init."""
+        workspace = self._load_workspaces[0]
+        device = self.layout.buffers[0].device
+        num_blocks, _ = workspace.load_block_transfers(
+            [(group_index, 1, 1)], geometry=geometry
+        )
+        with (
+            device_module.stream(self.load_stream),
+            self._memory_saver_adapter.named_region("cache_transfer"),
+        ):
+            mode = workspace.prepare_backend(
+                self.layout.buffers,
+                storage.host_buffer,
+                backend=self.transfer_backend,
+            )
+            if mode.layer_ready:
+                if mode.uses_device_tables:
+                    workspace.commit_block_transfers(
+                        num_blocks, device, non_blocking=False
+                    )
+                flags = workspace.prepare_layer_ready(
+                    len(geometry.layer_slices), device
+                )
+                transfer_cache_blocks(
+                    "h2d",
+                    self.layout.buffers,
+                    storage.host_buffer,
+                    geometry,
+                    workspace,
+                    self.load_stream,
+                    num_blocks=num_blocks,
+                    geometry_offset=0,
+                    num_geometry_rows=geometry.num_field_rows,
+                    backend=self.transfer_backend,
+                    layer_ready_flags=flags,
+                    grid_cap=None,
+                )
+                self.load_stream.synchronize()
+                # transfer_cache_blocks released every layer slot to 1; exit in one load.
+                wait_layer_ready(flags, 0)
+                device_module.current_stream().synchronize()
 
     def submit_write_backs(
         self, cache_ops: Sequence, *, prerequisite_stream, fence_stream

@@ -25,8 +25,11 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache import host_transfer
-from tokenspeed_kernel.ops.kvcache.triton import _transfer_cache_blocks_kernel
-from utils import assert_no_triton_compile
+from tokenspeed_kernel.ops.kvcache.triton import (
+    _transfer_cache_blocks_kernel,
+    _wait_layer_ready_kernel,
+)
+from utils import assert_no_triton_compile, assert_warmup_covers
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -242,3 +245,25 @@ def test_each_layers_transfer_reuses_one_binary():
         span = slice(layer * width, (layer + 1) * width)
         expected[2 * stride :][span] = device[2 * stride :][span]
     assert torch.equal(host, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_wait_layer_ready_reuses_one_binary():
+    if not host_transfer.layer_ready_ptx_supported():
+        pytest.skip("layer-ready flags require NVIDIA PTX")
+    flags = torch.ones((64,), dtype=torch.int32, device="cuda")
+
+    def warm() -> None:
+        host_transfer.wait_layer_ready(flags, 0)
+        torch.cuda.synchronize()
+
+    def run(layer_index: int) -> None:
+        host_transfer.wait_layer_ready(flags, layer_index)
+        torch.cuda.synchronize()
+
+    assert_warmup_covers(
+        (_wait_layer_ready_kernel,),
+        warm,
+        run,
+        (1, 2, 16, 17, 63),
+    )

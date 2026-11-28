@@ -113,6 +113,7 @@ from tokenspeed_kernel.ops.residual import (
     try_mhc_shifted_post_pre_norm,
     try_mhc_shifted_post_pre_norm_quantize_fp8,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError
 from torch import nn
@@ -767,6 +768,106 @@ def _max_forward_tokens() -> int:
     if args["speculative_algorithm"]:
         decode_rows *= int(args["speculative_num_draft_tokens"])
     return max(tokens, decode_rows)
+
+
+def _warmup_compressors(
+    compressors: list[DeepseekV41Compressor], max_tokens: int
+) -> None:
+    """Precompile dsv4_linear_fp32 variants for ratio-2 KV compressors."""
+    if max_tokens < 1:
+        return
+    warm_counts = sorted(
+        {
+            1,
+            min(max_tokens, 16),
+            *((min(max_tokens, 64),) if max_tokens > 32 else ()),
+        }
+    )
+    warmed: set[tuple[torch.device, tuple[int, ...]]] = set()
+    with kernel_warmup(enabled=True):
+        for module in compressors:
+            weight = module.wkv_wgate.weight
+            key = (weight.device, tuple(weight.shape))
+            if key in warmed:
+                continue
+            for m in warm_counts:
+                dummy = torch.zeros(
+                    (m, weight.shape[1]),
+                    dtype=weight.dtype,
+                    device=weight.device,
+                )
+                dsv4_linear_fp32(dummy, weight, override=None, solution=None)
+            warmed.add(key)
+
+
+def _warmup_mega_mhc(layers: list[DeepseekV41DecoderLayer], max_tokens: int) -> None:
+    """Precompile DeepGEMM MegaMHC BF16 and FP8-quantized shifted join kernels."""
+    if max_tokens < 1:
+        return
+    raw_counts = (
+        *range(1, 17),
+        24,
+        32,
+        48,
+        64,
+        96,
+        128,
+        192,
+        256,
+        384,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+    )
+    warm_counts = sorted({min(c, max_tokens) for c in raw_counts if c >= 1})
+    max_m = warm_counts[-1]
+    warmed: set[tuple[torch.device, int, int]] = set()
+    for module in layers:
+        dev = module.hc_attn_fn.device
+        hidden = module.attn_norm.weight.numel()
+        key = (dev, hidden, module.hc_sinkhorn_iters)
+        if key in warmed:
+            continue
+        buf_x = torch.zeros((max_m, hidden), dtype=torch.bfloat16, device=dev)
+        buf_res = torch.zeros((max_m, 4, hidden), dtype=torch.bfloat16, device=dev)
+        buf_pre = torch.ones((max_m, 4), dtype=torch.float32, device=dev)
+        buf_post = torch.ones((max_m, 4), dtype=torch.float32, device=dev)
+        buf_comb = torch.ones((max_m, 4, 4), dtype=torch.float32, device=dev)
+        with torch.inference_mode():
+            for m in warm_counts:
+                try_mhc_shifted_post_pre_norm(
+                    buf_x[:m],
+                    buf_res[:m],
+                    buf_pre[:m],
+                    buf_post[:m],
+                    buf_comb[:m],
+                    module.hc_attn_fn,
+                    module.hc_attn_scale,
+                    module.hc_attn_base,
+                    module.norm_eps,
+                    module.hc_eps,
+                    module.hc_sinkhorn_iters,
+                    module.attn_norm.weight,
+                    module.attn_norm.variance_epsilon,
+                )
+                try_mhc_shifted_post_pre_norm_quantize_fp8(
+                    buf_x[:m],
+                    buf_res[:m],
+                    buf_pre[:m],
+                    buf_post[:m],
+                    buf_comb[:m],
+                    module.hc_ffn_fn,
+                    module.hc_ffn_scale,
+                    module.hc_ffn_base,
+                    module.norm_eps,
+                    module.hc_eps,
+                    module.hc_sinkhorn_iters,
+                    module.ffn_norm.weight,
+                    module.ffn_norm.variance_epsilon,
+                )
+        warmed.add(key)
 
 
 def _all_reduce_output(
@@ -3764,6 +3865,29 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()
+        max_tokens = _max_forward_tokens() if attentions else None
+        compressors = [
+            module
+            for module in self.modules()
+            if isinstance(module, DeepseekV41Compressor)
+            and module.ratio == 2
+            and module.wkv_wgate.weight.is_cuda
+        ]
+        if compressors:
+            if max_tokens is None:
+                max_tokens = _max_forward_tokens()
+            _warmup_compressors(compressors, max_tokens)
+        layers = [
+            module
+            for module in self.modules()
+            if isinstance(module, DeepseekV41DecoderLayer)
+            and module.hc_attn_fn.is_cuda
+            and module.hc_ffn_fn.is_cuda
+        ]
+        if layers:
+            if max_tokens is None:
+                max_tokens = _max_forward_tokens()
+            _warmup_mega_mhc(layers, max_tokens)
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.embed_tokens
