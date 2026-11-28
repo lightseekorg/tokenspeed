@@ -43,8 +43,8 @@ _LOG2E = 1.4426950408889634
 _GFX950_CU_COUNT = 256
 # Selected slots per tile.
 _BLOCK_N = 16
-# Split each row's slots until about four one-wave workgroups run per CU.
-_TARGET_WORKGROUPS = 4 * _GFX950_CU_COUNT
+# Workgroups resident at once: LDS (about 33 KB each) fits four per CU.
+_RESIDENT_WORKGROUPS = 4 * _GFX950_CU_COUNT
 _MAX_SPLITS = 32
 
 
@@ -451,11 +451,15 @@ def _scalar_descale(scale: float | torch.Tensor | None, name: str) -> float:
     return float(scale)
 
 
-def _num_splits(rows: int, num_kv_heads: int, width: int) -> int:
-    """Splits per (row, KV head) so small batches still fill the GPU."""
-    programs = rows * num_kv_heads
+def _num_splits(programs: int, width: int) -> int:
+    """Splits per (row, KV head, head block) so small batches fill the GPU.
+
+    Rounded down: the grid stays within one round of resident workgroups.
+    A second, partial round (48 or 80 decode requests with 4 rows each)
+    leaves most CUs idle while it runs and cost up to 25%.
+    """
     max_splits = min(_MAX_SPLITS, triton.cdiv(width, _BLOCK_N))
-    return max(1, min(max_splits, triton.cdiv(_TARGET_WORKGROUPS, programs)))
+    return max(1, min(max_splits, _RESIDENT_WORKGROUPS // programs))
 
 
 def launch_gluon_qsa_sparse_attention_gfx950(
@@ -494,7 +498,7 @@ def launch_gluon_qsa_sparse_attention_gfx950(
         return output
     # Workgroups own up to 16 query heads of one KV head's GQA group.
     head_blocks = triton.cdiv(group, 16)
-    num_splits = _num_splits(rows, num_kv_heads * head_blocks, width)
+    num_splits = _num_splits(rows * num_kv_heads * head_blocks, width)
     use_split = num_splits > 1
     if use_split:
         partial_out = torch.empty(

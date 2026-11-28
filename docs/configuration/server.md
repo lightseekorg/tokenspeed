@@ -2322,18 +2322,24 @@ request computes the prefix itself.
 | `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
 | `--peer-prefix-landing-tier` | required | `device` reads the prefix into the GPU pages the request's admission allocates, which wait out the transfer; `host` reads it into Host blocks before the admission, which then takes it as a Host hit, at the cost of Host capacity and one host-to-device copy ([RFC 0006](../rfcs/0006-disk-tier.md)). |
 
-Peer sharing needs the Host tier (`--enable-kvstore`) and prefix caching.
-A `--disaggregation-mode decode` server serves the history it decoded, its
-prompts and replies, so the next turn's prefill server reads a reply rather
-than computing it; it never reads itself, since its prefill server sends what
-it lacks ([RFC 0005](../rfcs/0005-runtime-pd-roles.md)). Run it with
-`--kvstore-write-policy write_back` for its Host to hold what its GPU evicts.
+Peer sharing requires prefix caching. Prefill and fused workers also require
+Host L2 (`--enable-kvstore`). A Decode worker receives its prompt through
+the [PD path](../rfcs/0005-runtime-pd-roles.md) and offers the prompt and
+generated tokens to subsequent Prefill requests. With Host L2 enabled, use
+`--kvstore-write-policy write_back` to retain pages evicted from Device.
+
+A TP1/KVP1 Decode worker can serve device-resident prefixes with
+`--disable-kvstore --peer-prefix-landing-tier device` and a configured
+`--peer-prefix-port`. Omit the Host write-back policy in this mode. A
+TP8/KVP8 Prefill worker can read the resident history, including draft cache
+fields. Once the Decode worker evicts those pages, it cannot serve them.
+
 Peer sharing is refused with
 `--kvstore-storage-backend`, `--pipeline-parallel-size > 1`,
 `--query-context-parallel-size > 1` and `--enable-memory-saver` (releasing
-Device KV memory invalidates registered Mooncake MRs); the
-scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded
-groups). RDMA devices come from `--disaggregation-ib-device`. Replicas read
+Device KV memory invalidates registered Mooncake MRs). KV-page sharding
+requires the [sharded peer protocol](../rfcs/0004-peer-prefix-sharing.md).
+RDMA devices come from `--disaggregation-ib-device`. Replicas read
 each other within one namespace when their configured model and draft revisions,
 cache layout and numerical settings are compatible. Deploy the same weights on
 all peers and identify each generation with the same `--weight-version`. At

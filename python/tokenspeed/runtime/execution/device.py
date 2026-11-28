@@ -386,6 +386,7 @@ class DeviceBuild:
     shared_l2_client_config: SharedL2ClientConfig | None
     encoder_model_facts: Any
     peer_geometry: PeerGeometry | None
+    peer_deployment_id: str | None = None
 
 
 class DeviceRole(enum.Enum):
@@ -977,10 +978,35 @@ class DeviceHandle:
         if self._weight_memory is not None:
             self._weight_memory.before_kv_resume()
 
+    def _peer_weight_controllers(self) -> list:
+        from tokenspeed.runtime.layers.moe.peer_weights import (
+            peer_weights_controller_for,
+        )
+
+        models = [self._executor.model_runner.model]
+        draft_runner = self._executor.draft_model_runner
+        if draft_runner is not None:
+            models.append(draft_runner.model)
+        controllers = []
+        for model in models:
+            controller = peer_weights_controller_for(model)
+            if controller is not None:
+                controllers.append(controller)
+        return controllers
+
     def release_weights(self, adapter) -> None:
         """Discard or back up weights only after device and KV work drained."""
         self.synchronize()
-        operation = lambda: adapter.pause(tag="weights")
+        controllers = self._peer_weight_controllers()
+        backup = (
+            self._weight_memory is None or self._weight_memory.policy == "cpu_backup"
+        )
+
+        def operation() -> None:
+            for controller in controllers:
+                controller.release_storage(backup=backup)
+            adapter.pause(tag="weights")
+
         if self._weight_memory is None:
             operation()
         else:
@@ -988,7 +1014,16 @@ class DeviceHandle:
 
     def resume_weights(self, adapter) -> None:
         """Remap storage and restore constants; discarded parameters stay invalid."""
-        operation = lambda: adapter.resume(tag="weights")
+        controllers = self._peer_weight_controllers()
+        backup = (
+            self._weight_memory is None or self._weight_memory.policy == "cpu_backup"
+        )
+
+        def operation() -> None:
+            adapter.resume(tag="weights")
+            for controller in controllers:
+                controller.resume_storage(backup=backup)
+
         if self._weight_memory is None:
             operation()
         else:
@@ -1226,6 +1261,15 @@ class DeviceHandle:
             UpdateWeightsFromMooncakeReqInput,
         ):
             raise TypeError(f"unsupported weight-load request {type(req).__name__}")
+        controllers = self._peer_weight_controllers()
+        if controllers:
+            if type(req) is UpdateWeightsFromDistributedReqInput:
+                return (
+                    False,
+                    "Peer expert weights do not support distributed broadcast updates",
+                )
+            if any(controller.released for controller in controllers):
+                return False, "Resume weight storage before updating"
         state = self._weight_memory
         if state is None:
             return True, "ready for weight update"
@@ -2036,13 +2080,12 @@ def build_device_side(
     host_cache_executor = None
     host_cache = None
     host_tail_packing = {}
-    if server_args.enable_kvstore:
-        from tokenspeed.runtime.cache.host_storage import compute_host_group_packing
+    contract = views.token_to_kv_pool.arena.runtime_contract
+    if server_args.enable_kvstore or peer_outbox is not None:
         from tokenspeed.runtime.cache.transfer.layout import (
             combine_cache_transfer_layouts,
         )
 
-        contract = views.token_to_kv_pool.arena.runtime_contract
         layout = combine_cache_transfer_layouts(
             views.token_to_kv_pool.cache_transfer_layout(),
             (
@@ -2052,6 +2095,9 @@ def build_device_side(
             ),
             group_ids=tuple(spec.group_id for spec in contract.group_specs),
         )
+    if server_args.enable_kvstore:
+        from tokenspeed.runtime.cache.host_storage import compute_host_group_packing
+
         shards = {spec.group_id: spec.shard_count for spec in contract.group_specs}
         host_tail_packing = {
             group.group_id: packing * shards[group.group_id]
@@ -2067,7 +2113,7 @@ def build_device_side(
         }
     snapshot_pool = _retraction_pool_request(
         server_args,
-        views.token_to_kv_pool.arena.runtime_contract,
+        contract,
         host_group_packing=host_tail_packing,
         max_batch_size=max_batch_size,
         max_resident_requests=max_resident_requests,
@@ -2090,12 +2136,11 @@ def build_device_side(
             if server_args.mapping.world_size > 1
             else None
         )
-        checkpoint_granularities = tuple(
-            (spec.group_id, spec.checkpoint_granularity)
-            for spec in views.token_to_kv_pool.arena.runtime_contract.group_specs
-            if spec.checkpoint_granularity is not None
-            and spec.checkpoint_granularity > 1
-        )
+    checkpoint_granularities = tuple(
+        (spec.group_id, spec.checkpoint_granularity)
+        for spec in contract.group_specs
+        if spec.checkpoint_granularity is not None and spec.checkpoint_granularity > 1
+    )
     if server_args.shared_l2_config is not None:
         from tokenspeed.runtime.cache.shared_l2.rank import join_shared_l2_pool
 
@@ -2198,15 +2243,25 @@ def build_device_side(
         )
 
     peer_geometry = None
+    peer_deployment_id = None
     if peer_outbox is not None:
+        from tokenspeed.runtime.cache.l3.factory import cache_layout_deployment_id
         from tokenspeed.runtime.cache.peer import build_peer_geometry, peer_semantic_id
         from tokenspeed.runtime.plugins.registry import get_peer_host_region_planner
 
-        if host_cache is None:
-            raise ValueError(
-                "peer prefix sharing needs the Host tier (--enable-kvstore)"
-            )
         arena = views.token_to_kv_pool.arena
+        peer_deployment_id = cache_layout_deployment_id(
+            server_args,
+            model_config,
+            draft_model_config,
+            cache_layout=layout,
+            checkpoint_granularities=checkpoint_granularities,
+            group_shard_counts=tuple(spec.shard_count for spec in contract.group_specs),
+            attention_backend_name=attention.attention_backend_name,
+            draft_attention_backend_name=attention.draft_attention_backend_name,
+            world_cpu_group=None,
+            for_peer=True,
+        )
         transfer_contract = b""
         mapping = server_args.mapping
         topology = (
@@ -2240,14 +2295,14 @@ def build_device_side(
             scheduler_group_ids=tuple(
                 spec.group_id for spec in arena.runtime_contract.group_specs
             ),
-            groups=host_cache.groups,
+            groups=layout.groups,
             field_addresses={
                 field.field_id: arena.field_address(field.field_id)
-                for group in host_cache.groups
+                for group in layout.groups
                 for field in group.fields
             },
             device_regions=arena.registration_regions(),
-            host_storage=host_cache.storage,
+            host_storage=host_cache.storage if host_cache is not None else None,
             transfer_contract=transfer_contract,
             semantic_id=(
                 peer_semantic_id(
@@ -2260,8 +2315,16 @@ def build_device_side(
                 if transfer_contract
                 else b""
             ),
-            host_virtual_bounds=host_cache.ownership.host_virtual_counts,
-            host_region_planner=get_peer_host_region_planner(server_args.device),
+            host_virtual_bounds=(
+                host_cache.ownership.host_virtual_counts
+                if host_cache is not None
+                else ()
+            ),
+            host_region_planner=(
+                get_peer_host_region_planner(server_args.device)
+                if host_cache is not None
+                else None
+            ),
         )
 
     kv_transfer = kv_transfer_builder(
@@ -2362,6 +2425,7 @@ def build_device_side(
         host_cache=host_cache,
         shared_l2_client_config=shared_l2_client_config,
         peer_geometry=peer_geometry,
+        peer_deployment_id=peer_deployment_id,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,

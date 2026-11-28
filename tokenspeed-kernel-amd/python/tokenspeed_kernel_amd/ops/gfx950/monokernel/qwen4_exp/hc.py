@@ -347,23 +347,39 @@ def _stream_rows(
 
 @gluon.jit
 def _inverse_rms_rows(xs):
-    """The per-stream inverse RMS of each of the streams ``xs`` (1 to 4
-    tensors), as :func:`_normalize` computes it. The rows share one
-    reduction across waves."""
+    """The per-stream inverse RMS of each of the streams ``xs`` (a tuple of
+    rows), as :func:`_normalize` computes it. Up to 4 rows share one
+    reduction across waves; more rows take one such reduction per 4."""
     R: gl.constexpr = len(xs)
+    invs = ()
+    for q in gl.static_range((R + 3) // 4):
+        invs += _inverse_rms_quad(xs, 4 * q, _quad_rows(R, q))
+    return invs
+
+
+@gluon.constexpr_function
+def _quad_rows(rows, q):
+    """Rows of group ``q`` of 4 rows of ``rows``."""
+    return min(4, rows - 4 * q)
+
+
+@gluon.jit
+def _inverse_rms_quad(xs, FIRST: gl.constexpr, N: gl.constexpr):
+    """:func:`_inverse_rms_rows` of rows ``FIRST .. FIRST + N - 1`` (``N``
+    at most 4) of ``xs``, in one reduction across waves."""
     sq = ()
-    for r in gl.static_range(R):
-        sq += (gl.sum(xs[r] * xs[r], axis=2),)
-    if R == 1:
+    for r in gl.static_range(N):
+        sq += (gl.sum(xs[FIRST + r] * xs[FIRST + r], axis=2),)
+    if N == 1:
         sums = (gl.sum(sq[0], axis=1),)
-    elif R == 2:
+    elif N == 2:
         sums = gl.reduce(sq, 1, _add2)
-    elif R == 3:
+    elif N == 3:
         sums = gl.reduce(sq, 1, _add3)
     else:
         sums = gl.reduce(sq, 1, _add4)
     invs = ()
-    for r in gl.static_range(R):
+    for r in gl.static_range(N):
         invs += (gl.rsqrt(sums[r] * (1.0 / HIDDEN) + EPS),)
     return invs
 

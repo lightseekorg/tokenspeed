@@ -98,17 +98,30 @@ and each release followed by the next prefetch are ordered eager breaks. They
 run during capture and on every replay, so staging state advances and reader
 release is recorded on the replay's compute stream. Warmups use the same eager
 operations; capture itself records compute without reading the weights. A
-plain CUDA graph capture is rejected because it cannot replay these host-side
-operations. Prefill-only instances never capture a decode graph.
+plain decode graph capture cannot replay these host-side operations, so
+decode and aggregated workers using DWDP require `--enforce-eager`.
 
-Weights are immutable while published. Live weight replacement is rejected.
-Teardown drains local reads/copies and establishes peer quiescence before
-unmapping source storage. A model exposing peer weights implements
-`PeerWeightOwner`; the forward thread performs teardown as its last task.
+The CUDA `PeerWeightStore` remains immutable after finalization: live weight
+replacement, `dummy` loading, and CUDA memory-saver transitions are rejected
+until supported there.
 
-## Initial supported configuration
+The Ascend `PeerWeightStore` supports RL lifecycles while keeping stable VA
+reservations and full-expert view layouts (`data_ptr`, `shape`, `stride`):
+resident online weight updates (Mooncake SDK and disk), co-located sleep/wake
+through `--enable-memory-saver` (`cpu_backup` and `discard`), and `--load-format
+dummy` startup (skipping re-randomizing finalized composite views over shared
+staging pools). During live updates and wake/sleep transitions, the local reader
+and async peer-copy streams quiesce across the storage group before owned HBM
+buffers or VMM physical handles are rewritten or unmapped, staging slots are
+invalidated, and boundary intervals are refreshed after barrier agreement.
+Teardown drains local readers/copies and establishes peer quiescence before
+unmapping VA reservations and physical handles. A model exposing peer weights
+implements `PeerWeightOwner`; the forward thread performs teardown as its last
+task.
 
-The initial integration supports K3 NVFP4 and MXFP4 SiTU experts through the
+## Initial and RL supported configurations
+
+The initial CUDA integration supports K3 NVFP4 and MXFP4 SiTU experts through the
 FlashInfer TRT-LLM kernels on a fabric-connected NVIDIA prefill instance with
 local execution groups, PP1, and a fixed token budget. This K3 path selects
 fabric handles explicitly. POSIX support is exposed through the storage API for
@@ -122,8 +135,11 @@ Validation includes cross-node reconstruction, page-boundary handling, complete
 expert metadata, idle owners, odd/even queued forwards, bounded staging,
 full-model mapping counts, and numerical comparison against resident weights.
 
-Checkpoint loading currently supports auto and safetensors. Dummy/sharded-state
-loading and memory-saver sleep/wake are rejected before model allocation.
-All owners must remain available for the instance lifetime; deployment must
-terminate the instance on worker failure. Independent forwarding does not
-provide owner replacement or recovery after an owner fails.
+CUDA prefill workers remain limited to `auto` and `safetensors` checkpoint
+loading, eager or breakable prefill graphs, immutable checkpoints, and no
+memory saver. On Ascend NPU, peer weights additionally support `--load-format
+dummy`, eager `decode` and aggregated (`null`) roles (`--enforce-eager`),
+`--enable-memory-saver` (`cpu_backup` and `discard`), and Mooncake/disk online
+weight updates. All owners must remain available for the instance lifetime;
+deployment must terminate the instance on worker failure. Independent
+forwarding does not provide owner replacement or recovery after an owner fails.

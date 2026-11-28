@@ -26,9 +26,9 @@ use ts_scheduler::{PeerPageView, PeerTier};
 
 /// SHA-256 of the canonical representation agreed by the endpoints.
 pub type Digest = [u8; 32];
-// Earlier readers may submit an unbounded time after PIN. Never grant them
-// an offer which the holder can reclaim on a deadline.
-const VERSION: u8 = 2;
+// Wire revision 3 adds Disk-tier source pages pushed through each member's
+// push endpoint while preserving revision 2's bounded submission window.
+const VERSION: u8 = 3;
 pub(super) const SUBMIT_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_FRAME: usize = 16 << 20;
 const MAX_TOKENS: usize = 1 << 20;
@@ -105,6 +105,8 @@ pub enum Message {
     Offered(Key, Option<(Offer, Digest, Vec<PeerPageView>)>),
     /// Acquire exactly this offer.
     Pin(Key, Offer),
+    /// The exact unpinned offer expired. Only a fresh offer id may authorize a read.
+    Expired(Key, Offer),
     /// A grant requires every source member to have pinned.
     Grant(Key, Offer, bool),
     /// Terminal reader disposition.
@@ -199,6 +201,7 @@ fn pages(r: &mut Reader<'_>) -> Option<Vec<PeerPageView>> {
         let tier = match r.u8()? {
             0 => PeerTier::Device,
             1 => PeerTier::Host,
+            2 => PeerTier::Disk,
             _ => return None,
         };
         let block_id = i32::try_from(r.i64()?).ok()?;
@@ -226,7 +229,11 @@ impl Message {
     pub fn reply(&self) -> bool {
         matches!(
             self,
-            Self::LayoutReply(..) | Self::Offered(..) | Self::Grant(..) | Self::Ack(..)
+            Self::LayoutReply(..)
+                | Self::Offered(..)
+                | Self::Grant(..)
+                | Self::Expired(..)
+                | Self::Ack(..)
         )
     }
     /// Canonical little-endian encoding, beginning with the tag and version.
@@ -240,6 +247,7 @@ impl Message {
             Offered(..) => 0x13,
             Pin(..) => 0x14,
             Grant(..) => 0x15,
+            Expired(..) => 0x16,
             Release(..) => 0x17,
             Ack(..) => 0x18,
         };
@@ -279,7 +287,7 @@ impl Message {
                     put_pages(w, pages);
                 });
             }
-            Pin(k, o) => {
+            Pin(k, o) | Expired(k, o) => {
                 k.put(&mut w);
                 o.put(&mut w);
             }
@@ -374,6 +382,7 @@ impl Message {
             ),
             0x14 => Self::Pin(Key::get(&mut r)?, Offer::get(&mut r)?),
             0x15 => Self::Grant(Key::get(&mut r)?, Offer::get(&mut r)?, r.flag()?),
+            0x16 => Self::Expired(Key::get(&mut r)?, Offer::get(&mut r)?),
             0x17 => Self::Release(Key::get(&mut r)?, nonzero(&mut r)?, disposition(&mut r)?),
             0x18 => Self::Ack(
                 Key::get(&mut r)?,
@@ -427,6 +436,12 @@ mod tests {
             tier: PeerTier::Host,
             block_id: 3,
         };
+        let disk_page = PeerPageView {
+            group_id: 0,
+            slot: 1,
+            tier: PeerTier::Disk,
+            block_id: 4,
+        };
         let frames = [
             Message::LayoutReq(1, "r:12".into()),
             Message::LayoutReply(1, key.holder.clone(), [2; 32], [3; 32], vec![0]),
@@ -441,18 +456,22 @@ mod tests {
                     max_tokens: 1,
                 },
             ),
-            Message::Offered(key.clone(), Some((offer.clone(), [4; 32], vec![page]))),
+            Message::Offered(
+                key.clone(),
+                Some((offer.clone(), [4; 32], vec![page, disk_page])),
+            ),
             Message::Pin(key.clone(), offer.clone()),
-            Message::Grant(key.clone(), offer, true),
+            Message::Grant(key.clone(), offer.clone(), true),
+            Message::Expired(key.clone(), offer),
             Message::Release(key.clone(), 6, Disposition::Abort),
             Message::Ack(key, 6, Disposition::Abort, Closure::Closed),
         ];
-        for (tag, m) in [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x17, 0x18]
+        for (tag, m) in [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18]
             .into_iter()
             .zip(&frames)
         {
             let mut bytes = m.encode();
-            assert_eq!(bytes[..2], [tag, 2]);
+            assert_eq!(bytes[..2], [tag, VERSION]);
             assert_eq!(Message::decode(&bytes, m.reply()).as_ref(), Some(m));
             assert!(Message::decode(&bytes, !m.reply()).is_none());
             for end in 0..bytes.len() {
@@ -461,7 +480,7 @@ mod tests {
             bytes.push(0);
             assert!(Message::decode(&bytes, m.reply()).is_none());
             bytes.pop();
-            bytes[1] = 1;
+            bytes[1] = VERSION - 1;
             assert!(Message::decode(&bytes, m.reply()).is_none());
         }
     }
@@ -469,7 +488,7 @@ mod tests {
     fn discovery_bytes_are_stable_and_never_decode_as_a_legacy_request() {
         let query = Message::LayoutReq(1, "a:1".into());
         let golden = [
-            0x10, 2, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, b'a', b':', b'1', 8,
+            0x10, 3, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, b'a', b':', b'1', 8,
         ];
         assert_eq!(query.encode(), golden);
         assert!(super::super::wire::Request::decode(&golden).is_err());

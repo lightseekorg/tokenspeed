@@ -178,3 +178,118 @@ def test_moe_workspace_uses_ascend_pool(monkeypatch):
         torch.testing.assert_close(torch.stack([v.cpu() for v in result]), expected)
     finally:
         saver.resume("weights")
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_NPU_MEMORY_SAVER_TESTS") != "1",
+    reason="requires RUN_NPU_MEMORY_SAVER_TESTS=1 and an exclusively assigned NPU",
+)
+def test_npu_host_transfer_staging_uses_discardable_kv_pool():
+    import torch
+
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("requires an NPU")
+    pytest.importorskip("torch_npu_memory_saver")
+
+    from tokenspeed_kernel.ops.kvcache import host_transfer
+
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
+
+    torch.npu.set_device(0)
+    saver = TorchMemorySaverAdapter.create(enable=True, device="npu")
+    payload = 4096
+    with saver.region(tag="kv_cache", enable_cpu_backup=False):
+        device_buf = torch.zeros(payload * 4, dtype=torch.uint8, device="npu")
+    with saver.named_region("cache_transfer"):
+        geometry = host_transfer.build_host_transfer_geometry(
+            rows=((0, 0, 0, payload, payload, 0, 1, payload),),
+            layer_slices=((0, 1),),
+            group_packing=(1,),
+            host_group_packing=(1,),
+            host_lcm_block_bytes=payload,
+            num_host_lcm_blocks=2,
+            num_device_lcm_blocks=3,
+            num_device_buffers=1,
+        ).bind(device_buf.device, non_blocking=False)
+
+    def _alloc_staging(nbytes: int, target_device: torch.device) -> torch.Tensor:
+        with saver.region(tag="kv_cache", enable_cpu_backup=False):
+            return torch.empty(nbytes, dtype=torch.uint8, device=target_device)
+
+    staging = host_transfer.StagingBuffer(allocator=_alloc_staging, default_bytes=65536)
+    staging_ptr = staging.acquire(payload, device_buf.device).data_ptr()
+    host = torch.zeros(payload * 2, dtype=torch.uint8, pin_memory=True)
+    workspace = host_transfer.HostTransferWorkspace()
+    workspace.bind_staging_buffer(staging)
+    stream = torch.npu.Stream()
+    with torch.npu.stream(stream), saver.named_region("cache_transfer"):
+        workspace.prepare_backend((device_buf,), host, backend="auto")
+    stream.synchronize()
+
+    try:
+        for cycle in range(2):
+            saver.pause("kv_cache")
+            matching = [
+                block
+                for block in saver.stats()["blocks"]
+                if 0 <= staging_ptr - int(block["ptr"], 16) < block["aligned_bytes"]
+            ]
+            assert len(matching) == 1
+            assert matching[0]["tag"] == "kv_cache"
+            assert not matching[0]["mapped"] and not matching[0]["physical_live"]
+            assert not matching[0]["backup_valid"]
+            saver.resume("kv_cache")
+
+            pattern = (
+                torch.arange(payload, dtype=torch.int64)
+                .add(cycle * 37 + 1)
+                .remainder(251)
+                .to(torch.uint8)
+            )
+            num_blocks, _ = workspace.load_block_transfers(
+                ((0, 1, 1),), geometry=geometry
+            )
+            with torch.npu.stream(stream):
+                device_buf[payload : 2 * payload].copy_(pattern, non_blocking=False)
+                with saver.named_region("cache_transfer"):
+                    workspace.commit_block_transfers(
+                        num_blocks, device_buf.device, non_blocking=True
+                    )
+            host_transfer.transfer_cache_blocks(
+                "d2h",
+                (device_buf,),
+                host,
+                geometry,
+                workspace,
+                stream,
+                num_blocks=num_blocks,
+                geometry_offset=0,
+                num_geometry_rows=1,
+                backend="auto",
+                grid_cap=None,
+                layer_ready_flags=None,
+            )
+            with torch.npu.stream(stream):
+                device_buf[payload : 2 * payload].zero_()
+            host_transfer.transfer_cache_blocks(
+                "h2d",
+                (device_buf,),
+                host,
+                geometry,
+                workspace,
+                stream,
+                num_blocks=num_blocks,
+                geometry_offset=0,
+                num_geometry_rows=1,
+                backend="auto",
+                grid_cap=None,
+                layer_ready_flags=None,
+            )
+            stream.synchronize()
+            assert torch.equal(host[:payload], pattern)
+            assert torch.equal(device_buf[payload : 2 * payload].cpu(), pattern)
+    finally:
+        saver.resume("kv_cache")

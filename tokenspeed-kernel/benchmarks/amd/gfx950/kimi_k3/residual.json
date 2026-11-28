@@ -16,7 +16,7 @@
         "family": "residual",
         "mode": "attn_res_fwd",
         "parameters": {
-          "tokens": [4096, 8192],
+          "tokens": [2048, 8192],
           "num_valid_blocks": [1, 4, 8],
           "block_write": false,
           "has_delta": false
@@ -69,6 +69,48 @@
       "policy": {
         "max_regression_relative": 0.05,
         "max_regression_absolute_us": 5.0
+      }
+    },
+    {
+      "id": "kimi_k3.residual.attn_res_fwd/decode-attention-mix-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "residual",
+        "mode": "attn_res_fwd",
+        "parameters": {
+          "tokens": [48, 96, 288],
+          "num_valid_blocks": [1, 4, 8],
+          "block_write": false,
+          "has_delta": false
+        },
+        "cold_cache": true,
+        "seed": 4804
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "kimi_k3.residual.attn_res_fwd/decode-mlp-mix-delta-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "residual",
+        "mode": "attn_res_fwd",
+        "parameters": {
+          "tokens": [48, 96, 288],
+          "num_valid_blocks": 8,
+          "block_write": false,
+          "has_delta": true
+        },
+        "cold_cache": true,
+        "seed": 4805
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 1.0
       }
     }
   ]

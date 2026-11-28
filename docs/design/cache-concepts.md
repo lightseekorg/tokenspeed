@@ -21,32 +21,109 @@ Only the original holder's matching CLOSED/COMPLETE reply can publish a hit.
 Unknown retirement freezes the landing. A restarted holder or a conflicting
 close ends the business attempt with zero reused tokens.
 
-Wire revision 2 bounds the start of each member's last native read. Its local
-30-second monotonic submission window starts before the member votes READY.
-Workers check the same deadline at each batch, including after queue and
-destination-fence waits. The holder starts its own 30-second interval at
+Wire revision 3 extends cross-layout peer reads to holder Disk-tier pages while
+preserving revision 2's bounded submission window. When every member of a holder
+replica serves Disk pushes, its versioned descriptor (format version 2) advertises
+per-group exclusive Disk virtual block bounds alongside each member's push
+endpoint. A holder that cannot push Disk—or whose push endpoint has been
+quarantined on any replica member (propagated via the replica collective and
+exposed through `peer_scheduler_state{state="disk_push_quarantined"}`)—truncates
+lookups to its Device/Host prefix instead of returning a full miss; a holder
+that can push Disk answers lookups with any mix of Device, Host, and Disk pages,
+pinning every listed block across all tiers under its offer ticket. Each reader
+member plans one-sided READs for Device/Host pages and holder-pushed spans
+(tagged with the holder's `(incarnation, offer_id)` via wire frame `P`) for Disk
+pages through `PeerReadPlan::plan`, running both concurrently without occupying
+local read-worker threads while waiting on Disk pushes. Each holder member
+authorizes an offer's id on its push endpoint once pinned—recording the holder's
+local monotonic activation time—and rejects pushes for inactive,
+mismatched-incarnation, or expired-window offers before touching NVMe.
+A queued Disk offer can be restored only with a matching generation and a
+registered Disk-capable holder layout. After any holder member loses Disk
+capability, new lookups can still use its hot prefix. A duplicate lookup for
+an outstanding Disk offer receives a miss. A refreshed offer must bind the
+same prefix and page manifest before the reader can retry its PIN.
+
+Specifically, offer-bound (`P`) Disk pushes are only accepted within 35 seconds
+of offer activation (covering the reader's 30-second submission window plus
+transit slack), and every accepted job's execution deadline is clamped to at
+most 45 seconds past offer activation (`< 60`-second reader cancel retry budget
+plus `quarantine_us`), so a `Push` stalled inside a kernel TCP socket across a
+network partition cannot deliver late after heal and write into unfrozen reader
+device pages even while the holder's offer pin is still active. When a Disk push
+is cancelled and the holder does not confirm within a short grace window, the
+reader coordinates an early `FetchFrozen` fallback while retrying `Cancel` in
+the background on its push dispatcher for a bounded retry budget (60 seconds);
+a late `Cancelled`/`Done` reply cleanly unfreezes the landing via
+`TargetRetired` and sends `RELEASE(Abort)`, whereas retry-budget expiry, an
+RDMA write error, or a push worker panic reports `Unknown` retirement. On
+`Unknown` retirement, all reader members hold the landing frozen for the agreed
+quarantine interval (`quarantine_us`, shared with legacy peer landings;
+`frozen_targets`, `frozen_blocks`, and `frozen_landings` metrics expose active
+frozen landings) and then emit `TargetRetired` and `RELEASE(Abort)` in lockstep
+so neither a write fault nor a dead/restarted holder permanently leaks device KV
+memory or holder pins. Closing or expiring an offer on the holder revokes its
+push authorization, cancels in-flight pushes, and waits for them to drain before
+releasing Disk block pins. Every reader's local 30-second monotonic submission
+window starts before it votes
+READY; workers check the same deadline at each READ batch and clamp Disk push
+budgets to the remaining window. The holder starts its own 30-second interval at
 GRANT, after all READY votes. A delayed GRANT cannot restart the reader clock.
-Mixed wire revisions fall back to local prefill.
+Wire revision 3 and descriptor version 2 are incompatible with revision 2 /
+version 1; during a rolling upgrade, mixed-version pairs fall back to local
+prefill until both sides match.
 
 A deployment with a guaranteed upper bound on the time from the reader's
 final submission check through the last possible source-memory access can
 set `TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS` on the holder. Include host
 scheduling pauses after the check, native queues, reconnects, retries, DMA
-drain after process failure, and timer drift/margin. All ranks follow their
-holder leader's configured value. After the submission interval plus this
-bound, the holder initiates an ABORT and releases its own source references
-even if the reader disappeared. This never releases a reader's frozen target.
-If the backend has no verified bound, leave the setting unset: a granted
-source remains pinned pending explicit closure. A timeout for polling one
-Mooncake batch alone does not establish the bound. No heartbeats extend it.
+drain after process failure, timer drift/margin, and—when Disk-tier peer pushes
+are enabled—in-flight NVMe/RDMA execution within the holder's 45-second
+post-activation push deadline (35-second acceptance window plus bounded
+execution cap). When Disk-tier v1 peer pushes are enabled and this variable is unset,
+the holder defaults to a 90,000 ms bound past the 30-second submission window
+(120 seconds total) so orphaned Device/Host/Disk pins from a crashed reader are
+reclaimed automatically while leaving headroom above the ~65-second
+cancel-and-quarantine window. All ranks follow their holder leader's configured
+value. After the submission interval plus this bound, the holder initiates an
+ABORT, cancels any pushes tagged with the offer, and releases its own source
+references even if the reader disappeared. This never releases a reader's frozen
+target. For non-Disk v1 holders with no verified bound, leaving the setting
+unset preserves `0` (granted sources remain pinned pending explicit closure).
+A timeout for polling one Mooncake batch alone does not establish the bound. No
+heartbeats extend it.
 
-After all reader members have retired their reads, a missing RELEASE reply
+For Disk-tier peer pushes, the holder coalesces consecutive strided slices
+targeting contiguous remote addresses inside the same reader registered memory
+region (for example, head-sharded sliding-window draft slices pushed from TP1
+to TP8) into its own already-registered staging memory before issuing the RDMA
+WRITE, without changing the wire protocol. Reader planning partitions push
+items by destination memory region so a coalesced WRITE never crosses adjacent
+reader registrations. `TOKENSPEED_PEER_PUSH_COALESCE` controls this kill switch
+on the holder (enabled by default; set to `0` or `false` to emit uncoalesced
+spans). It is read once per process via `OnceLock`, so toggling it requires a
+process restart.
+
+After all reader members have retired their reads (or finished quarantining an
+unknown retirement), a missing RELEASE reply
 can still force the request to recompute. Once its closing deadline passes,
 the reader drops the finished request and keeps the exact release message.
 New lookups to that holder pause until its pending closes receive terminal
 replies. Cleanup retries rotate among those leases and do not occupy active
 attempt slots. Healthy holders can continue serving requests. An unknown DMA
-retirement keeps the original landing frozen and cannot enter this retry path.
+retirement stays frozen through its quarantine interval and cannot enter this
+retry path until `TargetRetired` and `RELEASE(Abort)` are emitted.
+
+A reader with frozen versioned Device targets pauses new peer reads across
+holders. The scheduler suppresses new lookups and discards answered but
+unreserved peer hits before admission, recording `reader_retirement_pending`.
+Requests continue through local cache matching and prefill with the remaining
+capacity. In-flight reads and holder serving keep their existing lifetimes.
+Only retirement of the last frozen target enables peer reads for new requests
+again; cancelling a request or waiting longer does not release its DMA pages.
+This prevents further landings from consuming the cache while a failed reader
+transport drains. It cannot restore capacity already held by a transfer that
+never retires or recover a failed device.
 
 ## Two worlds: logical tokens vs. physical storage
 

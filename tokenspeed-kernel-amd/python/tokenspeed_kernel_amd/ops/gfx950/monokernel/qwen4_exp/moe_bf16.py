@@ -301,9 +301,29 @@ def down_stage(
     160 registers).
     """
     mb.stamp("m5", trace.START)
+    routes = moe.routing(mb)
+    # The rows run in passes, as moe.py's down stage does.
+    for p in gl.static_range(moe.down_passes(mb.plan)):
+        _down_pass(
+            moe.pass_mailbox(mb, p),
+            task,
+            moe.pass_routes(routes, p, mb.plan),
+            weights,
+            out + p * moe.DOWN_PASS_ROWS * (4 * HIDDEN),
+            M,
+            W,
+            OUT,
+        )
+    mb.stamp("m5", trace.END)
+
+
+@gluon.jit
+def _down_pass(
+    mb, task, routes, weights, out, M: gl.constexpr, W: gl.constexpr, OUT: gl.constexpr
+):
+    """:func:`down_stage` for the rows of ``mb``, a pass's mailbox."""
     R: gl.constexpr = schedule.rows(mb.plan)
     G: gl.constexpr = moe._chain_groups(R)
-    routes = moe.routing(mb)
     tiles = _down_tiles(task, 0, routes[0], weights, R)
     x_lo, x_hi, block = _down_inputs(mb, task, M, W)
     mb.stamp("m5", trace.READY)
@@ -315,7 +335,6 @@ def down_stage(
             tiles = _down_tiles(task, g + 1, routes[0], weights, R)
     mb.stamp("m5", trace.COMPUTED)
     moe.down_epilogue(mb, task, accs, routes, block, out, OUT, False)
-    mb.stamp("m5", trace.END)
 
 
 __all__ = [

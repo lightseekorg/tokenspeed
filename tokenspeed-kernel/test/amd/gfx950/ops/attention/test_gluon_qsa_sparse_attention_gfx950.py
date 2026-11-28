@@ -78,8 +78,9 @@ def _inputs(rows, num_heads, num_kv_heads, cache_dtype, seed=0):
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-# Few rows split each row's slots over workgroups; many rows take one each.
-@pytest.mark.parametrize("rows", [3, 1500])
+# Few rows split each row's slots over many workgroups, 192 rows over two
+# (24 heads, 2 KV heads); many rows take one workgroup each.
+@pytest.mark.parametrize("rows", [3, 192, 1500])
 # 24 query heads on one KV head span two 16-head blocks.
 @pytest.mark.parametrize(("num_heads", "num_kv_heads"), [(12, 1), (24, 2), (24, 1)])
 def test_gluon_qsa_sparse_attention_matches_reference(

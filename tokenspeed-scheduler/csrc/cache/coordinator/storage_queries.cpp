@@ -91,9 +91,20 @@ StorageQuery StorageQueries::SharedPrefixKeys(const PromptPrefix& prompt, std::s
         const auto grain = store_.Geometry()[i].BlockGranularity();
         const auto per_prefix = store_.PrefixGranularity() / grain;
         const auto full_blocks = full_tokens / grain;
-        const auto first = group.Matcher().IsPrefixClosed()
-                               ? 0
-                               : store_.SlidingWindowBlocks(static_cast<std::int32_t>(i), prompt.max_tokens).first;
+        std::int32_t first = 0;
+        if (!group.Matcher().IsPrefixClosed()) {
+            const auto window = store_.SlidingWindowBlocks(static_cast<std::int32_t>(i), prompt.max_tokens);
+            first = window.first;
+            const auto sink = store_.SinkBlocksBelow(static_cast<std::int32_t>(i), window);
+            for (auto block = sink.first; block < std::min(sink.past_end, full_blocks); ++block) {
+                if (!add(CacheKey{.group_id = group.Id(),
+                                  .content_hash = ContentHash{prompt.prefix_hashes[block / per_prefix]},
+                                  .page_offset = block % per_prefix})) {
+                    result.max_tokens = -1;
+                    return result;
+                }
+            }
+        }
         for (auto block = first; block < full_blocks; ++block) {
             if (!add(CacheKey{.group_id = group.Id(),
                               .content_hash = ContentHash{prompt.prefix_hashes[block / per_prefix]},
@@ -253,20 +264,33 @@ StorageReservation StorageQueries::reserveStoragePrefix(const PromptPrefix& prom
         if (probe.num_common_tokens <= device_only.num_common_tokens ||
             (exact_retry && probe.num_common_tokens != prompt.max_tokens))
             return {};
+        bool missing_source = false;
         const auto pin = [&](const CacheKey& key, std::int32_t logical_block) {
+            if (missing_source) return;
             auto ref = store_.AcquireHostCachedBlock(key);
             if (ref) {
                 warm_blocks.push_back(std::move(ref));
             } else {
+                std::int32_t bucket = logical_block % store_.Groups()[key.group_id].Spec().shard_count;
+                if (source_pool != nullptr) {
+                    auto source = store_.Groups()[key.group_id].Index().Find(*source_pool, key);
+                    if (!source) {
+                        missing_source = true;
+                        return;
+                    }
+                    bucket = store_.Groups()[key.group_id].Allocator().BucketOf(source->Location());
+                    result.sources.push_back(std::move(source));
+                }
                 result.keys.push_back(key);
                 result.logical_blocks.push_back(logical_block);
                 groups.push_back(key.group_id);
-                buckets.push_back(logical_block % store_.Groups()[key.group_id].Spec().shard_count);
+                buckets.push_back(bucket);
             }
         };
         // Protect warm dependencies only while allocating destinations. They
         // stay evictable during I/O; ordinary admission matches the cache again.
         forEachStorageDependency(probe, group_keys, suffix.device.full_page_tokens, pin);
+        if (missing_source) return {};
         if (probe.tail) {
             result.tail_prior =
                 probe.full_page_tokens == 0
@@ -278,13 +302,6 @@ StorageReservation StorageQueries::reserveStoragePrefix(const PromptPrefix& prom
         const auto needed = result.keys.size() + warm_blocks.size();
         if (exact_retry && needed > limit) return {};
         if (needed <= max_blocks) {
-            if (source_pool) {
-                for (const auto& key : result.keys) {
-                    auto source = store_.Groups()[key.group_id].Index().Find(*source_pool, key);
-                    if (!source) return {};
-                    result.sources.push_back(std::move(source));
-                }
-            }
             auto allocation = host_.AcquireHostLanding(groups, buckets);
             if (allocation.stats.allocated == groups.size()) {
                 result.num_tokens = probe.num_common_tokens;
@@ -358,7 +375,11 @@ PrefixProber::PrefixListing StorageQueries::ListWithDisk(const PromptPrefix& pro
         }
         missing = true;
     };
-    if (suffix.device.num_common_tokens > 0) {
+    // ProbeHostSuffix overwrites suffix.device whenever a longer Host/Disk
+    // suffix exists; even when split_tokens == 0 (all KV pages live on Disk),
+    // suffix.device.per_group can still hold a Device-resident State checkpoint
+    // or Device tail (while pure-KV groups have empty hits when split == 0).
+    if (!suffix.device.per_group.empty()) {
         forEachStorageDependency(suffix.device, group_keys, /*floor_tokens=*/0,
                                  [&](const CacheKey& key, std::int32_t block) { list(key, block, true); });
     }

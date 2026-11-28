@@ -89,7 +89,7 @@ pub struct Settings {
     ib_device: String,
     regions: Vec<(usize, usize)>,
     device: Vec<DeviceField>,
-    host: HostPool,
+    host: Option<HostPool>,
     contract: Vec<u8>,
     host_bounds: Vec<i64>,
     semantic_id: Vec<u8>,
@@ -127,21 +127,25 @@ impl Settings {
             })
             .collect::<PyResult<Vec<_>>>()?;
         let host = geometry.getattr("host")?;
-        let host = HostPool {
-            address: host.getattr("address")?.extract()?,
-            groups: host
-                .getattr("groups")?
-                .try_iter()?
-                .map(|group| {
-                    let group = group?;
-                    Ok(HostGroup {
-                        parent_bytes: group.getattr("parent_bytes")?.extract()?,
-                        packing: group.getattr("packing")?.extract()?,
-                        block_bytes: group.getattr("block_bytes")?.extract()?,
-                        field_offsets: group.getattr("field_offsets")?.extract()?,
+        let host = if host.is_none() {
+            None
+        } else {
+            Some(HostPool {
+                address: host.getattr("address")?.extract()?,
+                groups: host
+                    .getattr("groups")?
+                    .try_iter()?
+                    .map(|group| {
+                        let group = group?;
+                        Ok(HostGroup {
+                            parent_bytes: group.getattr("parent_bytes")?.extract()?,
+                            packing: group.getattr("packing")?.extract()?,
+                            block_bytes: group.getattr("block_bytes")?.extract()?,
+                            field_offsets: group.getattr("field_offsets")?.extract()?,
+                        })
                     })
-                })
-                .collect::<PyResult<Vec<_>>>()?,
+                    .collect::<PyResult<Vec<_>>>()?,
+            })
         };
         Ok(Some(Self {
             peer: PeerSettings {
@@ -232,7 +236,7 @@ pub fn start(
     let local = RankGeometry {
         session: engine.session_id().to_owned(),
         device: settings.device,
-        host: Some(settings.host),
+        host: settings.host,
         push: Some(push.name().to_owned()),
     };
     let gathered = mesh
@@ -259,11 +263,28 @@ pub fn start(
     let capabilities = mesh
         .all_gather(replica, &capability)
         .map_err(|e| e.to_string())?;
+    let disk_bounds = match &push_source {
+        Some((_, disk_layout, _, _)) => disk_layout
+            .groups
+            .iter()
+            .map(|group| {
+                let count = disk_layout
+                    .num_lcm_blocks
+                    .checked_mul(group.packing)?
+                    .checked_mul(group.shard_count)?
+                    .checked_add(1)?;
+                i64::try_from(count).ok()
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or("Disk virtual block bound overflow")?,
+        None => Vec::new(),
+    };
     let registered =
         if !capability.is_empty() && capabilities.iter().all(|other| other == &capability) {
             let member = Member {
                 geometry: local.clone(),
                 bounds: settings.host_bounds,
+                disk_bounds,
                 regions: settings
                     .regions
                     .iter()
@@ -366,24 +387,98 @@ pub fn start(
     )
     .map_err(|error| error.to_string())?;
     if let Some(layout) = registered {
-        let retirement_bound_ms = match std::env::var("TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS") {
-            Ok(s) => s
-                .parse::<std::num::NonZeroU32>()
-                .map_err(|_| "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS must be a positive u32")?
-                .get(),
-            Err(std::env::VarError::NotPresent) => 0,
-            Err(e) => return Err(e.to_string()),
-        };
-        if replica.index() == 0 && retirement_bound_ms == 0 {
-            tracing::warn!(
-                "peer READ retirement bound unset; orphaned grants require explicit recovery"
-            );
+        let retirement_env = std::env::var("TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS");
+        let retirement_env_unset = matches!(retirement_env, Err(std::env::VarError::NotPresent));
+        let retirement_bound_ms =
+            resolve_retirement_bound_ms(retirement_env, layout.can_push_disk())?;
+        if replica.index() == 0 {
+            if retirement_bound_ms == 0 {
+                tracing::warn!(
+                    disk_push = layout.can_push_disk(),
+                    "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS is unset (0); orphaned grants from crashed readers retain holder pins until restart"
+                );
+            } else if layout.can_push_disk() && retirement_env_unset {
+                tracing::info!(
+                    retirement_bound_ms,
+                    "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS unset on Disk-push holder; defaulting to bounded orphan-grant reclamation"
+                );
+            }
         }
-        peer.enable_versioned(layout, name, incarnation, channel, retirement_bound_ms);
+        let progress_mesh = if replica.size() > 1 {
+            let listener =
+                ts_collective::Listener::bind(&settings.bind_host).map_err(|e| e.to_string())?;
+            let port = listener.port().map_err(|e| e.to_string())?;
+            let address = format!("{}:{port}", settings.push_host);
+            let addresses = mesh
+                .all_gather(replica, address.as_bytes())
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(String::from_utf8)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            let rank = replica.index();
+            let group =
+                Group::new(0, (0..addresses.len()).collect(), rank).map_err(|e| e.to_string())?;
+            let transport = Mesh::connect(rank, listener, &addresses, Duration::from_secs(60))
+                .map_err(|e| e.to_string())?;
+            Some((transport, group))
+        } else {
+            None
+        };
+        peer.enable_versioned(layout, name, incarnation, channel, retirement_bound_ms)
+            .map_err(|e| e.to_string())?;
+        peer.start_versioned_progress(progress_mesh)
+            .map_err(|e| e.to_string())?;
     }
     // A second start would be a second peer; there is one per process.
     if outbox.fence.set(peer.fence()).is_err() {
         return Err("the host's peer started twice".to_owned());
     }
     Ok(peer)
+}
+
+/// Default orphan-grant reclamation bound (ms past `SUBMIT_WINDOW`) for v1
+/// holders that can push Disk pages when `TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS`
+/// is unset. Leaves ~2x headroom past the ~65s cancel+quarantine window while
+/// ensuring crashed readers cannot permanently pin Disk/Device/Host blocks.
+const DEFAULT_DISK_PUSH_RETIREMENT_BOUND_MS: u32 = 90_000;
+
+fn resolve_retirement_bound_ms(
+    env_var: Result<String, std::env::VarError>,
+    can_push_disk: bool,
+) -> Result<u32, String> {
+    match env_var {
+        Ok(s) => Ok(s
+            .parse::<std::num::NonZeroU32>()
+            .map_err(|_| "TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS must be a positive u32")?
+            .get()),
+        Err(std::env::VarError::NotPresent) => Ok(if can_push_disk {
+            DEFAULT_DISK_PUSH_RETIREMENT_BOUND_MS
+        } else {
+            0
+        }),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retirement_bound_defaults_for_disk_holders_and_preserves_explicit_and_non_disk() {
+        assert_eq!(
+            resolve_retirement_bound_ms(Err(std::env::VarError::NotPresent), true),
+            Ok(DEFAULT_DISK_PUSH_RETIREMENT_BOUND_MS)
+        );
+        assert_eq!(
+            resolve_retirement_bound_ms(Err(std::env::VarError::NotPresent), false),
+            Ok(0)
+        );
+        assert_eq!(
+            resolve_retirement_bound_ms(Ok("45000".into()), true),
+            Ok(45_000)
+        );
+        assert!(resolve_retirement_bound_ms(Ok("0".into()), true).is_err());
+    }
 }
