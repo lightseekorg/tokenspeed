@@ -651,7 +651,13 @@ def get_runner(plan: dict, w: torch.nn.Module, *, prequantized: bool) -> MegaMoE
     top_k = w.top_k
     situ_beta = w.activation_situ_beta
     situ_linear_beta = w.activation_situ_linear_beta
-    max_capacity = _token_capacity(get_autotune_max_num_tokens())
+    scatter_size = int(plan.get("token_scatter_size", 1))
+    if scatter_size < 1:
+        raise ValueError(f"token_scatter_size must be >= 1, got {scatter_size}")
+    per_rank_ceiling = (
+        get_autotune_max_num_tokens() + scatter_size - 1
+    ) // scatter_size
+    max_capacity = _token_capacity(per_rank_ceiling)
     tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
     key = (
         id(group),

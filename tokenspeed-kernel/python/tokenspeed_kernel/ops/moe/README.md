@@ -701,10 +701,13 @@ arguments: MoE layers with matching dimensions and activation in an EP group
 share one set of workspaces (`thirdparty/flashinfer/kimi_mega_moe.py`).
 
 A workspace's token capacity is a compile-time parameter; the live row count
-is not. Both MegaMoE runners use the runtime's startup tuning capacity.
-`MoELayer.input_buffers` prepares shared storage in the CPU-backed workspace
-region during warmup. MXFP4 compiles power-of-two capacities from 128 to that
-bound over shared storage, with fixed region and counter offsets across variants.
+is not. Both MegaMoE runners size their workspace ceiling from the runtime's
+startup tuning capacity divided by `token_scatter_size` (rounded up, defaulting
+to `1`), so attention-TP callers that scatter rows across TP ranks before
+MegaMoE allocate only their per-rank share. `MoELayer.input_buffers` prepares
+shared storage in the CPU-backed workspace region during warmup. MXFP4 compiles
+power-of-two capacities from 128 to that bound over shared storage, with fixed
+region and counter offsets across variants.
 Each variant is warmed before capture. The router writes IDs and scores directly
 into the selected capacity's buffers, and the quantizer writes MXFP8 values
 and scales there. Only unused route rows need masking; there is no routing-copy

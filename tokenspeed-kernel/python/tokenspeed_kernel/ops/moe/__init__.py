@@ -2040,6 +2040,7 @@ def moe_plan(
     deepep_mode: str | None = None,
     deepep_low_latency_max_num_tokens_per_gpu: int | None = None,
     persistent_max_num_tokens_per_gpu: int | None = None,
+    token_scatter_size: int = 1,
     fast_math: bool,
     combine_order: str,
     features: frozenset[str],
@@ -2279,6 +2280,8 @@ def moe_plan(
             f"MoE kernel {apply_spec.name!r} must declare one "
             "sorted_route_block_size exactly when it declares sorted_route_rows"
         )
+    if token_scatter_size < 1:
+        raise ValueError(f"token_scatter_size must be >= 1, got {token_scatter_size}")
     return {
         "weight_dtype": weight_dtype,
         "activation": activation,
@@ -2302,6 +2305,7 @@ def moe_plan(
             deepep_low_latency_max_num_tokens_per_gpu
         ),
         "persistent_max_num_tokens_per_gpu": persistent_max_num_tokens_per_gpu,
+        "token_scatter_size": token_scatter_size,
         "fast_math": fast_math,
         "combine_order": combine_order,
         "cutlass_fused_finalize": True,

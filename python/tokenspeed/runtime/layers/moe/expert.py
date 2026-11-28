@@ -129,6 +129,7 @@ class MoELayer(torch.nn.Module):
         requires_deferred_finalize: bool = False,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
+        token_scatter_size: int = 1,
         input_dtype: torch.dtype | None = None,
         peer_weights: MoEPeerWeights | None = None,
         a2a_backend: str | None = None,
@@ -574,6 +575,7 @@ class MoELayer(torch.nn.Module):
                 deepep_low_latency_max_num_tokens_per_gpu
             ),
             persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
+            token_scatter_size=token_scatter_size,
             features=(
                 frozenset({"batch_invariant"})
                 if global_server_args_dict["numerics"] in BITWISE_ENVELOPES
