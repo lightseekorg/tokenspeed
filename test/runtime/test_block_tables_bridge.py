@@ -931,7 +931,7 @@ def test_forward_tables_match_through_retraction():
 
 def test_required_max_page_ids_scans_only_named_groups():
     """``required_max_page_ids`` validates the named subset on CPU while
-    leaving unlisted groups unscanned, without weakening ``max_page_ids``."""
+    leaving unlisted groups unscanned."""
     import numpy as np
 
     from tokenspeed.runtime.engine.scheduler_utils import (
@@ -940,18 +940,14 @@ def test_required_max_page_ids_scans_only_named_groups():
     )
 
     def _op(arrays, spans=None):
-        resolved_spans = whole_row_spans(arrays) if spans is None else spans
+        s = whole_row_spans(arrays) if spans is None else spans
         return SimpleNamespace(
             block_table_windows=lambda: whole_row_windows(arrays),
-            block_table_spans=lambda: resolved_spans,
+            block_table_spans=lambda: s,
         )
 
-    valid = _op(
-        {
-            "full": np.array([[99, 100], [50, 60]], dtype=np.int32),
-            "state": np.array([[-1, -1], [0, 4]], dtype=np.int32),
-        }
-    )
+    kv = np.array([[99, 100], [50, 60]], dtype=np.int32)
+    valid = _op({"full": kv, "state": np.array([[-1, -1], [0, 4]], dtype=np.int32)})
     packed = packed_block_tables_from_forward_op(
         valid,
         "cpu",
@@ -962,41 +958,26 @@ def test_required_max_page_ids_scans_only_named_groups():
     )
     assert packed.tables["full"].tolist() == [[99, 100], [50, 60]]
     assert packed.tables["state"].tolist() == [[-1, -1], [0, 4]]
-
-    bridged = block_tables_from_forward_op(
-        valid,
-        "cpu",
-        num_reqs=2,
-        expected_group_ids=("full", "state"),
-        required_max_page_ids={"state": 4},
-    )
-    assert bridged["state"].tolist() == [[-1, -1], [0, 4]]
+    assert block_tables_from_forward_op(
+        valid, "cpu", num_reqs=2, required_max_page_ids={"state": 4}
+    )["state"].tolist() == [[-1, -1], [0, 4]]
 
     for bad_rows, match in (
         ([[0, 5], [1, 2]], r"outside -1\.\.4.*row 0, col 1: 5"),
         ([[-2, 4], [1, 2]], r"outside -1\.\.4.*row 0, col 0: -2"),
     ):
-        oob = _op(
-            {
-                "full": np.array([[99, 100], [50, 60]], dtype=np.int32),
-                "state": np.array(bad_rows, dtype=np.int32),
-            }
-        )
+        oob = _op({"full": kv, "state": np.array(bad_rows, dtype=np.int32)})
         with pytest.raises(ValueError, match=match):
             packed_block_tables_from_forward_op(
                 oob,
                 "cpu",
                 host_tables=False,
                 num_reqs=2,
-                expected_group_ids=("full", "state"),
                 required_max_page_ids={"state": 4},
             )
 
-    bad_span_state = _op(
-        {
-            "full": np.array([[99, 100]], dtype=np.int32),
-            "state": np.array([[1, 2]], dtype=np.int32),
-        },
+    bad_span = _op(
+        {"full": kv[:1], "state": np.array([[1, 2]], dtype=np.int32)},
         spans={
             "full": np.array([[0, 2]], dtype=np.int32),
             "state": np.array([[0, 1]], dtype=np.int32),
@@ -1004,13 +985,12 @@ def test_required_max_page_ids_scans_only_named_groups():
     )
     with pytest.raises(ValueError, match="outside its row spans"):
         packed_block_tables_from_forward_op(
-            bad_span_state,
+            bad_span,
             "cpu",
             host_tables=False,
             num_reqs=1,
             required_max_page_ids={"state": 4},
         )
-
     with pytest.raises(ValueError, match="unknown cache groups"):
         packed_block_tables_from_forward_op(
             valid,
@@ -1019,37 +999,26 @@ def test_required_max_page_ids_scans_only_named_groups():
             num_reqs=2,
             required_max_page_ids={"missing": 4},
         )
-    with pytest.raises(
-        ValueError,
-        match="at most one of max_page_id, max_page_ids, or required_max_page_ids",
-    ):
-        packed_block_tables_from_forward_op(
-            valid,
-            "cpu",
-            host_tables=False,
-            num_reqs=2,
-            max_page_id=4,
-            required_max_page_ids={"state": 4},
-        )
-    with pytest.raises(
-        ValueError,
-        match="at most one of max_page_id, max_page_ids, or required_max_page_ids",
-    ):
-        packed_block_tables_from_forward_op(
-            valid,
-            "cpu",
-            host_tables=False,
-            num_reqs=2,
-            max_page_ids={"full": 100, "state": 4},
-            required_max_page_ids={"state": 4},
-        )
+    for extra in ({"max_page_id": 4}, {"max_page_ids": {"full": 100, "state": 4}}):
+        with pytest.raises(
+            ValueError,
+            match="at most one of max_page_id, max_page_ids, or required_max_page_ids",
+        ):
+            packed_block_tables_from_forward_op(
+                valid,
+                "cpu",
+                host_tables=False,
+                num_reqs=2,
+                required_max_page_ids={"state": 4},
+                **extra,
+            )
 
 
 @pytest.mark.parametrize("device_type", ["cpu", "cuda"])
 def test_cache_batch_metadata_always_bounds_state_groups_zero_gpu_sync(device_type):
-    """Pure decode / CUDA graph metadata (``validate_page_ids=False``,
-    ``host_tables=False``) always bounds every state group on CPU with zero GPU
-    sync while leaving KV page scanning gated on ``validate_page_ids``."""
+    """``CacheBatchMetadata.from_forward_op(validate_page_ids=False, host_tables=False)``
+    always bounds every state group on CPU with zero GPU sync while leaving KV unscanned.
+    """
     import numpy as np
     import torch
 
@@ -1066,109 +1035,77 @@ def test_cache_batch_metadata_always_bounds_state_groups_zero_gpu_sync(device_ty
         CacheGroupSpec,
     )
 
-    kv_spec = CacheGroupSpec(
-        group_id="full",
-        attn_kind="full_history",
-        rows_per_page=64,
-        entry_stride_tokens=4,
-        sliding_window_tokens=None,
-        shard_count=1,
-        replayable=False,
-    )
-    state_a = CacheGroupSpec(
-        group_id="state_a", attn_kind="state", shard_count=1, replayable=False
-    )
-    state_b = CacheGroupSpec(
-        group_id="state_b", attn_kind="state", shard_count=1, replayable=False
-    )
     contract = CacheRuntimeContract(
         prefix_granularity=256,
         num_lcm_blocks=4,
         token_capacity=4 * 256,
-        group_specs=(kv_spec, state_a, state_b),
-        group_page_counts={"full": 1 + 4 * 2, "state_a": 5, "state_b": 5},
+        group_specs=(
+            CacheGroupSpec(
+                group_id="full",
+                attn_kind="full_history",
+                rows_per_page=64,
+                entry_stride_tokens=4,
+                sliding_window_tokens=None,
+                shard_count=1,
+                replayable=False,
+            ),
+            CacheGroupSpec(
+                group_id="state_a", attn_kind="state", shard_count=1, replayable=False
+            ),
+            CacheGroupSpec(
+                group_id="state_b", attn_kind="state", shard_count=1, replayable=False
+            ),
+        ),
+        group_page_counts={"full": 9, "state_a": 5, "state_b": 5},
         group_packing={"full": 2, "state_a": 1, "state_b": 1},
     )
 
-    def _op(arrays):
+    def _op(full, state_a, state_b):
+        arrays = {
+            "full": np.array(full, dtype=np.int32),
+            "state_a": np.array(state_a, dtype=np.int32),
+            "state_b": np.array(state_b, dtype=np.int32),
+        }
         return SimpleNamespace(
             block_table_windows=lambda: whole_row_windows(arrays),
             block_table_spans=lambda: whole_row_spans(arrays),
         )
 
-    valid_op = _op(
-        {
-            "full": np.array([[99, 100], [1, 2]], dtype=np.int32),
-            "state_a": np.array([[-1, -1], [0, 4]], dtype=np.int32),
-            "state_b": np.array([[2, 3], [0, 1]], dtype=np.int32),
-        }
-    )
+    valid_op = _op([[99, 100], [1, 2]], [[-1, -1], [0, 4]], [[2, 3], [0, 1]])
     oob_ops = [
         (
-            _op(
-                {
-                    "full": np.array([[1, 2], [3, 4]], dtype=np.int32),
-                    "state_a": np.array([[0, 5], [1, 2]], dtype=np.int32),
-                    "state_b": np.array([[1, 2], [0, 3]], dtype=np.int32),
-                }
-            ),
+            _op([[1, 2], [3, 4]], [[0, 5], [1, 2]], [[1, 2], [0, 3]]),
             r"state_a.*outside -1\.\.4.*row 0, col 1: 5",
         ),
         (
-            _op(
-                {
-                    "full": np.array([[1, 2], [3, 4]], dtype=np.int32),
-                    "state_a": np.array([[0, 2, 4], [1, 2, -1]], dtype=np.int32),
-                    "state_b": np.array([[1, 2, 5], [0, 3, -1]], dtype=np.int32),
-                }
-            ),
+            _op([[1, 2], [3, 4]], [[0, 2, 4], [1, 2, -1]], [[1, 2, 5], [0, 3, -1]]),
             r"state_b.*outside -1\.\.4.*row 0, col 2: 5",
         ),
         (
-            _op(
-                {
-                    "full": np.array([[1, 2], [3, 4]], dtype=np.int32),
-                    "state_a": np.array([[-2, 2], [1, 2]], dtype=np.int32),
-                    "state_b": np.array([[1, 2], [0, 3]], dtype=np.int32),
-                }
-            ),
+            _op([[1, 2], [3, 4]], [[-2, 2], [1, 2]], [[1, 2], [0, 3]]),
             r"state_a.*outside -1\.\.4.*row 0, col 0: -2",
         ),
     ]
-
-    # Warm up expand_block_table_rows kernel before enabling strict sync mode.
-    CacheBatchMetadata.from_forward_op(
-        valid_op,
+    kw = dict(
         device=device_type,
         contract=contract,
         num_requests=2,
         validate_page_ids=False,
         host_tables=False,
     )
+    CacheBatchMetadata.from_forward_op(
+        valid_op, **kw
+    )  # warm up kernel before sync check
 
     previous = torch.cuda.get_sync_debug_mode() if device_type == "cuda" else None
     try:
         if device_type == "cuda":
             torch.cuda.synchronize()
             torch.cuda.set_sync_debug_mode("error")
-        metadata = CacheBatchMetadata.from_forward_op(
-            valid_op,
-            device=device_type,
-            contract=contract,
-            num_requests=2,
-            validate_page_ids=False,
-            host_tables=False,
-        )
+        metadata = CacheBatchMetadata.from_forward_op(valid_op, **kw)
         for bad_op, match in oob_ops:
             with pytest.raises(ValueError, match=match):
-                CacheBatchMetadata.from_forward_op(
-                    bad_op,
-                    device=device_type,
-                    contract=contract,
-                    num_requests=2,
-                    validate_page_ids=False,
-                    host_tables=False,
-                )
+                CacheBatchMetadata.from_forward_op(bad_op, **kw)
     finally:
         if device_type == "cuda":
             torch.cuda.set_sync_debug_mode(previous)
