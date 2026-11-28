@@ -44,6 +44,12 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 ENV = "TOKENSPEED_DRAFT_GRAPH_OVERLAP"
+# Without NVIDIA decode graphs, the rank-0 log names that condition first.
+NVIDIA = torch.version.hip is None
+
+
+def _expected_log(message: str) -> str:
+    return message if NVIDIA else "NVIDIA decode graphs"
 
 
 class OverlapDraft(nn.Module):
@@ -165,9 +171,9 @@ def overlap_log(caplog):
 
 def test_unset_enables_and_wires_the_overlap_on_an_eligible_runner(overlap_log):
     runner = _runner()
-    assert runner.draft_overlap is not None
+    assert (runner.draft_overlap is not None) == NVIDIA
     assert runner.drafter.decode_overlap is runner.draft_overlap
-    assert "Draft graph overlap on" in overlap_log.text
+    assert _expected_log("Draft graph overlap on") in overlap_log.text
 
 
 def test_zero_leaves_an_eligible_runner_without_overlap(monkeypatch):
@@ -195,7 +201,7 @@ def test_unset_ineligible_runner_runs_without_overlap_and_logs(
         kwargs = dict(config=_config(**kwargs["config"]))
     runner = _runner(**kwargs)
     assert runner.draft_overlap is None
-    assert reason in overlap_log.text
+    assert _expected_log(reason) in overlap_log.text
 
 
 @pytest.mark.parametrize(
@@ -222,10 +228,10 @@ def test_mega_moe_mask_keeps_the_overlap_off(monkeypatch, overlap_log):
     monkeypatch.setattr(moe_utils, "MOE_BACKEND", moe_utils.MoeBackend.MEGA_MOE)
     runner = _runner()
     assert runner.draft_overlap is None
-    assert "shared MoE row masks" in overlap_log.text
+    assert _expected_log("shared MoE row masks") in overlap_log.text
 
 
 def test_a_nonzero_rank_does_not_log(overlap_log):
     runner = _runner(config=_config(global_rank=1))
-    assert runner.draft_overlap is not None
+    assert (runner.draft_overlap is not None) == NVIDIA
     assert "Draft graph overlap" not in overlap_log.text
