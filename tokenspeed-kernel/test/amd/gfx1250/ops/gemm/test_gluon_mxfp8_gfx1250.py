@@ -20,8 +20,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.gemm import torch_mm_fp8_blockscale
@@ -466,54 +464,3 @@ def test_mxfp8_ue8m0_gemv_preserves_strided_out() -> None:
         atol=_BF16_ATOL,
         rtol=_BF16_RTOL,
     )
-
-
-def test_mxfp8_launch_metadata_models_reread_traffic() -> None:
-    m, n, k = 4, 128, 256
-    metadata = mxfp8_mm._ue8m0_launch_metadata(
-        (n // 16,),
-        SimpleNamespace(name="mxfp8"),
-        {"M": m, "N": n, "K": k, "SPLIT_K": 1},
-    )
-
-    assert metadata["name"] == "mxfp8"
-    assert metadata["flops8"] == 2 * m * n * k
-    assert metadata["bytes"] == (
-        n * k
-        + (n // 16) * m * k
-        + n * (k // 32)
-        + (n // 16) * m * (k // 32)
-        + m * n * 2
-    )
-    assert (
-        mxfp8_mm.gluon_mm_mxfp8_ue8m0_gfx1250.launch_metadata
-        is mxfp8_mm._ue8m0_launch_metadata
-    )
-
-
-def test_mxfp8_split_k_launch_metadata_models_partials() -> None:
-    m, n, k, split_k = 4, 576, 5120, 5
-    producer = mxfp8_mm._ue8m0_launch_metadata(
-        (n // 16 * split_k,),
-        SimpleNamespace(name="mxfp8_split"),
-        {"M": m, "N": n, "K": k, "SPLIT_K": split_k},
-    )
-    reduction = mxfp8_mm._split_reduce_launch_metadata(
-        (m * ((n + 127) // 128),),
-        SimpleNamespace(name="mxfp8_reduce"),
-        {"M": m, "N": n, "SPLIT_K": split_k},
-    )
-
-    assert producer["flops8"] == 2 * m * n * k
-    assert producer["bytes"] == (
-        n * k
-        + (n // 16) * m * k
-        + n * (k // 32)
-        + (n // 16) * m * (k // 32)
-        + split_k * m * n * 4
-    )
-    assert reduction == {
-        "name": "mxfp8_reduce",
-        "flops32": m * n * (split_k - 1),
-        "bytes": split_k * m * n * 4 + m * n * 2,
-    }

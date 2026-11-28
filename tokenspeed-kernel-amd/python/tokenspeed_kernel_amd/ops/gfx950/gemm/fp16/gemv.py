@@ -21,9 +21,9 @@
 """Dense16 decode GEMV ``y = x @ w.T`` (M <= 16) for gfx950.
 
 One program computes ``rows`` consecutive output columns over the full K, so
-a launch has one program per CU (``rows = cdiv(N, CUs)``; two for the shapes
-in ``_HALF_TILE_MAX_M``) and every program issues its whole weight share
-without split-K or cross-CU reductions:
+a launch has one program per CU (``rows = cdiv(N, CUs)``, or the measured
+tile height in ``_ROWS_PER_PROGRAM``) and every program issues its whole
+weight share without split-K or cross-CU reductions:
 
 * M = 1, ``BLOCK_M == 1``: FMA tile. Waves split the rows, lanes split each
   K chunk with 16-byte loads (one load instruction reads a 1 KB contiguous
@@ -114,8 +114,22 @@ _MFMA_BLOCK_M = 16
 _MFMA_MIN_BLOCK_N = 16
 _MFMA_LONG_K = 8192
 _MFMA_LONG_K_WARPS = 8
-# (N, K) -> largest M where two 16-row programs per CU beat one 28-row program.
-_HALF_TILE_MAX_M = {(7168, 768): 16, (7168, 1536): 4, (7168, 3584): 8}
+# (N, K) -> {row bucket (_row_bucket): output rows per program} where a
+# measured tile height beat one program per CU (``rows = cdiv(N, CUs)``) in
+# cold-cache sweeps on MI350X. Shorter tiles launch several programs per CU,
+# which keeps more weight bytes in flight on a CU and trims the power-of-2
+# padding of BLOCK_N: Qwen3.8-Flash-Next's 16480-wide in_proj takes 65 rows a
+# CU, a 128-row block half masked; 16-row programs avoid the masked half.
+_ROWS_PER_PROGRAM: dict[tuple[int, int], dict[int, int]] = {
+    # Kimi K3 TP8: two 16-row programs per CU beat one 28-row program.
+    (7168, 768): {4: 16, 8: 16, 16: 16},
+    (7168, 1536): {4: 16},
+    (7168, 3584): {4: 16, 8: 16},
+    # Qwen3.8-Flash-Next TP1 GDN in_proj (q, k, v, z, b, a).
+    (16480, 2560): {1: 8, 4: 16, 8: 16, 16: 32},
+    # Qwen3.8-Flash-Next TP1 attention q (with the output gate), k, v.
+    (13312, 2560): {1: 8, 4: 32, 8: 32, 16: 64},
+}
 # Gated GEMV: every K iteration's weights are in registers at once, and past 8
 # rows the norm each program repeats outlasts the weight stream.
 _GATED_MAX_ITERS = 3
@@ -127,6 +141,13 @@ _RMSNORM_MAX_ITERS = 3
 # several programs a CU instead of one tile too large for its registers.
 A16W8_MAX_M = 128
 _A16W8_MAX_BLOCK_N = 32
+# Outputs at least this many columns per CU (a whole-vocabulary LM head) take
+# 64 columns a program instead: every program re-reads all M activation rows
+# from L2, and with hundreds of columns per CU the halved re-reads outweigh
+# the coarser balance. Measured 2-17% faster at 1-32 rows on the 248320 x
+# 2560 Qwen3.8 head (MI350X, cold-weight graph replay).
+_A16W8_WIDE_COLUMNS_PER_CU = 256
+_A16W8_WIDE_BLOCK_N = 64
 # Per wave and K iteration, the activation tile (BLOCK_M x BLOCK_K 16-bit)
 # and the weight tile (BLOCK_N x BLOCK_K bytes) each stay within 128 B a
 # lane (32 VGPRs; the next iteration's copies double that).
@@ -912,10 +933,17 @@ def _mfma_k_step(k: int) -> tuple[int, int]:
     return (128 if k >= 128 * num_warps else 64), num_warps
 
 
+def _row_bucket(m: int) -> int:
+    """Row bucket of ``_ROWS_PER_PROGRAM``: 1, 2-4, 5-8 or 9-16 rows."""
+    return 1 if m == 1 else 4 if m <= 4 else 8 if m <= 8 else MAX_M
+
+
 def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int, int]:
     """``(rows, BLOCK_M, BLOCK_N, BLOCK_K, STAGES, num_warps)`` of a GEMV
     with ``n`` outputs on ``cus`` CUs."""
-    rows = triton.cdiv(n, cus)
+    rows = _ROWS_PER_PROGRAM.get((n, k), {}).get(_row_bucket(m))
+    if rows is None:
+        rows = triton.cdiv(n, cus)
     if m == 1:
         block_n = max(triton.next_power_of_2(rows), NUM_WARPS)
         rows_per_wave = block_n // NUM_WARPS
@@ -937,8 +965,6 @@ def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int, 
             return rows, 1, block_n, _FMA_MIN_CHUNK, stages, NUM_WARPS
         return rows, 1, block_n, chunk, 0, NUM_WARPS
     block_k, num_warps = _mfma_k_step(k)
-    if rows > _MFMA_MIN_BLOCK_N and m <= _HALF_TILE_MAX_M.get((n, k), 0):
-        rows = _MFMA_MIN_BLOCK_N
     block_n = max(triton.next_power_of_2(rows), _MFMA_MIN_BLOCK_N)
     return rows, _MFMA_BLOCK_M, block_n, block_k, 0, num_warps
 
@@ -946,7 +972,13 @@ def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int, 
 def _a16w8_config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int]:
     """``(rows, BLOCK_M, BLOCK_N, BLOCK_K, num_warps)`` of the FP8-weight
     GEMV with ``m`` rows and ``n`` outputs on ``cus`` CUs."""
-    rows = min(triton.cdiv(n, cus), _A16W8_MAX_BLOCK_N)
+    per_cu = triton.cdiv(n, cus)
+    max_block_n = (
+        _A16W8_WIDE_BLOCK_N
+        if per_cu >= _A16W8_WIDE_COLUMNS_PER_CU
+        else _A16W8_MAX_BLOCK_N
+    )
+    rows = min(per_cu, max_block_n)
     block_n = max(triton.next_power_of_2(rows), _MFMA_MIN_BLOCK_N)
     block_m = max(triton.next_power_of_2(m), _MFMA_BLOCK_M)
     num_warps = _MFMA_LONG_K_WARPS if k >= _MFMA_LONG_K else NUM_WARPS
@@ -1008,13 +1040,28 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     (5120, 15360): frozenset({1, 4, 16}),  # draft fc
     (5120, 16384): frozenset({4, 16}),  # draft MLP down
     (5120, 17408): frozenset({1, 4, 16}),  # MLP down
+    # Qwen3.8-Flash-Next TP1 (tile heights in _ROWS_PER_PROGRAM).
+    (16480, 2560): frozenset({1, 4, 16}),  # GDN in_proj
+    (13312, 2560): frozenset({1, 4, 16}),  # attention QKV with the output gate
+    (2560, 6144): frozenset({1, 4, 16}),  # GDN out_proj, attention o_proj
+}
+
+
+# (N, K) -> last row count of the 5-16 bucket where this GEMV still beat the
+# default; past it the default is faster.
+_PREFERRED_LAST_M: dict[tuple[int, int], int] = {
+    # Qwen3.8-Flash-Next TP1 in_proj: 21-34% faster than hipBLASLt at 9-13
+    # rows, 2-6% slower at 14-16.
+    (16480, 2560): 13,
 }
 
 
 def prefers_gluon_gemv_a16w16_gfx950(m: int, n: int, k: int) -> bool:
     """Whether this GEMV measured faster than the default selection here."""
     bucket = 1 if m == 1 else 4 if m <= 4 else 16 if m <= MAX_M else None
-    return bucket in _PREFERRED_BUCKETS.get((n, k), frozenset())
+    return bucket in _PREFERRED_BUCKETS.get(
+        (n, k), frozenset()
+    ) and m <= _PREFERRED_LAST_M.get((n, k), MAX_M)
 
 
 def launch_gluon_gemv_a16w16_gfx950(

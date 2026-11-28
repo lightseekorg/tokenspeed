@@ -28,6 +28,10 @@ from tokenspeed_kernel.numerics.torch.quantization import (
     dequantize_mxfp4,
     fake_quantize_mxfp4_even,
 )
+from tokenspeed_kernel.ops.activation.triton import (
+    fused_gate_sigmoid_mul_add,
+    moe_finalize_gate_add,
+)
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -128,7 +132,8 @@ def _torch_reference(x, w, topk_weights, topk_ids):
     )
 
 
-# 1-64 rows run the decode blocks; 300 and 1100 the LDS-staged larger blocks.
+# Up to 819 rows (8192 routes) run the decode stages; 1100 the LDS-staged
+# block stages.
 @pytest.mark.parametrize("m", [1, 5, 64, 300, 1100])
 def test_matches_reference(m: int) -> None:
     w = _weights()
@@ -155,13 +160,39 @@ def test_matches_reference(m: int) -> None:
     assert (actual == portable).float().mean().item() > 0.99
 
 
-# Decode route sets whose padded expert blocks span one to several 256-row
-# padding stores of the fused sort.
-@pytest.mark.parametrize("m", [1, 16, 64, 128])
-def test_fused_sort_matches_the_standalone_sort(m: int, monkeypatch) -> None:
+def _skewed_routes(m: int, hot: int, seed: int):
+    """Routes whose first ``hot`` slots go to experts ``0 .. hot - 1`` for
+    every token, so those experts get ``m`` routes each."""
+    x, topk_weights, topk_ids = _routes(m, seed=seed)
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    rest = torch.rand(m, EXPERTS - hot, device="cuda", generator=g).topk(
+        TOP_K - hot, dim=-1
+    )
+    topk_ids = torch.cat(
+        [
+            torch.arange(hot, device="cuda", dtype=torch.int32).expand(m, hot),
+            (rest.indices + hot).to(torch.int32),
+        ],
+        dim=1,
+    ).contiguous()
+    return x, topk_weights, topk_ids
+
+
+# Decode route sets from one grouping chunk to several, and skewed sets whose
+# hot experts run many 16-route tiles against weights loaded once (300 rows:
+# 19 tiles), match the block stages bit for bit: both compute every route
+# row on its own and combine in slot order.
+@pytest.mark.parametrize(
+    "m, hot",
+    [(1, 0), (16, 0), (64, 0), (128, 0), (40, 3), (300, 4), (512, 8), (800, 6)],
+)
+def test_decode_stages_match_the_block_stages(m: int, hot: int, monkeypatch) -> None:
     w = _weights()
     moe_process_weights(_plan(None), w)
-    x, topk_weights, topk_ids = _routes(m, seed=m)
+    if hot:
+        x, topk_weights, topk_ids = _skewed_routes(m, hot, seed=m)
+    else:
+        x, topk_weights, topk_ids = _routes(m, seed=m)
 
     def run():
         return mxfp4_gemm.launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
@@ -172,14 +203,108 @@ def test_fused_sort_matches_the_standalone_sort(m: int, monkeypatch) -> None:
             w.w2_weight_scale,
             topk_weights,
             topk_ids,
+            True,
         )
 
-    fused = run()
-    # Every route set takes gluon_moe_sorting instead.
-    monkeypatch.setattr(mxfp4_gemm, "_FUSED_SORT_MAX_ROUTES", 0)
-    # Routes are computed per row and combined in slot order, so the order of
-    # routes within an expert block does not change the bits.
-    torch.testing.assert_close(fused, run(), atol=0, rtol=0)
+    decode = run()
+    # Every route set takes gluon_moe_sorting and the block stages instead.
+    monkeypatch.setattr(mxfp4_gemm, "_DECODE_MAX_ROUTES", 0)
+    torch.testing.assert_close(decode, run(), atol=0, rtol=0)
+
+
+# Both block heights agree bit for bit. With 64-row sort blocks the down GEMM
+# runs 32-row tiles: an expert with at most 32 routes leaves a tile of only
+# padding (skipped), and the hot experts fill many tiles.
+@pytest.mark.parametrize("m, hot", [(300, 0), (700, 4)])
+def test_block_heights_match(m: int, hot: int, monkeypatch) -> None:
+    w = _weights()
+    moe_process_weights(_plan(None), w)
+    if hot:
+        x, topk_weights, topk_ids = _skewed_routes(m, hot, seed=m)
+    else:
+        x, topk_weights, topk_ids = _routes(m, seed=m)
+    topk_ids[1, 3] = -1
+
+    def run(block_m: int):
+        monkeypatch.setattr(
+            mxfp4_gemm, "_select_config", lambda r, e: mxfp4_gemm._CONFIGS[block_m]
+        )
+        return mxfp4_gemm.launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
+            x,
+            w.w13_weight,
+            w.w13_weight_scale,
+            w.w2_weight,
+            w.w2_weight_scale,
+            topk_weights,
+            topk_ids,
+            False,
+        )[0]
+
+    decode = run(32)
+    monkeypatch.setattr(mxfp4_gemm, "_DECODE_MAX_ROUTES", 0)
+    torch.testing.assert_close(run(32), decode, atol=0, rtol=0)
+    torch.testing.assert_close(run(64), decode, atol=0, rtol=0)
+
+
+# Token 2 routes to no expert in [0, E) and token 4 drops one slot: their
+# deferred rows are zero, so the shared-expert finalize needs no row map.
+@pytest.mark.parametrize("m", [6, 600])
+def test_deferred_routes_finalize_like_the_kernel(m: int) -> None:
+    w = _weights()
+    moe_process_weights(_plan(None), w)
+    x, topk_weights, topk_ids = _routes(m, seed=m)
+    topk_ids[2] = -1
+    topk_ids[4, -1] = EXPERTS
+    args = (
+        x,
+        w.w13_weight,
+        w.w13_weight_scale,
+        w.w2_weight,
+        w.w2_weight_scale,
+        topk_weights,
+        topk_ids,
+    )
+    g = torch.Generator(device="cuda").manual_seed(m)
+    gate_weight = torch.randn(HIDDEN, device="cuda", generator=g).bfloat16() / 32
+    shared = torch.randn(m, HIDDEN, device="cuda", generator=g).bfloat16()
+
+    expected = mxfp4_gemm.launch_gluon_mxfp4_a4w4_moe_apply_gfx950(*args, True)
+    fused_gate_sigmoid_mul_add(x, gate_weight, shared, expected)
+    route_out, route_weights, row_map = (
+        mxfp4_gemm.launch_gluon_mxfp4_a4w4_moe_apply_gfx950(*args, False)
+    )
+    assert row_map is None
+    torch.testing.assert_close(
+        route_out[2 * TOP_K : 3 * TOP_K].abs().max(),
+        torch.zeros((), device="cuda", dtype=torch.bfloat16),
+        atol=0,
+        rtol=0,
+    )
+    actual = moe_finalize_gate_add(
+        route_out, None, route_weights, x, gate_weight, shared
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_tokens_without_local_experts_are_zero() -> None:
+    w = _weights()
+    moe_process_weights(_plan(None), w)
+    x, topk_weights, topk_ids = _routes(6)
+    # Tokens 1 and 4 route to no expert in [0, E); -1 and E are both out.
+    topk_ids[1] = -1
+    topk_ids[4] = EXPERTS
+    actual = mxfp4_gemm.launch_gluon_mxfp4_a4w4_moe_apply_gfx950(
+        x,
+        w.w13_weight,
+        w.w13_weight_scale,
+        w.w2_weight,
+        w.w2_weight_scale,
+        topk_weights,
+        topk_ids,
+        True,
+    )
+    assert actual[[1, 4]].abs().max().item() == 0
+    assert actual[[0, 2, 3, 5]].abs().min(dim=1).values.max().item() > 0
 
 
 def test_row_strided_activations_match_contiguous() -> None:
@@ -212,6 +337,7 @@ def test_out_of_range_expert_contributes_zero() -> None:
         w.w2_weight_scale,
         topk_weights,
         dropped,
+        True,
     )
     kept_weights = topk_weights.clone()
     kept_weights[:, -1] = 0
@@ -223,6 +349,7 @@ def test_out_of_range_expert_contributes_zero() -> None:
         w.w2_weight_scale,
         kept_weights,
         topk_ids,
+        True,
     )
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
@@ -262,6 +389,8 @@ def test_batch_sizes_do_not_recompile() -> None:
     moe_process_weights(_plan(None), w)
     kernels = (
         mxfp4_gemm.gluon_mxfp4_a4w4_moe_apply_prep_gfx950,
+        mxfp4_gemm.gluon_mxfp4_a4w4_moe_apply_decode_stage1_gfx950,
+        mxfp4_gemm.gluon_mxfp4_a4w4_moe_apply_decode_stage2_gfx950,
         mxfp4_gemm.gluon_mxfp4_a4w4_moe_apply_stage1_gfx950,
         mxfp4_gemm.gluon_mxfp4_a4w4_moe_apply_stage2_gfx950,
         mxfp4_gemm.gluon_mxfp4_a4w4_moe_apply_combine_gfx950,
@@ -277,16 +406,17 @@ def test_batch_sizes_do_not_recompile() -> None:
             w.w2_weight_scale,
             topk_weights,
             topk_ids,
+            True,
         )
 
-    # Every decode width (routes <= 4 per expert, sorted in the prep launch
-    # with a power-of-two route bound) shares one specialization, and so does
-    # every width of the 64-row prefill blocks; the row count is a runtime
-    # argument in every kernel.
-    run(1)
-    run(400)
+    # The decode stages take every route count as a runtime argument; only
+    # the prep launch's grouping specializes, on the route count rounded up
+    # to a power of two (512 to 8192 routes: one compilation per bucket).
+    # Every width of the prefill blocks shares one specialization.
+    for m in (1, 100, 200, 400, 600, 1100):
+        run(m)
     with assert_no_triton_compile(*kernels):
-        for m in (2, 3, 7, 16, 17, 32, 401, 517, 1000):
+        for m in (2, 3, 7, 16, 17, 32, 64, 65, 128, 129, 256, 257, 512, 513, 1000):
             run(m)
     torch.cuda.synchronize()
 
@@ -305,6 +435,7 @@ def test_cuda_graph_replay_matches_eager() -> None:
             w.w2_weight_scale,
             topk_weights,
             topk_ids,
+            True,
         )
 
     run()

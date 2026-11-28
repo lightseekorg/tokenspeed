@@ -1035,7 +1035,7 @@ if platform.is_nvidia:
             )
         else:
             result = trtllm_fp8_block_scale_moe(
-                routing_logits=router_logits.to(torch.float32),
+                routing_logits=router_logits,
                 routing_bias=routing_bias,
                 n_group=n_group,
                 topk_group=topk_group,
@@ -4005,6 +4005,7 @@ if platform.is_nvidia:
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"kernel_routing"}),
             "supports_deferred_finalize": frozenset({True}),
+            "deferred_finalize_is_slot_sum": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({TRTLLM_NVFP4_ISPP_ALIGNMENT}),
@@ -4061,6 +4062,7 @@ if platform.is_nvidia:
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({True}),
+            "deferred_finalize_is_slot_sum": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({TRTLLM_NVFP4_ISPP_ALIGNMENT}),
@@ -4124,6 +4126,7 @@ if platform.is_nvidia:
             "routing_mode": frozenset({"precomputed_topk"}),
             "topk_weights_dtype": frozenset({torch.bfloat16}),
             "supports_deferred_finalize": frozenset({True, False}),
+            "deferred_finalize_is_slot_sum": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({TRTLLM_NVFP4_ISPP_ALIGNMENT}),
@@ -4218,6 +4221,7 @@ if platform.is_nvidia:
             "activation": frozenset({"relu2"}),
             "routing_mode": frozenset({"kernel_routing"}),
             "supports_deferred_finalize": frozenset({True}),
+            "deferred_finalize_is_slot_sum": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT}),
@@ -4271,6 +4275,7 @@ if platform.is_nvidia:
             "activation": frozenset({"relu2"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({True}),
+            "deferred_finalize_is_slot_sum": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({TRTLLM_NVFP4_RELU2_ISPP_ALIGNMENT}),

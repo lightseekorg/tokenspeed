@@ -177,7 +177,7 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.5 and compile isolated modules, operators, and tuning caches. They require
+0.7.6 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
@@ -252,7 +252,7 @@ replay. Performance depends on routing; benchmark the intended workload.
 
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.5) initializes unused rows inside active
+The pinned FlashInfer version (0.7.6) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
@@ -630,6 +630,15 @@ hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
 returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
+
+Qwen3.5-style shared experts with a sigmoid gate fold the routed finalize into
+the gate add (`moe_finalize_gate_add`, portable Triton) when the selected
+kernel declares `deferred_finalize_is_slot_sum`: its own finalize is the FP32
+top-k slot-order sum, one FMA per route, rounded to BF16 once, so the fold is
+bit-identical to the kernel's finalize followed by the gate add. The TRT-LLM
+NVFP4 kernels and the gfx950 A4W4 kernel declare it; the A4W4 kernel defers
+with token-order rows (zero for experts outside `[0, E)`) and no row map,
+which `moe_finalize_gate_add` takes as `None`.
 
 ## Kimi-K3 router
 

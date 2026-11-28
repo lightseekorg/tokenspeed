@@ -347,6 +347,54 @@ def dequantize_mxfp4_to_bf16(
     return (values * scale).reshape(rows, -1).to(torch.bfloat16)
 
 
+def quantize_bf16_to_mxfp4(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 16-bit weight to serialized MXFP4 as AMD Quark does.
+
+    Quark's MX weight quantization with ``scale_calculation_mode: even`` and
+    ``round_method: half_even``: each 32-value group's amax is first rounded
+    to E2M1's one mantissa bit (adding ``0x200000`` to its FP32 bits), and the
+    group's E8M0 scale is that amax's exponent minus 2, so the largest value
+    lands at most at 6 after scaling; scaled values round to the nearest E2M1
+    value with ties to the even code, saturating at 6. The inverse of
+    :func:`dequantize_mxfp4_to_bf16`.
+
+    Args:
+        weight: ``[N, K]`` BF16 or FP16 weight, ``K`` a multiple of 32.
+
+    Returns:
+        ``(packed, scales)``: ``[N, K // 2]`` uint8 E2M1 codes, the even
+        element in the low nibble, and ``[N, K // 32]`` uint8 E8M0 exponents.
+    """
+    if weight.dtype not in (torch.bfloat16, torch.float16) or weight.ndim != 2:
+        raise TypeError(
+            f"MXFP4 quantization expects a 2D 16-bit weight, got {weight.dtype} "
+            f"{tuple(weight.shape)}"
+        )
+    rows, k = weight.shape
+    if k % 32:
+        raise ValueError(f"MXFP4 quantization needs K divisible by 32, got {k}")
+    groups = weight.float().view(rows, k // 32, 32)
+    amax = groups.abs().amax(dim=-1, keepdim=True)
+    # The biased exponent of the rounded amax, minus E2M1's largest exponent.
+    biased = ((amax.view(torch.int32) + 0x200000) >> 23) - 2
+    biased = biased.clamp(0, 254)
+    # Dividing by a power of two is exact.
+    scaled = groups.abs() / torch.exp2(biased.float() - 127.0)
+    grid = torch.tensor(_E2M1_VALUES, dtype=torch.float32, device=weight.device)
+    midpoints = (grid[1:] + grid[:-1]) / 2
+    # Index of the nearest grid value; at a midpoint between codes i and i + 1
+    # the even one, which is i + 1 exactly when i is odd.
+    odd = torch.arange(7, device=weight.device) % 2 == 1
+    above = scaled.unsqueeze(-1) > midpoints
+    tie_up = (scaled.unsqueeze(-1) == midpoints) & odd
+    codes = (above | tie_up).sum(dim=-1, dtype=torch.uint8)
+    # Quark keeps the sign bit of negatives that round to zero.
+    codes |= groups.signbit().to(torch.uint8) << 3
+    codes = codes.view(rows, k // 2, 2)
+    packed = codes[..., 0] | (codes[..., 1] << 4)
+    return packed.contiguous(), biased.view(rows, k // 32).to(torch.uint8)
+
+
 def preprocess_mxfp4_checkpoint_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     quant_config: QuantizationConfig | None,

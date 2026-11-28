@@ -2,23 +2,26 @@
   "schema_version": 1,
   "cases": [
     {
-      "id": "qwen38_flash.gemm.mv/tp2-hc_down-n324-k10240-bfloat16",
+      "id": "qwen38_flash.gemm.mm/tp1-gdn_in_proj-n16480-k2560-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "gemm",
-        "mode": "mv",
+        "mode": "mm",
         "parameters": {
           "M": [
-            16,
-            64
+            4,
+            32,
+            128,
+            256
           ],
-          "N": 324,
-          "K": 10240,
+          "N": 16480,
+          "K": 2560,
+          "quant": "none",
           "dtype": "bfloat16"
         },
         "cold_cache": true,
-        "seed": 5107
+        "seed": 5146
       },
       "policy": {
         "max_regression_relative": 0.06,
@@ -26,7 +29,7 @@
       }
     },
     {
-      "id": "qwen38_flash.gemm.mv/tp2-final_mixer-n320-k10240-bfloat16",
+      "id": "qwen38_flash.gemm.mv/tp1-attn_qkv-n13312-k2560-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
@@ -34,87 +37,14 @@
         "mode": "mv",
         "parameters": {
           "M": [
-            16,
-            64
+            1
           ],
-          "N": 320,
-          "K": 10240,
-          "dtype": "bfloat16"
-        },
-        "cold_cache": true,
-        "seed": 5108
-      },
-      "policy": {
-        "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0
-      }
-    },
-    {
-      "id": "qwen38_flash.gemm.mv/tp2-hc_up-n10240-k320-bfloat16",
-      "comparison_epoch": 1,
-      "measurement_blocks": 50,
-      "definition": {
-        "family": "gemm",
-        "mode": "mv",
-        "parameters": {
-          "M": [
-            16,
-            64
-          ],
-          "N": 10240,
-          "K": 320,
-          "dtype": "bfloat16"
-        },
-        "cold_cache": true,
-        "seed": 5109
-      },
-      "policy": {
-        "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0
-      }
-    },
-    {
-      "id": "qwen38_flash.gemm.mv/tp2-o_proj-n2560-k3072-bfloat16",
-      "comparison_epoch": 1,
-      "measurement_blocks": 50,
-      "definition": {
-        "family": "gemm",
-        "mode": "mv",
-        "parameters": {
-          "M": [
-            16,
-            64
-          ],
-          "N": 2560,
-          "K": 3072,
-          "dtype": "bfloat16"
-        },
-        "cold_cache": true,
-        "seed": 5110
-      },
-      "policy": {
-        "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0
-      }
-    },
-    {
-      "id": "qwen38_flash.gemm.mv/tp2-router-n512-k2560-bfloat16",
-      "comparison_epoch": 1,
-      "measurement_blocks": 50,
-      "definition": {
-        "family": "gemm",
-        "mode": "mv",
-        "parameters": {
-          "M": [
-            16,
-            64
-          ],
-          "N": 512,
+          "N": 13312,
           "K": 2560,
           "dtype": "bfloat16"
         },
         "cold_cache": true,
-        "seed": 5111
+        "seed": 5147
       },
       "policy": {
         "max_regression_relative": 0.06,
@@ -122,7 +52,36 @@
       }
     },
     {
-      "id": "qwen38_flash.gemm.mv/tp2-qsa_indexer-n640-k2560-bfloat16",
+      "id": "qwen38_flash.gemm.mm/tp1-attn_qkv-n13312-k2560-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [
+            4,
+            8,
+            32,
+            64,
+            128,
+            256
+          ],
+          "N": 13312,
+          "K": 2560,
+          "quant": "none",
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5148
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp1-o_proj-n2560-k6144-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
@@ -130,7 +89,62 @@
         "mode": "mv",
         "parameters": {
           "M": [
-            16,
+            1
+          ],
+          "N": 2560,
+          "K": 6144,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5149
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mm/tp1-o_proj-n2560-k6144-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [
+            4,
+            8,
+            32,
+            64,
+            128,
+            256
+          ],
+          "N": 2560,
+          "K": 6144,
+          "quant": "none",
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5150
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp1-qsa_indexer-n640-k2560-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            1,
+            4,
+            8,
+            32,
             64
           ],
           "N": 640,
@@ -138,7 +152,7 @@
           "dtype": "bfloat16"
         },
         "cold_cache": true,
-        "seed": 5112
+        "seed": 5151
       },
       "policy": {
         "max_regression_relative": 0.06,
@@ -146,7 +160,32 @@
       }
     },
     {
-      "id": "qwen38_flash.gemm.mv/tp2-mtp_fc-n2560-k2560-bfloat16",
+      "id": "qwen38_flash.gemm.mm/tp1-qsa_indexer-n640-k2560-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [
+            128,
+            256
+          ],
+          "N": 640,
+          "K": 2560,
+          "quant": "none",
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5152
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp1-router-n512-k2560-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
@@ -154,7 +193,61 @@
         "mode": "mv",
         "parameters": {
           "M": [
-            16,
+            1,
+            4,
+            8,
+            32,
+            64
+          ],
+          "N": 512,
+          "K": 2560,
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5153
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mm/tp1-router-n512-k2560-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [
+            128,
+            256
+          ],
+          "N": 512,
+          "K": 2560,
+          "quant": "none",
+          "dtype": "bfloat16"
+        },
+        "cold_cache": true,
+        "seed": 5154
+      },
+      "policy": {
+        "max_regression_relative": 0.06,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "qwen38_flash.gemm.mv/tp1-mtp_fc-n2560-k2560-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "gemm",
+        "mode": "mv",
+        "parameters": {
+          "M": [
+            1,
+            8,
+            32,
             64
           ],
           "N": 2560,
@@ -162,7 +255,7 @@
           "dtype": "bfloat16"
         },
         "cold_cache": true,
-        "seed": 5113
+        "seed": 5155
       },
       "policy": {
         "max_regression_relative": 0.06,
@@ -170,7 +263,7 @@
       }
     },
     {
-      "id": "qwen38_flash.gemm.mv/tp2-gdn_in_proj-n8240-k2560-bfloat16",
+      "id": "qwen38_flash.gemm.mv/tp1-lm_head-n248320-k2560-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
@@ -178,43 +271,47 @@
         "mode": "mv",
         "parameters": {
           "M": [
-            16,
-            64
+            1
           ],
-          "N": 8240,
+          "N": 248320,
           "K": 2560,
           "dtype": "bfloat16"
         },
         "cold_cache": true,
-        "seed": 5114
+        "seed": 5156
       },
       "policy": {
-        "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0
       }
     },
     {
-      "id": "qwen38_flash.gemm.mv/tp2-attn_qkv-n6656-k2560-bfloat16",
+      "id": "qwen38_flash.gemm.mm/tp1-lm_head-n248320-k2560-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "gemm",
-        "mode": "mv",
+        "mode": "mm",
         "parameters": {
           "M": [
-            16,
-            64
+            4,
+            8,
+            32,
+            64,
+            128,
+            256
           ],
-          "N": 6656,
+          "N": 248320,
           "K": 2560,
+          "quant": "none",
           "dtype": "bfloat16"
         },
         "cold_cache": true,
-        "seed": 5115
+        "seed": 5157
       },
       "policy": {
-        "max_regression_relative": 0.06,
-        "max_regression_absolute_us": 1.0
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 5.0
       }
     }
   ]

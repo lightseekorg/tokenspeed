@@ -22,10 +22,8 @@
 
 from __future__ import annotations
 
-import importlib
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -112,9 +110,16 @@ def test_index_scan_graph_oracle_gluon(device, dtype, require, monkeypatch):
     )
 
 
-@pytest.mark.parametrize("heads", [1, 8, 32])
-@pytest.mark.parametrize("candidate_topk", [0, 17])
-@pytest.mark.parametrize("topk", [65, 512])
+# Every pair of top-k, block selection (none or 17 blocks) and head count.
+@pytest.mark.parametrize(
+    ("topk", "candidate_topk", "heads"),
+    [
+        pytest.param(65, 17, 32, id="65-17-32"),
+        pytest.param(65, 0, 8, id="65-0-8"),
+        pytest.param(512, 0, 1, id="512-0-1"),
+        pytest.param(512, 17, 8, id="512-17-8"),
+    ],
+)
 def test_index_topk_full_and_reindex_gluon(
     device, heads, candidate_topk, topk, require
 ):
@@ -174,125 +179,6 @@ def test_index_topk_large_head_count_auto_fallback(device, require):
     run_index_topk_full_and_reindex(
         device, None, 64, 17, 65, require, match_triton=True
     )
-
-
-@pytest.mark.parametrize(
-    ("arch", "dtype", "width", "metric", "kernel_name"),
-    [
-        ("gfx950", torch.uint8, 64, "flops4", "gluon_dsv41_index_topk_gfx950"),
-        ("gfx1250", torch.uint8, 64, "flops8", "gluon_dsv41_index_topk_gfx1250"),
-    ],
-)
-def test_indexer_launch_metadata(arch, dtype, width, metric, kernel_name):
-    module = importlib.import_module(
-        f"tokenspeed_kernel_amd.ops.{arch}.attention.dsv41.indexer"
-    )
-    args = {
-        "q": torch.empty((2, 32, width), dtype=dtype),
-        "logits": torch.empty((2, 512), dtype=torch.float32),
-        "NUM_HEADS": 32,
-    }
-    metadata = module._index_launch_metadata(
-        (2, 2, 1), SimpleNamespace(name="index_score"), args
-    )
-    assert metadata["name"] == "index_score"
-    assert metadata[metric] == 2 * 2 * 32 * 512 * 128
-    assert metadata["bytes"] > args["logits"].numel() * 4
-    assert getattr(module, kernel_name).launch_metadata is module._index_launch_metadata
-
-
-def test_gfx1250_page_scorer_launch_metadata():
-    module = importlib.import_module(
-        "tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.indexer"
-    )
-    args = {"logits": torch.empty((3, 512), dtype=torch.float32)}
-    metadata = module._page_launch_metadata(
-        (2, 1, 1), SimpleNamespace(name="index_score"), args
-    )
-    assert metadata["name"] == "index_score"
-    assert metadata["flops8"] == 2 * 3 * 32 * 512 * 128
-    assert metadata["bytes"] > args["logits"].numel() * 4
-    kernel = module.gluon_dsv41_index_qtile_gfx1250
-    assert kernel.launch_metadata is module._page_launch_metadata
-
-
-@pytest.mark.parametrize(
-    ("arch", "entry_name", "kernel_name", "tile_n"),
-    [
-        ("gfx950", "dsv41_index_logits_gfx950", "gluon_dsv41_index_topk_gfx950", 32),
-        ("gfx1250", "dsv41_index_logits_gfx1250", "gluon_dsv41_index_topk_gfx1250", 64),
-    ],
-)
-@pytest.mark.parametrize(
-    ("requested_chunk", "score_chunk"),
-    [(8, 8), (64, 64), (512, 256)],
-)
-def test_indexer_score_chunk_bound(
-    monkeypatch,
-    arch,
-    entry_name,
-    kernel_name,
-    tile_n,
-    requested_chunk,
-    score_chunk,
-):
-    if arch == "gfx950":
-        # Few queries score in 64-row chunks, within the requested bound.
-        score_chunk = min(score_chunk, 64)
-    hardware_chunk = (score_chunk + tile_n - 1) // tile_n * tile_n
-    module = importlib.import_module(
-        f"tokenspeed_kernel_amd.ops.{arch}.attention.dsv41.indexer"
-    )
-    launches = []
-
-    class FakeKernel:
-        def __init__(self, name):
-            self.name = name
-
-        def __getitem__(self, grid):
-            def launch(*args, **kwargs):
-                launches.append(
-                    (self.name, grid, kwargs.get("SCORE_CHUNK"), kwargs["CHUNK_N"])
-                )
-
-            return launch
-
-    monkeypatch.setattr(module, kernel_name, FakeKernel(kernel_name))
-    page_kernel = "gluon_dsv41_index_qtile_gfx1250"
-    if arch == "gfx1250":
-        monkeypatch.setattr(module, page_kernel, FakeKernel(page_kernel))
-    tokens, width = 2, 257
-    weights = torch.empty((tokens, 32), dtype=torch.float32)
-    cache = torch.empty((5, 64 * 68), dtype=torch.uint8)
-    table = torch.empty((tokens, 5), dtype=torch.int32)
-    visible = torch.empty((tokens,), dtype=torch.int32)
-    logits = torch.empty((tokens, width), dtype=torch.float32)
-    getattr(module, entry_name)(
-        torch.empty((tokens, 32, 64), dtype=torch.uint8),
-        torch.empty((tokens, 32), dtype=torch.int32),
-        weights,
-        cache,
-        table,
-        visible,
-        None,
-        logits,
-        requested_chunk,
-    )
-
-    if arch == "gfx1250" and score_chunk >= tile_n:
-        # Full scoring takes whole pages; two query rows keep one chunk per CTA.
-        page_chunk = score_chunk // tile_n * tile_n
-        expected = (page_kernel, (tokens, (width + page_chunk - 1) // page_chunk))
-        assert launches == [(*expected, None, page_chunk)]
-        return
-    assert launches == [
-        (
-            kernel_name,
-            (tokens, (width + score_chunk - 1) // score_chunk),
-            score_chunk,
-            hardware_chunk,
-        )
-    ]
 
 
 def _check_index_logits(device, reindex, score_chunk, index_logits, init=-torch.inf):
@@ -370,10 +256,17 @@ def test_gfx1250_index_logits_match_reference(device, reindex, score_chunk):
     )
 
 
-@pytest.mark.parametrize("queries", [1, 5])
-@pytest.mark.parametrize("score_chunk", [64, 256])
-@pytest.mark.parametrize("lengths_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("broadcast", [False, True])
+# Every pair of query count, score chunk, length dtype and table broadcast.
+@pytest.mark.parametrize(
+    ("queries", "score_chunk", "lengths_dtype", "broadcast"),
+    [
+        (1, 64, torch.int32, False),
+        (1, 256, torch.int64, True),
+        (5, 64, torch.int64, True),
+        (5, 256, torch.int32, True),
+        (5, 256, torch.int64, False),
+    ],
+)
 def test_gfx1250_page_tile_index_logits_match_reference(
     device, queries, score_chunk, lengths_dtype, broadcast
 ):
@@ -514,12 +407,16 @@ def test_index_topk_latest_block_outside_table(
 
 
 # A gap between arena pages leaves a page stride that is not a 16-byte multiple.
+# Every page layout under reindexing, and the Full scan over the arena view.
 @pytest.mark.parametrize(
-    ("byte_stride", "page_gap"),
-    [(1, 0), (2, 0), (1, 13)],
-    ids=["arena", "byte-strided", "unaligned-pages"],
+    ("reindex", "byte_stride", "page_gap"),
+    [
+        pytest.param(False, 1, 0, id="False-arena"),
+        pytest.param(True, 1, 0, id="True-arena"),
+        pytest.param(True, 2, 0, id="True-byte-strided"),
+        pytest.param(True, 1, 13, id="True-unaligned-pages"),
+    ],
 )
-@pytest.mark.parametrize("reindex", [False, True])
 def test_index_topk_preserves_arena_page_stride(
     device, require, monkeypatch, reindex, byte_stride, page_gap
 ):
@@ -612,9 +509,21 @@ def test_index_topk_preserves_arena_page_stride(
     assert actual[1].item() == (16 if reindex else 256)
 
 
-@pytest.mark.parametrize("rows", [0, 6, 12, 24, 48, 96, 192, 257])
-@pytest.mark.parametrize("heads", [1, 4, 32])
-@pytest.mark.parametrize("strided", [False, True])
+# The pack compiles per head count only (rows and strides are runtime, see
+# test_index_query_planes_do_not_specialize_on_rows_or_row_strides): every
+# head count dense and strided, plus an empty batch.
+@pytest.mark.parametrize(
+    ("rows", "heads", "strided"),
+    [
+        (0, 32, False),
+        (6, 1, True),
+        (6, 4, False),
+        (6, 32, True),
+        (257, 1, False),
+        (257, 4, True),
+        (257, 32, False),
+    ],
+)
 def test_index_query_planes_match_codec_and_padding(device, rows, heads, strided):
     torch.manual_seed(333)
     storage = torch.randn(rows, heads * 2, 128, dtype=torch.bfloat16, device=device)

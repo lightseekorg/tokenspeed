@@ -46,8 +46,9 @@ while other stages produce its inputs. Its weight loads then overlap the wait.
 
 from __future__ import annotations
 
+import functools
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 # A region starts on its own 256-byte line, so producers of different regions
@@ -227,6 +228,13 @@ class Plan:
             dims=self.dims,
         )
 
+    def with_rows(self, rows: int) -> Plan:
+        """This plan for ``rows`` rows of one token each (``chain`` 1), with
+        the same stages and regions: the plan of a part of a launch that
+        serves only some of its rows. A mailbox of it at the part's first
+        row addresses those rows' regions."""
+        return _with_rows(self, rows)
+
     def stage(self, name: str) -> Stage:
         """The stage named ``name``. Raises ``KeyError`` when the plan has no
         such stage."""
@@ -282,6 +290,11 @@ class Plan:
         if self.dims is not None:
             fields["dims"] = asdict(self.dims)
         return PlanKey(json.dumps(fields, separators=(",", ":")), self)
+
+
+@functools.cache
+def _with_rows(plan: Plan, rows: int) -> Plan:
+    return replace(plan, rows=rows, chain=1)
 
 
 class PlanKey(str):

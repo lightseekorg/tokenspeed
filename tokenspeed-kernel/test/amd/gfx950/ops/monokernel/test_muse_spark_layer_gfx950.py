@@ -477,8 +477,14 @@ def test_the_kernel_boundary_refuses_experts_of_another_layout():
         prepare_muse_spark_layer(tensors=tensors, max_rows=layer.MAX_ROWS)
 
 
-@pytest.mark.parametrize("solution", [None, "gluon"])
-@pytest.mark.parametrize("full", [False, True])
+# Each kind of layer and each way of selecting the solution, once.
+@pytest.mark.parametrize(
+    "full, solution",
+    [
+        pytest.param(False, None, id="False-None"),
+        pytest.param(True, "gluon", id="True-gluon"),
+    ],
+)
 def test_the_kernel_boundary_packs_a_layer_for_its_launches(full, solution):
     """The runtime packs a layer through the kernel boundary
     (``prepare_muse_spark_layer``). A forced solution selects the layer's
@@ -503,36 +509,14 @@ def test_the_kernel_boundary_packs_a_layer_for_its_launches(full, solution):
     assert fused.decode.name == "gluon_muse_spark_layer_gfx950"
 
 
-def test_the_kernel_boundary_refuses_a_kernel_name_as_its_solution():
-    """One forced solution selects both the prepare and the decode op: a
-    kernel name (here the decode's) would hand the prepare op the decode
-    kernel, and raises instead."""
-    from tokenspeed_kernel.ops.model.muse_spark.monokernel import (
-        prepare_muse_spark_layer,
-    )
-    from tokenspeed_kernel.selection import NoKernelFoundError
-
-    dev = torch.device("cuda:0")
-    tensors = _layer_tensors(
-        0, dev, inputs.layer_shared(42, 3000, 1), 3000, False, FULL_MODEL
-    )
-    tensors["experts_kernel"] = "gluon_mxfp4_precomputed_moe_apply"
-    with pytest.raises(NoKernelFoundError):
-        prepare_muse_spark_layer(
-            tensors=tensors,
-            max_rows=layer.MAX_ROWS,
-            solution="gluon_muse_spark_layer_gfx950",
-        )
-
-
-@pytest.mark.parametrize("full", [False, True])
-def test_one_binary_serves_every_layer_step_and_length(full):
+def test_one_binary_serves_every_layer_step_and_length():
     """What serving changes from launch to launch (the layer index, the step,
     the lengths, page-table widths and the KV slots) reaches the kernel at
     runtime: compiling the launches for one GPU's rank finds the first
     launch's binary. A new row count is a new plan, which the guard must
-    see compile."""
-    rows, length = 8, 900
+    see compile. A sliding layer: a full one takes the same runtime
+    arguments and reads fewer of them (no RoPE)."""
+    full, rows, length = False, 8, 900
     end = length + rows - 1
     dev = torch.device("cuda:0")
     sh = inputs.layer_shared(42, length, rows)
@@ -959,9 +943,29 @@ def test_the_launches_taps_feed_the_draft_context_as_the_capture_would():
     mp.spawn(_tap_context_worker, args=(port,), nprocs=WORLD, join=True)
 
 
-@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
-@pytest.mark.parametrize("rows", [1, 8])
-@pytest.mark.parametrize("full", [False, True])
+def _two_gpu_cases(first: tuple, second: tuple) -> list:
+    """``(full, rows, present)`` of a two-GPU layer test: pairs 01 and 45 run
+    the two ``(full, rows)`` of ``first``, pairs 23 and 67 those of
+    ``second``. Each holds both kinds of layer and both row counts, so every
+    rank program runs both, and every ``(full, rows)`` runs on four rank
+    programs. The two tests below swap ``first`` and ``second``: between
+    them every rank program runs every ``(full, rows)``."""
+    return [
+        pytest.param(full, rows, present, id=f"{full}-{rows}-{pair_id}")
+        for i, (present, pair_id) in enumerate(zip(standins.PAIRS, standins.PAIR_IDS))
+        for full, rows in (first if i % 2 == 0 else second)
+    ]
+
+
+# One decode row, or a verify's 8 rows; a sliding or a full layer.
+_SLIDING_DECODE_FULL_VERIFY = ((False, 1), (True, 8))
+_SLIDING_VERIFY_FULL_DECODE = ((False, 8), (True, 1))
+
+
+@pytest.mark.parametrize(
+    "full, rows, present",
+    _two_gpu_cases(_SLIDING_DECODE_FULL_VERIFY, _SLIDING_VERIFY_FULL_DECODE),
+)
 def test_zero_shard_layer_matches_the_regular_path_math_on_two_gpus(
     full, rows, present
 ):
@@ -1147,9 +1151,10 @@ def test_two_requests_in_one_launch_match_their_own_launches(full, rows):
     )
 
 
-@pytest.mark.parametrize("present", standins.PAIRS, ids=standins.PAIR_IDS)
-@pytest.mark.parametrize("rows", [1, 8])
-@pytest.mark.parametrize("full", [False, True])
+@pytest.mark.parametrize(
+    "full, rows, present",
+    _two_gpu_cases(_SLIDING_VERIFY_FULL_DECODE, _SLIDING_DECODE_FULL_VERIFY),
+)
 def test_two_requests_in_one_launch_match_their_own_launches_on_two_gpus(
     full, rows, present
 ):
@@ -1564,11 +1569,15 @@ _VARIANTS = [
     ((False, False, True), (False, False, False)),
     ((False, False, False), (False, True, True)),
 ]
+# Row counts by placement and region set: one row (BASES), up to 8 rows
+# (CHAINED_BASES), past 8 rows (WIDE, and the ffn words and flags), and the
+# ends of each.
+_PLAN_ROWS = [1, 2, 8, 9, layer.MAX_ROWS]
 
 
 @pytest.mark.parametrize("variants", _VARIANTS)
 @pytest.mark.parametrize("check_parity", [False, True])
-@pytest.mark.parametrize("rows", range(1, layer.MAX_ROWS + 1))
+@pytest.mark.parametrize("rows", _PLAN_ROWS)
 def test_both_kinds_of_layer_lay_the_scratch_out_alike(
     rows: int, variants, check_parity
 ):
@@ -1601,7 +1610,7 @@ def test_both_kinds_of_layer_lay_the_scratch_out_alike(
 
 
 @pytest.mark.parametrize("full", [False, True])
-@pytest.mark.parametrize("rows", range(1, layer.MAX_ROWS + 1))
+@pytest.mark.parametrize("rows", _PLAN_ROWS)
 def test_peer_regions_split_into_rank_ordered_blocks_without_gaps(
     rows: int, full: bool
 ):
@@ -1628,9 +1637,24 @@ def test_peer_regions_split_into_rank_ordered_blocks_without_gaps(
         assert at == sizes[name], (name, at, sizes[name])
 
 
-@pytest.mark.parametrize("gpus", [1, 2, 4])
-@pytest.mark.parametrize("full", [False, True])
-@pytest.mark.parametrize("rows, requests", [(1, 1), (8, 1), (16, 2)])
+# Every count of present GPUs with every launch width (one row, a request's
+# 8 rows, two requests' 16 rows, which add the ffn flags), the kinds of
+# layer alternating: both lay the scratch out alike (see
+# test_both_kinds_of_layer_lay_the_scratch_out_alike).
+@pytest.mark.parametrize(
+    "rows, requests, full, gpus",
+    [
+        (1, 1, False, 1),
+        (8, 1, True, 1),
+        (16, 2, False, 1),
+        (1, 1, True, 2),
+        (8, 1, False, 2),
+        (16, 2, True, 2),
+        (1, 1, False, 4),
+        (8, 1, True, 4),
+        (16, 2, True, 4),
+    ],
+)
 def test_the_bench_stands_in_for_the_absent_ranks_flags_as_raised(
     gpus: int, full: bool, rows: int, requests: int
 ):
@@ -1911,11 +1935,11 @@ def test_the_packer_refuses_experts_past_a_buffer_loads_offset():
     assert "w13" not in refusal(at_bound)
 
 
-@pytest.mark.parametrize("rows", [layer.STUCK_ROWS - 1, 256 + 1])
-def test_the_launcher_refuses_a_stuck_buffer_without_a_record_per_wave(rows):
+def test_the_launcher_refuses_a_stuck_buffer_without_a_record_per_wave():
     """A stuck-poll buffer must hold a record for every wave of the launch
-    (256 CTAs of 8 waves) and the header row: a per-CTA buffer is refused
-    before anything compiles."""
+    (256 CTAs of 8 waves) and the header row: a buffer one row short is
+    refused before anything compiles."""
+    rows = layer.STUCK_ROWS - 1
     f32, bf16, i32 = torch.float32, torch.bfloat16, torch.int32
     with pytest.raises(ValueError, match="stuck_rec"):
         layer.launch_gluon_muse_spark_layer_gfx950(

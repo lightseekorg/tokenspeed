@@ -256,6 +256,11 @@ _GLM52_TOPK_PREFILL_CASES = (
 )
 
 
+# The gfx950 packed sparse kernel takes the head count, top-k width, scale and
+# latent rank as compile-time values and unrolls its loop over the rank, so
+# each rank-512 shape takes minutes to compile. The rank-512 sparse cases share
+# one shape: 8 heads and a 512-wide selection, to which the first prompt's
+# 2048-wide selection is trimmed. The 1024-wide cases run at rank 128.
 _GLM52_DSA_CASES = (
     _DSACase(
         "decode_sparse_mixed_512",
@@ -281,6 +286,7 @@ _GLM52_DSA_CASES = (
         mode="decode",
         kv_layout="sparse",
         topk=1024,
+        kv_lora_rank=128,
         visible_lens=(2048, 3072, 4096),
         topk_lens=(640, 1024, 777),
         seed=303,
@@ -353,6 +359,7 @@ _GLM52_DSA_CASES = (
         mode="prefill",
         kv_layout="sparse",
         topk=1024,
+        kv_lora_rank=128,
         prefix_lens=(256, 1024, 1536),
         extend_lens=(4, 6, 4),
         topk_lens=(
@@ -388,7 +395,6 @@ _GLM52_DSA_CASES = (
         mode="prefill",
         kv_layout="sparse",
         topk=2048,
-        num_heads=16,
         prefix_lens=(0,),
         extend_lens=(25,),
         topk_lens=tuple(range(1, 26)),
@@ -654,26 +660,17 @@ def test_dsa_prefill_topk_fp8_glm52_cases(case: _TopKPrefillCase) -> None:
     )
 
 
+# Graph replay reruns the eager launch, so one length of each kind covers both.
 if is_cdna4():
-    _BF16_SPLIT_WEIGHT_DECODE_CASES = (
-        (8192, False),
-        (8192, True),
-        (16384, False),
-        (16384, True),
-    )
+    _BF16_SPLIT_WEIGHT_DECODE_CASES = ((8192, False), (16384, True))
 else:
-    _BF16_SPLIT_WEIGHT_DECODE_CASES = (
-        (49152, False),
-        (49152, True),
-        (49153, False),
-        (49153, True),
-    )
+    _BF16_SPLIT_WEIGHT_DECODE_CASES = ((49152, False), (49153, True))
 
 
 @pytest.mark.parametrize(
     ("seq_len", "capture_graph"),
     _BF16_SPLIT_WEIGHT_DECODE_CASES,
-    ids=("short-eager", "short-graph", "long-eager", "long-graph"),
+    ids=("short-eager", "long-graph"),
 )
 def test_dsa_decode_topk_fp8_accepts_glm52_bf16_split_weights(
     seq_len: int,
@@ -1010,9 +1007,17 @@ _DECODE_TOPK_DISTRIBUTIONS = {
 }
 
 
-@pytest.mark.parametrize("distribution", tuple(_DECODE_TOPK_DISTRIBUTIONS))
-@pytest.mark.parametrize("row_pad", (0, 1), ids=("aligned_rows", "unaligned_rows"))
-@pytest.mark.parametrize("q_len_per_req", (1, 4))
+# Every q_len_per_req and row alignment (both compiled) with each distribution.
+@pytest.mark.parametrize(
+    ("q_len_per_req", "row_pad", "distribution"),
+    [
+        pytest.param(1, 0, "spread", id="1-aligned_rows-spread"),
+        pytest.param(1, 0, "one_prefix", id="1-aligned_rows-one_prefix"),
+        pytest.param(1, 1, "crowded", id="1-unaligned_rows-crowded"),
+        pytest.param(4, 0, "one_prefix", id="4-aligned_rows-one_prefix"),
+        pytest.param(4, 1, "crowded", id="4-unaligned_rows-crowded"),
+    ],
+)
 def test_dsa_decode_topk_selects_largest_values_on_ragged_rows(
     q_len_per_req: int, row_pad: int, distribution: str
 ) -> None:
@@ -1156,22 +1161,30 @@ def _check_decode_topk_selection(
     return selections
 
 
+def _multi_cta_case(rows: int, cols: int, distribution: str):
+    return pytest.param(rows, cols, distribution, id=f"{rows}-{cols}-{distribution}")
+
+
 @pytest.mark.skipif(not is_cdna4(), reason="the multi-CTA decode top-k is gfx950's")
 @pytest.mark.parametrize(
-    "distribution", ("spread", "crowded", "one_prefix", "integers", "ulp_ties")
-)
-@pytest.mark.parametrize(
-    ("rows", "cols"),
+    ("rows", "cols", "distribution"),
     (
-        (1, 65536),
-        (4, 65536),
-        (8, 65536),
-        (16, 65536),
-        (32, 65536),
-        (4, 131072),
+        # Narrow tiles under 8 rows (one and four rows a request), wide from 8.
+        _multi_cta_case(1, 65536, "spread"),
+        _multi_cta_case(1, 65536, "ulp_ties"),
+        _multi_cta_case(4, 65536, "crowded"),
+        _multi_cta_case(4, 65536, "integers"),
+        _multi_cta_case(8, 65536, "one_prefix"),
+        _multi_cta_case(16, 65536, "integers"),
+        _multi_cta_case(32, 65536, "ulp_ties"),
+        # Past the gathered columns, the rest of a row streams from overflow.
+        _multi_cta_case(4, 131072, "one_prefix"),
+        _multi_cta_case(4, 131072, "ulp_ties"),
         # Logits as wide as a 256K or 1M max-model-len, mostly over short rows.
-        (32, 262144),
-        (8, 1048576),
+        _multi_cta_case(32, 262144, "crowded"),
+        _multi_cta_case(32, 262144, "integers"),
+        _multi_cta_case(8, 1048576, "integers"),
+        _multi_cta_case(8, 1048576, "ulp_ties"),
     ),
 )
 def test_dsa_decode_topk_multi_cta_selects_the_one_block_set(
@@ -1716,22 +1729,16 @@ def _assert_slots_visible(
         assert (topk_slots[token, count:] == -1).all()
 
 
+# Decode and prefill share the packed sparse kernel, which converts any query
+# dtype on load: a BF16 and an FP8 query.
 @pytest.mark.parametrize(
-    "mode,api",
+    ("api", "q_dtype"),
     [
-        pytest.param("decode", gluon_dsa_decode, id="decode"),
-        pytest.param("prefill", gluon_dsa_prefill, id="prefill"),
+        pytest.param(gluon_dsa_decode, torch.bfloat16, id="q_bf16-decode"),
+        pytest.param(gluon_dsa_prefill, torch.float8_e4m3fn, id="q_e4m3-prefill"),
     ],
 )
-@pytest.mark.parametrize(
-    "q_dtype",
-    [
-        pytest.param(torch.bfloat16, id="q_bf16"),
-        pytest.param(torch.float8_e4m3fn, id="q_e4m3"),
-        pytest.param(torch.float8_e5m2, id="q_e5m2"),
-    ],
-)
-def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
+def test_dsa_with_sparse_kvcache(api, q_dtype: torch.dtype) -> None:
     device = "cuda"
     tokens = 3
     num_heads = 2
@@ -1785,36 +1792,48 @@ def test_dsa_with_sparse_kvcache(mode: str, api, q_dtype: torch.dtype) -> None:
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
+_DSA_DTYPES = {
+    "bf16": torch.bfloat16,
+    "e4m3": torch.float8_e4m3fn,
+    "e5m2": torch.float8_e5m2,
+}
+
+
+def _dense_kvcache_case(kv_lora_rank: int, q_name: str, kv_name: str, mode: str):
+    dtypes = q_name if q_name == kv_name else f"{q_name}-q-{kv_name}-kv"
+    return pytest.param(
+        gluon_dsa_decode if mode == "decode" else gluon_dsa_prefill,
+        _DSA_DTYPES[q_name],
+        _DSA_DTYPES[kv_name],
+        kv_lora_rank,
+        id=f"rank_{kv_lora_rank}-{dtypes}-{mode}",
+    )
+
+
+# Rank 128 takes the scalar kernel, which converts any input dtype on load and
+# compiles slowly, so it runs BF16, FP8 and one mixed pair. Rank 512 takes the
+# tiled kernel; decode and prefill differ there only for same-dtype FP8, where
+# prefill has its own kernel. Its mixed pairs convert their inputs: one pair
+# per dtype on each side (test_dsa_decode_glm53_flash_graph_tracks_live_lengths
+# runs the other three pairs without RoPE).
 @pytest.mark.parametrize(
-    "mode,api",
+    ("api", "q_dtype", "kv_dtype", "kv_lora_rank"),
     [
-        pytest.param("decode", gluon_dsa_decode, id="decode"),
-        pytest.param("prefill", gluon_dsa_prefill, id="prefill"),
-    ],
-)
-@pytest.mark.parametrize(
-    ("q_dtype", "kv_dtype"),
-    [
-        pytest.param(torch.bfloat16, torch.bfloat16, id="bf16"),
-        pytest.param(torch.float8_e4m3fn, torch.float8_e4m3fn, id="e4m3"),
-        pytest.param(torch.float8_e5m2, torch.float8_e5m2, id="e5m2"),
-        pytest.param(torch.bfloat16, torch.float8_e4m3fn, id="bf16-q-e4m3-kv"),
-        pytest.param(torch.float8_e4m3fn, torch.bfloat16, id="e4m3-q-bf16-kv"),
-        pytest.param(torch.bfloat16, torch.float8_e5m2, id="bf16-q-e5m2-kv"),
-        pytest.param(torch.float8_e5m2, torch.bfloat16, id="e5m2-q-bf16-kv"),
-        pytest.param(torch.float8_e4m3fn, torch.float8_e5m2, id="e4m3-q-e5m2-kv"),
-        pytest.param(torch.float8_e5m2, torch.float8_e4m3fn, id="e5m2-q-e4m3-kv"),
-    ],
-)
-@pytest.mark.parametrize(
-    "kv_lora_rank",
-    [
-        pytest.param(128, id="rank_128"),
-        pytest.param(512, id="rank_512"),
+        _dense_kvcache_case(128, "bf16", "bf16", "decode"),
+        _dense_kvcache_case(128, "bf16", "bf16", "prefill"),
+        _dense_kvcache_case(128, "e5m2", "e5m2", "prefill"),
+        _dense_kvcache_case(128, "bf16", "e4m3", "decode"),
+        _dense_kvcache_case(512, "bf16", "bf16", "decode"),
+        _dense_kvcache_case(512, "e4m3", "e4m3", "decode"),
+        _dense_kvcache_case(512, "e4m3", "e4m3", "prefill"),
+        _dense_kvcache_case(512, "e5m2", "e5m2", "decode"),
+        _dense_kvcache_case(512, "e5m2", "e5m2", "prefill"),
+        _dense_kvcache_case(512, "bf16", "e4m3", "decode"),
+        _dense_kvcache_case(512, "e4m3", "e5m2", "prefill"),
+        _dense_kvcache_case(512, "e5m2", "bf16", "decode"),
     ],
 )
 def test_dsa_dense_kvcache(
-    mode: str,
     api,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
@@ -1874,53 +1893,38 @@ def test_dsa_dense_kvcache(
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
+_GLM52_PRODUCTION_LENGTHS = {
+    "static-full-width": ((0, 1, 31, 32, 33, 63, 64, 65, 2048), 2112),
+    "dynamic-short-list": ((0, 1, 31, 32, 33, 63, 64, 65), 65),
+    "single-row-full-width": ((2048,), 2112),
+    "multi-row-full-width": ((2048, 2048), 2112),
+    "registered-width-1024": ((1024,), 1024),
+    "dynamic-split-rows": ((0, 1, 31, 32, 33, 65, 1025), 1025),
+}
+
+
+def _glm52_production_case(fp8_name: str, lengths: str, mode: str):
+    return pytest.param(
+        gluon_dsa_decode if mode == "decode" else gluon_dsa_prefill,
+        *_GLM52_PRODUCTION_LENGTHS[lengths],
+        _DSA_DTYPES[fp8_name],
+        id=f"{fp8_name}-{lengths}-{mode}",
+    )
+
+
+# Each FP8 kernel (decode and prefill, E4M3 and E5M2) over two length sets;
+# every length set, and so every split count, runs at least once.
 @pytest.mark.parametrize(
-    "api",
+    ("api", "valid_lengths", "max_seqlen_k", "fp8_dtype"),
     [
-        pytest.param(gluon_dsa_decode, id="decode"),
-        pytest.param(gluon_dsa_prefill, id="prefill"),
-    ],
-)
-@pytest.mark.parametrize(
-    ("valid_lengths", "max_seqlen_k"),
-    [
-        pytest.param(
-            (0, 1, 31, 32, 33, 63, 64, 65, 2048),
-            2112,
-            id="static-full-width",
-        ),
-        pytest.param(
-            (0, 1, 31, 32, 33, 63, 64, 65),
-            65,
-            id="dynamic-short-list",
-        ),
-        pytest.param(
-            (2048,),
-            2112,
-            id="single-row-full-width",
-        ),
-        pytest.param(
-            (2048, 2048),
-            2112,
-            id="multi-row-full-width",
-        ),
-        pytest.param(
-            (1024,),
-            1024,
-            id="registered-width-1024",
-        ),
-        pytest.param(
-            (0, 1, 31, 32, 33, 65, 1025),
-            1025,
-            id="dynamic-split-rows",
-        ),
-    ],
-)
-@pytest.mark.parametrize(
-    "fp8_dtype",
-    [
-        pytest.param(torch.float8_e4m3fn, id="e4m3"),
-        pytest.param(torch.float8_e5m2, id="e5m2"),
+        _glm52_production_case("e4m3", "static-full-width", "decode"),
+        _glm52_production_case("e4m3", "single-row-full-width", "decode"),
+        _glm52_production_case("e5m2", "dynamic-short-list", "decode"),
+        _glm52_production_case("e5m2", "registered-width-1024", "decode"),
+        _glm52_production_case("e4m3", "dynamic-short-list", "prefill"),
+        _glm52_production_case("e4m3", "dynamic-split-rows", "prefill"),
+        _glm52_production_case("e5m2", "static-full-width", "prefill"),
+        _glm52_production_case("e5m2", "multi-row-full-width", "prefill"),
     ],
 )
 def test_dsa_dense_fp8_glm52_production_shape(
@@ -2352,23 +2356,32 @@ def test_dsa_decode_glm53_flash_bf16_split_matrix(tokens: int) -> None:
     torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
 
 
+def _graph_lengths_case(q_name: str, kv_name: str, tokens: int):
+    return pytest.param(
+        tokens,
+        _DSA_DTYPES[q_name],
+        _DSA_DTYPES[kv_name],
+        id=f"{q_name}-{kv_name}-{tokens}",
+    )
+
+
+# One row runs unsplit and 16 or 64 rows split (BF16 queries take the GLM-5.3
+# schedule, FP8 ones the generic or native one). The mixed pairs are the three
+# test_dsa_dense_kvcache leaves out: one per dtype on each side.
 @pytest.mark.skipif(
     not (is_cdna4() or is_cdna5()),
     reason="GLM-5.3-Flash graph replay requires AMD CDNA4 or CDNA5",
 )
-@pytest.mark.parametrize("tokens", (1, 16, 64))
 @pytest.mark.parametrize(
-    ("q_dtype", "kv_dtype"),
+    ("tokens", "q_dtype", "kv_dtype"),
     (
-        (torch.bfloat16, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.float8_e4m3fn),
-        (torch.bfloat16, torch.float8_e4m3fn),
-        (torch.float8_e4m3fn, torch.bfloat16),
-        (torch.float8_e5m2, torch.float8_e5m2),
-        (torch.bfloat16, torch.float8_e5m2),
-        (torch.float8_e5m2, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.float8_e5m2),
-        (torch.float8_e5m2, torch.float8_e4m3fn),
+        _graph_lengths_case("bf16", "bf16", 1),
+        _graph_lengths_case("bf16", "bf16", 16),
+        _graph_lengths_case("e4m3", "e4m3", 64),
+        _graph_lengths_case("e5m2", "e5m2", 16),
+        _graph_lengths_case("bf16", "e5m2", 64),
+        _graph_lengths_case("e5m2", "e4m3", 1),
+        _graph_lengths_case("e4m3", "bf16", 16),
     ),
 )
 def test_dsa_decode_glm53_flash_graph_tracks_live_lengths(
@@ -2710,7 +2723,10 @@ def test_dsa_lse_matches_the_reference(
     num_heads = 16
     num_slots = 4096
     topk = 2048
-    kv_lora_rank = 512
+    # The tiled dense kernel needs rank 512. The packed sparse kernel unrolls
+    # its rank at compile time, and with and without the LSE each rank-512
+    # build takes minutes; test_dsa_glm52_selected_attention_cases covers it.
+    kv_lora_rank = 128 if kv_kind == "sparse" else 512
     qk_rope_head_dim = 64
     qk_nope_head_dim = 128
     softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)

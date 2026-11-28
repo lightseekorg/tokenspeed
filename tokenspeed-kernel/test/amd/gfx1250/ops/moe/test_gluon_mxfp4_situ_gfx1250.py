@@ -135,9 +135,10 @@ def _make_plan() -> dict:
     return plan
 
 
-# 65 is the smallest size above the prefill BLOCK_M of 64, so off_m is nonzero
-# for the tail block.
-@pytest.mark.parametrize("num_tokens", [1, 4, 32, 65])
+# With 16 experts and top-k 16, up to 16 tokens decode on 16-row blocks; 32
+# and 65 tokens run prefill. 65 is the smallest size above the prefill BLOCK_M
+# of 64, so off_m is nonzero for the tail block.
+@pytest.mark.parametrize("num_tokens", [1, 32, 65])
 def test_kimi_k3_tp_situ_matches_a8w4_reference_gfx1250(
     num_tokens: int,
 ) -> None:
@@ -175,7 +176,7 @@ def test_kimi_k3_tp_situ_matches_a8w4_reference_gfx1250(
 
 # A real 64-bit index type needs a multi-gigabyte weight slab, so force the
 # predicate instead
-@pytest.mark.parametrize("num_tokens", [1, 4, 32])
+@pytest.mark.parametrize("num_tokens", [1, 32])
 def test_kimi_k3_tp_situ_compiles_and_matches_with_upcast_indices_gfx1250(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
@@ -245,7 +246,7 @@ def _count_tensor_loads(kernels: list) -> int:
     return sum(kernel.asm["amdgcn"].count("tensor_load") for kernel in kernels)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 4, 32, 65])
+@pytest.mark.parametrize("num_tokens", [1, 32, 65])
 def test_kimi_k3_tp_situ_partial_tdm_matches_whole_warp_loads_gfx1250(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,

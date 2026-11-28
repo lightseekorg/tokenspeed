@@ -48,6 +48,9 @@ def test_prims_qsa_benchmark_matches_fa2_and_captures(phase: str) -> None:
     }
     if phase == "decode":
         parameters["q_len"] = 4
+    else:
+        # The whole prompt in one chunk: no cached prefix.
+        parameters["extend_tokens"] = parameters["context_tokens"]
     request = BenchmarkRequest(
         family="attention",
         mode="qsa_sparse_attention",

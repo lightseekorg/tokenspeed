@@ -60,10 +60,11 @@ the same launches with ``chain = k + 1``:
 3. TokenSpeed's post-verify commit then writes the accepted state to the
    pages.
 
-The MTP draft's first step (its catch-up over one request's verified rows)
-runs as a chain too. As TokenSpeed's draft narrowing, every row writes its
-K / V, but only the live row (the last accepted token's) runs the rest of the
-layer, so the launch outputs one row.
+The MTP draft's first step (its catch-up over the requests' verified rows)
+runs as two launches. A prefix launch over the verified rows as chains writes
+every row's K / V and the accepted rows' index keys. As TokenSpeed's draft
+narrowing, each request's live row (the last accepted token's) then runs as
+an ordinary one-row decode launch, which reads the other rows from the caches.
 """
 
 from __future__ import annotations
@@ -104,15 +105,19 @@ logger = logging.getLogger(__name__)
 # Decode steps of up to this many token rows take the monokernels. The rows
 # are the requests, or a speculative verify's requests times their tokens.
 # Larger batches keep the regular path.
-MAX_ROWS = 4
+MAX_ROWS = 8
 
 
 class Qwen4ExpMonokernelState(MonokernelState):
     """:class:`MonokernelState` with the constants that the Qwen4-Exp
     launches read and the draft's lengths of the current forward."""
 
-    def __init__(self, device: torch.device, scratch_pairs: int) -> None:
+    def __init__(self, device: torch.device, scratch_pairs: int, layers: int) -> None:
         super().__init__(torch.zeros(scratch_pairs, dtype=torch.int64, device=device))
+        # Layer slots of the launch tags: a draft first step's prefix launch
+        # of layer i tags its mailbox writes as layer ``layers + i``, so its
+        # pairs never satisfy a poll of that layer's decode launch.
+        self.layers = layers
         # Constants the launches read, made here, outside any CUDA graph
         # capture: a capture records a kernel without running it, so a
         # constant made there holds garbage for every other graph. A launch
@@ -203,7 +208,9 @@ NOT_SUPPORTED_EXPERTS = (
     "the routed experts run neither the W4A4 MXFP4 nor the BF16 kernel"
 )
 NOT_SPLIT_IN_PROJ = "split in_proj_qkvz / in_proj_ba"
-NOT_PLE_TABLE = "a PLE table that is offloaded, cast or sharded"
+NOT_PLE_TABLE = (
+    "a PLE table that is offloaded, sharded, or cast to a type other than FP8 E4M3"
+)
 NO_INDEXER = "no QSA indexer"
 NO_OUTPUT_GATE = "no attention output gate"
 NOT_ROTARY = "a rotary cache that is not FP32 with 64 dims"
@@ -298,9 +305,9 @@ def forward_chain(rows: int, ctx: ForwardContext) -> int | None:
     (padded graph rows included). It must have one token per request (a
     decode step or an MTP draft step), or ``k + 1``: a target verify (with
     Gated DeltaNet layers and ReplaySSM, whose payload the kernels fill; a
-    view without them keeps the regular path) or the draft's first step of
-    one request, which catches up on the verified rows (its launch narrows to
-    the request's live row).
+    view without them keeps the regular path) or the draft's first step,
+    which catches up on the verified rows (a prefix launch over them, then
+    the requests' live rows as a decode launch).
     """
     if not (
         ctx.forward_mode.is_decode()
@@ -313,17 +320,11 @@ def forward_chain(rows: int, ctx: ForwardContext) -> int | None:
     if chain == 1:
         return chain
     if ctx.draft_narrowing is not None:
-        return chain if ctx.bs == 1 else None
+        return chain
     backend = ctx.attn_backend
     if not backend.has_linear_attn:
         return None
     return chain if backend.linear_attn_backend.replay_ssm else None
-
-
-def _out_rows(rows: int, chain: int, ctx: ForwardContext) -> int:
-    """The rows a launch outputs: one per request in the draft's catch-up
-    step (TokenSpeed's draft narrowing), else every row."""
-    return ctx.bs if chain > 1 and ctx.draft_narrowing is not None else rows
 
 
 class _Qwen4ExpMonokernelLayer(MonokernelLayer):
@@ -412,9 +413,11 @@ class DeltaMonokernelLayer(_Qwen4ExpMonokernelLayer):
         if ple is not None:
             embedding = ple.ple_embedding
             lookup = embedding.lookup
+            # The kernel gathers rows of a device table, BF16 or FP8 E4M3
+            # with a scalar scale (dequantized as the device lookup does).
             if (
                 lookup.offload_embedding
-                or lookup.embed_store_dtype is not None
+                or lookup.embed_store_dtype not in (None, torch.float8_e4m3fn)
                 or lookup.ngram_embedding.tp_size != 1
             ):
                 raise NoMonokernel(NOT_PLE_TABLE)
@@ -425,6 +428,7 @@ class DeltaMonokernelLayer(_Qwen4ExpMonokernelLayer):
                 "norm_conv": ple.norm_conv.gemma_weight,
                 "conv_w": ple.conv1d.weight.data,
                 "table": lookup.ngram_embedding.weight.data,
+                "table_scale": lookup.device_table_scale,
                 "multipliers": embedding.layer_multipliers,
                 "sizes": embedding.ngram_heads_vocab_sizes,
                 "offsets": embedding.ngram_heads_offsets,
@@ -599,7 +603,6 @@ class QSAMonokernelLayer(_Qwen4ExpMonokernelLayer):
             metadata.recent_block_table[: ctx.bs],
         )
         draft = None
-        accepted = None
         if chain == 1:
             seq_len, staging = metadata.seq_lens[: ctx.bs], None
             if backend.is_draft:
@@ -608,6 +611,22 @@ class QSAMonokernelLayer(_Qwen4ExpMonokernelLayer):
                 draft = self.indexer.draft_scratch(
                     ctx.bs, torch.bfloat16, hidden_states.device
                 )
+        elif backend.is_draft:
+            # The draft's first step: a prefix launch over the verified rows as
+            # chains, then the live rows' decode launch below.
+            hidden_states, positions = self._draft_prefix(
+                chain,
+                hidden_states,
+                positions,
+                metadata.seq_lens[: ctx.bs],
+                tables,
+                (k_cache, v_cache, raw_key, compressed, rope_position),
+                full.kernel_page_size,
+                ctx,
+            )
+            rows, chain = ctx.bs, 1
+            # Each live row is its request's last accepted token.
+            seq_len, staging = metadata.seq_lens[: ctx.bs], None
         else:
             # A verify: the launch takes each request's length and tables; token
             # t of request r sits at seq_lens[r] - chain + t (TokenSpeed's verify
@@ -615,36 +634,20 @@ class QSAMonokernelLayer(_Qwen4ExpMonokernelLayer):
             # target verify stages its index key for the post-verify commit
             # instead of writing the recent ring.
             seq_len = metadata.seq_lens[: ctx.bs]
-            if backend.is_draft:
-                # The draft's first step: the verified rows as a chain. Every row
-                # writes its K / V. Rows past the accepted length write no index
-                # key (TokenSpeed's draft write mask). Only the live row runs the
-                # rest of the layer (the draft narrowing). The step publishes the
-                # accepted lengths as the draft's decode lengths, so the rows'
-                # lengths are a copy from before (one copy per forward), and
-                # starts a new draft scratch round.
-                staging = None
-                seq_len = state.draft_lengths(seq_len, ctx.draft_narrowing)
-                accepted = metadata.seq_lens[: ctx.bs]
-                self.indexer.reset_draft_tags(
-                    ctx.bs, torch.bfloat16, hidden_states.device
-                )
-            else:
-                token_k, position_values, logical, recent = (
-                    backend.verify_staging_buffers(self.layer_id, ctx.bs)
-                )
-                staging = (
-                    token_k.reshape(rows, -1),
-                    position_values.reshape(rows, -1),
-                    logical.reshape(rows),
-                    recent.reshape(rows),
-                )
-        out_rows = _out_rows(rows, chain, ctx)
+            token_k, position_values, logical, recent = backend.verify_staging_buffers(
+                self.layer_id, ctx.bs
+            )
+            staging = (
+                token_k.reshape(rows, -1),
+                position_values.reshape(rows, -1),
+                logical.reshape(rows),
+                recent.reshape(rows),
+            )
         mixed_out = None
         if self.folds_final_mixer:
-            mixed_out = hidden_states.new_empty(out_rows, self.hidden_size)
+            mixed_out = hidden_states.new_empty(rows, self.hidden_size)
             state.lm_head_input = mixed_out
-        out = hidden_states.new_empty(out_rows, self.hc_count * self.hidden_size)
+        out = hidden_states.new_empty(rows, self.hc_count * self.hidden_size)
         qwen4_exp_qsa_layer_decode(
             self.fused,
             hidden_states,
@@ -664,7 +667,7 @@ class QSAMonokernelLayer(_Qwen4ExpMonokernelLayer):
             rope_position=rope_position,
             staging=staging,
             draft=draft,
-            accepted=accepted,
+            accepted=None,
             scratch=state.scratch,
             step=state.step,
             layer_index=self.layer_id,
@@ -673,6 +676,64 @@ class QSAMonokernelLayer(_Qwen4ExpMonokernelLayer):
             advance_step=self.folds_final_mixer,
         )
         return out, None
+
+    def _draft_prefix(
+        self,
+        chain: int,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        caches: tuple[torch.Tensor, ...],
+        page_size: int,
+        ctx: ForwardContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The prefix launch of the draft's first step, and the live rows'
+        streams and positions (``ctx.gather_ids``, TokenSpeed's draft
+        narrowing) for the decode launch that follows.
+
+        Every verified row writes its K / V. Rows past the accepted length
+        write no index key (TokenSpeed's draft write mask). The step publishes
+        the accepted lengths as the draft's decode lengths, so the rows'
+        lengths are a copy from before (one copy per forward), and starts a
+        new draft scratch round.
+        """
+        state = self.monokernel_state
+        k_cache, v_cache, raw_key, compressed, rope_position = caches
+        lengths = state.draft_lengths(seq_lens, ctx.draft_narrowing)
+        self.indexer.reset_draft_tags(ctx.bs, torch.bfloat16, hidden_states.device)
+        qwen4_exp_qsa_layer_decode(
+            self.fused,
+            hidden_states,
+            None,
+            chain=chain,
+            cos_sin=self.rotary_emb.cos_sin_cache,
+            positions=positions,
+            seq_len=lengths,
+            full_table=tables[0],
+            page_size=page_size,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            qsa_table=tables[1],
+            recent_table=tables[2],
+            compressed=_paged(compressed, QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE),
+            raw_key=_paged(raw_key, self.indexer.compress_ratio),
+            rope_position=rope_position,
+            staging=None,
+            draft=None,
+            # The published accepted lengths.
+            accepted=seq_lens,
+            scratch=state.scratch,
+            step=state.step,
+            layer_index=state.layers + self.layer_id,
+            mixed_out=None,
+            advance_step=False,
+        )
+        live = ctx.gather_ids
+        return (
+            hidden_states.index_select(0, live),
+            positions.index_select(1, live).contiguous(),
+        )
 
 
 def _streams(hidden_states: torch.Tensor, residual) -> torch.Tensor:
@@ -734,7 +795,7 @@ def enable_decode_monokernels(model: torch.nn.Module) -> None:
         raise ValueError(unserved_error(type(model).__name__, unserved))
     device = next(model.parameters()).device
     state = Qwen4ExpMonokernelState(
-        device, max(layer.fused.scratch_pairs for layer in layers)
+        device, max(layer.fused.scratch_pairs for layer in layers), len(layers)
     )
     for index, layer in enumerate(layers):
         if index < last:

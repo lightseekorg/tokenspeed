@@ -221,8 +221,8 @@ def test_model_numerics_complete_deferred_configuration(
             registry.register_model_rl_numerics("FixtureForCausalLM", cli_factory)
     monkeypatch.setattr(
         plugins,
-        "_deferred_longcat",
-        (_EntryPoint("deferred_policy", register), record.undo),
+        "_deferred_plugins",
+        ((_EntryPoint("deferred_policy", register),), record.undo),
     )
     (tmp_path / "config.json").write_text(
         json.dumps({"architectures": ["FixtureForCausalLM"], "vocab_size": 65536})

@@ -235,7 +235,7 @@ def prepare_qwen4_exp_qsa_layer(
 def qwen4_exp_qsa_layer_decode(
     layer: FusedDecodeLayer,
     h: torch.Tensor,
-    h_out: torch.Tensor,
+    h_out: torch.Tensor | None,
     *,
     chain: int,
     cos_sin: torch.Tensor,
@@ -285,16 +285,18 @@ def qwen4_exp_qsa_layer_decode(
             positions [rows, 3], position tags [rows, 4])``. The kernel stages
             the index keys there instead of the recent ring, and its
             compression reads the members that earlier draft steps staged.
-        accepted: None, except in an MTP draft catch-up step (the draft's
-            first step over one request's verified rows): the request's int32
-            accepted length ``[1]``. Rows at or past it write K / V but no
-            index keys. As TokenSpeed's draft narrowing, only the live row
-            (the last accepted token's) runs the attention and the rest of
-            the layer, so ``h_out`` and ``mixed_out`` hold that one row.
+        accepted: None, except in the prefix launch of an MTP draft's first
+            step (the requests' verified rows, ``chain`` each): the requests'
+            int32 accepted lengths ``[requests]``. The launch then runs the
+            layer up to its KV write: every row writes its K / V, and the
+            rows before the accepted length also their index keys. Rows at
+            or past it are rejected tokens. ``h_out`` and ``mixed_out`` are
+            ``None``; each request's live row (its last accepted token) then
+            runs as an ordinary one-row decode launch.
         mixed_out: When :func:`prepare_qwen4_exp_qsa_layer` packed the layer
             with the model's final mixer (``tensors["final_mixer"]``, the last
-            layer), the BF16 mixer output (the LM head's input), with the
-            rows of ``h_out``. Else ``None``.
+            layer) and the launch is no prefix launch, the BF16 mixer output
+            (the LM head's input), with the rows of ``h_out``. Else ``None``.
         advance_step: Whether the launch moves ``step`` on when it ends (the
             last launch of a forward); ``step`` is then int32 ``[2]`` (the
             step and a count that stays 0 between launches).

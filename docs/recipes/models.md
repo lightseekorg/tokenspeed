@@ -1335,7 +1335,72 @@ requires at least 96% accuracy on the GSM8K test split.
 On AMD MI350X/MI355X (gfx950), serve the
 [AMD Quark MXFP4](https://huggingface.co/amd/Qwen3.8-Flash-Next-Quark-MXFP4)
 checkpoint, which quantizes the routed and shared experts to MXFP4 and keeps
-the rest, including the MTP layer, in BF16:
+the rest, including the MTP layer, in BF16.
+
+#### One GPU
+
+For multi-turn agentic traffic (long, mostly reused prompts) serve one
+replica per GPU at TP1. The flags common to every concurrency:
+
+```bash
+ts serve \
+    --model amd/Qwen3.8-Flash-Next-Quark-MXFP4 \
+    --trust-remote-code \
+    --tensor-parallel-size 1 \
+    --quantization mxfp4 \
+    --max-model-len 262144 \
+    --max-num-seqs <N> \
+    --max-cudagraph-capture-size <N> \
+    --mamba-ssm-dtype bfloat16 \
+    --kvstore-size <host GB per GPU> \
+    --kvstore-write-policy write_back \
+    --enable-state-checkpoint-in-forward \
+    --checkpoint-retention-requests 0 \
+    --retraction-snapshot-host-gb 4 \
+    --speculative-algorithm MTP \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    <per-concurrency flags below>
+```
+
+- The Host KV cache, not device kernels, decides throughput here: the next
+  turn of a conversation reuses its earlier prompt after the Device cache has
+  evicted it. `write_back` copies only evicted pages to Host, and
+  `--enable-state-checkpoint-in-forward` keeps a GDN state at each prompt's
+  last page boundary so the next turn resumes there instead of recomputing
+  the prompt. Size `--kvstore-size` so that it, the retraction snapshot pool
+  (`--retraction-snapshot-host-gb`) and the offloaded PLE table fit in the
+  host memory per GPU with headroom; TokenSpeed's B300 AgentX recipe uses
+  236 GB with a 4 GB snapshot pool. See the compaction stalls under Two GPUs.
+- Set `--max-num-seqs` above the target concurrency; the settings below were
+  tuned with about twice the concurrency.
+
+| Concurrency | Per-concurrency flags |
+|---|---|
+| 1-2 | `--decode-monokernel --speculative-draft-lm-head-quantization fp8_weight_only --hf-overrides '{"ple_embed_dtype":"float8_e4m3fn","ple_offload_embedding":false}'` |
+| 4-16 | `--speculative-draft-lm-head-quantization fp8_weight_only --speculative-draft-moe-quantization mxfp4 --hf-overrides '{"ple_embed_dtype":"float8_e4m3fn","ple_offload_embedding":true}'` |
+| 24-32 | as 4-16, plus `--kv-cache-dtype fp8_e4m3` |
+| 48 and up | `--speculative-draft-moe-quantization mxfp4 --kv-cache-dtype fp8_e4m3 --hf-overrides '{"ple_embed_dtype":"float8_e4m3fn","ple_offload_embedding":true}'` |
+
+- At one or two requests the decode monokernel runs each layer of the verify
+  and draft steps in one launch. It reads the PLE table from device memory,
+  so keep the FP8 table on the GPU, and it refuses MXFP4 draft experts.
+- From four requests up, KV capacity bounds throughput, so keep other device
+  memory small: the FP8 PLE table stays in pinned host memory, and from 24
+  requests up the KV cache is FP8.
+- The FP8 draft LM head speeds up draft steps of up to 32 rows and slows
+  larger ones, so drop it from 48 requests up.
+- Prefill graphs cost device memory per capture bucket rather than per token,
+  mostly HIP driver memory held by each instantiated graph. Setting
+  `DEBUG_HIP_FORCE_GRAPH_QUEUES=0` in the server environment drops the graph
+  queues' per-graph kernel-argument pools and returns that memory to the KV
+  cache without a measured speed cost; it is a HIP runtime debug setting, so
+  recheck it after a ROCm upgrade. `--disable-prefill-graph` frees more but
+  costs prefill throughput; a shorter `--prefill-graph-capture-token-sizes`
+  ladder sits between the two.
+
+#### Two GPUs
 
 ```bash
 ts serve \

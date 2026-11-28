@@ -248,13 +248,18 @@ def _expected_prefill(q, weights, keys, workspace):
     )
 
 
-@pytest.mark.parametrize("q_len", (1, 4, 7, 8))
+# A program scores the next power of two of q_len rows; the batching test
+# below runs every row block with 32 heads, BF16 weights and packed pages.
+# These cover FP32 weights and 64 heads, each at one row and at a wider row
+# block, and padded pages.
 @pytest.mark.parametrize(
-    ("heads", "weight_dtype", "page_pad"),
+    ("q_len", "heads", "weight_dtype", "page_pad"),
     (
-        (32, torch.float32, 0),
-        (32, torch.bfloat16, 512),
-        (64, torch.bfloat16, 0),
+        (1, 32, torch.float32, 0),
+        (4, 32, torch.bfloat16, 512),
+        (8, 32, torch.float32, 0),
+        (1, 64, torch.bfloat16, 0),
+        (7, 64, torch.bfloat16, 0),
     ),
 )
 def test_fp8_pages_decode_matches_fp32_reference(
@@ -385,7 +390,8 @@ def test_fp8_pages_prefill_selection_is_independent_of_row_blocking(
     )
 
 
-@pytest.mark.parametrize("q_len", (1, 2, 3, 5, 6, 7, 8))
+# Every row block (1, 2, 4 and 8 rows), full or padded.
+@pytest.mark.parametrize("q_len", (1, 2, 3, 5, 8))
 def test_fp8_pages_decode_selection_is_independent_of_batching(q_len: int) -> None:
     """Every q_len_per_req selects per request what the batch selects."""
     generator = _generator(300 + q_len)
@@ -423,7 +429,8 @@ def test_fp8_pages_decode_selection_is_independent_of_batching(q_len: int) -> No
     )
 
 
-@pytest.mark.parametrize("splits", (1, 3, 64))
+# One program for all 256 chunks of a request, or an uneven three.
+@pytest.mark.parametrize("splits", (1, 3))
 def test_fp8_pages_decode_selection_is_independent_of_programs_per_request(
     monkeypatch, splits: int
 ) -> None:

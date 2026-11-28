@@ -49,14 +49,13 @@ def _reference(
 @pytest.mark.skipif(
     not (is_cdna4() or is_cdna5()), reason="AMD dense dsv4_prefill gluon"
 )
+# Heads are runtime: a partial 16-head group, a full one, and several groups.
 @pytest.mark.parametrize(
     "heads, width",
     [
         (1, 128),
-        (7, 128),
         (16, 128),
         (64, 128),
-        (1, 640),
         (7, 640),
         (16, 640),
     ],

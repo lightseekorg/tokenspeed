@@ -86,12 +86,20 @@ def _run(fixture, visible, reindex, make_blocks):
     )
 
 
+# 12 rows hold every raw value; 257 rows span two 256-row query chunks. Each
+# selection mode runs at both sizes, once with strided lengths.
 @requires_gpu
-@pytest.mark.parametrize("rows", [6, 12, 24, 48, 96, 192, 257])
 @pytest.mark.parametrize(
-    "reindex,make_blocks", [(False, False), (False, True), (True, False)]
+    "rows,reindex,make_blocks,strided",
+    [
+        (12, False, False, False),
+        (12, False, True, True),
+        (12, True, False, False),
+        (257, False, False, True),
+        (257, False, True, False),
+        (257, True, False, True),
+    ],
 )
-@pytest.mark.parametrize("strided", [False, True])
 def test_gluon_raw_visibility_matches_preclamped_inputs(
     rows, reindex, make_blocks, strided
 ):
@@ -183,7 +191,7 @@ def test_block_visibility_capacity_does_not_recompile(width):
 
 
 @requires_gpu
-@pytest.mark.parametrize("rows", [1, 6, 12])
+@pytest.mark.parametrize("rows", [1, 12])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_row_selector_live_width_strides_match_dense_without_recompile(rows, dtype):
     if current_platform().is_cdna4:

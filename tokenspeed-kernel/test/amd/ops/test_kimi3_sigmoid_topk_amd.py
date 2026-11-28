@@ -62,9 +62,23 @@ if not (is_cdna4() or is_cdna5()):
 
 
 @pytest.mark.skipif(not is_cdna4(), reason="gfx950 decode routing is CDNA4")
-@pytest.mark.parametrize("rows", [1, 8, 16, 32, 64, 128, 256, 512, 1024])
-@pytest.mark.parametrize("normalize", [False, True])
-@pytest.mark.parametrize("scale", [1.0, 2.5])
+# One row (exact), the decode rows (8 to 512 share one binary) and 1024 rows
+# (a separate binary). Each binary runs both scales and both normalizations.
+@pytest.mark.parametrize(
+    "rows,normalize,scale",
+    [
+        pytest.param(rows, normalize, scale, id=f"{scale}-{normalize}-{rows}")
+        for rows, normalize, scale in (
+            (1, False, 1.0),
+            (1, True, 2.5),
+            (8, True, 1.0),
+            (8, False, 2.5),
+            (512, True, 2.5),
+            (1024, True, 1.0),
+            (1024, False, 2.5),
+        )
+    ],
+)
 def test_kimi3_sigmoid_bias_topk_matches_torch_and_captures(
     rows: int,
     normalize: bool,
@@ -341,10 +355,8 @@ def test_kimi_topk_prefill_scales_beyond_8k(dtype: torch.dtype) -> None:
 
 @pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
 @pytest.mark.parametrize("stride", [1, 32, 64, 128])
-@pytest.mark.parametrize("tokens", [1024, 8192])
-def test_kimi_topk_prefill_selects_evenly_strided_winners(
-    stride: int, tokens: int
-) -> None:
+def test_kimi_topk_prefill_selects_evenly_strided_winners(stride: int) -> None:
+    tokens = 1024
     generator = torch.Generator(device="cuda").manual_seed(stride)
     logits = torch.randn(tokens, 896, device="cuda", generator=generator)
     bias = torch.randn(896, device="cuda", generator=generator) * 0.01
@@ -367,8 +379,17 @@ def test_kimi_topk_prefill_selects_evenly_strided_winners(
 
 
 @pytest.mark.skipif(not is_cdna4(), reason="Gluon sigmoid top-k is gfx950-only")
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("experts", [64, 128, 256, 288, 384])
+# Every expert count; the logits dtype alternates across them.
+@pytest.mark.parametrize(
+    "experts,dtype",
+    [
+        (64, torch.float32),
+        (128, torch.bfloat16),
+        (256, torch.float32),
+        (288, torch.bfloat16),
+        (384, torch.float32),
+    ],
+)
 def test_sigmoid_topk_prefill_exhausts_a_lane_of_few_experts(
     experts: int, dtype: torch.dtype
 ) -> None:

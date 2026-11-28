@@ -67,7 +67,9 @@ def _slots_kernel(ids_ptr, out_ptr, RP: gl.constexpr):
     _store_slots(out_ptr + (3 * NP + NP * RP + 1), owner, slot, count, table, NP, RP)
 
 
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16])
+# Each power-of-two row count, and the most padded rows of the 4, 8 and 16
+# row tables (the slot table stage repeats the last row up to them).
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 5, 8, 9, 16])
 def test_ballot_slots_match_slots(rows: int):
     rp = triton.next_power_of_2(rows)
     g = torch.Generator().manual_seed(rows)

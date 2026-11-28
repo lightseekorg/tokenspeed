@@ -135,18 +135,37 @@ def _assert_close(mode: str, actual: torch.Tensor, expected: torch.Tensor) -> No
     )
 
 
-@pytest.mark.parametrize("m", [17, 32, 33, 80, 96, 128, 129, 848, 2048, 8192])
+def _shape_params(*shapes: tuple[int, int, int]) -> list:
+    """``(n, k, m)`` cases with ids ``n-k-m``."""
+    return [pytest.param(m, n, k, id=f"{n}-{k}-{m}") for n, k, m in shapes]
+
+
+# Each case selects a distinct launch from _cluster_mm_config: 64-, 128- and
+# 256-row tiles, clustered or not, split K, single, two, remainder and unrolled
+# K walks with ragged or whole last K tiles, ragged M and N edges, and grids
+# that leave XCDs or GROUP_M rows partly filled. Every row count and model
+# shape appears at least once.
 @pytest.mark.parametrize(
-    "n,k",
-    [
-        (1792, 5120),
-        (4096, 1280),
-        (8192, 1280),
-        (5120, 2048),
-        (1152, 5120),
-        (5120, 576),
-        (25600, 6144),
-    ],
+    "m,n,k",
+    _shape_params(
+        (1152, 5120, 32),
+        (1152, 5120, 80),
+        (1152, 5120, 8192),
+        (1792, 5120, 129),
+        (1792, 5120, 8192),
+        (4096, 1280, 96),
+        (4096, 1280, 129),
+        (8192, 1280, 848),
+        (8192, 1280, 2048),
+        (5120, 2048, 128),
+        (5120, 2048, 129),
+        (5120, 576, 17),
+        (5120, 576, 129),
+        (5120, 576, 2048),
+        (25600, 6144, 33),
+        (25600, 6144, 128),
+        (25600, 6144, 848),
+    ),
 )
 def test_mxfp8_largem_matches_dequantized_reference(m: int, n: int, k: int) -> None:
     operands = _ue8m0_operands(m, n, k, seed=m + n + k)
@@ -155,8 +174,16 @@ def test_mxfp8_largem_matches_dequantized_reference(m: int, n: int, k: int) -> N
     _assert_close("ue8m0", actual, _reference("ue8m0", *operands))
 
 
-@pytest.mark.parametrize("m", [17, 96, 848, 2048])
-@pytest.mark.parametrize("n,k", [(4096, 512), (2048, 288)])
+# Unclustered 64-row and clustered 128-row tiles over a whole and a ragged K tile.
+@pytest.mark.parametrize(
+    "m,n,k",
+    _shape_params(
+        (4096, 512, 96),
+        (4096, 512, 848),
+        (2048, 288, 17),
+        (2048, 288, 2048),
+    ),
+)
 def test_mxfp8_largem_single_k_tile_matches_dequantized_reference(
     m: int, n: int, k: int
 ) -> None:
@@ -164,18 +191,27 @@ def test_mxfp8_largem_single_k_tile_matches_dequantized_reference(
     _assert_close("ue8m0", _run("ue8m0", *operands), _reference("ue8m0", *operands))
 
 
-@pytest.mark.parametrize("m", [16, 65, 96, 128, 129, 848, 2048, 8192])
+# As above for FP32 scales, which never take the 256-row BK256 tile.
 @pytest.mark.parametrize(
-    "n,k",
-    [
-        (1024, 4096),
-        (4096, 512),
-        (6144, 4096),
-        (4096, 3072),
-        (2048, 4096),
-        (4096, 1536),
-        (4096, 4096),
-    ],
+    "m,n,k",
+    _shape_params(
+        (1024, 4096, 16),
+        (1024, 4096, 129),
+        (2048, 4096, 8192),
+        (4096, 512, 65),
+        (4096, 512, 128),
+        (4096, 512, 129),
+        (4096, 512, 848),
+        (4096, 512, 2048),
+        (4096, 1536, 128),
+        (4096, 1536, 129),
+        (4096, 1536, 848),
+        (4096, 3072, 848),
+        (4096, 4096, 16),
+        (6144, 4096, 16),
+        (6144, 4096, 96),
+        (6144, 4096, 129),
+    ),
 )
 def test_fp8_blockscale_largem_matches_dequantized_reference(
     m: int, n: int, k: int
@@ -192,8 +228,16 @@ def test_fp8_blockscale_largem_rejects_partial_k_tiles() -> None:
         _run("fp32", *operands)
 
 
-@pytest.mark.parametrize("m", [24, 96, 4096])
-@pytest.mark.parametrize("mode", list(_MODES))
+# Split K with its FP32 partials and reduction, an unsplit 64-row tile, and
+# clustered 128-row tiles.
+@pytest.mark.parametrize(
+    "mode,m",
+    [
+        pytest.param("ue8m0", 24, id="ue8m0-24"),
+        pytest.param("fp32", 96, id="fp32-96"),
+        pytest.param("ue8m0", 4096, id="ue8m0-4096"),
+    ],
+)
 def test_largem_cuda_graph_replay(mode: str, m: int) -> None:
     n, k = 1792, 5120
     a, b, a_scales, b_scales = _MODES[mode].operands(m, n, k, 7)
@@ -228,14 +272,13 @@ def test_largem_varying_rows_reuse_compiled_kernels(mode: str) -> None:
             run(m)
 
 
+# The first row count each mode's large-M kernel takes, and a prefill batch.
 @pytest.mark.parametrize(
     "mode,m",
     [
         ("ue8m0", 17),
-        ("ue8m0", 96),
         ("ue8m0", 2048),
         ("fp32", 65),
-        ("fp32", 96),
         ("fp32", 2048),
     ],
 )

@@ -93,9 +93,14 @@ def _inputs(rows: int):
 
 
 # 3 rows: the GEMV pads to 4 rows (the padding row repeats the last one).
-# gate_halves 2: two 8-row gate tasks a block.
-@pytest.mark.parametrize("gate_halves", [1, 2])
-@pytest.mark.parametrize("rows", [1, 2, 3, 4, 8, 16])
+# gate_halves 2: two gate tasks a block of 16 weight rows, 8 each; here at 3
+# token rows (padded) and 16 (every MFMA row).
+# test_split_gate_puts_the_whole_block_words checks its words bit for bit
+# against gate_halves 1 at 1 and 8 token rows.
+@pytest.mark.parametrize(
+    "rows, gate_halves",
+    [(1, 1), (2, 1), (3, 1), (4, 1), (8, 1), (16, 1), (3, 2), (16, 2)],
+)
 def test_qkvg_halves_sum_to_the_bf16_rounded_fp32_projection(rows, gate_halves):
     w, a_full = _inputs(rows)
     a = a_full[:, :HIDDEN]
