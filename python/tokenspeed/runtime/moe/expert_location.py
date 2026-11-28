@@ -187,6 +187,9 @@ class ExpertLocationMetadata:
     _rank_dispatch_map: torch.Tensor | None = field(
         init=False, default=None, repr=False
     )
+    # All-ones [num_logical_experts] counts paired with
+    # ``rank_dispatch_map()[layer_id].unsqueeze(-1)`` for fused static routers.
+    static_replica_counts: torch.Tensor = field(init=False, repr=False)
 
     # -------------------------------- properties ------------------------------------
 
@@ -249,6 +252,11 @@ class ExpertLocationMetadata:
         self.logical_to_all_physical_map_num_valid = num_valid.to(
             torch.int32
         ).contiguous()
+        self.static_replica_counts = torch.ones(
+            (num_logical_experts_0,),
+            dtype=torch.int32,
+            device=self.physical_to_logical_map.device,
+        )
 
     # -------------------------------- in-place updates ------------------------------
 

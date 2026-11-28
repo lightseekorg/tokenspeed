@@ -102,7 +102,11 @@ from tokenspeed_kernel.ops.gemm import (
     warmup_fp8_projection,
     warmup_fp8_projections,
 )
-from tokenspeed_kernel.ops.moe import mega_gate_warmup_token_counts, moe_topk
+from tokenspeed_kernel.ops.moe import (
+    mega_gate_warmup_token_counts,
+    moe_topk,
+)
+from tokenspeed_kernel.ops.moe import record_expert_load as kernel_record_expert_load
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
@@ -163,7 +167,11 @@ from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
-from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
+from tokenspeed.runtime.layers.moe.topk import (
+    StandardTopKOutput,
+    record_expert_load,
+    topk_ids_logical_to_physical,
+)
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
 from tokenspeed.runtime.layers.paged_attention import QueryShardGather
 from tokenspeed.runtime.layers.parameter import ModelWeightParameter
@@ -1910,12 +1918,14 @@ class DeepseekV41MoE(DeepseekV4MoE):
 
     def _fused_router_call_kwargs(self, image_mask):
         gate, config = self.gate, self.topk.topk_config
+        info = self.expert_dispatch_info
         if (
             not gate.weight.is_cuda
             or config.router_topk != "fused"
             or gate.tid2eid is not None
             or self.topk.simulate_routing
             or not self.experts.supports_precomputed_topk
+            or (info is not None and info.ep_dispatch_algorithm == "fake")
         ):
             return None
         image_bias = gate.bias_vl if image_mask is not None else None
@@ -1928,10 +1938,31 @@ class DeepseekV41MoE(DeepseekV4MoE):
         if image_bias is not None:
             kwargs["image_bias"] = image_bias
             kwargs["image_token_mask"] = image_mask
+        if info is not None:
+            if (
+                info.ep_dispatch_algorithm == "static"
+                and info.partial_logical_to_rank_dispatch_physical_map is not None
+            ):
+                # Match unfused _topk_ids_logical_to_physical_static on all-to-all EP
+                # (one nearest replica per logical expert and EP rank, updated in place).
+                kwargs["logical_to_physical_map"] = (
+                    info.partial_logical_to_rank_dispatch_physical_map.unsqueeze(-1)
+                )
+                kwargs["logical_replica_counts"] = info.static_replica_counts
+                kwargs["ep_rank"] = info.ep_rank
+            elif info.ep_dispatch_algorithm == "dynamic":
+                kwargs["logical_to_physical_map"] = (
+                    info.partial_logical_to_all_physical_map
+                )
+                kwargs["logical_replica_counts"] = (
+                    info.partial_logical_to_all_physical_map_num_valid
+                )
+                kwargs["ep_rank"] = info.ep_rank
         return kwargs
 
     def _compute_topk_output(self, hidden_states, image_mask, routing_out=None):
         config = self.topk.topk_config
+        info = self.expert_dispatch_info
         kwargs = (
             self._fused_router_call_kwargs(image_mask)
             if hidden_states.is_cuda and hidden_states.shape[0] <= 65536
@@ -1939,9 +1970,17 @@ class DeepseekV41MoE(DeepseekV4MoE):
         )
         if kwargs is not None:
             kwargs["hidden_states"] = hidden_states
-            if routing_out is not None:
-                kwargs["out"] = routing_out
-                kwargs["topk_indices_dtype"] = routing_out[1].dtype
+            mapped_in_kernel = "logical_to_physical_map" in kwargs
+            # Write directly into pre-staged buffers only when bf16_mega_gate
+            # emits final physical IDs (or when placement is off).
+            direct_out = (
+                routing_out
+                if routing_out is not None and (info is None or mapped_in_kernel)
+                else None
+            )
+            if direct_out is not None:
+                kwargs["out"] = direct_out
+                kwargs["topk_indices_dtype"] = direct_out[1].dtype
             # moe_topk fuses the router GEMM when a kernel supports it.
             try:
                 topk_weights, topk_ids = moe_topk(
@@ -1956,6 +1995,13 @@ class DeepseekV41MoE(DeepseekV4MoE):
             except NoKernelFoundError:
                 pass
             else:
+                if not mapped_in_kernel:
+                    topk_ids = topk_ids_logical_to_physical(
+                        topk_ids,
+                        info,
+                        num_experts=self.gate.weight.shape[0],
+                    )
+                record_expert_load(None if info is None else info.load, topk_ids)
                 return StandardTopKOutput(topk_weights, topk_ids, None)
         return super()._compute_topk_output(hidden_states, image_mask)
 
@@ -1965,7 +2011,13 @@ class DeepseekV41MoE(DeepseekV4MoE):
             return
         gate_weight = self.gate.weight
         device = gate_weight.device
-        token_counts = mega_gate_warmup_token_counts(min(max_tokens, 65536))
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        token_counts = mega_gate_warmup_token_counts(
+            min(max_tokens, 65536),
+            hidden=gate_weight.shape[1],
+            num_experts=gate_weight.shape[0],
+            num_sms=num_sms,
+        )
         image_modes = (False,) if self.gate.bias_vl is None else (False, True)
         for include_image_bias in image_modes:
             for tokens in token_counts:
@@ -3896,15 +3948,47 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             max_tokens = _max_forward_tokens()
             _warmup_query_projections(attentions, max_tokens)
         warmed_routers = set()
+        warmed_loads = set()
         for module in self.modules():
             if isinstance(module, DeepseekV4MoE):
                 module.warmup()
+                info = module.expert_dispatch_info
+                if (
+                    info is not None
+                    and info.load is not None
+                    and info.load.physical_load.is_cuda
+                ):
+                    load_key = (
+                        info.load.physical_load.device,
+                        info.load.physical_load.dtype,
+                    )
+                    if load_key not in warmed_loads:
+                        device, load_dtype = load_key
+                        dummy_mask = torch.zeros((1,), dtype=torch.bool, device=device)
+                        dummy_load = torch.zeros((1,), dtype=load_dtype, device=device)
+                        for id_dtype in (torch.int32, torch.int64):
+                            dummy_ids = torch.zeros(
+                                (1, module.topk.topk_config.top_k),
+                                dtype=id_dtype,
+                                device=device,
+                            )
+                            kernel_record_expert_load(dummy_ids, dummy_mask, dummy_load)
+                        warmed_loads.add(load_key)
                 if isinstance(module, DeepseekV41MoE) and module.gate.weight.is_cuda:
+                    has_placement = info is not None and (
+                        (
+                            info.ep_dispatch_algorithm == "static"
+                            and info.partial_logical_to_rank_dispatch_physical_map
+                            is not None
+                        )
+                        or info.ep_dispatch_algorithm == "dynamic"
+                    )
                     router_key = (
                         module.gate.weight.device,
                         tuple(module.gate.weight.shape),
                         module.gate.e_score_correction_bias is not None,
                         module.gate.bias_vl is not None,
+                        has_placement,
                     )
                     if router_key not in warmed_routers:
                         if max_tokens is None:

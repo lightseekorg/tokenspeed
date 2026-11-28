@@ -589,9 +589,10 @@ Fused `bf16_mega_gate` routing follows the same workspace and stream rules:
 each CUDA stream's first non-empty uncaptured launch runs under the `workspace`
 named region (`set_mega_gate_workspace_region`) so DeepGEMM's persistent
 per-stream barrier stays off the ordinary allocator pool, and capturing on an
-uninitialized stream fails closed. Inputs are padded to canonical warmed power-of-two
-buckets (`1`, `16..65536`, warmed upfront via `mega_gate_warmup_token_counts` up
-to `65536`; unchunked batches above `65536` fall back cleanly to the unfused
+uninitialized stream fails closed. `bf16_mega_gate` passes exact runtime token
+counts directly without padding, while `mega_gate_warmup_token_counts` mirrors
+the heuristic config table upfront up to `65536` tokens (`<= 15` launches per
+variant; unchunked batches above `65536` fall back cleanly to the unfused
 router) so arbitrary serving batch sizes never compile new `bf16_mega_gate` cubins. Direct
 `mega_mhc -> symm_buffer` activation staging only fires on uncaptured forwards
 where `mega_mhc` runs (eager prefill); `PrefillGraph` (`BreakableCapture`) and

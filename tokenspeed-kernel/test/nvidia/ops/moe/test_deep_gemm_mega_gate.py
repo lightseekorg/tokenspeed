@@ -37,8 +37,9 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError
 from tokenspeed_kernel.thirdparty.cuda import mega_gate as mega_gate_mod
 from tokenspeed_kernel.thirdparty.cuda.mega_gate import (
+    _mega_gate_candidates,
+    _mega_gate_heuristic_key,
     bf16_mega_gate,
-    bucket_mega_gate_tokens,
     is_bf16_mega_gate_available,
     mega_gate_warmup_token_counts,
 )
@@ -339,69 +340,73 @@ def test_bf16_mega_gate_validation_and_registry_guards() -> None:
     assert w.shape == (4, 4) and idx.shape == (4, 4)
 
 
-def test_bf16_mega_gate_bucket_schedule_and_mask_padding() -> None:
-    warmed = set(mega_gate_warmup_token_counts(65536))
-    for count in (1, 2, 3, 8, 16, 17, 48, 100, 777, 1024, 2500, 16384, 50000):
-        assert bucket_mega_gate_tokens(count) in warmed
-    assert mega_gate_warmup_token_counts(1024) == [
-        1,
-        16,
-        32,
-        64,
-        128,
-        256,
-        512,
-        1024,
-    ]
+def test_bf16_mega_gate_heuristic_warmup_covers_all_configs() -> None:
+    for hidden, experts, num_sms, deterministic in (
+        (5120, 384, 148, False),
+        (5120, 128, 148, False),
+        (5120, 384, 132, False),
+        (1024, 64, 148, False),
+        (512, 64, 148, True),
+    ):
+        max_tokens = 8192
+        warm = mega_gate_warmup_token_counts(
+            max_tokens,
+            hidden=hidden,
+            num_experts=experts,
+            num_sms=num_sms,
+            deterministic=deterministic,
+        )
+        cands = _mega_gate_candidates(hidden, experts, num_sms, deterministic)
+        warmed_configs = {
+            _mega_gate_heuristic_key(t, cands, num_sms, deterministic) for t in warm
+        }
+        all_configs = {
+            _mega_gate_heuristic_key(t, cands, num_sms, deterministic)
+            for t in range(1, max_tokens + 1)
+        }
+        assert len(warm) == len(warmed_configs)
+        assert warmed_configs == all_configs
 
+
+def test_bf16_mega_gate_unpadded_mask_and_exact_out() -> None:
     torch.manual_seed(29)
-    tokens, hidden, experts, top_k = 17, 512, 64, 4
+    hidden, experts, top_k = 512, 64, 4
     gate_weight = (torch.randn(experts, hidden, device="cuda") * 0.1).bfloat16()
-    hidden_states = (torch.randn(tokens, hidden, device="cuda") * 0.1).bfloat16()
     bias = torch.randn(experts, device="cuda") * 0.05
-    mask = torch.tensor([i % 3 != 0 for i in range(tokens)], device="cuda")
-    out_w = torch.empty(tokens, top_k, device="cuda", dtype=torch.float32)
-    out_idx = torch.empty(tokens, top_k, device="cuda", dtype=torch.int64)
-    got_w, got_idx = bf16_mega_gate(
-        hidden_states,
-        gate_weight,
-        top_k,
-        renormalize=True,
-        routed_scaling_factor=1.5,
-        ep_rank=0,
-        correction_bias=bias,
-        mask=mask,
-        out=(out_w, out_idx),
-    )
-    assert got_w.data_ptr() == out_w.data_ptr()
-    assert got_idx.data_ptr() == out_idx.data_ptr()
 
-    # Padded execution matches invoking the unpadded bucket directly with False-extended mask.
-    direct_w, direct_idx = bf16_mega_gate(
-        F.pad(hidden_states, (0, 0, 0, 15)),
-        gate_weight,
-        top_k,
-        renormalize=True,
-        routed_scaling_factor=1.5,
-        ep_rank=0,
-        correction_bias=bias,
-        mask=F.pad(mask, (0, 15), value=False),
-    )
-    torch.testing.assert_close(got_idx, direct_idx[:tokens], atol=0, rtol=0)
-    torch.testing.assert_close(got_w, direct_w[:tokens], atol=0, rtol=0)
+    for tokens in (1, 17, 48, 96, 300):
+        hidden_states = (torch.randn(tokens, hidden, device="cuda") * 0.1).bfloat16()
+        mask = torch.tensor([i % 3 != 0 for i in range(tokens)], device="cuda")
+        out_w = torch.empty(tokens, top_k, device="cuda", dtype=torch.float32)
+        out_idx = torch.empty(tokens, top_k, device="cuda", dtype=torch.int64)
+        got_w, got_idx = bf16_mega_gate(
+            hidden_states,
+            gate_weight,
+            top_k,
+            renormalize=True,
+            routed_scaling_factor=1.5,
+            ep_rank=0,
+            correction_bias=bias,
+            mask=mask,
+            out=(out_w, out_idx),
+        )
+        assert got_w.data_ptr() == out_w.data_ptr()
+        assert got_idx.data_ptr() == out_idx.data_ptr()
+        assert (got_idx[~mask] == -1).all()
+        assert (got_w[~mask] == 0).all()
 
-    # Active rows match the unmasked reference parity closely.
-    ref_w, ref_idx = _reference_sqrt_softplus_topk(
-        hidden_states[mask],
-        gate_weight,
-        top_k,
-        routed_scaling_factor=1.5,
-        correction_bias=bias,
-    )
-    got_cw, got_ci = _canonicalize_routes(got_w[mask], got_idx[mask])
-    ref_cw, ref_ci = _canonicalize_routes(ref_w, ref_idx)
-    torch.testing.assert_close(got_ci, ref_ci, atol=0, rtol=0)
-    torch.testing.assert_close(got_cw, ref_cw, atol=2e-3, rtol=2e-3)
+        if mask.any():
+            ref_w, ref_idx = _reference_sqrt_softplus_topk(
+                hidden_states[mask],
+                gate_weight,
+                top_k,
+                routed_scaling_factor=1.5,
+                correction_bias=bias,
+            )
+            got_cw, got_ci = _canonicalize_routes(got_w[mask], got_idx[mask])
+            ref_cw, ref_ci = _canonicalize_routes(ref_w, ref_idx)
+            torch.testing.assert_close(got_ci, ref_ci, atol=0, rtol=0)
+            torch.testing.assert_close(got_cw, ref_cw, atol=2e-3, rtol=2e-3)
 
 
 @pytest.mark.filterwarnings("ignore:The CUDA Graph is empty:UserWarning")
@@ -586,7 +591,7 @@ _MEGA_GATE_WARMUP_SCRIPT = """
 import sys
 from pathlib import Path
 import torch
-from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.moe import mega_gate_warmup_token_counts, moe_topk
 
 cache = Path(sys.argv[1])
 hidden, experts, top_k = 5120, 256, 8
@@ -629,12 +634,18 @@ def _run(tokens: int) -> None:
         override="deep_gemm_bf16_mega_gate",
     )
 
-for warm_tokens in (1, 16, 32, 64, 128, 256, 512, 1024):
+num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+for warm_tokens in mega_gate_warmup_token_counts(
+    2048,
+    hidden=hidden,
+    num_experts=experts,
+    num_sms=num_sms,
+):
     _run(warm_tokens)
 torch.cuda.synchronize()
 compiled = {str(p) for p in cache.rglob("*")}
 
-for serve_tokens in (2, 3, 8, 17, 48, 100, 777):
+for serve_tokens in (2, 3, 8, 17, 48, 96, 192, 288, 300, 384, 432, 480, 528, 576, 720, 777, 1024, 1500):
     _run(serve_tokens)
 torch.cuda.synchronize()
 new = sorted({str(p) for p in cache.rglob("*")} - compiled)

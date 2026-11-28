@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -184,3 +185,52 @@ def test_graph_owners_mark_filler_rows_before_the_replay_and_clear_after(
     ]
     assert len(marks) == 1 and len(clears) == 1 and replays
     assert marks[0] < min(replays) < clears[0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
+def test_layer_expert_load_record_gpu_honors_mask_without_recompiles(
+    id_dtype: torch.dtype,
+):
+    from tokenspeed_kernel.ops.moe._triton import expert_load
+
+    mapping = Mapping(
+        rank=1, world_size=2, attn_tp_size=1, attn_dp_size=2, moe_ep_size=2
+    )
+    rows = ExpertLoadRowMask(mapping)
+    rows.reserve(32, "cuda")
+    load_bank = torch.zeros(3, 8, dtype=torch.int64, device="cuda")
+
+    rows.mark_padded(padded_global_num_tokens=[4, 4], live_global_num_tokens=[3, 2])
+    ids = torch.tensor(
+        [
+            [0, 1],
+            [1, 2],
+            [2, -1],
+            [7, 7],
+            [3, 4],
+            [4, 5],
+            [6, 6],
+            [7, 7],
+        ],
+        dtype=id_dtype,
+        device="cuda",
+    )
+    LayerExpertLoad(load_bank[0], rows).record(ids)
+    # Rank 0 live=[0, 1, 2], filler=[3]; Rank 1 live=[4, 5], filler=[6, 7].
+    assert load_bank[0].tolist() == [1, 2, 2, 1, 2, 1, 0, 0]
+
+    with patch.object(
+        expert_load._record_expert_load_kernel,
+        "_do_compile",
+        wraps=expert_load._record_expert_load_kernel._do_compile,
+    ) as compile_mock:
+        rows.clear()
+        LayerExpertLoad(load_bank[1], rows).record(ids)
+        rows.mark_padded(
+            padded_global_num_tokens=[16, 16], live_global_num_tokens=[5, 7]
+        )
+        bigger_ids = torch.randint(0, 8, (32, 8), dtype=id_dtype, device="cuda")
+        LayerExpertLoad(load_bank[2], rows).record(bigger_ids)
+    assert compile_mock.call_count == 0
+    assert load_bank[1].tolist() == [1, 2, 2, 1, 2, 1, 2, 4]

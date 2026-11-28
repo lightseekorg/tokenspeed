@@ -42,6 +42,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
+from tokenspeed_kernel.ops.moe import record_expert_load
 
 from tokenspeed.runtime.distributed.comm_manager import moe_input_row_segments
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -153,15 +154,14 @@ class LayerExpertLoad:
         """Count every real route of ``topk_ids`` into the counters.
 
         ``-1`` marks zero-expert and masked routes; filler rows are not
-        routes either. One ``scatter_add_`` with a zero weight for those keeps
-        this graph-capturable.
+        routes either. A single fused kernel update keeps this fast and
+        graph-capturable.
 
         Args:
             topk_ids: ``[rows, top_k]`` physical ids of this layer's routing.
         """
-        valid = (topk_ids >= 0) & self.rows.rows(topk_ids.shape[0]).unsqueeze(1)
-        self.physical_load.scatter_add_(
-            0,
-            topk_ids.masked_fill(~valid, 0).reshape(-1).long(),
-            valid.reshape(-1).to(self.physical_load.dtype),
+        record_expert_load(
+            topk_ids,
+            self.rows.rows(topk_ids.shape[0]),
+            self.physical_load,
         )
