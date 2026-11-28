@@ -993,7 +993,7 @@ class DFlash(BaseDrafter):
             )
         with torch.inference_mode():
             ctx_hidden = model.project_target_hidden(target_hidden)
-            if decode_only and self._fused_kv_enabled:
+            if (decode_only or self._fused_kv_is_mla) and self._fused_kv_enabled:
                 self._write_native_cache_fused(
                     ctx_hidden, target_positions, target_cache_locs
                 )
@@ -1233,6 +1233,13 @@ class DFlash(BaseDrafter):
                 # The fused write norms the latent but applies no runtime
                 # scale (--mla-lora-scale runtime); the per-layer path does.
                 return decline("the latent carries a runtime LoRA norm scale")
+            if (
+                self.attn_backend is not None
+                and self.attn_backend.cache_placement(attn.attn_mqa) is not None
+            ):
+                # Fused write scatters unmasked rows directly; defer sharded
+                # placement to write_context_kv + resolve_cache_slots.
+                return decline("the latent cache uses sharded placement")
             start = int(attn.q_lora_rank)
             weight_rows.append(weight[start : start + kv_width])
             norm_rows.append(attn.kv_a_layernorm.weight)
@@ -1277,31 +1284,88 @@ class DFlash(BaseDrafter):
             f"{rope_dim:d}, cache_dtype={planes.dtype!s}",
         )
 
+    _PREFILL_FUSED_KV_CHUNK_ROWS = 2048
+
+    def _run_fused_mla_kv_chunk(
+        self,
+        ctx_hidden: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_cache_locs: torch.Tensor,
+        proj_out: torch.Tensor,
+    ) -> None:
+        """Project one chunk of hidden rows and scatter its MLA latents."""
+        chunk_rows = int(ctx_hidden.shape[0])
+        torch.mm(ctx_hidden, self._fused_kv_flat_weight_t, out=proj_out)
+        mla_latent_norm_rope_scatter(
+            proj_out.view(
+                chunk_rows, self._fused_kv_n_layers, self._fused_kv_layer_out_dim
+            ),
+            self._fused_kv_k_norm_weight,
+            self._fused_kv_eps,
+            self._fused_kv_cos_sin_cache,
+            (
+                target_positions.contiguous()
+                if target_positions.stride(0) != 1
+                else target_positions
+            ),
+            (
+                target_cache_locs.contiguous()
+                if target_cache_locs.stride(0) != 1
+                else target_cache_locs
+            ),
+            self._fused_kv_latent_planes,
+            write_mask=None,
+            is_neox=self._fused_kv_is_neox,
+            sanitize=self._fused_kv_sanitize,
+        )
+
     def _write_native_cache_fused_mla(
         self,
         ctx_hidden: torch.Tensor,
         target_positions: torch.Tensor,
         target_cache_locs: torch.Tensor,
     ) -> None:
-        """One stacked GEMM plus one norm+RoPE+scatter launch for all layers."""
+        """One stacked GEMM plus one norm+RoPE+scatter launch per chunk."""
         total_ctx = int(ctx_hidden.shape[0])
-        self._ensure_fused_workspace(total_ctx, ctx_hidden.dtype)
-        proj_out = self._fused_kv_proj_workspace[:total_ctx]
-        torch.mm(ctx_hidden, self._fused_kv_flat_weight_t, out=proj_out)
-        mla_latent_norm_rope_scatter(
-            proj_out.view(
-                total_ctx, self._fused_kv_n_layers, self._fused_kv_layer_out_dim
-            ),
-            self._fused_kv_k_norm_weight,
-            self._fused_kv_eps,
-            self._fused_kv_cos_sin_cache,
-            target_positions,
-            target_cache_locs,
-            self._fused_kv_latent_planes,
-            write_mask=None,
-            is_neox=self._fused_kv_is_neox,
-            sanitize=self._fused_kv_sanitize,
-        )
+        if total_ctx == 0:
+            return
+        if (
+            total_ctx <= self._fused_kv_workspace_capacity
+            or is_current_stream_capturing(ctx_hidden.device)
+        ):
+            self._ensure_fused_workspace(total_ctx, ctx_hidden.dtype)
+            self._run_fused_mla_kv_chunk(
+                ctx_hidden,
+                target_positions,
+                target_cache_locs,
+                self._fused_kv_proj_workspace[:total_ctx],
+            )
+            return
+        if ctx_hidden.dtype != self._fused_kv_workspace_dtype:
+            raise RuntimeError(
+                "DFLASH fused MLA KV dtype mismatch: "
+                f"expected {self._fused_kv_workspace_dtype}, got {ctx_hidden.dtype}"
+            )
+        # Prefill batches larger than the decode-sized static workspace chunk
+        # through one bounded buffer so persistent GPU memory stays fixed.
+        if self._fused_kv_workspace_capacity >= self._PREFILL_FUSED_KV_CHUNK_ROWS:
+            chunk_rows = self._fused_kv_workspace_capacity
+            chunk_ws = self._fused_kv_proj_workspace
+        else:
+            chunk_rows = min(total_ctx, self._PREFILL_FUSED_KV_CHUNK_ROWS)
+            chunk_ws = torch.empty(
+                (chunk_rows, self._fused_kv_n_layers * self._fused_kv_layer_out_dim),
+                dtype=self._fused_kv_workspace_dtype,
+                device=self.device,
+            )
+        for start in range(0, total_ctx, chunk_rows):
+            end = min(start + chunk_rows, total_ctx)
+            self._run_fused_mla_kv_chunk(
+                ctx_hidden[start:end],
+                target_positions[start:end],
+                target_cache_locs[start:end],
+                chunk_ws[: end - start],
+            )
 
     def _init_context_taps(self) -> None:
         """Size the buffer the target's taps land in as the target produces them.
