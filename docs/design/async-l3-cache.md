@@ -175,6 +175,10 @@ separate namespace even with the same weights; objects are not converted.
 The literal `tsl3-` prefix identifies the cache without a second version number;
 the namespace hash includes `runtime_compat` as its single compatibility epoch.
 Scheduling, queue and query-budget changes do not advance that epoch.
+Plugin execution choices in `extra_server_args` also enter the producer identity.
+A model with a runtime-config hook includes this field even when the launch
+supplies no options, separating it from older checkpoint-owned plugin policies.
+Models without such hooks or extra options retain their existing identity.
 
 The request's soft deadline starts when the query is issued and includes
 queue wait for both query and GET. A soft timeout ends its wait and permits

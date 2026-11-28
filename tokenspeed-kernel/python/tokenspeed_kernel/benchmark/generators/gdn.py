@@ -54,8 +54,11 @@ class _GdnModelProfile:
 
 
 # Per-rank GDN geometry: Qwen3.8-Flash-Next has 16 key / 48 value heads of
-# 128 dims, split over TP2.
+# 128 dims, unsplit at TP1 and halved at TP2.
 _MODEL_PROFILES = {
+    "qwen38_flash_tp1": _GdnModelProfile(
+        num_q_heads=16, num_v_heads=48, head_dim=128, value_head_dim=128
+    ),
     "qwen38_flash_tp2": _GdnModelProfile(
         num_q_heads=8, num_v_heads=24, head_dim=128, value_head_dim=128
     ),
@@ -146,7 +149,7 @@ def _decode_inputs(
 def _state_dtype(request: BenchmarkRequest) -> torch.dtype:
     name = request.parameters.get("state_dtype")
     if name not in ("float32", "bfloat16"):
-        raise _invalid("GDN decode state_dtype must be explicit: float32 or bfloat16")
+        raise _invalid("GDN state_dtype must be explicit: float32 or bfloat16")
     return torch.float32 if name == "float32" else torch.bfloat16
 
 
@@ -248,6 +251,7 @@ def prepare_gdn_decode_mtp(
         "chunked_chain": False,
         "replay_payload": False,
         "pending_replay": False,
+        "output_norm": False,
     }
     if request.solution != "flashinfer" and per_token:
         # State-writing calls select by state dtype, as the facade does.
@@ -304,14 +308,16 @@ def prepare_gdn_chunk_prefill(
 ) -> PreparedBenchmark:
     """Prepare one chunked GDN prefill of ``sequences`` equal-length prompts.
 
-    Inputs mirror the runtime's prefill scan: FP32 log gates, BF16 betas,
-    in-kernel Q/K L2 normalization and an FP32 initial and final state.
-    This case does not request intermediate state checkpoints.
+    Inputs mirror the runtime's prefill scan: FP32 log gates, BF16 betas and
+    in-kernel Q/K L2 normalization. ``state_dtype`` explicitly selects float32
+    or bfloat16 for the initial state, as the runtime reads it from its SSM
+    pool. This case does not request intermediate state checkpoints.
     """
 
     model_profile, profile = _profile(request)
     sequences = _positive(request.parameters, "sequences")
     tokens_per_sequence = _positive(request.parameters, "tokens_per_sequence")
+    state_dtype = _state_dtype(request)
     total = sequences * tokens_per_sequence
     traits = {
         "head_dim": profile.head_dim,
@@ -338,7 +344,7 @@ def prepare_gdn_chunk_prefill(
         generator=generator,
     )
     beta = randn(1, total, profile.num_v_heads).sigmoid()
-    state = _state_pool(sequences, profile, torch.float32)
+    state = _state_pool(sequences, profile, state_dtype)
     cu_seqlens = torch.arange(
         0, total + 1, tokens_per_sequence, device="cuda", dtype=torch.int32
     )
@@ -370,7 +376,7 @@ def prepare_gdn_chunk_prefill(
             "sequences": sequences,
             "tokens_per_sequence": tokens_per_sequence,
             "dtype": "bfloat16",
-            "state_dtype": "float32",
+            "state_dtype": request.parameters["state_dtype"],
         },
         validation=None,
     )

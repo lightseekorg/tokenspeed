@@ -567,15 +567,23 @@ def test_gdn_chunk_prefill_output_h_contract(device: str, solution: str, require
     assert result.final_state.shape == initial_state.shape
 
 
+@pytest.mark.parametrize(
+    ("solution", "lengths", "interval"),
+    [
+        ("flashinfer", (300, 520), 128),
+        ("triton", (300, 520), 128),
+        # Chunk-sized interval, a sequence shorter than it, and one ending on
+        # a checkpoint (its last checkpoint is its final state).
+        ("triton", (64, 40, 192), 64),
+    ],
+)
 def test_gdn_chunk_prefill_state_checkpoints_are_the_truncated_final_states(
-    device: str, require
+    device: str, require, solution, lengths, interval
 ):
-    # A caller-owned checkpoint buffer at a 128-token interval: sequence i's
-    # j-th state is the final state of the same scan cut after (j + 1) * 128
-    # of its tokens, bit for bit.
-    require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
-    lengths = (300, 520)
-    interval = 128
+    # A caller-owned checkpoint buffer at an interval of whole chunks:
+    # sequence i's j-th state is the final state of the same scan cut after
+    # (j + 1) * interval of its tokens, bit for bit.
+    require("attention", "gdn_chunk_prefill", solution, torch.bfloat16, "q")
     q, k, v, g, beta, initial_state, _ = _make_inputs(
         device=device,
         dtype=torch.bfloat16,
@@ -587,10 +595,13 @@ def test_gdn_chunk_prefill_state_checkpoints_are_the_truncated_final_states(
     )
     initial_state = initial_state.repeat(len(lengths), 1, 1, 1)
     initial_state[1] *= -1
-    starts = (0, lengths[0])
-    cu_seqlens = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()])
+    bounds = [0, *torch.tensor(lengths).cumsum(0).tolist()]
+    starts = bounds[:-1]
+    cu_seqlens = torch.tensor(bounds)
     counts = [length // interval for length in lengths]
-    cu_starts = torch.tensor([0, counts[0], counts[0] + counts[1]], dtype=torch.int32)
+    cu_starts = torch.tensor(
+        [0, *torch.tensor(counts).cumsum(0).tolist()], dtype=torch.int32
+    )
     states = torch.full(
         (sum(counts), *initial_state.shape[1:]), float("nan"), device=device
     )
@@ -609,6 +620,7 @@ def test_gdn_chunk_prefill_state_checkpoints_are_the_truncated_final_states(
         state_checkpoints=GdnStateCheckpoints(
             every_n_tokens=interval, states=states, cu_starts=cu_starts.to(device)
         ),
+        solution=solution,
     )
     for i, (start, count) in enumerate(zip(starts, counts)):
         for j in range(count):
@@ -626,6 +638,7 @@ def test_gdn_chunk_prefill_state_checkpoints_are_the_truncated_final_states(
                 ),
                 qk_l2norm=True,
                 output_final_state=True,
+                solution=solution,
             )
             assert torch.equal(
                 states[int(cu_starts[i]) + j], truncated.final_state[0]

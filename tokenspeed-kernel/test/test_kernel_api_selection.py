@@ -4195,6 +4195,7 @@ def test_qsa_indexer_selects_gluon_on_gfx950(
         for name in (
             "gluon_qsa_block_scores_gfx950",
             "gluon_qsa_block_topk_select_gfx950",
+            "gluon_qsa_block_topk_stream_gfx950",
         )
     ]
     if None in gluon_specs:
@@ -4232,11 +4233,10 @@ def test_qsa_indexer_selects_gluon_on_gfx950(
         return scores, topk, stream
 
     assert all(spec.priority == Priority.SPECIALIZED for spec in gluon_specs)
-    # Streaming top-k has only the portable implementation.
     assert select(mi350_platform) == (
         "gluon_qsa_block_scores_gfx950",
         "gluon_qsa_block_topk_select_gfx950",
-        "triton_qsa_block_topk_stream",
+        "gluon_qsa_block_topk_stream_gfx950",
     )
     assert select(mi450_platform) == (
         "triton_qsa_block_scores",

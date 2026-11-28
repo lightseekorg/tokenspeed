@@ -87,9 +87,16 @@ std::int64_t Deadline(std::int64_t now_us, std::int64_t lifetime_us) {
 }  // namespace
 
 Scheduler::PeerStats Scheduler::GetPeerStats() const {
-    PeerStats stats{.landed_tokens = peer_landed_tokens_,
+    PeerStats stats{.frozen_targets = peer_frozen_targets_.size(),
+                    .landed_tokens = peer_landed_tokens_,
                     .failed_landings = peer_failed_landings_,
-                    .unused_host_landings = peer_unused_host_landings_};
+                    .unused_host_landings = peer_unused_host_landings_,
+                    .frozen_landings = peer_frozen_landings_};
+    for (const auto& lease : peer_frozen_targets_) {
+        if (const auto it = peer_target_holds_.find(lease); it != peer_target_holds_.end()) {
+            stats.frozen_blocks += it->second.size();
+        }
+    }
     if (peer_exports_) {
         stats.leases = peer_exports_->NumLeases();
         stats.pinned_blocks = peer_exports_->NumPinnedBlocks();
@@ -192,6 +199,10 @@ void Scheduler::recordPeerDispatch(Request& request) {
     request.peer_dispatch_sample.reset();
 }
 
+void Scheduler::handleEvent(const cache::PeerTargetRetired& event) {
+    RetirePeerTarget(event.lease);
+}
+
 void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
     if (config_.peer_config && config_.peer_config->versioned_shards) {
         auto attempt = peer_target_attempts_.find(event.request_id);
@@ -199,7 +210,13 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
         // A frozen landing can publish only a fallback, never readable tokens.
         if (event.frozen && event.num_tokens != 0) return;
         peer_target_attempts_.erase(attempt);
-        if (!event.frozen) RetirePeerTarget(event.lease);
+        if (event.frozen) {
+            if (peer_target_holds_.contains(event.lease) && peer_frozen_targets_.insert(event.lease).second) {
+                ++peer_frozen_landings_;
+            }
+        } else {
+            RetirePeerTarget(event.lease);
+        }
     }
     Request* request = findRequest(event.request_id);
     if (auto attempt = device_attempts_.extract(event.request_id); !attempt.empty()) {
@@ -490,6 +507,16 @@ void Scheduler::preparePeer(Request& request) {
     if (submitted == nullptr) {
         return;
     }
+    if (!peer_frozen_targets_.empty() && !request.PeerHolder().empty()) {
+        // A failed read still owns Device pages and may occupy the reader's
+        // transport workers. Do not add landings, including previously answered
+        // offers, until TargetRetired releases every frozen target. Normal local
+        // admission can use the remaining cache capacity (cache-concepts.md).
+        submitted->admission.peer_hit.reset();
+        submitted->admission.peer_prepared = true;
+        request.peer_local_reason = "reader_retirement_pending";
+        return;
+    }
     // A prompt its holder answered lands into Host before its admission; not
     // while frozen, so a flush or a weight update waits for no new landing.
     if (peer_host_landings_ && submitted->admission.peer_hit && forward_allowed_) {
@@ -547,7 +574,8 @@ void Scheduler::preparePeer(Request& request) {
                                               .holder = holder,
                                               .prefix_hashes = {hashes.begin(), hashes.end()},
                                               .tokens = {tokens.begin(), tokens.end()},
-                                              .max_tokens = max_tokens});
+                                              .max_tokens = max_tokens,
+                                              .local_tokens = local});
     spdlog::debug("[Peer] rid={} lookup {} to {} local_tokens={} bound_tokens={}", request.Id(), lease.id, holder,
                   local, max_tokens);
     const bool grant_host = async_host_peer_;

@@ -28,6 +28,11 @@ successful and failed availability checks are cached.
 
 ## Streaming block selection
 
+On gfx950 the Gluon streaming registration scores and selects row chunks that
+fit `max_partial_bytes` with the gfx950 logits kernels, so both paths select
+the same blocks there (see the gfx950 QSA indexer section of
+`tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/README.md`).
+
 The Blackwell CuTe implementation under `thirdparty/cute_dsl/_qsa_stream_topk/`
 computes BF16 dot products with FP32 accumulation, clamps each head at zero,
 and selects up to 512 compressed-block IDs. Scores retain FP32 precision;

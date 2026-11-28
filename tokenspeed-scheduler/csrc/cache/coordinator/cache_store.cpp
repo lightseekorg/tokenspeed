@@ -213,7 +213,8 @@ std::vector<CacheStore::NodeEntry> CacheStore::NodeEntries(const BlockPool& pool
                 .pool = &pool, .group_id = groups_[i].Id(), .location = entry->location, .in_use = entry->pinned});
         }
     };
-    const auto tier = &pool == host_pool_ ? BoundaryTree::kHost : BoundaryTree::kDevice;
+    const auto tier =
+        &pool == disk_pool_ ? BoundaryTree::kDisk : (&pool == host_pool_ ? BoundaryTree::kHost : BoundaryTree::kDevice);
     // Preserve group and block order within each kind without a temporary
     // partition buffer for every inspected boundary.
     for (const bool state : {true, false}) {

@@ -97,7 +97,11 @@ Like every `mv` kernel it is selected by the row count alone, in any forward.
 Startup kernel warmup compiles its binaries from any `mm` call that meets
 such a weight (`warm_gluon_mm_a16w16_skinny`, beside the TGV warm hook), so
 the row counts it takes need not run before serving; outside warmup the
-hooks cost `mm` one `is_warming_up()` check. `warm_gluon_mm_a16w16_decode`
+hooks cost `mm` one `is_warming_up()` check. The gfx950 pipelined GEMM,
+`gluon_mm_a16w16_pipelined_gfx950`, is an `mv` kernel of the same kind (row
+ranges per weight shape, alignment traits, `warm_gluon_mm_a16w16_pipelined`);
+it ranks ahead of the decode GEMM and behind the GEMVs.
+`warm_gluon_mm_a16w16_decode`
 does the same for the gfx950 decode GEMM: it compiles every config measured
 for the weight, whose row buckets a startup may not all reach. Both hooks
 fire on `mm`'s plain BF16 path only: a startup that reaches the weight no

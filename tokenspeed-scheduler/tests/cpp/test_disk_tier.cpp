@@ -522,7 +522,7 @@ TEST(DiskTierTest, APeerListingNamesEachPageFromTheFastestTierHoldingIt) {
                                    .prefix_hashes = prompt.hashes,
                                    .tokens = prompt.tokens,
                                    .max_tokens = static_cast<std::int32_t>(prompt.tokens.size())};
-    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup);
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup, /*include_disk=*/true);
     EXPECT_EQ(answer.num_tokens, 16) << "the Disk extends the Host's two pages";
     ASSERT_EQ(answer.pages.size(), 4u);
     for (std::int32_t slot = 0; slot < 4; ++slot) {
@@ -561,7 +561,7 @@ TEST(DiskTierTest, APeerListingWithoutADiskGainIsTheDeviceAndHostOne) {
                                    .prefix_hashes = prompt.hashes,
                                    .tokens = prompt.tokens,
                                    .max_tokens = static_cast<std::int32_t>(prompt.tokens.size())};
-    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup);
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup, /*include_disk=*/true);
     EXPECT_EQ(answer.num_tokens, 12);
     EXPECT_TRUE(std::ranges::none_of(answer.pages, [](const PeerPage& page) { return page.tier == CacheTier::kDisk; }));
 }
@@ -1077,6 +1077,387 @@ TEST(DiskTierTest, HybridStateDiskOnlyResidencyAndHotDescendantVisibility) {
             cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{h}}, 0).host_publishable);
     }
     EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(cache.coordinator).empty());
+}
+
+TEST(DiskTierTest, HybridPeerListAndPinKeepsDeviceStateWhenKvIsOnDisk) {
+    DiskTierCache cache(FullAndState(), 16);
+    const Prompt prompt(2, 77);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(keys).op_id, .success = true});
+    // Evict every group from Host so the KV prefix lives exclusively on Disk.
+    cache.EvictFromHost(keys);
+    // Re-publish only the State checkpoint on Device at the same boundary:
+    // ListWithDisk has split_tokens == 0 (KV pages live on Disk) while the
+    // State checkpoint resides on Device.
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(AdmitForTest(cache.coordinator, tables, static_cast<std::int32_t>(prompt.tokens.size())));
+    CacheCompletedBlocksForTest(cache.coordinator, tables, prompt.hashes,
+                                CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator),
+                                /*first_new_prefix_page=*/0, static_cast<std::int32_t>(prompt.tokens.size()),
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/true);
+    cache.coordinator.Free(tables);
+    // Drop Device KV blocks (group 0) while retaining the Device State block (group 1).
+    for (const auto& h : prompt.hashes) {
+        const CacheKey key{.group_id = 0, .content_hash = ContentHash{h}};
+        const auto location = cache.coordinator.Store().LocationOf(cache.device, 0, key);
+        ASSERT_TRUE(location);
+        ASSERT_TRUE(cache.coordinator.Evictor().EvictCachedBlockAlone(
+            0, *location, &CacheEvictor::DeviceEvictionStats::admission, /*write_back_segment=*/nullptr));
+    }
+
+    const cache::PeerLookup lookup{.lease = {.reader = "tp8-reader", .id = 1},
+                                   .prefix_hashes = prompt.hashes,
+                                   .tokens = prompt.tokens,
+                                   .max_tokens = static_cast<std::int32_t>(prompt.tokens.size())};
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup, /*include_disk=*/true);
+    ASSERT_EQ(answer.num_tokens, static_cast<std::int32_t>(prompt.tokens.size()));
+    ASSERT_EQ(answer.pages.size(), 3u);
+    auto find_page = [&](std::uint32_t group, std::int32_t slot) {
+        const auto it = std::ranges::find_if(answer.pages,
+                                             [&](const PeerPage& p) { return p.group_id == group && p.slot == slot; });
+        EXPECT_NE(it, answer.pages.end());
+        return it != answer.pages.end() ? *it : PeerPage{};
+    };
+    EXPECT_EQ(find_page(0u, 0).tier, CacheTier::kDisk);
+    EXPECT_EQ(find_page(0u, 1).tier, CacheTier::kDisk);
+    EXPECT_EQ(find_page(1u, kPeerStateSlot).tier, CacheTier::kDevice);
+
+    PeerConfig peer_cfg{.name = "holder",
+                        .incarnation = 1,
+                        .max_leases = 4,
+                        .soft_pin_us = 1000,
+                        .hard_pin_us = 10000,
+                        .lookup_timeout_us = 1000,
+                        .min_fetch_tokens = kGrain,
+                        .landing_tier = PeerLandingTier::kDevice,
+                        .max_host_landing_blocks = 0,
+                        .host_ready_timeout_us = 0,
+                        .versioned_shards = true};
+    PeerExports exports{peer_cfg};
+    exports.Lookup(cache.coordinator, lookup, /*now_us=*/0);
+    exports.Pin(cache.coordinator,
+                cache::PeerPin{.lease = answer.lease, .num_tokens = answer.num_tokens, .pages = answer.pages},
+                /*now_us=*/0, nullptr);
+    EXPECT_TRUE(exports.Held(answer.lease));
+    EXPECT_EQ(exports.NumPinnedBlocks(), 3u);
+    EXPECT_FALSE(cache.coordinator.ClearCache()) << "Disk + Device pins hold blocks";
+
+    exports.Release(cache.coordinator, cache::PeerRelease{.lease = answer.lease}, /*now_us=*/0);
+    EXPECT_EQ(exports.NumPinnedBlocks(), 0u);
+    EXPECT_EQ(exports.NumLeases(), 0u);
+    EXPECT_TRUE(cache.coordinator.ClearCache());
+}
+
+TEST(DiskTierTest, HybridPeerListWithoutDiskKeepsDeviceStateWhenKvIsOnHost) {
+    // Regression test for P2-1: when Device KV is evicted (split_tokens == 0)
+    // while Host KV and a Device State checkpoint are both present, both
+    // `AnswerLookupWithoutDisk` (`ListPrefix`) and `ExportPrefix` must report
+    // the Device State checkpoint (`kDevice`) alongside Host KV (`kHost`).
+    DiskTierCache cache(FullAndState(), 16);
+    const Prompt prompt(2, 83);
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(AdmitForTest(cache.coordinator, tables, static_cast<std::int32_t>(prompt.tokens.size())));
+    CacheCompletedBlocksForTest(cache.coordinator, tables, prompt.hashes,
+                                CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator),
+                                /*first_new_prefix_page=*/0, static_cast<std::int32_t>(prompt.tokens.size()),
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/true);
+    cache.coordinator.Free(tables);
+    // Copy KV pages to Host and evict KV from Device while retaining Device State.
+    for (const auto& h : prompt.hashes) {
+        const CacheKey key{.group_id = 0, .content_hash = ContentHash{h}};
+        CacheBlockRef host_blk = cache.coordinator.Host().AcquireHostBlock(0, 0);
+        ASSERT_TRUE(host_blk);
+        cache.coordinator.Host().CacheHostBlock(host_blk, key, std::nullopt);
+        const auto dev_loc = cache.coordinator.Store().LocationOf(cache.device, 0, key);
+        ASSERT_TRUE(dev_loc);
+        ASSERT_TRUE(cache.coordinator.Evictor().EvictCachedBlockAlone(
+            0, *dev_loc, &CacheEvictor::DeviceEvictionStats::admission, /*write_back_segment=*/nullptr));
+    }
+
+    const cache::PeerLookup lookup{.lease = {.reader = "no-disk-reader", .id = 1},
+                                   .prefix_hashes = prompt.hashes,
+                                   .tokens = prompt.tokens,
+                                   .max_tokens = static_cast<std::int32_t>(prompt.tokens.size())};
+    const PeerAnswer answer = PeerExports::AnswerLookup(cache.coordinator, lookup, /*include_disk=*/false);
+    ASSERT_EQ(answer.num_tokens, static_cast<std::int32_t>(prompt.tokens.size()));
+    ASSERT_EQ(answer.pages.size(), 3u);
+    auto find_page = [&](std::uint32_t group, std::int32_t slot) {
+        const auto it = std::ranges::find_if(answer.pages,
+                                             [&](const PeerPage& p) { return p.group_id == group && p.slot == slot; });
+        EXPECT_NE(it, answer.pages.end());
+        return it != answer.pages.end() ? *it : PeerPage{};
+    };
+    EXPECT_EQ(find_page(0u, 0).tier, CacheTier::kHost);
+    EXPECT_EQ(find_page(0u, 1).tier, CacheTier::kHost);
+    EXPECT_EQ(find_page(1u, kPeerStateSlot).tier, CacheTier::kDevice);
+
+    const auto exported = cache.coordinator.ExportPrefix(cache.coordinator.Prober().ProbePromptPrefix(prompt.Prefix()));
+    EXPECT_EQ(exported.num_tokens, answer.num_tokens);
+    ASSERT_EQ(exported.blocks.size(), 3u);
+    EXPECT_EQ(exported.blocks[2].tier, CacheTier::kDevice);
+}
+
+TEST(DiskTierTest, ShardedDiskPrefetchPreservesDiskBlockOwnerBucket) {
+    // Reproduces KVP8 (shard_count = 8) local SSD prefetch where Disk blocks
+    // reside in arbitrary owner buckets `(j + 3) % 8 != logical_block % 8`.
+    std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 8, .block_granularity = kGrain, .shard_count = 8},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0, .shard_count = 1},
+    };
+    DiskTierCache cache(specs, /*disk_parents=*/16);
+    const Prompt prompt(/*pages=*/5, /*seed=*/91);
+
+    // Publish on Device first to register boundary tree nodes, then place each
+    // Host KV block in bucket `(j + 3) % 8` so none matches `logical_block % 8`.
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(AdmitForTest(cache.coordinator, tables, static_cast<std::int32_t>(prompt.tokens.size())));
+    CacheCompletedBlocksForTest(cache.coordinator, tables, prompt.hashes,
+                                CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator),
+                                /*first_new_prefix_page=*/0, static_cast<std::int32_t>(prompt.tokens.size()),
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/true);
+    cache.coordinator.Free(tables);
+    std::vector<CacheKey> keys = cache.DeviceKeys(prompt);
+    ASSERT_EQ(keys.size(), 6u);  // 5 KV pages + 1 State checkpoint
+    std::int32_t kv_idx = 0;
+    for (const CacheKey& key : keys) {
+        const std::int32_t bucket = key.group_id == 0 ? ((kv_idx++ + 3) % 8) : 0;
+        CacheBlockRef block = cache.coordinator.Host().AcquireHostBlock(key.group_id, bucket);
+        ASSERT_TRUE(block);
+        cache.coordinator.Host().CacheHostBlock(block, key, std::nullopt);
+    }
+    ASSERT_TRUE(cache.coordinator.ClearDeviceCache());
+
+    // Clean Host -> Disk (Disk preserves each Host block's owner bucket).
+    const DiskOperation write = cache.Clean(keys);
+    ASSERT_EQ(write.group_ids.size(), 6u);
+    cache.disks.Complete(cache::DiskDone{.op_id = write.op_id, .success = true});
+    cache.EvictFromHost(keys);
+
+    // Prefetch Disk -> Host: every row must pair equal-owner Host and Disk blocks.
+    StorageLease read = cache.disks.StartRead(prompt.Prefix());
+    ASSERT_TRUE(read);
+    const auto ops = cache.disks.TakeCommands();
+    ASSERT_EQ(ops.size(), 1u);
+    const DiskOperation& op = ops[0];
+    ASSERT_EQ(op.group_ids.size(), 6u);
+    for (std::size_t row = 0; row < op.group_ids.size(); ++row) {
+        if (op.group_ids[row] == 0u) {
+            EXPECT_EQ((op.host_blocks[row] - 1) % 8, (op.disk_blocks[row] - 1) % 8)
+                << "row " << row << " paired Host and Disk blocks from different KVP8 owners";
+        }
+    }
+    cache.disks.Complete(cache::DiskDone{.op_id = op.op_id, .success = true});
+    for (const CacheKey& key : keys) {
+        EXPECT_TRUE(cache.OnHost(key));
+    }
+}
+
+TEST(DiskTierTest, ShardedDiskPrefetchMixedTiersPreservesOwners) {
+    // Pages 0..1 stay on Host, pages 2..4 live only on Disk with shifted KVP8
+    // owner buckets `(j + 5) % 8`; Disk prefetch must skip pages already on Host
+    // and allocate Host destinations in each Disk block's own bucket.
+    std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 8, .block_granularity = kGrain, .shard_count = 8},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0, .shard_count = 1},
+    };
+    DiskTierCache cache(specs, /*disk_parents=*/16);
+    const Prompt prompt(/*pages=*/5, /*seed=*/97);
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(AdmitForTest(cache.coordinator, tables, static_cast<std::int32_t>(prompt.tokens.size())));
+    CacheCompletedBlocksForTest(cache.coordinator, tables, prompt.hashes,
+                                CacheCoordinatorTestAccess::NextAccessEpoch(cache.coordinator),
+                                /*first_new_prefix_page=*/0, static_cast<std::int32_t>(prompt.tokens.size()),
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/true);
+    cache.coordinator.Free(tables);
+    std::vector<CacheKey> keys = cache.DeviceKeys(prompt);
+    ASSERT_EQ(keys.size(), 6u);
+    std::int32_t kv_idx = 0;
+    for (const CacheKey& key : keys) {
+        const std::int32_t bucket = key.group_id == 0 ? ((kv_idx++ + 5) % 8) : 0;
+        CacheBlockRef block = cache.coordinator.Host().AcquireHostBlock(key.group_id, bucket);
+        ASSERT_TRUE(block);
+        cache.coordinator.Host().CacheHostBlock(block, key, std::nullopt);
+    }
+    ASSERT_TRUE(cache.coordinator.ClearDeviceCache());
+    const DiskOperation write = cache.Clean(keys);
+    cache.disks.Complete(cache::DiskDone{.op_id = write.op_id, .success = true});
+    // Evict only pages 2..4 + State from Host; keep pages 0..1 on Host.
+    std::vector<CacheKey> tail_keys(keys.begin() + 2, keys.end());
+    cache.EvictFromHost(tail_keys);
+
+    StorageLease read = cache.disks.StartRead(prompt.Prefix());
+    ASSERT_TRUE(read);
+    const auto ops = cache.disks.TakeCommands();
+    ASSERT_EQ(ops.size(), 1u);
+    const DiskOperation& op = ops[0];
+    ASSERT_EQ(op.group_ids.size(), 4u);  // only the 3 Disk KV tail pages + State
+    for (std::size_t row = 0; row < op.group_ids.size(); ++row) {
+        if (op.group_ids[row] == 0u) {
+            EXPECT_EQ((op.host_blocks[row] - 1) % 8, (op.disk_blocks[row] - 1) % 8);
+        }
+    }
+    cache.disks.Complete(cache::DiskDone{.op_id = op.op_id, .success = true});
+    for (const CacheKey& key : keys) {
+        EXPECT_TRUE(cache.OnHost(key));
+    }
+}
+
+TEST(DiskTierTest, DiskNodeEntriesIncludesDiskOnlyStateCheckpoint) {
+    // Regression test for Fix #3: CacheStore::NodeEntries(disk_pool, node) must
+    // check `BoundaryTree::kDisk` (not `kDevice`) so Disk-only State checkpoints
+    // are enumerated even when neither Device nor Host holds a checkpoint.
+    DiskTierCache cache(FullAndState(), 16);
+    const Prompt prompt(2, 101);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(keys).op_id, .success = true});
+    cache.EvictFromHost(keys);
+
+    const BoundaryTree::Node* tip = cache.coordinator.Store().Boundaries().Find(ContentHash{prompt.hashes.back()});
+    ASSERT_NE(tip, nullptr);
+    ASSERT_FALSE(tip->HasCheckpoint(BoundaryTree::kDevice));
+    ASSERT_FALSE(tip->HasCheckpoint(BoundaryTree::kHost));
+    ASSERT_TRUE(tip->HasCheckpoint(BoundaryTree::kDisk));
+
+    const auto entries = cache.coordinator.Store().NodeEntries(*cache.coordinator.Store().DiskPool(), *tip);
+    const bool found_state =
+        std::ranges::any_of(entries, [](const CacheStore::NodeEntry& e) { return e.group_id == 1; });
+    const bool found_full =
+        std::ranges::any_of(entries, [](const CacheStore::NodeEntry& e) { return e.group_id == 0; });
+    EXPECT_TRUE(found_state);
+    EXPECT_TRUE(found_full);
+}
+
+TEST(DiskTierTest, SwaDiskOnlyBoundaryReportsDiskPublishable) {
+    // Regression test for Fix #4a: when a non-replayable SWA group (e.g. DFLASH
+    // draft) has been evicted from Host/Device to Disk while Full History stays
+    // in Host RAM, GetBoundaryEventStatus must downgrade the boundary from
+    // Host/Device to Disk publishable.
+    std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kGrain},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .sink_tokens = 2,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = kGrain},
+    };
+    DiskTierCache cache(specs, 16);
+    const Prompt prompt(4, 103);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(keys).op_id, .success = true});
+
+    // Evict only SWA (group 1) from Host while keeping Full History (group 0) on Host.
+    std::vector<CacheKey> swa_keys;
+    for (const CacheKey& key : keys) {
+        if (key.group_id == 1) swa_keys.push_back(key);
+    }
+    ASSERT_FALSE(swa_keys.empty());
+    cache.EvictFromHost(swa_keys);
+
+    const auto status =
+        cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{prompt.hashes.back()}}, 0);
+    EXPECT_FALSE(status.device_publishable);
+    EXPECT_FALSE(status.host_publishable);
+    EXPECT_TRUE(status.disk_publishable);
+}
+
+TEST(DiskTierTest, SwaPartialHostEvictionAtMultiBlockBoundaryReportsDiskPublishable) {
+    // Models DFLASH where one prefix boundary spans multiple non-replayable SWA
+    // blocks (`prefix_granularity = kGrain = 4`, `block_granularity = 2` -> 2
+    // SWA blocks per boundary). Evicting just ONE of those SWA blocks from Host
+    // while leaving the sibling SWA block and Full History on Host must still
+    // downgrade the boundary from Host to Disk publishable and notify the
+    // mutation sink.
+    std::vector<CacheGroupSpec> specs{
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = kGrain},
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 8,
+         .sink_tokens = 2,
+         .cache_blocks_per_lcm_block = 2,
+         .block_granularity = 2},
+    };
+    DiskTierCache cache(specs, 24);
+    const Prompt prompt(3, 107);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(keys).op_id, .success = true});
+
+    const ContentHash tip_hash{prompt.hashes.back()};
+    // Before eviction, all SWA blocks at the tip are in Host RAM -> Host publishable.
+    const auto before = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = tip_hash}, 0);
+    EXPECT_FALSE(before.device_publishable);
+    EXPECT_TRUE(before.host_publishable);
+    EXPECT_TRUE(before.disk_publishable);
+
+    std::vector<CacheKey> tip_swa_keys;
+    for (const CacheKey& key : keys) {
+        if (key.group_id == 1 && key.content_hash == tip_hash) {
+            tip_swa_keys.push_back(key);
+        }
+    }
+    ASSERT_EQ(tip_swa_keys.size(), 2u);
+
+    bool notified_tip = false;
+    cache.coordinator.SetCacheMutationSink([&](const CacheKey& key, CacheMutation mutation) {
+        if (mutation == CacheMutation::kLowerTierResidency && key.content_hash == tip_hash) {
+            notified_tip = true;
+        }
+    });
+
+    // Evict only ONE of the two required SWA blocks at the tip boundary from Host.
+    cache.EvictFromHost(std::vector<CacheKey>{tip_swa_keys.front()});
+
+    EXPECT_TRUE(notified_tip);
+    const auto after = cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = tip_hash}, 0);
+    EXPECT_FALSE(after.device_publishable);
+    EXPECT_FALSE(after.host_publishable);
+    EXPECT_TRUE(after.disk_publishable);
+}
+
+TEST(DiskTierTest, SwaDiskOnlyBoundaryWithStateRespectsHotterRamSubtree) {
+    // Covers the `NumStateGroups() > 0` branch of `swa_disk_only` in
+    // `CacheCoordinator::GetBoundaryEventStatus`: when SWA is Disk-only while
+    // Full History and State remain in Host RAM, the boundary downgrades to
+    // Disk publishable if no deeper child holds a RAM checkpoint, and stays
+    // Host publishable when a deeper descendant holds a hotter RAM checkpoint.
+    std::vector<CacheGroupSpec> specs = FullAndState();
+    specs.push_back({.attn_kind = AttnKind::kSlidingWindow,
+                     .sliding_window = 8,
+                     .sink_tokens = 2,
+                     .cache_blocks_per_lcm_block = 1,
+                     .block_granularity = kGrain});
+    DiskTierCache cache(specs, 24);
+    const Prompt prompt(3, 105);
+    const std::vector<CacheKey> keys = cache.OnHostOnly(prompt);
+    cache.disks.Complete(cache::DiskDone{.op_id = cache.Clean(keys).op_id, .success = true});
+
+    // Evict SWA (group 2) at the middle boundary (page 1) and tip (page 2) from Host.
+    std::vector<CacheKey> swa_keys;
+    for (const CacheKey& key : keys) {
+        if (key.group_id == 2 &&
+            (key.content_hash == ContentHash{prompt.hashes[1]} || key.content_hash == ContentHash{prompt.hashes[2]})) {
+            swa_keys.push_back(key);
+        }
+    }
+    ASSERT_EQ(swa_keys.size(), 2u);
+    cache.EvictFromHost(swa_keys);
+
+    // At the tip (page 2), no deeper child holds a RAM checkpoint -> Disk publishable.
+    const auto tip_status =
+        cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{prompt.hashes[2]}}, 0);
+    EXPECT_FALSE(tip_status.device_publishable);
+    EXPECT_FALSE(tip_status.host_publishable);
+    EXPECT_TRUE(tip_status.disk_publishable);
+
+    // At the middle boundary (page 1), page 2 still holds a State checkpoint in Host RAM,
+    // so `HasRamCheckpointInProperSubtree()` is true and page 1 stays Host publishable.
+    const auto mid_status =
+        cache.coordinator.GetBoundaryEventStatus(CacheKey{.content_hash = ContentHash{prompt.hashes[1]}}, 0);
+    EXPECT_FALSE(mid_status.device_publishable);
+    EXPECT_TRUE(mid_status.host_publishable);
+    EXPECT_TRUE(mid_status.disk_publishable);
 }
 
 DiskConfig GdsDiskLimits() {
@@ -1699,6 +2080,48 @@ TEST(DiskGdsTest, CleanPlacementPricesSharedReadsBeforeUniqueReads) {
     EXPECT_TRUE(cache.coordinator.Host().ContainsHostCachedBlock(shallow.back()));
     EXPECT_DOUBLE_EQ(cache.coordinator.Store().GdsStats().host_watermark, 0);
     EXPECT_EQ(cache.coordinator.Store().GdsStats().logical_evictions, 0u);
+}
+
+TEST(DiskGdsTest, PartialOnDiskBoundaryCleansRemainingDirtySwaAndStateKeys) {
+    // Verify that under GDS, when Full History at a boundary is already on Disk
+    // while State and SWA(sink>0) keys at the same boundary are still dirty on
+    // Host, GDS cleaning still discovers and flushes the remaining dirty keys.
+    std::vector<CacheGroupSpec> specs = FullAndState();
+    specs.push_back({.attn_kind = AttnKind::kSlidingWindow,
+                     .sliding_window = 8,
+                     .sink_tokens = 2,
+                     .cache_blocks_per_lcm_block = 1,
+                     .block_granularity = kGrain});
+    DiskTierCache cache(specs, 32, GdsDiskLimits());
+    ConfigureDiskGds(cache);
+    const Prompt prompt(3, 111);
+    const auto keys = cache.OnHostOnly(prompt);
+
+    std::vector<CacheKey> full_only;
+    std::vector<CacheKey> dirty_expected;
+    for (const auto& key : keys) {
+        if (key.group_id == 0) {
+            full_only.push_back(key);
+        } else {
+            dirty_expected.push_back(key);
+        }
+    }
+    ASSERT_FALSE(full_only.empty());
+    ASSERT_FALSE(dirty_expected.empty());
+    CopyToDisk(cache, full_only);
+
+    // Every boundary node already has `OnDisk() == true` via group 0, yet GDS
+    // cleaning must still flush the dirty State (group 1) and SWA (group 2) keys.
+    cache.disks.StartCleaning();
+    const auto commands = cache.disks.TakeCommands();
+    ASSERT_FALSE(commands.empty());
+    for (const auto& cmd : commands) {
+        cache.disks.Complete(cache::DiskDone{.op_id = cmd.op_id, .success = true});
+    }
+    for (const auto& key : dirty_expected) {
+        EXPECT_TRUE(cache.coordinator.Disk().ContainsDiskCachedBlock(key))
+            << "GDS cleaning missed dirty group " << key.group_id;
+    }
 }
 
 }  // namespace

@@ -21,6 +21,7 @@
 # -*- coding: utf-8 -*-
 
 import torch
+from tokenspeed_kernel.ops.attention.gdn import GdnStateCheckpoints
 from tokenspeed_kernel.ops.attention.gdn._triton.chunk_delta_h import (
     chunk_gated_delta_rule_fwd_h,
 )
@@ -50,6 +51,7 @@ def chunk_gated_delta_rule_fwd(
     output_final_state: bool,
     cu_seqlens: torch.LongTensor | None = None,
     return_h: bool = False,
+    state_checkpoints: GdnStateCheckpoints | None = None,
 ):
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     # obtain WY representation. u is actually the new v.
@@ -73,6 +75,7 @@ def chunk_gated_delta_rule_fwd(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
+        state_checkpoints=state_checkpoints,
     )
     o = chunk_fwd_o(
         q=q,
@@ -108,6 +111,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         output_final_state: bool,
         cu_seqlens: torch.LongTensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
+        state_checkpoints: GdnStateCheckpoints | None = None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -123,6 +127,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state=initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
+            state_checkpoints=state_checkpoints,
         )
         return o.to(q.dtype), final_state
 
@@ -141,6 +146,7 @@ def chunk_gated_delta_rule(
     head_first: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     output_h: bool = False,
+    state_checkpoints: GdnStateCheckpoints | None = None,
 ):
     r"""
     Args:
@@ -169,6 +175,9 @@ def chunk_gated_delta_rule(
         head_first (Optional[bool]):
             Whether the inputs are in the head-first format, which is not supported for variable-length inputs.
             Default: `False`.
+        state_checkpoints (Optional[GdnStateCheckpoints]):
+            Receives the FP32 K-last state after every `every_n_tokens` whole
+            tokens of each sequence. Default: `None`.
 
     Returns:
         o (torch.Tensor):
@@ -248,6 +257,7 @@ def chunk_gated_delta_rule(
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             return_h=True,
+            state_checkpoints=state_checkpoints,
         )
         o = o.to(q.dtype)
         return o, final_state, h
@@ -263,5 +273,6 @@ def chunk_gated_delta_rule(
             output_final_state,
             cu_seqlens,
             use_qk_l2norm_in_kernel,
+            state_checkpoints,
         )
         return o, final_state

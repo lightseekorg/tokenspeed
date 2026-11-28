@@ -186,7 +186,7 @@ if _qwen4_exp_layer is not None:
         *,
         weights: Any,
         h: torch.Tensor,
-        h_out: torch.Tensor,
+        h_out: torch.Tensor | None,
         scratch: torch.Tensor,
         step: torch.Tensor,
         layer_index: int,

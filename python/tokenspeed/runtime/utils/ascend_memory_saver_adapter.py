@@ -126,8 +126,22 @@ class AscendMemorySaverAdapter(NpuMemorySaver, TorchMemorySaverAdapter):
             with super().allocation_region(key):
                 yield
 
-    def validate_startup(self, *, models, kv_regions, graphs) -> None:
-        """Check all model and KV storage plus captured graph pool ownership."""
+    def validate_startup(
+        self,
+        *,
+        models,
+        kv_regions,
+        graphs,
+        peer_storages: frozenset[tuple[int, int]] = frozenset(),
+    ) -> None:
+        """Check all model and KV storage plus captured graph pool ownership.
+
+        Args:
+            peer_storages: ``(data_ptr, nbytes)`` pairs for peer-owned model
+                storage (such as VMM-backed DWDP views) that satisfy weight
+                presence for their role while being exempted from memory-saver
+                allocation tracking.
+        """
         allocations = []
         for role, model in models:
             found = False
@@ -135,6 +149,9 @@ class AscendMemorySaverAdapter(NpuMemorySaver, TorchMemorySaverAdapter):
                 if tensor.device.type != "npu" or not tensor.numel():
                     continue
                 storage = tensor.untyped_storage()
+                if (storage.data_ptr(), storage.nbytes()) in peer_storages:
+                    found = True
+                    continue
                 allocations.append(
                     ("weights", f"{role}.{name}", storage.data_ptr(), storage.nbytes())
                 )

@@ -1846,6 +1846,22 @@ _DECODE_CONFIGS: dict[
         32: (32, 32, 512, 2, 2, 2, 5, 1),
         64: (32, 32, 512, 2, 2, 2, 5, 8),
     },
+    # Qwen3.8-Flash-Next TP1 GDN out_proj and attention o_proj (6144 = 48
+    # value heads or 24 query heads x 256). From 17 to 64 rows (speculative
+    # verify of 5-16 requests, draft steps of 17-64): 25% and 10-15% faster
+    # than hipBLASLt in HIP-graph replay with cold weights on MI350X. Past
+    # 64 rows hipBLASLt wins again.
+    (2560, 6144): {
+        32: (32, 32, 256, 2, 2, 3, 3, 1),
+        64: (64, 32, 256, 2, 2, 3, 3, 1),
+    },
+    # Qwen3.8-Flash-Next TP1 attention q|gate|k|v at speculative verify of
+    # 49-64 requests (196-256 rows): faster than hipBLASLt in a captured
+    # decode-like graph on MI350X. hipBLASLt is faster at 192 rows and below,
+    # so _DECODE_FIRST_M starts the bucket at 193 rows.
+    (13312, 2560): {
+        256: (128, 128, 64, 4, 2, 3, 1, 8),
+    },
     # QSA indexer query/key projection.
     (640, 2560): {
         4: (16, 64, 128, 1, 4, 4, 5, 8),
@@ -1856,12 +1872,17 @@ _DECODE_CONFIGS: dict[
     },
 }
 DECODE_MIN_M = 2
+# Shapes whose lowest listed bucket starts above the previous bucket bound:
+# fewer rows keep torch.mm.
+_DECODE_FIRST_M: dict[tuple[int, int], int] = {(13312, 2560): 193}
 
 
 def _choose_decode_config(
     M: int, N: int, K: int
 ) -> tuple[int, int, int, int, int, int, int, int] | None:
-    if M < DECODE_MIN_M or M > DECODE_M_BUCKETS[-1]:
+    if M < max(DECODE_MIN_M, _DECODE_FIRST_M.get((N, K), 0)):
+        return None
+    if M > DECODE_M_BUCKETS[-1]:
         return None
     bucket = next(bound for bound in DECODE_M_BUCKETS if M <= bound)
     return _DECODE_CONFIGS.get((N, K), {}).get(bucket)

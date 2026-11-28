@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "common_parameters": {
-    "model_profile": "qwen38_flash_tp2",
+    "model_profile": "qwen38_flash_tp1",
     "num_experts": 512
   },
   "cases": [
     {
-      "id": "qwen38_flash.moe.softmax_topk/decode-bfloat16",
+      "id": "qwen38_flash.moe.softmax_topk/tp1-decode-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
@@ -14,15 +14,20 @@
         "mode": "softmax_topk",
         "parameters": {
           "tokens": [
-            16,
-            64
+            1,
+            4,
+            8,
+            32,
+            64,
+            128,
+            256
           ],
           "topk": 10,
           "router_logits_dtype": "bfloat16",
           "normalize_topk_weights": true
         },
         "cold_cache": true,
-        "seed": 5101
+        "seed": 5138
       },
       "policy": {
         "max_regression_relative": 0.08,
@@ -30,21 +35,21 @@
       }
     },
     {
-      "id": "qwen38_flash.moe.softmax_topk/prefill-bfloat16",
+      "id": "qwen38_flash.moe.softmax_topk/tp1-prefill-bfloat16",
       "comparison_epoch": 1,
       "definition": {
         "family": "moe",
         "mode": "softmax_topk",
         "parameters": {
           "tokens": [
-            8192
+            4096
           ],
           "topk": 10,
           "router_logits_dtype": "bfloat16",
           "normalize_topk_weights": true
         },
         "cold_cache": true,
-        "seed": 5102
+        "seed": 5139
       },
       "policy": {
         "max_regression_relative": 0.08,
@@ -52,7 +57,7 @@
       }
     },
     {
-      "id": "qwen38_flash.moe.apply/tp2-decode-mxfp4",
+      "id": "qwen38_flash.moe.apply/tp1-verify-mxfp4",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
@@ -60,14 +65,16 @@
         "mode": "apply",
         "parameters": {
           "tokens": [
-            16,
-            64
+            4,
+            32,
+            128,
+            256
           ],
           "hidden_size": 2560,
           "intermediate_size": 640,
           "num_local_experts": 512,
           "topk": 10,
-          "tp_size": 2,
+          "tp_size": 1,
           "ep_size": 1,
           "ep_rank": 0,
           "input_dtype": "bfloat16",
@@ -83,7 +90,7 @@
           "token_count_scope": "global"
         },
         "cold_cache": true,
-        "seed": 5103
+        "seed": 5140
       },
       "policy": {
         "max_regression_relative": 0.05,
@@ -91,22 +98,20 @@
       }
     },
     {
-      "id": "qwen38_flash.moe.apply/tp2-prefill-mxfp4",
+      "id": "qwen38_flash.moe.apply/tp1-prefill-mxfp4",
       "comparison_epoch": 1,
       "definition": {
         "family": "moe",
         "mode": "apply",
         "parameters": {
           "tokens": [
-            512,
-            2048,
-            8192
+            4096
           ],
           "hidden_size": 2560,
           "intermediate_size": 640,
           "num_local_experts": 512,
           "topk": 10,
-          "tp_size": 2,
+          "tp_size": 1,
           "ep_size": 1,
           "ep_rank": 0,
           "input_dtype": "bfloat16",
@@ -122,7 +127,7 @@
           "token_count_scope": "global"
         },
         "cold_cache": true,
-        "seed": 5104
+        "seed": 5141
       },
       "policy": {
         "max_regression_relative": 0.05,
@@ -130,7 +135,7 @@
       }
     },
     {
-      "id": "qwen38_flash.moe.apply/mtp-tp2-decode-unquant",
+      "id": "qwen38_flash.moe.apply/mtp-tp1-draft-unquant",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
@@ -138,14 +143,16 @@
         "mode": "apply",
         "parameters": {
           "tokens": [
-            16,
+            1,
+            8,
+            32,
             64
           ],
           "hidden_size": 2560,
           "intermediate_size": 640,
           "num_local_experts": 512,
           "topk": 10,
-          "tp_size": 2,
+          "tp_size": 1,
           "ep_size": 1,
           "ep_rank": 0,
           "input_dtype": "bfloat16",
@@ -161,7 +168,7 @@
           "token_count_scope": "global"
         },
         "cold_cache": true,
-        "seed": 5105
+        "seed": 5142
       },
       "policy": {
         "max_regression_relative": 0.05,
@@ -169,22 +176,20 @@
       }
     },
     {
-      "id": "qwen38_flash.moe.apply/mtp-tp2-prefill-unquant",
+      "id": "qwen38_flash.moe.apply/mtp-tp1-prefill-unquant",
       "comparison_epoch": 1,
       "definition": {
         "family": "moe",
         "mode": "apply",
         "parameters": {
           "tokens": [
-            512,
-            2048,
-            8192
+            4096
           ],
           "hidden_size": 2560,
           "intermediate_size": 640,
           "num_local_experts": 512,
           "topk": 10,
-          "tp_size": 2,
+          "tp_size": 1,
           "ep_size": 1,
           "ep_rank": 0,
           "input_dtype": "bfloat16",
@@ -200,7 +205,7 @@
           "token_count_scope": "global"
         },
         "cold_cache": true,
-        "seed": 5106
+        "seed": 5143
       },
       "policy": {
         "max_regression_relative": 0.05,

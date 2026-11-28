@@ -53,6 +53,18 @@ def _reset_caches(monkeypatch):
         monkeypatch.setattr(cute_fused, name, {})
 
 
+def _keep_split_k(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hide single-CTA residency so SM107 keeps the split-K tactics."""
+    capacity_hint = cute_fused._cluster_capacity_hint
+    monkeypatch.setattr(
+        cute_fused,
+        "_cluster_capacity_hint",
+        lambda index, stream, split_k: (
+            0 if split_k == 1 else capacity_hint(index, stream, split_k)
+        ),
+    )
+
+
 def inputs(rows, dtype, has_inject):
     generator = torch.Generator(device="cuda").manual_seed(1729 + rows)
     return tuple(
@@ -258,6 +270,104 @@ def test_batched_fp64_and_changed_input_graph(rows):
                 assert torch.equal(actual, first)
 
 
+# SM107 streaming bounds on 212 SMs: one vs two token tiles, last one-round tile.
+@pytest.mark.parametrize(
+    ("rows", "has_inject", "streams"),
+    [
+        (64, True, False),
+        (65, True, True),
+        (256, True, True),
+        (257, True, False),
+        (64, False, False),
+        (65, False, True),
+        (320, False, True),
+        (321, False, False),
+    ],
+)
+def test_sm107_streaming_bounds_keep_fp64_error(rows, has_inject, streams, monkeypatch):
+    if current_platform().arch_version != ArchVersion(10, 7):
+        pytest.skip("requires the SM107 streaming tactic")
+    index = torch.cuda.current_device()
+    stream = int(torch.cuda.current_stream().cuda_stream)
+    if cute_fused._cluster_capacity_hint(index, stream, 1) != 212:
+        pytest.skip("row bounds assume 212 resident single CTAs")
+    _reset_caches(monkeypatch)
+    values = inputs(rows, torch.bfloat16, has_inject)
+    expected = reference(values, 0.25)
+    pdl_enabled(True)
+    selected = mix(values, 0.25, True)
+    kernel = list(cute_fused._PLANS.values())[-1][0]
+    assert (kernel.reduction_groups, kernel.counter_activation_ready) == (
+        (16, True) if streams else (1, False)
+    )
+    _keep_split_k(monkeypatch)
+    split = mix(values, 0.25, True)
+    assert list(cute_fused._PLANS.values())[-1][0].reduction_groups == 1
+    for result in (selected, split):
+        check_within(result, expected, 0.002, 0.01)
+
+
+@pytest.mark.parametrize("projection_rows", [324, 320])
+def test_sm107_streaming_graph_replays_match_eager_bitwise(
+    monkeypatch: pytest.MonkeyPatch, projection_rows: int
+) -> None:
+    if current_platform().arch_version != ArchVersion(10, 7):
+        pytest.skip("requires the SM107 streaming tactic")
+    _reset_caches(monkeypatch)
+    pdl_enabled(True)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        streams = [
+            cute_fused._streams_in_one_round(rows, 4, 2560, 320, projection_rows)
+            for rows in (65, 128, 256)
+        ]
+    if not all(streams):
+        pytest.skip("requires one resident round of streaming tiles")
+    generator = torch.Generator(device="cuda").manual_seed(2718)
+
+    def randn(rows: int, columns: int, scale: float) -> torch.Tensor:
+        return scale * torch.randn(
+            (rows, columns), dtype=torch.bfloat16, device="cuda", generator=generator
+        )
+
+    # Up weights near 0.1 move gates off 0.5, so stale activations change outputs.
+    weights = (randn(projection_rows, 10240, 0.01), randn(10240, 320, 0.1))
+    pairs = [[randn(rows, 10240, 1.0) for _ in range(2)] for rows in (65, 128, 256) * 4]
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        eager = [[mix((x, *weights), 0.25, True) for x in pair] for pair in pairs]
+    stream.synchronize()
+    assert all(
+        kernel.counter_activation_ready for kernel, _ in cute_fused._PLANS.values()
+    )
+    for pair, results in zip(pairs[:3], eager):
+        for x, result in zip(pair, results):
+            check(result, reference((x, *weights), 0.25), torch.bfloat16)
+    staged = [pair[0].clone() for pair in pairs]
+    static = [pair[0].clone() for pair in pairs]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = []
+        for source, x in zip(staged, static):
+            # Each input is written right before its call, as the model's norm does.
+            x.copy_(source)
+            outputs.append(mix((x, *weights), 0.25, True))
+    mismatches = torch.zeros((), dtype=torch.int64, device="cuda")
+    with torch.cuda.stream(stream):
+        # A broken READY wait corrupts about one replay in 500 at 324 rows.
+        for replay in range(8000):
+            # Alternating inputs leave the other input's activations in the workspace.
+            for source, pair in zip(staged, pairs):
+                source.copy_(pair[replay % 2])
+            graph.replay()
+            for output, results in zip(outputs, eager):
+                for actual, wanted in zip(output, results[replay % 2]):
+                    if wanted is not None:
+                        mismatches += (actual != wanted).any()
+    stream.synchronize()
+    assert mismatches.item() == 0
+
+
 @pytest.mark.parametrize("rows", [17, 32, 33, 64, 97, 193, 224, 225, 256, 385, 1024])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("has_inject", [False, True])
@@ -397,6 +507,8 @@ def test_serialized_stream_graphs_share_plans_and_workspaces(monkeypatch):
         mix(values[0], 0.25, True)
     streams[0].synchronize()
     plans = dict(cute_fused._PLANS)
+    if current_platform().arch_version == ArchVersion(10, 7):
+        assert any(kernel.counter_activation_ready for kernel, _ in plans.values())
     workspaces = dict(cute_fused._WORKSPACES)
 
     streams[1].wait_stream(torch.cuda.current_stream())
@@ -437,9 +549,14 @@ def test_serialized_stream_graphs_share_plans_and_workspaces(monkeypatch):
                 output = mix(stream_values, 0.25, True)
             stream.synchronize()
             states.append((stream, stream_values, graph, output))
-    for storage, _, epochs in cute_fused._WORKSPACES.values():
+    generation = 2**32 - 1
+    for key, (storage, _, epochs) in cute_fused._WORKSPACES.items():
+        workers, _, grid_clusters, _, _, groups, split_k, projection_tiles = key[3:]
+        flags = 2 * workers * grid_clusters
         storage.fill_(0x7FC1)
-        epochs.fill_(2**32 - 1)
+        epochs[:flags].fill_(generation)
+        # Every projection step adds 2 * groups * split_k arrivals to each counter.
+        epochs[flags:].fill_(generation * projection_tiles * 2 * groups * split_k)
     torch.cuda.synchronize()
     for factor in (-0.75, 1.25, -0.5):
         for stream, stream_values, graph, output in reversed(states):
@@ -511,6 +628,13 @@ def test_mid_batch_replay_with_limited_cluster_capacity(
         return min(real_capacity(compiled, kernel, device, stream), 36)
 
     monkeypatch.setattr(cute_fused, "_capacity", limited_capacity)
+    capacity_hint = cute_fused._cluster_capacity_hint
+    # Tactic selection sees the same smaller context.
+    monkeypatch.setattr(
+        cute_fused,
+        "_cluster_capacity_hint",
+        lambda index, stream, split_k: min(capacity_hint(index, stream, split_k), 36),
+    )
     values = [
         inputs(rows, dtype, has_inject) for rows in (193, 224, 225, 207, 223, 239)
     ]
@@ -724,6 +848,12 @@ def test_startup_warms_full_tail_tiles_and_rounds(monkeypatch):
             forward(1)
     stream.synchronize()
     plans = dict(cute_fused._PLANS)
+    if current_platform().arch_version == ArchVersion(10, 7):
+        assert any(kernel.counter_activation_ready for kernel, _ in plans.values())
+    with torch.cuda.stream(stream), utils.assert_no_cute_compile():
+        for rows in range(1, 257):
+            forward(rows)
+    stream.synchronize()
     row_counts = (13, 16, 23, 32, 33, 64, 95, 96, 97, 128, 191, 192, 193, 224, 255, 256)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
@@ -847,6 +977,8 @@ def test_startup_skips_global_nonfused_override(monkeypatch, override_source):
 @pytest.mark.filterwarnings("ignore:The CUDA Graph is empty:UserWarning")
 def test_dynamic_rows_reuse_round_bucket_and_workspace(dtype, enable_pdl, monkeypatch):
     _reset_caches(monkeypatch)
+    # Round buckets belong to the split-K tactics; streaming runs in one round.
+    _keep_split_k(monkeypatch)
     pdl_enabled(enable_pdl)
     first = inputs(193, dtype, True)
     stream = torch.cuda.Stream()

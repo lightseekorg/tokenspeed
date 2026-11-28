@@ -556,6 +556,10 @@ class BaseCausalLM(nn.Module):
         """Names a full disk checkpoint may carry without a local writer."""
         return frozenset()
 
+    def reloadable_post_load_hooks(self) -> frozenset[Any]:
+        """Return startup hooks and MoE preprocessors safe to refresh in place during disk weight updates."""
+        return frozenset()
+
     def allow_redundant_checkpoint_names(self, names: frozenset[str]) -> None:
         """Allow extra source names to occur once without writing a parameter."""
         required = self._weight_update_required_names
