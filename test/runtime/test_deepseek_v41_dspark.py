@@ -2203,7 +2203,9 @@ def test_dspark_warmup_extend_compiles_anchors_and_rows(monkeypatch):
     _dspark_anchors_kernel.device_caches.clear()
     _dspark_rows_kernel.device_caches.clear()
     with kernel_warmup(enabled=True):
+        drafter.token_to_kv_pool = None
         drafter.warmup_extend(16)
+        drafter.token_to_kv_pool = pool
     # Warmup writes to slot -1, leaving every cache window untouched.
     assert windows.count_nonzero() == 0
 
@@ -2235,10 +2237,13 @@ def test_dspark_warmup_extend_compiles_anchors_and_rows(monkeypatch):
             decode_query_indptr=torch.tensor([0, 2], dtype=torch.int32, device=device),
         )
         assert (next_tokens == 2).all()
-        adapter.model.write_context_kv(
-            torch.randn((2, drafter.hidden_width), dtype=torch.bfloat16, device=device),
-            torch.tensor([0, 1], dtype=torch.int64, device=device),
-            torch.tensor([64, 65], dtype=torch.int32, device=device),
-            pool,
-        )
+        for slot_dtype in (torch.int32, torch.int64):
+            adapter.model.write_context_kv(
+                torch.randn(
+                    (2, drafter.hidden_width), dtype=torch.bfloat16, device=device
+                ),
+                torch.tensor([0, 1], dtype=torch.int64, device=device),
+                torch.tensor([64, 65], dtype=slot_dtype, device=device),
+                pool,
+            )
     assert windows[:, 1, :2].count_nonzero() > 0

@@ -1348,16 +1348,33 @@ class DeepseekV41DSpark(BaseDrafter):
                 [0, 1], dtype=torch.int32, device=self.device
             ),
         )
-        if self.token_to_kv_pool is not None:
-            # Negative slots skip cache stores while warming main_proj, main_norm,
+        pool = self.token_to_kv_pool
+        if pool is None:
+            # V4.1 DSpark writes its window into the target's SWA pool, so
+            # draft_token_to_kv_pool is None at construction. Negative slots
+            # skip cache stores while still warming main_proj, main_norm,
             # context_wkv, and dsv41.dspark_rows.
+            head_dim = int(self.model.attention_params["head_dim"])
+            dummy_window = torch.zeros(
+                (1, 64, head_dim), dtype=torch.bfloat16, device=self.device
+            )
+
+            class _WarmupDsparkPool:
+                def dspark_kv(self, stage: int) -> torch.Tensor:
+                    del stage
+                    return dummy_window
+
+            pool = _WarmupDsparkPool()
+        # Negative slots skip cache stores while warming main_proj, main_norm,
+        # context_wkv, and dsv41.dspark_rows for both int32 tests and int64 SWA slots.
+        for slot_dtype in (torch.int32, torch.int64):
             self.model.write_context_kv(
                 torch.zeros(
                     (1, self.hidden_width), dtype=torch.bfloat16, device=self.device
                 ),
                 torch.zeros((1,), dtype=torch.int64, device=self.device),
-                torch.full((1,), -1, dtype=torch.int32, device=self.device),
-                self.token_to_kv_pool,
+                torch.full((1,), -1, dtype=slot_dtype, device=self.device),
+                pool,
             )
 
     def draft(self, *args, **kwargs) -> torch.Tensor | None:
