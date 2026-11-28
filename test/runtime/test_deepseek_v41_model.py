@@ -5086,7 +5086,7 @@ def test_expert_placement_flags_and_replicated_checkpoint_load(monkeypatch, tmp_
     assert DeepseekV41ForCausalLMDSpark.supports_expert_placement is False
 
     config = _loader_config()
-    config.moe_intermediate_size = 2176
+    config.moe_intermediate_size = 2304
     # 3 layers x 4 logical experts -> 8 physical slots (2 local slots per EP4 rank),
     # with rank 1 holding replicas of logical expert 3 in both local slots on layer 0.
     placement_map = torch.tensor(
