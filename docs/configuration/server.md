@@ -857,11 +857,14 @@ run on the draft-tree path and share its requirements, with these limits:
   `(steps - 1) * topk` at most 128 and `1 + topk + (steps - 1) * topk^2` at
   most 1024.
 - `--enable-speculative-sampling` samples harness trees and chains (not
-  when measuring) and needs `--sampling-backend flashinfer`, which accepts
-  them by tree rejection sampling. Static `EAGLE4` drafts do not take it.
-  Its sampling kernels are NVIDIA-only: elsewhere (AMD) harness rounds
-  draft greedy trees and chains, and the drafter refuses sampling at
-  startup.
+  when measuring) and needs `--sampling-backend flashinfer` or `triton`,
+  which accept them by tree rejection sampling (`triton` on its no-filter
+  and top-k routes; its top-p-only and mixed routes keep the target-sampled
+  walk). A node's children are drawn without replacement from the draft's
+  `softmax(logits / T)` over its candidates; like the chains' `q`, it is not
+  cut to the request's top-k / top-p, which would leave children past the
+  cut that can never be accepted. Static `EAGLE4` drafts do not take it. The sampled-tree kernels
+  have CUDA and Triton builds.
 
 ### Draft-prob rejection sampling
 
@@ -901,10 +904,12 @@ role only.
 Requirements: `--speculative-algorithm EAGLE3`, `MTP`, `DSPARK` (each
 DSpark Markov step samples its token) or `DFLASH` (covered below),
 `--speculative-eagle-topk 1`,
-and `--sampling-backend flashinfer`, `flashinfer_full`, or `sonic` (`sonic`
-reads `q` at its top-128 target candidates; `greedy` verifies by exact match,
-the Triton backends by target-sampled exact match; neither reads the dense
-`q`). The drafter switches its draft model's fused TP-sharded argmax off so
+and `--sampling-backend flashinfer`, `flashinfer_full`, `sonic`, or `triton`
+(`sonic` reads `q` at its top-128 target candidates; `triton` runs the rule
+over whole rows on its no-filter and top-k routes and keeps the
+target-sampled exact match on the top-p-only and mixed routes; `greedy`
+verifies by exact match and `triton_full` by target-sampled exact match;
+neither reads the dense `q`). The drafter switches its draft model's fused TP-sharded argmax off so
 the full-vocab logits reach it, which adds the logits all-gather to every
 draft step under tensor parallelism. With `sonic` sampling vocabulary shards
 (the server logs `Sampled rows stay vocab-sharded`) and an MTP, EAGLE3, or
