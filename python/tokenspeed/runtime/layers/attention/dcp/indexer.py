@@ -39,6 +39,11 @@ from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
     pack_index_candidates,
 )
 
+# Cache-placement ops are portable Triton with no registry entry to dispatch through.
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
+    virtual_pages_to_local_table,
+)
+
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_exchange_input,
     all_gather,
@@ -46,10 +51,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_gather_single,
     all_to_all_single,
 )
-from tokenspeed.runtime.layers.attention.dcp.placement import (
-    CachePlacement,
-    resolve_cache_slots,
-)
+from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
 # Some leaves offset logits rows in int32: a tile's padded logits stay < 2**31.
 _MAX_TILE_LOGITS = 1 << 31
@@ -287,8 +289,15 @@ _PAGES_BYTES_PER_COLUMN = 8
 def _local_index_table(
     page_table: torch.Tensor, placement: CachePlacement, page_size: int
 ) -> torch.Tensor:
-    slots, owned = resolve_cache_slots(page_table.long() * page_size, placement)
-    return torch.where(owned, slots // page_size, -1).to(torch.int32)
+    if placement.block_granularity % page_size:
+        raise ValueError("a KVP index table needs whole pages per cache block")
+    return virtual_pages_to_local_table(
+        page_table,
+        pages_per_block=placement.block_granularity // page_size,
+        virtual_block_count=placement.virtual_block_count,
+        degree=len(placement.group),
+        rank=placement.rank,
+    )
 
 
 def _owned_columns(

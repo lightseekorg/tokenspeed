@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
 )
 from tokenspeed_kernel.ops.embedding import FusedMLASetKVBufferArg
 from tokenspeed_kernel.ops.embedding.triton import mla_rope_set_kv_buffer_args
+from tokenspeed_kernel.ops.metadata import expand_k_row_requests
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from torch import nn
 from transformers import PretrainedConfig
@@ -789,14 +790,13 @@ class GlmDsaSparseAttentionMixin:
                 capturing=capturing,
             )
             if dcp_index is None:
-                requests = (
-                    torch.arange(q.shape[0], device=q.device, dtype=torch.int32)
-                    // q_len_per_req
-                )
-                causal_lens = (
-                    seq_lens[requests.long()]
-                    - (q_len_per_req - 1)
-                    + torch.arange(q.shape[0], device=q.device) % q_len_per_req
+                requests = torch.empty(q.shape[0], device=q.device, dtype=torch.int32)
+                causal_lens = torch.empty_like(requests)
+                expand_k_row_requests(
+                    seq_lens,
+                    k=q_len_per_req,
+                    requests_out=requests,
+                    ends_out=causal_lens,
                 )
                 dcp_index = build_dcp_index_metadata(
                     q,
