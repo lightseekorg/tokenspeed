@@ -883,7 +883,7 @@ def test_target_runner_passes_model_kwargs_not_context_tensors(buffers, mode):
     executor.attn_backend = SimpleNamespace(prepare_prefill_metadata=Mock())
     executor._active_positions_override = None
     executor._active_multimodal_context = None
-    executor.prefill_graph = SimpleNamespace(can_run=lambda ctx, mm: False)
+    executor.prefill_graph = SimpleNamespace(select_buckets=lambda ctx, mm: None)
     ctx = SimpleNamespace(
         input_num_tokens=num_tokens, forward_mode=mode, bs=1, query_shard=None
     )
@@ -1002,6 +1002,7 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False, device="cpu")
     pg.dp_size = 1
     pg.drafter = None
+    pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     executor.prefill_graph = pg
     monkeypatch.setattr(model_executor, "autotune", tuner)
     monkeypatch.setattr(
@@ -1100,7 +1101,8 @@ def test_autotune_covers_the_draft_experts_once_per_geometry(monkeypatch):
         assert all(len(set(row.tolist())) == 3 for row in ids)
 
 
-def test_execute_idle_forward_passes_empty_engram_views(buffers):
+@pytest.mark.parametrize("staged", [False, True])
+def test_execute_idle_forward_passes_empty_engram_views(buffers, staged, monkeypatch):
     ib, runtime = buffers
     seen = []
 
@@ -1128,13 +1130,31 @@ def test_execute_idle_forward_passes_empty_engram_views(buffers):
     executor.model_runner = SimpleNamespace(forward=forward)
     executor.forward_step = SimpleNamespace(can_run=lambda bs, ctx: False)
     executor.drafter = None
+    if staged:
+        monkeypatch.setenv("TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE", "1")
+        with torch.inference_mode():
+            handoff = torch.empty(1, device=ib.device)
+
+        def replay(ctx, ids, *, buckets, model_kwargs):
+            # Capture allocates the handoff; an eager break writes it on replay.
+            handoff.fill_(1)
+            forward(ctx, ids, ib.positions_buf[:0], **model_kwargs)
+
+        executor.prefill_graph = SimpleNamespace(
+            select_buckets=lambda ctx: (None, 16), replay=replay
+        )
+        executor.attn_backend.refresh_decode_metadata = Mock()
+        executor.forward_step.placeholder_block_tables = lambda bs: {}
     executor.execute_idle_forward(
         DpForwardMetadata(
-            global_num_tokens=[0],
-            global_batch_size=[0],
-            global_num_decodes=[0],
-            global_forward_mode=[ForwardMode.IDLE],
-            all_decode_or_idle=True,
+            global_num_tokens=[0, 4],
+            global_batch_size=[0, 1],
+            global_num_decodes=[0, int(not staged)],
+            global_forward_mode=[
+                ForwardMode.IDLE,
+                ForwardMode.EXTEND if staged else ForwardMode.DECODE,
+            ],
+            all_decode_or_idle=not staged,
             all_extend=False,
             need_idle_forward=True,
         )

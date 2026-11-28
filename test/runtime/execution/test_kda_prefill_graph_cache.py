@@ -37,9 +37,11 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
+from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
 from tokenspeed.runtime.execution.memory_delta import (  # noqa: E402
     NULL_MEMORY_DELTA_OBSERVER,
 )
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout  # noqa: E402
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (  # noqa: E402
     MambaForwardMetadata,
 )
@@ -894,7 +896,6 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     # No Host L2 tier: nothing to wait for before the replay.
     owner.token_to_kv_pool = SimpleNamespace(layerwise_load_tracker=None)
     owner._route_counts = {}
-    owner._replay_bucket = lambda ctx: 8
     owner._log_engaged_once = lambda *args: None
     owner._compute_input_embeddings = (
         lambda ids, ctx, *, request_token_history: torch.zeros(8, 4)
@@ -927,7 +928,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
             ctx,
             torch.zeros(num_tokens, dtype=torch.int64),
             None,
-            request_token_history=None,
+            buckets=(8, None),
         )
     torch.testing.assert_close(result, torch.full((num_tokens, 4), float(expected)))
     assert ctx.bs == batch_size
@@ -989,7 +990,6 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
         layerwise_load_tracker=tracker, layer_accesses_wait_for_load=False
     )
     owner._route_counts = {}
-    owner._replay_bucket = lambda ctx: 8
     owner._log_engaged_once = lambda *args: None
     owner._compute_input_embeddings = (
         lambda ids, ctx, *, request_token_history: torch.zeros(8, 4)
@@ -1026,7 +1026,10 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
         ),
     ):
         owner.replay(
-            ctx, torch.zeros(8, dtype=torch.int64), None, request_token_history=None
+            ctx,
+            torch.zeros(8, dtype=torch.int64),
+            None,
+            buckets=(8, None),
         )
     waits = [f"wait e{index}" for index in consumers or ()]
     assert events == waits + ["refresh", "inline"]
@@ -1067,7 +1070,8 @@ def test_request_bucket_selection_reserves_dummy_scan_tokens(bs, tokens, expecte
         draft_narrowing=None,
         capture_hidden_mode=None,
     )
-    bucket = owner._replay_bucket(ctx)
+    bucket, decoder = owner.select_buckets(ctx)
+    assert decoder is None
     assert (bucket, owner._merged_capture_bs(bucket, ctx)) == expected
 
 
@@ -1174,7 +1178,15 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
 
     events = []
     mode = ForwardMode[mode]
-    ctx = SimpleNamespace(forward_mode=mode, bs=2, input_num_tokens=7, query_shard=None)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        forward_mode=mode,
+        bs=2,
+        input_num_tokens=7,
+        num_extends=1,
+        output_layout=ForwardOutputLayout(1, 1, 1, 1),
+    )
     executor = object.__new__(ModelExecutor)
     executor.config = SimpleNamespace(pp_size=1, data_parallel_size=dp_size)
     executor._active_positions_override = torch.arange(7)
@@ -1191,8 +1203,8 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
 
     executor.attn_backend = SimpleNamespace(prepare_prefill_metadata=prepare)
     executor.prefill_graph = SimpleNamespace(
-        can_run=lambda *_: use_graph,
-        replay=lambda *_, request_token_history: events.append("graph"),
+        select_buckets=lambda *_: (7, None) if use_graph else None,
+        replay=lambda *_, **kwargs: events.append("graph"),
     )
     executor.model_runner = SimpleNamespace(
         forward=lambda *_, **__: events.append("eager")
@@ -1230,11 +1242,9 @@ def kimi_host_cache():
 
     from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
     from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
-    from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.device import DeviceHandle
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
-    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
     from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
     from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
         HybridLinearAttnBackend,
@@ -1355,7 +1365,6 @@ def kimi_host_cache():
         input_ids_buf=torch.ones(_BUCKET, dtype=torch.int64)
     )
     owner.make_dummy_batch = lambda num_tokens, bs: ctx
-    owner._replay_bucket = lambda ctx: _BUCKET
     owner.inner_model = SimpleNamespace(embed_tokens=torch.nn.Embedding(2, 4))
     owner._compute_input_embeddings = (
         lambda ids, ctx, *, request_token_history: owner.inner_model.embed_tokens(ids)
@@ -1499,7 +1508,7 @@ def test_a_replay_writes_a_loaded_tail_page_after_the_load(
             result = owner.replay(
                 cache.ctx,
                 torch.ones(_BUCKET, dtype=torch.int64),
-                request_token_history=None,
+                buckets=(_BUCKET, None),
             )
     finally:
         pool.__class__ = kimi_pool_class
@@ -1588,7 +1597,7 @@ def test_an_inline_kda_replay_reads_a_loaded_state_after_the_load(kimi_host_cach
             results[inline_kda] = owner.replay(
                 cache.ctx,
                 torch.ones(_BUCKET, dtype=torch.int64),
-                request_token_history=None,
+                buckets=(_BUCKET, None),
             ).clone()
         assert not cache.executor.load_stream.query()
         torch.cuda.synchronize()
@@ -1674,7 +1683,7 @@ def test_segmented_replay_orders_layer_loads(kimi_host_cache, released_by):
             events.layer_done_events[layer].record()
     tracker.set_consumers(load)
     with maybe_inference_mode():
-        result = owner.replay(cache.ctx, input_ids, request_token_history=None)
+        result = owner.replay(cache.ctx, input_ids, buckets=(_BUCKET, None))
     torch.cuda.synchronize()
     assert torch.equal(latent[page], rows)
     assert torch.equal(result, value + state_rows() + state_rows())

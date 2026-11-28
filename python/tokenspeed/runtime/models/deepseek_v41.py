@@ -102,7 +102,7 @@ from tokenspeed_kernel.ops.gemm import (
     warmup_fp8_projection,
     warmup_fp8_projections,
 )
-from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.moe import deep_gemm, moe_topk
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
@@ -1758,7 +1758,9 @@ class DeepseekV41Attention(nn.Module):
             codes, scales = out
             weight, weight_scales = self.fused_wo_a_weight, self.fused_wo_a_scales
         else:
-            if out.shape[0] == 0 and query_gather is not None:
+            # Zero rows arise from an empty query shard or an idle DP peer's
+            # stage replay; every head-TP rank sees the same row count.
+            if out.shape[0] == 0:
                 return hidden_states.new_empty((0, self.wo_b.output_size))
             out = out[:, : self.n_local_heads]
             weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
@@ -1989,9 +1991,7 @@ def _v41_hc_post_pre(
             pending.reduce_group,
         )
         return residual, x, None, None
-    # DeepGEMM mega_mhc split barriers race under CUDA graph replay: a replay can
-    # read the previous replay's partials, so keep it out of captured segments.
-    if not prefer_overlap and not is_breakable_capture_active():
+    if not prefer_overlap:
         join = (
             try_mhc_shifted_post_pre_norm_quantize_fp8
             if quantize_fp8
@@ -3062,6 +3062,29 @@ class DeepseekV41Model(nn.Module):
     def decoder_rows(self, ctx: ForwardContext) -> int:
         """Rows ``decoder_forward`` receives for the forward ``ctx`` describes."""
         return int(ctx.attn_backend.decoder_view().metadata.positions.numel())
+
+    def dp_prefill_graph_live_counts(self) -> torch.Tensor | None:
+        """Borrow MegaMoE's live-row counts for full-world EP with local attention.
+
+        For this layout the model constructor already requires dense TP1,
+        full-world EP implies MoE TP1, and attention TP1 implies replicated KV.
+        """
+        if (
+            self.mapping.attn.tp_size != 1
+            or self.mapping.attn.head_tp_size != 1
+            or self.mapping.moe.ep_size != self.mapping.world_size
+        ):
+            return None
+        if any(
+            not layer.ffn.owns_ep_communication
+            or layer.ffn.experts.plan["apply_kernel_name"]
+            != "deep_gemm_mxfp4_mega_moe_apply"
+            for layer in self.layers
+        ):
+            return None
+        # Each stage writes its live token rows into the selected provider's
+        # persistent count pair, also used by ForwardStepRunner for decode.
+        return deep_gemm.mega_moe_live_requests(self.embed_tokens.weight.device)
 
     def allocate_decoder_state(self, rows: int) -> V41RowState:
         """A zero ``rows``-row state laid out like ``narrowing_forward``'s output.

@@ -264,18 +264,6 @@ def test_dspark_anchors_do_not_read_or_write_incomplete_prefill():
     assert starts.tolist() == [51]
 
 
-def test_zero_decoder_rows_do_not_select_a_padded_graph():
-    import bisect
-
-    bucket = load_symbol(
-        RUNTIME + "execution/prefill_graph.py",
-        "_decoder_bucket",
-        owner="PrefillGraph",
-        bisect=bisect,
-    )
-    assert bucket(SimpleNamespace(decoder_buckets=[16, 32, 64]), 0) is None
-
-
 @pytest.mark.parametrize("width", [1, 3])
 def test_cache_progress_is_independent_of_generated_tokens(width):
     advance = load_symbol(
@@ -582,6 +570,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
         tree_spec=None,
         capturable_grammar=None,
         dspark_context_producer=None,
+        forward_step=SimpleNamespace(draft_overlap=None),
         attn_backend=SimpleNamespace(
             prepare_cache_batch=lambda *args, **kwargs: None,
             writeback_accepted_kv=lambda *args: None,

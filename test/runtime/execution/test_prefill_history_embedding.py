@@ -263,10 +263,16 @@ def test_embeddings_refresh_with_live_history_and_padding(model_cls, history_emb
             )
             appended = history_ids.clone()
             history_ids.copy_(before)
-            assert owner.can_run(ctx)
+            buckets = owner.select_buckets(ctx)
+            assert buckets is not None
             mm_context = MultimodalForwardContext([None], [0], [count], count)
-            assert owner.can_run(ctx, mm_context) is not history_embedding
-            actual = owner.replay(ctx, ids, request_token_history=history)
+            assert (owner.select_buckets(ctx, mm_context) is None) == history_embedding
+            actual = owner.replay(
+                ctx,
+                ids,
+                buckets=buckets,
+                model_kwargs={"request_token_history": history},
+            )
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             torch.testing.assert_close(history_ids, appended, rtol=0, atol=0)
             history_ids.add_(1)
@@ -287,7 +293,11 @@ def test_embeddings_refresh_with_live_history_and_padding(model_cls, history_emb
         expected = model(ctx, ids, ib.positions_buf[:16], request_token_history=history)
         appended = history_ids.clone()
         history_ids.copy_(before)
-        actual = owner.replay(ctx, ids, request_token_history=history)
+        buckets = owner.select_buckets(ctx)
+        assert buckets is not None
+        actual = owner.replay(
+            ctx, ids, buckets=buckets, model_kwargs={"request_token_history": history}
+        )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(history_ids, appended, rtol=0, atol=0)
     finally:
@@ -305,7 +315,7 @@ def test_history_model_without_embedding_seam_stays_eager():
         memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False, device="cpu"),
     )
     owner.capture(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
-    assert not owner.can_run(owner.make_dummy_batch(16, 1))
+    assert owner.select_buckets(owner.make_dummy_batch(16, 1)) is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

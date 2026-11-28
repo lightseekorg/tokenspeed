@@ -594,6 +594,11 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Post-load configuration hook (information unavailable at
         construction, e.g. sliding window sizes). Default: no-op."""
 
+    @contextmanager
+    def prefill_graph_scope(self):
+        """Keep per-forward scratch alive across encoder/narrowing/decoder replay."""
+        yield
+
     def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
         """Allocate static buffers the breakable prefill graphs bake.
         Default: no-op — attention stays eager at the break points."""
