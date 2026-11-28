@@ -51,6 +51,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
 from tokenspeed_kernel.ops.gemm import (
+    dsv4_linear_fp32,
     fp8_projection,
     grouped_fp8_projection,
     grouped_fp8_projection_quantize_fp8,
@@ -5069,3 +5070,85 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         shared.down_proj.weight_scale_inv,
     )
     assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))
+
+
+class _TinyCompressorAndLayerWarmupModel(BaseCausalLM):
+    """Real compressor and decoder layer behind V4.1 post_quant_warmup."""
+
+    def __init__(self, config):
+        mapping = _mapping(0, 1, 1)
+        super().__init__(config=SimpleNamespace(), mapping=mapping, encoder_only=True)
+        self.compressor = v41.DeepseekV41Compressor(config, 2, "compressor")
+        self.layer = DeepseekV41DecoderLayer(
+            config,
+            mapping,
+            0,
+            0,
+            None,
+            "layers.0",
+            None,
+            None,
+            False,
+            "gpu",
+            None,
+        )
+        _initialize(self)
+
+    def post_load_weights(self):
+        DeepseekV41ForCausalLM.post_load_weights(self)
+
+    def post_quant_warmup(self):
+        DeepseekV41ForCausalLM.post_quant_warmup(self)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_post_quant_warmup_compiles_compressor_and_mhc_layers(monkeypatch):
+    """post_quant_warmup precompiles ratio-2 compressor dsv4_linear_fp32 and
+    MegaMHC kernels without leaving serving-time compilations behind."""
+    import importlib.util
+    from contextlib import nullcontext
+
+    from tokenspeed_kernel.thirdparty.cute_dsl.ll_bf16 import ll_bf16_router
+
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    monkeypatch.setattr(v41, "_max_forward_tokens", lambda: 64)
+    config = _config()
+    config.hidden_size = 1024
+    config.num_attention_heads = config.o_groups = 4
+    config.q_lora_rank = config.o_lora_rank = 64
+    config.moe_intermediate_size = 256
+    config.engram_layer_ids = []
+
+    with torch.device("cuda"):
+        model = _TinyCompressorAndLayerWarmupModel(config)
+
+    compile_check = nullcontext()
+    if current_platform().is_nvidia and ll_bf16_router.is_available():
+        helper_path = (
+            Path(__file__).resolve().parents[2]
+            / "tokenspeed-kernel"
+            / "test"
+            / "utils.py"
+        )
+        helper_spec = importlib.util.spec_from_file_location(
+            "v41_model_kernel_test_utils", helper_path
+        )
+        helper = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper)
+        ll_bf16_router._dotprod.clear()
+        ll_bf16_router._splitk.clear()
+        compile_check = helper.assert_no_cute_compile()
+
+    model.post_quant_warmup()
+
+    weight = model.compressor.wkv_wgate.weight
+    with compile_check:
+        for tokens in (1, 5, 16, 17, 24, 32, 64):
+            x = torch.randn(
+                (tokens, config.hidden_size), dtype=torch.bfloat16, device="cuda"
+            )
+            out = dsv4_linear_fp32(x, weight, override=None, solution=None)
+            ref = F.linear(x.float(), weight.float())
+            torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

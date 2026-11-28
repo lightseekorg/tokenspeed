@@ -1025,6 +1025,9 @@ class TestGroupAwareWireTest:
             patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(
+                executor_module.HostCacheExecutor, "_warmup_restore_transfers"
+            ),
+            patch.object(
                 lanes_module,
                 "build_host_transfer_geometry",
                 return_value=unbound_geometry,
@@ -2734,6 +2737,81 @@ class TestCompactLayoutRoundTripTest:
         assert ([int(event.op_id) for event in executor.poll_results()]) == ([9])
         assert (device[24:28].tolist()) == ([0x11] * 4)
         assert (device[64:68].tolist()) == ([0x12] * 4)
+
+    def test_l2_init_warms_layer_ready_transfers_without_serving_jit(self):
+        import importlib.util
+
+        from tokenspeed_kernel.ops.kvcache.triton import (
+            _transfer_cache_blocks_kernel,
+            _wait_layer_ready_kernel,
+        )
+
+        torch = self.torch
+        helper_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "..",
+            "tokenspeed-kernel",
+            "test",
+            "utils.py",
+        )
+        helper_spec = importlib.util.spec_from_file_location(
+            "host_executor_kernel_test_utils", helper_path
+        )
+        helper = importlib.util.module_from_spec(helper_spec)
+        helper_spec.loader.exec_module(helper)
+
+        _transfer_cache_blocks_kernel.device_caches.clear()
+        _wait_layer_ready_kernel.device_caches.clear()
+
+        device = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")
+        layout = self.CacheTransferLayout(
+            num_lcm_blocks=4,
+            groups=(
+                self.CacheGroupLayout(
+                    group_id="full",
+                    cache_blocks_per_lcm_block=1,
+                    fields=(
+                        self.CacheField("layer.0.k", 0, 8, 16, 4),
+                        self.CacheField("layer.1.k", 0, 12, 16, 4),
+                    ),
+                ),
+            ),
+            buffers=(device,),
+            consumers=(("layer.0.k",), ("layer.1.k",)),
+        )
+        executor, pool, _ = self._make_executor(layout, io_backend="kernel", kvp_rank=0)
+
+        device[24:28].fill_(0x31)
+        device[28:32].fill_(0x32)
+        torch.cuda.synchronize()
+        with helper.assert_no_triton_compile(
+            _transfer_cache_blocks_kernel, _wait_layer_ready_kernel
+        ):
+            executor._start_writing(  # pylint: disable=protected-access
+                [1],
+                [(0, 1, 1)],
+                lane=executor._pinned_write_lane,
+                prerequisite_stream=torch.cuda.current_stream(),
+            )
+            torch.cuda.synchronize()
+            assert [int(e.op_id) for e in executor.poll_results()] == [1]
+
+            device[40:48].fill_(0xEE)
+            torch.cuda.synchronize()
+            load_index = executor._start_loading(  # pylint: disable=protected-access
+                [2],
+                [(0, 2, 1)],
+                prerequisite_stream=torch.cuda.current_stream(),
+            )
+            assert load_index is not None
+            pool.load_tracker.set_consumers(load_index)
+            pool.load_tracker.wait_for_layer(0)
+            pool.load_tracker.wait_for_layer(1)
+            torch.cuda.synchronize()
+            assert [int(e.op_id) for e in executor.poll_results()] == [2]
+        assert device[40:44].tolist() == [0x31] * 4
+        assert device[44:48].tolist() == [0x32] * 4
 
 
 if __name__ == "__main__":
