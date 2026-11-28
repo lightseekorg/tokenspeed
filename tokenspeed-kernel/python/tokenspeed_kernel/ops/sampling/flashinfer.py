@@ -17,8 +17,10 @@
 
 """FlashInfer sampling kernels."""
 
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.registry import error_fn
+import torch
+from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 min_p_sampling_from_probs = error_fn
 softmax = error_fn
@@ -45,6 +47,26 @@ if current_platform().is_nvidia:
         from tokenspeed_kernel.thirdparty.cuda.flashinfer_softmax import softmax
     except ImportError:
         pass
+    else:
+
+        @register_kernel(
+            "sampling",
+            "softmax",
+            name="flashinfer_softmax",
+            solution="flashinfer",
+            capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+            signatures=format_signatures(
+                "logits", "dense", {torch.float16, torch.bfloat16, torch.float32}
+            ),
+            priority=Priority.SPECIALIZED,
+        )
+        def flashinfer_softmax(
+            logits: torch.Tensor, temperature: torch.Tensor
+        ) -> torch.Tensor:
+            """The family-level ``softmax`` on FlashInfer's softmax, which
+            takes contiguous logits only."""
+            return softmax(logits.contiguous(), temperature=temperature)
+
 
 __all__ = [
     "min_p_sampling_from_probs",

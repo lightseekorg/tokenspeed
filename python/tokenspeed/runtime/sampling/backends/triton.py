@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.sampling import (
     SELECTED_LOGPROBS_BLOCK,
 )
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from tokenspeed_kernel.ops.sampling import softmax as sampling_softmax
 from tokenspeed_kernel.ops.sampling import (
     vocab_shard_logprobs_supports,
 )
@@ -158,7 +159,7 @@ def block_target_probs(
     Returns:
         ``[rows, V]`` contiguous fp32 probabilities.
     """
-    probs = torch.softmax(torch.div(logits.float(), temperature.view(-1, 1)), dim=-1)
+    probs = sampling_softmax(logits, temperature)
     if sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
         return probs
     if sample_route in (_SAMPLE_ROUTE_GUMBEL_TOP_K, _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P):

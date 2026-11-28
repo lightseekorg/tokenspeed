@@ -56,6 +56,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from tokenspeed_kernel.ops.sampling import softmax as sampling_softmax
 from tokenspeed_kernel.ops.sampling import (
     vocab_shard_draft_record,
     vocab_shard_draft_stats,
@@ -66,20 +67,8 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_from_pools,
     gumbel_scratch_shape,
 )
-from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.sampled_vocab_shard import gather_topk_pairs
-
-# Bypasses the registry: tokenspeed-kernel has no family-level softmax op, and
-# the recorded q must be fp32 softmax(logits / T) on every platform.
-if current_platform().is_nvidia:
-    from tokenspeed_kernel.ops.sampling.flashinfer import softmax
-else:
-
-    def softmax(logits: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
-        """``softmax(logits / temperature)`` in fp32, off NVIDIA (no FlashInfer)."""
-        return torch.softmax(torch.div(logits.float(), temperature), dim=-1)
-
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
@@ -282,7 +271,7 @@ class DraftProposalSampler:
         greedy_rows = (self._pools.top_k.index_select(0, pool_indices) == 1).view(-1, 1)
 
         # q at the request's temperature, fp32 like the verifier's target probs.
-        q = softmax(logits, temperature=temperature.view(-1, 1))
+        q = sampling_softmax(logits, temperature)
         # A row whose logits give no finite distribution (all NaN, or an
         # overflow) proposes nothing: it is recorded as the sentinel below.
         no_proposal = ~torch.isfinite(q).all(dim=1, keepdim=True)

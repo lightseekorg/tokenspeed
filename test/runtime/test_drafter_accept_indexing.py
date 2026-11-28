@@ -729,8 +729,8 @@ class TestDrafterAcceptIndexing:
 
 # ---------------------------------------------------------------------------
 # Draft-prob sampling (--enable-speculative-sampling): the shared proposal
-# sampler and the drafters' use of it. CPU: the flashinfer softmax and the
-# Triton Gumbel kernel are replaced by torch equivalents.
+# sampler and the drafters' use of it. CPU: the softmax op takes its torch
+# fallback, and the Triton Gumbel kernel is replaced by a torch equivalent.
 # ---------------------------------------------------------------------------
 
 POOL, VOCAB, N, MAX_BS = 4, 8, 3, 4
@@ -770,11 +770,6 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
         top_k=torch.tensor(top_k_rows, dtype=torch.int32),
         top_p=torch.ones(POOL + 1),
         seed=torch.arange(POOL + 1, dtype=torch.int64) * 11,
-    )
-    monkeypatch.setattr(
-        spec,
-        "softmax",
-        lambda logits, temperature: torch.softmax(logits.float() / temperature, -1),
     )
     monkeypatch.setattr(spec, "sampling_argmax", _kernel_argmax)
     calls = []
