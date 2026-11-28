@@ -370,14 +370,13 @@ Consequences:
   the request would block in the collective while its peer is still in the
   round's DP agreement. `--init-expert-location` sums the ranks' records
   where it consumes them.
-  Online expert rebalancing (`--enable-eplb`) adds two more named
-  operations on the same counters: `snapshot_expert_load` (read the window
-  to the host and zero it, one stream-ordered step) and
+  Online expert rebalancing (`--enable-eplb`) adds `set_expert_recording` to gate short
+  windows, `snapshot_expert_load` to read and reset physical and logical counts, and
   `apply_expert_placement` (one chunk of layers: P2P over the EP device
   group into a startup-reserved staging buffer, slot copies, then each
   layer's routing tables switched in place after its slots landed, and a
   final execution-stream synchronization so a P2P failure surfaces in the
-  op). Both are rank-local on the handle. The rebalance may reduce the
+  op). These operations are rank-local on the handle. The rebalance may reduce the
   snapshot over the EP group because its steps ride the same-round gate
   (below), unlike the profile's dump.
   Changing this surface requires updating this contract.
@@ -1049,7 +1048,9 @@ rank-identical — and decides when a rebalance's steps are due; the round
 queues them for the gate. EP rank 0 derives the placement on a solver thread
 of its own, off the round; the other ranks take the broadcast. Nothing in
 the round knows a rebalance exists beyond the one call that notes the
-round's forward.
+round's forward. An eligible draft contributes separate rows and receives its own
+apply chunks. Manual triggers require resident weights on all ranks, and a forward
+reload preserves each model's sample across warmup and rollback.
 
 **Cache-op acknowledgments** (`cache_ops`). The scheduler is mirrored on
 every rank of the replica, so an acknowledgment may only advance once every

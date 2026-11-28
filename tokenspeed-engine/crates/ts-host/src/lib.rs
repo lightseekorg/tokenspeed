@@ -358,12 +358,8 @@ struct Eplb {
 }
 
 impl Eplb {
-    fn from_python(eplb: &Bound<'_, PyAny>) -> PyResult<Option<Self>> {
-        if eplb.is_none() {
-            return Ok(None);
-        }
-        let specs = eplb.getattr("specs")?;
-        let specs = EplbSpecs {
+    fn specs(specs: &Bound<'_, PyAny>) -> PyResult<EplbSpecs> {
+        Ok(EplbSpecs {
             num_layers: specs.getattr("num_layers")?.extract()?,
             num_logical_experts: specs.getattr("num_logical_experts")?.extract()?,
             num_physical_experts: specs.getattr("num_physical_experts")?.extract()?,
@@ -373,7 +369,15 @@ impl Eplb {
             all_to_all_ep: specs.getattr("all_to_all_ep")?.extract()?,
             num_groups: specs.getattr("num_groups")?.extract()?,
             num_nodes: specs.getattr("num_nodes")?.extract()?,
-        };
+        })
+    }
+
+    fn from_python(eplb: &Bound<'_, PyAny>) -> PyResult<Option<Self>> {
+        if eplb.is_none() {
+            return Ok(None);
+        }
+        let specs = Self::specs(&eplb.getattr("specs")?)?;
+        let draft_specs = eplb.getattr("draft_specs")?;
         let algorithm: String = eplb.getattr("algorithm")?.extract()?;
         let algorithm = Algorithm::resolve(
             &algorithm,
@@ -385,7 +389,13 @@ impl Eplb {
         Ok(Some(Self {
             config: EplbConfig {
                 specs,
+                draft_specs: if draft_specs.is_none() {
+                    None
+                } else {
+                    Some(Self::specs(&draft_specs)?)
+                },
                 rebalance_num_iterations: eplb.getattr("rebalance_num_iterations")?.extract()?,
+                window_size: eplb.getattr("window_size")?.extract()?,
                 layers_per_chunk: eplb.getattr("layers_per_chunk")?.extract()?,
                 algorithm,
                 commit_delay_forwards: COMMIT_DELAY_FORWARDS,

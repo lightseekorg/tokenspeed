@@ -336,8 +336,7 @@ impl DataPlane for InstantDevice {
         unreachable!("no control operation in the benchmark")
     }
 
-    #[allow(clippy::type_complexity)]
-    fn snapshot_expert_load(&mut self) -> Result<(Vec<Vec<i64>>, Vec<Vec<i32>>), DataPlaneError> {
+    fn snapshot_expert_load(&mut self) -> Result<ts_control::eplb::ExpertLoad, DataPlaneError> {
         unreachable!("no expert rebalance in the benchmark")
     }
 
@@ -351,6 +350,10 @@ impl DataPlane for InstantDevice {
 
     fn epd_released(&mut self) -> Result<Vec<usize>, DataPlaneError> {
         unreachable!("no EPD in the benchmark")
+    }
+
+    fn set_expert_recording(&mut self, _: bool) -> Result<(), DataPlaneError> {
+        unreachable!("no expert rebalance in the benchmark")
     }
 
     fn apply_expert_placement(

@@ -688,7 +688,7 @@ The envelope folds that combine in (alignment.trainer above), so the
 combination is accepted; `--enable-eplb` with the rank-order combine stays an
 `auto` launch. The load counters, the CPU-side algorithm and the P2P copies
 never enter the arithmetic; the dispatch algorithm stays static (required
-under rl-bitwise already) and drafts stay trivially placed.
+under rl-bitwise already). Drafts that opt in use their own placement and counters.
 
 ## Acceptance
 

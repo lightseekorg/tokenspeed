@@ -31,9 +31,9 @@ the loader fills every slot from its logical expert's checkpoint tensors, and
 the load counters record how many routes each slot received so a better
 placement can be derived (``--init-expert-location <records>``).
 
-The placement is process-global for the target model
-(``set_global_expert_location_metadata``); drafts route their own experts
-trivially. Models opt in explicitly (``BaseCausalLM.supports_expert_placement``,
+The placement is installed while a model is built. The target remains the
+process global for profiling; an opt-in draft captures its own placement in
+its MoE layers before the target's global is restored. Models opt in explicitly (``BaseCausalLM.supports_expert_placement``,
 or the same class attribute on a model class outside ``BaseCausalLM``) by
 building their MoE layers from the placement; the placement is refused for
 any other model. Zero experts (LongCat) never enter these tables: the router
@@ -57,7 +57,8 @@ import glob
 import json
 import logging
 import random
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -99,6 +100,7 @@ __all__ = [
     "logical_count_of",
     "merge_expert_load_records",
     "pad_replica_table",
+    "preserve_expert_load_for_warmup",
     "replica_table_width",
     "set_global_expert_location_metadata",
 ]
@@ -112,25 +114,17 @@ EXPERT_LOAD_RECORD_SUFFIX = ".expert-load.pt"
 
 @dataclass(frozen=True)
 class ExpertLoadSnapshot:
-    """One rank's route counters since the previous snapshot, on the host.
+    """One rank's route counters for the sampled forwards, on the host.
 
     Attributes:
         physical_count: ``[layers, physical]`` int64 routes per slot.
-        physical_to_logical_map: The placement those routes were counted
-            under, so the logical load is derived from the matching rows even
-            if the tables move afterwards.
+        physical_to_logical_map: Current placement used to plan the next moves.
+        logical_count: Routes credited under the placement live at dispatch.
     """
 
     physical_count: torch.Tensor
     physical_to_logical_map: torch.Tensor
-
-    @property
-    def logical_count(self) -> torch.Tensor:
-        return logical_count_of(
-            self.physical_count,
-            self.physical_to_logical_map,
-            int(self.physical_to_logical_map.max().item()) + 1,
-        )
+    logical_count: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -179,6 +173,9 @@ class ExpertLocationMetadata:
     # (layers, num_physical_experts) int64 routes to each physical expert
     # since the last reset; None until load recording is enabled.
     physical_load: torch.Tensor | None = field(init=False, default=None)
+    _logical_correction: torch.Tensor | None = field(
+        init=False, default=None, repr=False
+    )
     # Which rows of the MoE input are real tokens (padded forwards carry
     # filler rows the counters must not see); enabled with the counters.
     load_rows: ExpertLoadRowMask | None = field(init=False, default=None)
@@ -323,15 +320,21 @@ class ExpertLocationMetadata:
             index: Position of the layer within ``prepared.layer_ids``.
         """
         layer_id = prepared.layer_ids[index]
-        device = self.physical_to_logical_map.device
-        self.physical_to_logical_map[layer_id].copy_(
-            prepared.physical_to_logical[index].to(self.physical_to_logical_map.dtype)
-        )
+        row = self.physical_to_logical_map[layer_id]
+        if self._logical_correction is not None:
+            counts = self.physical_load[layer_id]
+            correction = self._logical_correction[layer_id]
+            correction.scatter_add_(0, row.long(), counts)
+        row.copy_(prepared.physical_to_logical[index], non_blocking=True)
+        if self._logical_correction is not None:
+            # Cancel the credit these existing counts would get under the new
+            # map. The corrections telescope even across several switches.
+            correction.scatter_add_(0, row.long(), -counts)
         self.logical_to_all_physical_map[layer_id].copy_(
-            prepared.replicas[index].to(device)
+            prepared.replicas[index], non_blocking=True
         )
         self.logical_to_all_physical_map_num_valid[layer_id].copy_(
-            prepared.num_valid[index].to(device)
+            prepared.num_valid[index], non_blocking=True
         )
         if self._rank_dispatch_map is not None:
             if prepared.rank_dispatch is None:
@@ -340,7 +343,7 @@ class ExpertLocationMetadata:
                     "were prepared; prepare the chunk again"
                 )
             self._rank_dispatch_map[layer_id].copy_(
-                prepared.rank_dispatch[index].to(device)
+                prepared.rank_dispatch[index], non_blocking=True
             )
         self.physical_to_logical_map_cpu[layer_id].copy_(
             prepared.physical_to_logical[index].to(
@@ -365,10 +368,12 @@ class ExpertLocationMetadata:
         if self.physical_load is None:
             raise RuntimeError("expert load recording is not enabled")
         physical = self.physical_load.to(device="cpu", dtype=torch.int64, copy=True)
-        self.physical_load.zero_()
+        logical = self._logical_load(physical)
+        self.reset_load()
         return ExpertLoadSnapshot(
             physical_count=physical,
             physical_to_logical_map=self.physical_to_logical_map_cpu.clone(),
+            logical_count=logical,
         )
 
     # -------------------------------- placement queries ------------------------------
@@ -413,7 +418,9 @@ class ExpertLocationMetadata:
 
     # -------------------------------- load recording ---------------------------------
 
-    def enable_load_recording(self, mapping: Mapping) -> None:
+    def enable_load_recording(
+        self, mapping: Mapping, *, local_rows: bool = False, windowed: bool = False
+    ) -> None:
         """Allocate the per-physical-expert route counters the router bumps.
 
         int64: on replicated-input EP every rank counts every token's routes,
@@ -431,7 +438,16 @@ class ExpertLocationMetadata:
             dtype=torch.int64,
             device=self.physical_to_logical_map.device,
         )
-        self.load_rows = ExpertLoadRowMask(mapping)
+        self.load_rows = ExpertLoadRowMask(mapping, local_rows=local_rows)
+        self._logical_correction = torch.zeros(
+            (self.num_layers, self.num_logical_experts),
+            dtype=torch.int64,
+            device=self.physical_load.device,
+        )
+        if windowed:
+            self.load_rows.recording_enabled = torch.zeros(
+                (), dtype=torch.bool, device=self.physical_load.device
+            )
 
     def reserve_load_rows(self, max_rows: int) -> None:
         """Reserve the live-row mask for the largest MoE input any forward carries."""
@@ -443,6 +459,15 @@ class ExpertLocationMetadata:
         if self.physical_load is None:
             raise RuntimeError("expert load recording is not enabled")
         self.physical_load.zero_()
+        self._logical_correction.zero_()
+
+    def _logical_load(self, physical: torch.Tensor) -> torch.Tensor:
+        logical = logical_count_of(
+            physical, self.physical_to_logical_map_cpu, self.num_logical_experts
+        )
+        if self._logical_correction is not None:
+            logical.add_(self._logical_correction.cpu())
+        return logical
 
     def load_record(self, physical_load: torch.Tensor) -> dict[str, torch.Tensor | int]:
         """Package this rank's ``[layers, physical]`` count for ``--init-expert-location``.
@@ -458,9 +483,7 @@ class ExpertLocationMetadata:
         physical = physical_load.to(device="cpu", dtype=torch.int64, copy=True)
         return {
             "physical_count": physical,
-            "logical_count": logical_count_of(
-                physical, self.physical_to_logical_map_cpu, self.num_logical_experts
-            ),
+            "logical_count": self._logical_load(physical),
             "physical_to_logical_map": self.physical_to_logical_map_cpu.clone(),
             "ep_rank": self.ep_rank,
             "ep_size": self.ep_size,
@@ -674,6 +697,33 @@ class ExpertLocationMetadata:
         )
 
 
+@contextmanager
+def preserve_expert_load_for_warmup(
+    placements: Sequence[ExpertLocationMetadata], execution_stream
+) -> Iterator[None]:
+    """Restore the recording models' counters after synthetic forwards on this device."""
+    if not placements:
+        yield
+        return
+    device_module = torch.get_device_module(
+        placements[0].physical_to_logical_map.device
+    )
+    with device_module.stream(execution_stream):
+        saved = [
+            (counter, counter.to("cpu", copy=True))
+            for placement in placements
+            for counter in (placement.physical_load, placement._logical_correction)
+        ]
+    try:
+        yield
+    finally:
+        # A failed recapture can leave either model's kernels on a capture stream.
+        device_module.synchronize()
+        with device_module.stream(execution_stream):
+            for counter, backup in saved:
+                counter.copy_(backup, non_blocking=True)
+
+
 def logical_count_of(
     physical_count: torch.Tensor,
     physical_to_logical_map: torch.Tensor,
@@ -681,7 +731,9 @@ def logical_count_of(
 ) -> torch.Tensor:
     """Sum a host ``[layers, physical]`` int64 count over each logical expert's replicas."""
     num_layers = physical_to_logical_map.shape[0]
-    logical = torch.zeros((num_layers, num_logical_experts), dtype=torch.int64)
+    logical = physical_count.new_zeros(
+        (num_layers, num_logical_experts), dtype=torch.int64
+    )
     logical.scatter_add_(1, physical_to_logical_map.long(), physical_count)
     return logical
 
@@ -876,7 +928,7 @@ _global_expert_location_metadata: ExpertLocationMetadata | None = None
 def set_global_expert_location_metadata(
     metadata: ExpertLocationMetadata | None,
 ) -> None:
-    """Install the target model's placement (None: trivial routing)."""
+    """Install the placement used to build the current model (None: trivial routing)."""
     global _global_expert_location_metadata
     _global_expert_location_metadata = metadata
 
@@ -892,7 +944,7 @@ def expert_load_recording_enabled() -> bool:
 
 
 def build_expert_placement(
-    server_args: ServerArgs, model_config: ModelConfig
+    server_args: ServerArgs, model_config: ModelConfig, *, draft: bool = False
 ) -> ExpertLocationMetadata | None:
     """Build the serving placement, or None when routing stays untouched.
 
@@ -903,18 +955,23 @@ def build_expert_placement(
     consume is otherwise a silent no-op, so any other model is refused. Load
     recording allocates the counters the router bumps.
     """
-    if not expert_placement_requested(server_args):
+    if not expert_placement_requested(server_args) or (
+        draft and (not server_args.enable_eplb or not server_args.eplb_balance_draft)
+    ):
         return None
     # Deferred: the model base imports the MoE layers, whose router imports
     # this module for its placement view.
     from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 
     model_class, architecture = get_model_architecture(model_config)
+    is_causal_lm = issubclass(model_class, BaseCausalLM)
+    if draft and not (is_causal_lm and model_class.supports_draft_eplb):
+        return None
     # A model class outside BaseCausalLM (Kimi-K3's multimodal wrapper) opts
     # in by declaring the flag on itself.
     opted_in = (
         model_class.supports_expert_placement
-        if issubclass(model_class, BaseCausalLM)
+        if is_causal_lm
         else vars(model_class).get("supports_expert_placement", False)
     )
     if opted_in is not True:
@@ -929,9 +986,25 @@ def build_expert_placement(
         raise ValueError(
             "Expert placement was requested for a model without routed experts."
         )
-    placement = compute_initial_expert_location_metadata(server_args, model_config)
+    # A target profile contains target logical ids. The draft starts with its
+    # own trivial rows and learns its placement from its own online samples.
+    placement = (
+        ExpertLocationMetadata.init_trivial(server_args, model_config)
+        if draft
+        else compute_initial_expert_location_metadata(server_args, model_config)
+    )
     if server_args.expert_distribution_recorder_mode is not None:
-        placement.enable_load_recording(server_args.mapping)
+        windowed = (
+            server_args.enable_eplb
+            and server_args.eplb_window_size is not None
+            and server_args.eplb_window_size
+            != server_args.eplb_rebalance_num_iterations
+        )
+        placement.enable_load_recording(
+            server_args.mapping,
+            local_rows=is_causal_lm and model_class.expert_placement_local_rows,
+            windowed=windowed,
+        )
     if server_args.ep_dispatch_algorithm in STATIC_EP_DISPATCH_ALGORITHMS and (
         server_args.all2all_backend != "none"
         # Attention-DP ranks route only their own tokens whatever carries the
@@ -974,6 +1047,7 @@ def merge_expert_load_records(paths: Sequence[str | Path]) -> dict:
     if not paths:
         raise ValueError("no expert load records to merge")
     physical_count: torch.Tensor | None = None
+    logical_count: torch.Tensor | None = None
     physical_to_logical_map: torch.Tensor | None = None
     ep_size: int | None = None
     ep_ranks: list[int] = []
@@ -985,6 +1059,7 @@ def merge_expert_load_records(paths: Sequence[str | Path]) -> dict:
             )
             physical_to_logical_map = record["physical_to_logical_map"]
             ep_size = int(record["ep_size"])
+            num_logical = int(physical_to_logical_map.max().item()) + 1
         elif not torch.equal(
             record["physical_to_logical_map"], physical_to_logical_map
         ):
@@ -996,16 +1071,29 @@ def merge_expert_load_records(paths: Sequence[str | Path]) -> dict:
             raise ValueError(
                 f"{path} was recorded with ep_size {record['ep_size']}, not {ep_size}"
             )
-        physical_count += record["physical_count"].to(torch.int64)
+        physical = record["physical_count"].to(torch.int64)
+        physical_count += physical
+        logical = record.get("logical_count")
+        if logical is None:  # Legacy records cover a single placement.
+            logical = logical_count_of(physical, physical_to_logical_map, num_logical)
+        if logical.ndim not in (2, 3) or logical.shape[-2:] != (
+            physical_count.shape[0],
+            num_logical,
+        ):
+            raise ValueError(f"{path} has incompatible logical expert counts")
+        if logical_count is None:
+            logical_count = torch.zeros_like(logical, dtype=torch.int64)
+        elif logical.shape != logical_count.shape:
+            # Ranks with different window layouts can only be merged by total load.
+            if logical_count.ndim == 3:
+                logical_count = logical_count.sum(0)
+            if logical.ndim == 3:
+                logical = logical.sum(0)
+        logical_count += logical.to(torch.int64)
         ep_ranks.append(int(record["ep_rank"]))
     num_layers = physical_to_logical_map.shape[0]
     return {
-        # Every logical expert has a slot, so the map's largest id is E - 1.
-        "logical_count": logical_count_of(
-            physical_count,
-            physical_to_logical_map,
-            int(physical_to_logical_map.max().item()) + 1,
-        ),
+        "logical_count": logical_count,
         "physical_count": physical_count,
         "physical_to_logical_map": physical_to_logical_map,
         "ep_size": ep_size,

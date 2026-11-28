@@ -548,6 +548,8 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
     # still rejects them through the target's masked distribution.
     logits_processor_cls = LogitsProcessor
 
+    supports_draft_eplb = True
+
     def configure_target(self, target_model, target_config) -> None:
         """Install the checkpoint's target taps before draft execution exists."""
         del target_config

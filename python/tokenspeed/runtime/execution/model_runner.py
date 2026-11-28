@@ -209,30 +209,25 @@ class ModelRunner:
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=server_args.enable_memory_saver, device=self.device
         )
-        # The target's expert placement (redundant replicas, load counters) is
-        # process-global so its model picks it up while it is built and loaded.
-        # A draft routes its own experts trivially: the target's placement is
-        # hidden while the draft is built, then restored for serving.
-        # Online rebalancing (--enable-eplb) moves the target's expert weights
-        # between slots: its staging buffer and P2P channels are reserved here,
-        # after the load and before the cache profile sizes the KV arena.
-        self.expert_location_updater: ExpertLocationUpdater | None = None
-        if self.is_draft_worker:
-            target_placement = get_global_expert_location_metadata()
-            set_global_expert_location_metadata(None)
-            try:
-                self.load_model()
-            finally:
-                set_global_expert_location_metadata(target_placement)
-        else:
-            set_global_expert_location_metadata(
-                build_expert_placement(server_args, model_config)
+        # Layers and checkpoint loaders capture their model's placement at construction.
+        # Restore the target global after building a draft; the two banks have different ids.
+        target_placement = get_global_expert_location_metadata()
+        with self.memory_saver_adapter.named_region("runtime_states"):
+            self.expert_placement = build_expert_placement(
+                server_args, model_config, draft=self.is_draft_worker
             )
+        self.expert_location_updater: ExpertLocationUpdater | None = None
+        set_global_expert_location_metadata(self.expert_placement)
+        try:
             self.load_model()
-            if server_args.enable_eplb:
-                self.expert_location_updater = build_expert_location_updater(
-                    self.model, model_config, server_args
-                )
+            if server_args.enable_eplb and self.expert_placement is not None:
+                with self.memory_saver_adapter.named_region("runtime_states"):
+                    self.expert_location_updater = build_expert_location_updater(
+                        self.model, model_config, server_args
+                    )
+        finally:
+            if self.is_draft_worker:
+                set_global_expert_location_metadata(target_placement)
         if draft_moe_override:
             server_args.moe_backend = saved_moe_backend
             global_server_args_dict_update(server_args)
@@ -304,15 +299,12 @@ class ModelRunner:
         before the first forward (captured graphs hold its address) and is
         accounted for by the cache profile like the communication buffers.
         """
-        placement = get_global_expert_location_metadata()
-        if (
-            not self.is_draft_worker
-            and placement is not None
-            and placement.load_rows is not None
-        ):
-            placement.reserve_load_rows(
-                self.server_args.mapping.moe.tp_ep_size * max_num_tokens
-            )
+        placement = self.expert_placement
+        if placement is not None and placement.load_rows is not None:
+            with self.memory_saver_adapter.named_region("runtime_states"):
+                placement.reserve_load_rows(
+                    self.server_args.mapping.moe.tp_ep_size * max_num_tokens
+                )
         prepared = self.prepare_dp_linear_communication(max_num_tokens)
         prepare = getattr(self.model, "prepare_communication_runtime", None)
         if prepare is None:

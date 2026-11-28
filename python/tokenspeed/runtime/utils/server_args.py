@@ -648,10 +648,12 @@ class ServerArgs:
     # 'stat': int64 route counters per physical expert, read by the
     # EXPERT_LOAD profile activity and by --enable-eplb.
     expert_distribution_recorder_mode: Literal["stat"] | None = None
-    # Online expert rebalancing; the two knobs below are required with it.
+    # Online expert rebalancing requires a positive snapshot interval.
     enable_eplb: bool = False
     eplb_rebalance_num_iterations: int | None = None
     eplb_rebalance_layers_per_chunk: int | None = None
+    eplb_window_size: int | None = None
+    eplb_balance_draft: bool = True
 
     # Dense GEMM selection is independent of routed-expert kernels.
     dense_gemm_backend: str = "auto"
@@ -3377,15 +3379,18 @@ class ServerArgs:
                 f"--emulate-rank-zero does not support {', '.join(unsupported)}"
             )
 
+    def effective_eplb_layers_per_chunk(self, num_layers: int) -> int:
+        """Resolve the default once the target's MoE layer count is known."""
+        return self.eplb_rebalance_layers_per_chunk or min(8, num_layers)
+
     def validate_expert_placement_options(self):
         """Check the expert placement flags (redundant experts, recorded load).
 
         A placement needs an explicit dispatch algorithm, and under rl-bitwise
         a deterministic one: the replicated-input EP path relies on every rank
         choosing the same replica for a route. Online rebalancing
-        (``--enable-eplb``) spells out every choice it depends on -- the load
-        counters, a static dispatch algorithm, the snapshot interval and the
-        layers switched per round -- rather than auto-setting any of them.
+        (``--enable-eplb``) requires the load counters, a static dispatch
+        algorithm and the snapshot interval.
         """
         if self.enable_eplb:
             if self.expert_distribution_recorder_mode != "stat":
@@ -3408,11 +3413,11 @@ class ServerArgs:
                     "the forwards between two load snapshots."
                 )
             if (
-                self.eplb_rebalance_layers_per_chunk is None
-                or self.eplb_rebalance_layers_per_chunk < 1
+                self.eplb_rebalance_layers_per_chunk is not None
+                and self.eplb_rebalance_layers_per_chunk < 1
             ):
                 raise ValueError(
-                    "--enable-eplb requires --eplb-rebalance-layers-per-chunk L >= 1: "
+                    "--eplb-rebalance-layers-per-chunk must be positive: "
                     "the MoE layers whose experts move in one scheduling round "
                     "(at most the model's MoE layer count)."
                 )
@@ -3421,6 +3426,12 @@ class ServerArgs:
                     "--enable-eplb balances expert load across expert-parallel "
                     f"ranks, but the MoE layers run with ep_size="
                     f"{self.mapping.moe.ep_size}; enable expert parallelism."
+                )
+            if self.eplb_window_size is not None and not (
+                1 <= self.eplb_window_size <= self.eplb_rebalance_num_iterations
+            ):
+                raise ValueError(
+                    "--eplb-window-size must be in [1, --eplb-rebalance-num-iterations]"
                 )
             if self.numerics != "auto" and self.moe_combine_order != "slot":
                 # Under a bitwise envelope the rank-order MoE combine makes the
@@ -3436,11 +3447,11 @@ class ServerArgs:
         elif (
             self.eplb_rebalance_num_iterations is not None
             or self.eplb_rebalance_layers_per_chunk is not None
+            or self.eplb_window_size is not None
+            or not self.eplb_balance_draft
         ):
             raise ValueError(
-                "--eplb-rebalance-num-iterations and "
-                "--eplb-rebalance-layers-per-chunk have no effect without "
-                "--enable-eplb."
+                "Online EPLB options have no effect without --enable-eplb."
             )
         if self.expert_distribution_recorder_mode not in (None, "stat"):
             raise ValueError(
@@ -4691,7 +4702,7 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Online expert rebalancing: every --eplb-rebalance-num-iterations "
-            "forwards the routing load since the previous snapshot is balanced "
+            "forwards the sampled routing load is balanced "
             "with the EPLB algorithm and the expert weights move between slots, "
             "--eplb-rebalance-layers-per-chunk layers per scheduling round. "
             "Requires --expert-distribution-recorder-mode stat and a static "
@@ -4709,9 +4720,20 @@ class ServerArgs:
             "--eplb-rebalance-layers-per-chunk",
             type=int,
             default=ServerArgs.eplb_rebalance_layers_per_chunk,
-            help="MoE layers whose experts move in one scheduling round under "
-            "--enable-eplb (required with it; at most the MoE layer count). "
-            "Fewer layers per chunk bound the per-round stall.",
+            help="Maximum MoE layers moved per scheduling round under --enable-eplb. "
+            "Defaults to 8 or the target's MoE layer count, whichever is smaller.",
+        )
+        parser.add_argument(
+            "--eplb-window-size",
+            type=int,
+            default=ServerArgs.eplb_window_size,
+            help="Record the last W forwards of each EPLB interval (default: the full interval).",
+        )
+        parser.add_argument(
+            "--eplb-balance-draft",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.eplb_balance_draft,
+            help="Include a draft model that supports its own online expert placement.",
         )
         parser.add_argument(
             "--enable-fp8-attn-proj",

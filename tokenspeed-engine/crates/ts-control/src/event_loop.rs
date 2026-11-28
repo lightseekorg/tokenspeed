@@ -129,22 +129,26 @@ fn fnv1a<'a>(values: impl Iterator<Item = &'a i64>) -> i64 {
     (hash >> 1) as i64
 }
 
-/// A placement `[layers, physical]` as bytes: the row width, then the values.
+/// Placement rows in model/layer order. Target and draft can have different widths.
 fn encode_rows(rows: &[Vec<i32>]) -> Vec<u8> {
     let mut out = Writer::new();
-    out.count(rows.first().map_or(0, Vec::len));
-    out.i32s(&rows.concat());
+    out.count(rows.len());
+    for row in rows {
+        out.i32s(row);
+    }
     out.finish()
 }
 
 fn decode_rows(bytes: &[u8]) -> Option<Vec<Vec<i32>>> {
     let mut reader = Reader::new(bytes);
-    let width = reader.count()?;
-    let values = reader.i32s()?;
-    if width == 0 || values.len() % width != 0 {
+    let count = reader.count()?;
+    if count == 0 || count > bytes.len() / size_of::<u64>() {
         return None;
     }
-    reader.finish(values.chunks(width).map(<[i32]>::to_vec).collect())
+    let rows = (0..count)
+        .map(|_| reader.i32s().filter(|row| !row.is_empty()))
+        .collect::<Option<Vec<_>>>()?;
+    reader.finish(rows)
 }
 
 /// How long an idle loop waits for a request before checking `stop` again.
@@ -332,11 +336,11 @@ pub trait DataPlane {
     /// Restore resources that require every rank's memory to be resident.
     fn finish_memory_resume(&mut self) -> Result<(), DataPlaneError>;
 
-    /// EPLB: this rank's route counters since the previous snapshot,
-    /// `[layers, physical]`, with the placement they were counted under;
-    /// starts a new window behind the forwards dispatched before it.
-    #[allow(clippy::type_complexity)]
-    fn snapshot_expert_load(&mut self) -> Result<(Vec<Vec<i64>>, Vec<Vec<i32>>), DataPlaneError>;
+    /// EPLB: read this rank's per-slot and per-expert counts and current map,
+    /// then reset both counters on the execution stream.
+    fn snapshot_expert_load(&mut self) -> Result<eplb::ExpertLoad, DataPlaneError>;
+    /// Set the captured counter gate between two submitted forwards.
+    fn set_expert_recording(&mut self, enabled: bool) -> Result<(), DataPlaneError>;
 
     /// Grammar: these requests' matchers, by handle, with the tokens that
     /// end each grammar, for the forwards they run in from now on.
@@ -1186,7 +1190,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 }
             }
             busy |= forwarded;
-            self.note_forward(forwarded);
+            self.note_forward(forwarded)?;
             if !copies_clear {
                 std::thread::sleep(PAUSED_IDLE_SLEEP);
             } else {
@@ -1458,7 +1462,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             // forward dispatched does.
             self.copies_confirmed_at = Some(self.forwards_dispatched + u64::from(!queued));
         }
-        self.note_forward(forwarded);
+        self.note_forward(forwarded)?;
 
         // Commit from the head once the queue exceeds the depth; a round with
         // no new work drains fully so results never wait on future traffic.
@@ -1661,11 +1665,17 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// the steps it makes due complete through the gate. Every round on
     /// every rank, frozen or not: the attention-DP ranks forward in step,
     /// so their counts, and the steps that follow, stay rank-identical.
-    fn note_forward(&mut self, forwarded: bool) {
+    fn note_forward(&mut self, forwarded: bool) -> Result<(), LoopError> {
         if let Some(controller) = self.eplb.as_mut() {
+            let before = controller.recording();
             let due = controller.note_round(forwarded);
+            if before != controller.recording() {
+                self.data_plane
+                    .set_expert_recording(controller.recording())?;
+            }
             self.controls.enqueue_internal(due);
         }
+        Ok(())
     }
 
     /// With a shared L2 pool, the waiting prompts not looked up yet ask the
@@ -2689,18 +2699,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let flush_refused = control::wants_flush(&op) && !flushed;
         let (success, message) = match &op {
-            ControlRequest::RebalanceExperts(_) => {
-                // Not a weight operation: the frontend's trigger of the
-                // rebalance, whose snapshot runs in this gated round.
-                let (local, message) = self.begin_manual_rebalance()?;
-                let agreed = self.converge(local)?;
-                let message = if local && !agreed {
-                    format!("rebalance refused on another rank in the replica ({message})")
-                } else {
-                    message
-                };
-                (agreed, message)
-            }
+            ControlRequest::RebalanceExperts(_) => self.begin_manual_rebalance()?,
             ControlRequest::ReloadForward(_) => self.complete_reload(&op, flushed)?,
             _ if flush_refused => (
                 false,
@@ -2874,24 +2873,39 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }))
     }
 
-    /// `RebalanceExpertsReqInput`: take the snapshot now, if no rebalance runs.
+    /// Start or finish a short sample, or snapshot an entire-cycle window immediately.
     fn begin_manual_rebalance(&mut self) -> Result<(bool, String), LoopError> {
-        let Some(controller) = self.eplb.as_mut() else {
+        // The counters live in the weights region. Agree before any rank opens
+        // a window or enters the full-window snapshot's EP reduction.
+        let refusal = match &self.eplb {
+            None => Some("expert rebalancing needs the server to start with --enable-eplb".into()),
+            Some(_) if self.controls.region_released("weights") => {
+                Some("resume the weights region before rebalancing experts".into())
+            }
+            Some(controller) if controller.phase() != eplb::Phase::Idle => Some(format!(
+                "an expert rebalance is already in progress ({})",
+                controller.phase().name()
+            )),
+            Some(_) => None,
+        };
+        if !self.converge(refusal.is_none())? {
             return Ok((
                 false,
-                "expert rebalancing needs the server to start with --enable-eplb".to_owned(),
+                refusal.unwrap_or_else(|| "rebalance refused on another rank".into()),
             ));
-        };
-        let Some(op) = controller.request_snapshot() else {
-            return Ok((
-                false,
-                format!(
-                    "an expert rebalance is already in progress ({})",
-                    controller.phase().name()
-                ),
-            ));
-        };
+        }
+        let controller = self.eplb_controller()?;
         let delay = controller.commit_delay_forwards();
+        let was_recording = controller.recording();
+        if let Some(remaining) = controller.request_window() {
+            if !was_recording {
+                self.data_plane.set_expert_recording(true)?;
+            }
+            return Ok((true, format!("expert load snapshot after {remaining} more forwards; placement commits {delay} forwards later")));
+        }
+        let op = controller
+            .request_snapshot()
+            .expect("the gate admitted an idle controller");
         self.complete_internal_op(op)?;
         Ok((
             true,
@@ -2904,7 +2918,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let eplb_error = |error: String| LoopError::Control(format!("expert rebalance: {error}"));
         match op {
             InternalOp::Snapshot => {
-                let (mut physical, old_map) = self.data_plane.snapshot_expert_load()?;
+                let (mut physical, old_map, mut logical) =
+                    self.data_plane.snapshot_expert_load()?;
                 let all_to_all = self
                     .eplb
                     .as_ref()
@@ -2912,17 +2927,20 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 if let Some(ep) = &self.ranks.ep {
                     if all_to_all {
                         // Each rank counted its own tokens: the load is the sum.
-                        let flat: Vec<i64> = physical.iter().flatten().copied().collect();
+                        let flat: Vec<i64> =
+                            physical.iter().chain(&logical).flatten().copied().collect();
                         let summed = self.ranks.mesh.all_reduce(ep, &flat, Reduce::Sum)?;
-                        let width = physical.first().map_or(0, Vec::len);
-                        for (row, chunk) in physical.iter_mut().zip(summed.chunks(width.max(1))) {
-                            row.copy_from_slice(chunk);
+                        let mut offset = 0;
+                        for row in physical.iter_mut().chain(&mut logical) {
+                            let end = offset + row.len();
+                            row.copy_from_slice(&summed[offset..end]);
+                            offset = end;
                         }
                     } else {
                         // Every rank routed every token through the same
                         // tables: the counters already are the group's load,
                         // and must agree.
-                        let digest = fnv1a(physical.iter().flatten());
+                        let digest = fnv1a(physical.iter().chain(&logical).flatten());
                         let reduced =
                             self.ranks
                                 .mesh
@@ -2939,7 +2957,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     }
                 }
                 self.eplb_controller()?
-                    .on_snapshot(physical, old_map)
+                    .on_snapshot(physical, old_map, logical)
                     .map_err(eplb_error)?;
             }
             InternalOp::Commit => {

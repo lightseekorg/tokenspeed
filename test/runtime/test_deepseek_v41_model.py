@@ -418,6 +418,7 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     adapter.encoder_only = False
     adapter.vision = None
     adapter.model = nn.Module()
+    adapter.model.expert_placement = None
     adapter.model.config = config
     with set_default_torch_dtype(dtype), torch.device(device):
         adapter.lm_head = adapter.resolve_lm_head(
@@ -3998,12 +3999,11 @@ def test_moe_intermediate_alignment(
     assert config.n_shared_experts == 1
 
 
-def _loader_model(monkeypatch, config, rank, device):
-    mapping = _mapping(rank, 4, 4)
+def _loader_model(monkeypatch, config, rank, device, *, mapping=None):
+    if mapping is None:
+        mapping = _mapping(rank, 4, 4)
     _mock_loader_hardware(monkeypatch, mapping)
     wrapper = SimpleNamespace(text_config=config)
-    mapping = _mapping(rank, 4, 4)
-    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
     with torch.device(device):
         return DeepseekV41ForCausalLM(
             wrapper,
@@ -4451,6 +4451,11 @@ def test_checkpoint_rejects_duplicate_alias_and_shapes(monkeypatch):
     with pytest.raises(TypeError, match="FP8 E4M3"):
         model.load_weights([(name, weights[name].bfloat16())])
     name = "layers.0.ffn.experts.0.w1.weight"
+    alias = "layers.0.ffn.experts.00.w1.weight"
+    with pytest.raises(
+        ValueError, match=f"Unexpected V4.1 expert tensor: {re.escape(alias)}"
+    ):
+        model.load_weights([(name, weights[name]), (alias, weights[name])])
     with pytest.raises(TypeError, match="packed FP4"):
         model.load_weights([(name, weights[name].bfloat16())])
     name = "layers.0.attn.wo_a.scale"
@@ -5069,3 +5074,148 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         shared.down_proj.weight_scale_inv,
     )
     assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))
+
+
+def _eplb_mapping(rank, size):
+    return v41.Mapping(rank, size, attn_dp_size=size, dense_tp_size=1, moe_ep_size=size)
+
+
+def test_v41_loads_every_placed_mxfp4_replica_and_its_scales(monkeypatch, tmp_path):
+    from tokenspeed.runtime.moe import expert_location
+
+    config = _loader_config()
+    config.moe_intermediate_size = 512
+    rows = [[e, e, 0, 1, 2, 3, 0, 1] for e in (2, 3, 1)]
+    placement = expert_location.ExpertLocationMetadata.from_physical_to_logical_map(
+        torch.tensor(rows), 4, ep_size=4, ep_rank=0, ep_rank_nodes=(0,) * 4
+    )
+    monkeypatch.setattr(expert_location, "_global_expert_location_metadata", placement)
+    monkeypatch.setitem(global_server_args_dict, "ep_dispatch_algorithm", "static")
+    with set_default_torch_dtype(torch.bfloat16):
+        mapping = _eplb_mapping(0, 4)
+        model = _loader_model(monkeypatch, config, 0, "cpu", mapping=mapping)
+    weights = _checkpoint(config)
+    model.load_weights(_bind_engram_tables(model, weights, tmp_path).items())
+    for layer, (w13, s13, w2, s2) in model.routed_experts_weights_of_layer.items():
+        prefix = f"layers.{layer}.ffn.experts.{rows[layer][0]}."
+        for field, pair, down in (("weight", w13, w2), ("scale", s13, s2)):
+            for proj, slots in zip(("w1", "w3", "w2"), (*pair.chunk(2, dim=1), down)):
+                raw = weights[f"{prefix}{proj}.{field}"].view(torch.uint8)
+                assert torch.equal(slots, raw.expand_as(slots))
+
+    # Layer 0 skips the remote expert 0 alias and rejects the local expert 2 alias.
+    prefix = "layers.0.ffn.experts."
+    with pytest.raises(ValueError, match=re.escape(f"{prefix}02.w1.weight")):
+        model.load_weights(
+            (f"{prefix}0{e}.w1.weight", weights[f"{prefix}{e}.w1.weight"])
+            for e in (0, 2)
+        )
+
+
+def _native_eplb_layer(monkeypatch, mapping, n):
+    from test.runtime.moe.test_expert_location_updater import _placement
+
+    from tokenspeed.runtime.moe import expert_location
+
+    slots = torch.tensor([[*range(n), 0, 1]], device="cuda")
+    placement = _placement(slots, mapping.rank, (0, 0), local_rows=True)
+    placement.reserve_load_rows(16)
+    monkeypatch.setattr(expert_location, "_global_expert_location_metadata", placement)
+    config = _config()
+    config.hidden_size, config.moe_intermediate_size = 512, 256
+    config.n_routed_experts, config.n_shared_experts = n, None
+    with torch.device("cuda"), set_default_torch_dtype(torch.bfloat16):
+        layer = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    local = placement.local_slot_logical_experts(0, mapping.rank)
+    rng = torch.Generator().manual_seed(n)
+    weights = {
+        name: param
+        for name, param in layer.experts.named_parameters()
+        if name.startswith(("w13_", "w2_"))
+    }
+    for name, param in weights.items():
+        low, high = (120, 124) if "scale" in name else (0, 256)
+        bank = torch.randint(
+            low, high, (n, *param.shape[1:]), dtype=torch.uint8, generator=rng
+        )
+        param.copy_(bank[local])
+    layer.experts.process_weights_after_loading(layer.experts)
+    layer.warmup()
+    rows = torch.arange(16, device="cuda")
+    ids = torch.stack((rows % n, (rows + 1) % n), dim=1).int()
+    scores = torch.tensor([0.3, 0.7], device="cuda").repeat(16, 1)
+    topk = v4.StandardTopKOutput(scores, ids, None)
+    x = (torch.randn(16, 512, generator=rng) * 0.25).bfloat16().cuda()
+
+    def forward():
+        return layer._forward_routed_experts(x, topk, 32, 16, do_finalize=True)
+
+    return forward, placement, tuple(weights.values())
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) != 2 or not current_platform().is_blackwell,
+    reason="requires torchrun with two Blackwell GPUs",
+)
+@torch.no_grad()
+def test_captured_target_and_draft_read_migrated_experts(monkeypatch):
+    from test.runtime.moe.test_expert_location_updater import (
+        _moves,
+        _single_layer_updater,
+    )
+
+    from torch.distributed.nn.functional import all_gather
+
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+
+    device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(device)
+    mapping = _eplb_mapping(int(os.environ["RANK"]), 2)
+    pg_manager.init_distributed(mapping, device_id=device)
+    try:
+        group = torch.distributed.group.WORLD
+        monkeypatch.setattr(pg_manager, "_process_groups", {})
+        pg_manager.register_process_group("nccl", mapping.moe.ep_group, group)
+        monkeypatch.setattr(moe_utils, "MOE_BACKEND", MoeBackend.MEGA_MOE)
+        for name, value in dict(
+            mapping=mapping,
+            ep_dispatch_algorithm="static",
+            enable_eplb=True,
+            deepseek_v4_mega_moe_max_num_tokens=32,
+        ).items():
+            monkeypatch.setitem(global_server_args_dict, name, value)
+        banks = [_native_eplb_layer(monkeypatch, mapping, n) for n in (8, 4)]
+        expected = [forward().clone() for forward, _, _ in banks]
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = [forward() for forward, _, _ in banks]
+        for (_, p, weights), slots in zip(
+            banks, ([7, 5, 6, 7, 4, 0, 1, 2, 3, 7], [2, 3, 3, 0, 1, 3])
+        ):
+            reference = [torch.cat(all_gather(w)).cpu() for w in weights]
+            updater = _single_layer_updater(p, weights, group)
+            new = torch.tensor([slots])
+            updater.apply([0], new, _moves(p.physical_to_logical_map_cpu, new, p))
+            local = p.local_slot_logical_experts(0, mapping.rank)
+            for w, ref in zip(weights, reference):
+                assert torch.equal(w.cpu(), ref[local])
+            for _, placement, _ in banks:
+                placement.reset_load()
+            target, draft = (placement.load_rows for _, placement, _ in banks)
+            live = [16, 5]
+            target.mark_padded(
+                padded_global_num_tokens=[16, 16], live_global_num_tokens=live
+            )
+            draft_rows = 0 if mapping.rank else 8
+            with draft.local_replay(16, draft_rows):
+                graph.replay()
+            target.clear()
+            assert draft.rows(16).all()
+            for output, ref, (_, placement, _), rows in zip(
+                actual, expected, banks, (live[mapping.rank], draft_rows)
+            ):
+                assert torch.equal(output, ref)
+                assert placement.snapshot_load().physical_count.sum() == 2 * rows
+
+    finally:
+        torch.distributed.destroy_process_group()

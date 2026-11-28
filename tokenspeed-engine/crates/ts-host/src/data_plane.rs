@@ -52,7 +52,7 @@ use pyo3::{
     prelude::*,
     types::{PyBytes, PyList, PyTuple},
 };
-use ts_control::eplb::SlotMoves;
+use ts_control::eplb::{ExpertLoad, SlotMoves};
 use ts_control::{
     event_loop::{DataPlane, DataPlaneError, Dispatch, DpRound},
     ingress::Admission,
@@ -151,6 +151,7 @@ enum Op {
     SnapshotExpertLoad {
         reply: mpsc::SyncSender<Result<ExpertLoad, String>>,
     },
+    SetExpertRecording(bool),
     /// EPD: landed embeddings to publish onto their items.
     EpdPublish(Vec<LandedRequest>),
     ApplyExpertPlacement {
@@ -183,15 +184,12 @@ impl Op {
             Op::ResumeMemory { .. } => "Op::ResumeMemory",
             Op::FinishMemoryResume { .. } => "Op::FinishMemoryResume",
             Op::SnapshotExpertLoad { .. } => "Op::SnapshotExpertLoad",
+            Op::SetExpertRecording(_) => "Op::SetExpertRecording",
             Op::EpdPublish(_) => "Op::EpdPublish",
             Op::ApplyExpertPlacement { .. } => "Op::ApplyExpertPlacement",
         }
     }
 }
-
-/// Route counters `[layers, physical]` and the placement they were counted
-/// under.
-type ExpertLoad = (Vec<Vec<i64>>, Vec<Vec<i32>>);
 
 struct AdmitRow {
     rid: String,
@@ -652,6 +650,10 @@ impl DataPlane for PythonDataPlane {
         self.ask(|reply| Op::SnapshotExpertLoad { reply })
     }
 
+    fn set_expert_recording(&mut self, enabled: bool) -> Result<(), DataPlaneError> {
+        self.queue(Op::SetExpertRecording(enabled))
+    }
+
     fn apply_expert_placement(
         &mut self,
         layer_ids: &[usize],
@@ -772,7 +774,8 @@ fn forward_loop(
                 Op::SnapshotExpertLoad { reply } => {
                     let _ = reply.send(Err(failure));
                 }
-                Op::Admit(_)
+                Op::SetExpertRecording(_)
+                | Op::Admit(_)
                 | Op::Execute(_)
                 | Op::Committed(_)
                 | Op::Release(..)
@@ -1045,6 +1048,11 @@ fn run(
                 .collect();
             plane
                 .call_method1("epd_publish", (landed,))
+                .map_err(python)?;
+        }
+        Op::SetExpertRecording(enabled) => {
+            plane
+                .call_method1("set_expert_recording", (enabled,))
                 .map_err(python)?;
         }
         Op::SnapshotExpertLoad { reply } => {

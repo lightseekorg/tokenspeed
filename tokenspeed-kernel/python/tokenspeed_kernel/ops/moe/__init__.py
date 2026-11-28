@@ -49,6 +49,7 @@ __all__ = [
     "gather_moe_routes",
     "COMBINE_ORDERS",
     "ExpertDispatch",
+    "dispatch_and_record_topk_ids",
     "dispatch_topk_ids",
     "native_latent_moe_available",
     "latent_moe_decode_pipeline_available",
@@ -320,6 +321,28 @@ def dispatch_topk_ids(topk_ids: torch.Tensor, dispatch: ExpertDispatch) -> torch
     count = dispatch.num_replicas.long()[logical]
     physical = dispatch.replicas.long()[logical, (rows + ranks) % count]
     return physical.to(topk_ids.dtype)
+
+
+def dispatch_and_record_topk_ids(
+    topk_ids: torch.Tensor,
+    replicas: torch.Tensor,
+    num_replicas: torch.Tensor,
+    live_rows: torch.Tensor,
+    physical_load: torch.Tensor,
+    recording_enabled: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Map [rows, top_k] logical IDs through the per-expert replica table.
+    Return physical IDs and increment their int64 counters for live rows while
+    recording is enabled. Omitting the device flag records every forward.
+    """
+    kernel = select_kernel(
+        "moe",
+        "dispatch_and_record_topk_ids",
+        dense_format_signature(("topk_ids",), (topk_ids.dtype,)),
+    )
+    return kernel(
+        topk_ids, replicas, num_replicas, live_rows, physical_load, recording_enabled
+    )
 
 
 # How a token's routed-expert contributions are combined across the MoE

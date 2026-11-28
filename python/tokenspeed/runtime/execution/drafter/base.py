@@ -367,6 +367,10 @@ class BaseDrafter:
     def set_decode_graph_query_extent(self, num_tokens: int | None) -> None:
         """Select physical target extent for capture; None restores eager policy."""
 
+    def mark_packed_verify_rows(self, mask: torch.Tensor, *, bs: int) -> None:
+        """Mark the live target rows for ``bs`` requests in the selected packed graph."""
+        raise ValueError(f"{type(self).__name__} does not support packed verification")
+
     def target_forward_context(self, ctx: ForwardContext) -> AbstractContextManager:
         """Lend temporary input storage; restore it before sampling and commit.
 

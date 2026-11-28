@@ -194,6 +194,7 @@ from tokenspeed.runtime.execution.weight_memory import WeightMemoryState
 from tokenspeed.runtime.moe.expert_location import (
     ExpertLoadSnapshot,
     get_global_expert_location_metadata,
+    preserve_expert_load_for_warmup,
 )
 from tokenspeed.runtime.moe.expert_rebalance import ExpertRebalanceSpecs, SlotMoves
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -215,6 +216,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.attention.registry import AttentionBuild
+    from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -315,6 +317,7 @@ class DeviceSpecs:
         expert_rebalance: The expert placement's geometry and this rank's
             position in its EP group, for the online rebalance controller;
             None unless the server started with ``--enable-eplb``.
+        draft_expert_rebalance: Geometry of a separately placed draft, when enabled.
         cache_observation_capacity: Startup capacity of optional completed
             CPU copy observations; zero when diagnostics are disabled.
     """
@@ -338,6 +341,7 @@ class DeviceSpecs:
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
     cache_observation_capacity: int = 0
+    draft_expert_rebalance: ExpertRebalanceSpecs | None = None
 
 
 def speculative_widths(
@@ -1136,13 +1140,13 @@ class DeviceHandle:
         with executor.device_module.stream(executor.execution_stream):
             with allow_host_sync("expert load dump"):
                 physical = placement.physical_load.cpu()
-        record = placement.load_record(physical)
+                record = placement.load_record(physical)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         torch.save(record, path)
         return record
 
-    def snapshot_expert_load(self) -> ExpertLoadSnapshot:
-        """Read this rank's expert load since the previous snapshot and start a new window.
+    def snapshot_expert_load(self, *, draft: bool = False) -> ExpertLoadSnapshot:
+        """Read this rank's sampled expert load and reset the window's counters.
 
         The online rebalance's recording window: the counters are copied to
         the host (the one deliberate host wait) and zeroed on the execution
@@ -1152,20 +1156,38 @@ class DeviceHandle:
         where that is needed (inside the same-round gate, never here).
 
         Returns:
-            The host counters with the placement they were counted under.
+            Per-slot counts, the current placement and per-expert counts at dispatch.
         """
         self.settle()
-        placement = _recording_expert_placement()
+        placement = (
+            self._executor.draft_model_runner.expert_placement
+            if draft
+            else _recording_expert_placement()
+        )
         executor = self._executor
         with executor.device_module.stream(executor.execution_stream):
             with allow_host_sync("expert load snapshot"):
                 return placement.snapshot_load()
+
+    def set_expert_recording(self, enabled: bool) -> None:
+        """An ordered forward-thread command on the two edges of a short window."""
+        self.settle()
+        executor = self._executor
+        with executor.device_module.stream(executor.execution_stream):
+            for runner in (executor.model_runner, executor.draft_model_runner):
+                if runner is not None and runner.expert_location_updater is not None:
+                    placement = runner.expert_placement
+                    if enabled:
+                        placement.reset_load()
+                    placement.load_rows.recording_enabled.fill_(enabled)
 
     def apply_expert_placement(
         self,
         layer_ids: Sequence[int],
         new_rows: torch.Tensor,
         moves_by_layer: Mapping[int, SlotMoves],
+        *,
+        draft: bool = False,
     ) -> None:
         """Move one chunk of layers' expert weights and switch their routing tables.
 
@@ -1186,7 +1208,10 @@ class DeviceHandle:
             RuntimeError: The server did not start with ``--enable-eplb``.
         """
         self.settle()
-        updater = self._executor.model_runner.expert_location_updater
+        runner = (
+            self._executor.draft_model_runner if draft else self._executor.model_runner
+        )
+        updater = runner.expert_location_updater
         if updater is None:
             raise RuntimeError(
                 "expert placement updates need the server to start with --enable-eplb"
@@ -1342,7 +1367,11 @@ class DeviceHandle:
             executor.forget_served_inputs()
             recapture_graphs(executor, server_args)
 
-        with allow_host_sync("a forward reload warms kernels and captures graphs"):
+        with allow_host_sync(
+            "a forward reload warms kernels and captures graphs"
+        ), preserve_expert_load_for_warmup(
+            _warmup_expert_placements(executor), executor.execution_stream
+        ):
             return self._forward_reloader.reload(
                 req.modules, warm=warm, recapture=recapture
             )
@@ -1379,7 +1408,20 @@ def _recording_expert_placement():
     return placement
 
 
-def start_expert_load_window(executor) -> None:
+def _warmup_expert_placements(
+    executor: ModelExecutor,
+) -> tuple[ExpertLocationMetadata, ...]:
+    """Placements whose load counters a synthetic forward can change."""
+    target = get_global_expert_location_metadata()
+    if target is None or target.physical_load is None:
+        return ()
+    draft = executor.draft_model_runner
+    if draft is not None and draft.expert_placement is not None:
+        return target, draft.expert_placement
+    return (target,)
+
+
+def start_expert_load_window(executor: ModelExecutor) -> None:
     """Zero the expert load counters once the startup forwards are done.
 
     Autotune, warm-up and graph capture route tokens through the MoE layers,
@@ -1389,12 +1431,13 @@ def start_expert_load_window(executor) -> None:
     is still bumping the counters, then the reset rides the execution stream
     like the serving-time resets. A no-op without load recording.
     """
-    placement = get_global_expert_location_metadata()
-    if placement is None or placement.physical_load is None:
+    placements = _warmup_expert_placements(executor)
+    if not placements:
         return
     executor.device_module.synchronize()
     with executor.device_module.stream(executor.execution_stream):
-        placement.reset_load()
+        for placement in placements:
+            placement.reset_load()
 
 
 def arm_data_plane_sync_debug(device: str) -> None:
@@ -2332,6 +2375,11 @@ def build_device_side(
         expert_rebalance=(
             target.expert_location_updater.specs
             if target.expert_location_updater is not None
+            else None
+        ),
+        draft_expert_rebalance=(
+            draft.expert_location_updater.specs
+            if draft is not None and draft.expert_location_updater is not None
             else None
         ),
     )

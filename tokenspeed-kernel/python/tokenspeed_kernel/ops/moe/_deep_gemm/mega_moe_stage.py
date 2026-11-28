@@ -25,6 +25,89 @@ from tokenspeed_kernel.platform import pdl_enabled
 _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE = 128
 
 
+@triton.jit(do_not_specialize=["num_routes", "id_row_stride", "id_col_stride"])
+def _dispatch_and_record_topk_ids_kernel(
+    logical_ids,
+    physical_ids,
+    replicas,
+    num_replicas,
+    live_rows,
+    physical_load,
+    recording_enabled,
+    num_routes,
+    id_row_stride,
+    id_col_stride,
+    TOP_K: tl.constexpr,
+    NUM_EXPERTS: tl.constexpr,
+    REPLICA_STRIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    route = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    active = route < num_routes
+    row = route // TOP_K
+    expert = tl.load(
+        logical_ids + row * id_row_stride + (route % TOP_K) * id_col_stride,
+        active,
+        other=0,
+    )
+    # Match tensor indexing for negative indices in the static dispatch table.
+    expert = tl.where(expert < 0, expert + NUM_EXPERTS, expert)
+    valid = active & (expert >= 0) & (expert < NUM_EXPERTS)
+    tl.device_assert(~active | valid, "logical expert out of range")
+    copies = tl.load(num_replicas + expert, valid, other=1).to(tl.uint32)
+    row_hash = (row * 2654435769).to(tl.uint32)
+    column = (row_hash % copies).to(tl.int32)
+    slot = tl.load(
+        replicas + expert.to(tl.int64) * REPLICA_STRIDE + column, valid, other=-1
+    )
+    tl.store(physical_ids + route, slot, active)
+    enabled = True
+    if recording_enabled is not None:
+        enabled = tl.load(recording_enabled)
+    if enabled:
+        live = tl.load(live_rows + row, active, other=False)
+        tl.atomic_add(
+            physical_load + tl.maximum(slot, 0),
+            1,
+            mask=valid & live & (slot >= 0),
+            sem="relaxed",
+        )
+
+
+def triton_dispatch_and_record_topk_ids(
+    topk_ids: torch.Tensor,
+    replicas: torch.Tensor,
+    num_replicas: torch.Tensor,
+    live_rows: torch.Tensor,
+    physical_load: torch.Tensor,
+    recording_enabled: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Map rank-local top-k IDs by token row and count live routes in one launch."""
+    rows, top_k = topk_ids.shape
+    if rows == 0:
+        return topk_ids
+    output = torch.empty((rows, top_k), dtype=topk_ids.dtype, device=topk_ids.device)
+    block = 128
+    _dispatch_and_record_topk_ids_kernel[(triton.cdiv(topk_ids.numel(), block),)](
+        topk_ids,
+        output,
+        replicas,
+        num_replicas,
+        live_rows,
+        physical_load,
+        recording_enabled,
+        topk_ids.numel(),
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        TOP_K=top_k,
+        NUM_EXPERTS=replicas.shape[0],
+        REPLICA_STRIDE=replicas.stride(0),
+        BLOCK=block,
+        num_warps=4,
+    )
+    return output
+
+
 @triton.jit(do_not_specialize=["num_tokens", "shared_block_m"])
 def _stage_mxfp4_mega_moe_inputs_kernel(
     hidden_states,

@@ -28,10 +28,95 @@ if not is_nvidia():
     pytest.skip("NVIDIA GPU required", allow_module_level=True)
 
 from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (  # noqa: E402
+    _dispatch_and_record_topk_ids_kernel,
     _stage_mxfp4_mega_moe_inputs_kernel,
     stage_mxfp4_mega_moe_inputs,
+    triton_dispatch_and_record_topk_ids,
 )
 from utils import assert_no_triton_compile  # noqa: E402
+
+
+@pytest.mark.parametrize("width", [1, 13])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_captured_token_replica_dispatch_tracks_placement_and_live_rows(width, dtype):
+    rows = 97
+    ids = torch.tensor([0, 0, 1, 0, 2, 0], device="cuda", dtype=dtype).repeat(rows, 1)[
+        :, ::2
+    ]
+    replicas = torch.full((3, width), -1, device="cuda", dtype=torch.int32)
+    replicas[0] = torch.arange(width, device="cuda")
+    replicas[1, 0], replicas[2, 0] = width, width + 1
+    counts = torch.tensor([width, 1, 1], device="cuda", dtype=torch.int32)
+    row = torch.arange(rows, device="cuda")
+    live = row % 3 != 0
+    initial = 2**33
+    load = torch.full((width + 2,), initial, device="cuda", dtype=torch.int64)
+
+    enabled = torch.tensor(False, device="cuda")
+    triton_dispatch_and_record_topk_ids(ids, replicas, counts, live, load, enabled)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mapped = triton_dispatch_and_record_topk_ids(
+            ids, replicas, counts, live, load, enabled
+        )
+
+    for hot_expert in (0, 2):
+        if hot_expert == 2:
+            replicas.copy_(replicas.flip([0]))
+            counts.copy_(counts.flip([0]))
+            live.logical_not_()
+        load.fill_(initial)
+        enabled.fill_(False)
+        graph.replay()
+        assert (load == initial).all()
+        disabled_ids = mapped.clone()
+        enabled.fill_(True)
+        graph.replay()
+        assert torch.equal(mapped, disabled_ids)
+        hashed = (row[:, None] * 2654435769) & 0xFFFFFFFF
+        logical = ids.long()
+        expected = replicas[logical, hashed % counts[logical]]
+        assert mapped.dtype == ids.dtype
+        assert torch.equal(mapped, expected.to(dtype))
+        assert mapped[:, hot_expert].unique().numel() == width
+        assert torch.equal(
+            load - initial,
+            torch.bincount(expected[live].long().flatten(), minlength=load.numel()),
+        )
+
+
+def test_token_replica_dispatch_varies_row_count_without_recompile():
+    ids = torch.zeros((128, 6), device="cuda", dtype=torch.int32)
+    replicas = torch.tensor([[1], [0]], device="cuda", dtype=torch.int32)
+    counts = torch.ones(2, device="cuda", dtype=torch.int32)
+    live = torch.ones(128, device="cuda", dtype=torch.bool)
+    load = torch.zeros(2, device="cuda", dtype=torch.int64)
+    for rows in (1, 16, 33):
+        triton_dispatch_and_record_topk_ids(
+            ids[:rows], replicas, counts, live[:rows], load
+        )
+    load.zero_()
+    with assert_no_triton_compile(_dispatch_and_record_topk_ids_kernel):
+        for rows in (0, 2, 17, 32, 65):
+            mapped = triton_dispatch_and_record_topk_ids(
+                ids[:rows], replicas, counts, live[:rows], load
+            )
+            assert mapped.shape == (rows, 6) and (mapped == 1).all()
+    assert load.tolist() == [0, (2 + 17 + 32 + 65) * 6]
+
+
+def test_token_replica_dispatch_reads_strided_ids_past_int32_offsets():
+    stride = 2**31
+    storage = torch.empty(stride + 1, device="cuda", dtype=torch.int32)
+    ids = storage.as_strided((2, 1), (stride, 1))
+    ids[:, 0].copy_(torch.tensor([0, 1], device="cuda", dtype=torch.int32))
+    replicas = torch.tensor([[1], [0]], device="cuda", dtype=torch.int32)
+    counts = torch.ones(2, device="cuda", dtype=torch.int32)
+    live = torch.tensor([False, True], device="cuda")
+    load = torch.zeros(2, device="cuda", dtype=torch.int64)
+    mapped = triton_dispatch_and_record_topk_ids(ids, replicas, counts, live, load)
+    assert mapped.tolist() == [[1], [0]]
+    assert load.tolist() == [1, 0]
 
 
 def _stage(hidden, weights, ids):

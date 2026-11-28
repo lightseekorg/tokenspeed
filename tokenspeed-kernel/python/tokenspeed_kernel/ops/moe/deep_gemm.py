@@ -35,7 +35,11 @@ from tokenspeed_kernel.platform import (
     prepare_cuda_toolkit_env,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
 
 platform = current_platform()
 logger = logging.getLogger(__name__)
@@ -532,6 +536,23 @@ def warmup_deep_gemm_mxfp4_mega_moe(plan: dict, w: torch.nn.Module) -> None:
         fast_math=fast_math,
     )
     _warmed_configs.add(warmup_key)
+
+
+if platform.is_nvidia:
+    # The Triton router also runs on Hopper, independently of native MegaMoE.
+    from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (
+        triton_dispatch_and_record_topk_ids,
+    )
+
+    register_kernel(
+        "moe",
+        "dispatch_and_record_topk_ids",
+        name="triton_dispatch_and_record_topk_ids",
+        solution="mega_moe",
+        capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+        signatures=format_signatures("topk_ids", "dense", {torch.int32, torch.int64}),
+        priority=Priority.PERFORMANT,
+    )(triton_dispatch_and_record_topk_ids)
 
 
 if _HAS_DEEP_GEMM:

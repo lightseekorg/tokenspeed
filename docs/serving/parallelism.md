@@ -520,6 +520,8 @@ Inkling2 does for static placements (it does not expose its expert weights to
 `--enable-eplb`), and so does Kimi-K3 with attention DP and EP-only MoE
 (MegaMoE, or the all-to-all / all-gather dispatch to the local MoE; static
 dispatch, no load recording or online rebalancing).
+DeepSeek-V4.1-Flash supports static placement and online rebalancing with
+attention TP1, MoE TP1, MegaMoE and `--ep-dispatch-algorithm static`.
 TokenSpeed refuses the placement flags for any other model, so it
 never installs a placement only to ignore it.
 `--ep-num-redundant-experts` also needs expert parallelism (`ep_size > 1`):
@@ -565,7 +567,9 @@ the routed experts: Kimi-K3's 896 experts run at EP20 with
 
 2. **Place**: restart with the redundant slots and the recorded load,
    pointing `--init-expert-location` at the directory (or a glob) of the
-   records to merge them.
+   records to merge them. Records with `[windows, layers, experts]` logical counts
+   retain matching windows across ranks. Different window counts or a mix with
+   `[layers, experts]` records are combined using per-expert totals.
 
    ```bash
    --ep-num-redundant-experts 128 \
@@ -602,7 +606,7 @@ the routed experts: Kimi-K3's 896 experts run at EP20 with
      on every rank. TokenSpeed refuses random replica choice on this path.
 
    Under `--numerics rl-bitwise` the placement must be deterministic (static
-   algorithms only) and drafts stay trivially placed. The MoE output remains
+   algorithms only). The MoE output remains
    a pure function of the token and its routes, so a placed server stays
    bitwise aligned with the trainer.
 
@@ -612,11 +616,18 @@ drifts. Decode benefit depends on the kernel being row-bound. Where a grouped
 GEMM streams every touched expert regardless of row count (small decode
 batches), balancing the rows changes little.
 
+### DeepSeek V4.1 with DSpark
+
+With online EPLB, V4.1 hashes each local token row to a replica and counts live routes.
+Its DSpark draft starts trivially placed. Each model has its own redundant slots,
+staging buffer and apply chunks. `--no-eplb-balance-draft` keeps the draft on its
+ordinary layout. Offline `EXPERT_LOAD` profiles record the target.
+
 ### Dynamic expert rebalancing
 
 `--enable-eplb` re-derives the placement while serving and moves the expert
 weights to match, so the placement follows drifts in the traffic's expert
-distribution without a restart. Every choice it depends on is explicit:
+distribution without a restart. For example, a LongCat launch can use
 
 ```bash
 --enable-eplb \
@@ -627,10 +638,10 @@ distribution without a restart. Every choice it depends on is explicit:
 --eplb-rebalance-layers-per-chunk 4
 ```
 
-`--eplb-rebalance-num-iterations N` is the recording window: every `N`
+`--eplb-rebalance-num-iterations N` sets the interval. Every `N`
 forwards (real or DP-idle, so every rank counts the same) the runtime reads
-the routing load since the previous snapshot, the EPLB algorithm derives a
-new placement, and the weights move. `--eplb-rebalance-layers-per-chunk L`
+the routing load from the last `--eplb-window-size` forwards (default `N`). It derives a
+new placement from those routes, and the weights move. `--eplb-rebalance-layers-per-chunk L`
 bounds the stall each scheduling round pays: the rebalance switches the
 model's MoE layers `L` per round, each layer's weights first and its routing
 tables right after, so a forward never sees a layer whose tables and slots
@@ -638,31 +649,30 @@ disagree.
 TokenSpeed allows `--ep-num-redundant-experts 0`: the rebalance then only
 permutes experts across ranks. `--init-expert-location` still seeds the first
 placement. The `RebalanceExpertsReqInput` control operation starts one
-rebalance now (it replies once it takes the load snapshot; the moves follow). TokenSpeed refuses the
+rebalance with weights resident on all ranks. A full-window trigger snapshots immediately.
+With a short window it opens a sample or waits for the remaining forwards.
+A missed deadline starts a fresh window after the previous rebalance. TokenSpeed refuses the
 `EXPERT_LOAD` profile activity under `--enable-eplb`, since the rebalance
 owns the same counters. The engine log reports the balancedness each snapshot
 saw and the one the new placement is expected to reach.
 
-How a rebalance runs, and why it needs no new communication:
-
 1. **Snapshot.** The runtime copies the counters to the host and zeroes them
    in one step on the execution stream, so the window boundary is exact at
-   forward granularity. Under replicated-input EP (every rank routes every
+   forward granularity. Logical counts credit the expert owning each slot at dispatch,
+   even when a window spans a placement switch. Under replicated-input EP (every rank routes every
    token) each rank's counters already are the group load, and the runtime
    compares the ranks' checksums — a difference means the ranks routed
    differently within a forward, a correctness bug, so the server fails
    rather than average the difference away. Under all-to-all EP (DeepEP) each
    rank counted its own tokens, and the runtime sums the load over the EP
    group.
-2. **Compute and commit.** EP rank 0 derives the placement in a spawned
-   CPU worker process, started at launch (the DeepSeek algorithm with stable
-   tie-breaking and double-precision counts; off the serving process's GIL,
-   so it does not slow the forward thread). 200 forwards later EP rank 0
+2. **Compute and commit.** EP rank 0 derives the placement on a solver thread.
+   After 200 more forwards it
    broadcasts the result over the EP group, and every rank plans the same
    slot moves from the old and new rows. Only the `[layers, slots]` map
    crosses the wire. Each rank rebuilds the inverse tables locally.
 3. **Apply, one chunk per round.** Each rank receives every incoming slot
-   into a staging buffer reserved at startup (one layer's worth, before
+   into a staging buffer reserved at startup (one layer per participating model, before
    startup sizes the KV arena) and sends every outgoing slot from its live
    tensor, in one batched P2P over the EP group. A same-GPU move goes
    through staging too, and a slot that needs an expert an earlier local
@@ -672,7 +682,7 @@ How a rebalance runs, and why it needs no new communication:
    the sources. The processed parameters move as bytes — quantized weights
    and scales included — so the rebalance re-derives nothing.
 
-Every step is an internal control op completed through the same
+Snapshot, commit and apply each run through the same
 attention-DP same-round gate as the RL weight ops, so all ranks switch a
 layer in the same round and a weight update can never interleave with a
 chunk (both are blocking device ops, one per round). A weight update between

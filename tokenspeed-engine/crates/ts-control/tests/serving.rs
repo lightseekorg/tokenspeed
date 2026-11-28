@@ -1122,11 +1122,10 @@ impl DataPlane for FakeDevice {
         Ok(slots)
     }
 
-    #[allow(clippy::type_complexity)]
-    fn snapshot_expert_load(&mut self) -> Result<(Vec<Vec<i64>>, Vec<Vec<i32>>), DataPlaneError> {
+    fn snapshot_expert_load(&mut self) -> Result<ts_control::eplb::ExpertLoad, DataPlaneError> {
         let placement = self.placement.lock().unwrap().clone();
         // Expert 0 is hot, more so on rank 0's tokens.
-        let counts = placement
+        let counts: Vec<Vec<i64>> = placement
             .iter()
             .map(|row| {
                 row.iter()
@@ -1140,7 +1139,26 @@ impl DataPlane for FakeDevice {
                     .collect()
             })
             .collect();
-        Ok((counts, placement))
+        let logical = counts
+            .iter()
+            .zip(&placement)
+            .map(|(counts, map)| {
+                let mut row = vec![0; 4];
+                for (&n, &e) in counts.iter().zip(map) {
+                    row[e as usize] += n;
+                }
+                row
+            })
+            .collect();
+        Ok((counts, placement, logical))
+    }
+
+    fn set_expert_recording(&mut self, enabled: bool) -> Result<(), DataPlaneError> {
+        self.device_ops
+            .lock()
+            .unwrap()
+            .push(format!("record {enabled}"));
+        Ok(())
     }
 
     fn apply_expert_placement(
@@ -1149,6 +1167,10 @@ impl DataPlane for FakeDevice {
         rows: &[Vec<i32>],
         _: &[SlotMoves],
     ) -> Result<(), DataPlaneError> {
+        self.device_ops
+            .lock()
+            .unwrap()
+            .push("apply expert chunk".into());
         let mut placement = self.placement.lock().unwrap();
         for (&layer, row) in layer_ids.iter().zip(rows) {
             placement[layer] = row.clone();
@@ -1701,7 +1723,9 @@ fn eplb_config(ep_size: usize, ep_rank: usize) -> EplbConfig {
             num_groups: None,
             num_nodes: 1,
         },
+        draft_specs: None,
         rebalance_num_iterations: 4,
+        window_size: 4,
         layers_per_chunk: 1,
         algorithm: Algorithm::Deepseek,
         commit_delay_forwards: 3,
@@ -4158,6 +4182,73 @@ async fn expert_parallel_ranks_rebalance_to_the_same_placement() {
     assert!(rows_hold_expert_zero_thrice(rank0));
 }
 
+#[test]
+fn manual_rebalance_refuses_unmapped_weights_and_can_retry() {
+    fn short(size: usize, rank: usize) -> EplbConfig {
+        EplbConfig {
+            window_size: 2,
+            rebalance_num_iterations: 100,
+            ..eplb_config(size, rank)
+        }
+    }
+    for (config, windowed) in [
+        (eplb_config as fn(usize, usize) -> EplbConfig, false),
+        (short, true),
+    ] {
+        let mut scripts = vec![vec![vec![]; 48]; 2];
+        // Both ranks sleep, but only the first rank unmaps the route counters.
+        for (script, tag) in scripts.iter_mut().zip(["weights", "kv_cache"]) {
+            script[0].push(memory_transition(true, Some(&[tag])));
+            script[12].push(memory_transition(false, Some(&[tag])));
+            for round in [6, 18] {
+                script[round].push(EngineRequest::Control(Box::new(
+                    ControlRequest::RebalanceExperts(ts_wire::control::RebalanceExpertsReqInput {
+                        rid: None,
+                        http_worker_ipc: None,
+                    }),
+                )));
+            }
+        }
+        scripts[0][20].push(EngineRequest::Add(Box::new(request("m", 20, budget(10)))));
+        let ranks = run_scripted(
+            Layout::Dp(2),
+            0,
+            Tiers::DeviceOnly,
+            Setup {
+                eplb: Some(config),
+                ..Setup::default()
+            },
+            scripts,
+            no_reaction,
+        );
+        for (rank, tag) in ranks.into_iter().zip(["weights", "kv_cache"]) {
+            assert_eq!(rank.outcome, Ok(()));
+            assert_eq!(
+                outcome(rank.replies),
+                [
+                    ("ReleaseMemoryOccupationReqOutput", true),
+                    ("RebalanceExpertsReqOutput", false),
+                    ("ResumeMemoryOccupationReqOutput", true),
+                    ("RebalanceExpertsReqOutput", true),
+                ]
+            );
+            if windowed {
+                let edges: Vec<_> = rank
+                    .device_ops
+                    .iter()
+                    .filter(|op| op.starts_with("record "))
+                    .collect();
+                assert_eq!(edges, ["record true", "record false"]);
+            }
+            assert!(rank.device_ops.iter().any(|op| op == "apply expert chunk"));
+            assert_eq!(
+                rank.device_ops[..2],
+                [format!("release {tag}"), format!("resume {tag}")]
+            );
+        }
+    }
+}
+
 fn rows_hold_expert_zero_thrice(applied: &[(Vec<usize>, Vec<Vec<i32>>)]) -> bool {
     applied
         .iter()
@@ -5555,6 +5646,7 @@ fn outcome(replies: Vec<ControlOutput>) -> Vec<(&'static str, bool)> {
                 ControlOutput::UpdateWeightsFromDistributed(r) => r.success,
                 ControlOutput::ReleaseMemoryOccupation(r) => r.success,
                 ControlOutput::ResumeMemoryOccupation(r) => r.success,
+                ControlOutput::RebalanceExperts(r) => r.success,
                 ControlOutput::IsSleeping(r) => r.is_sleeping,
                 ControlOutput::Profile(r) => r.success,
                 ControlOutput::ReloadForward(r) => r.success,

@@ -168,6 +168,10 @@ class BaseCausalLM(nn.Module):
     # refuses the placement flags for a model that does not, so a placement
     # is never installed only to be ignored.
     supports_expert_placement: ClassVar[bool] = False
+    # Whether the placed layers route rank-local rows through their own EP transport.
+    expert_placement_local_rows: ClassVar[bool] = False
+    # A heterogeneous draft that handles placement, load counters and weight moves.
+    supports_draft_eplb: ClassVar[bool] = False
     # Opt in only when complete checkpoint loading and non-parameter state
     # restoration are both defined for this model.
     supports_weight_discard: ClassVar[bool] = False

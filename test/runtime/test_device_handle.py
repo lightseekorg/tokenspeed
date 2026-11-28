@@ -1712,6 +1712,11 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
     )
     placement.enable_load_recording(Mapping(rank=0, world_size=2, moe_ep_size=2))
     placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5]]))  # startup routes
+    draft = expert_location.ExpertLocationMetadata.from_physical_to_logical_map(
+        torch.tensor([[1, 0]]), 2, ep_size=2, ep_rank=0, ep_rank_nodes=(0, 0)
+    )
+    draft.enable_load_recording(Mapping(rank=0, world_size=2, moe_ep_size=2))
+    draft.physical_load.fill_(3)
     trace: list = []
 
     class _DeviceModule:
@@ -1725,7 +1730,9 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
             return contextlib.nullcontext()
 
     executor = SimpleNamespace(
-        device_module=_DeviceModule(), execution_stream="execution-stream"
+        device_module=_DeviceModule(),
+        execution_stream="execution-stream",
+        draft_model_runner=SimpleNamespace(expert_placement=draft),
     )
     expert_location.set_global_expert_location_metadata(placement)
     try:
@@ -1734,6 +1741,7 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
         expert_location.set_global_expert_location_metadata(None)
     assert trace == ["synchronize", ("stream", "execution-stream")]
     assert not placement.physical_load.any()
+    assert not draft.physical_load.any()
     # Without load recording there is nothing to reset and nothing is touched.
     start_expert_load_window(SimpleNamespace())
 
