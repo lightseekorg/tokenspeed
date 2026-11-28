@@ -41,6 +41,12 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
 from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.layers.attention.configs.base import (
+    get_dflash_attention_window_sink,
+    get_dflash_layer_types,
+    get_dflash_raw_sliding_window,
+    get_dflash_sliding_window_tokens,
+)
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -857,43 +863,6 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
                 weight_loader(param, loaded_weight)
 
 
-def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
-    if isinstance(config, dict):
-        return config.get(key, default)
-    return getattr(config, key, default)
-
-
-def _get_text_config(config: Any) -> Any:
-    if config is None:
-        return None
-    if isinstance(config, dict):
-        return config.get("text_config", config)
-    text_config = getattr(config, "text_config", None)
-    if text_config is not None:
-        return text_config
-    get_text_config = getattr(config, "get_text_config", None)
-    if callable(get_text_config):
-        try:
-            resolved = get_text_config()
-            if resolved is not None:
-                return resolved
-        except TypeError:
-            pass
-    return config
-
-
-def get_dflash_layer_types(config: Any) -> Sequence[str] | None:
-    text_config = _get_text_config(config)
-    layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
-    if layer_types is None:
-        return None
-    if isinstance(layer_types, str) or not isinstance(layer_types, Sequence):
-        raise ValueError(
-            "DFLASH config.layer_types must be a sequence of attention type strings."
-        )
-    return layer_types
-
-
 def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
     """The window a ``sliding_attention`` draft layer attends over, or None.
 
@@ -903,47 +872,12 @@ def get_dflash_attention_sliding_window_size(config: Any) -> int | None:
     different thing (gpt-oss's learnable per-head logit bias, a weight a
     DFlash checkpoint does not carry).
     """
-    layer_types = get_dflash_layer_types(config)
-    if layer_types is None or "sliding_attention" not in layer_types:
-        return None
-
-    text_config = _get_text_config(config)
-    sliding_window = _cfg_get(
-        text_config, "sliding_window", _cfg_get(config, "sliding_window")
+    sliding_window = get_dflash_raw_sliding_window(config)
+    return (
+        hf_sliding_window_to_window_left(sliding_window)
+        if sliding_window is not None
+        else None
     )
-    if sliding_window is None:
-        raise ValueError(
-            "DFLASH sliding_attention layers require config.sliding_window."
-        )
-
-    return hf_sliding_window_to_window_left(sliding_window)
-
-
-def get_dflash_attention_window_sink(config: Any) -> int:
-    """Leading tokens a ``sliding_attention`` draft layer keeps outside its
-    window (``sliding_window_sink``), or 0.
-
-    The trainer's own implementation ships this as ``context_sink_size`` inside
-    ``dflash_config`` and the exports repeat it at the top level; read both.
-    Returns 0 when the draft has no windowed layer, where a sink would name
-    rows the mask already keeps.
-    """
-    layer_types = get_dflash_layer_types(config)
-    if layer_types is None or "sliding_attention" not in layer_types:
-        return 0
-
-    text_config = _get_text_config(config)
-    dflash_config = getattr(config, "dflash_config", None) or {}
-    sink = _cfg_get(
-        text_config,
-        "sliding_window_sink",
-        _cfg_get(config, "sliding_window_sink"),
-    )
-    if sink is None and isinstance(dflash_config, dict):
-        sink = dflash_config.get("context_sink_size")
-    if sink is None:
-        return 0
-    return int(sink)
 
 
 def _get_dflash_layer_sliding_window(config, layer_id: int) -> int:

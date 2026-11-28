@@ -290,3 +290,210 @@ fn a_sharded_draft_group_is_still_refused_on_its_own() {
         "unexpected refusal: {error}"
     );
 }
+
+#[test]
+fn sharded_target_and_unsharded_sliding_mla_draft_transfer_window_cleanly() {
+    use std::collections::BTreeMap;
+
+    use ts_pd::layout::{
+        copies::{Source, Transfer},
+        manifest::{build_manifest, BlockTable, BlockTables},
+    };
+
+    const MLA_ROWS: i64 = 128;
+    let mla_target_latent_bytes = MLA_ROWS * LATENT_BYTES;
+    let mla_index_bytes = MLA_ROWS * INDEX_BYTES;
+    let draft_latent_bytes = MLA_ROWS * LATENT_BYTES;
+
+    let contract_for_kvp = |target_shards: i64| -> Contract {
+        let wire = json!({
+            "plan": {
+                "prefix_granularity": MLA_ROWS,
+                "lcm_block_bytes": mla_target_latent_bytes + mla_index_bytes + draft_latent_bytes,
+                "num_lcm_blocks": 32,
+                "groups": [
+                    {
+                        "group_id": "full_attention",
+                        "cache_blocks_per_lcm_block": 1,
+                        "page_count": 32 * target_shards,
+                    },
+                    {
+                        "group_id": "draft_sliding_attention",
+                        "cache_blocks_per_lcm_block": 1,
+                        "page_count": 32,
+                    },
+                ],
+                "planes": [
+                    {
+                        "plane_id": "slot.0",
+                        "bytes_per_lcm_block": mla_target_latent_bytes,
+                        "arena_offset_bytes": 0,
+                    },
+                    {
+                        "plane_id": "layer.0.index_k",
+                        "bytes_per_lcm_block": mla_index_bytes,
+                        "arena_offset_bytes": mla_target_latent_bytes,
+                    },
+                ],
+                "fields": [
+                    {
+                        "group_id": "full_attention",
+                        "field_id": "layer.0.latent_kv",
+                        "plane_id": "slot.0",
+                        "shape": [MLA_ROWS, 1, 576],
+                        "dtype": "bfloat16",
+                        "field_offset_bytes": 0,
+                        "page_stride_bytes": mla_target_latent_bytes,
+                    },
+                    {
+                        "group_id": "full_attention",
+                        "field_id": "layer.0.index_k",
+                        "plane_id": "layer.0.index_k",
+                        "shape": [MLA_ROWS, INDEX_BYTES],
+                        "dtype": "uint8",
+                        "field_offset_bytes": 0,
+                        "page_stride_bytes": mla_index_bytes,
+                    },
+                    {
+                        "group_id": "draft_sliding_attention",
+                        "field_id": "layer.1.latent_kv",
+                        "plane_id": "slot.0",
+                        "shape": [MLA_ROWS, 1, 576],
+                        "dtype": "bfloat16",
+                        "field_offset_bytes": 0,
+                        "page_stride_bytes": draft_latent_bytes,
+                    },
+                ],
+                "resident_block_bytes": null,
+            },
+            "group_specs": [
+                {
+                    "group_id": "full_attention",
+                    "attn_kind": "full_history",
+                    "rows_per_page": MLA_ROWS,
+                    "entry_stride_tokens": 1,
+                    "sliding_window_tokens": null,
+                    "replayable": false,
+                    "transfer_policy": "full_suffix",
+                    "shard_count": target_shards,
+                },
+                {
+                    "group_id": "draft_sliding_attention",
+                    "attn_kind": "sliding_window",
+                    "rows_per_page": MLA_ROWS,
+                    "entry_stride_tokens": 1,
+                    "sliding_window_tokens": 1024,
+                    "replayable": false,
+                    "transfer_policy": "full_suffix",
+                    "shard_count": 1,
+                },
+            ],
+            "transfer_schema": {"fields": []},
+            "field_addresses": null,
+        });
+        Contract::from_wire(wire.to_string().as_bytes()).expect("valid mixed MLA sliding contract")
+    };
+
+    let prefill = contract_for_kvp(8);
+    let decode = contract_for_kvp(8);
+    validate_peer(&prefill, &decode).expect("peers agree");
+
+    let planner = Planner::new(8, 8, &prefill, &decode, None).expect("KVP 8 mixed plans");
+    assert_eq!(planner.sharded_group_ids(), vec!["full_attention"]);
+
+    // 2048 prompt tokens (16 pages), target already has a 512-token prefix
+    // (4 pages); full_attention transfers pages 5..=16 whereas the
+    // non-replayable sliding draft window (1024 tokens) slices from
+    // prompt_len - window + 1 = 1025 -> page 8..16 (1-based blocks 9..=16).
+    let page_count = 16usize;
+    let make_tables = |offset: i64| -> BlockTables {
+        let pages: Vec<i64> = (1..=page_count as i64).map(|p| p + offset).collect();
+        BTreeMap::from([
+            (
+                "full_attention".to_owned(),
+                BlockTable {
+                    columns: page_count,
+                    blocks: pages.clone(),
+                },
+            ),
+            (
+                "draft_sliding_attention".to_owned(),
+                BlockTable {
+                    columns: page_count,
+                    blocks: pages,
+                },
+            ),
+        ])
+    };
+
+    let src_manifest = build_manifest(&make_tables(0), &prefill, 0, 512, 2048, false)
+        .expect("prefill manifest builds");
+    let dst_manifest = build_manifest(&make_tables(8), &decode, 0, 512, 2048, false)
+        .expect("decode manifest builds");
+
+    assert_eq!(src_manifest.groups[0].group_id, "full_attention");
+    assert_eq!(src_manifest.groups[0].block_ids, (5..=16).collect::<Vec<_>>());
+    assert_eq!(src_manifest.groups[1].group_id, "draft_sliding_attention");
+    assert_eq!(src_manifest.groups[1].block_ids, (9..=16).collect::<Vec<_>>());
+
+    for decode_rank in 0..8 {
+        let plan = planner
+            .plan_for_decode_rank(decode_rank)
+            .expect("planned decode rank");
+        assert!(
+            plan.owner_filters_by_prefill_rank
+                .values()
+                .all(|filters| filters.get("draft_sliding_attention").is_none()),
+            "unsharded sliding draft must not carry owner filters on rank {decode_rank}"
+        );
+        // Each decode rank pulls full_attention shards from all 8 prefill ranks
+        // and its whole unsharded sliding draft replica from its matching prefill rank.
+        let full_contributors: BTreeSet<i64> = plan
+            .fragments_by_prefill_rank
+            .iter()
+            .filter(|(_, frags)| frags.iter().any(|f| f.group_id == "full_attention"))
+            .map(|(&rank, _)| rank)
+            .collect();
+        let draft_contributors: BTreeSet<i64> = plan
+            .fragments_by_prefill_rank
+            .iter()
+            .filter(|(_, frags)| frags.iter().any(|f| f.group_id == "draft_sliding_attention"))
+            .map(|(&rank, _)| rank)
+            .collect();
+        assert_eq!(full_contributors, (0..8).collect::<BTreeSet<_>>());
+        assert_eq!(draft_contributors, BTreeSet::from([decode_rank]));
+
+        let rank_fragments = &plan.fragments_by_prefill_rank[&decode_rank];
+        let transfer = Transfer {
+            layout: &prefill,
+            arena_base: 0x1000_0000,
+            destination_base: 0x2000_0000,
+            destination_tp_rank: decode_rank,
+            destination_layout: &decode,
+            source: Source::Manifest(&src_manifest),
+            destination: &dst_manifest,
+            fragments: rank_fragments,
+            owner_filters: &plan.owner_filters_by_prefill_rank[&decode_rank],
+        };
+        let steps = transfer.copies(&[None]).expect("transfer copies plan cleanly");
+        assert_eq!(steps.len(), 1);
+        let draft_src_pages: Vec<i64> = steps[0]
+            .iter()
+            .filter_map(|copy| match copy {
+                ts_pd::Copy::Pages(grid)
+                    if grid.fields.len() == 1 && grid.fields[0][4] == draft_latent_bytes =>
+                {
+                    Some(grid.src_pages.as_slice())
+                }
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            draft_src_pages,
+            (9..=16).collect::<Vec<_>>(),
+            "rank {decode_rank} must transfer the 8 retained sliding draft pages"
+        );
+    }
+}

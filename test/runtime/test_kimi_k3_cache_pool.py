@@ -578,5 +578,386 @@ def test_drafter_keeps_fused_kv_writes_for_an_unsharded_draft_group() -> None:
     assert not DFlash._draft_cache_page_sharded(drafter(1, "full_attention"))
 
 
+def test_kimi_k3_and_k31_sliding_mla_draft_uses_unsharded_group() -> None:
+    """An all-sliding MLA block draft (DFlash2) owns DRAFT_SLIDING_ATTENTION,
+    stays unsharded under target KVP=8, and gets contiguous latent planes
+    with exact page stride across TP sizes and FP8/BF16 dtypes."""
+    from dataclasses import replace
+    from test.runtime.conftest import kimi_layout
+
+    from tokenspeed.runtime.layers.attention.kv_cache.factory import (
+        create_cache_arena,
+        create_cache_pool,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+        DRAFT_SLIDING_ATTENTION,
+        FULL_ATTENTION,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+        CachePoolSpec,
+    )
+
+    num_draft_layers = 5
+    cases = [
+        # Kimi-K3 at TP=8 with KVP=8, BF16 draft over FP8 target.
+        dict(
+            tp_size=8,
+            kvp_size=8,
+            dsa_index_k_format=None,
+            kv_cache_dtype=torch.float8_e4m3fn,
+        ),
+        # Kimi-K3.1 at TP=8 with KVP=8, BF16 draft over FP8 target.
+        dict(
+            tp_size=8,
+            kvp_size=8,
+            dsa_index_k_format="fp8_scaled",
+            kv_cache_dtype=torch.float8_e4m3fn,
+        ),
+        # TP=2 odd mla_packing rounds up so BF16 draft fits exact_page_stride.
+        dict(
+            tp_size=2,
+            kvp_size=1,
+            dsa_index_k_format="fp8_scaled",
+            kv_cache_dtype=torch.float8_e4m3fn,
+        ),
+        # Matching BF16 target and draft keeps packing parity.
+        dict(
+            tp_size=8,
+            kvp_size=8,
+            dsa_index_k_format="fp8_scaled",
+            kv_cache_dtype=torch.bfloat16,
+        ),
+    ]
+    for case in cases:
+        recipe = kimi_recipe(
+            tp_size=case["tp_size"],
+            dsa_index_k_format=case["dsa_index_k_format"],
+            kv_cache_dtype=case["kv_cache_dtype"],
+            mamba_ssm_dtype="bfloat16",
+            draft_layers=num_draft_layers,
+            draft_attn="mla",
+            draft_window=1024,
+            speculative_algorithm="DFLASH",
+        )
+        if case["kvp_size"] > 1:
+            target_softmax = replace(
+                recipe.attn_config.components[0],
+                backend_name="tokenspeed_mla",
+            )
+            recipe.attn_config = replace(
+                recipe.attn_config,
+                kvp_size=case["kvp_size"],
+                kvp_group=tuple(range(case["kvp_size"])),
+                components=(target_softmax, recipe.attn_config.components[1]),
+            )
+        target_less = kimi_recipe(
+            tp_size=case["tp_size"],
+            dsa_index_k_format=case["dsa_index_k_format"],
+            kv_cache_dtype=case["kv_cache_dtype"],
+            mamba_ssm_dtype="bfloat16",
+        )
+        _, target_layout = kimi_layout(target_less)
+
+        assert recipe.draft_window_tokens == 1024
+        groups, layout = kimi_layout(recipe)
+        specs = {spec.group_id: spec for spec, _ in groups}
+        assert set(specs) >= {FULL_ATTENTION, DRAFT_SLIDING_ATTENTION}
+        assert specs[FULL_ATTENTION].shard_count == case["kvp_size"]
+        draft_spec = specs[DRAFT_SLIDING_ATTENTION]
+        assert draft_spec.attn_kind == "sliding_window"
+        assert draft_spec.sliding_window_tokens == 1024
+        assert not draft_spec.replayable
+        assert draft_spec.shard_count == 1
+        assert draft_spec.block_granularity == layout.prefix_granularity
+
+        num_target_mla = sum(
+            group_id == FULL_ATTENTION for group_id in recipe.target_group_ids
+        )
+        expected_index_planes = (
+            num_target_mla if case["dsa_index_k_format"] is not None else 0
+        )
+        assert recipe.num_index_k_planes == expected_index_planes
+        assert len(layout.plane_bytes) == len(target_layout.plane_bytes)
+
+        draft_fields = [
+            field
+            for field in layout.fields
+            if field.group_id == DRAFT_SLIDING_ATTENTION
+        ]
+        assert len(draft_fields) == num_draft_layers
+        packing = dict(layout.group_packing)
+        plane_bytes = dict(layout.plane_bytes)
+        for index, field in enumerate(draft_fields):
+            field_spec = recipe.fields_for_layer(
+                recipe.num_target_layers + index, DRAFT_SLIDING_ATTENTION, index
+            )[0]
+            assert field_spec.exact_page_stride
+            assert field.plane_id == f"slot.{index}"
+            assert field.page_stride_bytes == field.payload_bytes
+            assert (
+                packing[DRAFT_SLIDING_ATTENTION] * field.payload_bytes
+                == plane_bytes[field.plane_id]
+            )
+            assert ".index_k" not in field.field_id
+
+        recipe.check_layout(layout)
+        plan = layout.bind(2)
+        pool_spec = CachePoolSpec(
+            family="kimi_k3",
+            memory_plan=plan,
+            layer_types=recipe.layer_types,
+            cache_group_specs=tuple(spec for spec, _ in groups),
+            token_capacity=2 * packing[FULL_ATTENTION] * layout.prefix_granularity,
+        )
+        arena = create_cache_arena(pool_spec, device="cpu", enable_memory_saver=False)
+        draft_pool = create_cache_pool(
+            pool_spec.layer_view(
+                first_layer=recipe.num_target_layers,
+                num_layers=num_draft_layers,
+                family="mla",
+            ),
+            recipe.draft_attn_config,
+            arena,
+            num_layers=num_draft_layers,
+            rank=0,
+            field_layer_offset=recipe.num_target_layers,
+        )
+        for local_layer in range(num_draft_layers):
+            layer_view = arena.field(
+                f"layer.{recipe.num_target_layers + local_layer}.latent_kv"
+            )
+            assert layer_view.dtype == torch.bfloat16
+            assert layer_view.shape[1:] == (1, 576)
+            assert layer_view.shape[0] >= (
+                2 * packing[DRAFT_SLIDING_ATTENTION] * layout.prefix_granularity
+            )
+            assert layer_view.is_contiguous()
+            pool_buf = draft_pool.get_key_buffer(local_layer)
+            assert pool_buf.dtype == torch.bfloat16
+            assert pool_buf.shape[-1] == 576
+
+
+def test_kimi_k3_sliding_mla_draft_requires_all_sliding_without_sink() -> None:
+    """Mixed full/sliding layers, non-zero sink, non-block drafts, or DSA drafts
+    keep draft_window_tokens as None instead of forming a sliding group."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.layers.attention.configs.base import (
+        get_dflash_sliding_window_tokens,
+    )
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+        KimiK3Recipe,
+    )
+
+    assert (
+        get_dflash_sliding_window_tokens(
+            SimpleNamespace(layer_types=["sliding_attention"], sliding_window=1),
+            num_layers=1,
+        )
+        == 1
+    )
+    with pytest.raises(ValueError, match="sliding_window must be positive"):
+        get_dflash_sliding_window_tokens(
+            SimpleNamespace(layer_types=["sliding_attention"], sliding_window=0),
+            num_layers=1,
+        )
+
+    base = kimi_recipe(
+        tp_size=8,
+        dsa_index_k_format="fp8_scaled",
+        draft_layers=5,
+        draft_attn="mla",
+        draft_window=1024,
+        speculative_algorithm="DFLASH",
+    )
+    assert base.draft_window_tokens == 1024
+
+    def variant(*, draft_model_config=None, draft_attn_config=None) -> KimiK3Recipe:
+        return KimiK3Recipe(
+            server_args=base.server_args,
+            model_config=base.model_config,
+            attn_config=base.attn_config,
+            draft_model_config=(
+                base.draft_model_config
+                if draft_model_config is None
+                else draft_model_config
+            ),
+            draft_attn_config=(
+                base.draft_attn_config
+                if draft_attn_config is None
+                else draft_attn_config
+            ),
+            cache_budget_bytes=base.cache_budget_bytes,
+            probe_batch_rows=None,
+            decode_input_tokens=base.decode_input_tokens,
+            overlap_schedule_depth=base.overlap_schedule_depth,
+        )
+
+    mixed = variant(
+        draft_model_config=SimpleNamespace(
+            num_attention_layers=5,
+            hf_config=SimpleNamespace(
+                layer_types=["sliding_attention"] * 4 + ["full_attention"],
+                sliding_window=1024,
+            ),
+        )
+    )
+    assert mixed.draft_window_tokens is None
+
+    top_sink = variant(
+        draft_model_config=SimpleNamespace(
+            num_attention_layers=5,
+            hf_config=SimpleNamespace(
+                layer_types=["sliding_attention"] * 5,
+                sliding_window=1024,
+                sliding_window_sink=4,
+            ),
+        )
+    )
+    assert top_sink.draft_window_tokens is None
+
+    export_sink = variant(
+        draft_model_config=SimpleNamespace(
+            num_attention_layers=5,
+            hf_config=SimpleNamespace(
+                layer_types=["sliding_attention"] * 5,
+                sliding_window=1024,
+                dflash_config={"context_sink_size": 2},
+            ),
+        )
+    )
+    assert export_sink.draft_window_tokens is None
+
+    non_block = variant(
+        draft_attn_config=replace(base.draft_attn_config, draft_block_decode=False)
+    )
+    assert non_block.draft_window_tokens is None
+
+    target_dsa = base.attn_config.component(MLAConfig)
+    assert isinstance(target_dsa, DSAConfig)
+    dsa_draft = variant(
+        draft_attn_config=replace(base.draft_attn_config, components=(target_dsa,))
+    )
+    assert dsa_draft.draft_window_tokens is None
+
+
+def test_kimi_k3_sliding_mla_check_layout_allows_more_draft_than_target_planes() -> (
+    None
+):
+    """When draft_layers exceeds target MLA layers, check_layout accounts for
+    max(num_mla_layers, num_draft_planes) and rejects mismatched plane counts."""
+    from test.runtime.conftest import kimi_layout
+
+    from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheLayout
+
+    # Toy Kimi-K3 config with 4 total layers -> 1 FULL_ATTENTION target layer
+    # and 3 KDA layers, paired with 3 sliding MLA draft layers (3 > 1).
+    small_text = KimiLinearConfig(
+        num_hidden_layers=4,
+        linear_attn_config={
+            "full_attn_layers": [4],
+            "kda_layers": [1, 2, 3],
+            "num_heads": 96,
+            "head_dim": 128,
+            "short_conv_kernel_size": 4,
+        },
+    )
+    recipe = kimi_recipe(
+        text_config=small_text,
+        tp_size=8,
+        draft_layers=3,
+        draft_attn="mla",
+        draft_window=1024,
+        speculative_algorithm="DFLASH",
+    )
+    _, layout = kimi_layout(recipe)
+    assert len(layout.plane_bytes) == 3
+    recipe.check_layout(layout)
+
+    bad_layout = CacheLayout(
+        prefix_granularity=layout.prefix_granularity,
+        lcm_block_bytes=layout.lcm_block_bytes,
+        group_packing=layout.group_packing,
+        plane_bytes=layout.plane_bytes[:-1],
+        fields=layout.fields,
+    )
+    with pytest.raises(ValueError, match="slot planes"):
+        recipe.check_layout(bad_layout)
+
+
+def test_kimi_k31_sliding_mla_long_prefix_and_snapshot_contract() -> None:
+    """Metadata and group contracts keep FULL_ATTENTION (shard_count=8) and
+    DRAFT_SLIDING_ATTENTION (shard_count=1, sliding_window=1024) isolated
+    across >1024-token prefix windows with leading null slots."""
+    from dataclasses import replace
+    from test.runtime.conftest import cache_metadata_for, kimi_layout
+
+    from tokenspeed.runtime.layers.attention.kv_cache.factory import (
+        create_cache_arena,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
+        DRAFT_SLIDING_ATTENTION,
+        FULL_ATTENTION,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+        CachePoolSpec,
+    )
+
+    recipe = kimi_recipe(
+        tp_size=8,
+        dsa_index_k_format="fp8_scaled",
+        mamba_ssm_dtype="bfloat16",
+        draft_layers=5,
+        draft_attn="mla",
+        draft_window=1024,
+        speculative_algorithm="DFLASH",
+    )
+    target_softmax = replace(
+        recipe.attn_config.components[0],
+        backend_name="tokenspeed_mla",
+    )
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        kvp_size=8,
+        kvp_group=tuple(range(8)),
+        components=(target_softmax, recipe.attn_config.components[1]),
+    )
+    groups, layout = kimi_layout(recipe)
+    plan = layout.bind(4)
+    pool_spec = CachePoolSpec(
+        family="kimi_k3",
+        memory_plan=plan,
+        layer_types=recipe.layer_types,
+        cache_group_specs=tuple(spec for spec, _ in groups),
+        token_capacity=4 * dict(layout.group_packing)[FULL_ATTENTION] * 128,
+    )
+    arena = create_cache_arena(pool_spec, device="cpu", enable_memory_saver=False)
+    contract = arena.runtime_contract
+
+    # 16 pages = 2048 tokens: prefix pages before the 1024-token window expire
+    # to slot 0 while the trailing 8 pages retain live page ids, preserving
+    # absolute indexing across target full_attention and unsharded draft.
+    full_row = list(range(1, 17))
+    draft_row = [0] * 8 + list(range(1, 9))
+    metadata, active = cache_metadata_for(
+        contract,
+        {FULL_ATTENTION: [full_row], DRAFT_SLIDING_ATTENTION: [draft_row]},
+        device="cpu",
+    )
+    tables = dict(metadata.tables(active_forward_op=active))
+    assert tables[FULL_ATTENTION].shape == (1, 16)
+    assert tables[DRAFT_SLIDING_ATTENTION].tolist() == [draft_row]
+
+    group_specs = {spec.group_id: spec for spec in contract.group_specs}
+    assert group_specs[FULL_ATTENTION].shard_count == 8
+    assert group_specs[DRAFT_SLIDING_ATTENTION].shard_count == 1
+    assert group_specs[DRAFT_SLIDING_ATTENTION].sliding_window_tokens == 1024
+    assert not group_specs[DRAFT_SLIDING_ATTENTION].replayable
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -94,6 +94,19 @@ class MLAConfig(SoftmaxAttnConfig):
             model_config.hf_config
         )
         spec = cls(**cls._spec_kwargs(server_args, model_config, is_draft))
+        is_sliding_block_draft = False
+        if draft_block_decode and not spec.is_dsa:
+            from tokenspeed.runtime.layers.attention.configs.base import (
+                get_dflash_sliding_window_tokens,
+            )
+
+            is_sliding_block_draft = (
+                get_dflash_sliding_window_tokens(
+                    model_config.hf_config,
+                    num_layers=model_config.num_attention_layers,
+                )
+                is not None
+            )
         return AttnConfig(
             components=(spec,),
             **model_wide_kwargs(
@@ -103,6 +116,10 @@ class MLAConfig(SoftmaxAttnConfig):
                 kv_cache_dtype=resolve_dtype(server_args.kv_cache_dtype),
                 draft_block_decode=draft_block_decode,
                 draft_block_causal=draft_block_causal,
+                # An all-sliding block draft owns its own small unsharded
+                # sliding-window group, whereas full-history and DSA drafts
+                # shard KV history alongside the target.
+                shards_kv_history=not is_sliding_block_draft,
                 # An MTP depth plans the target's own DSA attention and
                 # computes the same query-context shard, sharing the target's
                 # history gather. Plain MLA cannot shard, and __post_init__
