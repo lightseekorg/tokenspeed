@@ -74,13 +74,6 @@ _MODEL_FLAG_TOKENS = ("--model", "--model-path")
 
 _HEADLESS_FLAG = "--headless"
 
-_ENGINE_MULTI_VALUE_FLAGS = {
-    "--cudagraph-capture-sizes",
-    "--prefill-graph-capture-sizes",
-    "--prefill-graph-capture-token-sizes",
-    "--prefill-graph-capture-batch-sizes",
-}
-
 
 def _has_model_flag(tokens: Iterable[str]) -> bool:
     for token in tokens:
@@ -107,13 +100,16 @@ class SplitResult:
 
 
 def _normalize(
-    argv: Iterable[str], engine_flags: set[str]
+    argv: Iterable[str],
+    engine_flags: set[str],
+    engine_multi_value_flags: dict[str, int | None],
 ) -> list[tuple[str, list[str] | str | None]]:
     """Convert raw argv into a list of (name, value) pairs.
 
     Handles both ``--flag value`` and ``--flag=value`` forms. Aliases are
     resolved to their canonical names. Gateway-only options keep all consecutive
-    values; SMG validates their arity. Known scalar options still take one value.
+    values; SMG validates their arity. Multi-value engine options keep up to their
+    nargs values. Known scalar options still take one value.
     """
     items: list[tuple[str, list[str] | str | None]] = []
     tokens = list(argv)
@@ -140,10 +136,16 @@ def _normalize(
             if nxt is None or nxt.startswith("--"):
                 value = None
                 i += 1
-            elif name in _ENGINE_MULTI_VALUE_FLAGS or name not in scalar_flags:
+            elif name in engine_multi_value_flags or name not in scalar_flags:
+                # Fixed-arity flags take at most nargs values; argparse checks arity.
+                max_values = engine_multi_value_flags.get(name)
                 values = []
                 i += 1
-                while i < len(tokens) and not tokens[i].startswith("--"):
+                while (
+                    i < len(tokens)
+                    and not tokens[i].startswith("--")
+                    and (max_values is None or len(values) < max_values)
+                ):
                     values.append(tokens[i])
                     i += 1
                 value = values
@@ -191,21 +193,25 @@ def split_headless_argv(argv: list[str]) -> list[str] | None:
 
 
 @functools.lru_cache(maxsize=1)
-def _engine_recognized_flags() -> set[str]:
-    """Snapshot the set of long-form flags accepted by ``prepare_server_args``."""
+def _engine_recognized_flags() -> tuple[set[str], dict[str, int | None]]:
+    """Snapshot long-form ServerArgs flags and the ones that take several values."""
     # Lazy import: ServerArgs pulls the full runtime stack (~200ms).
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
     parser = argparse.ArgumentParser(add_help=False)
     ServerArgs.add_cli_args(parser)
     flags: set[str] = set()
+    multi_value_flags: dict[str, int | None] = {}
     for action in parser._actions:
-        for opt in action.option_strings:
-            if opt.startswith("--"):
-                flags.add(opt)
+        long_opts = {opt for opt in action.option_strings if opt.startswith("--")}
+        flags |= long_opts
+        if action.nargs in ("*", "+"):
+            multi_value_flags.update(dict.fromkeys(long_opts))
+        elif isinstance(action.nargs, int) and action.nargs > 1:
+            multi_value_flags.update(dict.fromkeys(long_opts, action.nargs))
     flags.discard("--help")
     flags.discard("-h")
-    return flags
+    return flags, multi_value_flags
 
 
 def split_argv(argv: list[str]) -> SplitResult:
@@ -234,8 +240,8 @@ def split_argv(argv: list[str]) -> SplitResult:
             )
         argv = ["--model", model, *rest]
 
-    engine_flags = _engine_recognized_flags()
-    items = _normalize(argv, engine_flags)
+    engine_flags, engine_multi_value_flags = _engine_recognized_flags()
+    items = _normalize(argv, engine_flags, engine_multi_value_flags)
     result = SplitResult()
 
     for name, value in items:
