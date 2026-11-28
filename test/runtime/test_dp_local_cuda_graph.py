@@ -58,6 +58,7 @@ def test_local_graph_rejects_global_moe_counts_at_startup():
             None,
             None,
             SimpleNamespace(enable_dp_local_cuda_graph=True),
+            requires_forward_coordination=True,
             moe_source_rows=(object(),),
         )
 
@@ -74,6 +75,7 @@ def _runner(
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
     runner.disable = False
     runner.dp_size = 4
+    runner.requires_forward_coordination = True
     runner.disable_padding = disable_padding
     runner.dp_local_graph = local
     runner.capture_bs = capture_bs
@@ -162,3 +164,55 @@ def test_disable_padding_requires_every_nonzero_peer_graph_to_be_captured():
 
     for local_bs in global_bs:
         assert not runner.can_run(local_bs, _context(local_bs, global_bs))
+
+
+@pytest.mark.parametrize("local_bs,padded", [(1, 1), (3, 4), (7, 8)])
+@pytest.mark.parametrize("verify_width", [1, 6])
+def test_independent_dp_uses_local_graph_without_scheduler_coordination(
+    local_bs, padded, verify_width
+):
+    runner = _runner(local=False, capture_bs=[1, 2, 4, 8], verify_width=verify_width)
+    runner.requires_forward_coordination = False
+    ctx = _context(
+        local_bs, [8, 8, 8, 8], all_decode_or_idle=False, verify_width=verify_width
+    )
+    ctx.global_num_tokens = None
+    assert runner.can_run(local_bs, ctx)
+    assert runner.padded_bs(local_bs, ctx) == padded
+    assert not runner.can_run(9, ctx)
+    runner.requires_forward_coordination = True
+    assert not runner.can_run(local_bs, ctx)
+
+
+@pytest.mark.parametrize(
+    "mode", [ForwardMode.EXTEND, ForwardMode.MIXED, ForwardMode.IDLE]
+)
+def test_independent_dp_only_uses_decode_graph_for_decode(mode):
+    runner = _runner(local=False, capture_bs=[1, 2, 4])
+    runner.requires_forward_coordination = False
+    ctx = _context(2, [2] * 4, all_decode_or_idle=False)
+    ctx.global_num_tokens = None
+    ctx.forward_mode = mode
+    assert not runner.can_run(2, ctx)
+
+
+def test_independent_dp_retains_exact_bucket_requirement_without_padding():
+    runner = _runner(local=False, capture_bs=[1, 4, 8], disable_padding=True)
+    runner.requires_forward_coordination = False
+    ctx = _context(2, [8] * 4, all_decode_or_idle=False)
+    ctx.global_num_tokens = None
+    assert not runner.can_run(2, ctx)
+    assert runner.can_run(4, ctx)
+
+
+@pytest.mark.parametrize("verify_width", [1, 6])
+def test_independent_dp_ignores_control_plane_peer_counts(verify_width):
+    runner = _runner(local=False, capture_bs=[1, 2, 4, 8], verify_width=verify_width)
+    runner.requires_forward_coordination = False
+    # Control-plane cache coordination may publish counts even though this
+    # layout has no forward collective. Oversized and mixed peers are irrelevant.
+    ctx = _context(
+        3, [16, 1, 0, 8], all_decode_or_idle=False, verify_width=verify_width
+    )
+    assert runner.can_run(3, ctx)
+    assert runner.padded_bs(3, ctx) == 4

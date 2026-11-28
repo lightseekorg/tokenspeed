@@ -374,6 +374,8 @@ class ForwardStepRunner:
         token_to_kv_pool: CachePool,
         input_buffers: InputBuffers,
         config: ModelExecutorConfig,
+        *,
+        requires_forward_coordination: bool,
         draft_attn_backend: AttentionBackend | None = None,
         draft_token_to_kv_pool: CachePool | None = None,
         drafter: BaseDrafter | None = None,
@@ -385,6 +387,7 @@ class ForwardStepRunner:
         moe_source_rows: tuple[MoESourceRows, ...] = (),
     ):
         self.config = config
+        self.requires_forward_coordination = requires_forward_coordination
         self.moe_source_rows: tuple[MoESourceRows, ...] = moe_source_rows
         self.attn_backend = attn_backend
         self.draft_attn_backend = draft_attn_backend
@@ -507,6 +510,7 @@ class ForwardStepRunner:
         # The padded batch the last call replayed a decode graph at (None: eager).
         self.last_graph_bs: int | None = None
         self._reported_query_graphs: set[tuple[str, int, int | None]] = set()
+        self._reported_independent_graphs: set[tuple[str, int, int | None]] = set()
         self._decode_query_tokens: int | None = None
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
@@ -702,6 +706,7 @@ class ForwardStepRunner:
         self.output_buffers.clear()
         self._metadata_snapshots.clear()
         self._reported_query_graphs.clear()
+        self._reported_independent_graphs.clear()
         # The tables name no arena; only the graphs and their pool go.
         global_graph_memory_pool = None
 
@@ -1344,7 +1349,11 @@ class ForwardStepRunner:
                 )
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
-        if self.dp_size <= 1 or ctx.global_num_tokens is None:
+        if (
+            self.dp_size <= 1
+            or not self.requires_forward_coordination
+            or ctx.global_num_tokens is None
+        ):
             return None
         max_num_tokens = max(ctx.global_num_tokens)
         return (max_num_tokens + self.max_tokens_per_req - 1) // self.max_tokens_per_req
@@ -1354,7 +1363,7 @@ class ForwardStepRunner:
             return False
         if not ctx.forward_mode.is_decode():
             return False
-        if self.dp_size > 1:
+        if self.dp_size > 1 and self.requires_forward_coordination:
             if not ctx.all_decode_or_idle:
                 return False
             global_bs = self._global_graph_bs(ctx)
@@ -1663,6 +1672,16 @@ class ForwardStepRunner:
                 if self._expert_load_rows is not None:
                     self._expert_load_rows.clear()
 
+            if (
+                not self.requires_forward_coordination
+                and report_key not in self._reported_independent_graphs
+            ):
+                self._reported_independent_graphs.add(report_key)
+                logger.info(
+                    "Independent DP decode graph replayed: "
+                    f"rank={self.global_rank}, live_requests={bs}, "
+                    f"request_capacity={padded_bs}"
+                )
             result = live_graph_outputs(
                 self.output_buffers[graph_key], bs, self.max_tokens_per_req
             )

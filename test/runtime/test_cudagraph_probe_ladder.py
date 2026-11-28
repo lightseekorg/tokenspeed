@@ -85,6 +85,7 @@ def _decode_runner(capture_bs, variants=None):
     runner.drafter = None
     runner.draft_overlap = None
     runner._reported_query_graphs = set()
+    runner._reported_independent_graphs = set()
     runner.graphs = {}
     runner.output_buffers = {}
     runner._placeholder_tables = {}

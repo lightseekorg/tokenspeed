@@ -1497,6 +1497,7 @@ class TestPrefillRoleGraphsTest:
             token_to_kv_pool=_fake_pool(cache_group_page_counts={}),
             input_buffers=object(),
             config=config,
+            requires_forward_coordination=False,
         )
 
     def _prefill_owner(self, config):
@@ -1548,6 +1549,7 @@ class TestPrefillRoleGraphsTest:
             token_to_kv_pool=_fake_pool(specs=specs, cache_group_page_counts={}),
             input_buffers=object(),
             config=self._config(prefill_only=False),
+            requires_forward_coordination=False,
         )
         tables = runner._placeholder_tables
         assert (set(tables)) == ({"full", "state"})
