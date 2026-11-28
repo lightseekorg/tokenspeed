@@ -1145,9 +1145,12 @@ class ServerArgs:
                 "DP-local CUDA graphs require attention/dense/MoE/LM-head TP1, "
                 "no head TP, PP1/KVP1/DCP1/QCP1 and no DP sampling"
             )
-        if self.sampling_backend != "greedy" and not self.enable_dsv41_adaptive_dspark:
+        if (
+            self.sampling_backend not in ("greedy", "sonic")
+            and not self.enable_dsv41_adaptive_dspark
+        ):
             raise ValueError(
-                "DP-local CUDA graphs require greedy sampling "
+                "DP-local CUDA graphs require greedy, sonic, "
                 "or adaptive DSpark sampling"
             )
 
@@ -5271,8 +5274,8 @@ class ServerArgs:
             default=ServerArgs.enable_dp_local_cuda_graph,
             help="Select decode CUDA graph capacities independently on attention-DP "
             "ranks. Currently requires a supported DSPARK drafter, target and draft "
-            "MegaMoE, TP1 for attention/dense/MoE/LM head, and greedy or adaptive "
-            "DSpark sampling.",
+            "MegaMoE, TP1 for attention/dense/MoE/LM head, and greedy, sonic, or "
+            "adaptive DSpark sampling.",
         )
         parser.add_argument(
             "--enable-dsv41-adaptive-dspark",
