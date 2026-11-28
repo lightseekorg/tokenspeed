@@ -29,6 +29,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
 from tokenspeed_kernel.ops.quantization import try_output_fp8_quant_pack
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
@@ -625,6 +626,19 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
+        # Each head normalized on its own, rows kept whole (z may be a strided view).
+        z = z.reshape(seq_len, -1)
+        packs_fp8_output = self.enable_fp8_attn_proj and _uses_packed_fp8_output(
+            self.out_proj
+        )
+        # A sigmoid-gated norm (both norms here normalize before gating) is the
+        # backend's output norm, which a verify kernel may apply itself; the
+        # packed FP8 path fuses it with the quantization instead.
+        output_norm = (
+            KdaOutputNorm(z, self.norm.weight, self.norm.eps)
+            if self.norm.sigmoid_gate and not packs_fp8_output
+            else None
+        )
         kwargs = {
             "mixed_qkv": mixed_qkv,
             "conv_weights": self.conv_weights,
@@ -642,6 +656,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             "layer_id": self.layer_id,
             "seq_len": seq_len,
             "z": z,
+            "output_norm": output_norm,
         }
 
         core_attn_out = ctx.attn_backend.forward(
@@ -655,10 +670,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             **kwargs,
         )
 
-        # Each head normalized on its own, rows kept whole (z may be a strided view).
         core_attn_out = core_attn_out.reshape(seq_len, -1)
-        z = z.reshape(seq_len, -1)
-        if self.enable_fp8_attn_proj and _uses_packed_fp8_output(self.out_proj):
+        if output_norm is not None:
+            output, _ = self.out_proj(core_attn_out)
+            return output
+        if packs_fp8_output:
             packed = try_output_fp8_quant_pack(
                 core_attn_out,
                 z,

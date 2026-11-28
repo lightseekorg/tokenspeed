@@ -205,6 +205,7 @@ def make_qsa_pool_for_layers(
     num_layers: int,
     num_lcm_blocks: int,
     kv_head_dim: int,
+    enable_memory_saver: bool,
 ) -> MHATokenToKVPool:
     """Build a real pool with tiny QSA fields for the specified global layers.
 
@@ -255,7 +256,12 @@ def make_qsa_pool_for_layers(
         alignment=1,
         max_padding_fraction=float("inf"),
     )
-    arena = CacheArena(layout.bind(num_lcm_blocks), device, cache_group_specs=specs)
+    arena = CacheArena(
+        layout.bind(num_lcm_blocks),
+        device,
+        cache_group_specs=specs,
+        enable_memory_saver=enable_memory_saver,
+    )
     return MHATokenToKVPool(
         arena,
         torch.bfloat16,

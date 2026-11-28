@@ -6,6 +6,125 @@ concepts are *logical* (token-based, storage-agnostic) and which are *physical*
 reference for naming, code placement, and layering decisions in both the C++
 scheduler (`tokenspeed-scheduler`) and the Python runtime.
 
+## Cross-layout peer prefix reads
+
+A coordinated peer reader matches a digest of the serving model namespace,
+immutable weight generation, and the active recipe's state encoding. An explicit
+shared serving name lets replicas mount the same weights at different paths.
+Compute precision, fusion and parallelism are local choices. The transfer planner
+checks both descriptors before constructing member reads. Persistent storage has
+its own identity.
+
+All source members must pin the proposed checkpoint before the holder grants a
+read. All reader members must report retirement before sending RELEASE.
+Only the original holder's matching CLOSED/COMPLETE reply can publish a hit.
+Unknown retirement freezes the landing. A restarted holder or a conflicting
+close ends the business attempt with zero reused tokens.
+
+Wire revision 3 extends cross-layout peer reads to holder Disk-tier pages while
+preserving revision 2's bounded submission window. When every member of a holder
+replica serves Disk pushes, its versioned descriptor (format version 2) advertises
+per-group exclusive Disk virtual block bounds alongside each member's push
+endpoint. A holder that cannot push Disk—or whose push endpoint has been
+quarantined on any replica member (propagated via the replica collective and
+exposed through `peer_scheduler_state{state="disk_push_quarantined"}`)—truncates
+lookups to its Device/Host prefix instead of returning a full miss; a holder
+that can push Disk answers lookups with any mix of Device, Host, and Disk pages,
+pinning every listed block across all tiers under its offer ticket. Each reader
+member plans one-sided READs for Device/Host pages and holder-pushed spans
+(tagged with the holder's `(incarnation, offer_id)` via wire frame `P`) for Disk
+pages through `PeerReadPlan::plan`, running both concurrently without occupying
+local read-worker threads while waiting on Disk pushes. Each holder member
+authorizes an offer's id on its push endpoint once pinned—recording the holder's
+local monotonic activation time—and rejects pushes for inactive,
+mismatched-incarnation, or expired-window offers before touching NVMe.
+A queued Disk offer can be restored only with a matching generation and a
+registered Disk-capable holder layout. After any holder member loses Disk
+capability, new lookups can still use its hot prefix. A duplicate lookup for
+an outstanding Disk offer receives a miss. A refreshed offer must bind the
+same prefix and page manifest before the reader can retry its PIN.
+
+Specifically, offer-bound (`P`) Disk pushes are only accepted within 35 seconds
+of offer activation (covering the reader's 30-second submission window plus
+transit slack), and every accepted job's execution deadline is clamped to at
+most 45 seconds past offer activation (`< 60`-second reader cancel retry budget
+plus `quarantine_us`), so a `Push` stalled inside a kernel TCP socket across a
+network partition cannot deliver late after heal and write into unfrozen reader
+device pages even while the holder's offer pin is still active. When a Disk push
+is cancelled and the holder does not confirm within a short grace window, the
+reader coordinates an early `FetchFrozen` fallback while retrying `Cancel` in
+the background on its push dispatcher for a bounded retry budget (60 seconds);
+a late `Cancelled`/`Done` reply cleanly unfreezes the landing via
+`TargetRetired` and sends `RELEASE(Abort)`, whereas retry-budget expiry, an
+RDMA write error, or a push worker panic reports `Unknown` retirement. On
+`Unknown` retirement, all reader members hold the landing frozen for the agreed
+quarantine interval (`quarantine_us`, shared with legacy peer landings;
+`frozen_targets`, `frozen_blocks`, and `frozen_landings` metrics expose active
+frozen landings) and then emit `TargetRetired` and `RELEASE(Abort)` in lockstep
+so neither a write fault nor a dead/restarted holder permanently leaks device KV
+memory or holder pins. Closing or expiring an offer on the holder revokes its
+push authorization, cancels in-flight pushes, and waits for them to drain before
+releasing Disk block pins. Every reader's local 30-second monotonic submission
+window starts before it votes
+READY; workers check the same deadline at each READ batch and clamp Disk push
+budgets to the remaining window. The holder starts its own 30-second interval at
+GRANT, after all READY votes. A delayed GRANT cannot restart the reader clock.
+Wire revision 3 and descriptor version 2 are incompatible with revision 2 /
+version 1; during a rolling upgrade, mixed-version pairs fall back to local
+prefill until both sides match.
+
+A deployment with a guaranteed upper bound on the time from the reader's
+final submission check through the last possible source-memory access can
+set `TOKENSPEED_PEER_READ_RETIREMENT_BOUND_MS` on the holder. Include host
+scheduling pauses after the check, native queues, reconnects, retries, DMA
+drain after process failure, timer drift/margin, and—when Disk-tier peer pushes
+are enabled—in-flight NVMe/RDMA execution within the holder's 45-second
+post-activation push deadline (35-second acceptance window plus bounded
+execution cap). When Disk-tier v1 peer pushes are enabled and this variable is unset,
+the holder defaults to a 90,000 ms bound past the 30-second submission window
+(120 seconds total) so orphaned Device/Host/Disk pins from a crashed reader are
+reclaimed automatically while leaving headroom above the ~65-second
+cancel-and-quarantine window. All ranks follow their holder leader's configured
+value. After the submission interval plus this bound, the holder initiates an
+ABORT, cancels any pushes tagged with the offer, and releases its own source
+references even if the reader disappeared. This never releases a reader's frozen
+target. For non-Disk v1 holders with no verified bound, leaving the setting
+unset preserves `0` (granted sources remain pinned pending explicit closure).
+A timeout for polling one Mooncake batch alone does not establish the bound. No
+heartbeats extend it.
+
+For Disk-tier peer pushes, the holder coalesces consecutive strided slices
+targeting contiguous remote addresses inside the same reader registered memory
+region (for example, head-sharded sliding-window draft slices pushed from TP1
+to TP8) into its own already-registered staging memory before issuing the RDMA
+WRITE, without changing the wire protocol. Reader planning partitions push
+items by destination memory region so a coalesced WRITE never crosses adjacent
+reader registrations. `TOKENSPEED_PEER_PUSH_COALESCE` controls this kill switch
+on the holder (enabled by default; set to `0` or `false` to emit uncoalesced
+spans). It is read once per process via `OnceLock`, so toggling it requires a
+process restart.
+
+After all reader members have retired their reads (or finished quarantining an
+unknown retirement), a missing RELEASE reply
+can still force the request to recompute. Once its closing deadline passes,
+the reader drops the finished request and keeps the exact release message.
+New lookups to that holder pause until its pending closes receive terminal
+replies. Cleanup retries rotate among those leases and do not occupy active
+attempt slots. Healthy holders can continue serving requests. An unknown DMA
+retirement stays frozen through its quarantine interval and cannot enter this
+retry path until `TargetRetired` and `RELEASE(Abort)` are emitted.
+
+A reader with frozen versioned Device targets pauses new peer reads across
+holders. The scheduler suppresses new lookups and discards answered but
+unreserved peer hits before admission, recording `reader_retirement_pending`.
+Requests continue through local cache matching and prefill with the remaining
+capacity. In-flight reads and holder serving keep their existing lifetimes.
+Only retirement of the last frozen target enables peer reads for new requests
+again; cancelling a request or waiting longer does not release its DMA pages.
+This prevents further landings from consuming the cache while a failed reader
+transport drains. It cannot restore capacity already held by a transfer that
+never retires or recover a failed device.
+
 ## Two worlds: logical tokens vs. physical storage
 
 ### Logical world (token units, storage-agnostic)
@@ -126,6 +245,19 @@ pool; no capacity is reserved for State or history.
 Mirrored ranks must agree on Host packing as well as parent counts. Startup
 compares both before allocating pinned memory and refuses incompatible local
 payload geometry rather than giving the same block ID different meanings.
+
+A shared L2 pool (`--shared-l2-config`) uses the compact Host geometry too. A
+pool page holds one block exactly as a Host block does, and a rank reports the
+pool's `host_group_packing` for its Host tier, which is then a proxy: its
+blocks hold no bytes and stand for pinned pool pages. Only the parents are
+spread over the provider processes' memory, in the order the providers
+joined: a page lies in its parent as a Host block does, on the provider that
+holds the parent (`shared_l2/geometry.rs` of `ts-control`, from the sizes
+`runtime/cache/shared_l2/layout.py` reads off the Host layout); the bytes
+move between a rank's Device blocks and pool pages by RDMA and never pass
+through the rank's host memory. The pool's capacity follows from the same
+geometry: a State checkpoint costs one parent for each State group, and KV
+pages share parents by their group's packing.
 
 Host allocations follow PyTorch's existing allocator configuration, including
 `PYTORCH_ALLOC_CONF` and its legacy `PYTORCH_CUDA_ALLOC_CONF` name. TokenSpeed
@@ -453,10 +585,10 @@ prompt end from slot 0: slot 1 is the fresh block the padding row never wrote
 prompt-end state onto another request's canonical checkpoint before the
 rotation; slot 0 then pins that equivalent checkpoint through the finish.
 
-KDA keeps its FP32 decode records and their accepted count in the active
-request slot, outside the LCM arena. The live State block holds only the
-dense base and the convolution state, exactly as without retained history;
-the scheduler and the cache see nothing else. Prefill writes complete
+KDA keeps its FP32 decode records and their accepted count, one for all its
+layers, in the active request slot, outside the LCM arena. The live State
+block holds only the dense base and the convolution state, exactly as without
+retained history; the scheduler and the cache see nothing else. Prefill writes complete
 checkpoints. The decode commit of the forward that ends a request (the
 sampling epilogue has set `RuntimeStates.stopped` for its slot) folds the
 slot's accepted records into the live block and clears the count. The block
@@ -474,7 +606,9 @@ it publishes nothing, as for a numerically corrupted forward, and the slot's
 next admission clears the count (`reset_request_workspace`). A request the
 device ended but could not complete -- records left outside the live block --
 is an engine error (`CommitError::IncompleteDecodeState`): the engine stops
-rather than publish an incomplete state.
+rather than publish an incomplete state. An ending request whose commit a
+KDA layer that carried it rejected reports `REQUEST_ENDED_INCOMPLETE`; a row
+no KDA layer carries (graph padding, a masked overlap row) reports nothing.
 
 A retraction publishes and images the victim's computed frontier. The
 backend declares its State groups as deferring their decode state
@@ -482,10 +616,11 @@ backend declares its State groups as deferring their decode state
 and the scheduler lists a decoded victim's live block in each of them, the
 one its decode steps write in place, in the plan's `state_folds`, by request
 slot. Before the plan's stores, copies, zeroing and forward, the data plane
-folds each listed slot's records into its block (`DeviceHandle.execute`,
-`fold_deferred_state`). The list does not depend on the image: a retraction
-whose image the split refuses after the publication aborts the victim, but
-its publication stands, and the fold completes it before any reader. A
+folds each listed slot's records into its block, layer by layer, then clears
+the slot's count once (`DeviceHandle.execute`, `fold_deferred_state`). The
+list does not depend on the image: a retraction whose image the split refuses
+after the publication aborts the victim, but its publication stands, and the
+fold completes it before any reader. A
 block the publication swapped for another request's equal entry is not
 listed; that entry already holds the complete state. The FP32 records stay in
 the GPU workspace. Restore copies the complete dense and convolution states
@@ -547,6 +682,12 @@ its KV tail are evicted together, so a stale state is never matched). Resuming a
 of its kernel chunk regroups a floating-point reduction; `numerics.md`
 ("Prefix hits resume at any token") states the tolerance and the oracle.
 
+`ServerArgs.checkpoint_config` derives production, publication and retention
+rules from the explicit checkpoint flag, engine role and eviction policy.
+Cache validation and staged argument resolution use the same rules without
+requiring full server initialization. Decode treats in-forward production as
+a no-op; GDS retains the publication filters but does not use LRU demotion hints.
+
 Capacity prefill graphs (`backends/state/prefill_capacity.py`) keep this
 contract at a captured request count: an unused request slot scans one
 padding row past the live tokens, its state-block index is negative so the
@@ -601,37 +742,49 @@ KDA uses retained history for ordinary decode and speculative verification.
 Each KDA State page holds the convolution window and a dense recurrent base,
 and nothing else. Each resident request has a stable slot outside the LCM
 arena. For each KDA layer, the slot holds FP32 corrections (U), normalized
-keys (K) and per-token decays, plus an INT32 count of the updates accepted
-since the dense base of the request's input page. Batch reordering changes
-the mapping from batch rows to request slots.
+keys (K) and per-token decays; one INT32 count, which every layer shares,
+counts the updates accepted since the dense base of the request's input page.
+Batch reordering changes the mapping from batch rows to request slots.
 
 Verify replays the accepted updates in order to reconstruct the current
-state. It appends candidates after that accepted prefix. Commit advances the
-slot's count by the accepted count and updates the convolution window. For
+state. It appends candidates after that accepted prefix. Commit updates the
+convolution windows, then sets the slot's count to the records the verify
+read plus the accepted count; it is the count's only writer in a decode round
+and writes it once, in a second launch after every layer has read it. For
 example, after four candidates and two acceptances, the next verify starts
 writing at index two. Generation stamps identify candidates from the current
 round. Eager execution and CUDA graphs use the same page and request-slot
 routing.
 
-Each layer has room for `max(16, effective_verify_width)` records per slot, or
-for `--kda-history-capacity` records when set (at least the verify width): a
-smaller capacity shrinks the request-slot workspace but folds more often. Every
+Each layer has room for `--kda-history-capacity` records per slot, 16 by
+default; it must be at least the effective verify width, so a window wider
+than 16 requires setting it. A verify reads at most the capacity minus its
+width in accepted records. A smaller capacity shrinks the request-slot
+workspace but folds more often. Every
 resident slot holds them, a decode role's extra slots included. When a whole
 candidate window will no longer fit, the accepted updates are folded into the
 dense base before the slot is reused, even for a request whose own window is
-shorter. A change of live page likewise starts from a materialized base. Both
-folds run before the verify forward, in one launch pair for every layer, once
-the metadata refresh has resolved the round's pages
-(`KdaAttnBackend._prepare_retained_history`): verify itself reads only live
-blocks and writes neither a block nor a count. The base uses `--mamba-ssm-dtype`
-(FP32 or BF16). Replay accumulates in FP32 and rounds when it writes the dense
-base.
+shorter. A change of live page likewise starts from a copy of the dense base.
+Both run before the verify forward, in one launch for every layer, once the
+metadata refresh has resolved the round's pages
+(`KdaAttnBackend._prepare_retained_history`), and the launch only reads the
+count H. With a verify window T and the capacity C, H overflows when it lies
+outside `[0, C - T]`: every layer then folds the records into its live block
+(in place when its pages did not move), and verify and commit apply none of
+them (`eff = 0`, else `eff = H`). A request that fits but moves to a new live
+block in a State group gets the source's dense base copied there in that
+group's layers, with no record applied: the records still count from that
+base. Verify itself reads only live blocks and writes neither a block nor a
+count, and the commit derives the new count from `eff`. The base uses
+`--mamba-ssm-dtype` (FP32 or BF16). Replay accumulates in FP32 and rounds
+when it writes the dense base.
 
 Prefill starts from the logical state of its input page, then writes dense
-live and interior checkpoints and clears the rows' counts. A decode commit
-only advances the count, except in the forward that ends the request, which
-folds the records into the live block; a retraction folds them before its
-image is stored (above). A published or imaged block is therefore a
+live and interior checkpoints. Every layer's gather reads the rows' counts,
+which clear once, after the last KDA layer's gather, in a launch ordered
+behind it. A decode commit only advances the count, except in the forward
+that ends the request, which folds the records into the live block; a
+retraction folds them before its image is stored (above). A published or imaged block is therefore a
 self-contained dense checkpoint, and prefill to decode transfer carries it
 unchanged. A recycled slot may still count records of an owner whose end the
 device did not see, so the runtime clears the count whenever a slot gets a
@@ -1237,6 +1390,9 @@ Its responsibilities:
   State group's hits count from page 0 on both tiers, since a Host
   checkpoint may sit on the Device's last page); when the Device alone
   resumes furthest the Host tier mirrors its boundary and claims nothing.
+  Without KV groups the Host-suffix split is zero: State-only hits claim
+  the actual checkpoints, never an implicit Device prefix. This also lets
+  an empty-Device shared L2 pool pin Host checkpoints through the same probe.
   The probe records the longest usable KV boundary even when its State is
   missing, since admission uses that reach for the junction cut; with a
   State group the reach is at least the prefix-closed groups' coverage (on
@@ -1708,13 +1864,13 @@ Its responsibilities:
     destinations until every owner finished it, then publishes the Disk
     entries with the Host entries' metadata; a Host placement can then drop
     the Host copy without loss. The write-back segment plan
-    (`AcquireHostSegments`) drops clean entries before dirty ones; the
-    block-by-block placement (`AcquireHostBlocks`: prefetch and peer landing,
-    a retraction leg's fallback) still ranks them by recency alone. Cleaning
-    never removes a Host entry.
+    (`AcquireHostSegments`) ranks a victim as clean only when Disk holds
+    every entry its expansion takes, and counts these evictions separately.
+    Block-by-block Host placement also reclaims safe Disk-backed copies
+    before ordinary dirty candidates. Cleaning never removes a Host entry.
   * *Prefetch* reads a waiting prompt's Disk-only prefix into Host before
     admission: the Disk's keys of the prompt stand in as Host hits for
-    `ReserveStoragePrefix` (the Host-suffix rule picks the boundary and the
+    `ReserveDiskPrefix` (the Host-suffix rule picks the boundary and the
     keys Host lacks), the request waits in `Prefetching` holding no Device
     pages, and the read's Host entries are published when every owner
     finished it and held for the request as its Ready hold, as an L3 GET's
@@ -3232,7 +3388,7 @@ Verified end to end for this round: DeepSeek V3.2, R1, and V4-Flash, each
 **Configuration and placement.** `ServerArgs.resolve_kv_offload()` normalizes
 `--kv-offload-config`: target attention layer IDs, per-request hot capacity,
 Host GiB budget and prefetch overlap. The plugin recipe interprets model
-options, including the explicit `kv_offload_window_ring` HF override, and
+options, including `kv_offload_window_ring` from the flat `extra_server_args`, and
 declares a `KVOffloadPolicy` with field IDs, verify width, reserved/ring rows
 and selection dependencies. The common `CacheRecipe.setup()` binds request
 slots and the extend chunk bound. Recipes without offloading support reject
@@ -3520,3 +3676,232 @@ The runtime retires replay before reading or reusing its old State block or
 request slot. It materializes the state at a request exit to cover published
 checkpoints and snapshots. Until then the bank and live block together
 describe the logical frontier. This adds no State slot or cache span.
+
+## Hybrid recovery eviction
+
+Under pressure, `PublicationPreview` describes the completed components that
+the admission will publish. It reuses `CompletedBlockRanges` and the recovery
+resolver, and augments plan-local lineage and coverage. A new intermediate
+State can shorten a descendant's fallback and reduce its exclusive suffix
+before the next victim is chosen. The preview changes no live registration,
+stamp, watermark or reference count.
+
+Producer-owned preview points cannot fund capacity. Their exact component
+locations, canonical duplicates and required route dependencies are excluded
+before building request-reclaim candidates. Admission and compaction share
+that exclusion; a failed plan discards the preview. Publication commit remains
+the only operation that creates readable cache identities.
+
+Typed residency, reserved-promise and checkpoint-use events connect existing
+RAII owners to dependency metadata. Peer use and last-use release retain
+distinct causes, and precise demotion results identify the keys and tiers
+actually changed. They do not introduce a second event queue or allocator.
+
+Recovery availability counters update with the index and are sampled in O(1).
+Metrics distinguish Host-loaded KV suffix tokens from the additional resume
+tokens supplied by Host State. Neither is a historical-compute missed-token
+oracle. Selection time counts committed plans; failed attempts leave retention
+statistics unchanged.
+
+Physical release counters belong to the pools: dropping a cache reference
+does not increment them while a request or transfer still owns the slot.
+The last child owner increments its group's slot count; emptying the parent
+also increments that group's parent count, before the parent can bind to a
+different group. These counters include all release paths, not only GDS, and
+are exposed by group and tier without scanning the cache.
+
+At native debug log level, pressure plans keep transient GDS score
+observations (stamp, fallback, relief and cause) and emit them only on commit.
+Rolled-back trials discard their observations. This trace and the existing
+peer estimation-error histogram support attribution without introducing
+per-prefix Prometheus labels or a permanent decision journal.
+
+Physical victim sets carry only their members and removal semantics.
+`PlannedEviction` owns GDS commit metadata once per plan; LRU selections
+allocate none. Moving or abandoning a selection has no cache side effects.
+Commit prepares required Host reservations and records fresh rejection before
+Device removal, then applies the plan's watermarks, statistics and trace once.
+Host-only plans still commit even when they remove no Device blocks.
+Admission skips the eviction call only when both physical victims and GDS
+commit metadata are absent; publication and allocation still run normally.
+The member arena outlives the selected sets, and each compaction retains its
+own plan through placement. Selection order, cascades and write-back segment
+boundaries remain the planners' decisions.
+
+`--prefix-cache-evict-policy lru` retains legacy Device and Host retention and
+segment policies. `gds` requires State groups and explicit finite prefill
+cost coefficients D > 0, E >= 0. It shares logical retention across Device
+and Host. Published Disk data participates in recovery, but future Disk
+capacity and unfinished cleaning do not guarantee retention. Retention rejection never
+rejects the producing request.
+
+`CheckpointTree` owns lineage, freshness and reuse stamps. Its non-owning
+`RecoveryIndex` registrations describe history, sliding windows, sinks and
+partial tails with shared binary ranges. Canonical residency handles update
+shared ancestors and affected cached routes. Destroy registrations before
+cache groups so callbacks cannot query destroyed matchers. LRU does not
+register ranges. Matching and planning share the exact-boundary resolver:
+one Device-prefix/Host-suffix split, whole tails on one tier, independent
+State groups and required windows. Arbitrary per-key tier unions are invalid.
+
+With Host, a pressure plan overlays hypothetical residency changes without
+mutating the index. Overlay mutations refresh only routes watching changed
+ranges; untouched ordinary routes read the resident result. Copy alternatives
+are resolved separately. A plan reuses its coverage until residency or logical
+survivors change, and rollback restores coverage with the route overlay.
+Placement may remove a duplicate or reserve a migration;
+only the joint logical choice may lose a recovery identity. Every originally
+ready, Disk-recoverable or guaranteed-pending survivor must have a legal final route. Physical
+eligibility, heavy-path coordinates, coverage and selection remain plan-local.
+The no-Host planner retains its versioned heap and explicit block fallback.
+There is no persistent selection heap or constant-time pressure guarantee.
+
+Host placement builds coverage before a pressure trial's snapshot, so a
+rejected trial restores the same coverage rather than rebuilding it for the
+next demand. Demand alone does not change coverage; residency and survivor
+changes still invalidate it, except that removing a Host copy unused by every
+selected surviving route preserves that coverage. The route overlay still
+records the removal; subsequent rows reuse the unchanged selected paths.
+Device removal, logical loss and Disk-backed replacement retain their normal
+coverage invalidation. Free capacity needs no snapshot. Without a Disk
+pool, placement skips the clean-copy scan entirely. Within one Host plan, a
+failed single-block demand can be reused for the same group and ownership
+bucket until any segment succeeds. Other groups and buckets are still tried;
+multi-block failures are not reused as single-block failures. No refusal is
+remembered across plans, and rejection counters still count every refused row.
+
+Optional Host placement keeps the complete cross-tier recovery view but builds
+only Host physical candidates. It cannot remove Device copies or choose a
+logical victim, so it needs neither the Device candidate census nor the Device
+held-State scan. Plans that permit logical loss, Device admission, compaction
+and cleaning retain both tiers' candidates and held checks. This changes the
+metadata prepared by the same planner, not its placement or retention rules.
+
+Device pressure first tries eligible copy-only releases across the candidate
+census before migration or logical loss. Each release must preserve complete
+routes, including the single Device-prefix/Host-suffix split; a same-key Host
+copy does not prove safety. This pass creates no Host demand and advances no
+watermark. It checks only routes watching the candidate's leaf, stops at the
+first broken route, and changes the shadow only after every affected route
+passes. Required keys without backups fail before route resolution. One
+physical capacity shadow tracks relief incrementally; trials neither clone
+the growing plan nor scan unrelated checkpoints. LRU and no-pressure admission
+are unchanged.
+
+Remaining preservation trials may reserve Host capacity. Failure to preserve
+cache content is not itself an admission failure or fresh rejection: the
+latter requires a separate logical score comparison. If the joint heuristic
+stalls, retain the initial safe Device releases, discard its later tentative
+Host victims and reservations, then retry without migration. Ordinary Device
+losses use Device scores. If held State or shared dependencies leave no eligible
+whole unit, reclaim the complete eligible Device census through the same
+physical ownership and protected-input constraints. Record every route actually lost by that fallback;
+a held State does not pin otherwise unowned history. Only actual insufficient
+group/bucket capacity may fail this retry. Exceptional block fallback has no
+finite single-unit exclusive score and does not advance either watermark.
+Failed attempts leave both tiers and committed statistics unchanged.
+
+For pressure in tier t, rank an eligible point by
+`stamp_t + C(fallback, position) / relief_t`, where
+`C(a,b) = D*(b-a) + E*(b-a)*(b+a)/200000`. The joint fallback is the nearest
+surviving usable ancestor without Disk. With Disk, subtract the point's read
+cost from the cheapest surviving ancestor's read-plus-prefill cost, including
+cold recomputation, and clamp the benefit at zero. Relief counts exclusive eligible slots in tier t,
+weighted by `1 / packing(group)`; cancelling proposed Host copies also
+relieves Host demand. Group/bucket `Fits` remains authoritative. State copies
+identify a logical point, but its KV stays when another survivor needs it.
+
+Device and Host have independent watermarks. Only committed normal logical
+choices advance the pressure domain's watermark. Strictly cheaper fresh
+points may be rejected without advancing it. Pure migration, duplicate
+removal, copy ACK and optional-copy rejection do not age logical retention.
+Committed use and last State-owner release refresh both domain stamps;
+read-only probes do not. A failed preview changes neither residency nor stats.
+
+Write-back first reserves all required Host destinations and holds existing
+Host dependencies, then removes Device copies in dependency order. Required
+pending registrations are owned by `PendingHostStore`; an unreserved optional
+record is not a promise. The drain consumes reservations and publishes after
+ACK. Sources keep the existing unpinned, stream-ordered eviction contract.
+Extra dependencies may be copied while their Device copies remain. Physical
+releases, reserved copies and logical losses therefore have separate counts.
+
+Write-through publication uses optional Host admission: free or safely
+reclaimable copies only. Skipping a replica preserves Device publication.
+Sources stay pinned until ACK; pending copies cannot supply Device capacity.
+After ACK, Device duplicate removal can use the legal Host route. This mode
+does not implicitly enable eviction write-back. Host-only allocation also
+uses the joint policy. Fixed-slot compaction clears only a safe duplicate or
+orphan rather than bypassing logical selection. Explicit lifecycle cleanup
+remains separate from pressure ranking.
+
+Superseded-checkpoint hints do not override GDS on either tier or in-flight
+stores. Explicit peer handoff keeps its no-write-back disposition and access
+epoch race checks. Imports hold metadata through their owning transfer;
+metadata alone makes no recovery point readable.
+
+Disk is a source for the existing logical Host suffix, not a third GDS domain.
+The range index tracks published Disk residency and distinguishes a ready
+memory route from one requiring prefetch. Read cost is the explicit per-block
+fixed cost plus the aligned Host block bytes times the byte coefficient;
+unique logical blocks across groups are summed consistently by every scheduler.
+Ordinary admission still requires Device/Host data. Disk replacement remains
+LRU/retention; losing a Disk-only dependency invalidates affected routes without
+advancing either GDS watermark.
+
+Host placement reclaims dead entries and usable Device duplicates before
+safe same-key Disk copies, then considers dirty logical losses.
+GDS trials these removals through the resolver and ranks clean copies by added
+read cost per Host relief. Legacy block placement shares the segment planner's
+Device KV duplicate checks, including the contiguous prefix and sliding-window
+constraints, and includes every unpinned State sibling in copy classification.
+A Disk prefetch checks credits before planning, pins exact Disk sources,
+and reserves a complete Host boundary transactionally. A failed boundary evicts
+nothing. Existing warm Host dependencies are protected during allocation;
+admission probes again after I/O. Arrival alone is not checkpoint reuse.
+
+GDS cleaning derives useful dirty closures from the current Host policy order,
+then writes their history before State. It maintains a free-plus-clean reserve
+bounded by Host parents and the configured write credits. Candidate selection
+is plan-local; each cleaning pass rediscovers copies made dirty by Disk loss.
+Both policies respect the write-operation limit and reserve foreground read
+capacity. Cleaning length and reuse gates apply to the candidate tip, never
+to its required ancestors. GDS rediscovers a gated candidate on a later pass;
+the queue-based policy keeps cold entries in its bounded reuse queue.
+A published Disk tip remains eligible when its lost ancestor copies need
+cleaning again: new Disk entries do not inherit Host's tier-local reuse bit.
+GDS does not queue write-back ACK notifications: its candidates come from
+residency, so unused notifications consume neither queue space nor the dropped
+cleaning counter. Legacy cleaning retains its bounded FIFO and drop accounting.
+Rank compressed paths before expanding candidate keys, and stop visiting
+candidates when the write credits are filled. A selected closure can still be
+long; this does not bound all cleaning CPU work by the number of writes.
+Published Disk prerequisites remain held during placement and I/O. Pending
+writes do not count as prerequisites, and failed placement keeps only the
+dependency-ordered prefix. Maintenance source handles let peer no-write-back
+demotion reach queued and issued cleaning; issued buffers retire at ACK and
+demoted results are not published. A newer real use cancels an older demotion.
+Failed reads invalidate only their exact source incarnation, even if another
+I/O owner still holds its bytes.
+
+`host_cache_stats().gds_evictions` and serving metrics distinguish logical
+loss, fresh rejection, Device releases, Host reservations and optional-copy
+rejection. `tokenspeed:gds_watermark` and `tokenspeed:gds_host_watermark` report
+the pressure-domain watermarks. These diagnostics do not drive scheduling.
+
+
+An in-forward checkpoint may carry one CPU production receipt with its extra
+State block count. It owns no cache blocks. Committing fresh logical rejection
+charges that receipt once, before removing the checkpoint. Preview failure,
+replica rejection and migration do not charge it; natural checkpoints never
+inherit whole-forward cost. Runtime producer bytes and GPU cost are currently
+unmeasured and reported explicitly, rather than assumed to be zero.
+
+Optional prefix-load telemetry records one copy-stream event interval per local
+batch after prerequisites and transfer-table preparation. Normal completion
+polling retires it without a new synchronization. Request records share a batch
+ID and carry its duration only once, together with resolved transport, group
+row counts and payload bytes. Unsupported timing devices report no duration.
+These observations do not alter admission or retention. Full planning-attempt,
+cleaning and dependency-mutation profile spans include failed attempts; the
+committed-plan time counter alone is not total cache or scheduler CPU time.

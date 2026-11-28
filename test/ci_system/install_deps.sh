@@ -92,8 +92,8 @@ apt_install_with_retry() {
 }
 
 ensure_flashinfer_jit_cache() {
-    # Blackwell runner images preinstall flashinfer-jit-cache; it must
-    # match the flashinfer-python pin exactly or flashinfer refuses to import.
+    # Match the Blackwell runner's preinstalled cache to the Python pin so
+    # FlashInfer can use the precompiled kernels.
     if [[ "${CI_RUNNER_LABEL:-}" != gb200* && "${CI_RUNNER_LABEL:-}" != gb300* && "${CI_RUNNER_LABEL:-}" != b200* && "${CI_RUNNER_LABEL:-}" != b300* && "${CI_RUNNER_LABEL:-}" != slurm-gb200-* && "${CI_RUNNER_LABEL:-}" != slurm-gb300-* && "${CI_RUNNER_LABEL:-}" != slurm-b300-* ]]; then
         return 0
     fi
@@ -179,8 +179,7 @@ if [[ "${FLASHINFER_PIN_VERSION}" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.dev([0-9]{8})$ ]
     NIGHTLY_TAG="nightly-v${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
     NIGHTLY_BASE="https://github.com/flashinfer-ai/flashinfer/releases/download/${NIGHTLY_TAG}"
     NIGHTLY_WHEEL="$(cache_remote_wheel "${NIGHTLY_BASE}/flashinfer_python-${FLASHINFER_PIN_VERSION}-py3-none-any.whl")"
-    # flashinfer-cubin must match too: runner images preinstall an older one
-    # and flashinfer's import-time version check refuses the mismatch.
+    # Match the cubin wheel so FlashInfer can use the precompiled kernels.
     NIGHTLY_CUBIN_WHEEL="$(cache_remote_wheel "${NIGHTLY_BASE}/flashinfer_cubin-${FLASHINFER_PIN_VERSION}-py3-none-any.whl")"
     echo "Pre-installing nightly FlashInfer Python + cubin from GitHub release: ${NIGHTLY_TAG}"
     pip_install_with_retry pip3 install --break-system-packages --no-deps \
@@ -260,6 +259,7 @@ if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
         0.7.3) FLASHINFER_CUBIN_SHA256="115b96065fa2dcc1674c74fcb0544ec2890a6fa4a8519b2251d1f6ab3d780093" ;;
         0.7.4) FLASHINFER_CUBIN_SHA256="8af62986f52e8cd29d1eaef7ecc63c441c1c214bd33175019a8f548a128bc2e2" ;;
         0.7.5) FLASHINFER_CUBIN_SHA256="d9e45f4b025d1fd81ad99dc73a2d865e1037b1313fe7bc04de8bfb4d2612a71c" ;;
+        0.7.6) FLASHINFER_CUBIN_SHA256="e96f034a667dd726f7dcd693f2cbce96ccca488e6fe6b1e4c3e249f56d0a3219" ;;
         *) echo "No SHA256 pinned for flashinfer-cubin ${FLASHINFER_VERSION}" >&2; exit 1 ;;
     esac
     # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,

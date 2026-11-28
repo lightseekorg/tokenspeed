@@ -106,11 +106,13 @@ CacheStore::GroupMetadata CacheStore::buildGroupMetadata(std::span<const CacheGr
 CacheStore::CacheStore(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                        BlockPool* host_pool, BlockPool* disk_pool, BlockPool* snapshot_pool, bool write_back_evictions,
                        std::int32_t checkpoint_retention_leaf_distance)
-    : pool_{pool},
+    : write_back_evictions_{write_back_evictions},
+      pool_{pool},
       host_pool_{host_pool},
       disk_pool_{disk_pool},
       snapshot_pool_{snapshot_pool},
       prefix_granularity_{prefix_granularity},
+      recovery_index_{*this},
       checkpoints_{prefix_granularity, checkpoint_retention_leaf_distance},
       boundary_tree_{boundaryTreeConfig(groups, prefix_granularity, write_back_evictions, host_pool != nullptr,
                                         disk_pool != nullptr),
@@ -211,7 +213,8 @@ std::vector<CacheStore::NodeEntry> CacheStore::NodeEntries(const BlockPool& pool
                 .pool = &pool, .group_id = groups_[i].Id(), .location = entry->location, .in_use = entry->pinned});
         }
     };
-    const auto tier = &pool == host_pool_ ? BoundaryTree::kHost : BoundaryTree::kDevice;
+    const auto tier =
+        &pool == disk_pool_ ? BoundaryTree::kDisk : (&pool == host_pool_ ? BoundaryTree::kHost : BoundaryTree::kDevice);
     // Preserve group and block order within each kind without a temporary
     // partition buffer for every inspected boundary.
     for (const bool state : {true, false}) {

@@ -44,7 +44,12 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "prepare_dsa_decode",
+    "prepare_dsa_decode_dcp_records",
+    "prepare_dsa_decode_projected_value",
+    "prepare_dsa_decode_topk",
+    "prepare_dsa_index_candidates",
     "prepare_dsa_prefill",
+    "prepare_dsa_select_owned_candidates",
     "prepare_kpool_decode_append",
     "prepare_kpool_decode_topk",
     "prepare_kpool_prefill_topk",
@@ -992,3 +997,880 @@ def prepare_dsa_decode(
     """Prepare one sparse decode attention call."""
 
     return _prepare_dsa_attention(request, platform, prefill=False)
+
+
+# ===-----------------------------------------------------------------------===#
+# Indexer DSA (Kimi-K3.1)
+# ===-----------------------------------------------------------------------===#
+#
+# Kimi-K3.1's lightning indexer scores every history token (no KPool pooling)
+# from an mxfp4 Index-K plane and keeps its top-k for the MLA core. Decode
+# without KV parallelism scores the whole history (``dsa_decode_topk``) and
+# attends it through the projected-value core. Under KV parallelism each rank
+# scores its owned pages (``dsa_index_candidates``), selects its share of the
+# group's top-k from every rank's gathered scores
+# (``dsa_select_owned_candidates``), and attends that share for every rank's
+# heads (``dsa_decode_dcp_records``). The cases time one rank (rank 0).
+
+_INDEXER_MODEL_PROFILES = frozenset({"kimi_k31_tp8"})
+_INDEXER_DTYPES = {"bfloat16": torch.bfloat16}
+_INDEXER_KV_CACHE_DTYPES = {"float8_e4m3fn": torch.float8_e4m3fn}
+_INDEXER_INDEX_K_FORMATS = frozenset({"mxfp4"})
+_MXFP4_GROUP_SIZE = 32
+# UE8M0 exponents [low, high) of the generated key scales (2^-3 to 2^0), so
+# generated scores stay finite; 255 would encode NaN.
+_MXFP4_SCALE_EXPONENTS = (124, 128)
+# The server's --dsa-slot-order default.
+_SLOT_ORDER = "selection"
+
+
+@dataclass(frozen=True)
+class _IndexerConfig:
+    """One DSA layer whose indexer scores every history token."""
+
+    model_profile: str
+    dtype: torch.dtype
+    kv_cache_dtype: torch.dtype
+    index_heads: int
+    index_head_dim: int
+    index_k_format: str
+    local_attention_heads: int
+    kv_lora_rank: int
+    qk_nope_head_dim: int
+    qk_rope_head_dim: int
+    v_head_dim: int
+    kv_page_size: int
+    topk_tokens: int
+    max_context: int
+
+    @property
+    def qk_head_dim(self) -> int:
+        return self.kv_lora_rank + self.qk_rope_head_dim
+
+    @property
+    def index_row_bytes(self) -> int:
+        """Bytes of one mxfp4 Index-K row: E2M1 code pairs, then UE8M0 scales."""
+        return self.index_head_dim // 2 + self.index_head_dim // _MXFP4_GROUP_SIZE
+
+    @property
+    def index_score_scale(self) -> float:
+        """The positive score scale the indexer's top-k multiplies by."""
+        return self.index_head_dim**-0.5 * self.index_heads**-0.5
+
+    @property
+    def attention_softmax_scale(self) -> float:
+        return (self.qk_nope_head_dim + self.qk_rope_head_dim) ** -0.5
+
+    @property
+    def table_columns(self) -> int:
+        """Decode page-table width: decode tables are sized by the serving
+        context capacity, not by the live history."""
+        return math.ceil(self.max_context / self.kv_page_size)
+
+
+def _resolve_indexer_config(request: BenchmarkRequest) -> _IndexerConfig:
+    if request.parameters.get("validation") is not None:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "DSA benchmark correctness validation is not implemented yet",
+        )
+    if request.registration is not None:
+        # The operations select their own leaves and take no exact override.
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Indexer DSA benchmarks take a solution, not an exact registration",
+        )
+    parameters = request.parameters
+    config = _IndexerConfig(
+        model_profile=_implemented_value(
+            "model_profile", parameters["model_profile"], _INDEXER_MODEL_PROFILES
+        ),
+        dtype=_parse_dtype("dtype", parameters["dtype"], _INDEXER_DTYPES),
+        kv_cache_dtype=_parse_dtype(
+            "kv_cache_dtype", parameters["kv_cache_dtype"], _INDEXER_KV_CACHE_DTYPES
+        ),
+        index_heads=parameters["index_heads"],
+        index_head_dim=parameters["index_head_dim"],
+        index_k_format=_implemented_value(
+            "index_k_format", parameters["index_k_format"], _INDEXER_INDEX_K_FORMATS
+        ),
+        local_attention_heads=parameters["local_attention_heads"],
+        kv_lora_rank=parameters["kv_lora_rank"],
+        qk_nope_head_dim=parameters["qk_nope_head_dim"],
+        qk_rope_head_dim=parameters["qk_rope_head_dim"],
+        v_head_dim=parameters["v_head_dim"],
+        kv_page_size=parameters["kv_page_size"],
+        topk_tokens=parameters["topk_tokens"],
+        max_context=parameters["max_context"],
+    )
+    if config.index_head_dim % _MXFP4_GROUP_SIZE:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            f"mxfp4 index_head_dim must be a multiple of {_MXFP4_GROUP_SIZE}",
+        )
+    return config
+
+
+def _indexer_common_parameters(config: _IndexerConfig) -> dict[str, object]:
+    return {
+        "model_profile": config.model_profile,
+        "dtype": str(config.dtype).removeprefix("torch."),
+        "kv_cache_dtype": str(config.kv_cache_dtype).removeprefix("torch."),
+        "index_heads": config.index_heads,
+        "index_head_dim": config.index_head_dim,
+        "index_k_format": config.index_k_format,
+        "attention_heads": config.local_attention_heads,
+        "kv_lora_rank": config.kv_lora_rank,
+        "qk_nope_head_dim": config.qk_nope_head_dim,
+        "qk_rope_head_dim": config.qk_rope_head_dim,
+        "v_head_dim": config.v_head_dim,
+        "kv_page_size": config.kv_page_size,
+        "topk_tokens": config.topk_tokens,
+        "max_context": config.max_context,
+    }
+
+
+def _verify_shape(
+    request: BenchmarkRequest, config: _IndexerConfig
+) -> tuple[int, int, int]:
+    """``(batch, q_len_per_req, sequence_length)`` of a decode verify step:
+    ``batch`` requests of ``q_len_per_req`` rows each, every request holding
+    ``sequence_length`` tokens including its verify window."""
+    parameters = request.parameters
+    batch, q_len_per_req, sequence_length = (
+        parameters[name] for name in ("batch", "q_len_per_req", "sequence_length")
+    )
+    if any(
+        type(value) is not int or value < 1
+        for value in (batch, q_len_per_req, sequence_length)
+    ):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Indexer DSA batch, q_len_per_req and sequence_length must be "
+            "positive integers",
+        )
+    if not q_len_per_req <= config.topk_tokens <= sequence_length:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Indexer DSA decode needs q_len_per_req <= topk_tokens <= "
+            "sequence_length, so every row selects a full top-k",
+        )
+    if sequence_length > config.max_context:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Indexer DSA sequence_length exceeds max_context",
+        )
+    return batch, q_len_per_req, sequence_length
+
+
+def _kvp_size(request: BenchmarkRequest) -> int:
+    kvp_size = request.parameters["kvp_size"]
+    if type(kvp_size) is not int or kvp_size < 2:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Indexer DSA kvp_size must be an integer of at least 2",
+        )
+    return kvp_size
+
+
+def _verify_rows(
+    batch: int,
+    q_len_per_req: int,
+    sequence_length: int,
+    *,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Every verify row's request and causal length: row ``j`` of a
+    request's window sees ``sequence_length - (q_len_per_req - 1) + j``
+    tokens."""
+    offsets = torch.arange(1 - q_len_per_req, 1, dtype=torch.int32, device=device)
+    causal_lens = offsets.add(sequence_length).repeat(batch).contiguous()
+    requests = torch.arange(batch, dtype=torch.int32, device=device)
+    return requests.repeat_interleave(q_len_per_req), causal_lens
+
+
+def _scheduler_page_table(
+    batch: int,
+    sequence_length: int,
+    *,
+    config: _IndexerConfig,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Every request's scheduler (virtual) page table at the decode width.
+
+    Block 0 is the null block. Request ``r``'s live pages are blocks
+    ``1 + r * live_pages + column``; columns past them hold 0.
+    """
+    live_pages = math.ceil(sequence_length / config.kv_page_size)
+    column = torch.arange(config.table_columns, dtype=torch.int32, device=device)
+    first = 1 + torch.arange(batch, dtype=torch.int32, device=device) * live_pages
+    return torch.where(column < live_pages, first.unsqueeze(1) + column, 0).contiguous()
+
+
+def _owned_page_table(
+    scheduler_table: torch.Tensor, *, kvp_size: int, kvp_rank: int
+) -> torch.Tensor:
+    """One KVP rank's local page table of ``scheduler_table``.
+
+    As the runtime's cache placement (``virtual_slots_to_local``), rank
+    ``r`` owns block ``b > 0`` when ``(b - 1) % kvp_size == r``, as local
+    page ``(b - 1) // kvp_size + 1``; other columns are -1.
+    """
+    before = scheduler_table - 1
+    owned = (scheduler_table > 0) & (before % kvp_size == kvp_rank)
+    return torch.where(owned, before // kvp_size + 1, -1).to(torch.int32).contiguous()
+
+
+def _spread_slots(
+    causal_lens: torch.Tensor,
+    requests: torch.Tensor,
+    *,
+    topk: int,
+    region_slots: int,
+    device: torch.device | str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A stand-in for the indexer's selection: ``topk`` slots per row spread
+    over its causal history, in request ``r``'s region of ``region_slots``
+    cache slots starting at ``r * region_slots``."""
+    columns = torch.arange(topk, dtype=torch.int64, device=device)
+    phases = torch.arange(causal_lens.numel(), dtype=torch.int64, device=device)
+    positions = (
+        columns.unsqueeze(0) * _POOL_PERMUTATION_STRIDE
+        + phases.unsqueeze(1) * _TOKEN_PERMUTATION_STRIDE
+    ).remainder_(causal_lens.to(torch.int64).unsqueeze(1))
+    slots = positions + requests.to(torch.int64).unsqueeze(1) * region_slots
+    lens = causal_lens.clamp(max=topk)
+    slots.masked_fill_(columns.unsqueeze(0) >= lens.unsqueeze(1), -1)
+    return slots.to(torch.int32).contiguous(), lens.to(torch.int32).contiguous()
+
+
+def _mxfp4_index_plane(
+    pages: int, *, config: _IndexerConfig, generator: torch.Generator
+) -> torch.Tensor:
+    """Random mxfp4 Index-K pages as the runtime plane: uint8 ``[pages *
+    page_size, row_bytes]``, each page its rows' E2M1 code bytes, then their
+    UE8M0 scale bytes (page planar)."""
+    code_bytes = config.kv_page_size * config.index_head_dim // 2
+    scale_bytes = config.kv_page_size * config.index_head_dim // _MXFP4_GROUP_SIZE
+    plane = torch.empty(
+        (pages, code_bytes + scale_bytes), dtype=torch.uint8, device="cuda"
+    )
+    plane[:, :code_bytes] = torch.randint(
+        0,
+        256,
+        (pages, code_bytes),
+        generator=generator,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    plane[:, code_bytes:] = torch.randint(
+        *_MXFP4_SCALE_EXPONENTS,
+        (pages, scale_bytes),
+        generator=generator,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    return plane.view(pages * config.kv_page_size, config.index_row_bytes)
+
+
+def _index_queries(
+    rows: int, *, config: _IndexerConfig, generator: torch.Generator
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """mxfp4 index query codes and scale words, and the per-head score
+    weights as a strided view of the indexer's ``[wk; weights_proj]``
+    projection rows."""
+    from tokenspeed_kernel.ops.attention import dsa as dsa_ops
+
+    q = _randn(
+        (rows, config.index_heads, config.index_head_dim),
+        generator=generator,
+        dtype=config.dtype,
+    )
+    codes, scales = dsa_ops.dsa_quantize_index_query_mxfp4(q)
+    key_weights = _randn(
+        (rows, config.index_head_dim + config.index_heads),
+        generator=generator,
+        dtype=config.dtype,
+    )
+    return codes, scales, key_weights[:, config.index_head_dim :]
+
+
+def _select_indexer_registration(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+    mode: str,
+    signature: object,
+    traits: dict[str, object],
+) -> KernelSpec:
+    try:
+        selected = select_kernel(
+            request.family,
+            mode,
+            signature,
+            platform=platform,
+            traits=traits,
+            solution=request.solution,
+        )
+    except NoKernelFoundError as error:
+        raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(error)) from error
+    spec = KernelRegistry.get().get_by_name(selected.name)
+    if spec is None:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.REGISTRATION_MISSING,
+            f"Selected registration {selected.name!r} is not available",
+        )
+    return spec
+
+
+def _index_scorer_selection(
+    config: _IndexerConfig,
+) -> tuple[object, dict[str, object]]:
+    """The scorers' signature and the traits they share (mxfp4 queries over
+    the packed ``[slots, row_bytes]`` plane)."""
+    from tokenspeed_kernel.ops.attention import dsa as dsa_ops
+
+    signature = format_signature(
+        q=dsa_ops.MXFP4_INDEX_QUERY_FORMAT, weights=dense_tensor_format(config.dtype)
+    )
+    return signature, {
+        "index_heads": config.index_heads,
+        "head_dim": config.index_head_dim,
+        "page_size": config.kv_page_size,
+        "index_k_format": config.index_k_format,
+        "index_k_layout": "packed",
+    }
+
+
+def _owned_candidates(
+    request: BenchmarkRequest,
+    config: _IndexerConfig,
+    batch: int,
+    q_len_per_req: int,
+    sequence_length: int,
+    kvp_size: int,
+    generator: torch.Generator,
+) -> dict[str, object]:
+    """Rank 0's inputs to ``dsa_index_candidates`` for every verify row:
+    owned Index-K pages, queries and the page plan the runtime builds once
+    per forward for every indexer layer."""
+    from tokenspeed_kernel.ops.attention import dsa as dsa_ops
+
+    requests, causal_lens = _verify_rows(
+        batch, q_len_per_req, sequence_length, device="cuda"
+    )
+    local_table = _owned_page_table(
+        _scheduler_page_table(batch, sequence_length, config=config, device="cuda"),
+        kvp_size=kvp_size,
+        kvp_rank=0,
+    )
+    local_pages = int(local_table.max()) + 1
+    plane = _mxfp4_index_plane(local_pages, config=config, generator=generator)
+    q, q_scales, weights = _index_queries(
+        requests.numel(), config=config, generator=generator
+    )
+    pages = dsa_ops.plan_dsa_index_candidates(
+        q,
+        weights,
+        plane,
+        local_table,
+        requests,
+        causal_lens,
+        page_size=config.kv_page_size,
+        solution=request.solution,
+        index_k_format=config.index_k_format,
+    )
+    return {
+        "q": q,
+        "q_scales": q_scales,
+        "weights": weights,
+        "plane": plane,
+        "local_table": local_table,
+        "local_pages": local_pages,
+        "requests": requests,
+        "causal_lens": causal_lens,
+        "pages": pages,
+    }
+
+
+def _score_owned_candidates(
+    request: BenchmarkRequest,
+    config: _IndexerConfig,
+    inputs: dict[str, object],
+    q_len_per_req: int,
+    scores_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from tokenspeed_kernel.ops.attention import dsa as dsa_ops
+
+    return dsa_ops.dsa_index_candidates(
+        inputs["q"],
+        inputs["weights"],
+        inputs["plane"],
+        inputs["local_table"],
+        inputs["requests"],
+        inputs["causal_lens"],
+        page_size=config.kv_page_size,
+        topk=config.topk_tokens,
+        softmax_scale=config.index_score_scale,
+        initial_tokens=0,
+        local_tokens=0,
+        solution=request.solution,
+        pages=inputs["pages"],
+        scores_out=scores_out,
+        q_scales=inputs["q_scales"],
+        query_group_size=q_len_per_req,
+        index_k_format=config.index_k_format,
+    )
+
+
+def _gathered_scores_and_query(
+    config: _IndexerConfig,
+    rows: int,
+    kvp_size: int,
+    rank_scores: torch.Tensor,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The owned top-k's all-gather as it lands: per rank, ``[rows, topk]``
+    FP32 candidate scores, then its decode query rows riding along.
+
+    Rank 0's plane holds ``rank_scores``; every other rank's holds them
+    permuted along the candidates and slightly perturbed, so the ranks'
+    shares of the selection stay balanced as on a uniformly spread
+    history. Returns the rank-major ``[ranks, rows, topk]`` score view and
+    the rank-major FP8 ``[ranks, rows, heads, qk_head_dim]`` query view.
+    """
+    score_bytes = rows * config.topk_tokens * torch.float32.itemsize
+    query_row_bytes = (
+        config.local_attention_heads
+        * config.qk_head_dim
+        * config.kv_cache_dtype.itemsize
+    )
+    gathered = torch.empty(
+        (kvp_size, score_bytes + rows * query_row_bytes),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    scores = (
+        gathered[:, :score_bytes]
+        .view(torch.float32)
+        .view(kvp_size, rows, config.topk_tokens)
+    )
+    scores[0].copy_(rank_scores)
+    for rank in range(1, kvp_size):
+        permutation = torch.randperm(
+            config.topk_tokens, generator=generator, device="cuda"
+        )
+        noise = torch.randn(rank_scores.shape, generator=generator, device="cuda").mul_(
+            1e-3
+        )
+        scores[rank].copy_(rank_scores[:, permutation] * (1 + noise))
+    query = gathered[:, score_bytes:].view(kvp_size, rows, query_row_bytes)
+    query.view(config.kv_cache_dtype).copy_(
+        _randn(
+            (kvp_size, rows, query_row_bytes // config.kv_cache_dtype.itemsize),
+            generator=generator,
+            dtype=config.dtype,
+        ).to(config.kv_cache_dtype)
+    )
+    return scores, query.view(config.kv_cache_dtype).view(
+        kvp_size, rows, config.local_attention_heads, config.qk_head_dim
+    )
+
+
+def _verify_parameters(
+    config: _IndexerConfig, batch: int, q_len_per_req: int, sequence_length: int
+) -> dict[str, object]:
+    return {
+        **_indexer_common_parameters(config),
+        "batch": batch,
+        "q_len_per_req": q_len_per_req,
+        "sequence_length": sequence_length,
+        "table_columns": config.table_columns,
+    }
+
+
+def prepare_dsa_decode_topk(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one indexer top-k over the whole history of each request."""
+
+    config = _resolve_indexer_config(request)
+    batch, q_len_per_req, sequence_length = _verify_shape(request, config)
+    load_builtin_kernels()
+    signature, traits = _index_scorer_selection(config)
+    spec = _select_indexer_registration(
+        request,
+        platform,
+        "dsa_decode_topk",
+        signature,
+        {**traits, "q_len": q_len_per_req, "topk": config.topk_tokens},
+    )
+
+    from tokenspeed_kernel.ops.attention import dsa as dsa_ops
+
+    generator = _generator(request.seed)
+    block_table = _scheduler_page_table(
+        batch, sequence_length, config=config, device="cuda"
+    )
+    plane = _mxfp4_index_plane(
+        int(block_table.max()) + 1, config=config, generator=generator
+    )
+    rows = batch * q_len_per_req
+    q, q_scales, weights = _index_queries(rows, config=config, generator=generator)
+    seq_lens = torch.full((batch,), sequence_length, dtype=torch.int32, device="cuda")
+    out = torch.empty((rows, config.topk_tokens), dtype=torch.int32, device="cuda")
+    lens_out = torch.empty(rows, dtype=torch.int32, device="cuda")
+
+    def invoke() -> object:
+        return dsa_ops.dsa_decode_topk(
+            q,
+            weights,
+            seq_lens,
+            block_table,
+            page_size=config.kv_page_size,
+            topk=config.topk_tokens,
+            softmax_scale=config.index_score_scale,
+            batch_invariant=False,
+            q_len_per_req=q_len_per_req,
+            index_k_cache=plane,
+            q_scales=q_scales,
+            out=out,
+            lens_out=lens_out,
+            slot_order=_SLOT_ORDER,
+            solution=request.solution,
+            index_k_format=config.index_k_format,
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters=_verify_parameters(config, batch, q_len_per_req, sequence_length),
+        validation=None,
+    )
+
+
+def prepare_dsa_decode_projected_value(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one sparse decode of the attention-TP heads with their gated
+    value projection."""
+
+    config = _resolve_indexer_config(request)
+    batch, q_len_per_req, sequence_length = _verify_shape(request, config)
+    rows = batch * q_len_per_req
+    load_builtin_kernels()
+    spec = _select_indexer_registration(
+        request,
+        platform,
+        "dsa_decode_projected_value",
+        format_signature(q=dense_tensor_format(config.kv_cache_dtype)),
+        {
+            "q_len": q_len_per_req,
+            "kv_lora_rank": config.kv_lora_rank,
+            "qk_rope_head_dim": config.qk_rope_head_dim,
+            "topk": config.topk_tokens,
+            "logit_cap": False,
+            "topk_layout": "global_slots",
+            "gate_kind": "sigmoid",
+            "tokens": rows,
+            "heads": config.local_attention_heads,
+            "q_dtype": config.kv_cache_dtype,
+            "kv_dtype": config.kv_cache_dtype,
+            "value_head_dim": config.v_head_dim,
+            "qk_nope_head_dim": config.qk_nope_head_dim,
+            "page_size": config.kv_page_size,
+            "slot_order": _SLOT_ORDER,
+        },
+    )
+
+    from tokenspeed_kernel.ops.attention import dsa as dsa_ops
+
+    generator = _generator(request.seed)
+    requests, causal_lens = _verify_rows(
+        batch, q_len_per_req, sequence_length, device="cuda"
+    )
+    topk_slots, topk_lens = _spread_slots(
+        causal_lens,
+        requests,
+        topk=config.topk_tokens,
+        region_slots=sequence_length,
+        device="cuda",
+    )
+    # The core reads an FP8 query over an FP8 cache.
+    q = _randn(
+        (rows, config.local_attention_heads, config.qk_head_dim),
+        generator=generator,
+        dtype=config.dtype,
+    ).to(config.kv_cache_dtype)
+    kv_cache = _randn(
+        (batch * sequence_length, 1, config.qk_head_dim),
+        generator=generator,
+        dtype=config.dtype,
+    ).to(config.kv_cache_dtype)
+    # The absorbed value projection (w_vc) is K-major: [heads, kv_lora_rank,
+    # v_head_dim] viewed over [heads, v_head_dim, kv_lora_rank] storage.
+    value_weight = _randn(
+        (config.local_attention_heads, config.v_head_dim, config.kv_lora_rank),
+        generator=generator,
+        dtype=config.dtype,
+    ).transpose(1, 2)
+    gate = _randn(
+        (rows, config.local_attention_heads * config.v_head_dim),
+        generator=generator,
+        dtype=config.dtype,
+    )
+    out = torch.empty_like(gate)
+
+    def invoke() -> object:
+        return dsa_ops.dsa_decode_projected_value(
+            q,
+            kv_cache,
+            topk_slots,
+            topk_lens,
+            config.max_context,
+            config.qk_nope_head_dim,
+            config.kv_lora_rank,
+            config.qk_rope_head_dim,
+            config.attention_softmax_scale,
+            config.kv_page_size,
+            value_weight,
+            gate=gate,
+            out=out,
+            q_len_per_req=q_len_per_req,
+            solution=request.solution,
+            slot_order=_SLOT_ORDER,
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters=_verify_parameters(config, batch, q_len_per_req, sequence_length),
+        validation=None,
+    )
+
+
+def prepare_dsa_index_candidates(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one KVP rank's scoring of its owned pages for every verify
+    row, writing its candidates' scores where the all-gather reads them."""
+
+    config = _resolve_indexer_config(request)
+    batch, q_len_per_req, sequence_length = _verify_shape(request, config)
+    kvp_size = _kvp_size(request)
+    load_builtin_kernels()
+    signature, traits = _index_scorer_selection(config)
+    spec = _select_indexer_registration(
+        request, platform, "dsa_index_candidates", signature, traits
+    )
+
+    generator = _generator(request.seed)
+    inputs = _owned_candidates(
+        request, config, batch, q_len_per_req, sequence_length, kvp_size, generator
+    )
+    rows = batch * q_len_per_req
+    scores_out = torch.empty(
+        (rows, config.topk_tokens), dtype=torch.float32, device="cuda"
+    )
+
+    def invoke() -> object:
+        return _score_owned_candidates(
+            request, config, inputs, q_len_per_req, scores_out
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            **_verify_parameters(config, batch, q_len_per_req, sequence_length),
+            "kvp_size": kvp_size,
+            "owned_index_pages": inputs["local_pages"] - 1,
+        },
+        validation=None,
+    )
+
+
+def prepare_dsa_select_owned_candidates(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one KVP rank's selection of its share of the group's top-k
+    from every rank's gathered candidate scores."""
+
+    config = _resolve_indexer_config(request)
+    batch, q_len_per_req, sequence_length = _verify_shape(request, config)
+    kvp_size = _kvp_size(request)
+    rows = batch * q_len_per_req
+    query_row_bytes = (
+        config.local_attention_heads
+        * config.qk_head_dim
+        * config.kv_cache_dtype.itemsize
+    )
+    load_builtin_kernels()
+    spec = _select_indexer_registration(
+        request,
+        platform,
+        "dsa_select_owned_candidates",
+        format_signature(scores=dense_tensor_format(torch.float32)),
+        {
+            "ranks": kvp_size,
+            "rows": rows,
+            "topk": config.topk_tokens,
+            # Each rank's scores are followed by its gathered query rows.
+            "rank_stride": rows * config.topk_tokens
+            + rows * query_row_bytes // torch.float32.itemsize,
+        },
+    )
+
+    from tokenspeed_kernel.ops.attention import dsa as dsa_ops
+
+    generator = _generator(request.seed)
+    inputs = _owned_candidates(
+        request, config, batch, q_len_per_req, sequence_length, kvp_size, generator
+    )
+    rank_scores = torch.empty(
+        (rows, config.topk_tokens), dtype=torch.float32, device="cuda"
+    )
+    positions, _ = _score_owned_candidates(
+        request, config, inputs, q_len_per_req, rank_scores
+    )
+    scores, _ = _gathered_scores_and_query(
+        config, rows, kvp_size, rank_scores, generator
+    )
+    out = torch.empty((rows, config.topk_tokens), dtype=torch.int32, device="cuda")
+    lens_out = torch.empty(rows, dtype=torch.int32, device="cuda")
+
+    def invoke() -> object:
+        return dsa_ops.dsa_select_owned_candidates(
+            scores,
+            positions,
+            inputs["local_table"],
+            inputs["requests"],
+            rank=0,
+            topk=config.topk_tokens,
+            page_size=config.kv_page_size,
+            solution=request.solution,
+            out=out,
+            lens_out=lens_out,
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            **_verify_parameters(config, batch, q_len_per_req, sequence_length),
+            "kvp_size": kvp_size,
+            "rank_stride": scores.stride(0),
+        },
+        validation=None,
+    )
+
+
+def prepare_dsa_decode_dcp_records(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one KVP rank's sparse decode of every rank's heads over its
+    share of the selection, written as the records the group combines."""
+
+    config = _resolve_indexer_config(request)
+    batch, q_len_per_req, sequence_length = _verify_shape(request, config)
+    kvp_size = _kvp_size(request)
+    rows = batch * q_len_per_req
+    load_builtin_kernels()
+    spec = _select_indexer_registration(
+        request,
+        platform,
+        "dsa_decode_dcp_records",
+        format_signature(q=dense_tensor_format(config.kv_cache_dtype)),
+        {
+            "q_len": q_len_per_req,
+            "tokens": rows,
+            "heads": kvp_size * config.local_attention_heads,
+            "topk": config.topk_tokens,
+            "q_dtype": config.kv_cache_dtype,
+            "kv_dtype": config.kv_cache_dtype,
+            "qk_nope_head_dim": config.qk_nope_head_dim,
+            "kv_lora_rank": config.kv_lora_rank,
+            "qk_rope_head_dim": config.qk_rope_head_dim,
+            "page_size": config.kv_page_size,
+            "logit_cap": False,
+            "topk_layout": "global_slots",
+            "slot_order": _SLOT_ORDER,
+        },
+    )
+
+    from tokenspeed_kernel.ops.attention import dsa as dsa_ops
+
+    generator = _generator(request.seed)
+    inputs = _owned_candidates(
+        request, config, batch, q_len_per_req, sequence_length, kvp_size, generator
+    )
+    rank_scores = torch.empty(
+        (rows, config.topk_tokens), dtype=torch.float32, device="cuda"
+    )
+    positions, _ = _score_owned_candidates(
+        request, config, inputs, q_len_per_req, rank_scores
+    )
+    scores, q = _gathered_scores_and_query(
+        config, rows, kvp_size, rank_scores, generator
+    )
+    # This rank's share of the group's selection, as the runtime selects it.
+    topk_slots, topk_lens = dsa_ops.dsa_select_owned_candidates(
+        scores,
+        positions,
+        inputs["local_table"],
+        inputs["requests"],
+        rank=0,
+        topk=config.topk_tokens,
+        page_size=config.kv_page_size,
+        solution=request.solution,
+    )
+    kv_cache = _randn(
+        (inputs["local_pages"] * config.kv_page_size, 1, config.qk_head_dim),
+        generator=generator,
+        dtype=config.dtype,
+    ).to(config.kv_cache_dtype)
+    workspace_bytes = dsa_ops.dsa_decode_dcp_records_workspace_bytes(
+        tokens=rows,
+        heads=kvp_size * config.local_attention_heads,
+        topk=config.topk_tokens,
+        q_dtype=config.kv_cache_dtype,
+        kv_dtype=config.kv_cache_dtype,
+        kv_lora_rank=config.kv_lora_rank,
+        qk_rope_head_dim=config.qk_rope_head_dim,
+    )
+    workspace = torch.empty(
+        math.ceil(workspace_bytes / torch.int32.itemsize),
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    def invoke() -> object:
+        return dsa_ops.dsa_decode_dcp_records(
+            q=q,
+            kv_cache=kv_cache,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            kv_lora_rank=config.kv_lora_rank,
+            qk_rope_head_dim=config.qk_rope_head_dim,
+            softmax_scale=config.attention_softmax_scale,
+            page_size=config.kv_page_size,
+            q_len_per_req=q_len_per_req,
+            solution=request.solution,
+            slot_order=_SLOT_ORDER,
+            workspace=workspace,
+        )
+
+    return PreparedBenchmark(
+        registration=spec,
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            **_verify_parameters(config, batch, q_len_per_req, sequence_length),
+            "kvp_size": kvp_size,
+        },
+        validation=None,
+    )

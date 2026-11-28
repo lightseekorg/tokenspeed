@@ -55,8 +55,9 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mha.prefill import (  # noqa: E4
 )
 
 FP8 = torch.float8_e4m3fn
-# The head dims extend and prefill accept.
+# The head dims prefill accepts; extend also takes 256.
 HEAD_DIMS = [64, 128]
+EXTEND_HEAD_DIMS = [64, 128, 256]
 Q_HEADS = 16
 KV_HEADS = 2
 PAGE_SIZE = 64
@@ -162,7 +163,7 @@ def test_decode_keeps_small_fp8_probabilities(
     _check(out, expected, has_sink)
 
 
-@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("head_dim", EXTEND_HEAD_DIMS)
 @pytest.mark.parametrize("has_sink", [False, True])
 @pytest.mark.parametrize("window_left", [-1, OTHER_KEYS + 64])
 def test_extend_keeps_small_fp8_probabilities(window_left, has_sink, head_dim):
@@ -261,7 +262,7 @@ def _random_fp8(*shape: int, scale: float, seed: int) -> torch.Tensor:
     return x.to(FP8)
 
 
-@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("head_dim", EXTEND_HEAD_DIMS)
 @pytest.mark.parametrize("window_left", [-1, 255])
 @pytest.mark.parametrize("prefix,rows", [(0, 1024), (2048, 32), (2048, 1024)])
 def test_extend_matches_reference_on_random_fp8(prefix, rows, window_left, head_dim):

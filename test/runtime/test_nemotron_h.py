@@ -1039,6 +1039,7 @@ def test_mamba2_verify_scan_continues_each_request_from_its_committed_state(repl
         draft_token_num=steps,
         seq_len=rows,
         replay_payload=None,
+        output_norm=None,
         **_UNUSED,
     )
     assert out.shape == (1, rows, heads, head_dim)

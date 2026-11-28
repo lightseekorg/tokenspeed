@@ -750,6 +750,8 @@ def _apply_constrained_decoding_policy(
 
 
 class ModelConfig:
+    download_dir: str | None
+
     def __init__(
         self,
         model_path: str,
@@ -788,6 +790,8 @@ class ModelConfig:
         if override_config_file and override_config_file.strip():
             kwargs["_configuration_file"] = override_config_file.strip()
 
+        download_dir = server_args.download_dir if server_args is not None else None
+        self.download_dir = download_dir
         self.hf_config = get_config(
             model_path,
             trust_remote_code=trust_remote_code,
@@ -799,6 +803,7 @@ class ModelConfig:
                 if is_draft_worker
                 else None
             ),
+            download_dir=download_dir,
             **kwargs,
         )
         _apply_constrained_decoding_policy(
@@ -810,6 +815,7 @@ class ModelConfig:
             self.model_path,
             trust_remote_code=trust_remote_code,
             revision=revision,
+            download_dir=download_dir,
             **kwargs,
         )
 
@@ -830,6 +836,7 @@ class ModelConfig:
         self.model_profile: ModelProfile | None = (
             resolved_profile[1] if resolved_profile is not None else None
         )
+        self.runtime_config: object | None = None
         self.spec_block_size: int | None = None
         self.draft_sample_from_anchor: bool = False
         if is_draft_worker:
@@ -858,6 +865,7 @@ class ModelConfig:
             dspark_num_stages = count_dspark_stages(
                 model_path,
                 revision=revision,
+                download_dir=download_dir,
             )
             if dspark_num_stages is None:
                 raise ValueError(
@@ -954,6 +962,15 @@ class ModelConfig:
                 "Running in encoder-only mode: the language model will not "
                 "be constructed or loaded (encode role)."
             )
+        if not is_draft_worker and server_args.ple_table_layout != "global_sharded":
+            if (
+                not is_qwen4_exp(self.hf_config)
+                or not self.hf_text_config.ple_layer_ids
+            ):
+                raise ValueError(
+                    "--ple-table-layout requires a Qwen4-Exp target with PLE layers"
+                )
+            self.hf_text_config.ple_table_layout = server_args.ple_table_layout
         if server_args.decode_monokernel and not is_draft_worker:
             # The model reads the switch from its text config. ServerArgs
             # accepts it only for DECODE_MONOKERNEL_ARCHITECTURES, whose
@@ -1030,6 +1047,10 @@ class ModelConfig:
                 attention_family, resolve_architecture(self.hf_config), server_args
             )
         if self.model_profile is not None:
+            if self.model_profile.create_runtime_config is not None:
+                self.runtime_config = self.model_profile.create_runtime_config(
+                    self, server_args
+                )
             _apply_attention_defaults(
                 server_args,
                 name=resolve_architecture(self.hf_config),
@@ -1166,10 +1187,18 @@ class ModelConfig:
         fallback = quant_cfg is None or is_inkling2_manifest_stub(quant_cfg)
         if fallback or inkling2_summary:
             # modelopt NVFP4 checkpoints store quant config in hf_quant_config.json
-            # Resolve the local snapshot directory (model_path may be a HF hub ID)
-            if os.path.isdir(self.model_path):
-                model_dir = self.model_path
-            else:
+            # Resolve the local snapshot directory (model_path may be a local dir,
+            # object-store URI, or HF hub ID)
+            from tokenspeed.runtime.model_loader.object_store import (
+                resolve_checkpoint_metadata_dir,
+            )
+
+            model_dir = resolve_checkpoint_metadata_dir(
+                self.model_path,
+                download_dir=self.download_dir,
+                sync=True,
+            )
+            if model_dir is None:
                 try:
                     from huggingface_hub import snapshot_download
 

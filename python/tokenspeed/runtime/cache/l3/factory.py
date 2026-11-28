@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from tokenspeed.runtime.cache.host_storage import host_block_capacity
@@ -54,13 +55,14 @@ def model_checkpoint_id(server_args: ServerArgs, model_config: ModelConfig) -> s
         hf_config=model_config.hf_config,
         revision=str(model_config.revision or ""),
         load_format=str(server_args.load_format),
-        # LoadConfig uses this same empty extra-config.
-        model_loader_extra_config={},
+        model_loader_extra_config=server_args.model_loader_extra_config,
         ext_yaml=str(server_args.ext_yaml or ""),
     )
 
 
-def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any]:
+def _kv_producer_options(
+    args: ServerArgs, *, draft_dtype: str, plugin_runtime_config: bool
+) -> dict[str, Any]:
     """Snapshot numerical and partition choices for the deployment identity.
 
     Target dtype is already part of the packed-cache signature. An empty
@@ -72,6 +74,14 @@ def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any
     return {
         "draft_dtype": draft_dtype,
         "numerics": args.numerics,
+        # Runtime-config hooks separate plugin execution policy from HF data.
+        # Keep a marker even with no explicit options so old checkpoint-owned
+        # policies cannot share KV with the new launch-owned policy.
+        **(
+            {"extra_server_args": dict(args.extra_server_args)}
+            if args.extra_server_args or plugin_runtime_config
+            else {}
+        ),
         "yarn_ramp_mask_device": args.yarn_ramp_mask_device,
         "yarn_frequency_device": args.yarn_frequency_device,
         "mla_lora_scale": args.mla_lora_scale,
@@ -220,6 +230,56 @@ def cache_deployment_id(
     Returns:
         The id; the weight version is not part of it.
     """
+    return cache_layout_deployment_id(
+        server_args,
+        model_config,
+        draft_model_config,
+        cache_layout=host_cache,
+        checkpoint_granularities=host_cache.checkpoint_granularities,
+        group_shard_counts=host_cache.ownership.shard_counts,
+        attention_backend_name=host_cache.attention_backend_name,
+        draft_attention_backend_name=host_cache.draft_attention_backend_name,
+        world_cpu_group=world_cpu_group,
+        for_peer=for_peer,
+    )
+
+
+def cache_layout_deployment_id(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    draft_model_config: ModelConfig | None,
+    *,
+    cache_layout: Any,
+    checkpoint_granularities: tuple[tuple[str, int], ...],
+    group_shard_counts: Sequence[int],
+    attention_backend_name: str,
+    draft_attention_backend_name: str,
+    world_cpu_group: ProcessGroup | None,
+    for_peer: bool,
+) -> str:
+    """``cache_deployment_id`` from the cache facts themselves, for a rank
+    that has no ``HostCacheResources``: a rank of a shared L2 pool, which
+    allocates no Host storage and which the pool admits by this id
+    (``cache/shared_l2``).
+
+    Args:
+        server_args: Resolved launch settings; numerical choices are snapshotted.
+        model_config: Target checkpoint configuration, without model weights.
+        draft_model_config: Draft checkpoint configuration, or None.
+        cache_layout: The packed Host CacheBlock layout, as
+            ``cache_layout_signature`` reads it.
+        checkpoint_granularities: The groups whose checkpoints are coarser
+            than a page, with their granularity.
+        group_shard_counts: Each cache group's shard count.
+        attention_backend_name: The resolved target attention backend.
+        draft_attention_backend_name: The resolved draft attention backend.
+        world_cpu_group: The existing Gloo world group for checkpoint agreement;
+            None in a single-process deployment. Every rank calls this.
+        for_peer: Apply the live peer cache compatibility rules.
+
+    Returns:
+        The id; the weight version is not part of it.
+    """
     from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS
 
     eagle3_layers_to_capture: tuple[int, ...] = ()
@@ -233,14 +293,12 @@ def cache_deployment_id(
             draft_layers = _eagle_aux_layer_ids(draft_model_config.hf_config)
             if draft_layers:
                 eagle3_layers_to_capture = tuple(int(layer) for layer in draft_layers)
-    attention_backend_name = host_cache.attention_backend_name
-    draft_attention_backend_name = host_cache.draft_attention_backend_name
     from tokenspeed.runtime.cache.l3.identity import cache_layout_signature
 
     cache_signature = cache_layout_signature(
-        host_cache,
+        cache_layout,
         cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
-        checkpoint_granularities=host_cache.checkpoint_granularities,
+        checkpoint_granularities=checkpoint_granularities,
     )
     from tokenspeed.runtime.cache.l3.identity import (
         L3_RUNTIME_COMPAT,
@@ -274,7 +332,7 @@ def cache_deployment_id(
         cache_signature=cache_signature,
         pipeline_rank=pipeline_rank,
         attn_tp_size=int(server_args.mapping.attn.tp_size),
-        group_shard_counts=host_cache.ownership.shard_counts,
+        group_shard_counts=group_shard_counts,
         draft_model=draft_model,
         draft_revision=draft_revision,
         cache_quantization=cache_quantization,
@@ -286,6 +344,11 @@ def cache_deployment_id(
         for_peer=for_peer,
         kv_producer=_kv_producer_options(
             server_args,
+            plugin_runtime_config=(
+                model_config.runtime_config is not None
+                or draft_model_config is not None
+                and draft_model_config.runtime_config is not None
+            ),
             draft_dtype=(
                 str(draft_model_config.dtype) if draft_model_config is not None else ""
             ),

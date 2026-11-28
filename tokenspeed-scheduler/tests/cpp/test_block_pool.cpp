@@ -169,6 +169,28 @@ TEST(BlockPoolTest, DestroyWithLiveReferenceReportsFatalInvariant) {
         "BlockPool destroyed with live block references");
 }
 
+TEST(BlockPoolTest, ReleaseCountsFollowLastOwnersAndParentRebinding) {
+    BlockPool pool(1, {2, 1});
+    auto first = pool.AcquireBlock(0);
+    auto second = pool.AcquireBlock(0);
+    auto pinned = first;
+    first.reset();
+    EXPECT_EQ(pool.Released(0).child_slots, 0u);
+    second.reset();
+    EXPECT_EQ(pool.Released(0).child_slots, 1u);
+    EXPECT_EQ(pool.Released(0).parents, 0u);
+    pinned.reset();
+    EXPECT_EQ(pool.Released(0).child_slots, 2u);
+    EXPECT_EQ(pool.Released(0).parents, 1u);
+    auto rebound = pool.AcquireBlock(1);
+    ASSERT_TRUE(rebound);
+    EXPECT_EQ(pool.Released(1).child_slots, 0u);
+    rebound.reset();
+    EXPECT_EQ(pool.Released(1).child_slots, 1u);
+    EXPECT_EQ(pool.Released(1).parents, 1u);
+    EXPECT_EQ(pool.Released(0).parents, 1u);
+}
+
 TEST(BlockPoolTest, KOneBatchAcquireIsAllOrNothing) {
     BlockPool pool(3, {1});
     auto blocks = pool.AcquireBlocks(/*group_id=*/0, /*num=*/4);

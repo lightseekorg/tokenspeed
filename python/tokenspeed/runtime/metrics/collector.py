@@ -460,6 +460,11 @@ class EngineMetrics:
             ),
             labelnames=labelnames,
         )
+        self.prefix_peer_hit_tokens = factory.counter(
+            name="tokenspeed:prefix_peer_hit_tokens",
+            documentation="Additional Device peer tokens used at first prefill dispatch.",
+            labelnames=labelnames,
+        )
         self.prefix_host_hit_tokens = factory.counter(
             name="tokenspeed:prefix_host_hit_tokens",
             documentation=(
@@ -714,6 +719,7 @@ class EngineMetrics:
         device_hit_tokens: int,
         host_hit_tokens: int,
         l3_hit_tokens: int,
+        peer_hit_tokens: int = 0,
     ) -> None:
         """Counters gained since the last report (the Rust host diffs them)."""
         if not self.enabled:
@@ -721,7 +727,10 @@ class EngineMetrics:
         if prompt_tokens > 0:
             self.prefix_prompt_tokens.labels(**self.labels).inc(prompt_tokens)
             for metric, hit in (
-                (self.prefix_cache_hit_ratio, device_hit_tokens + host_hit_tokens),
+                (
+                    self.prefix_cache_hit_ratio,
+                    device_hit_tokens + host_hit_tokens + peer_hit_tokens,
+                ),
                 (self.prefix_device_hit_ratio, device_hit_tokens),
                 (self.prefix_host_hit_ratio, host_hit_tokens),
             ):
@@ -732,6 +741,8 @@ class EngineMetrics:
             self.prefix_device_hit_tokens.labels(**self.labels).inc(device_hit_tokens)
         if host_hit_tokens > 0:
             self.prefix_host_hit_tokens.labels(**self.labels).inc(host_hit_tokens)
+        if peer_hit_tokens > 0:
+            self.prefix_peer_hit_tokens.labels(**self.labels).inc(peer_hit_tokens)
         if l3_hit_tokens > 0:
             self.prefix_l3_hit_tokens.labels(**self.labels).inc(l3_hit_tokens)
 

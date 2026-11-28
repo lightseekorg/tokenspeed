@@ -149,3 +149,34 @@ def test_host_gather_large_table_offset(table_shards, tokens):
         .repeat(tokens * 4, 1)
     )
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
+def test_peer_gather_shard_boundary_and_large_offset():
+    dim = 160
+    rows = 2**31 // dim + 2
+    shards = [
+        torch.empty((rows, dim), dtype=torch.float8_e4m3fn, pin_memory=True)
+        for _ in range(2)
+    ]
+    for i, shard in enumerate(shards):
+        shard[0].fill_(2 * i + 1)
+        shard[-1].fill_(2 * i + 2)
+    ptrs = torch.tensor(
+        [ple.current_platform().device_visible_data_ptr(s) for s in shards],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    ids = torch.tensor([-1, 0, rows - 1, rows, 2 * rows - 1, 2 * rows], device="cuda")
+    out = torch.empty((ids.numel(), dim), dtype=torch.bfloat16, device="cuda")
+    ple.ple_host_gather(
+        shards[0], ids, out, 0, 2 * rows, 0.5, None, table_shards=2, shard_ptrs=ptrs
+    )
+    expected = torch.tensor([0, 0.5, 1, 1.5, 2, 0], dtype=out.dtype)
+    torch.testing.assert_close(
+        out.cpu(), expected[:, None].expand_as(out), atol=0, rtol=0
+    )
+    with pytest.raises(ValueError, match="row_scale is unsupported with shard_ptrs"):
+        ple.ple_host_gather(
+            shards[0], ids, out, 0, 2 * rows, None, out, table_shards=2, shard_ptrs=ptrs
+        )

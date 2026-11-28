@@ -39,6 +39,7 @@
 
 mod bootstrap;
 mod l3;
+mod transfer_engine;
 
 #[cfg(test)]
 mod tests;
@@ -302,8 +303,7 @@ impl Frontend {
     }
 
     /// This frontend's attached request streams per engine, in index order.
-    /// Local cancellation decreases this count without proving retirement
-    /// of engine resources.
+    /// `abort` and `cancel` decrease this count when they detach a stream.
     fn in_flight(&self) -> Vec<usize> {
         self.client.in_flight()
     }
@@ -342,7 +342,7 @@ impl Frontend {
     /// Wait for outputs and return every one that arrived, oldest first: a
     /// `(rid, chunk)` per output, where the chunk is a dict, or an
     /// `EngineError` for a stream ended without a finished output.
-    /// Explicit local cancellation yields its subclass `RequestCancelled`.
+    /// The `cancel` method yields its subclass `RequestCancelled`.
     fn next_outputs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let receiver = self.receiver.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -358,9 +358,11 @@ impl Frontend {
         })
     }
 
-    /// Ask the engine to abort a request, leaving its local stream attached.
-    /// A terminal output is not guaranteed. Resolves to False if the request
-    /// is not in flight; True means only that the abort was sent.
+    /// Send an abort and close its local stream. `next_outputs` yields a
+    /// terminal chunk with `finish_reason` set to `"abort"` after any queued
+    /// outputs, or the terminal result if the stream already ended.
+    /// Resolves to True if the abort was sent or False if the request was
+    /// absent. Use a fresh request id for a subsequent submission.
     fn abort<'py>(&self, py: Python<'py>, rid: String) -> PyResult<Bound<'py, PyAny>> {
         let client = self.client.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -564,6 +566,7 @@ fn value_to_py(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<bootstrap::BootstrapServer>()?;
     module.add_class::<l3::L3Executor>()?;
+    module.add_class::<transfer_engine::TransferEngine>()?;
     module.add_class::<FrontendListener>()?;
     module.add_class::<PendingFrontend>()?;
     module.add_class::<Frontend>()?;

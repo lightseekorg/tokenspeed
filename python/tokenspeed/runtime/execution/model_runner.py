@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import ExitStack
 from typing import TYPE_CHECKING
 
 import torch
@@ -175,9 +176,13 @@ class ModelRunner:
         require_verified_numerics(
             server_args.numerics,
             model_profile=model_config.model_profile,
-            architecture=resolve_architecture(model_config.hf_config),
+            architecture=(
+                model_config.model_profile_architecture
+                or resolve_architecture(model_config.hf_config)
+            ),
             quantization=model_config.quantization,
             vocab_size=model_config.vocab_size,
+            hf_config=model_config.hf_config,
         )
 
         draft_moe_override = (
@@ -206,7 +211,7 @@ class ModelRunner:
         initialize_moe_config(server_args)
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
+            enable=server_args.enable_memory_saver, device=self.device
         )
         # The target's expert placement (redundant replicas, load counters) is
         # process-global so its model picks it up while it is built and loaded.
@@ -540,7 +545,7 @@ class ModelRunner:
         Returns:
             ``(ok, message)`` for the control plane.
         """
-        if self.mapping.moe_weight_sharing_size is not None:
+        if self.mapping.moe_weight_sharing_size is not None and self.device != "npu":
             return (
                 False,
                 "Peer expert weights are immutable; restart to change the checkpoint",
@@ -551,6 +556,8 @@ class ModelRunner:
                 "--model-update-config (target runner only)"
             )
         device_module = torch.get_device_module(self.device)
+        managed_npu = self.device == "npu" and self.server_args.enable_memory_saver
+        preserve_update_error = False
         try:
             with weight_update_session(
                 models,
@@ -560,13 +567,28 @@ class ModelRunner:
                 ),
             ):
                 result = self.model_update.update(models, version, snapshot=snapshot)
+                if managed_npu:
+                    # Agree queued copy errors before deriving state on any rank.
+                    device_module.synchronize(self.gpu_id)
             device_module.synchronize(self.gpu_id)
             return True, f"applied model version {version}: {result}"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
+            preserve_update_error = managed_npu
             logger.exception("update_weights_from_mooncake failed")
             return False, str(e)
         finally:
-            device_module.empty_cache()
+            if preserve_update_error:
+                # A failed SDK call or post-load hook can leave work in flight.
+                try:
+                    device_module.synchronize(self.gpu_id)
+                except Exception:
+                    logger.exception("NPU synchronization after a failed weight update")
+            try:
+                device_module.empty_cache()
+            except Exception:
+                if not preserve_update_error:
+                    raise
+                logger.exception("NPU cache cleanup after a failed weight update")
 
     def update_weights_from_disk(self, obj) -> tuple[bool, str]:
         """Reload this worker's parameters in place from a checkpoint directory.
@@ -586,78 +608,158 @@ class ModelRunner:
         the model holds would fail partway through the load. A failure after
         tensors have reached the model says the weights may be partial.
         """
-        from tokenspeed.runtime.configs.load_config import LoadConfig
+        from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
         from tokenspeed.runtime.model_loader.loader import (
             DefaultModelLoader,
             get_model_loader,
             post_load_transformed_modules,
         )
 
-        if self.mapping.moe_weight_sharing_size is not None:
+        if self.mapping.moe_weight_sharing_size is not None and self.device != "npu":
             return (
                 False,
                 "Peer expert weights are immutable; restart to change the checkpoint",
             )
         model_path = str(obj.model_path)
-        transformed = post_load_transformed_modules(self.model)
-        if transformed:
-            more = len(transformed) - 3
-            return False, (
-                "update_weights_from_disk cannot reload this model in place: the "
-                "startup loader transformed its weights after loading ("
-                + ", ".join(transformed[:3])
-                + (f", and {more} more" if more > 0 else "")
-                + "), and a checkpoint holds them untransformed. Nothing was "
-                f"written; restart the engine with {model_path!r} instead"
-            )
         load_format = obj.load_format or self.server_args.load_format
         consumed = 0
         try:
-            loader = get_model_loader(
-                LoadConfig(
-                    load_format=load_format,
-                    download_dir=self.server_args.download_dir,
-                    ext_yaml=self.server_args.ext_yaml,
-                    weight_loader_prefetch_checkpoints=(
-                        self.server_args.weight_loader_prefetch_checkpoints
-                    ),
-                    weight_loader_prefetch_num_threads=(
-                        self.server_args.weight_loader_prefetch_num_threads
-                    ),
-                    checkpoint_load_group=self.checkpoint_load_group,
-                )
+            require_complete = (
+                self.device == "npu"
+                and self.server_args.enable_memory_saver
+                and self.server_args.weight_memory_policy == "discard"
             )
-            if not isinstance(loader, DefaultModelLoader):
-                return False, (
-                    f"load_format {load_format!r} selects "
-                    f"{type(loader).__name__}, which does not read checkpoint "
-                    "files; an in-place reload needs a file-backed format"
-                )
+            has_peer_weights = self.mapping.moe_weight_sharing_size is not None
+            coordinated_restore = require_complete or has_peer_weights
+            ignored_disk_names: frozenset[str] = frozenset()
+            shapes = None
+            weights = None
 
-            shapes, problem = self._check_disk_reload(loader, model_path)
-            if problem is not None:
-                return False, f"{problem}; nothing was written"
-            weights = loader.get_checkpoint_weights(
-                model_path, None, self.model, self.model_config.mapping
-            )
+            def _prepare_disk_load(*, fail_by_raising: bool) -> tuple[bool, str] | None:
+                """Validate disk reloadability and open the checkpoint tensor stream.
+
+                Populates the enclosing ``ignored_disk_names``, ``shapes``, and
+                ``weights`` bindings consumed by ``_counted``. When
+                ``fail_by_raising`` is True (used inside a coordinated group
+                preflight), failures raise ``ValueError``; otherwise, returns
+                ``(False, message)`` on validation failure or ``None`` on success.
+                """
+                nonlocal ignored_disk_names, shapes, weights
+                if require_complete:
+                    ignored_disk_names = (
+                        self.model.weight_discard_ignored_disk_checkpoint_names()
+                    )
+                    self.model.allow_redundant_checkpoint_names(ignored_disk_names)
+                transformed = post_load_transformed_modules(self.model)
+                if transformed:
+                    more = len(transformed) - 3
+                    message = (
+                        "update_weights_from_disk cannot reload this model in place: the "
+                        "startup loader transformed its weights after loading ("
+                        + ", ".join(transformed[:3])
+                        + (f", and {more} more" if more > 0 else "")
+                        + "), and a checkpoint holds them untransformed. Nothing was "
+                        f"written; restart the engine with {model_path!r} instead"
+                    )
+                    if fail_by_raising:
+                        raise ValueError(message)
+                    return False, message
+                loader = get_model_loader(
+                    LoadConfig(
+                        load_format=load_format,
+                        download_dir=self.server_args.download_dir,
+                        model_loader_extra_config=(
+                            self.server_args.model_loader_extra_config
+                        ),
+                        ext_yaml=self.server_args.ext_yaml,
+                        weight_loader_prefetch_checkpoints=(
+                            self.server_args.weight_loader_prefetch_checkpoints
+                        ),
+                        weight_loader_prefetch_num_threads=(
+                            self.server_args.weight_loader_prefetch_num_threads
+                        ),
+                        checkpoint_load_group=self.checkpoint_load_group,
+                    )
+                )
+                if not isinstance(loader, DefaultModelLoader):
+                    message = (
+                        f"load_format {load_format!r} selects "
+                        f"{type(loader).__name__}, which does not read checkpoint "
+                        "files; an in-place reload needs a file-backed format"
+                    )
+                    if fail_by_raising:
+                        raise ValueError(message)
+                    return False, message
+                if (
+                    self.device == "npu"
+                    and loader.load_config.load_format == LoadFormat.INSTANTTENSOR
+                ):
+                    raise ValueError(
+                        "InstantTensor checkpoint loading uses CUDA/NCCL and is not "
+                        "implemented for NPU"
+                    )
+
+                shapes, problem = self._check_disk_reload(
+                    loader, model_path, ignored_disk_names
+                )
+                if problem is not None:
+                    if fail_by_raising:
+                        raise ValueError(f"{problem}; nothing was written")
+                    return False, f"{problem}; nothing was written"
+                weights = loader.get_checkpoint_weights(
+                    model_path, None, self.model, self.model_config.mapping
+                )
+                return None
 
             def _counted():
                 nonlocal consumed
+                assert weights is not None
                 for name, tensor in weights:
                     consumed += 1
                     yield name, tensor
 
-            # Same session and KV-cache scale screen as a distributed load.
-            rejected: list[str] = []
-            with weight_update_session(
-                [self.model], require_complete=False, cpu_group=None
-            ):
-                self.model.load_weights(
-                    record_non_unit_kv_scales(
-                        _counted(),
-                        rejected,
+            with ExitStack() as session:
+                if coordinated_restore:
+                    # A local preparation or copy error must reach peers before
+                    # any rank enters peer quiesce or post-load collectives.
+                    cpu_group = (
+                        pg_manager.get_process_group("gloo", self.mapping.world_group)
+                        if len(self.mapping.world_group) > 1
+                        else None
                     )
-                )
+                    session.enter_context(
+                        weight_update_session(
+                            [self.model],
+                            require_complete=require_complete,
+                            cpu_group=cpu_group,
+                            preflight=lambda: _prepare_disk_load(fail_by_raising=True),
+                        )
+                    )
+                else:
+                    failure = _prepare_disk_load(fail_by_raising=False)
+                    if failure is not None:
+                        return failure
+                    session.enter_context(
+                        weight_update_session(
+                            [self.model],
+                            require_complete=require_complete,
+                            cpu_group=None,
+                        )
+                    )
+                # Same session and KV-cache scale screen as a distributed load.
+                rejected: list[str] = []
+                try:
+                    self.model.load_weights(
+                        record_non_unit_kv_scales(
+                            _counted(),
+                            rejected,
+                        )
+                    )
+                finally:
+                    if self.device == "npu":
+                        # Report NPU copy failures in the complete session before
+                        # any rank enters post-load hooks.
+                        torch.npu.synchronize(self.gpu_id)
             if consumed == 0:
                 return False, (
                     f"no checkpoint tensors found at {model_path!r}; "
@@ -669,7 +771,9 @@ class ModelRunner:
                     f"the KV-cache scales loaded at startup ({consumed} checkpoint "
                     "tensors had reached the model)"
                 )
-            if self.device != "cpu":
+            if self.device == "npu":
+                torch.npu.synchronize(self.gpu_id)
+            elif self.device != "cpu":
                 torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_disk failed")
@@ -692,7 +796,7 @@ class ModelRunner:
         )
 
     def _check_disk_reload(
-        self, loader, model_path: str
+        self, loader, model_path: str, ignored_disk_names: frozenset[str]
     ) -> tuple[dict[str, tuple[int, ...]] | None, str | None]:
         """Check a safetensors checkpoint's headers before any tensor is loaded.
 
@@ -751,6 +855,7 @@ class ModelRunner:
             (name, shape, held[name])
             for name, shape in shapes.items()
             if name in held
+            and name not in ignored_disk_names
             and shape != held[name]
             and not (torch.Size(shape).numel() == 1 == torch.Size(held[name]).numel())
         ]

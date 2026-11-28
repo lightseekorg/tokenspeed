@@ -1130,6 +1130,54 @@ either ranks the few keys sharing the resulting 24-bit prefix in LDS or
 counts their last 8 bits, then emits the rest of the row's top-k and zeroes
 the row's histogram and counters.
 
+### gfx950 DCP candidate merge
+
+`gluon_dsa_merge_candidates_gfx950` in `dsa/candidate_merge.py` is
+`dsa_merge_candidates` in one launch: it selects each row's global top-k from
+every KVP rank's gathered candidates without a `torch.topk`.
+
+#### Contract
+
+- Records are contiguous int32 `[ranks, rows, candidates, 2]` (position, FP32
+  score bits) pairs in the all-gather's rank-major layout. The outputs are
+  int32 `[rows, topk]` positions and `[rows]` counts.
+- The selection is bit for bit `select_through_threshold` over an exact top-k,
+  as in `triton_dsa_merge_candidates` and `cuda_dsa_merge_candidates`: every
+  live candidate above the k-th largest live score, then the first tied ones
+  in candidate order up to `topk`, written in candidate order and padded with
+  -1. A negative position, a NaN or a `-inf` score makes a candidate not live;
+  `+inf` is live, and both zeros tie.
+- A row's `ranks * candidates`, rounded up to a power of two, stay in
+  registers: at most 32768 (`merge_candidates_supported`). Larger merges keep
+  the portable kernel. Rows are a runtime value, and record offsets are
+  64-bit.
+
+#### Algorithm
+
+One program takes a row (8 warps, 16 past 16384 candidates, so each lane
+holds at most 32) and loads each record as one 64-bit value;
+the keys order larger scores first. Up to four 8-bit radix passes over the
+live keys find the bucket holding the k-th smallest, k = min(live, topk), and
+stop once that bucket is taken whole (keys spread over many exponents need
+two). Then one block scan carries the running counts of the live keys below
+the bucket and in it, packed in the two halves of an int32, which places each
+kept candidate in candidate order.
+
+- Histogram contention: a row's scores mostly share their sign and exponent,
+  and runs of equal scores share every digit, so every pass's histogram keeps
+  8 copies of each bucket, lane l adding to copy l % 8. All-equal rows then
+  take ~20 us per row instead of ~57 us with one copy. The first pass adds
+  zero for dead candidates to per-lane slots (unmasked atomics, no branch);
+  later passes, where few keys usually still match, mask their atomics so a
+  wave skips the instructions none of its lanes issue.
+- Digit search: every wave reads the whole histogram, lane i holding buckets
+  [4i, 4i + 4) with their copies, and finds the digit with in-lane sums and a
+  DPP prefix sum (`wave_inclusive_sum_i32`), so a pass needs no cross-wave
+  exchange. The first pass's total gives k. The four histograms (32 KiB) are
+  zeroed once.
+- Registers: 118 VGPRs for 32 candidates per lane, two 8-warp programs per
+  CU. 64 per lane on 8 warps took 217 VGPRs and ran up to 14% slower.
+
 ### DeepSeek V4.1 CSA2 index selection
 
 CSA2 picks, for each query, the KV rows its sparse attention reads. The
@@ -1398,37 +1446,67 @@ register-resident Q forced the allocator to reuse gather destinations behind
 `vmcnt(0)` waits.
 
 Gathering is L2-bandwidth bound (prefill rows of one request re-read the same
-slots). Batches with fewer than about 1024 (row, head-block) workgroups split
-the compacted tiles over up to 32 workgroups that store FP32 partials and
-base-2 LSE; `gluon_qsa_sparse_attention_merge_gfx950` merges all splits of a
-(row, head) in one pass.
+slots). Batches with fewer than 1024 (row, KV head, head-block) workgroups, the
+number LDS keeps resident at once (four per CU), split the compacted tiles over
+up to 32 workgroups that store FP32 partials and base-2 LSE;
+`gluon_qsa_sparse_attention_merge_gfx950` merges all splits of a (row, head) in
+one pass. The split count rounds down, so a grid never spills into a mostly
+idle second round of workgroups.
 
 ### gfx950 QSA indexer
 
 The `qsa_block_scores` and `qsa_block_topk_select` ops, which the `logits`
-algorithm of `qwen4_exp_qsa_block_topk` composes, select these Gluon kernels on
-gfx950. They return the same blocks as the portable Triton registrations; the
-selected ids come out in increasing order rather than by score.
+algorithm of `qwen4_exp_qsa_block_topk` composes, and the `qsa_block_topk_stream`
+op select these Gluon kernels on gfx950. They return the same blocks as the
+portable Triton registrations up to ties and near-ties at the threshold (the
+FP32 head sums associate differently); the selected ids come out in
+increasing order rather than by score.
 
 - `gluon_qsa_block_scores_gfx950` writes `sum_h relu(q_h . k)` for each valid
   compressed block below each row's `complete_blocks`, leaving the tail
   unwritten. Each request run stops at its current maximum frontier.
-  A program owns 16 query rows (prefill) or 4 rows (decode) whose index heads
-  form the 64- or 16-row MFMA M dimension, and loops over its share of
-  128-block tiles, prefetching the next key tile. Rows of one request are
-  contiguous; a tile spanning requests scores one request run at a time, so
-  ragged batches need no query grouping. Keys are gathered with 64-bit
-  pointers (the compressed cache may exceed 2 GiB). Page ids, request ids and
-  complete-block counts accept int32 or int64. Query and page-table buffers
-  must fit within 2 GiB; their buffer-load offsets remain 32-bit.
-- `gluon_qsa_block_topk_select_gfx950` radix-selects the `topk` largest
-  finite scores per row: four 8-bit passes build LDS-atomic histograms, then
-  one pass writes the ids above the threshold and the first ids equal to it in
-  increasing column order (ties keep the smaller id, like the portable
-  selection). Rows with at most 4096 scores stay in registers; the chunk is a
-  power-of-two bucket of the score width, and wider rows stream in 4096-score
-  chunks. Supplied per-row lengths bound every scan and load; columns beyond
-  them may be uninitialized. Passing `None` scans the full score row.
+  - A program owns 16 query rows (large batches), 4 rows, or 1 row (one row
+    per request, zero heads filling the MFMA rows); their index heads form
+    the MFMA M dimension. A row's heads are summed within the lane in a fixed
+    order, so scores do not depend on the tile. Programs go round-robin to
+    the XCDs so a split's key tiles stay in one L2; a tile spanning requests
+    scores one request run at a time, so ragged batches need no grouping.
+  - A program stages its next tiles' cache slots in LDS and copies each
+    tile's keys straight to LDS with asynchronous 16-byte copies, one tile
+    ahead of the MFMA. Copies are unmasked (dead slots read slot 0 and are
+    never stored) to keep the wait counts static, and a tile's scores are
+    stored one iteration late with masked buffer stores, because gfx950
+    counts stores and loads on one counter.
+  - Keys are gathered with 64-bit pointers (the compressed cache may exceed
+    2 GiB) from 32-bit slot ids; key rows must be 16-byte aligned. Page ids,
+    request ids and complete-block counts accept int32 or int64. Query and
+    page-table buffers must fit within 2 GiB; their buffer-load offsets and a
+    tile's score-store offsets remain 32-bit.
+- `gluon_qsa_block_topk_select_gfx950` selects the `topk` largest finite
+  scores of a row in one program (8 warps, or 4 for large batches):
+  1. The `topk`-th largest maximum of small groups of consecutive scores
+     bounds the `topk`-th score from below; an LDS histogram over buckets of
+     the positive floats (the 11 bits below the sign) finds that bound's
+     bucket edge. Negative values share the last bucket with zero.
+  2. Scores at or above the bound are compacted, in column order, into a
+     4032-entry LDS list.
+  3. 8-bit radix passes over the list find the threshold, stopping once the
+     threshold bucket is taken whole.
+  4. The ids above the threshold and the first ids equal to it are written in
+     increasing column order (ties keep the smaller id, like the portable
+     selection).
+
+  Rows whose candidates overflow the list (many equal scores) take four
+  8-bit radix passes over the whole row instead. `-inf` and NaN scores are
+  never selected. Supplied per-row lengths bound every load; columns beyond
+  them may be uninitialized, and `None` scans the full row. No constexpr
+  depends on the score width; the batch picks one of two warp counts.
+- `launch_gluon_qsa_block_topk_stream_gfx950` (the `qsa_block_topk_stream`
+  registration) scores and selects row chunks whose FP32 scores fit
+  `max_partial_bytes`, reusing one scratch buffer, so it selects exactly what
+  the two kernels above select over all rows. A budget below one row of
+  scores is an error. Larger budgets mean fewer, fuller launches; the
+  `logits` path, which scores all rows at once, is the limiting case.
 
 ### gfx1250 MLA decode
 
@@ -1979,33 +2057,69 @@ scheduler, which is 3–5% faster there.
 
 ### gfx950 GDN decode and MTP verify
 
-`gluon_gdn_decode_gfx950` runs the sigmoid-gated delta-rule recurrence for
-`gdn_decode_step` (one token) and chain `gdn_decode_mtp` (T tokens) over the
-K-last recurrent-state pool. Draft trees stay on the Triton kernel.
+Two kernels run the sigmoid-gated delta-rule recurrence over the K-last
+recurrent-state pool: `gluon_gdn_decode_step_gfx950` for `gdn_decode_step`
+(one token) and `gluon_gdn_decode_mtp_gfx950` for chain `gdn_decode_mtp` (T
+tokens). Draft trees, chains longer than 8 tokens, and head dims or pool
+dtypes outside the contracts below stay on the Triton kernel: the
+registrations declare these limits as traits, so selection routes around them
+instead of reaching the launchers' checks.
 
-#### Contract
+#### Decode step
 
-- q/k are `[B, T, H, 128]` and v is `[B, T, HV, V]` (V a multiple of 16), with
-  contiguous heads and any batch/token strides, so packed conv-output views
-  need no split copy. a/b are `[B, T, HV]` with any strides.
-- The pool is K-last `[rows, HV, V, K]`, FP32 or BF16, with any row stride.
+One token needs no chunk algebra, and the chunk form's T x T setup and
+one-program-per-head grid made it slower than the per-token update at T = 1.
+Each one-wave program owns 16 value rows of one (request, value head): each
+lane holds a `[2, 16]` patch of the FP32 `[16, 128]` state tile (four 4-wide K
+runs, 32 apart), so every 16-byte state access fills whole 128-byte lines and
+a reduction over K is 16 in-register FMAs plus a three-step butterfly. The
+step decays the state, applies the rank-1 delta update, writes the output and
+stores the state to the write row (a negative row is skipped). q/k are
+`[B, 1, H, 128]`, v is `[B, 1, HV, V]` with V any multiple of 16 (the trait
+enumerates up to 1024), heads contiguous with any batch stride; the pool is
+BF16, FP16 or FP32 with any row stride. No value derived from the batch is a
+constexpr.
+
+#### Verify contract
+
+- q/k are `[B, T, H, 128]` and v is `[B, T, HV, V]` (V a multiple of 16, at
+  most 256), with contiguous heads and any batch/token strides, so packed
+  conv-output views need no split copy. a/b are `[B, T, HV]` with any strides.
+- The pool is K-last `[rows, HV, V, K]`, BF16, FP16 or FP32, with any row stride.
   A negative read row starts from a zero state; negative destination rows are
   skipped.
 - Per-token states go to `output_state_indices` rows of `output_state` (default
   the read pool) or to the dense intermediate buffer; the final state goes
   back to the read row only when neither applies and updates are enabled.
-- `T` and the batch are runtime values. The kernel stages tokens in LDS in
-  chunks of `min(next_power_of_2(T), 16)`, the only T-derived constexpr.
+- `T` and the batch are runtime values; the power-of-2 token bucket
+  (`next_power_of_2(T)`, at most 8) is the only T-derived constexpr.
+- The verify optionally applies the layer's gated output norm
+  (`rmsnorm(o) * w * sigmoid(z)` per head, `output_norm`): the head is within
+  the wave, so the RMS is a lane reduction and the separate norm launch goes
+  away. The gate is loaded behind the state so it holds no registers through
+  the algebra.
 
-#### Algorithm
+#### Verify algorithm
 
-One wave owns 16 V rows of one request and value head: each lane holds two
-rows by four 4-wide K runs, so every state access is a 16-byte load or store
-filling whole 128-byte lines, and each K reduction is 16 in-register FMAs plus
-a three-step DPP butterfly. The prologue loads the chunk's q/k (L2-normalized
-and scaled), beta-scaled v, beta and decay into LDS once, so the serial steps
-wait only on LDS rather than one global round trip per token. The kernel is
-HBM bound: it reads the state once and writes it once per destination.
+One wave owns one (request, value head). The outputs use the chunk (WY)
+form: with normalized q/k, cumulative decays `G`, `D[t, i] = G_t / G_i`,
+`A = beta D (k k^T)` (strictly lower) and `N = (D q k^T) (I + A)^-1`,
+
+    o_t = G_t (S0 q_t) + sum_i N[t, i] beta_i (v_i - G_i (S0 k_i))
+
+so the state is read once, straight from the pool into MFMA A operands, and
+multiplied by the raw q/k rows (`[V, K] x [K, 2T]`, exact BF16 products with
+FP32 sums; FP32 pools are split into three BF16 terms). The same raw rows give
+the Gram matrix (norms and `k k^T`, `q k^T`) through one more MFMA tile; the
+T x T algebra (`(I + A)^-1` as `(I - A)(I + A^2)...`) runs in registers while
+the state streams in, and the rest is O(V T^2) per head. The sequential form
+needed about 16 vector FLOPs per state entry for T = 4 and was VALU bound.
+
+All activation loads are issued before the state loads and the algebra's
+results are parked in LDS before the state MFMA, so the algebra overlaps the
+state's latency instead of following it. State writes (non-ReplaySSM
+verify) replay the tokens on the FP32 state in a blocked
+layout; the ReplaySSM verify writes none.
 
 ### KDA chunked prefill (gfx950 / gfx1250)
 
@@ -2053,10 +2167,11 @@ prepare kernel with `max-ilp`.
 ### KDA retained history (gfx950 / gfx1250)
 
 Each physical page holds only a V-major FP32 or BF16 dense base. Each resident
-request slot holds FP32 correction U, normalized K and multiplicative decay,
-plus an INT32 accepted length L: the records accepted since the dense base of
-the request's page. Verify uses the row's physical page indices for dense
-state, and its record slot for L, all L accepted updates and new candidates.
+request slot holds every layer's FP32 correction U, normalized K and
+multiplicative decay, plus one INT32 accepted count H that all its layers
+share: the records accepted since the dense base of the request's pages.
+Verify uses the row's physical page indices for dense state, and its record
+slot for the count, the accepted updates it covers and new candidates.
 Reconstruction accumulates in FP32 and rounds when writing the dense base.
 Shared source pages are immutable dense checkpoints. Each active request has a
 private live page.
@@ -2072,44 +2187,60 @@ architectures use supplied raw gate inputs directly.
 
 Before the verify forward, the caller runs the batched retained prepare that
 `tokenspeed-kernel` shares across vendors (`kda_retained_prepare`), once for
-every layer: a source-to-live transition or L + T greater than capacity C
-consolidates the accepted endpoint into the live dense base, and a second,
-ordered launch resets those slots' lengths. T is the actual packed request
-length. L + T equal to C still fits. Empty requests and padding pages leave
-page storage and lengths unchanged.
+every layer, in one launch that reads H and never writes it. With T the
+verify window and C the history capacity, H overflows when it lies outside
+[0, C - T]: every layer then consolidates the accepted endpoint into its live
+dense base, in place where the pages did not move. A request that fits but
+moves to a new live page in a State group gets the source's dense base copied
+there in that group's layers, with no record applied. Empty requests and
+padding pages leave page storage unchanged.
 
-Verify reconstructs the accepted endpoint from the live base and history, then
-writes candidate U, K and decay at L + token offset. It preserves L and the
-dense base. Convolution still reads the original source page, because recurrent
+Verify reads `eff` records: H, or 0 for an overflowing H, whose records the
+prepare folded. Each architecture's kernel derives it with one scalar select
+on its compile-time `CAPACITY` and `TOKENS_PER_SEQUENCE`. It reconstructs the
+accepted endpoint from the live base and those records, then writes candidate
+U, K and decay at `eff` + token offset. It preserves H and the dense base.
+Convolution still reads the original source page, because recurrent
 consolidation does not copy convolution history. The fused convolution,
-activation-dtype rounding, gate projection and state-panel scheduling are shared
-by one-token and speculative windows. The registered activation dtype is BF16.
+activation-dtype rounding, gate projection and state-panel scheduling are
+shared by one-token and speculative windows. The registered activation dtype
+is BF16.
 
 Retained commit clamps the accepted count to the actual window and configured
-bound, updates convolution from the caller's original QKV, then publishes the
-slot's new length. It does not replay dense state or copy retained records. Zero
-acceptance still copies source convolution history to a distinct live page.
-Invalid accepted stamps prevent both convolution writes and length publication.
-Stamps validate the current candidate window; accepted history is independent
-of stamp-ring reuse.
+bound and updates convolution from the caller's original QKV. It does not
+replay dense state or copy retained records, except to fold a request that
+ended. Zero acceptance still copies source convolution history to a distinct
+live page. Invalid accepted stamps prevent that layer's convolution writes;
+if the row's request ended in this forward, that layer raises its
+`request_ends` entry from `REQUEST_ENDED` to `REQUEST_ENDED_INCOMPLETE` with a
+compare-and-swap. It does so after the convolution window loads and reads no
+stop flag on that path, so the uniform descriptor fields stay scalar loads.
+Stamps validate the current candidate window; accepted history is
+independent of stamp-ring reuse.
 
 The public adapter accepts `KdaRetainedRecords`, including its
 `KdaRetainedHistory`; the AMD package receives the tensors explicitly and has
-no dependency on `tokenspeed-kernel`. Batched commit uses a 14-column
-descriptor: QKV, convolution and length pointers, the page count, per-layer
-element strides, then the v-major recurrent-state pointer and its strides.
-Record slots select the lengths. One launch updates all layers' convolution;
-the next publishes lengths. A request whose slot is set in `request_stopped`
-ended in this forward: the convolution launch also folds its records into
-its live page, each program taking some heads, and the length launch clears
-its length. Public verify requires retained records; unsupported
-configurations fail instead of selecting another checkpoint format.
+no dependency on `tokenspeed-kernel`. Batched commit uses a 12-column
+descriptor: QKV and convolution pointers, the page count, per-layer element
+strides, then the v-major recurrent-state pointer and its strides; the count
+every layer shares is an INT32 `[slots, 1]` tensor of its own, and record
+slots select each request's. One launch updates all layers' convolution and
+reads the counts; a second, one-dimensional launch then writes each carried
+request's count once, to `eff` plus its acceptance, with no scratch and no
+cross-program reduction. A request whose slot is set in `request_stopped`
+ended in this forward: the convolution launch also folds its records into its
+live page, each program taking some heads, and the count launch clears its
+count. Rows no layer carries (graph padding, a masked overlap row, a row paged
+only in groups no launched layer lists) keep their counts.
+Public verify requires retained records; unsupported configurations fail
+instead of selecting another checkpoint format.
 
-Prefill materializes source history into its existing gathered dense input,
-then clears the rows' slot lengths. These utilities use wave64 on gfx950 and
-wave32 on gfx1250. Before a retraction stores its image, the victim's accepted
-records are materialized directly into its physical page before its slot's
-length is reset.
+Prefill materializes source history into its existing gathered dense input;
+every layer reads the same counts, which clear once, after the last KDA
+layer's gather. These utilities use wave64 on gfx950 and wave32 on gfx1250.
+Before a retraction stores its image, the victim's accepted records are
+materialized directly into its physical page, layer by layer, before its
+slot's count is reset once.
 
 
 ## Transform
@@ -3109,10 +3240,13 @@ whole row once.
 
 ### gfx950 Qwen4 hyper-connection mix
 
-`gluon_hyperconnection_mix_gfx950` serves `gated_residual_mix` for decode
-batches (1 to 256 rows) of the HC4 / H2560 / R320 stream in two launches,
-replacing two hipBLASLt GEMMs (one with a split-K reduction kernel) and two
-Triton epilogues.
+`gluon_hyperconnection_mix_gfx950` serves `gated_residual_mix` for the
+HC4 / H2560 / R320 stream at every row count. Decode batches (1 to 192 rows)
+run as two Gluon launches: a split-K down projection and an up projection
+whose epilogue applies the gate. Larger batches run the down projection as a
+dense GEMM followed by `gluon_hyperconnection_mix_up_prefill_gfx950`, which
+fuses the up projection with the gated branch sum so the `[rows, 4 * H]` gate
+never reaches memory.
 
 #### Contract
 
@@ -3125,8 +3259,8 @@ Triton epilogues.
   FP32 and are rounded to the input dtype before the scale/SiLU and the
   sigmoid gate, so only the accumulation order differs (at most one ulp).
   Split partials are summed in split order, so results are deterministic.
-- Row counts are runtime arguments within three tile buckets (up to 16, up
-  to 32, larger rows).
+- Row counts are runtime arguments within three decode tile buckets (up to
+  16, up to 32, up to 192 rows) and one prefill tile.
 - The split-K workspace (FP32 partials and self-resetting arrival counters)
   is shared per device and tiling, so launches must be ordered on one stream.
 
@@ -3147,6 +3281,15 @@ branches as one MFMA tile, one branch per wave, with the 320-deep reduction
 loaded as a 256 + 64 pair so every load is in flight at once. The epilogue
 multiplies `sigmoid(gate)` with the matching normalized branch and sums the
 four branches across waves, so the gate tensor never reaches memory.
+
+The prefill up projection tiles 128 rows by 32 hidden columns of all four
+branches, streaming the 320-deep rank in 32-deep slices through three LDS
+stages while the normalized branches load into registers in a layout that
+holds every branch of eight columns in one lane, so the branch sum needs no
+cross-lane traffic. Three four-wave programs share a CU, so one program's
+epilogue overlaps the others' loads; each XCD owns a contiguous range of
+hidden tiles and reads its weight slice once. Row offsets step the base
+pointers in 64-bit once per tile.
 
 ### gfx1250 mHC mixes projection
 

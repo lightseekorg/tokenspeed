@@ -209,6 +209,7 @@ class BaseCausalLM(nn.Module):
     # above. Complete sessions require each source exactly once.
     _weight_update_required_names: set[str] | None = None
     _weight_update_source_names: set[str] | None = None
+    _weight_update_redundant_names: frozenset[str] = frozenset()
     _weight_update_load_failed: bool = False
     _weight_update_load_depth: int = 0
 
@@ -241,6 +242,7 @@ class BaseCausalLM(nn.Module):
         self._weight_update_non_unit_kv_scales = None
         self._weight_update_required_names = None
         self._weight_update_source_names = None
+        self._weight_update_redundant_names = frozenset()
         self._weight_update_load_failed = False
         self._weight_update_load_depth = 0
 
@@ -546,6 +548,27 @@ class BaseCausalLM(nn.Module):
             f"{type(self).__name__} does not support weight discard"
         )
 
+    def weight_discard_redundant_checkpoint_names(self) -> frozenset[str]:
+        """Optional checkpoint aliases that do not own independent storage."""
+        return frozenset()
+
+    def weight_discard_ignored_disk_checkpoint_names(self) -> frozenset[str]:
+        """Names a full disk checkpoint may carry without a local writer."""
+        return frozenset()
+
+    def reloadable_post_load_hooks(self) -> frozenset[Any]:
+        """Return startup hooks and MoE preprocessors safe to refresh in place during disk weight updates."""
+        return frozenset()
+
+    def allow_redundant_checkpoint_names(self, names: frozenset[str]) -> None:
+        """Allow extra source names to occur once without writing a parameter."""
+        required = self._weight_update_required_names
+        if required is None:
+            raise RuntimeError("Checkpoint aliases require a complete weight update")
+        if required & names:
+            raise ValueError("Required checkpoint sources cannot also be aliases")
+        self._weight_update_redundant_names |= names
+
     def _record_weight_update_sources(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
@@ -553,7 +576,7 @@ class BaseCausalLM(nn.Module):
         received = self._weight_update_source_names
         assert required is not None and received is not None
         for name, tensor in weights:
-            if name not in required:
+            if name not in required and name not in self._weight_update_redundant_names:
                 raise ValueError(
                     f"{type(self).__name__}: unexpected checkpoint weight {name!r}"
                 )
@@ -562,6 +585,8 @@ class BaseCausalLM(nn.Module):
                     f"{type(self).__name__}: duplicate checkpoint weight {name!r}"
                 )
             received.add(name)
+            if name in self._weight_update_redundant_names:
+                continue
             yield name, tensor
 
     def _validate_weight_update_complete(self) -> None:
@@ -595,6 +620,7 @@ class BaseCausalLM(nn.Module):
         self._weight_update_non_unit_kv_scales = []
         self._weight_update_required_names = None
         self._weight_update_source_names = None
+        self._weight_update_redundant_names = frozenset()
         self._weight_update_load_failed = False
         self._weight_update_load_depth = 0
 
@@ -647,6 +673,7 @@ class BaseCausalLM(nn.Module):
         self._weight_update_non_unit_kv_scales = None
         self._weight_update_required_names = None
         self._weight_update_source_names = None
+        self._weight_update_redundant_names = frozenset()
         self._weight_update_load_failed = False
         self._weight_update_load_depth = 0
 
@@ -696,5 +723,9 @@ class BaseCausalLM(nn.Module):
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
 
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if embed.device.type == "npu":
+            torch.npu.empty_cache()
+            torch.npu.synchronize()
+        else:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()

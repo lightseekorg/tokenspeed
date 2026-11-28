@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include "cache/core/checkpoint_lifecycle.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -49,6 +51,15 @@ enum class CacheBoundaryKind { kChunk, kEndpoint };
 // SSD (docs/rfcs/0006-disk-tier.md), which feeds only Host.
 enum class CacheTier { kDevice, kHost, kDisk };
 inline constexpr std::size_t kNumCacheTiers = 3;
+
+// Physical releases since pool construction, independent of cache identity.
+// Dropping one reference does not release a slot until its last owner leaves.
+struct CacheReleaseStats {
+    std::uint32_t group_id;
+    CacheTier tier;
+    std::uint64_t child_slots;
+    std::uint64_t parents;
+};
 
 // The most new-request admissions an aged State checkpoint may rank behind
 // (SchedulerConfig::checkpoint_retention_requests).
@@ -212,6 +223,8 @@ struct TailPublication {
     // HashPrefixPage(tokens[kP, T), prior) with prior = the chain hash of
     // page k - 1 (prefix_hashes.back(), or "" for k = 0).
     ContentHash hash{};
+
+    bool operator==(const TailPublication&) const = default;
 };
 
 // What the owner of a published partial page does with its blocks of that
@@ -238,7 +251,7 @@ enum class OwnerTail {
 // struct exists only when there is something to publish: a non-empty page
 // range, a tail, or a state checkpoint. The request owns the storage behind
 // the spans.
-struct CompletedPages {
+struct CheckpointPublication {
     // The completed tokens, which order checkpoints inside a page.
     std::span<const std::int32_t> tokens{};
     std::span<const std::string> prefix_hashes{};
@@ -271,12 +284,17 @@ struct CompletedPages {
     // pages means none.
     std::int32_t state_checkpoint_pages{0};
     std::span<CacheBlockRef> state_checkpoint_blocks{};
+    std::shared_ptr<CheckpointLifecycle> checkpoint_lifecycle;
     // Which kind of boundary the publication ends on (eviction provenance).
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     // Prefill streams newly published history and state to Host. Decode
     // leaves this false; only sliding windows keep streaming.
     bool stream_completed_to_host{false};
 };
+
+// Existing runtime/cache adapter. The descriptor contains completed views;
+// neither constructing it nor submitting it performs producer computation.
+using CompletedPages = CheckpointPublication;
 
 // Per-request facts about the past that ride along with one admission:
 // what the request has computed since the coordinator's previous transaction

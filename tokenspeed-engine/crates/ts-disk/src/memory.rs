@@ -59,6 +59,23 @@ impl Memory {
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
+        #[cfg(target_os = "linux")]
+        // SAFETY: `base..base+size` is the private mapping just created above
+        // (without MAP_POPULATE, so no pages are faulted in yet). Applied to
+        // every `ts_disk::Memory` allocation (io_uring/psync bounce pools and
+        // peer-push staging rings): disable THP so `io_uring_register_buffers`
+        // (`FOLL_LONGTERM`) does not fail on transparent huge pages, and mark
+        // `MADV_DONTFORK` so a child process cannot trigger COW on DMA-pinned
+        // pages.
+        unsafe {
+            let _ = libc::madvise(base, size, libc::MADV_NOHUGEPAGE);
+            if libc::madvise(base, size, libc::MADV_DONTFORK) != 0 {
+                tracing::warn!(
+                    error = %io::Error::last_os_error(),
+                    "madvise(MADV_DONTFORK) failed on disk staging memory"
+                );
+            }
+        }
         Ok(Self {
             base: NonNull::new(base.cast()).expect("mmap returns a non-null mapping"),
             size,
@@ -93,6 +110,63 @@ impl Memory {
         }
     }
 
+    /// Move `len` bytes between two (possibly overlapping) ranges inside this
+    /// mapping (`memmove` semantics). Caller must ensure exclusive ownership
+    /// of both source and destination sub-ranges (no concurrent I/O or DMA).
+    pub fn move_within(&self, src_offset: usize, dst_offset: usize, len: usize) {
+        if len == 0 || src_offset == dst_offset {
+            return;
+        }
+        let src_end = src_offset
+            .checked_add(len)
+            .expect("source range overflow in Memory::move_within");
+        let dst_end = dst_offset
+            .checked_add(len)
+            .expect("destination range overflow in Memory::move_within");
+        assert!(
+            src_end <= self.size && dst_end <= self.size,
+            "move_within past the mapping"
+        );
+        // SAFETY: both ranges lie inside `self.base..self.base+self.size`,
+        // verified above; `ptr::copy` handles arbitrary overlap.
+        unsafe {
+            std::ptr::copy(
+                self.base.as_ptr().add(src_offset),
+                self.base.as_ptr().add(dst_offset),
+                len,
+            );
+        }
+    }
+
+    /// Copy `len` bytes between two non-overlapping ranges inside this mapping.
+    /// Caller must ensure exclusive ownership of both source and destination
+    /// sub-ranges (no concurrent I/O or DMA touching either range).
+    pub fn copy_within(&self, src_offset: usize, dst_offset: usize, len: usize) {
+        let src_end = src_offset
+            .checked_add(len)
+            .expect("source range overflow in Memory::copy_within");
+        let dst_end = dst_offset
+            .checked_add(len)
+            .expect("destination range overflow in Memory::copy_within");
+        assert!(
+            src_end <= self.size && dst_end <= self.size,
+            "copy_within past the mapping"
+        );
+        assert!(
+            src_end <= dst_offset || dst_end <= src_offset,
+            "copy_within ranges overlap"
+        );
+        // SAFETY: both ranges lie inside `self.base..self.base+self.size` and
+        // are non-overlapping, verified by the assertions above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.base.as_ptr().add(src_offset),
+                self.base.as_ptr().add(dst_offset),
+                len,
+            );
+        }
+    }
+
     /// Copy out `bytes.len()` bytes at `offset`. No job may be writing this
     /// range.
     pub fn read_at(&self, offset: usize, bytes: &mut [u8]) {
@@ -119,5 +193,39 @@ impl Drop for Memory {
         unsafe {
             libc::munmap(self.base.as_ptr().cast(), self.size);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Memory;
+
+    #[test]
+    fn copy_within_and_move_within_handle_disjoint_and_overlapping_ranges() {
+        let mut mem = Memory::map(4096).unwrap();
+        let pattern: Vec<u8> = (0u8..=255).collect();
+        mem.write_at(128, &pattern);
+
+        // Disjoint copy_within.
+        mem.copy_within(128, 1024, pattern.len());
+        let mut out = vec![0u8; pattern.len()];
+        mem.read_at(1024, &mut out);
+        assert_eq!(out, pattern);
+
+        // Overlapping backward move_within (mirrors in-place span compaction).
+        mem.move_within(128, 64, pattern.len());
+        mem.read_at(64, &mut out);
+        assert_eq!(out, pattern);
+
+        // Overlapping forward move_within.
+        mem.move_within(64, 100, pattern.len());
+        mem.read_at(100, &mut out);
+        assert_eq!(out, pattern);
+
+        // Zero-length and self-move are no-ops.
+        mem.move_within(100, 100, pattern.len());
+        mem.move_within(100, 200, 0);
+        mem.read_at(100, &mut out);
+        assert_eq!(out, pattern);
     }
 }

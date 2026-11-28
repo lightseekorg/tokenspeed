@@ -102,12 +102,21 @@ def resolve_draft_query_width(verify_width: int, sample_from_anchor: bool) -> in
 def count_dspark_stages(
     model_path: str,
     revision: str | None = None,
+    download_dir: str | None = None,
 ) -> int | None:
     """Count contiguous ``mtp.<stage>`` namespaces in a safetensors index."""
+    from tokenspeed.runtime.model_loader.object_store import (
+        resolve_checkpoint_metadata_dir,
+    )
 
     index_filename = "model.safetensors.index.json"
-    if os.path.isdir(model_path):
-        index_path = os.path.join(model_path, index_filename)
+    local_dir = resolve_checkpoint_metadata_dir(
+        model_path,
+        download_dir=download_dir,
+        sync=True,
+    )
+    if local_dir is not None:
+        index_path = os.path.join(local_dir, index_filename)
     else:
         try:
             index_path = hf_hub_download(

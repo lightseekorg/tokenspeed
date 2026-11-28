@@ -393,7 +393,97 @@ pub struct EngineLabels {
     pub dp_rank: i64,
 }
 
+/// Committed scheduler GDS totals, independent of allocator ownership.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GdsStats {
+    /// Normal recovery unit evictions.
+    pub evicted_units: u64,
+    /// Unused fresh units rejected under pressure.
+    pub retention_rejections: u64,
+    /// Explicitly demoted units reclaimed.
+    pub demoted_units: u64,
+    /// Selected units with a Host dependency.
+    pub mixed_tier_units: u64,
+    /// Device blocks with no recovery consumer.
+    pub orphan_blocks: u64,
+    /// Blocks reclaimed by the capacity fallback.
+    pub fallback_blocks: u64,
+    /// Recovery routes lost to the capacity fallback.
+    pub fallback_units: u64,
+    /// Current normal-eviction watermark.
+    pub watermark: f64,
+    /// Recovery identities discarded by joint retention.
+    pub logical_evictions: u64,
+    /// Fresh recovery identities rejected by joint retention.
+    pub logical_rejections: u64,
+    /// Physical Device copies released by joint plans.
+    pub device_copies_released: u64,
+    /// Required Host destinations reserved before Device reuse.
+    pub host_copies_reserved: u64,
+    /// Optional Host replicas skipped without logical loss.
+    pub host_copy_rejections: u64,
+    /// Host copies safely released because the same keys are already on Disk.
+    pub host_clean_copies_released: u64,
+    /// Routes requiring published Disk data, possibly also reserved Host data.
+    pub disk_recoverable_units: u64,
+    /// Routes made unavailable by Disk residency loss.
+    pub disk_route_losses: u64,
+    /// In-forward targets planned before allocation.
+    pub checkpoint_planned: u64,
+    /// Plans that acquired all extra State output blocks.
+    pub checkpoint_allocated: u64,
+    /// Outputs whose computed frontier reached their target.
+    pub checkpoint_materialized: u64,
+    /// Extra outputs whose publication committed.
+    pub checkpoint_published: u64,
+    /// Allocated outputs retired without publication.
+    pub checkpoint_cancelled: u64,
+    /// Additional State blocks allocated for in-forward outputs.
+    pub checkpoint_extra_blocks: u64,
+    /// Optional allocation failures handled at the same chunk-end target.
+    pub checkpoint_chunk_end_fallbacks: u64,
+    /// Produced checkpoints charged once on committed fresh logical rejection.
+    pub checkpoint_fresh_rejected: u64,
+    /// Extra State blocks paid for those rejected checkpoints.
+    pub checkpoint_rejected_extra_blocks: u64,
+    /// Rejected production receipts without runtime byte and GPU cost samples.
+    pub checkpoint_rejected_unmeasured: u64,
+    /// Selection plans committed to the cache.
+    pub committed_plans: u64,
+    /// CPU wall time selecting committed plans, excluding failed attempts.
+    pub planning_nanoseconds: u64,
+    /// Current recovery units with a ready legal route.
+    pub ready_units: u64,
+    /// Ready units requiring no Host load, a subset of ready_units.
+    pub device_ready_units: u64,
+    /// Units waiting for an already-reserved necessary migration.
+    pub pending_units: u64,
+    /// Registered units without a ready or promised legal route.
+    pub broken_units: u64,
+    /// Current registered recovery points.
+    pub dependency_points: u64,
+    /// Current shared dependency ranges.
+    pub dependency_ranges: u64,
+    /// Current component leaves of those ranges.
+    pub dependency_leaves: u64,
+    /// Current Host pressure-domain watermark.
+    pub host_watermark: f64,
+}
+
 const ENGINE_LABELS: [&str; 3] = ["model_name", "app_key", "dp_rank"];
+
+/// Physical pool releases since startup; cache-reference removal is not a release.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheReleaseStats {
+    /// Cache group in the model's fixed cache geometry.
+    pub group_id: u32,
+    /// Host L2 if true, Device L1 otherwise.
+    pub host: bool,
+    /// Child slots whose last owning references have been released.
+    pub child_slots: u64,
+    /// Parents returned to the shared pool after their last child left.
+    pub parents: u64,
+}
 
 /// The scheduler loop's metrics (`EngineMetrics`), on the attention-TP
 /// group's first rank.
@@ -461,7 +551,20 @@ pub struct EngineMetrics {
     prefix_prompt_tokens: Metric,
     prefix_device_hit_tokens: Metric,
     prefix_host_hit_tokens: Metric,
+    prefix_peer_hit_tokens: Metric,
+    prefix_host_gain_tokens: Metric,
+    prefix_unresumable_kv_tokens: Metric,
     prefix_l3_hit_tokens: Metric,
+    gds_outcomes: Metric,
+    gds_watermark: Metric,
+    gds_host_watermark: Metric,
+    gds_recovery_units: Metric,
+    gds_dependency_metadata: Metric,
+    gds_plan_seconds: Metric,
+    checkpoint_events: Metric,
+    exported_gds: GdsStats,
+    cache_releases: Metric,
+    exported_cache_releases: Vec<CacheReleaseStats>,
     /// Serving-time compile totals already exported.
     exported_compiles: u64,
     exported_compile_seconds: f64,
@@ -837,6 +940,12 @@ impl EngineMetrics {
                 "Admitted prompt tokens served from the Device prefix cache (L1).",
                 names,
             ),
+            prefix_peer_hit_tokens: Metric::counter(
+                exporter,
+                "tokenspeed:prefix_peer_hit_tokens",
+                "Additional Device peer tokens used at first prefill dispatch.",
+                names,
+            ),
             prefix_host_hit_tokens: Metric::counter(
                 exporter,
                 "tokenspeed:prefix_host_hit_tokens",
@@ -849,6 +958,38 @@ impl EngineMetrics {
                 "Token spans of successful storage keys (L3), counted per cache group.",
                 names,
             ),
+            prefix_host_gain_tokens: Metric::counter(
+                exporter, "tokenspeed:prefix_host_gain_tokens",
+                "Additional resumable tokens supplied by Host over the same probe's Device-only route.", names,
+            ),
+            prefix_unresumable_kv_tokens: Metric::counter(
+                exporter, "tokenspeed:prefix_unresumable_kv_tokens",
+                "Matched KV tokens beyond the usable recovery point; not historical missed tokens.", names,
+            ),
+            gds_outcomes: Metric::counter(
+                exporter, "tokenspeed:gds_outcomes", "Committed GDS placement and retention outcomes by kind.",
+                &["model_name", "app_key", "dp_rank", "outcome"],
+            ),
+            gds_watermark: Metric::gauge(
+                exporter, "tokenspeed:gds_watermark", "Device GDS normal-eviction watermark.", names,
+            ),
+            gds_host_watermark: Metric::gauge(exporter, "tokenspeed:gds_host_watermark", "Host pressure logical GDS watermark.", names),
+            exported_gds: GdsStats::default(),
+            cache_releases: Metric::counter(exporter, "tokenspeed:cache_releases",
+                "Actual physical pool releases, including request and transfer teardown.",
+                &["model_name", "app_key", "dp_rank", "tier", "group", "unit"]),
+            exported_cache_releases: Vec::new(),
+            checkpoint_events: Metric::counter(exporter, "tokenspeed:checkpoint_events",
+                "In-forward checkpoint production lifecycle events, independent of eviction policy.",
+                &["model_name", "app_key", "dp_rank", "event"]),
+            gds_recovery_units: Metric::gauge(exporter, "tokenspeed:gds_recovery_units",
+                "Recovery availability; device_ready is a subset of ready.",
+                &["model_name", "app_key", "dp_rank", "state"]),
+            gds_dependency_metadata: Metric::gauge(exporter, "tokenspeed:gds_dependency_metadata",
+                "Resident recovery dependency metadata entries.",
+                &["model_name", "app_key", "dp_rank", "kind"]),
+            gds_plan_seconds: Metric::counter(exporter, "tokenspeed:gds_plan_seconds",
+                "CPU wall time spent selecting committed GDS plans; excludes failed attempts.", names),
             exported_compiles: 0,
             exported_compile_seconds: 0.0,
         }
@@ -1116,6 +1257,230 @@ impl EngineMetrics {
             .set(&self.labels(), waiting.max(0) as f64);
     }
 
+    /// Publish cumulative totals once: repeated scrapes cannot count them again.
+    pub fn record_gds_evictions(&mut self, stats: GdsStats) {
+        let labels = self.labels();
+        for (outcome, current, previous) in [
+            (
+                "evicted_units",
+                stats.evicted_units,
+                self.exported_gds.evicted_units,
+            ),
+            (
+                "retention_rejections",
+                stats.retention_rejections,
+                self.exported_gds.retention_rejections,
+            ),
+            (
+                "demoted_units",
+                stats.demoted_units,
+                self.exported_gds.demoted_units,
+            ),
+            (
+                "mixed_tier_units",
+                stats.mixed_tier_units,
+                self.exported_gds.mixed_tier_units,
+            ),
+            (
+                "orphan_blocks",
+                stats.orphan_blocks,
+                self.exported_gds.orphan_blocks,
+            ),
+            (
+                "fallback_blocks",
+                stats.fallback_blocks,
+                self.exported_gds.fallback_blocks,
+            ),
+            (
+                "fallback_units",
+                stats.fallback_units,
+                self.exported_gds.fallback_units,
+            ),
+            (
+                "logical_evictions",
+                stats.logical_evictions,
+                self.exported_gds.logical_evictions,
+            ),
+            (
+                "logical_rejections",
+                stats.logical_rejections,
+                self.exported_gds.logical_rejections,
+            ),
+            (
+                "device_copies_released",
+                stats.device_copies_released,
+                self.exported_gds.device_copies_released,
+            ),
+            (
+                "host_copies_reserved",
+                stats.host_copies_reserved,
+                self.exported_gds.host_copies_reserved,
+            ),
+            (
+                "host_copy_rejections",
+                stats.host_copy_rejections,
+                self.exported_gds.host_copy_rejections,
+            ),
+            (
+                "host_clean_copies_released",
+                stats.host_clean_copies_released,
+                self.exported_gds.host_clean_copies_released,
+            ),
+            (
+                "disk_route_losses",
+                stats.disk_route_losses,
+                self.exported_gds.disk_route_losses,
+            ),
+        ] {
+            let delta = current.saturating_sub(previous);
+            if delta > 0 {
+                self.gds_outcomes
+                    .inc(&[labels[0], labels[1], labels[2], outcome], delta as f64);
+            }
+        }
+        self.gds_watermark.set(&labels, stats.watermark);
+        self.gds_host_watermark.set(&labels, stats.host_watermark);
+        for (event, current, previous) in [
+            (
+                "planned",
+                stats.checkpoint_planned,
+                self.exported_gds.checkpoint_planned,
+            ),
+            (
+                "allocated",
+                stats.checkpoint_allocated,
+                self.exported_gds.checkpoint_allocated,
+            ),
+            (
+                "materialized",
+                stats.checkpoint_materialized,
+                self.exported_gds.checkpoint_materialized,
+            ),
+            (
+                "published",
+                stats.checkpoint_published,
+                self.exported_gds.checkpoint_published,
+            ),
+            (
+                "cancelled",
+                stats.checkpoint_cancelled,
+                self.exported_gds.checkpoint_cancelled,
+            ),
+            (
+                "extra_blocks",
+                stats.checkpoint_extra_blocks,
+                self.exported_gds.checkpoint_extra_blocks,
+            ),
+            (
+                "chunk_end_fallbacks",
+                stats.checkpoint_chunk_end_fallbacks,
+                self.exported_gds.checkpoint_chunk_end_fallbacks,
+            ),
+            (
+                "fresh_rejected",
+                stats.checkpoint_fresh_rejected,
+                self.exported_gds.checkpoint_fresh_rejected,
+            ),
+            (
+                "rejected_extra_blocks",
+                stats.checkpoint_rejected_extra_blocks,
+                self.exported_gds.checkpoint_rejected_extra_blocks,
+            ),
+            (
+                "rejected_unmeasured",
+                stats.checkpoint_rejected_unmeasured,
+                self.exported_gds.checkpoint_rejected_unmeasured,
+            ),
+        ] {
+            let delta = current.saturating_sub(previous);
+            if delta > 0 {
+                self.checkpoint_events
+                    .inc(&[labels[0], labels[1], labels[2], event], delta as f64);
+            }
+        }
+        for (state, count) in [
+            ("ready", stats.ready_units),
+            ("device_ready", stats.device_ready_units),
+            ("pending", stats.pending_units),
+            ("disk_recoverable", stats.disk_recoverable_units),
+            ("broken", stats.broken_units),
+        ] {
+            self.gds_recovery_units
+                .set(&[labels[0], labels[1], labels[2], state], count as f64);
+        }
+        for (kind, count) in [
+            ("points", stats.dependency_points),
+            ("ranges", stats.dependency_ranges),
+            ("leaves", stats.dependency_leaves),
+        ] {
+            self.gds_dependency_metadata
+                .set(&[labels[0], labels[1], labels[2], kind], count as f64);
+        }
+        let plans = stats
+            .committed_plans
+            .saturating_sub(self.exported_gds.committed_plans);
+        if plans > 0 {
+            self.gds_outcomes.inc(
+                &[labels[0], labels[1], labels[2], "committed_plans"],
+                plans as f64,
+            );
+            self.gds_plan_seconds.inc(
+                &labels,
+                stats
+                    .planning_nanoseconds
+                    .saturating_sub(self.exported_gds.planning_nanoseconds) as f64
+                    / 1e9,
+            );
+        }
+        self.exported_gds = stats;
+    }
+
+    /// Export physical release growth once, without confusing refs with slots.
+    pub fn record_cache_releases(&mut self, stats: Vec<CacheReleaseStats>) {
+        let labels = self.labels();
+        for sample in &stats {
+            let previous = self
+                .exported_cache_releases
+                .iter()
+                .find(|old| old.group_id == sample.group_id && old.host == sample.host);
+            let group = sample.group_id.to_string();
+            let tier = if sample.host { "host" } else { "device" };
+            for (unit, current, before) in [
+                (
+                    "child_slots",
+                    sample.child_slots,
+                    previous.map_or(0, |old| old.child_slots),
+                ),
+                (
+                    "parents",
+                    sample.parents,
+                    previous.map_or(0, |old| old.parents),
+                ),
+            ] {
+                let delta = current.saturating_sub(before);
+                if delta > 0 {
+                    self.cache_releases.inc(
+                        &[labels[0], labels[1], labels[2], tier, &group, unit],
+                        delta as f64,
+                    );
+                }
+            }
+        }
+        self.exported_cache_releases = stats;
+    }
+
+    /// Dependency-aware recovery gains since the previous scheduler snapshot.
+    pub fn record_prefix_recovery(&self, host_gain: u64, unresumable_kv: u64) {
+        let labels = self.labels();
+        if host_gain > 0 {
+            self.prefix_host_gain_tokens.inc(&labels, host_gain as f64);
+        }
+        if unresumable_kv > 0 {
+            self.prefix_unresumable_kv_tokens
+                .inc(&labels, unresumable_kv as f64);
+        }
+    }
+
     /// Prefix-cache counters gained since the last report.
     pub fn record_prefix_hits(
         &self,
@@ -1124,14 +1489,36 @@ impl EngineMetrics {
         host_hit_tokens: u64,
         l3_hit_tokens: u64,
     ) {
+        self.record_prefix_hits_with_peer(
+            prompt_tokens,
+            device_hit_tokens,
+            host_hit_tokens,
+            l3_hit_tokens,
+            0,
+        );
+    }
+
+    /// Report local tier hits and additional Device peer hits against the same prompt count.
+    pub fn record_prefix_hits_with_peer(
+        &self,
+        prompt_tokens: u64,
+        device_hit_tokens: u64,
+        host_hit_tokens: u64,
+        l3_hit_tokens: u64,
+        peer_hit_tokens: u64,
+    ) {
         let labels = self.labels();
+        if peer_hit_tokens > 0 {
+            self.prefix_peer_hit_tokens
+                .inc(&labels, peer_hit_tokens as f64);
+        }
         if prompt_tokens > 0 {
             self.prefix_prompt_tokens.inc(&labels, prompt_tokens as f64);
             // One weighted event keeps numerator and denominator atomic.
             for (metric, hit) in [
                 (
                     &self.prefix_cache_hit_ratio,
-                    device_hit_tokens + host_hit_tokens,
+                    device_hit_tokens + host_hit_tokens + peer_hit_tokens,
                 ),
                 (&self.prefix_device_hit_ratio, device_hit_tokens),
                 (&self.prefix_host_hit_ratio, host_hit_tokens),

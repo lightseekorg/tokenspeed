@@ -35,6 +35,10 @@
 //! behind the forward thread's queue: the round head never waits for
 //! launches in flight. The L3 tier's storage executor is the host's own
 //! (`ts-l3`), outside the data plane.
+//!
+//! A rank whose Host tier is a shared L2 pool has only load-backs to
+//! acknowledge, and the host's loader ran them: its cache acknowledgments
+//! are the loader's finished loads, read without the GIL (`shared_l2.rs`).
 
 use std::{
     collections::HashMap,
@@ -58,7 +62,7 @@ use ts_pd::LandedRequest;
 use ts_scheduler::{profile, CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
-use crate::{cache_events::CacheEvents, pd::Streams, LAUNCHER_FAILURE};
+use crate::{cache_events::CacheEvents, pd::Streams, shared_l2, LAUNCHER_FAILURE};
 
 mod result_buffers;
 
@@ -127,6 +131,12 @@ enum Op {
         payload: Bytes,
         reply: mpsc::SyncSender<Result<(bool, String), String>>,
     },
+    /// Read-only preflight for an ordered release or resume on this rank.
+    CheckMemoryTransition {
+        tags: Vec<String>,
+        release: bool,
+        reply: mpsc::SyncSender<Result<(bool, String), String>>,
+    },
     ReleaseMemory {
         tags: Vec<String>,
         reply: mpsc::SyncSender<Result<(), String>>,
@@ -168,6 +178,7 @@ impl Op {
             Op::CommitWeightUpdate { .. } => "Op::CommitWeightUpdate",
             Op::Profile { .. } => "Op::Profile",
             Op::ReloadForward { .. } => "Op::ReloadForward",
+            Op::CheckMemoryTransition { .. } => "Op::CheckMemoryTransition",
             Op::ReleaseMemory { .. } => "Op::ReleaseMemory",
             Op::ResumeMemory { .. } => "Op::ResumeMemory",
             Op::FinishMemoryResume { .. } => "Op::FinishMemoryResume",
@@ -290,6 +301,9 @@ impl Drop for ExitNotice {
 pub struct PythonDataPlane {
     /// The Python `HostDataPlane`.
     plane: Py<PyAny>,
+    /// The rank's shared L2 handle: the loads of a rank that joined a pool
+    /// are acknowledged from there.
+    shared_l2_handle: Py<shared_l2::Handle>,
     /// The control thread's dispatch guard, entered while the plane serves.
     guard: Option<Py<PyAny>>,
     ops: Option<mpsc::Sender<Op>>,
@@ -305,11 +319,13 @@ impl PythonDataPlane {
     /// dispatch guard on the calling thread, the control thread, which must
     /// also drop the data plane. With PD, the forward thread stages each
     /// plan's remote stream with the transfer peer (`streams`).
+    /// `shared_l2_handle` is the rank's, whether or not it joined a pool.
     pub(crate) fn start(
         plane: Py<PyAny>,
         streams: Option<Streams>,
         cache_events: Option<CacheEvents>,
         replay_retirement: bool,
+        shared_l2_handle: Py<shared_l2::Handle>,
     ) -> Result<Self, String> {
         let guard = Python::attach(|py| {
             plane
@@ -321,6 +337,7 @@ impl PythonDataPlane {
         let shared = Arc::new(Shared::default());
         let mut data_plane = Self {
             plane: Python::attach(|py| plane.clone_ref(py)),
+            shared_l2_handle,
             guard: Some(guard),
             ops: Some(ops),
             shared: shared.clone(),
@@ -487,6 +504,20 @@ impl DataPlane for PythonDataPlane {
 
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
         let _span = profile::span("DataPlane::poll_cache_events");
+        // A rank that joined a shared L2 pool has no cache op to acknowledge
+        // but its load-backs, which the host's loader ran: what the loader
+        // finished is the answer, and Python is not asked.
+        if let Some(loads) = self.shared_l2_handle.get().loads() {
+            self.failed()?;
+            let finished = loads.poll().map_err(|error| self.fail(error.0))?;
+            return Ok(finished
+                .into_iter()
+                .map(|op_id| CacheEvent {
+                    kind: CacheEventKind::LoadBackDone,
+                    op_id,
+                })
+                .collect());
+        }
         let polled: Vec<(String, u32)> = self.query(|plane| {
             let events = plane.call_method0("poll_cache_events")?.extract()?;
             if let Some(observations) = &self.cache_events {
@@ -568,6 +599,19 @@ impl DataPlane for PythonDataPlane {
     fn reload_forward(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
         let payload = control_payload(op)?;
         self.ask(|reply| Op::ReloadForward { payload, reply })
+    }
+
+    fn check_memory_transition(
+        &mut self,
+        tags: &[String],
+        release: bool,
+    ) -> Result<(bool, String), DataPlaneError> {
+        let tags = tags.to_vec();
+        self.ask(|reply| Op::CheckMemoryTransition {
+            tags,
+            release,
+            reply,
+        })
     }
 
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
@@ -719,6 +763,7 @@ fn forward_loop(
                     let _ = reply.send(Err(failure));
                 }
                 Op::CheckWeightUpdate { reply, .. }
+                | Op::CheckMemoryTransition { reply, .. }
                 | Op::UpdateWeights { reply, .. }
                 | Op::Profile { reply, .. }
                 | Op::ReloadForward { reply, .. } => {
@@ -936,6 +981,17 @@ fn run(
         Op::ReloadForward { payload, reply } => {
             let done = plane
                 .call_method1("reload_forward", (PyBytes::new(py, &payload),))
+                .and_then(|result| result.extract())
+                .map_err(python);
+            answer(reply, done)?;
+        }
+        Op::CheckMemoryTransition {
+            tags,
+            release,
+            reply,
+        } => {
+            let done = plane
+                .call_method1("check_memory_transition", (tags, release))
                 .and_then(|result| result.extract())
                 .map_err(python);
             answer(reply, done)?;

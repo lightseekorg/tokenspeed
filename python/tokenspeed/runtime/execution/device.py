@@ -62,6 +62,9 @@ hold each piece:
   resolved past its gate because a text-only model has no vision tower.
 - ``host_cache`` — startup-only Host storage and immutable payload facts,
   consumed by Host-only storage construction outside the device builder.
+- ``shared_l2_client_config`` — the rank's client config for the shared L2
+  pool (``--shared-l2-config``), or None without a pool. The rank's client of the
+  pool's owner runs in the engine host.
 - ``DeviceHandle`` — the running handle, and the only piece the loop stores.
 
 Startup steps that need a real device object (the layerwise step counter,
@@ -109,7 +112,7 @@ The two planes exchange information ONLY through the two channels below.
    shape rather than by anyone remembering them: what the loop cannot see,
    it cannot pass implicitly or mutate afterwards.
 
-5. Two registered exceptions — and new ones belong in this list, not in a
+5. Three registered exceptions — and new ones belong in this list, not in a
    comment at the call site:
 
    - Grammar matchers. ``GrammarStepInputs.grammars`` holds handles to the
@@ -130,6 +133,18 @@ The two planes exchange information ONLY through the two channels below.
      release of the shared SHM handles, behind any forward still reading
      them. What the shallow copy does freeze is the OUTER struct —
      ``mrope_positions`` and its siblings, which the next gather rebinds.
+
+   - Shared L2 proxy pages. With a shared L2 pool the control thread hands
+     the host's pool client the pool page behind each proxy Host block an
+     answer created (``map_proxy_blocks``), and the forward thread's
+     hand-over of a plan's load-backs reads that map
+     (``SharedL2LoadExecutor.submit_load_backs``, through the host's shared
+     L2 handle, ``SharedL2Handle.submit_load``). The discipline is ordering:
+     the map is
+     written right before the plan that may load from those blocks is
+     queued, and the scheduler holds a proxy block a planned
+     load reads until the load is acknowledged, so no later answer remaps it
+     first.
 """
 
 from __future__ import annotations
@@ -139,7 +154,7 @@ import enum
 import json
 import os
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -191,6 +206,7 @@ logger = get_colorful_logger(__name__)
 if TYPE_CHECKING:
     from tokenspeed.runtime.cache.host_storage import HostCacheResources
     from tokenspeed.runtime.cache.peer import PeerGeometry
+    from tokenspeed.runtime.cache.shared_l2.client import SharedL2ClientConfig
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
     from tokenspeed.runtime.execution.forward_reload import ForwardReloader
@@ -318,6 +334,7 @@ class DeviceSpecs:
     num_host_pages: int
     num_snapshot_pages: int
     host_group_packing: tuple[int, ...]
+    host_cache_block_bytes: tuple[int, ...]
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
     cache_observation_capacity: int = 0
@@ -348,6 +365,9 @@ class DeviceBuild:
             register/abort, event polling — or None outside PD.
         host_cache: Startup-only Host resources and immutable payload facts,
             or None without an L2 Host allocation. Contains no Device buffers.
+        shared_l2_client_config: The rank's client config for the shared L2
+            pool (``--shared-l2-config``), or None without a pool. The pool's
+            loads run behind ``handle`` like Host L2 loads.
         handle: The running handle; the loop's only reach into the device.
         encoder_model_facts: Zero-argument callable extracting the facts the
             EPD receive needs (``EncoderModelFacts``). A callable, not a
@@ -363,8 +383,10 @@ class DeviceBuild:
     transfer: Any
     handle: "DeviceHandle"
     host_cache: HostCacheResources | None
+    shared_l2_client_config: SharedL2ClientConfig | None
     encoder_model_facts: Any
     peer_geometry: PeerGeometry | None
+    peer_deployment_id: str | None = None
 
 
 class DeviceRole(enum.Enum):
@@ -406,6 +428,8 @@ class DeviceHandle:
     the control thread calls (see the module docstring); none of them returns
     anything the caller could then use to bypass the rest.
     """
+
+    _additional_discard_reload_types: tuple[type, ...] = ()
 
     def __init__(
         self,
@@ -827,7 +851,8 @@ class DeviceHandle:
         queries plus queue drains (serialized against the forward thread's
         submissions by the executor's own lock). Queued behind the forward
         thread's work, the round head would wait for every forward still
-        being launched.
+        being launched. A rank with a shared L2 pool is not asked: the host
+        acknowledges its loads from its own loader.
 
         Returns:
             The completed ops' scheduler events; empty when nothing finished.
@@ -911,6 +936,26 @@ class DeviceHandle:
         self.settle()
         self._executor.device_module.synchronize()
 
+    @contextlib.contextmanager
+    def complete_memory_transition(self) -> Iterator[None]:
+        """Wait for device work before reporting a successful transition."""
+        with allow_host_sync(
+            "memory transitions wait for the device before rank agreement"
+        ):
+            yield
+            self.synchronize()
+
+    def check_memory_transition(
+        self, tags: list[str], *, release: bool
+    ) -> tuple[bool, str]:
+        """Check the local weight and KV state without changing either."""
+        if self._weight_memory is not None:
+            try:
+                self._weight_memory.check_memory_transition(tags, release=release)
+            except RuntimeError as error:
+                return False, str(error)
+        return True, ""
+
     def empty_cache(self) -> None:
         """Release eager cuBLAS workspaces and allocator blocks after GPU work drains."""
         if self._forward_device.type == "cuda" and (
@@ -947,10 +992,35 @@ class DeviceHandle:
         if self._weight_memory is not None:
             self._weight_memory.before_kv_resume()
 
+    def _peer_weight_controllers(self) -> list:
+        from tokenspeed.runtime.layers.moe.peer_weights import (
+            peer_weights_controller_for,
+        )
+
+        models = [self._executor.model_runner.model]
+        draft_runner = self._executor.draft_model_runner
+        if draft_runner is not None:
+            models.append(draft_runner.model)
+        controllers = []
+        for model in models:
+            controller = peer_weights_controller_for(model)
+            if controller is not None:
+                controllers.append(controller)
+        return controllers
+
     def release_weights(self, adapter) -> None:
         """Discard or back up weights only after device and KV work drained."""
         self.synchronize()
-        operation = lambda: adapter.pause(tag="weights")
+        controllers = self._peer_weight_controllers()
+        backup = (
+            self._weight_memory is None or self._weight_memory.policy == "cpu_backup"
+        )
+
+        def operation() -> None:
+            for controller in controllers:
+                controller.release_storage(backup=backup)
+            adapter.pause(tag="weights")
+
         if self._weight_memory is None:
             operation()
         else:
@@ -958,24 +1028,37 @@ class DeviceHandle:
 
     def resume_weights(self, adapter) -> None:
         """Remap storage and restore constants; discarded parameters stay invalid."""
-        operation = lambda: adapter.resume(tag="weights")
+        controllers = self._peer_weight_controllers()
+        backup = (
+            self._weight_memory is None or self._weight_memory.policy == "cpu_backup"
+        )
+
+        def operation() -> None:
+            adapter.resume(tag="weights")
+            for controller in controllers:
+                controller.resume_storage(backup=backup)
+
         if self._weight_memory is None:
             operation()
         else:
             self._weight_memory.resume(operation)
 
-    def finish_kv_resume(self) -> None:
+    def _restore_kv_contents(self) -> None:
+        self._executor.token_to_kv_pool.clear_kv_buffers()
+
+    def finish_kv_resume(self, *, synchronize_before_registration: bool) -> None:
         """Repair the KV arena after a memory-saver wake re-maps its storage.
 
-        Re-mapped memory holds garbage, so the arena is zeroed first. The
-        draft pool names the same arena, so clearing the target's clears both.
-        FP8 KV scales ride with the weights region and need no reset. The
-        arena then goes back to the PD transfer engine, which registers the
-        new physical pages.
+        The target and draft share an arena. Restore its contents before
+        registering the new physical pages with the PD transfer engine.
         """
         self.settle()
-        self._executor.token_to_kv_pool.clear_kv_buffers()
+        self._restore_kv_contents()
         if self._kv_transfer is not None:
+            if synchronize_before_registration:
+                # NPU transfer registration can expose pages without ordering
+                # against the stream that cleared them.
+                self._executor.device_module.synchronize()
             self._kv_transfer.restore_cache_registration()
         if self._weight_memory is not None:
             self._weight_memory.mark_kv_resumed()
@@ -1192,12 +1275,22 @@ class DeviceHandle:
             UpdateWeightsFromMooncakeReqInput,
         ):
             raise TypeError(f"unsupported weight-load request {type(req).__name__}")
+        controllers = self._peer_weight_controllers()
+        if controllers:
+            if type(req) is UpdateWeightsFromDistributedReqInput:
+                return (
+                    False,
+                    "Peer expert weights do not support distributed broadcast updates",
+                )
+            if any(controller.released for controller in controllers):
+                return False, "Resume weight storage before updating"
         state = self._weight_memory
         if state is None:
             return True, "ready for weight update"
         if (
             state.policy == "discard"
             and type(req) is not UpdateWeightsFromMooncakeReqInput
+            and type(req) not in self._additional_discard_reload_types
         ):
             return False, "Discard policy requires a complete Model Updater SDK update"
         try:
@@ -1701,6 +1794,7 @@ def build_device_side(
     max_resident_requests: int,
     kv_transfer_builder,
     peer_outbox,
+    shared_l2_handle,
 ) -> DeviceBuild:
     """Construct the whole device side and return the three views of it.
 
@@ -1738,6 +1832,11 @@ def build_device_side(
         peer_outbox: With peer prefix sharing, the host's ``PeerOutbox``,
             which the handle tells when a plan's landings may be read (see
             ``cache/peer.py``); None without.
+        shared_l2_handle: The host's shared L2 handle (``SharedL2Handle``),
+            where a rank with ``--shared-l2-config`` starts its client of the
+            pool's owner and hands over its loads (see
+            ``cache/shared_l2/rank.py``); a rank without a pool leaves it
+            unused.
 
     Returns:
         A ``DeviceBuild``. No device object escapes except inside the
@@ -1998,13 +2097,12 @@ def build_device_side(
     host_cache_executor = None
     host_cache = None
     host_tail_packing = {}
-    if server_args.enable_kvstore:
-        from tokenspeed.runtime.cache.host_storage import compute_host_group_packing
+    contract = views.token_to_kv_pool.arena.runtime_contract
+    if server_args.enable_kvstore or peer_outbox is not None:
         from tokenspeed.runtime.cache.transfer.layout import (
             combine_cache_transfer_layouts,
         )
 
-        contract = views.token_to_kv_pool.arena.runtime_contract
         layout = combine_cache_transfer_layouts(
             views.token_to_kv_pool.cache_transfer_layout(),
             (
@@ -2014,6 +2112,9 @@ def build_device_side(
             ),
             group_ids=tuple(spec.group_id for spec in contract.group_specs),
         )
+    if server_args.enable_kvstore:
+        from tokenspeed.runtime.cache.host_storage import compute_host_group_packing
+
         shards = {spec.group_id: spec.shard_count for spec in contract.group_specs}
         host_tail_packing = {
             group.group_id: packing * shards[group.group_id]
@@ -2029,7 +2130,7 @@ def build_device_side(
         }
     snapshot_pool = _retraction_pool_request(
         server_args,
-        views.token_to_kv_pool.arena.runtime_contract,
+        contract,
         host_group_packing=host_tail_packing,
         max_batch_size=max_batch_size,
         max_resident_requests=max_resident_requests,
@@ -2037,17 +2138,59 @@ def build_device_side(
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
     )
-    if server_args.enable_kvstore or not snapshot_pool.disabled:
-        from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+    shared_l2_client_config = None
+    if server_args.has_host_tier or not snapshot_pool.disabled:
         from tokenspeed.runtime.distributed.process_group_manager import (
             process_group_manager as pg_manager,
         )
 
+        # What the Host cache executor's side and a shared L2 pool both
+        # read: the world's Gloo group, for their collectives, and the groups
+        # whose checkpoints are coarser than a page, part of the identity L3
+        # names its objects under and a pool admits its ranks by.
         cpu_group = (
             pg_manager.get_process_group("gloo", server_args.mapping.world_group)
             if server_args.mapping.world_size > 1
             else None
         )
+    checkpoint_granularities = tuple(
+        (spec.group_id, spec.checkpoint_granularity)
+        for spec in contract.group_specs
+        if spec.checkpoint_granularity is not None and spec.checkpoint_granularity > 1
+    )
+    if server_args.shared_l2_config is not None:
+        from tokenspeed.runtime.cache.shared_l2.rank import join_shared_l2_pool
+
+        # The pool is this rank's Host L2: the scheduler's Host tier is its
+        # proxy and Host loads read it by RDMA, so its executor takes the
+        # Host cache executor's place (no local Host bytes, no snapshot pool).
+        shared_l2_client_config, host_cache_executor = join_shared_l2_pool(
+            server_args,
+            model_config,
+            draft_model_config,
+            device_pool=views.token_to_kv_pool,
+            draft_pool=views.draft_token_to_kv_pool,
+            cache_groups=views.cache_groups,
+            prefix_granularity=views.cache_geometry.prefix_granularity,
+            checkpoint_granularities=checkpoint_granularities,
+            attention_backend_name=attention.attention_backend_name,
+            draft_attention_backend_name=attention.draft_attention_backend_name,
+            world_cpu_group=cpu_group,
+            gpu_id=gpu_id,
+            shared_l2_handle=shared_l2_handle,
+        )
+        if cache_observation_capacity > 0:
+            # TODO: record the pool's loads in the engine host's loader, which
+            # runs them. Until then a pool rank records no completed copy, so
+            # its plans keep the loads in their unobserved form.
+            logger.warning(
+                "TOKENSPEED_CACHE_EVENT_LOG=1 logs no prefix_load_completed "
+                "record on a shared L2 rank: the engine host runs its loads"
+            )
+            cache_observation_capacity = 0
+    elif server_args.enable_kvstore or not snapshot_pool.disabled:
+        from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+
         if server_args.kvstore_release_checkpoint_cache:
             from tokenspeed.runtime.cache.l2.executor import (
                 release_checkpoint_file_cache,
@@ -2113,37 +2256,92 @@ def build_device_side(
             memory_plan=views.token_to_kv_pool.arena.plan,
             attention_backend_name=attention.attention_backend_name,
             draft_attention_backend_name=attention.draft_attention_backend_name,
-            checkpoint_granularities=tuple(
-                (spec.group_id, spec.checkpoint_granularity)
-                for spec in views.token_to_kv_pool.arena.runtime_contract.group_specs
-                if spec.checkpoint_granularity is not None
-                and spec.checkpoint_granularity > 1
-            ),
+            checkpoint_granularities=checkpoint_granularities,
         )
 
     peer_geometry = None
+    peer_deployment_id = None
     if peer_outbox is not None:
-        from tokenspeed.runtime.cache.peer import build_peer_geometry
+        from tokenspeed.runtime.cache.l3.factory import cache_layout_deployment_id
+        from tokenspeed.runtime.cache.peer import build_peer_geometry, peer_semantic_id
         from tokenspeed.runtime.plugins.registry import get_peer_host_region_planner
 
-        if host_cache is None:
-            raise ValueError(
-                "peer prefix sharing needs the Host tier (--enable-kvstore)"
-            )
         arena = views.token_to_kv_pool.arena
+        peer_deployment_id = cache_layout_deployment_id(
+            server_args,
+            model_config,
+            draft_model_config,
+            cache_layout=layout,
+            checkpoint_granularities=checkpoint_granularities,
+            group_shard_counts=tuple(spec.shard_count for spec in contract.group_specs),
+            attention_backend_name=attention.attention_backend_name,
+            draft_attention_backend_name=attention.draft_attention_backend_name,
+            world_cpu_group=None,
+            for_peer=True,
+        )
+        transfer_contract = b""
+        mapping = server_args.mapping
+        topology = (
+            server_args.disaggregation_mode,
+            mapping.attn.tp_size,
+            mapping.attn.kvp_size,
+        )
+        state_abi = attention.peer_state_abi
+        draft_supported = (
+            server_args.speculative_algorithm == "DFLASH" and state_abi is not None
+        )
+        if (draft_model_config is None or draft_supported) and topology in (
+            ("prefill", 8, 8),
+            ("decode", 1, 1),
+        ):
+            from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+                build_cache_transfer_schema,
+            )
+            from tokenspeed.runtime.pd.cache_protocol import CacheTransferContract
+
+            transfer_contract = CacheTransferContract(
+                arena.plan,
+                tuple(arena.cache_group_specs),
+                build_cache_transfer_schema(
+                    arena.plan,
+                    model_config=model_config,
+                    draft_model_config=draft_model_config,
+                ),
+            ).to_wire_bytes()
         peer_geometry = build_peer_geometry(
             scheduler_group_ids=tuple(
                 spec.group_id for spec in arena.runtime_contract.group_specs
             ),
-            groups=host_cache.groups,
+            groups=layout.groups,
             field_addresses={
                 field.field_id: arena.field_address(field.field_id)
-                for group in host_cache.groups
+                for group in layout.groups
                 for field in group.fields
             },
             device_regions=arena.registration_regions(),
-            host_storage=host_cache.storage,
-            host_region_planner=get_peer_host_region_planner(server_args.device),
+            host_storage=host_cache.storage if host_cache is not None else None,
+            transfer_contract=transfer_contract,
+            semantic_id=(
+                peer_semantic_id(
+                    server_args.served_model_name,
+                    model_config.revision,
+                    server_args.weight_version,
+                    state_abi,
+                    paired_weights=draft_model_config is not None,
+                )
+                if transfer_contract
+                else b""
+            ),
+            host_virtual_bounds=(
+                host_cache.ownership.host_virtual_counts
+                if host_cache is not None
+                else ()
+            ),
+            host_region_planner=(
+                get_peer_host_region_planner(server_args.device)
+                if host_cache is not None
+                else None
+            ),
         )
 
     kv_transfer = kv_transfer_builder(
@@ -2200,6 +2398,12 @@ def build_device_side(
             if host_cache_executor is not None
             else ()
         ),
+        host_cache_block_bytes=(
+            tuple(host_cache_executor.host_storage.host_cache_block_bytes)
+            if host_cache_executor is not None
+            and host_cache_executor.host_storage is not None
+            else ()
+        ),
         max_retracted_requests=(
             host_cache_executor.max_retracted_requests
             if host_cache_executor is not None
@@ -2227,13 +2431,22 @@ def build_device_side(
             policy=server_args.weight_memory_policy, models=update_models
         )
 
+    handle_type: type[DeviceHandle] = DeviceHandle
+    if server_args.enable_memory_saver and executor.device == "npu":
+        from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+            AscendMemorySaverDeviceHandle,
+        )
+
+        handle_type = AscendMemorySaverDeviceHandle
     return DeviceBuild(
         host_cache=host_cache,
+        shared_l2_client_config=shared_l2_client_config,
         peer_geometry=peer_geometry,
+        peer_deployment_id=peer_deployment_id,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,
-        handle=DeviceHandle(
+        handle=handle_type(
             executor,
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,

@@ -100,9 +100,10 @@ _DTYPES = {
 
 
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.retained import (
+    applied_length,
     fake_retained_arguments,
     retained_arguments,
-    retained_length,
+    retained_count,
     retained_row,
 )
 
@@ -385,10 +386,12 @@ class _Shared(NamedTuple):
     norm: cute.Tensor | None
     history: cute.Tensor | None
     history_addr: Int32 | None
+    records: cute.Tensor | None
     token_barrier: object
     state_barrier: object
     weight_barrier: object
     norm_barrier: object
+    records_barrier: object | None
 
 
 class RecoverSsmVerify:
@@ -408,6 +411,9 @@ class RecoverSsmVerify:
       norm: (subclasses that set ``norm_words``) FP32 output-norm sums.
       history: the history rows' products w_p . M as [history_rows,
         padded_columns], then the records' total decay of each key channel.
+      records: (subclasses that set ``copy_records``) the accepted records'
+        keys and decays as [history_rows, K] each, then this tile's U as
+        [history_rows, VT], bulk-copied from global memory.
     """
 
     def __init__(
@@ -478,6 +484,14 @@ class RecoverSsmVerify:
         # store them while the others solve, from the gate steps the tile's
         # threads leave in M's place once the product has read it.
         self.defer_window_records = self.preload_history_us
+        # Subclasses may bulk-copy the records' keys, decays and the tile's U
+        # into shared memory (``copy_records``); word offsets of the three
+        # [history_rows, ...] parts of that region and its size.
+        self.copy_records = False
+        self.record_keys = 0
+        self.record_decays = 0
+        self.record_us = 0
+        self.record_words = 0
         assert not self.defer_window_records or (
             value_tile_rows < THREADS
             and key_dim * self.padded_columns >= value_tile_rows * window
@@ -673,8 +687,12 @@ class RecoverSsmVerify:
                     )
                     _store_if(Int32(t < valid_tokens), row.toint(), Float32(0.0), True)
         else:
-            # Loaded once, early: phase 1 branches on it.
-            count = retained_length(retained, slot)
+            # Loaded once, early: phase 1 branches on it. Bounded by
+            # ``applied_length`` only once every warp uses it, after the copies.
+            count = retained_count(retained, slot)
+            if const_expr(self.early_history_loads):
+                # The early record loads branch on it at once.
+                count = applied_length(count, self.capacity - W)
             history_keys, history_decays, history_us = self._early_history_registers()
             self._start_early_history(
                 retained,
@@ -716,7 +734,10 @@ class RecoverSsmVerify:
             self._load_base_tile(
                 shared, retained, live_page, head, value_start, tidx, warp, lane
             )
-            self._prefetch_records(retained, slot, head, value_start, count, warp, lane)
+            if const_expr(not self.early_history_loads):
+                self._prefetch_records(
+                    retained, slot, head, value_start, count, warp, lane
+                )
 
             stamp_slot = Int64(request)
             generation = Int64(0)
@@ -742,6 +763,8 @@ class RecoverSsmVerify:
                         stamps, stamp_slot, ring_capacity, start, generation, tidx
                     )
             cute.arch.mbarrier_wait(shared.token_barrier, 0)
+            if const_expr(not self.early_history_loads):
+                count = applied_length(count, self.capacity - W)
             decay_steps = self._project_window(
                 shared,
                 tidx,
@@ -850,6 +873,10 @@ class RecoverSsmVerify:
         # Records exist only where the capacity leaves room beside the window.
         has_history = self.history_rows > 0
         late_loads = has_history and not self.early_history_loads
+        # With several value tiles per head only tile 0 stores the window's
+        # records; the branch is uniform per CTA and skips the others' exps
+        # and addresses. A single tile per head always stores them.
+        split_value = self.value_tile_rows < self.value_dim
         history_keys = early_keys
         history_decays = early_decays
         history_us = early_us
@@ -861,7 +888,7 @@ class RecoverSsmVerify:
         decay_steps = cute.make_rmem_tensor((W,), Float32)
         # Phase 1, one thread per key; every load precedes every store.
         if tidx < K:
-            if const_expr(late_loads and not channel_loaded):
+            if const_expr(late_loads and not channel_loaded and not self.copy_records):
                 if record_start > 0:
                     # In flight during the key channel's work.
                     self._load_history_channel(
@@ -877,6 +904,18 @@ class RecoverSsmVerify:
             if const_expr(self.defer_window_records):
                 for t in cutlass.range_constexpr(W):
                     decay_steps[t] = steps[t]
+            elif const_expr(split_value):
+                if records_keys != 0:
+                    self._store_decay_records(
+                        retained,
+                        record_slot,
+                        record_head,
+                        record_start,
+                        records_keys,
+                        valid_tokens,
+                        tidx,
+                        steps,
+                    )
             else:
                 self._store_decay_records(
                     retained,
@@ -888,7 +927,20 @@ class RecoverSsmVerify:
                     tidx,
                     steps,
                 )
-            if const_expr(has_history):
+            if const_expr(has_history and self.copy_records):
+                if record_start > 0:
+                    # The copies the CTA issued after its row loads.
+                    cute.arch.mbarrier_wait(shared.records_barrier, 0)
+                    # Views of this channel's copied rows: the store reads only
+                    # the rows below the count, the ones the copies wrote.
+                    rows = cute.make_layout((self.history_rows,), stride=(K,))
+                    channel = shared.records.iterator + tidx
+                    key_rows = cute.make_tensor(channel + self.record_keys, rows)
+                    decay_rows = cute.make_tensor(channel + self.record_decays, rows)
+                    self._store_history_rows(
+                        shared, key_rows, decay_rows, record_start, tidx
+                    )
+            elif const_expr(has_history):
                 if record_start > 0:
                     self._store_history_rows(
                         shared, history_keys, history_decays, record_start, tidx
@@ -900,7 +952,7 @@ class RecoverSsmVerify:
             cute.arch.barrier()
             self._finalize_coefficients(shared.sums, tidx)
 
-        if const_expr(self.preload_history_us):
+        if const_expr(self.preload_history_us and not self.copy_records):
             if record_start > 0:
                 self._load_history_us(
                     retained,
@@ -983,16 +1035,29 @@ class RecoverSsmVerify:
         if const_expr(not self.defer_window_records):
             # The window's normalized keys need the final key scales.
             cute.arch.barrier()
-            self._store_key_records(
-                shared,
-                retained,
-                record_slot,
-                record_head,
-                record_start,
-                records_keys,
-                valid_tokens,
-                tidx,
-            )
+            if const_expr(split_value):
+                if records_keys != 0:
+                    self._store_key_records(
+                        shared,
+                        retained,
+                        record_slot,
+                        record_head,
+                        record_start,
+                        records_keys,
+                        valid_tokens,
+                        tidx,
+                    )
+            else:
+                self._store_key_records(
+                    shared,
+                    retained,
+                    record_slot,
+                    record_head,
+                    record_start,
+                    records_keys,
+                    valid_tokens,
+                    tidx,
+                )
         return decay_steps
 
     @cute.jit
@@ -1144,7 +1209,12 @@ class RecoverSsmVerify:
                 Float32, cute.make_layout((self.history_words,)), byte_alignment=16
             )
             history_addr = Int32(history.iterator.toint())
-        barriers = smem.allocate_array(Int64, num_elems=4)
+        records = None
+        if const_expr(self.copy_records):
+            records = smem.allocate_tensor(
+                Float32, cute.make_layout((self.record_words,)), byte_alignment=128
+            )
+        barriers = smem.allocate_array(Int64, num_elems=5 if self.copy_records else 4)
         return _Shared(
             tile=tile,
             tile_addr=Int32(tile.iterator.toint()),
@@ -1157,10 +1227,12 @@ class RecoverSsmVerify:
             norm=norm,
             history=history,
             history_addr=history_addr,
+            records=records,
             token_barrier=barriers,
             state_barrier=barriers + 1,
             weight_barrier=barriers + 2,
             norm_barrier=barriers + 3,
+            records_barrier=barriers + 4 if self.copy_records else None,
         )
 
     @cute.jit
@@ -1283,17 +1355,21 @@ class RecoverSsmVerify:
         warp: Int32,
         lane: Int32,
     ):
-        """Prefetch the (slot, head)'s ``count`` records into L2 for the projection.
+        """Prefetch the (slot, head)'s applied records into L2 for the projection.
 
         Records were written rounds ago and are usually only in DRAM; the
-        prefetch overlaps their latency with phase 1. The last warp issues it.
+        prefetch overlaps their latency with phase 1. The last warp issues it,
+        and only it waits for the stored ``count`` it bounds here.
         Lanes 2p and 2p + 1 cover record p, the even one its key row and this
         tile's u, the odd one its decay row, a 128-byte line at a time over
         dense rows (other layouts prefetch lines the replay may not read).
+        Tiles with ``early_history_loads`` skip it: every thread's loads of
+        those lines already start with the CTA (``_start_early_history``).
         """
         K = self.key_dim
         VT = self.value_tile_rows
         if warp == THREADS // 32 - 1:
+            count = applied_length(count, self.capacity - self.window)
             correction, key, decay = retained[1], retained[2], retained[3]
             for group in cutlass.range((count + 15) // 16, unroll=1):
                 record = group * 16 + lane // 2
@@ -1636,12 +1712,25 @@ class RecoverSsmVerify:
         groups = THREADS // VT
         channel = tidx % VT
         group = tidx // VT
-        if const_expr(not self.early_history_loads and not self.preload_history_us):
+        if const_expr(
+            not self.early_history_loads
+            and not self.preload_history_us
+            and not self.copy_records
+        ):
             # All in flight before the first use.
             self._load_history_us(
                 retained, slot, head, count, value_start, tidx, history_us
             )
-        us = [history_us[p] for p in range(self._history_u_count())]
+        us = []
+        if const_expr(self.copy_records):
+            # Rows past the count reuse the last record, whose u meets a zero D row.
+            last = count - 1
+            for i in cutlass.range_constexpr(4 // groups):
+                for j in cutlass.range_constexpr(block):
+                    at = cutlass.min((group + i * groups) * block + j, last)
+                    us.append(shared.records[self.record_us + at * VT + channel])
+        else:
+            us = [history_us[p] for p in range(self._history_u_count())]
         sums = cute.make_rmem_tensor((columns,), Float32)
         for i in cutlass.range_constexpr(4 // groups):
             b = group + i * groups

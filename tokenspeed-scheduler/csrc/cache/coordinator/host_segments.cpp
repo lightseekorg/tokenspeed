@@ -32,15 +32,18 @@
 #include <vector>
 
 #include "cache/coordinator/host_cache.h"
+#include "cache/coordinator/clean_host_copies.h"
 #include "cache/coordinator/shadow_occupancy.h"
 #include "cache/core/block_placement_demand.h"
 #include "utils.h"
 
+#include "cache/coordinator/gds_tiered.h"
+
 namespace tokenspeed {
 
-template <typename Visitor>
-void HostCache::visitHostKvDuplicateCandidates(Visitor&& visit) const {
-    if (!store_.Boundaries().HasHostKvDuplicateCandidate()) {
+void VisitHostKvDuplicateCandidates(const CacheStore& store,
+                                    const std::function<bool(const HostKvDuplicateCandidate&)>& visit) {
+    if (!store.Boundaries().HasHostKvDuplicateCandidate()) {
         return;
     }
     std::pmr::monotonic_buffer_resource scratch;
@@ -48,18 +51,18 @@ void HostCache::visitHostKvDuplicateCandidates(Visitor&& visit) const {
     // The leading tokens whose pages hold some group's sink blocks.
     std::int64_t sink_span_tokens = 0;
     std::vector<std::size_t> closed_groups;
-    for (std::size_t i = 0; i < store_.Groups().size(); ++i) {
-        if (store_.Groups()[i].Matcher().IsPrefixClosed()) {
+    for (std::size_t i = 0; i < store.Groups().size(); ++i) {
+        if (store.Groups()[i].Matcher().IsPrefixClosed()) {
             closed_groups.push_back(i);
         }
-        if (const std::int32_t sink_blocks = store_.Groups()[i].Allocator().KeptHeadBlocks(); sink_blocks > 0) {
+        if (const std::int32_t sink_blocks = store.Groups()[i].Allocator().KeptHeadBlocks(); sink_blocks > 0) {
             sink_span_tokens = std::max(
-                sink_span_tokens, static_cast<std::int64_t>(sink_blocks) * store_.Geometry()[i].BlockGranularity());
+                sink_span_tokens, static_cast<std::int64_t>(sink_blocks) * store.Geometry()[i].BlockGranularity());
         }
-        if (!store_.GroupIsReplayable(i) && !store_.GroupIsState(i) && !store_.Groups()[i].Matcher().IsPrefixClosed()) {
-            lookback_tokens = std::max(
-                lookback_tokens, static_cast<std::int64_t>(store_.Groups()[i].Matcher().BoundaryLookbackBlocks()) *
-                                     store_.Geometry()[i].BlockGranularity());
+        if (!store.GroupIsReplayable(i) && !store.GroupIsState(i) && !store.Groups()[i].Matcher().IsPrefixClosed()) {
+            lookback_tokens = std::max(lookback_tokens,
+                                       static_cast<std::int64_t>(store.Groups()[i].Matcher().BoundaryLookbackBlocks()) *
+                                           store.Geometry()[i].BlockGranularity());
         }
     }
     std::vector<const BoundaryTree::Node*> ancestors;
@@ -77,17 +80,17 @@ void HostCache::visitHostKvDuplicateCandidates(Visitor&& visit) const {
         const BoundaryTree::Node* page = boundary.tail_tokens > 0 ? boundary.parent : &boundary;
         const std::int64_t first_window_token = std::max<std::int64_t>(0, boundary.boundary_tokens - lookback_tokens);
         while (page != nullptr && page->boundary_tokens > first_window_token) {
-            const std::int32_t page_start = page->boundary_tokens - store_.PrefixGranularity();
-            store_.ForEachBoundaryKey(
+            const std::int32_t page_start = page->boundary_tokens - store.PrefixGranularity();
+            store.ForEachBoundaryKey(
                 CacheKey{.content_hash = page->hash}, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
-                    if (store_.GroupIsState(i) || store_.Groups()[i].Matcher().IsPrefixClosed()) {
+                    if (store.GroupIsState(i) || store.Groups()[i].Matcher().IsPrefixClosed()) {
                         return;
                     }
-                    const std::int32_t block = page_start / store_.Geometry()[i].BlockGranularity() + key.page_offset;
+                    const std::int32_t block = page_start / store.Geometry()[i].BlockGranularity() + key.page_offset;
                     const CacheStore::BlockRange window =
-                        store_.SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary.boundary_tokens);
+                        store.SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary.boundary_tokens);
                     if (block >= window.first && block < window.past_end &&
-                        !store_.Groups()[i].Index().Contains(store_.DevicePool(), key)) {
+                        !store.Groups()[i].Index().Contains(store.DevicePool(), key)) {
                         split = std::min(split, page_start);
                     }
                 });
@@ -100,16 +103,16 @@ void HostCache::visitHostKvDuplicateCandidates(Visitor&& visit) const {
     // missing one lowers the Host-suffix split of every boundary above the
     // page to it, so the Host KV from there on is no duplicate.
     const auto device_holds_sink_blocks = [&](const BoundaryTree::Node& page) {
-        const std::int32_t page_start = page.boundary_tokens - store_.PrefixGranularity();
+        const std::int32_t page_start = page.boundary_tokens - store.PrefixGranularity();
         bool held = true;
-        store_.ForEachBoundaryKey(
+        store.ForEachBoundaryKey(
             CacheKey{.content_hash = page.hash}, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
-                const std::int32_t sink_blocks = store_.Groups()[i].Allocator().KeptHeadBlocks();
+                const std::int32_t sink_blocks = store.Groups()[i].Allocator().KeptHeadBlocks();
                 if (sink_blocks == 0) {
                     return;
                 }
-                const std::int32_t block = page_start / store_.Geometry()[i].BlockGranularity() + key.page_offset;
-                held = held && (block >= sink_blocks || store_.Groups()[i].Index().Contains(store_.DevicePool(), key));
+                const std::int32_t block = page_start / store.Geometry()[i].BlockGranularity() + key.page_offset;
+                held = held && (block >= sink_blocks || store.Groups()[i].Index().Contains(store.DevicePool(), key));
             });
         return held;
     };
@@ -129,9 +132,9 @@ void HostCache::visitHostKvDuplicateCandidates(Visitor&& visit) const {
                 break;
             }
             ancestors.push_back(ancestor);
-            if (ancestor->PendingHostStores() > 0 || !store_.Boundaries().DeviceKvPageExtendsPrefix(*ancestor) ||
+            if (ancestor->PendingHostStores() > 0 || !store.Boundaries().DeviceKvPageExtendsPrefix(*ancestor) ||
                 (ancestor->tail_tokens == 0 &&
-                 ancestor->boundary_tokens - store_.PrefixGranularity() < sink_span_tokens &&
+                 ancestor->boundary_tokens - store.PrefixGranularity() < sink_span_tokens &&
                  !device_holds_sink_blocks(*ancestor))) {
                 backed = false;
                 break;
@@ -166,7 +169,7 @@ void HostCache::visitHostKvDuplicateCandidates(Visitor&& visit) const {
                 const BoundaryTree::Node& boundary = *pending.back();
                 pending.pop_back();
                 if (boundary.PendingHostStores() > 0 ||
-                    ((store_.NumStateGroups() == 0 || boundary.HasCheckpoint(BoundaryTree::kDevice) ||
+                    ((store.NumStateGroups() == 0 || boundary.HasCheckpoint(BoundaryTree::kDevice) ||
                       boundary.HasCheckpoint(BoundaryTree::kHost)) &&
                      device_window_split(boundary) < node.boundary_tokens)) {
                     return false;
@@ -192,8 +195,8 @@ void HostCache::visitHostKvDuplicateCandidates(Visitor&& visit) const {
     std::vector<std::size_t> next_unpinned(closed_groups.size(), 0);
     const auto next_entry = [&](std::size_t i, bool pinned) -> std::optional<PrefixCacheIndex::CommonEntry> {
         if (pinned) {
-            while (const auto entry = store_.Groups()[closed_groups[i]].Index().NextCommonRecentEntry(
-                       store_.DevicePool(), cursors[i])) {
+            while (const auto entry =
+                       store.Groups()[closed_groups[i]].Index().NextCommonRecentEntry(store.DevicePool(), cursors[i])) {
                 if (entry->source.pinned) {
                     return entry;
                 }
@@ -230,12 +233,12 @@ void HostCache::visitHostKvDuplicateCandidates(Visitor&& visit) const {
                     const PrefixCacheIndex::CommonEntry& device = *next[i];
                     const bool boundary_key =
                         device.key->namespace_id == kDefaultCacheNamespaceId && device.key->page_offset >= 0 &&
-                        device.key->page_offset < store_.BlocksPerBoundary(static_cast<std::int32_t>(closed_groups[i]));
+                        device.key->page_offset < store.BlocksPerBoundary(static_cast<std::int32_t>(closed_groups[i]));
                     const BoundaryTree::Node* node =
-                        boundary_key ? store_.Boundaries().Find(device.key->content_hash) : nullptr;
+                        boundary_key ? store.Boundaries().Find(device.key->content_hash) : nullptr;
                     if (node != nullptr && !device.peer.pinned && eligible(*node)) {
                         candidates.push_back(HostKvDuplicateCandidate{
-                            .group_id = store_.Groups()[closed_groups[i]].Id(),
+                            .group_id = store.Groups()[closed_groups[i]].Id(),
                             .location = device.peer.location,
                             .boundary_tokens = node->boundary_tokens,
                             .device_in_use = pinned,
@@ -257,6 +260,82 @@ void HostCache::visitHostKvDuplicateCandidates(Visitor&& visit) const {
             }
         }
     }
+}
+
+std::vector<HostCopyVictim> HostCopiesBeforeDirty(const CacheStore& store) {
+    if (!store.DiskPool() || !store.HostPool()) return {};
+    const auto& host = *store.HostPool();
+    // Use the same three-tier gap/pending rules as dead collection. A Disk
+    // ancestor keeps its Host descendants live; a missing ancestor does not.
+    struct Boundary {
+        const BoundaryTree::Node* node;
+        bool gap;
+    };
+    std::vector<Boundary> pending;
+    for (auto* root = store.Boundaries().FirstRoot(); root != nullptr; root = root->next_sibling)
+        pending.push_back({root, false});
+    std::unordered_set<const BoundaryTree::Node*> dead;
+    while (!pending.empty()) {
+        const auto [node, ancestor_gap] = pending.back();
+        pending.pop_back();
+        const bool gap =
+            ancestor_gap || (node->PendingHostStores() == 0 &&
+                             ((store.HasPrefixClosedGroups() && !node->HasClosedEntries()) ||
+                              (node->tail_tokens > 0 && !store.Boundaries().Tails().Contains(node->hash))));
+        if (node->PendingHostStores() == 0 &&
+            (gap || (store.NumStateGroups() > 0 && !node->HasCheckpointBoundaryInSubtree())))
+            dead.insert(node);
+        for (auto* child = node->first_child; child != nullptr; child = child->next_sibling)
+            pending.push_back({child, gap});
+    }
+
+    std::vector<HostCopyVictim> result;
+    std::vector<HostCopyVictim> device_states;
+    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> seen;
+    for (const auto& group : store.Groups()) {
+        group.Index().ForEachEntry(host, [&](const CacheKey& key, const auto& entry) {
+            if (entry.pinned || seen.contains(entry.location) || key.namespace_id != kDefaultCacheNamespaceId) return;
+            const auto* node = store.Boundaries().Find(key.content_hash);
+            const bool is_dead = node != nullptr && dead.contains(node);
+            if (!is_dead && (!store.GroupIsState(group.Id()) || !group.Index().Contains(store.DevicePool(), key)))
+                return;
+            HostCopyVictim copy{entry.metadata.eviction.last_access_epoch, {{group.Id(), entry.location}}};
+            bool covered = true;
+            if (store.GroupIsState(group.Id())) {
+                // Removing a State takes its unpinned siblings too. Every
+                // sibling must be on Device before this is a duplicate loss.
+                store.ForEachBoundaryKey(key, 0, [&](std::size_t g, const CacheKey& sibling) {
+                    if (g == group.Id() || !store.GroupIsState(g)) return;
+                    const auto other = store.Groups()[g].Index().Inspect(host, sibling);
+                    if (!other || other->pinned) return;
+                    covered = covered && (is_dead || store.Groups()[g].Index().Contains(store.DevicePool(), sibling));
+                    copy.members.emplace_back(static_cast<std::uint32_t>(g), other->location);
+                    copy.epoch = std::max(copy.epoch, other->metadata.eviction.last_access_epoch);
+                });
+            }
+            if (!covered) return;
+            for (const auto& [g, location] : copy.members) seen.insert(location);
+            (is_dead ? result : device_states).push_back(std::move(copy));
+        });
+    }
+    const auto older = [](const HostCopyVictim& a, const HostCopyVictim& b) {
+        return std::tuple{a.epoch, a.members.front().first, a.members.front().second.lcm_block_id,
+                          a.members.front().second.slot_index} < std::tuple{b.epoch, b.members.front().first,
+                                                                            b.members.front().second.lcm_block_id,
+                                                                            b.members.front().second.slot_index};
+    };
+    std::ranges::sort(result, older);
+    std::ranges::sort(device_states, older);
+    for (auto& copy : device_states) result.push_back(std::move(copy));
+    VisitHostKvDuplicateCandidates(store, [&](const HostKvDuplicateCandidate& copy) {
+        if (seen.insert(copy.location).second) result.push_back({0, {{copy.group_id, copy.location}}});
+        return true;
+    });
+    for (auto& copy : DiskCleanHostCopies(store)) {
+        std::erase_if(copy.members, [&](const auto& member) { return seen.contains(member.second); });
+        if (!copy.members.empty()) result.push_back(std::move(copy));
+    }
+    return result;
 }
 
 HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::uint32_t> group_ids,
@@ -284,6 +363,15 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
         _assert(buckets[row] >= 0 && buckets[row] < store_.Groups()[group_ids[row]].Allocator().ShardCount(),
                 "Host block bucket is outside the group's shard count");
         ++block_demands[group_ids[row]].blocks_by_bucket[static_cast<std::size_t>(buckets[row])];
+    }
+    if (store_.UsesGds()) {
+        std::vector<std::size_t> ends;
+        for (const auto& segment : segments) ends.push_back(segment.past_end_row);
+        auto selected = PlanTieredHostAllocation(store_, group_ids, buckets, ends, true, true);
+        HostPlacementPlan plan;
+        plan.num_placed = selected.accepted_segments;
+        plan.tiered = std::move(selected.plan);
+        return plan;
     }
     ShadowOccupancy shadow{*store_.HostPool(), store_.Groups()};
     // Nothing is evicted while free capacity fits every segment.
@@ -709,7 +797,7 @@ HostCache::HostPlacementPlan HostCache::planHostSegments(std::span<const std::ui
         if ((!added_kv_duplicates && (host_only_next || demoted_next)) ||
             (unheld_duplicates_deferred && host_only_next)) {
             bool deferred = false;
-            visitHostKvDuplicateCandidates([&](const HostKvDuplicateCandidate& duplicate) {
+            VisitHostKvDuplicateCandidates(store_, [&](const HostKvDuplicateCandidate& duplicate) {
                 if (demoted_next && !duplicate.device_in_use) {
                     deferred = true;
                     return false;
@@ -952,6 +1040,17 @@ HostCache::HostAllocationBatch HostCache::acquireHostPlacement(const HostPlaceme
                                                                std::span<const std::uint32_t> group_ids,
                                                                std::span<const std::int32_t> buckets,
                                                                std::span<const HostSegmentRows> segments) {
+    if (plan.tiered) {
+        const auto victims = TieredVictims(plan.tiered, std::pmr::get_default_resource());
+        FatalCheck(evictor_
+                       .EvictPlanned(victims, false,
+                                     CacheEvictor::VictimReasons{
+                                         .victim = &CacheEvictor::DeviceEvictionStats::admission,
+                                         .stranded_suffix = &CacheEvictor::DeviceEvictionStats::stranded_suffix,
+                                         .request_reclaim = &CacheEvictor::DeviceEvictionStats::request_reclaim})
+                       .empty(),
+                   "a joint Host plan cannot reclaim live Device owners");
+    }
     // Evict, then allocate: the fit holds once the victims are gone.
     for (const auto& [group_id, location, reason] : plan.victims) {
         // A checkpoint takes the other State groups' at its hash along.

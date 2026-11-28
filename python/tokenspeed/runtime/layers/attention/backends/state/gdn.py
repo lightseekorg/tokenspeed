@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_supports,
     gdn_pending_replay_supported,
     gdn_tree_verify_needs_node_states,
+    gdn_verify_fuses_output_norm,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
 from tokenspeed_kernel.ops.conv.replay import BankedConvReplayPayload
@@ -193,6 +194,10 @@ class GdnAttnBackend(CapacityPrefillBackend):
             trait="strided_qkv",
             traits=decode_traits,
             solution=None,
+        )
+        # A verify kernel applying the gated output norm saves its launch.
+        self._verify_fuses_output_norm = gdn_verify_fuses_output_norm(
+            self.dtype, state_dtype=ssm_dtype, traits=verify_traits, solution=None
         )
 
     def _admits_capacity_prefill(self) -> bool:

@@ -71,7 +71,7 @@ def _synthetic_arena(layout):
     return SimpleNamespace(
         cache_group_specs=contract.group_specs,
         runtime_contract=contract,
-        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False, device="cpu"),
     )
 
 
@@ -127,6 +127,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
             return import_module("tokenspeed.runtime.cache.l2.executor")
     host_transfer = ModuleType("tokenspeed_kernel.ops.kvcache.host_transfer")
     host_transfer.HostTransferWorkspace = Mock
+    host_transfer.StagingBuffer = Mock
     host_transfer.build_host_transfer_geometry = Mock()
     host_transfer.transfer_cache_blocks = Mock()
     host_transfer.wait_layer_ready = Mock()
@@ -268,7 +269,9 @@ class TestGroupAwareWireTest:
         executor._load_poisoned = False
         executor.load_stream = object() if load_stream is None else load_stream
         executor.transfer_backend = backend
-        executor._memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+        executor._memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=False, device="cpu"
+        )
         device = SimpleNamespace(type="cuda")
         executor.layout = SimpleNamespace(
             buffers=(SimpleNamespace(device=device),),
@@ -484,7 +487,7 @@ class TestGroupAwareWireTest:
         for lane_name in ("_ordered_write_lane", "_pinned_write_lane"):
             with patch.object(lanes_module, "HostTransferWorkspace", Mock):
                 lane = lanes_module.HostTransferLane(
-                    TorchMemorySaverAdapter.create(enable=False)
+                    TorchMemorySaverAdapter.create(enable=False, device="cpu")
                 )
             lane.workspace.load_block_transfers.return_value = (1, (0, 1))
             lane.workspace.prepare_backend.return_value = SimpleNamespace(
@@ -963,7 +966,7 @@ class TestGroupAwareWireTest:
         draft_layout = SimpleNamespace(consumers=(("draft.0.k",),))
         target_pool = Mock()
         target_pool.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=False
+            enable=False, device="cpu"
         )
         target_pool.cache_transfer_layout.return_value = target_layout
         target_pool.arena.runtime_contract = _replicated_contract(
@@ -1067,7 +1070,9 @@ class TestGroupAwareWireTest:
         HostCacheExecutor = executor_module.HostCacheExecutor
 
         pool = Mock()
-        pool.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+        pool.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=False, device="cpu"
+        )
         pool.arena.runtime_contract = SimpleNamespace(
             group_specs=(
                 SimpleNamespace(
@@ -1089,6 +1094,14 @@ class TestGroupAwareWireTest:
         )
         tracker = Mock()
         tracker.event_sets = [object()]
+
+        bound_geometry = SimpleNamespace(device_rows="bound")
+
+        def _make_unbound_geometry(**_kwargs):
+            unbound = SimpleNamespace(
+                device_rows=None, bind=Mock(return_value=bound_geometry)
+            )
+            return unbound
 
         with (
             patch.object(
@@ -1113,18 +1126,22 @@ class TestGroupAwareWireTest:
                 executor_module.device_module, "stream", return_value=nullcontext()
             ),
             patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(executor_module, "StagingBuffer", side_effect=Mock),
             patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(HostCacheExecutor, "_warmup_restore_transfers"),
             patch.object(
                 lanes_module,
                 "build_host_transfer_geometry",
-                side_effect=lambda **_kwargs: SimpleNamespace(
-                    device_rows=None,
-                    bind=Mock(),
-                ),
+                side_effect=_make_unbound_geometry,
             ) as build_geometry,
         ):
-            for io_backend, device_type in (("direct", "cuda"), ("kernel", "npu")):
+            for io_backend, device_type, expect_bound in (
+                ("direct", "cuda", False),
+                ("direct", "npu", False),
+                ("kernel", "npu", True),
+            ):
                 with subtests.test(io_backend=io_backend, device_type=device_type):
+                    device = SimpleNamespace(type=device_type)
                     field = SimpleNamespace(
                         field_id="field",
                         device_buffer_index=0,
@@ -1134,9 +1151,7 @@ class TestGroupAwareWireTest:
                     )
                     layout = SimpleNamespace(
                         num_lcm_blocks=2,
-                        buffers=(
-                            SimpleNamespace(device=SimpleNamespace(type=device_type)),
-                        ),
+                        buffers=(SimpleNamespace(device=device),),
                         groups=(
                             SimpleNamespace(
                                 group_id="group",
@@ -1161,10 +1176,13 @@ class TestGroupAwareWireTest:
                         world_cpu_group=None,
                         block_alignment=1,
                     )
-                    assert (executor._transfer_geometry.device_rows) is None
-                    executor._transfer_geometry.bind.assert_not_called()
+                    if expect_bound:
+                        assert (executor._transfer_geometry) is (bound_geometry)
+                    else:
+                        assert (executor._transfer_geometry.device_rows) is None
+                        executor._transfer_geometry.bind.assert_not_called()
 
-        assert (build_geometry.call_count) == (2)
+        assert (build_geometry.call_count) == (3)
 
     def test_optional_dependency_shim_restores_existing_modules(self):
         protected_names = (
@@ -1433,7 +1451,9 @@ class TestHostMemoryShareTest:
             payload_bytes=16,
         )
         pool = Mock()
-        pool.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+        pool.arena.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=False, device="cpu"
+        )
         pool.cache_transfer_layout.return_value = SimpleNamespace(
             num_lcm_blocks=device_lcm_blocks,
             buffers=(SimpleNamespace(device=SimpleNamespace(type="cuda")),),
@@ -2096,7 +2116,9 @@ class TestCompactHostParentTest:
             SimpleNamespace(
                 cache_group_specs=specs,
                 runtime_contract=contract,
-                memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    enable=False, device="cpu"
+                ),
             ),
         )
         tracker = Mock()
@@ -2536,7 +2558,9 @@ class TestCompactLayoutRoundTripTest:
         arena = SimpleNamespace(
             cache_group_specs=contract.group_specs,
             runtime_contract=contract,
-            memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+            memory_saver_adapter=TorchMemorySaverAdapter.create(
+                enable=False, device="cpu"
+            ),
         )
 
         class WriteBackOp:

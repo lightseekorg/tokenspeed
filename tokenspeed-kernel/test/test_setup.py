@@ -159,9 +159,10 @@ def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None
         "tokenspeed-deepgemm",
     } <= requirements.keys()
     assert {"tokenspeed-kernel-amd", "tokenspeed-iris"}.isdisjoint(requirements)
+    assert "torch-npu-memory-saver" not in requirements
     assert "tokenspeed-triton-kernels" not in requirements
     assert requirements["nvidia-cutlass-dsl"].extras == {"cu13"}
-    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.32.0"
+    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.33.0"
 
 
 def test_cuda_thirdparty_requirements_are_exactly_pinned() -> None:
@@ -197,6 +198,7 @@ def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
     } == {">="}
     assert {
         "flashinfer-python",
+        "torch-npu-memory-saver",
         "nvidia-cutlass-dsl",
         "nvidia-cutlass-dsl-libs-cu13",
         "nvidia-ml-py",
@@ -218,6 +220,7 @@ def test_npu_install_requires_use_ascend_provider(monkeypatch) -> None:
     requirements = _requirements_by_name(install_requires)
     assert {"torch", "triton-ascend", "apache-tvm-ffi"} <= requirements.keys()
     assert str(requirements["triton-ascend"].specifier) == "==3.2.1"
+    assert str(requirements["torch-npu-memory-saver"].specifier) == "==0.1.6"
     assert not any(
         name.startswith("nvidia-")
         or name

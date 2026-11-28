@@ -405,6 +405,7 @@ def _executor_config(spec_algo: str) -> ModelExecutorConfig:
         enable_memory_saver=False,
         spec_algo=spec_algo,
         spec_num_tokens=N,
+        acl_graph_memory_policy="discard",
     )
 
 
