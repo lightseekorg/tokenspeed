@@ -46,6 +46,9 @@ _CASES = {
         "max_seqlen_k": 1024,
         "page_size": 64,
         "window_left": 127,
+        "kv_cache_dtype": "bfloat16",
+        "output_gate": False,
+        "split_schedule": False,
     },
     "mha_prefill": {
         **_HEADS,
@@ -58,9 +61,9 @@ _CASES = {
         "sequences": 2,
         "extend_tokens": 64,
         "prefix_tokens": 100,
-        "max_seqlen_k": 1024,
         "page_size": 64,
         "window_left": 127,
+        "kv_cache_dtype": "bfloat16",
     },
     "gqa_prologue": {
         "num_q_heads": 4,
@@ -74,6 +77,8 @@ _CASES = {
         "has_norm": True,
         "rope": "gptj",
         "return_kv": False,
+        "kv_cache_dtype": "bfloat16",
+        "query_dtype": "bfloat16",
     },
 }
 _PREPARE = {
@@ -102,9 +107,15 @@ def _request(mode: str, **updates: object) -> BenchmarkRequest:
         ("mha_decode_with_kvcache", {"num_kv_heads": 3}, "divide"),
         ("mha_decode_with_kvcache", {"window_left": -2}, "window_left"),
         ("mha_decode_with_kvcache", {"context_tokens": 2048}, "max_seqlen_k"),
+        ("mha_decode_with_kvcache", {"kv_cache_dtype": "float16"}, "kv_cache_dtype"),
+        ("mha_decode_with_kvcache", {"output_gate": 1}, "output_gate"),
+        ("mha_decode_with_kvcache", {"split_schedule": True}, "full attention"),
         ("mha_prefill", {"dtype": "float16"}, "dtype"),
-        ("mha_extend_with_kvcache", {"prefix_tokens": 1000}, "max_seqlen_k"),
+        ("mha_extend_with_kvcache", {"prefix_tokens": -1}, "non-negative"),
+        ("mha_extend_with_kvcache", {"max_seqlen_k": 1024}, "max_seqlen_k"),
+        ("mha_extend_with_kvcache", {"kv_cache_dtype": "float16"}, "kv_cache_dtype"),
         ("gqa_prologue", {"rope": "yarn"}, "rope"),
+        ("gqa_prologue", {"query_dtype": "float32"}, "query_dtype"),
         ("gqa_prologue", {"qkv_row_stride": 400}, "qkv_row_stride"),
         ("gqa_prologue", {"tokens": 65}, "cache_slots"),
     ],
@@ -116,13 +127,46 @@ def test_attention_generators_reject_invalid_parameters(
         _PREPARE[mode](_request(mode, **updates), None)
 
 
+# An FP8 KV cache, the fused decode output gate and the full-attention verify
+# split schedule, as Muse Spark serves them (benchmarks/amd/gfx950/muse_spark).
+_FP8 = {"kv_cache_dtype": "float8_e4m3fn"}
+_VERIFY = {"num_q_heads": 16, "num_kv_heads": 2, "batch": 2, "q_len": 8}
+_GPU_CASES = [(mode, {}) for mode in sorted(_CASES)] + [
+    ("mha_decode_with_kvcache", {**_FP8, **_VERIFY, "output_gate": True}),
+    (
+        "mha_decode_with_kvcache",
+        {
+            **_FP8,
+            **_VERIFY,
+            "window_left": -1,
+            "output_gate": True,
+            "split_schedule": True,
+        },
+    ),
+    ("mha_extend_with_kvcache", {**_FP8, "prefix_tokens": 0}),
+    ("mha_extend_with_kvcache", {**_FP8, "window_left": -1}),
+    ("gqa_prologue", {**_FP8, "query_dtype": "float8_e4m3fn"}),
+    ("gqa_prologue", {**_FP8, "return_kv": True}),
+]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-@pytest.mark.parametrize("mode", sorted(_CASES))
+@pytest.mark.parametrize(("mode", "updates"), _GPU_CASES)
 def test_attention_generator_times_the_registration_the_operation_selects(
-    mode: str,
+    mode: str, updates: dict[str, object]
 ) -> None:
-    request = _request(mode)
-    prepared = _PREPARE[mode](request, current_platform())
+    request = _request(mode, **updates)
+    try:
+        prepared = _PREPARE[mode](request, current_platform())
+    except BenchmarkCaseError as error:
+        if error.status is not BenchmarkStatus.NOT_APPLICABLE:
+            raise
+        pytest.skip(f"no registration serves this case here: {error}")
+    if (
+        request.parameters.get("output_gate")
+        and "rmsnorm_output_gate" not in prepared.registration.features
+    ):
+        pytest.skip("no decode kernel here applies the output gate in its store")
 
     capture = ShapeCapture.get()
     capture.clear()

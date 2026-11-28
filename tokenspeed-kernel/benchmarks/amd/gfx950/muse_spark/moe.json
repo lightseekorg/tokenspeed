@@ -6,17 +6,14 @@
   },
   "cases": [
     {
-      "id": "muse_spark.moe.sigmoid_bias_topk/decode-float32",
+      "id": "muse_spark.moe.sigmoid_bias_topk/tp8-decode-float32",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "moe",
         "mode": "sigmoid_bias_topk",
         "parameters": {
-          "tokens": [
-            1,
-            16
-          ],
+          "tokens": [24, 64],
           "topk": 8,
           "router_logits_dtype": "float32",
           "weights_dtype": "float32",
@@ -32,15 +29,38 @@
       }
     },
     {
-      "id": "muse_spark.moe.sigmoid_bias_topk/prefill-float32",
+      "id": "muse_spark.moe.sigmoid_bias_topk/tp4-decode-float32",
       "comparison_epoch": 1,
+      "measurement_blocks": 50,
       "definition": {
         "family": "moe",
         "mode": "sigmoid_bias_topk",
         "parameters": {
-          "tokens": [
-            1024
-          ],
+          "model_profile": "muse_spark_tp4",
+          "tokens": [104, 160],
+          "topk": 8,
+          "router_logits_dtype": "float32",
+          "weights_dtype": "float32",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true
+        },
+        "cold_cache": true,
+        "seed": 5725
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.moe.sigmoid_bias_topk/tp8-owned-float32",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "moe",
+        "mode": "sigmoid_bias_topk",
+        "parameters": {
+          "tokens": [200, 1024],
           "topk": 8,
           "router_logits_dtype": "float32",
           "weights_dtype": "float32",
@@ -56,6 +76,30 @@
       }
     },
     {
+      "id": "muse_spark.moe.sigmoid_bias_topk/tp4-owned-float32",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "moe",
+        "mode": "sigmoid_bias_topk",
+        "parameters": {
+          "model_profile": "muse_spark_tp4",
+          "tokens": [80, 400, 6144],
+          "topk": 8,
+          "router_logits_dtype": "float32",
+          "weights_dtype": "float32",
+          "routed_scaling_factor": 1.0,
+          "normalize_topk_weights": true
+        },
+        "cold_cache": true,
+        "seed": 5754
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
       "id": "muse_spark.moe.apply/tp8-decode-mxfp4",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
@@ -63,10 +107,7 @@
         "family": "moe",
         "mode": "apply",
         "parameters": {
-          "tokens": [
-            1,
-            16
-          ],
+          "tokens": [24, 32, 48, 64],
           "hidden_size": 4096,
           "intermediate_size": 4096,
           "num_local_experts": 256,
@@ -97,63 +138,21 @@
       }
     },
     {
-      "id": "muse_spark.moe.apply/tp8-prefill-mxfp4",
-      "comparison_epoch": 1,
-      "definition": {
-        "family": "moe",
-        "mode": "apply",
-        "parameters": {
-          "tokens": [
-            1024,
-            8192
-          ],
-          "hidden_size": 4096,
-          "intermediate_size": 4096,
-          "num_local_experts": 256,
-          "topk": 8,
-          "tp_size": 8,
-          "ep_size": 1,
-          "ep_rank": 0,
-          "input_dtype": "bfloat16",
-          "router_logits_dtype": "float32",
-          "weight_dtype": "mxfp4",
-          "activation": "silu",
-          "routing_mode": "precomputed_topk",
-          "route_scope": "global",
-          "route_distribution": "router",
-          "routed_scaling_factor": 1.0,
-          "normalize_topk_weights": true,
-          "internal_activation_dtype": "mxfp4",
-          "token_count_scope": "global",
-          "do_finalize": false,
-          "prequantized_input": true
-        },
-        "cold_cache": true,
-        "seed": 5725
-      },
-      "policy": {
-        "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 10.0
-      }
-    },
-    {
-      "id": "muse_spark.moe.apply/ep8-decode-mxfp4",
+      "id": "muse_spark.moe.apply/ep4-decode-mxfp4",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "moe",
         "mode": "apply",
         "parameters": {
-          "tokens": [
-            1,
-            16
-          ],
+          "model_profile": "muse_spark_tp4",
+          "tokens": [104, 160, 320],
           "hidden_size": 4096,
           "intermediate_size": 4096,
-          "num_local_experts": 32,
+          "num_local_experts": 64,
           "topk": 8,
           "tp_size": 1,
-          "ep_size": 8,
+          "ep_size": 4,
           "ep_rank": 0,
           "input_dtype": "bfloat16",
           "router_logits_dtype": "float32",
@@ -178,21 +177,21 @@
       }
     },
     {
-      "id": "muse_spark.moe.apply/ep8-prefill-mxfp4",
+      "id": "muse_spark.moe.apply/ep4-prefill-mxfp4",
       "comparison_epoch": 1,
+      "measurement_blocks": 10,
       "definition": {
         "family": "moe",
         "mode": "apply",
         "parameters": {
-          "tokens": [
-            8192
-          ],
+          "model_profile": "muse_spark_tp4",
+          "tokens": [1600, 24576],
           "hidden_size": 4096,
           "intermediate_size": 4096,
-          "num_local_experts": 32,
+          "num_local_experts": 64,
           "topk": 8,
           "tp_size": 1,
-          "ep_size": 8,
+          "ep_size": 4,
           "ep_rank": 0,
           "input_dtype": "bfloat16",
           "router_logits_dtype": "float32",
@@ -213,21 +212,19 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 10.0
+        "max_regression_absolute_us": 20.0
       }
     },
     {
-      "id": "muse_spark.moe.routed_input_scale_rmsnorm_sum/decode-bfloat16",
+      "id": "muse_spark.moe.routed_input_scale_rmsnorm_sum/tp4-decode-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "moe",
         "mode": "routed_input_scale_rmsnorm_sum",
         "parameters": {
-          "tokens": [
-            1,
-            16
-          ],
+          "model_profile": "muse_spark_tp4",
+          "tokens": [104, 160, 320],
           "topk": 8,
           "hidden_size": 4096,
           "input_dtype": "bfloat16",
@@ -243,15 +240,15 @@
       }
     },
     {
-      "id": "muse_spark.moe.routed_input_scale_rmsnorm_sum/prefill-bfloat16",
+      "id": "muse_spark.moe.routed_input_scale_rmsnorm_sum/tp4-prefill-bfloat16",
       "comparison_epoch": 1,
+      "measurement_blocks": 30,
       "definition": {
         "family": "moe",
         "mode": "routed_input_scale_rmsnorm_sum",
         "parameters": {
-          "tokens": [
-            1024
-          ],
+          "model_profile": "muse_spark_tp4",
+          "tokens": [1600, 24576],
           "topk": 8,
           "hidden_size": 4096,
           "input_dtype": "bfloat16",
@@ -263,7 +260,7 @@
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 2.0
+        "max_regression_absolute_us": 5.0
       }
     }
   ]

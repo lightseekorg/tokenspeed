@@ -64,6 +64,7 @@ _IMPLEMENTED_MODEL_PROFILES = frozenset(
         "dsv41_flash_tp4",
         "glm53_flash_tp4",
         "kimi_k3_tp8",
+        "muse_spark_tp4",
         "muse_spark_tp8",
         "qwen38_flash_tp1",
         "qwen38_flash_tp2",
