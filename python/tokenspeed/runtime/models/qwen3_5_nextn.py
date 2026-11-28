@@ -41,7 +41,10 @@ from tokenspeed.runtime.layers.moe import (
     build_moe_checkpoint_loader,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
+from tokenspeed.runtime.layers.quantization.utils import (
+    should_exclude_quant_module,
+    should_ignore_quant_layer,
+)
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.qwen3_5 import (
@@ -60,6 +63,17 @@ def _resolve_mtp_quant_config(
     # target model is NVFP4. Honor that checkpoint contract during construction.
     if quant_config is not None and should_exclude_quant_module(
         "mtp.layers.0", quant_config.exclude_modules
+    ):
+        return None
+    # AMD Quark lists the MTP layer's excluded linears in ignored_layers.
+    if quant_config is not None and all(
+        should_ignore_quant_layer(f"mtp.layers.0.{module}", quant_config.ignored_layers)
+        for module in (
+            "self_attn.qkv_proj",
+            "self_attn.o_proj",
+            "mlp.gate_up_proj",
+            "mlp.down_proj",
+        )
     ):
         return None
     return quant_config

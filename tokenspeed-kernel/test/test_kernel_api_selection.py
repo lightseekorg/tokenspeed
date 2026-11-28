@@ -8318,6 +8318,32 @@ def test_mha_plan_keeps_b300_prefill_prewrite(b300_platform):
         registry.clear_cache()
 
 
+@pytest.mark.parametrize(
+    "arch_version,mixed_decode",
+    [
+        (ArchVersion(9, 5), False),
+        (ArchVersion(12, 0), True),
+        (ArchVersion(12, 5), False),
+    ],
+)
+def test_mha_plan_runs_mixed_batch_decode_rows_where_a_kernel_asks(
+    mi350_platform, arch_version, mixed_decode
+):
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(replace(mi350_platform, arch_version=arch_version))
+        registry.clear_cache()
+        for solution in (None, "triton"):
+            plan = _attention_mha_pkg.mha_plan(torch.bfloat16, 64, solution=solution)
+            assert plan["mixed_decode"] == mixed_decode
+        plan = _attention_mha_pkg.mha_plan(torch.bfloat16, 64, solution="gluon")
+        assert not plan["mixed_decode"]
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
 # Capture host-available registrations before the fixture clears them. CI runs
 # this guard on each vendor; explicit DSV4.1 module checks also run across vendors.
 _CASE_REGISTRATION_MODULES = {

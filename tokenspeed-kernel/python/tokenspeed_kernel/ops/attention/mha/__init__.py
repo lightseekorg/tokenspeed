@@ -147,9 +147,13 @@ def mha_plan(
         - "extend_mode":
           "postwrite" means prefill attends the new K/V rows directly;
           "prewrite" means extend attention reads them from the KV cache.
+        - "mixed_decode": whether the single-token decode rows of a mixed
+          prefill/decode batch run decode attention (``mha_decode_with_kvcache``)
+          instead of extend attention: a decode kernel registered with the
+          ``mixed_batch_rows`` feature asks for them.
     """
     if dtype == torch.float8_e4m3fn:
-        return {"extend_mode": "prewrite"}
+        return {"extend_mode": "prewrite", "mixed_decode": False}
 
     traits = {
         "head_dim": head_dim,
@@ -183,7 +187,21 @@ def mha_plan(
         if any(spec.priority >= Priority.PERFORMANT for spec in candidates)
         else "prewrite"
     )
-    return {"extend_mode": extend_mode}
+    mixed_decode = bool(
+        KernelRegistry.get().get_for_operator(
+            "attention",
+            "mha_decode_with_kvcache",
+            features=_MIXED_BATCH_ROWS,
+            platform=current_platform(),
+            format_signature=format_signature(
+                q=dense_tensor_format(dtype),
+                k_cache=dense_tensor_format(dtype),
+                v_cache=dense_tensor_format(dtype),
+            ),
+            solution=solution,
+        )
+    )
+    return {"extend_mode": extend_mode, "mixed_decode": mixed_decode}
 
 
 def mha_prefill(
@@ -459,6 +477,9 @@ _RMSNORM_OUTPUT_GATE = frozenset({"rmsnorm_output_gate"})
 # Feature of decode kernels that read mha_decode_with_kvcache's
 # uniform_row_groups and run each group of one-row requests as one request.
 _UNIFORM_ROW_GROUPS = frozenset({"uniform_row_groups"})
+# Feature of decode kernels that should take the single-token decode rows of
+# a mixed prefill/decode batch (see mha_plan).
+_MIXED_BATCH_ROWS = frozenset({"mixed_batch_rows"})
 
 # Schedule-reading decode kernel -> whether calls of a shape (num_q_heads,
 # num_kv_heads, max_seqlen_q) should take it; the others keep the default.
