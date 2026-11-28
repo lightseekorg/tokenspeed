@@ -688,12 +688,15 @@ class DFlash(BaseDrafter):
             or self._greedy_gathered_max.device != device
             or self._greedy_gathered_ids.dtype != ids_dtype
         ):
-            self._greedy_gathered_max = torch.empty(
-                (cap,), dtype=max_dtype, device=device
-            )
-            self._greedy_gathered_ids = torch.empty(
-                (cap,), dtype=ids_dtype, device=device
-            )
+            with self.token_to_kv_pool.arena.memory_saver_adapter.named_region(
+                "workspace"
+            ):
+                self._greedy_gathered_max = torch.empty(
+                    (cap,), dtype=max_dtype, device=device
+                )
+                self._greedy_gathered_ids = torch.empty(
+                    (cap,), dtype=ids_dtype, device=device
+                )
             self._greedy_gather_cap = cap
         return self._greedy_gathered_max, self._greedy_gathered_ids
 
@@ -1753,6 +1756,7 @@ class DFlash(BaseDrafter):
             pool=self._block_graph_pool,
             stream=capture.stream,
             handoff_storage=self._block_graph_handoffs,
+            memory_saver_adapter=capture.memory_saver_adapter,
             run_segments_while_capturing=True,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())

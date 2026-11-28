@@ -38,6 +38,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
@@ -129,6 +131,7 @@ def _capture(drafter, plan, *, entries, num_warmup=1, stream=None, prepare=None)
             series: ladder_from_plan(graphs, entries) for series, graphs in plan.items()
         },
         stream=stream,
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda"),
         num_warmup=num_warmup,
         target_hidden_width=0,
         target_hidden_dtype=torch.bfloat16,

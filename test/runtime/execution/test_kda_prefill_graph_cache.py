@@ -29,6 +29,8 @@ import numpy as np
 import pytest
 import torch
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 # ``test/`` (for ``ci_system``) and the repo root (for ``test.runtime.*``).
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _TEST_DIR)
@@ -271,7 +273,11 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
 
     leaf = object.__new__(Leaf)
     configure_prefill(leaf)
-    leaf.cache_pool = object()
+    leaf.cache_pool = SimpleNamespace(
+        arena=SimpleNamespace(
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
+        )
+    )
     leaf.forward_metadata = metadata("cuda", 1)
     full = object.__new__(Leaf)
     full.forward_metadata = None
@@ -296,7 +302,9 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
 
     forward()
     torch.cuda.synchronize()
-    ordinary = BreakableCapture()
+    ordinary = BreakableCapture(
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
+    )
     with ordinary:
         forward()
     assert ordinary.num_segments == 7  # Three eager breaks + four graphs.
@@ -304,7 +312,9 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
     retained = leaf.forward_metadata
     forward()
     torch.cuda.synchronize()
-    merged = BreakableCapture()
+    merged = BreakableCapture(
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
+    )
     with merged:
         output = forward()
     assert merged.num_segments == 3  # Only full attention remains an eager break.
@@ -347,7 +357,11 @@ def test_eager_and_capture_use_the_same_metadata_contract_without_retaining_eage
 
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
-    backend.cache_pool = object()
+    backend.cache_pool = SimpleNamespace(
+        arena=SimpleNamespace(
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
+        )
+    )
     original = metadata("cuda", 1)
     backend.forward_metadata = original
     backend.prepare_prefill_metadata(8, 1, ForwardMode.EXTEND, capture=False)
@@ -426,7 +440,13 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
     backend._state_layer_ids = lambda: [0]
     backend.__dict__.update(
         is_draft=False,
-        cache_pool=object(),
+        cache_pool=SimpleNamespace(
+            arena=SimpleNamespace(
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    False, device="cuda"
+                )
+            )
+        ),
         kda_backend=backend_name,
         kda_recurrent_layout="v_major",
     )
@@ -763,7 +783,13 @@ def test_plain_metadata_norms_the_zero_padded_bucket():
     backend._replay_length = torch.zeros(4, 1, device="cuda", dtype=torch.int32)
     backend.__dict__.update(
         is_draft=False,
-        cache_pool=object(),
+        cache_pool=SimpleNamespace(
+            arena=SimpleNamespace(
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    False, device="cuda"
+                )
+            )
+        ),
         kda_backend="auto",
         kda_recurrent_layout=kda_recurrent_layout(),
     )
@@ -1563,7 +1589,9 @@ def test_an_inline_kda_replay_reads_a_loaded_state_after_the_load(kimi_host_cach
     leaf.prepare_prefill_metadata(_BUCKET, 1, ForwardMode.EXTEND, capture=True)
     forward()
     torch.cuda.synchronize()
-    inline = BreakableCapture()
+    inline = BreakableCapture(
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
+    )
     with maybe_inference_mode(), inline:
         inline_output = forward()
     assert inline.num_segments == 1

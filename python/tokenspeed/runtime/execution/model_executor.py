@@ -1172,6 +1172,7 @@ class ModelExecutor:
                             plan=plan,
                             ladders=self.drafter_extend_ladders(entries),
                             stream=self.forward_step.stream,
+                            memory_saver_adapter=self.memory_saver_adapter,
                             num_warmup=self.prefill_graph.num_warmup,
                             target_hidden_width=width,
                             target_hidden_dtype=dtype,

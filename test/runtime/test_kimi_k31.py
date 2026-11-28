@@ -31,6 +31,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 # ``test/`` (for ``ci_system``) and the repo root (for ``test.runtime.*``).
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _TEST_DIR)
@@ -3827,7 +3829,9 @@ def _capture_padded_prefill(router, pool, forward):
     positions = torch.arange(_PADDED_BUCKET, device="cuda")
     hidden = torch.randn(_PADDED_BUCKET, 256, device="cuda", dtype=torch.bfloat16)
     dummy = _extend_ctx(router, pool, [3], [0], [_PADDED_BUCKET], [1])
-    capture = BreakableCapture()
+    capture = BreakableCapture(
+        memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
+    )
     # Warm up where the capture runs: on the capture stream, behind this one's writes.
     capture.stream.wait_stream(torch.cuda.current_stream())
     with torch.no_grad():

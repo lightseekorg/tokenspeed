@@ -1066,19 +1066,22 @@ class Eagle(HiddenStateDrafter):
         ):
             # Outside the measured capture: the utilization headroom funds them.
             ib = self.input_buffers
-            tile = self._kv_tile = _KVTile(
-                ids=torch.empty(
-                    rows, dtype=ib.shifted_prefill_ids_buf.dtype, device=self.device
-                ),
-                positions=torch.empty(
-                    rows, dtype=ib.positions_buf.dtype, device=self.device
-                ),
-                hidden=torch.empty((rows, width), dtype=dtype, device=self.device),
-                locations=tuple(
-                    torch.empty((rows, *t.shape[1:]), dtype=t.dtype, device=self.device)
-                    for t in locations
-                ),
-            )
+            with capture.memory_saver_adapter.named_region("executor_inputs"):
+                tile = self._kv_tile = _KVTile(
+                    ids=torch.empty(
+                        rows, dtype=ib.shifted_prefill_ids_buf.dtype, device=self.device
+                    ),
+                    positions=torch.empty(
+                        rows, dtype=ib.positions_buf.dtype, device=self.device
+                    ),
+                    hidden=torch.empty((rows, width), dtype=dtype, device=self.device),
+                    locations=tuple(
+                        torch.empty(
+                            (rows, *t.shape[1:]), dtype=t.dtype, device=self.device
+                        )
+                        for t in locations
+                    ),
+                )
         # Every row a padded one: the warmups write only at zero locations.
         for buf in tile.inputs():
             buf.zero_()
@@ -1092,6 +1095,7 @@ class Eagle(HiddenStateDrafter):
             pool=self._extend_graph_pool,
             stream=capture.stream,
             handoff_storage=self._extend_graph_handoffs,
+            memory_saver_adapter=capture.memory_saver_adapter,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -1107,21 +1111,22 @@ class Eagle(HiddenStateDrafter):
             cap.replay()
         tile.graph = _ExtendGraph(cap, ctx)
 
-    def _stage_split_inputs(self, bs: int) -> None:
+    def _stage_split_inputs(self, bs: int, capture: DrafterExtendCapture) -> None:
         """A capture's split-step inputs: a valid token and a zero hidden row each."""
         buffers = self._extend_buffers
         if buffers.draft_ids is None:
             rows = buffers.gather_ids.shape[0]
-            buffers.draft_ids = torch.empty(
-                rows,
-                dtype=self.input_buffers.shifted_prefill_ids_buf.dtype,
-                device=self.device,
-            )
-            buffers.hidden_out = torch.empty(
-                (rows, buffers.hidden_in.shape[1]),
-                dtype=buffers.hidden_in.dtype,
-                device=self.device,
-            )
+            with capture.memory_saver_adapter.named_region("executor_inputs"):
+                buffers.draft_ids = torch.empty(
+                    rows,
+                    dtype=self.input_buffers.shifted_prefill_ids_buf.dtype,
+                    device=self.device,
+                )
+                buffers.hidden_out = torch.empty(
+                    (rows, buffers.hidden_in.shape[1]),
+                    dtype=buffers.hidden_in.dtype,
+                    device=self.device,
+                )
         buffers.draft_ids[:bs].fill_(1)
         buffers.hidden_out[:bs].zero_()
 
@@ -1201,9 +1206,9 @@ class Eagle(HiddenStateDrafter):
                 capture.prepare_batch(bs, bs)
                 self._stage_capture_inputs(bs)
                 if self._split_extend_supported():
-                    self._stage_split_inputs(bs)
+                    self._stage_split_inputs(bs, capture)
                 else:
-                    self._run_first_step_eager(bs, capture.stream)
+                    self._run_first_step_eager(bs, capture)
                 self._decode_steps_graphs[bs] = self._capture_decode_steps(
                     bs, capture, observer.measure(EXTEND_DECODE_SERIES)
                 )
@@ -1259,20 +1264,25 @@ class Eagle(HiddenStateDrafter):
             and buffers.gather_ids.shape[0] >= requests
         ):
             return
-        self._extend_buffers = _ExtendGraphBuffers(
-            hidden_in=torch.zeros(
-                (requests, width), dtype=capture.target_hidden_dtype, device=self.device
-            ),
-            gather_ids=torch.zeros(requests, dtype=torch.int64, device=self.device),
-            frontier=torch.zeros(
-                requests,
-                dtype=self.input_buffers.seq_lens_buf.dtype,
-                device=self.device,
-            ),
-            next_tokens=torch.zeros(
-                (requests, self.spec_num_tokens), dtype=torch.int32, device=self.device
-            ),
-        )
+        with capture.memory_saver_adapter.named_region("executor_inputs"):
+            self._extend_buffers = _ExtendGraphBuffers(
+                hidden_in=torch.zeros(
+                    (requests, width),
+                    dtype=capture.target_hidden_dtype,
+                    device=self.device,
+                ),
+                gather_ids=torch.zeros(requests, dtype=torch.int64, device=self.device),
+                frontier=torch.zeros(
+                    requests,
+                    dtype=self.input_buffers.seq_lens_buf.dtype,
+                    device=self.device,
+                ),
+                next_tokens=torch.zeros(
+                    (requests, self.spec_num_tokens),
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+            )
 
     def _stage_capture_inputs(self, bs: int) -> None:
         """Stage the capture dummy's one-token requests: valid ids, zero hidden."""
@@ -1286,7 +1296,7 @@ class Eagle(HiddenStateDrafter):
         buffers.gather_ids[:bs].copy_(lengths.cumsum(0) - 1)
         buffers.frontier[:bs].copy_(ib.seq_lens_buf[:bs])
 
-    def _run_first_step_eager(self, bs: int, stream: torch.cuda.Stream) -> None:
+    def _run_first_step_eager(self, bs: int, capture: DrafterExtendCapture) -> None:
         """Step 0 over the capture dummy, on its stream: the decode steps' inputs."""
         ib = self.input_buffers
         buffers = self._extend_buffers
@@ -1304,6 +1314,7 @@ class Eagle(HiddenStateDrafter):
                 self.attn_backend, buffers.frontier[:bs]
             ),
         )
+        stream = capture.stream
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             self._attach_dsa_topk((None, None))
@@ -1319,16 +1330,17 @@ class Eagle(HiddenStateDrafter):
                 hidden = logits_output.hidden_states
                 if buffers.draft_ids is None:
                     # The first capture: allocate outside the graph pool.
-                    buffers.draft_ids = torch.empty(
-                        buffers.gather_ids.shape,
-                        dtype=draft_ids.dtype,
-                        device=self.device,
-                    )
-                    buffers.hidden_out = torch.empty(
-                        (buffers.gather_ids.shape[0], hidden.shape[1]),
-                        dtype=hidden.dtype,
-                        device=self.device,
-                    )
+                    with capture.memory_saver_adapter.named_region("executor_inputs"):
+                        buffers.draft_ids = torch.empty(
+                            buffers.gather_ids.shape,
+                            dtype=draft_ids.dtype,
+                            device=self.device,
+                        )
+                        buffers.hidden_out = torch.empty(
+                            (buffers.gather_ids.shape[0], hidden.shape[1]),
+                            dtype=hidden.dtype,
+                            device=self.device,
+                        )
                 buffers.draft_ids[:bs].copy_(draft_ids)
                 buffers.hidden_out[:bs].copy_(hidden)
                 buffers.next_tokens[:bs, 1] = self._map_hot(draft_ids)
@@ -1377,6 +1389,7 @@ class Eagle(HiddenStateDrafter):
             pool=self._extend_graph_pool,
             stream=capture.stream,
             handoff_storage=self._extend_graph_handoffs,
+            memory_saver_adapter=capture.memory_saver_adapter,
             run_segments_while_capturing=True,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())

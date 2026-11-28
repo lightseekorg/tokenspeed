@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from abc import abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -585,12 +586,20 @@ class CapacityPrefillBackend(MambaAttnBackend):
         actual_bs = source.extend_seq_lens_cpu.numel()
         if actual_bs > bs or (actual_bs != bs and (capture or retained is None)):
             raise ValueError("request padding requires an existing captured capacity")
-        target = prepare_capacity_prefill_metadata(
-            source,
-            token_capacity,
-            retained,
-            checkpoints=self._checkpoint_layout(token_capacity),
+        # A fresh snapshot clones device metadata and may grow checkpoint scratch.
+        # Retained shapes refresh in place without reopening an allocator region.
+        region = (
+            self.cache_pool.arena.memory_saver_adapter.named_region("attention_state")
+            if retained is None
+            else nullcontext()
         )
+        with region:
+            target = prepare_capacity_prefill_metadata(
+                source,
+                token_capacity,
+                retained,
+                checkpoints=self._checkpoint_layout(token_capacity),
+            )
         if capture:
             # Only startup grows retained storage; serving never captures.
             self._prefill_metadata[key] = target

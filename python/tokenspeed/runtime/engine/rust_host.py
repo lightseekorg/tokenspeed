@@ -1171,6 +1171,9 @@ class HostDataPlane:
             for tag in tags:
                 region = self._regions[tag]
                 (region.release if release else region.resume)()
+            if release:
+                # Return eager cache before the replica reports release complete.
+                self._device.empty_cache()
 
     def finish_memory_resume(self) -> None:
         """Rebuild resources after the scheduler's all-rank wake gate."""

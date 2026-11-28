@@ -74,6 +74,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_cuda_ci
 
@@ -1202,7 +1204,11 @@ def _padded_replay_worker(rank, degree, rendezvous):
             # Capture as PrefillGraph._capture_bucket does, then replay once unpadded.
             backend.begin(capture_table, capture_prefill, device)
             dummy = extend_ctx(backend, pool, capture_prefill)
-            capture = BreakableCapture()
+            capture = BreakableCapture(
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    False, device="cuda"
+                )
+            )
             capture.stream.wait_stream(torch.cuda.current_stream())
             with torch.no_grad():
                 with torch.cuda.stream(capture.stream):

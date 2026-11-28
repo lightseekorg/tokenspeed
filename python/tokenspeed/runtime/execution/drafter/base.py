@@ -58,6 +58,9 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
 
 
 # Extend-round graph series: the decode steps after step 0.
@@ -80,6 +83,7 @@ class DrafterExtendCapture:
     ladders: Mapping[str, CapturedLadder]
     # The capture stream the target's graphs used.
     stream: torch.cuda.Stream
+    memory_saver_adapter: TorchMemorySaverAdapter
     # Eager runs before each capture.
     num_warmup: int
     # Per-row width and dtype of the target's FULL hidden capture, the rows

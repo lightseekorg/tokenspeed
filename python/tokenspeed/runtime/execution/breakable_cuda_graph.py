@@ -66,6 +66,8 @@ import torch
 from tokenspeed_kernel.ops.transform.weak_ref import weak_ref_tensor as _kernel_weak_ref
 from tokenspeed_kernel.workspace import capture_session
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 __all__ = [
     "BreakableCapture",
     "HandoffSlot",
@@ -186,7 +188,7 @@ class BreakableCapture:
 
     Usage::
 
-        cap = BreakableCapture(pool=shared_pool)
+        cap = BreakableCapture(pool=shared_pool, memory_saver_adapter=adapter)
         with cap:
             model_forward(...)        # attention calls hit break_here()
         # later, after copying live inputs into the static buffers:
@@ -209,6 +211,10 @@ class BreakableCapture:
             its documented "pass the same stream for effective memory sharing".
         handoff_storage: An optional handoff storage map shared with captures that
             never replay while this one's handoffs are live; see ``_handoff_view``.
+        memory_saver_adapter: The executor's allocation owner, when captures must
+            survive memory release. Handoffs retain CPU-backed storage while
+            segment scratch follows the discardable ``cuda_graph`` region.
+            Standalone captures without a lifecycle owner use Torch allocation.
         run_segments_while_capturing: Whether each segment runs once as soon
             as it is captured, before the break that follows it (default
             False). A capture records a segment's kernels without running
@@ -230,8 +236,10 @@ class BreakableCapture:
         handoff_storage: dict[HandoffSlot, torch.Tensor] | None = None,
         *,
         run_segments_while_capturing: bool = False,
+        memory_saver_adapter: TorchMemorySaverAdapter,
     ) -> None:
         self.pool = pool
+        self.memory_saver_adapter = memory_saver_adapter
         self._run_segments_while_capturing = run_segments_while_capturing
         self.segments: list[Callable[[], Any]] = []
         # Per entry of ``segments``, the (wait, layer) calls a replay makes
@@ -241,6 +249,7 @@ class BreakableCapture:
         self.segment_waits: list[tuple[tuple[Callable[[int], None], int], ...]] = []
         self._current_waits: dict[Callable[[int], None], int] = {}
         self._current_graph: torch.cuda.CUDAGraph | None = None
+        self._graph_context: AbstractContextManager | None = None
         self._capturing = False
         if stream is None:
             if BreakableCapture._default_capture_stream is None:
@@ -308,10 +317,12 @@ class BreakableCapture:
     def _begin_segment(self) -> None:
         assert not self._capturing
         graph = torch.cuda.CUDAGraph()
-        if self.pool is not None:
-            graph.capture_begin(pool=self.pool)
-        else:
-            graph.capture_begin()
+        # No segment is capturing here: the saver's public context may collect
+        # garbage or synchronize before entering its tagged graph pool.
+        self._graph_context = self.memory_saver_adapter.capture_segment(
+            graph, pool=self.pool, stream=self._stream, tag="cuda_graph"
+        )
+        self._graph_context.__enter__()
         self._current_graph = graph
         self._current_waits = {}
         self._capturing = True
@@ -320,7 +331,9 @@ class BreakableCapture:
         if not self._capturing:
             return
         assert self._current_graph is not None
-        self._current_graph.capture_end()
+        assert self._graph_context is not None
+        self._graph_context.__exit__(None, None, None)
+        self._graph_context = None
         self.segments.append(self._current_graph.replay)
         self.segment_waits.append(tuple(self._current_waits.items()))
         # All segments share one pool so intermediate addresses stay stable.
@@ -491,15 +504,17 @@ def _handoff_view(cap: BreakableCapture, key: HandoffKey) -> torch.Tensor:
     """
     shape, dtype, device, _ = key
     if not shape:
-        return torch.empty(shape, dtype=dtype, device=device)
+        with cap.memory_saver_adapter.named_region("workspace"):
+            return torch.empty(shape, dtype=dtype, device=device)
     trailing = (shape[1:], dtype, device)
     rank = sum(1 for s, d, v, _ in cap._handoff if s and (s[1:], d, v) == trailing)
     slot = (*trailing, rank)
     storage = cap._handoff_storage.get(slot)
     if storage is None or storage.shape[0] < shape[0]:
-        storage = cap._handoff_storage[slot] = torch.empty(
-            shape, dtype=dtype, device=device
-        )
+        with cap.memory_saver_adapter.named_region("workspace"):
+            storage = cap._handoff_storage[slot] = torch.empty(
+                shape, dtype=dtype, device=device
+            )
     return storage[: shape[0]]
 
 

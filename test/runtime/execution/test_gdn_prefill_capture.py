@@ -28,6 +28,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
 sys.path.insert(
     0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
@@ -190,7 +192,11 @@ def _capture(backend, bucket, batch_size, forward, dummy):
 def test_admission_follows_the_selected_scan():
     """Only a scan that reads its bounds on device is captured; others stay eager."""
     backend = _backend(writes_state_checkpoints_in_forward=False)
-    backend.cache_pool = object()
+    backend.cache_pool = SimpleNamespace(
+        arena=SimpleNamespace(
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
+        )
+    )
     assert backend.admits_prefill_graph(512, 1, ForwardMode.EXTEND) == _capturable()
     assert not backend.admits_prefill_graph(512, 1, ForwardMode.MIXED)
 
@@ -219,7 +225,11 @@ def test_hybrid_propagates_layerwise_counter_to_gdn():
 def test_uncaptured_shapes_keep_the_scheduler_metadata():
     """Eager forwards of shapes without a graph skip the capacity layout."""
     backend = _backend(writes_state_checkpoints_in_forward=False)
-    backend.cache_pool = object()
+    backend.cache_pool = SimpleNamespace(
+        arena=SimpleNamespace(
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
+        )
+    )
     if not backend.admits_prefill_graph(512, 1, ForwardMode.EXTEND):
         pytest.skip("the selected GDN scan is not graph-capturable here")
     source = _source([300], [0], 2)
@@ -233,7 +243,11 @@ def test_uncaptured_shapes_keep_the_scheduler_metadata():
 def test_outer_graph_replays_gdn_lengths_pages_and_states(batch_size):
     """Replay equals eager on the retained metadata, which equals plain eager."""
     backend = _backend(writes_state_checkpoints_in_forward=False)
-    backend.cache_pool = object()
+    backend.cache_pool = SimpleNamespace(
+        arena=SimpleNamespace(
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
+        )
+    )
     if not backend.admits_prefill_graph(2048, batch_size, ForwardMode.EXTEND):
         pytest.skip("the selected GDN scan is not graph-capturable here")
     torch.manual_seed(42)
@@ -356,10 +370,11 @@ class _StatePool:
 
     def __init__(self, slabs, prefix_granularity=PAGE):
         self.arena = SimpleNamespace(
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda"),
             runtime_contract=SimpleNamespace(
                 prefix_granularity=prefix_granularity,
                 group_specs=(SimpleNamespace(group_id="state", attn_kind="state"),),
-            )
+            ),
         )
         self.state_group_by_layer = {layer_id: "state" for layer_id in slabs}
         self._slabs = slabs
@@ -685,7 +700,9 @@ def test_qwen4_exp_composite_captures_gdn_inline_around_full_attention():
     def capture():
         forward()
         torch.cuda.synchronize()
-        graph = BreakableCapture()
+        graph = BreakableCapture(
+            memory_saver_adapter=TorchMemorySaverAdapter.create(False, device="cuda")
+        )
         with active_forward(ctx), graph:
             output = forward()
         return graph, output
