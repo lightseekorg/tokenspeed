@@ -5108,6 +5108,7 @@ def test_v41_moe_fused_router_and_capture_guard(monkeypatch):
         moe.config = SimpleNamespace(
             num_experts_per_tok=2, norm_topk_prob=True, n_routed_experts=4
         )
+        moe.expert_dispatch_info = None
         return moe
 
     calls = []
@@ -5244,3 +5245,281 @@ def test_v41_moe_fused_router_parity(monkeypatch):
             atol=2e-3,
             rtol=2e-3,
         )
+
+
+def test_v41_moe_fused_router_placement_kwargs_and_load_warmup(monkeypatch):
+    from tokenspeed.runtime.layers.moe.topk import (
+        ExpertLocationDispatchInfo,
+        StandardTopKOutput,
+    )
+    from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
+
+    class _FakeCudaTensor(torch.Tensor):
+        @property
+        def is_cuda(self) -> bool:
+            return True
+
+    class _FakeGate(nn.Module):
+        def __init__(self, weight: torch.Tensor):
+            super().__init__()
+            self.weight = weight
+            self.e_score_correction_bias = torch.zeros(4)
+            self.bias_vl = None
+            self.tid2eid = None
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            return torch.matmul(hidden_states, self.weight.t())
+
+    placement = ExpertLocationMetadata.from_physical_to_logical_map(
+        torch.tensor([[0, 1, 2, 3, 0, 1]], dtype=torch.int64),
+        num_logical_experts=4,
+        ep_size=2,
+        ep_rank=1,
+        ep_rank_nodes=(0, 0),
+    )
+    placement.enable_load_recording(_mapping(1, 2, 2))
+    placement.reserve_load_rows(16)
+
+    def _make_moe(algorithm: str):
+        moe = v41.DeepseekV41MoE.__new__(v41.DeepseekV41MoE)
+        nn.Module.__init__(moe)
+        gate_w = torch.randn(4, 256, dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
+        moe.gate = _FakeGate(gate_w)
+        moe.experts = SimpleNamespace(supports_precomputed_topk=True)
+        moe.topk = v4.DeepseekV4TopK(
+            top_k=2,
+            renormalize=True,
+            correction_bias=moe.gate.e_score_correction_bias,
+            routed_scaling_factor=1.0,
+            hash_routing=False,
+            weights_dtype=torch.float32,
+        )
+        moe.topk.topk_config.router_topk = "fused"
+        moe.config = SimpleNamespace(
+            num_experts_per_tok=2, norm_topk_prob=True, n_routed_experts=4
+        )
+        moe.warmup = lambda: None
+        moe.expert_dispatch_info = ExpertLocationDispatchInfo.init_new(
+            layer_id=0,
+            ep_dispatch_algorithm=algorithm,
+            expert_location_metadata=placement,
+            all_to_all_ep=True,
+        )
+        return moe
+
+    calls = []
+
+    def fake_moe_topk(logits, *args, **kwargs):
+        calls.append((logits, kwargs))
+        out = kwargs.get("out")
+        if out is not None:
+            out[0].fill_(0.5)
+            out[1].copy_(torch.tensor([[4, 5], [3, 4]], dtype=torch.int64))
+            return out[0], out[1]
+        return torch.full((2, 2), 0.5), torch.tensor(
+            [[4, 1], [2, 5]], dtype=torch.int64
+        )
+
+    monkeypatch.setattr(v41, "moe_topk", fake_moe_topk)
+    monkeypatch.setattr(v4, "moe_topk", fake_moe_topk)
+
+    x = torch.randn(2, 256, dtype=torch.bfloat16).as_subclass(_FakeCudaTensor)
+    out_bufs = (
+        torch.empty(2, 2, dtype=torch.float32),
+        torch.empty(2, 2, dtype=torch.int64),
+    )
+
+    static_moe = _make_moe("static")
+    static_moe.expert_dispatch_info.load.physical_load = (
+        static_moe.expert_dispatch_info.load.physical_load.as_subclass(_FakeCudaTensor)
+    )
+    placement.reset_load()
+    res_static = static_moe._compute_topk_output(x, None, routing_out=out_bufs)
+    assert isinstance(res_static, StandardTopKOutput)
+    assert res_static.topk_ids is out_bufs[1]
+    assert calls[-1][1]["ep_rank"] == 1
+    assert torch.equal(
+        calls[-1][1]["logical_to_physical_map"],
+        static_moe.expert_dispatch_info.partial_logical_to_rank_dispatch_physical_map.unsqueeze(
+            -1
+        ),
+    )
+    assert (
+        calls[-1][1]["logical_replica_counts"]
+        is static_moe.expert_dispatch_info.static_replica_counts
+    )
+    assert placement.physical_load[0].tolist() == [0, 0, 0, 1, 2, 1]
+
+    dynamic_moe = _make_moe("dynamic")
+    placement.reset_load()
+    res_dynamic = dynamic_moe._compute_topk_output(x, None, routing_out=out_bufs)
+    assert res_dynamic.topk_ids is out_bufs[1]
+    assert calls[-1][1]["ep_rank"] == 1
+    assert (
+        calls[-1][1]["logical_to_physical_map"]
+        is dynamic_moe.expert_dispatch_info.partial_logical_to_all_physical_map
+    )
+    assert (
+        calls[-1][1]["logical_replica_counts"]
+        is dynamic_moe.expert_dispatch_info.partial_logical_to_all_physical_map_num_valid
+    )
+    assert placement.physical_load[0].tolist() == [0, 0, 0, 1, 2, 1]
+
+    fake_moe = _make_moe("fake")
+    assert fake_moe._fused_router_call_kwargs(None) is None
+
+    # Warmup distinguishes has_placement and warms record_expert_load for int32/int64.
+    warmup_calls = []
+    load_warmup_dtypes = []
+    monkeypatch.setattr(
+        v41,
+        "mega_gate_warmup_token_counts",
+        lambda max_tok, **kw: (warmup_calls.append((max_tok, kw)), [1, 16])[1],
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda dev: SimpleNamespace(multi_processor_count=148),
+    )
+    monkeypatch.setattr(
+        v41,
+        "kernel_record_expert_load",
+        lambda ids, mask, load: load_warmup_dtypes.append(ids.dtype),
+    )
+    monkeypatch.setattr(
+        global_server_args_dict,
+        "get",
+        global_server_args_dict.get,
+    )
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 1024)
+
+    plain_moe = _make_moe("static")
+    plain_moe.expert_dispatch_info = None
+
+    class _Holder(nn.Module):
+        def __init__(self, layers):
+            super().__init__()
+            self.layers = nn.ModuleList(layers)
+
+        def post_load_weights(self):
+            pass
+
+    holder = _Holder([plain_moe, static_moe, dynamic_moe])
+    calls.clear()
+    v41.DeepseekV41ForCausalLM.post_quant_warmup(holder)
+    assert warmup_calls == [
+        (1024, {"hidden": 256, "num_experts": 4, "num_sms": 148}),
+        (1024, {"hidden": 256, "num_experts": 4, "num_sms": 148}),
+    ]
+    assert any("logical_to_physical_map" not in kw for _, kw in calls)
+    assert any("logical_to_physical_map" in kw for _, kw in calls)
+    assert load_warmup_dtypes == [torch.int32, torch.int64]
+
+
+def test_v41_moe_fused_router_eplb_parity_gpu(monkeypatch):
+    from tokenspeed_kernel.thirdparty.cuda.mega_gate import is_bf16_mega_gate_available
+
+    from tokenspeed.runtime.layers.moe.topk import ExpertLocationDispatchInfo
+    from tokenspeed.runtime.moe.expert_location import ExpertLocationMetadata
+
+    if (
+        not torch.cuda.is_available()
+        or not current_platform().is_nvidia
+        or current_platform().arch_version.major != 10
+        or not is_bf16_mega_gate_available()
+    ):
+        pytest.skip("requires SM100-family GPU and deep_gemm.bf16_mega_gate")
+
+    config = _loader_config()
+    config.hidden_size = 512
+    config.n_routed_experts = 8
+    config.num_experts_per_tok = 2
+    config.moe_intermediate_size = 128
+    torch.manual_seed(41)
+    experts = config.n_routed_experts
+    placement_map = torch.tensor(
+        [[0, 1, 2, 3, 0, 4, 5, 6, 7, 2]], dtype=torch.int64, device="cuda"
+    )
+
+    monkeypatch.setitem(global_server_args_dict, "moe_runner_backend", "triton")
+    for algorithm in ("static", "dynamic"):
+        placement = ExpertLocationMetadata.from_physical_to_logical_map(
+            placement_map,
+            num_logical_experts=experts,
+            ep_size=2,
+            ep_rank=1,
+            ep_rank_nodes=(0, 0),
+        )
+        placement.enable_load_recording(_mapping(1, 2, 2))
+        placement.reserve_load_rows(128)
+        with torch.device("cuda"):
+            moe = v41.DeepseekV41MoE(
+                config, _mapping(0, 1, 1), _quant(), 0, "ffn", None
+            )
+        gate_weight = (
+            torch.randn(experts, config.hidden_size, device="cuda") * 0.05
+        ).bfloat16()
+        gate_weight[:, :experts] += (
+            torch.eye(experts, device="cuda", dtype=torch.bfloat16) * 1.5
+        )
+        bias = torch.randn(experts, device="cuda", dtype=torch.float32) * 0.02
+        with torch.no_grad():
+            moe.gate.weight.copy_(gate_weight)
+            moe.gate.e_score_correction_bias.copy_(bias)
+        moe.expert_dispatch_info = ExpertLocationDispatchInfo.init_new(
+            layer_id=0,
+            ep_dispatch_algorithm=algorithm,
+            expert_location_metadata=placement,
+            all_to_all_ep=True,
+        )
+
+        tokens = 48
+        hidden = (
+            torch.randn(tokens, config.hidden_size, device="cuda") * 0.05
+        ).bfloat16()
+        for row in range(tokens):
+            hidden[row, row % experts] = 2.0
+            hidden[row, (row + 3) % experts] = 1.6
+
+        out_w = torch.empty(tokens, 2, device="cuda", dtype=torch.float32)
+        out_ids = torch.empty(tokens, 2, device="cuda", dtype=torch.int64)
+        placement.reset_load()
+        moe.topk.topk_config.router_topk = "fused"
+        fused = moe._compute_topk_output(hidden, None, routing_out=(out_w, out_ids))
+        fused_load = placement.physical_load[0].clone()
+        assert fused.topk_weights.data_ptr() == out_w.data_ptr()
+        assert fused.topk_ids.data_ptr() == out_ids.data_ptr()
+        assert int(fused_load.sum().item()) == tokens * 2
+
+        placement.reset_load()
+        moe.topk.topk_config.router_topk = "torch"
+        unfused = moe._compute_topk_output(hidden, None)
+        unfused_load = placement.physical_load[0].clone()
+        fused_order = torch.argsort(fused.topk_ids, dim=-1)
+        unfused_order = torch.argsort(unfused.topk_ids, dim=-1)
+        torch.testing.assert_close(
+            fused.topk_weights.gather(1, fused_order),
+            unfused.topk_weights.gather(1, unfused_order),
+            atol=2e-3,
+            rtol=2e-3,
+        )
+        if algorithm == "static":
+            torch.testing.assert_close(
+                fused.topk_ids.gather(1, fused_order),
+                unfused.topk_ids.gather(1, unfused_order),
+                atol=0,
+                rtol=0,
+            )
+            assert torch.equal(fused_load, unfused_load)
+        else:
+            physical_to_logical = placement_map[0].to("cuda")
+            mapped_logical = physical_to_logical[fused.topk_ids]
+            fused_l_order = torch.argsort(mapped_logical, dim=-1)
+            unfused_logical = physical_to_logical[unfused.topk_ids]
+            unfused_l_order = torch.argsort(unfused_logical, dim=-1)
+            torch.testing.assert_close(
+                mapped_logical.gather(1, fused_l_order),
+                unfused_logical.gather(1, unfused_l_order),
+                atol=0,
+                rtol=0,
+            )

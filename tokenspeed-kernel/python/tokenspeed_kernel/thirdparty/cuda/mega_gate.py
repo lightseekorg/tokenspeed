@@ -29,47 +29,215 @@ from contextlib import AbstractContextManager, nullcontext
 from functools import lru_cache
 
 import torch
-import torch.nn.functional as F
 from tokenspeed_kernel.platform import pdl_enabled, prepare_cuda_toolkit_env
 
 _MAX_TOKENS = 1 << 20
-_WARMUP_BUCKET_CAP = 65536
 _MAX_EXPERTS = 512
 _MAX_TOPK = 32
 _HIDDEN_ALIGNMENT = 256
 _EXPERT_ALIGNMENT = 4
+_KERNEL_EXPERT_ALIGNMENT = 128
+_KERNEL_BLOCK_K = 64
+_KERNEL_MIN_BLOCK_TOKENS = 16
+_KERNEL_MAX_BLOCK_TOKENS = 256
+_KERNEL_MAX_LOGICAL_CTAS = 64
+_KERNEL_MAX_GATE_WARPGROUPS = 7
+_KERNEL_TRANSPOSE_COLS_PER_WG = 8
+_KERNEL_TOPK_TOKENS_PER_WG = 4
 
 
-def bucket_mega_gate_tokens(num_tokens: int) -> int:
-    """Return the canonical warmed batch size for ``num_tokens`` tokens.
+def _cdiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
-    Keeps exact ``M=1`` latency and buckets larger batches to powers of two
-    starting at 16 (and 64K multiples above 65,536, within ``_MAX_TOKENS``)
-    so arbitrary uncaptured serving batch sizes hit warmed DeepGEMM kernels
-    without runtime JIT compilations.
+
+def _align(a: int, b: int) -> int:
+    return _cdiv(a, b) * b
+
+
+def _select_wave_block_tokens(num_tokens: int, wg: int) -> int:
+    waves = _cdiv(_cdiv(num_tokens, _KERNEL_MAX_BLOCK_TOKENS), wg)
+    return min(
+        _KERNEL_MAX_BLOCK_TOKENS,
+        _align(_cdiv(num_tokens, waves * wg), _KERNEL_MIN_BLOCK_TOKENS),
+    )
+
+
+def _get_num_waves(num_tokens: int, wg: int) -> int:
+    block_tokens = _select_wave_block_tokens(num_tokens, wg)
+    return _cdiv(_cdiv(num_tokens, block_tokens), wg)
+
+
+def _mega_gate_candidates(
+    hidden: int, num_experts: int, num_sms: int, deterministic: bool
+) -> list[tuple[int, int, int, int, int, int]]:
+    num_aligned_experts = _align(num_experts, _KERNEL_EXPERT_ALIGNMENT)
+    nsk_choices = (1,) if deterministic else (1, 2, 4, 8)
+    candidates: list[tuple[int, int, int, int, int, int]] = []
+    for neg in range(1, num_aligned_experts // _KERNEL_EXPERT_ALIGNMENT + 1):
+        if num_aligned_experts % (_KERNEL_EXPERT_ALIGNMENT * neg) != 0:
+            continue
+        nepg = num_aligned_experts // neg
+        if nepg > 256:
+            continue
+        for nmma in (1, 2):
+            if nepg > 128 and nmma != 2:
+                continue
+            for nsk in nsk_choices:
+                if hidden % (nsk * _KERNEL_BLOCK_K) != 0 or (nmma == 2 and nsk == 8):
+                    continue
+                nlc = neg * nmma * nsk
+                if nlc > num_sms or nlc >= _KERNEL_MAX_LOGICAL_CTAS:
+                    continue
+                candidates.append((neg, nepg, nmma, nsk, nlc, num_sms // nlc))
+    return candidates
+
+
+def _mega_gate_heuristic_key(
+    num_tokens: int,
+    candidates: list[tuple[int, int, int, int, int, int]],
+    num_sms: int,
+    deterministic: bool,
+) -> tuple[int, int, int, int] | None:
+    best_score: tuple[int, int, int, int, int] | None = None
+    best: tuple[int, int, int, int, int, int, int] | None = None
+    for neg, nepg, nmma, nsk, nlc, wg in candidates:
+        block_tokens = _select_wave_block_tokens(num_tokens, wg)
+        num_token_blocks = _cdiv(num_tokens, block_tokens)
+        launch_sms = min(wg, num_token_blocks) * nlc
+        waves = _cdiv(num_token_blocks, wg)
+        token_cols = block_tokens // nmma if nepg == 128 else block_tokens
+        cols = min(token_cols, 56)
+
+        doubling_nlc = nlc * 2
+        doubling_free = False
+        if doubling_nlc <= num_sms and doubling_nlc < _KERNEL_MAX_LOGICAL_CTAS:
+            doubling_wg = num_sms // doubling_nlc
+            if nmma == 1 and nsk != 8:
+                doubling_free = _get_num_waves(num_tokens, doubling_wg) <= waves + 2
+            elif nmma == 2 and nsk == 1 and waves == 1 and not deterministic:
+                doubling_free = (
+                    _select_wave_block_tokens(num_tokens, doubling_wg) == block_tokens
+                )
+        if doubling_free:
+            continue
+
+        score = (cols, launch_sms, nmma, -nsk, -waves)
+        if best_score is None or score > best_score:
+            best_score = score
+            best = (neg, nepg, nmma, nsk, nlc, block_tokens, waves)
+
+    if best is None:
+        return None
+    neg, nepg, nmma, nsk, nlc, block_tokens, waves = best
+    token_cols = block_tokens // nmma if nepg == 128 else block_tokens
+    ntu = _cdiv(token_cols, _KERNEL_TRANSPOSE_COLS_PER_WG)
+    tku = _cdiv(block_tokens, _KERNEL_TOPK_TOKENS_PER_WG * nlc)
+
+    def _balanced_wg(units: int) -> int:
+        return _cdiv(units, _cdiv(units, _KERNEL_MAX_GATE_WARPGROUPS))
+
+    ngw = (
+        _KERNEL_MAX_GATE_WARPGROUPS
+        if waves > 1
+        else max(_balanced_wg(ntu), _balanced_wg(tku))
+    )
+    return (ngw * 128, nmma, nsk, neg)
+
+
+def _mega_gate_transition_points(
+    max_tokens: int,
+    candidates: list[tuple[int, int, int, int, int, int]],
+    num_sms: int,
+) -> list[int]:
+    wave_groups = sorted(
+        {wg for *_, wg in candidates}
+        | {
+            num_sms // (nlc * 2)
+            for *_, nlc, _ in candidates
+            if nlc * 2 <= num_sms and nlc * 2 < _KERNEL_MAX_LOGICAL_CTAS
+        }
+    )
+    points: set[int] = {1, max_tokens}
+
+    def _add_pair(token_count: int) -> None:
+        if 1 <= token_count <= max_tokens:
+            points.add(token_count)
+        if 1 <= token_count - 1 <= max_tokens:
+            points.add(token_count - 1)
+
+    for wg in wave_groups:
+        step = _KERNEL_MAX_BLOCK_TOKENS * wg
+        max_waves = _cdiv(max_tokens, step)
+        for wave_idx in range(max_waves):
+            base = wave_idx * step
+            _add_pair(base + 1)
+            waves = wave_idx + 1
+            inner = _KERNEL_MIN_BLOCK_TOKENS * waves * wg
+            m = base // inner
+            limit = min(max_tokens, base + step) + 1
+            while True:
+                t = m * inner + 1
+                if t > limit:
+                    break
+                _add_pair(t)
+                m += 1
+            for block_step in range(
+                _KERNEL_MIN_BLOCK_TOKENS,
+                _KERNEL_MAX_BLOCK_TOKENS + 1,
+                _KERNEL_MIN_BLOCK_TOKENS,
+            ):
+                if waves == 1:
+                    for mult in range(1, wg + 2):
+                        t = mult * block_step + 1
+                        if t > min(max_tokens, step) + 1:
+                            break
+                        _add_pair(t)
+                _add_pair(waves * wg * block_step + 1)
+    return sorted(points)
+
+
+def mega_gate_warmup_token_counts(
+    max_tokens: int,
+    *,
+    hidden: int,
+    num_experts: int,
+    num_sms: int,
+    deterministic: bool = False,
+) -> list[int]:
+    """Return representative token counts covering SM100 MegaGate JIT configs.
+
+    ``sm100_bf16_mega_gate`` passes ``num_tokens`` as a runtime ``uint32`` and
+    specializes only on the heuristic tuple ``(num_gate_threads, num_mma_ctas,
+    num_split_k, num_expert_groups)``. Mirroring the C++ heuristic transition
+    points lets warmup compile all distinct templates in ``<= 15`` launches so
+    arbitrary serving batch sizes execute unpadded with zero runtime JITs.
     """
-    if num_tokens <= 1:
-        return num_tokens
-    if num_tokens <= _WARMUP_BUCKET_CAP:
-        return max(16, 1 << (num_tokens - 1).bit_length())
-    stride = _WARMUP_BUCKET_CAP
-    rounded = ((num_tokens + stride - 1) // stride) * stride
-    return min(rounded, _MAX_TOKENS)
-
-
-def mega_gate_warmup_token_counts(max_tokens: int) -> list[int]:
-    """Return every canonical ``bf16_mega_gate`` bucket up to ``max_tokens``."""
+    if hidden <= 0 or hidden % _HIDDEN_ALIGNMENT != 0:
+        raise ValueError(
+            f"hidden must be a positive multiple of {_HIDDEN_ALIGNMENT}, got {hidden}"
+        )
+    if (
+        num_experts <= 0
+        or num_experts > _MAX_EXPERTS
+        or num_experts % _EXPERT_ALIGNMENT != 0
+    ):
+        raise ValueError(
+            f"num_experts must be in 1..{_MAX_EXPERTS} divisible by {_EXPERT_ALIGNMENT}, got {num_experts}"
+        )
+    if num_sms <= 0:
+        raise ValueError(f"num_sms must be positive, got {num_sms}")
     if max_tokens <= 0:
         return []
-    target_max = bucket_mega_gate_tokens(min(max_tokens, _MAX_TOKENS))
-    counts = [1]
-    bucket = 16
-    while bucket <= min(target_max, _WARMUP_BUCKET_CAP):
-        counts.append(bucket)
-        bucket *= 2
-    if target_max > _WARMUP_BUCKET_CAP:
-        counts.extend(range(2 * _WARMUP_BUCKET_CAP, target_max + 1, _WARMUP_BUCKET_CAP))
-    return counts
+    limit = min(max_tokens, _MAX_TOKENS)
+    candidates = _mega_gate_candidates(hidden, num_experts, num_sms, deterministic)
+    if not candidates:
+        return [1]
+    seen_configs: dict[tuple[int, int, int, int], int] = {}
+    for token_count in _mega_gate_transition_points(limit, candidates, num_sms):
+        key = _mega_gate_heuristic_key(token_count, candidates, num_sms, deterministic)
+        if key is not None and key not in seen_configs:
+            seen_configs[key] = token_count
+    return list(seen_configs.values()) or [1]
 
 
 _INIT_LOCK = threading.Lock()
@@ -221,10 +389,35 @@ def bf16_mega_gate(
         raise ValueError(f"mask must be 1D with length {num_tokens} on {device}")
     if unmapped_topk_idx is not None and (
         unmapped_topk_idx.shape != (num_tokens, top_k)
+        or unmapped_topk_idx.dtype != torch.int64
+        or unmapped_topk_idx.stride(1) != 1
         or unmapped_topk_idx.device != device
     ):
         raise ValueError(
-            f"unmapped_topk_idx must have shape [{num_tokens}, {top_k}] on {device}"
+            f"unmapped_topk_idx must have INT64 shape [{num_tokens}, {top_k}] "
+            f"with unit trailing stride on {device}"
+        )
+    if to_physical_map is not None and (
+        to_physical_map.ndim != 2
+        or to_physical_map.shape[0] < num_routed_experts
+        or to_physical_map.shape[1] <= 0
+        or to_physical_map.dtype != torch.int32
+        or not to_physical_map.is_contiguous()
+        or to_physical_map.device != device
+    ):
+        raise ValueError(
+            f"to_physical_map must be contiguous INT32 [>={num_routed_experts}, >=1] "
+            f"on {device}"
+        )
+    if logical_count is not None and (
+        to_physical_map is None
+        or logical_count.shape != (to_physical_map.shape[0],)
+        or logical_count.dtype != torch.int32
+        or not logical_count.is_contiguous()
+        or logical_count.device != device
+    ):
+        raise ValueError(
+            f"logical_count must be contiguous INT32 matching to_physical_map rows on {device}"
         )
 
     out_arg: tuple[torch.Tensor, torch.Tensor] | None = None
@@ -258,54 +451,13 @@ def bf16_mega_gate(
             torch.empty((0, top_k), dtype=torch.int64, device=device),
         )
 
-    padded_tokens = bucket_mega_gate_tokens(num_tokens)
     api = _api()
     if api.get_pdl() != pdl_enabled():
         api.set_pdl(pdl_enabled())
 
     def _launch():
-        if padded_tokens == num_tokens:
-            return api.bf16_mega_gate(
-                x=hidden_states,
-                weight=gate_weight,
-                num_topk=int(top_k),
-                use_shared_as_routed=False,
-                num_shared_experts=0,
-                routed_scaling_factor=float(routed_scaling_factor),
-                ep_rank=0 if ep_rank is None else int(ep_rank),
-                scoring_func="sqrtsoftplus",
-                mask=mask,
-                bias=correction_bias,
-                image_bias=image_bias,
-                image_token_mask=image_token_mask,
-                fix_routing_mask=None,
-                to_physical_map=to_physical_map,
-                logical_count=logical_count,
-                unmapped_topk_idx=unmapped_topk_idx,
-                force_random=None,
-                out=out_arg,
-            )
-        # Pad only to canonical warmed buckets; keep mask=None when the caller
-        # passed mask=None because DeepGEMM specializes on mask presence.
-        extra = padded_tokens - num_tokens
-        hidden_in = F.pad(hidden_states, (0, 0, 0, extra))
-        image_mask_in = (
-            F.pad(image_token_mask, (0, extra), value=False)
-            if image_token_mask is not None
-            else None
-        )
-        mask_in = F.pad(mask, (0, extra), value=False) if mask is not None else None
-        unmapped_in = (
-            torch.empty(
-                (padded_tokens, top_k),
-                dtype=unmapped_topk_idx.dtype,
-                device=device,
-            )
-            if unmapped_topk_idx is not None
-            else None
-        )
-        padded_idx, padded_weights = api.bf16_mega_gate(
-            x=hidden_in,
+        return api.bf16_mega_gate(
+            x=hidden_states,
             weight=gate_weight,
             num_topk=int(top_k),
             use_shared_as_routed=False,
@@ -313,27 +465,17 @@ def bf16_mega_gate(
             routed_scaling_factor=float(routed_scaling_factor),
             ep_rank=0 if ep_rank is None else int(ep_rank),
             scoring_func="sqrtsoftplus",
-            mask=mask_in,
+            mask=mask,
             bias=correction_bias,
             image_bias=image_bias,
-            image_token_mask=image_mask_in,
+            image_token_mask=image_token_mask,
             fix_routing_mask=None,
             to_physical_map=to_physical_map,
             logical_count=logical_count,
-            unmapped_topk_idx=unmapped_in,
+            unmapped_topk_idx=unmapped_topk_idx,
             force_random=None,
-            out=None,
+            out=out_arg,
         )
-        sliced_idx = padded_idx[:num_tokens]
-        sliced_weights = padded_weights[:num_tokens]
-        if unmapped_topk_idx is not None and unmapped_in is not None:
-            unmapped_topk_idx.copy_(unmapped_in[:num_tokens])
-        if out is not None:
-            out_weights, out_idx = out
-            out_weights.copy_(sliced_weights)
-            out_idx.copy_(sliced_idx)
-            return out_idx, out_weights
-        return sliced_idx, sliced_weights
 
     topk_idx, topk_weights = _call_with_workspace_region(device, _launch)
     return topk_weights, topk_idx

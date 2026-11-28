@@ -50,6 +50,7 @@ __all__ = [
     "COMBINE_ORDERS",
     "ExpertDispatch",
     "dispatch_topk_ids",
+    "record_expert_load",
     "native_latent_moe_available",
     "latent_moe_decode_pipeline_available",
     "latent_moe_expert_shared",
@@ -320,6 +321,113 @@ def dispatch_topk_ids(topk_ids: torch.Tensor, dispatch: ExpertDispatch) -> torch
     count = dispatch.num_replicas.long()[logical]
     physical = dispatch.replicas.long()[logical, (rows + ranks) % count]
     return physical.to(topk_ids.dtype)
+
+
+def validate_record_expert_load_inputs(
+    topk_ids: torch.Tensor,
+    live_rows: torch.Tensor,
+    physical_load: torch.Tensor,
+    recording_enabled: torch.Tensor | None,
+) -> tuple[int, int, int]:
+    """Validate shapes, dtypes, and devices for ``record_expert_load``."""
+    if topk_ids.ndim != 2:
+        raise ValueError("topk_ids must be 2D [rows, top_k]")
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        raise TypeError("topk_ids must have dtype int32 or int64")
+    rows, top_k = topk_ids.shape
+    if (
+        live_rows.ndim != 1
+        or live_rows.dtype != torch.bool
+        or live_rows.shape[0] < rows
+    ):
+        raise ValueError(
+            f"live_rows must be 1D bool with length >= {rows}, got {tuple(live_rows.shape)}"
+        )
+    if physical_load.ndim != 1 or physical_load.dtype not in (torch.int32, torch.int64):
+        raise ValueError("physical_load must be a 1D int32 or int64 tensor")
+    num_physical_experts = physical_load.shape[0]
+    if num_physical_experts <= 0:
+        raise ValueError("physical_load must have at least one expert slot")
+    device = topk_ids.device
+    if live_rows.device != device or physical_load.device != device:
+        raise ValueError("topk_ids, live_rows, and physical_load must share one device")
+    if recording_enabled is not None and (
+        recording_enabled.numel() != 1
+        or recording_enabled.dtype != torch.bool
+        or recording_enabled.device != device
+    ):
+        raise ValueError(
+            "recording_enabled must be a 1-element bool tensor on the same device"
+        )
+    return rows, top_k, num_physical_experts
+
+
+def _record_expert_load_cpu(
+    topk_ids: torch.Tensor,
+    live_rows: torch.Tensor,
+    physical_load: torch.Tensor,
+    recording_enabled: torch.Tensor | None,
+    rows: int,
+    top_k: int,
+    num_physical_experts: int,
+) -> None:
+    if rows == 0 or top_k == 0:
+        return
+    if recording_enabled is not None and not bool(recording_enabled.item()):
+        return
+    valid = (topk_ids >= 0) & live_rows[:rows].unsqueeze(1)
+    if bool((valid & (topk_ids >= num_physical_experts)).any().item()):
+        raise ValueError("physical expert id out of range")
+    physical_load.scatter_add_(
+        0,
+        topk_ids.masked_fill(~valid, 0).reshape(-1).long(),
+        valid.reshape(-1).to(physical_load.dtype),
+    )
+
+
+def record_expert_load(
+    topk_ids: torch.Tensor,
+    live_rows: torch.Tensor,
+    physical_load: torch.Tensor,
+    *,
+    recording_enabled: torch.Tensor | None = None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> None:
+    """Count non-negative physical expert routes on live rows into ``physical_load``.
+
+    Args:
+        topk_ids: Physical expert ids shaped ``[rows, top_k]`` (int32 or int64).
+        live_rows: Boolean row mask covering at least ``rows`` elements.
+        physical_load: 1D int32 or int64 counters incremented in place.
+        recording_enabled: Optional 1-element bool device flag gating updates.
+        override: Optional registered kernel override name.
+        solution: Optional registered solution filter.
+    """
+    rows, top_k, num_physical_experts = validate_record_expert_load_inputs(
+        topk_ids, live_rows, physical_load, recording_enabled
+    )
+    if topk_ids.device.type == "cpu":
+        if override is not None or solution is not None:
+            raise ValueError("override and solution are only supported on GPU tensors")
+        _record_expert_load_cpu(
+            topk_ids,
+            live_rows,
+            physical_load,
+            recording_enabled,
+            rows,
+            top_k,
+            num_physical_experts,
+        )
+        return
+    kernel = select_kernel(
+        "moe",
+        "record_expert_load",
+        dense_format_signature(("topk_ids",), (topk_ids.dtype,)),
+        override=override,
+        solution=solution,
+    )
+    kernel(topk_ids, live_rows, physical_load, recording_enabled)
 
 
 # How a token's routed-expert contributions are combined across the MoE
@@ -2505,13 +2613,26 @@ def set_mega_gate_workspace_region(region) -> None:
     _set_region(region)
 
 
-def mega_gate_warmup_token_counts(max_tokens: int) -> list[int]:
-    """Return canonical warmed token counts for SM100 MegaGate up to ``max_tokens``."""
+def mega_gate_warmup_token_counts(
+    max_tokens: int,
+    *,
+    hidden: int,
+    num_experts: int,
+    num_sms: int,
+    deterministic: bool = False,
+) -> list[int]:
+    """Return representative token counts covering SM100 MegaGate JIT configs."""
     from tokenspeed_kernel.thirdparty.cuda.mega_gate import (
         mega_gate_warmup_token_counts as _warmup_counts,
     )
 
-    return _warmup_counts(max_tokens)
+    return _warmup_counts(
+        max_tokens,
+        hidden=hidden,
+        num_experts=num_experts,
+        num_sms=num_sms,
+        deterministic=deterministic,
+    )
 
 
 def moe_warmup(plan: dict, w: torch.nn.Module, *, max_num_tokens: int) -> None:

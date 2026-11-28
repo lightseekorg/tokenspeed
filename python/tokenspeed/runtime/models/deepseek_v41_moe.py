@@ -38,6 +38,7 @@ from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
 from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo,
     StandardTopKOutput,
     TopK,
     TopKOutput,
@@ -193,6 +194,8 @@ def _deepseek_v4_routed_expert_quant_config(
 
 
 class DeepseekV4MoE(nn.Module):
+    expert_dispatch_info: ExpertLocationDispatchInfo | None = None
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -333,6 +336,7 @@ class DeepseekV4MoE(nn.Module):
                 _deepseek_v4_mega_moe_max_num_tokens() if self.use_mega_moe else None
             ),
         )
+        self.expert_dispatch_info = None
         self.topk = DeepseekV4TopK(
             top_k=config.num_experts_per_tok,
             renormalize=self._renormalize_routing_weights(),

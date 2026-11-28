@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.moe._triton.bf16 import _validate as _validate_bf16_m
 from tokenspeed_kernel.ops.moe._triton.decode_sigmoid_topk import (
     decode_sigmoid_bias_topk,
 )
+from tokenspeed_kernel.ops.moe._triton.expert_load import triton_record_expert_load
 from tokenspeed_kernel.ops.moe._triton.fp8 import (
     _triton_fp8_moe_impl,
     _validate_fp8_moe,
@@ -1061,3 +1062,14 @@ register_kernel(
     ),
     priority=Priority.PERFORMANT,
 )(triton_sigmoid_bias_topk_routing)
+
+
+register_kernel(
+    "moe",
+    "record_expert_load",
+    name="triton_record_expert_load",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures("topk_ids", "dense", {torch.int32, torch.int64}),
+    priority=Priority.PORTABLE,
+)(triton_record_expert_load)
