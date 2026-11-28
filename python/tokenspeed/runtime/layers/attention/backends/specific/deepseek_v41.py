@@ -98,6 +98,13 @@ from tokenspeed.runtime.utils.host_sync import allow_host_sync
 # Initial long-prefill thresholds; tune with query count and visible history.
 _INDEXER_PARTITION_MIN_QUERIES = 4096
 _INDEXER_PARTITION_MIN_HISTORY = 8192
+# Bound per-launch MQA scoring / selection rows so >8K prefill chunks stay
+# below tensor-core power/thermal downclocking thresholds and limit scratch.
+V41_INDEXER_MAX_QUERY_CHUNK = 8192
+
+
+def _indexer_query_chunk_size(rows: int) -> int:
+    return min(V41_INDEXER_MAX_QUERY_CHUNK, max(1, rows))
 
 
 class V41CompressorPlan(NamedTuple):
@@ -338,6 +345,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     supports_layer_sliding_window = True
 
     skips_incomplete_prefill_outputs = True
+    # V4.1 DSpark shares the final target step (layer.39.dspark_stage* in
+    # the SWA group) with no separate draft_attn_backend.
+    embeds_draft_cache_fields = True
 
     def __init__(self, config: AttnConfig, spec: DeepseekV41Config) -> None:
         super().__init__(config, spec)
@@ -1908,7 +1918,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self.spec.index_topk,
                 candidate_capacity if produce_candidates else 0,
                 self.spec.candidate_block_size,
-                max(1, stop - start),
+                _indexer_query_chunk_size(stop - start),
                 256,
                 index_process_group,
                 outputs,
@@ -2067,7 +2077,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             ),
             index_heads,
             torch.bfloat16,
-            n,
+            _indexer_query_chunk_size(n),
             geometry.kernel_metadata,
         )
 

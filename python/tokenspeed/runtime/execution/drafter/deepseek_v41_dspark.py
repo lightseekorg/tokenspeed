@@ -117,6 +117,7 @@ class DeepseekV41DSpark(BaseDrafter):
     supports_dp_local_graph: bool = True
     shares_target_embed_head = True
     supports_speculative_sampling = True
+    supports_pd_layerwise_finalization = True
 
     def __init__(
         self,

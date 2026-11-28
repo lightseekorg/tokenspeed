@@ -71,6 +71,7 @@ import os
 import re
 from collections import Counter
 from collections.abc import Iterable
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass, replace
 from weakref import WeakValueDictionary
@@ -1099,6 +1100,7 @@ class DeepseekV41Attention(nn.Module):
         super().__init__()
         self.stream_fork = StreamFork(aux_stream)
         self.layer_id = layer_id
+        self.is_last_layer = layer_id == config.num_hidden_layers - 1
         self.ced_decoder_start = ced_decoder_start
         self.mapping = mapping
         self.head_dim = config.head_dim
@@ -1782,6 +1784,25 @@ class DeepseekV41Attention(nn.Module):
             )
         return out
 
+    def _pd_cache_step(self, ctx: ForwardContext, *, writes_in_call: bool):
+        if ctx.attn_backend is None:
+            return nullcontext()
+        record_kv_cache = (
+            False
+            if self.is_last_layer and ctx.attn_backend.defer_final_pd_cache_step
+            else None
+        )
+        return ctx.attn_backend.record_pd_cache_step(
+            ctx.forward_mode,
+            writes_in_call=writes_in_call,
+            record_kv_cache=record_kv_cache,
+        )
+
+    def record_empty_pd_step(self, ctx: ForwardContext) -> None:
+        """Record one PD cache step when this layer carries zero local rows."""
+        with self._pd_cache_step(ctx, writes_in_call=False):
+            pass
+
     @break_point
     def _sparse_attention_and_kv(
         self,
@@ -1798,6 +1819,35 @@ class DeepseekV41Attention(nn.Module):
         fused_decode: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Execute variable-length KV writes, indexer selection, and attention eagerly."""
+        with self._pd_cache_step(ctx, writes_in_call=True):
+            return self._execute_sparse_attention_and_kv(
+                ctx,
+                q,
+                swa,
+                latent_or_comp,
+                index_k_proj,
+                index_q,
+                index_weights,
+                swa_rope_cache,
+                swa_norm_weight,
+                out_rope_cache,
+                fused_decode,
+            )
+
+    def _execute_sparse_attention_and_kv(
+        self,
+        ctx: ForwardContext,
+        q: torch.Tensor,
+        swa: torch.Tensor,
+        latent_or_comp: torch.Tensor | None,
+        index_k_proj: torch.Tensor | None,
+        index_q: torch.Tensor | IndexQueryInput | None,
+        index_weights: torch.Tensor | None,
+        swa_rope_cache: torch.Tensor | None,
+        swa_norm_weight: torch.Tensor | None,
+        out_rope_cache: torch.Tensor | None,
+        fused_decode: bool,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         backend, mode = ctx.attn_backend, ctx.forward_mode
         if mode.is_idle():
             if fused_decode:
@@ -1996,6 +2046,25 @@ class DeepseekV41Attention(nn.Module):
         )
 
     def _forward_eager(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        reduce_output: bool,
+        hidden_codes: torch.Tensor | None,
+        hidden_scales: torch.Tensor | None,
+    ) -> torch.Tensor:
+        with self._pd_cache_step(ctx, writes_in_call=True):
+            return self._execute_eager(
+                positions,
+                hidden_states,
+                ctx,
+                reduce_output,
+                hidden_codes,
+                hidden_scales,
+            )
+
+    def _execute_eager(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -2713,6 +2782,8 @@ class DeepseekV41DecoderLayer(nn.Module):
                 if rows.query_shard.total_rows == 0:
                     captured = hidden_states[:, 0, :] if capture_input else None
                     return hidden_states, pre_mix, None, captured
+            else:
+                self.attn.record_empty_pd_step(ctx)
             self._forward_ffn(
                 hidden_states[:, 0, :], image_mask, ctx, defer_reduce=False
             )
@@ -3560,6 +3631,8 @@ class DeepseekV41Model(nn.Module):
         if (query_plan is not None and query_plan.total_rows == 0) or (
             state.rows == 0 and not self.mapping.attn.has_dp and query_plan is None
         ):
+            for layer in self.layers[start + 1 :]:
+                layer.attn.record_empty_pd_step(ctx)
             hidden = h[:, 0, :]
             captured.extend(
                 hidden for layer_id in self.dspark_capture_layers if layer_id > start

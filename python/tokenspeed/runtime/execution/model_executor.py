@@ -3446,8 +3446,12 @@ class ModelExecutor:
                 "the speculative drafter cannot finalize layerwise CachePD writes"
             )
         if self.draft_attn_backend is None:
-            raise RuntimeError("draft-final CachePD readiness requires a draft backend")
-        if self.draft_attn_backend is self.attn_backend:
+            if not self.attn_backend.embeds_draft_cache_fields:
+                raise RuntimeError(
+                    "draft-final CachePD readiness requires a draft backend"
+                )
+            self.attn_backend.defer_final_pd_cache_step = True
+        elif self.draft_attn_backend is self.attn_backend:
             raise RuntimeError(
                 "draft-final CachePD readiness requires distinct target and draft backends"
             )
