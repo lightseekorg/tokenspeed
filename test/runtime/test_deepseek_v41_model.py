@@ -5261,7 +5261,7 @@ def test_mhc_boundary_gpu_layer_and_prefill_graph_matches_fallback(
         boundary_calls.reset_mock()
         with torch.cuda.graph(graph, stream=stream):
             captured = _complete_layer(*args)
-        assert boundary_calls.call_count == 1
+        assert boundary_calls.call_count == int(tokens <= decode_wave_limit)
         for _ in range(3):
             residual.normal_()
             pre.uniform_()
@@ -5455,3 +5455,57 @@ def test_mhc_boundary_weight_refresh_and_memory_release():
             check=True,
             timeout=300,
         )
+
+
+def test_v41_decode_skips_mhc_boundary_when_cap_zero(monkeypatch):
+    """On SM103 (cap=0), decode routes away from mhc_boundary while prefill keeps its cap-independent path."""
+    from tokenspeed_kernel.ops.residual._cute_dsl import (
+        mhc_boundary as residual_backend,
+    )
+    from tokenspeed_kernel.platform import ArchVersion
+
+    monkeypatch.setattr(
+        residual_backend,
+        "_blackwell_cute_dsl_available",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        residual_backend,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=True, arch_version=ArchVersion(10, 3)),
+    )
+    assert v41.mhc_boundary_max_decode_tokens("cuda") == 0
+
+    called = []
+    monkeypatch.setattr(
+        v41,
+        "try_mhc_shifted_post_pre_boundary",
+        lambda *args, **kwargs: called.append(args),
+    )
+
+    class _Pending:
+        def __init__(self):
+            self.x = torch.zeros(8, 16)
+            self.post = torch.zeros(8, 4)
+            self.comb = torch.zeros(8, 16)
+            self.reduce_group = None
+
+        def finish(self, residual):
+            return residual + 1
+
+    norm = SimpleNamespace(weight=torch.ones(16), variance_epsilon=1e-6)
+    out = v41._v41_hc_post_pre(
+        torch.zeros(8, 4, 16),
+        torch.zeros(8, 4),
+        _Pending(),
+        hc_weights=(torch.zeros(2), torch.zeros(2), torch.zeros(2)),
+        boundary_weight=torch.zeros(1),
+        norm=norm,
+        hc_norm_eps=1e-6,
+        hc_eps=1e-6,
+        sinkhorn_iters=4,
+        prefer_overlap=True,
+        quantize_fp8=False,
+    )
+    assert called == []
+    assert out[1] is None and out[2] is None and out[3] is None

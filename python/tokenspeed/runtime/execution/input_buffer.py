@@ -34,6 +34,7 @@ from tokenspeed.runtime.execution.types import NGramInputs
 from tokenspeed.runtime.multimodal.inputs import Modality, substitute_mm_pad_
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+from tokenspeed.runtime.utils.pinned_host_ring import PinnedHostRing, copy_host_values
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
@@ -120,7 +121,8 @@ class InputBuffers:
             # request only on the chunk that completes its prompt.
             self.extend_prompt_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
 
-        # NOT pinned: python readers only; the H2D uses the per-step bulk pinned staging (_bulk_pinned).
+        # NOT pinned: python readers only; H2D uses ring-buffered pinned staging (_bulk_pinned).
+        self._pinned_ring = PinnedHostRing(device)
         self.extend_prefix_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self.extend_seq_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         # Host-only extend facts the attention backend plans from: how many
@@ -293,16 +295,17 @@ class InputBuffers:
                 zip(forward_op.request_ids, forward_op.request_pool_indices)
             )
         ]
-        # One fresh pinned allocation and one H2D. The GPU destination is stable;
-        # the host source must not be reused while an earlier copy is in flight.
+        # Ring-staged pinned allocation and one H2D. The GPU destination is stable;
+        # the host slot stays locked until both returned views and the stream event clear.
         seed_values = [token for row in snapshot.tokens for token in row]
         seed_values.extend(snapshot.positions)
         seed_values.extend(reset)
         seed_values.extend(accumulate(forward_op.input_lengths))
-        (seed_cpu,) = self._bulk_pinned((len(seed_values), torch.int64))
-        seed_cpu.copy_(torch.tensor(seed_values, dtype=torch.int64))
-        seed = self.ngram_seed_buf[: len(seed_values)]
-        seed.copy_(seed_cpu, non_blocking=True)
+        with self._pinned_ring.staging():
+            (seed_cpu,) = self._bulk_pinned((len(seed_values), torch.int64))
+            copy_host_values(seed_cpu, seed_values)
+            seed = self.ngram_seed_buf[: len(seed_values)]
+            seed.copy_(seed_cpu, non_blocking=True)
         token_count = bs * (context_len + 1)
         tokens = seed[:token_count].view(bs, context_len + 1)
         positions = seed[token_count : token_count + bs]
@@ -362,22 +365,8 @@ class InputBuffers:
         return tape
 
     def _bulk_pinned(self, *specs):
-        """One pinned allocation for this step, sliced per (numel, dtype).
-
-        NEVER persistent: a reused pinned buffer races with overlap
-        scheduling (the CPU preps step N+1 while step N's async H2D from
-        the same buffer may still be in flight). A fresh allocation per
-        step is event-fenced by the caching host allocator; bulking keeps
-        it to ONE allocation instead of one per field.
-        """
-        align = 8
-        offsets, off = [], 0
-        for numel, dtype in specs:
-            nbytes = numel * dtype.itemsize
-            offsets.append((off, numel, dtype))
-            off += (nbytes + align - 1) // align * align
-        bulk = torch.empty(off, dtype=torch.int8, pin_memory=True)
-        return [bulk[o : o + n * dt.itemsize].view(dt) for o, n, dt in offsets]
+        """Rent aligned pinned staging views for this step, event+ref fenced."""
+        return self._pinned_ring.acquire_views(specs, align=8)
 
     def set_mm_pad_substitute_ids(
         self, substitute_ids: dict[Modality, int], vocab_size: int
@@ -421,24 +410,25 @@ class InputBuffers:
         decode_input_ids = forward_op.decode_input_ids
         if decode_input_ids is not None and all(x == -1 for x in decode_input_ids):
             decode_input_ids = None
-        req_pool_indices_cpu, input_lengths_cpu = self._bulk_pinned(
-            (len(req_pool_indices), torch.int64), (len(input_lengths), torch.int32)
-        )
-        req_pool_indices_cpu.copy_(torch.as_tensor(req_pool_indices, dtype=torch.int64))
-        input_lengths_cpu.copy_(torch.as_tensor(input_lengths, dtype=torch.int32))
-        self.req_pool_indices_buf[:batch_size].copy_(
-            req_pool_indices_cpu,
-            non_blocking=True,
-        )
-        self.state_write_req_pool_indices_buf[:batch_size].copy_(
-            req_pool_indices_cpu,
-            non_blocking=True,
-        )
+        with self._pinned_ring.staging():
+            req_pool_indices_cpu, input_lengths_cpu = self._bulk_pinned(
+                (len(req_pool_indices), torch.int64), (len(input_lengths), torch.int32)
+            )
+            copy_host_values(req_pool_indices_cpu, req_pool_indices)
+            copy_host_values(input_lengths_cpu, input_lengths)
+            self.req_pool_indices_buf[:batch_size].copy_(
+                req_pool_indices_cpu,
+                non_blocking=True,
+            )
+            self.state_write_req_pool_indices_buf[:batch_size].copy_(
+                req_pool_indices_cpu,
+                non_blocking=True,
+            )
 
-        self.input_lengths_buf[:batch_size].copy_(
-            input_lengths_cpu,
-            non_blocking=True,
-        )
+            self.input_lengths_buf[:batch_size].copy_(
+                input_lengths_cpu,
+                non_blocking=True,
+            )
         if runtime_states.has_request_token_history:
             self.prepare_request_token_history_inputs(
                 batch_size=batch_size,
@@ -458,38 +448,42 @@ class InputBuffers:
         )
 
         if num_extends > 0:
-            # Fresh bulk pinned per step (see _bulk_pinned: persistent staging races overlap scheduling).
-            self.extend_prefix_lens_cpu[:num_extends] = torch.as_tensor(
-                extend_prefix_lens, dtype=torch.int32
+            copy_host_values(
+                self.extend_prefix_lens_cpu[:num_extends], extend_prefix_lens
             )
-            self.extend_seq_lens_cpu[:num_extends] = torch.as_tensor(
-                input_lengths[:num_extends], dtype=torch.int32
+            copy_host_values(
+                self.extend_seq_lens_cpu[:num_extends], input_lengths[:num_extends]
             )
-            self.extend_replay_lens_cpu[:num_extends] = torch.as_tensor(
-                forward_op.extend_replay_lens, dtype=torch.int32
+            copy_host_values(
+                self.extend_replay_lens_cpu[:num_extends],
+                forward_op.extend_replay_lens,
             )
-            self.extend_prompt_lens_cpu[:num_extends] = torch.as_tensor(
-                prefill_lengths[:num_extends], dtype=torch.int32
+            copy_host_values(
+                self.extend_prompt_lens_cpu[:num_extends], prefill_lengths[:num_extends]
             )
             if self.reads_state_checkpoints:
-                self.extend_state_checkpoint_lens_cpu[:num_extends] = torch.as_tensor(
-                    forward_op.extend_state_checkpoint_lens, dtype=torch.int32
+                copy_host_values(
+                    self.extend_state_checkpoint_lens_cpu[:num_extends],
+                    forward_op.extend_state_checkpoint_lens,
                 )
-            ext_prefix_cpu, ext_seq_cpu, ext_prompt_cpu = self._bulk_pinned(
-                (num_extends, torch.int32),
-                (num_extends, torch.int32),
-                (num_extends, torch.int32),
-            )
-            ext_prefix_cpu.copy_(self.extend_prefix_lens_cpu[:num_extends])
-            ext_seq_cpu.copy_(self.extend_seq_lens_cpu[:num_extends])
-            ext_prompt_cpu.copy_(self.extend_prompt_lens_cpu[:num_extends])
-            self.extend_prefix_lens_buf[:num_extends].copy_(
-                ext_prefix_cpu, non_blocking=True
-            )
-            self.extend_seq_lens_buf[:num_extends].copy_(ext_seq_cpu, non_blocking=True)
-            self.extend_prompt_lens_buf[:num_extends].copy_(
-                ext_prompt_cpu, non_blocking=True
-            )
+            with self._pinned_ring.staging():
+                ext_prefix_cpu, ext_seq_cpu, ext_prompt_cpu = self._bulk_pinned(
+                    (num_extends, torch.int32),
+                    (num_extends, torch.int32),
+                    (num_extends, torch.int32),
+                )
+                ext_prefix_cpu.copy_(self.extend_prefix_lens_cpu[:num_extends])
+                ext_seq_cpu.copy_(self.extend_seq_lens_cpu[:num_extends])
+                ext_prompt_cpu.copy_(self.extend_prompt_lens_cpu[:num_extends])
+                self.extend_prefix_lens_buf[:num_extends].copy_(
+                    ext_prefix_cpu, non_blocking=True
+                )
+                self.extend_seq_lens_buf[:num_extends].copy_(
+                    ext_seq_cpu, non_blocking=True
+                )
+                self.extend_prompt_lens_buf[:num_extends].copy_(
+                    ext_prompt_cpu, non_blocking=True
+                )
 
         # Get valid cache lengths for requests
         req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
@@ -539,21 +533,22 @@ class InputBuffers:
             prefill_token_count = sum(input_lengths[:num_extends])
             input_ids = forward_op.input_ids
             shifted_ids = forward_op.shifted_input_ids
-            input_ids_cpu, shifted_ids_cpu = self._bulk_pinned(
-                (input_ids.size, torch.int32), (shifted_ids.size, torch.int32)
-            )
-            # Copy the scheduler's read-only int32 views directly into this
-            # step's writable pinned storage; no intermediate token copy.
-            np.copyto(input_ids_cpu.numpy(), input_ids, casting="no")
-            np.copyto(shifted_ids_cpu.numpy(), shifted_ids, casting="no")
-            self.input_ids_buf[:prefill_token_count].copy_(
-                input_ids_cpu,
-                non_blocking=True,
-            )
-            self.shifted_prefill_ids_buf[:prefill_token_count].copy_(
-                shifted_ids_cpu,
-                non_blocking=True,
-            )
+            with self._pinned_ring.staging():
+                input_ids_cpu, shifted_ids_cpu = self._bulk_pinned(
+                    (input_ids.size, torch.int32), (shifted_ids.size, torch.int32)
+                )
+                # Copy the scheduler's read-only int32 views directly into this
+                # step's ring-staged pinned storage; no intermediate token copy.
+                np.copyto(input_ids_cpu.numpy(), input_ids, casting="no")
+                np.copyto(shifted_ids_cpu.numpy(), shifted_ids, casting="no")
+                self.input_ids_buf[:prefill_token_count].copy_(
+                    input_ids_cpu,
+                    non_blocking=True,
+                )
+                self.shifted_prefill_ids_buf[:prefill_token_count].copy_(
+                    shifted_ids_cpu,
+                    non_blocking=True,
+                )
             if self.mm_pad_substitute_ids:
                 # Media positions carry content-hash ids (prefix-cache keying);
                 # the draft embedding needs the modality's in-vocab token.
@@ -624,12 +619,14 @@ class InputBuffers:
                     f"{context} decode_input_ids length mismatch: "
                     f"got {len(decode_input_ids)}, expected {expected_count}"
                 )
-            decode_input_ids_tensor = torch.tensor(
-                decode_input_ids,
-                dtype=torch.int32,
-                device="cpu",
-                pin_memory=True,
-            ).to(req_pool_indices_device.device, non_blocking=True)
+            with self._pinned_ring.staging():
+                (decode_ids_cpu,) = self._bulk_pinned(
+                    (len(decode_input_ids), torch.int32)
+                )
+                copy_host_values(decode_ids_cpu, decode_input_ids)
+                decode_input_ids_tensor = decode_ids_cpu.to(
+                    req_pool_indices_device.device, non_blocking=True
+                )
             mask = (decode_input_ids_tensor != -1).unsqueeze(1)
             ids = decode_input_ids_tensor.unsqueeze(1)
 

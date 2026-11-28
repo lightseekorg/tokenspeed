@@ -360,7 +360,12 @@ def test_mhc_boundary_hi_lo_split_fp64_precision_and_cluster_limit():
     props = torch.cuda.get_device_properties("cuda")
     expected_clusters = max(1, (2 * props.multi_processor_count) // cute_mhc.CLUSTER)
     assert cute_mhc.max_decode_wave_clusters("cuda") == expected_clusters
-    assert mhc_boundary_max_decode_tokens("cuda") == expected_clusters * cute_mhc.TILE
+    expected_max_tokens = (
+        0
+        if platform.current_platform().arch_version == platform.ArchVersion(10, 3)
+        else expected_clusters * cute_mhc.TILE
+    )
+    assert mhc_boundary_max_decode_tokens("cuda") == expected_max_tokens
 
     args = _inputs(33, 5120, 20, seed=107)
     raw = args["raw_weight"] * 8.0
@@ -376,3 +381,30 @@ def test_mhc_boundary_hi_lo_split_fp64_precision_and_cluster_limit():
     # Without the hi+lo BF16 weight split, 8x weights shift projections by ~5e-3+.
     for got, ref in zip(actual[2:], ref64[2:], strict=True):
         torch.testing.assert_close(got, ref, atol=5e-4, rtol=5e-4)
+
+
+def test_mhc_boundary_max_decode_tokens_disabled_on_sm103(monkeypatch):
+    from types import SimpleNamespace
+
+    from tokenspeed_kernel.ops.residual._cute_dsl import mhc_boundary as backend
+
+    props = torch.cuda.get_device_properties("cuda")
+    expected_clusters = max(1, (2 * props.multi_processor_count) // cute_mhc.CLUSTER)
+
+    monkeypatch.setattr(
+        backend,
+        "current_platform",
+        lambda: SimpleNamespace(
+            is_nvidia=True, arch_version=platform.ArchVersion(10, 3)
+        ),
+    )
+    assert mhc_boundary_max_decode_tokens("cuda") == 0
+
+    monkeypatch.setattr(
+        backend,
+        "current_platform",
+        lambda: SimpleNamespace(
+            is_nvidia=True, arch_version=platform.ArchVersion(10, 0)
+        ),
+    )
+    assert mhc_boundary_max_decode_tokens("cuda") == expected_clusters * cute_mhc.TILE

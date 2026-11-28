@@ -53,6 +53,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
     cache_group_config,
     scheduler_role,
 )
+from tokenspeed.runtime.utils.pinned_host_ring import get_shared_pinned_host_ring
 
 # The data plane reports Host cache and state commit ACKs as ``(kind, op_id)``.
 _CACHE_EVENT_TYPES = frozenset(
@@ -1057,53 +1058,62 @@ def packed_block_tables_from_forward_op(
     num_rows = sum(arr.shape[0] for _, arr, _, _, _ in packable)
     fields = num_rows * BLOCK_TABLE_ROW_FIELDS
     num_values = sum(arr.size for _, arr, _, _, _ in packable)
-    # Fresh pinned stages per step (event-fenced; reuse races overlap).
+    # Ring-staged pinned buffers fenced by copy event and weakrefs on returned CPU views.
     # arr is a read-only zero-copy view over the C++ buffer; np.copyto
     # reads it into our own writable pinned tensors (never writes back).
-    pin_memory = device.type in ("cuda", "npu")
-    upload = torch.empty(fields + num_values, dtype=torch.int32, pin_memory=pin_memory)
-    upload_np = upload.numpy()
-    row_fields = upload_np[:fields].reshape(num_rows, BLOCK_TABLE_ROW_FIELDS)
-    values = upload_np[fields:]
-    row_at = value_at = 0
-    for _, arr, columns, offset, first in packable:
-        rows, width = arr.shape
-        # (offset, width, start, end, source): expand_block_table_rows' fields.
-        group_fields = row_fields[row_at : row_at + rows]
-        group_fields[:, 0] = offset + np.arange(rows) * columns
-        group_fields[:, 1] = columns
-        group_fields[:, 2] = first
-        group_fields[:, 3] = first + width
-        group_fields[:, 4] = value_at + np.arange(rows) * width
-        windows = values[value_at : value_at + rows * width].reshape(rows, width)
-        np.copyto(windows, arr)
-        row_at += rows
-        value_at += rows * width
-    upload = upload.to(device, non_blocking=True)
+    ring = get_shared_pinned_host_ring(device)
+    with ring.staging():
+        (upload,) = ring.acquire_views(((fields + num_values, torch.int32),), align=8)
+        upload_np = upload.numpy()
+        row_fields = upload_np[:fields].reshape(num_rows, BLOCK_TABLE_ROW_FIELDS)
+        values = upload_np[fields:]
+        row_at = value_at = 0
+        for _, arr, columns, offset, first in packable:
+            rows, width = arr.shape
+            # (offset, width, start, end, source): expand_block_table_rows' fields.
+            group_fields = row_fields[row_at : row_at + rows]
+            group_fields[:, 0] = offset + np.arange(rows) * columns
+            group_fields[:, 1] = columns
+            group_fields[:, 2] = first
+            group_fields[:, 3] = first + width
+            group_fields[:, 4] = value_at + np.arange(rows) * width
+            windows = values[value_at : value_at + rows * width].reshape(rows, width)
+            np.copyto(windows, arr)
+            row_at += rows
+            value_at += rows * width
+        upload_gpu = upload.to(device, non_blocking=True)
     packed = torch.empty(total, dtype=torch.int32, device=device)
     expand_block_table_rows(
-        upload[:fields].view(num_rows, BLOCK_TABLE_ROW_FIELDS), upload[fields:], packed
+        upload_gpu[:fields].view(num_rows, BLOCK_TABLE_ROW_FIELDS),
+        upload_gpu[fields:],
+        packed,
     )
     for key, arr, columns, offset, _ in packable:
         shape = (arr.shape[0], columns)
         size = shape[0] * shape[1]
         out[key] = packed[offset : offset + size].view(shape)
     if host_tables:
-        staged = torch.empty(total, dtype=torch.int32, pin_memory=pin_memory)
-        staged_np = staged.numpy()
-        for key, arr, columns, offset, first in packable:
-            rows, width = arr.shape
-            shape = (rows, columns)
-            size = shape[0] * shape[1]
-            host = staged_np[offset : offset + size].reshape(shape)
-            if width == shape[1]:
-                np.copyto(host, arr)
-            else:
-                for row, start in enumerate(first):
-                    host[row, :start] = 0
-                    host[row, start : start + width] = arr[row]
-                    host[row, start + width :] = -1
-            out_cpu[key] = staged[offset : offset + size].view(shape)
+        with ring.staging():
+            staged_views = ring.acquire_views(
+                [
+                    ((arr.shape[0], columns), torch.int32)
+                    for _, arr, columns, _, _ in packable
+                ],
+                align=8,
+            )
+            for (key, arr, columns, _, first), dst in zip(
+                packable, staged_views, strict=True
+            ):
+                rows, width = arr.shape
+                host = dst.numpy()
+                if width == columns:
+                    np.copyto(host, arr)
+                else:
+                    for row, start in enumerate(first):
+                        host[row, :start] = 0
+                        host[row, start : start + width] = arr[row]
+                        host[row, start + width :] = -1
+                out_cpu[key] = dst
     return PackedBlockTables(out, out_cpu)
 
 

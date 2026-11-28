@@ -195,6 +195,7 @@ class SonicSamplingBackend(SamplingBackend):
 
     _HAS_POOL_STATE = True
     _SUPPORTS_DP_VERIFY = False
+    _PACK_ACCEPT_INDEX = False
     supports_tree_verify = True
     # Forced lengths over sonic's verify; see ``_synthetic_outputs``.
     _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
@@ -242,21 +243,27 @@ class SonicSamplingBackend(SamplingBackend):
 
         rows = self.max_bs * self.n_max
 
+        if self.n_max != config.max_draft_tokens_per_req:
+            self._allocate_verify_outputs(self.max_bs, self.n_max)
+
         with torch.device(self.device):
 
             # Batch-indexed working space, persistent (captured kernel never allocs).
             self.scratchpad = torch.empty(
                 (rows, scratchpad_columns(self.vocab_size)), dtype=torch.uint32
             )
-            self.out_tok = torch.empty((self.max_bs, 1), dtype=torch.int32)
-            self.lengths_buf = torch.ones((self.max_bs,), dtype=torch.int32)
+            # Alias output buffers into _output_pack_buf so get_packed_outputs_and_ends_d2h
+            # copies predict, lengths, and request_ends in a single pinned D2H.
+            self.out_tok = self._predict_buf[: self.max_bs].view(self.max_bs, 1)
+            self.lengths_buf = self._accept_length_buf
+            self.lengths_buf.fill_(1)
 
             if self.spec:
 
                 # verify() drafted-tokens I/O and candidate scratch; see ``_fused_multistep``.
-                self.v_drafted = torch.empty(self.max_bs, self.n_max, dtype=torch.int32)
+                self.v_drafted = self._predict_buf.view(self.max_bs, self.n_max)
                 self.v_accepted = torch.empty((self.max_bs, 1), dtype=torch.int32)
-                self.accept_buf = torch.empty((self.max_bs,), dtype=torch.int32)
+                self.accept_buf = self._accept_length_buf
                 self.values = torch.empty((rows, MAX_K), dtype=torch.float32)
                 self.indices = torch.empty((rows, MAX_K), dtype=torch.int32)
                 # Synthetic acceptance's target token per request.

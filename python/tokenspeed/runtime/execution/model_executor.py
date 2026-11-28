@@ -733,9 +733,19 @@ class ModelExecutor:
             # Per row of a forward (sized like InputBuffers.max_bs), whether
             # the device ended its request, and with a complete decode state:
             # the control plane's word for publishing a request's state.
-            self.request_ends = torch.zeros(
-                max_bs, dtype=torch.int32, device=self.device
-            )
+            # Alias the sampling backend's packed _request_ends_buf when present
+            # so output_d2h copies tokens, lengths, and request_ends in one DMA.
+            if sampling_backend is not None:
+                if sampling_backend.request_ends_buf.shape[0] < max_bs:
+                    raise ValueError(
+                        "sampling_backend request_ends_buf length "
+                        f"{sampling_backend.request_ends_buf.shape[0]} < max_bs={max_bs}"
+                    )
+                self.request_ends = sampling_backend.request_ends_buf[:max_bs]
+            else:
+                self.request_ends = torch.zeros(
+                    max_bs, dtype=torch.int32, device=self.device
+                )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -3128,14 +3138,13 @@ class ModelExecutor:
                 with maybe_inference_mode():
                     output_tokens.clamp_(0, vocab_size - 1)
 
-                packed = self.sampling_backend.get_packed_output_d2h(
-                    output_tokens, output_lengths
+                output_tokens, output_lengths, output_request_ends = (
+                    self.sampling_backend.copy_outputs_d2h(
+                        output_tokens,
+                        output_lengths,
+                        self.request_ends[:bs],
+                    )
                 )
-                if packed is not None:
-                    output_tokens, output_lengths = packed
-                else:
-                    output_tokens = output_tokens.to("cpu", non_blocking=True)
-                    output_lengths = output_lengths.to("cpu", non_blocking=True)
 
                 if output_logprobs is not None:
                     output_logprobs = output_logprobs.to("cpu", non_blocking=True)
@@ -3149,10 +3158,6 @@ class ModelExecutor:
                     forward_logprobs = ForwardLogprobs()
 
                 output_nan_flags = self.nan_guard.flags_cpu
-                # Every row as the stop conditions and the commit left it.
-                output_request_ends = self.request_ends[:bs].to(
-                    "cpu", non_blocking=True
-                )
 
                 copy_event = self.device_module.Event()
                 copy_event.record()

@@ -1020,10 +1020,11 @@ V4.1 completes deferred HC posts and reductions before stage handoffs or
 Engram updates. The fixed graph input state contains only completed residuals.
 Decode replaces its 80 stream-forked sublayer boundaries with the single-wave
 Blackwell DSMEM cluster kernel (`try_mhc_shifted_post_pre_boundary`, up to
-`mhc_boundary_max_decode_tokens(device)` = `24 * (2 * SM // 16)` tokens, e.g.
-336 on 112 SMs) using weights prepacked in place inside the `weights`
-memory-saver region and pre-warmed per `(hidden, sinkhorn_iters, device)`
-(1.8-3.2x speedup at T=1..32 and 1.38x at T=336 vs unfused decode).
+`mhc_boundary_max_decode_tokens(device)` = `24 * (2 * SM // 16)` tokens on
+SM100/SM107, e.g. 336 on 112 SMs, and `0` on SM103 where StreamFork overlap
+wins across measured decode batch sizes) using weights prepacked in place
+inside the `weights` memory-saver region and pre-warmed per `(hidden, sinkhorn_iters, device)`
+(1.8-3.2x speedup at T=1..32 and 1.38x at T=336 on SM100 vs unfused decode).
 Prefill warmup runs on the eventual capture stream because MegaMHC (gated on
 `is_mega_mhc_capture_safe()`, i.e. `deep_gemm >= 2.8.3`; builds through
 `2.8.2.post20261115` assert `CaptureStatus::None` in `mega_mhc.hpp`) initializes
@@ -1512,11 +1513,17 @@ scores; no backend computes them. `docs/guides/sampling-calibration.md` is
 the contract: ordering, masking, supported configurations and cost.
 
 `sample()` and `verify()` land their outputs in each sampling backend's
-persistent output buffers, on eager and replay alike. When tokens and accept
-lengths share one region (`_output_pack_buf`, where every `verify()` lands
-them), `get_packed_output_d2h` brings both back in one device-to-host copy;
-otherwise (`sonic`, which returns its own token and length buffers) it returns
-None and the executor makes two. The stop conditions cut the returned accept
+persistent output buffers, on eager and replay alike. `_output_pack_buf`
+contiguously packs `predict`, `accept_length`, and `request_ends` (with
+`ModelExecutor.request_ends` aliasing `sampling_backend.request_ends_buf[:max_bs]`,
+and `accept_index` appended when packed for TP broadcast). `SonicSamplingBackend`
+aliases its `out_tok`, `lengths_buf`, `v_drafted`, and `accept_buf` into
+`_output_pack_buf` as well (leaving `_tree_pack` for draft-tree verification).
+`copy_outputs_d2h` / `get_packed_outputs_and_ends_d2h` copy predict, lengths,
+and `request_ends` back in a single device-to-host transfer into an event- and
+weakref-fenced `PinnedHostRing` host slot (falling back to fenced ring copies
+for mixed batches or tree verification), eliminating per-step `cudaHostAlloc` and
+pageable `.to("cpu")` driver stalls. The stop conditions cut the returned accept
 lengths in place (0 for a stopped request), so a backend whose decode rows
 return a buffer of ones refills it on every call, as `sonic` and FlashInfer do.
 
