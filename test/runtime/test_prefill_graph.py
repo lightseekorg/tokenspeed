@@ -1806,5 +1806,121 @@ def test_all_capture_stages_warm_the_execution_stream():
                 torch.testing.assert_close(output, torch.full_like(x, value * 2))
 
 
+@pytest.mark.parametrize("stage", ["bucket", "encoder", "decoder"])
+def test_capture_stages_materialize_segments_before_breaks(stage: str) -> None:
+    """Segments must execute during capture before eager breaks read pool tensors.
+
+    Otherwise capturing a smaller bucket on the shared graph pool can send stale
+    bytes (including NaNs from an earlier bucket's replay) into an eager break.
+    """
+    import torch
+
+    from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+
+    rows_large, rows_small, width = 1024, 512, 1024
+    x_static = torch.ones(rows_large, width, device="cuda", dtype=torch.float32)
+    statics_large = torch.ones(rows_large, width, device="cuda", dtype=torch.float32)
+    statics_small = torch.ones(rows_small, width, device="cuda", dtype=torch.float32)
+    expected_input = x_static
+
+    class Probe:
+        @break_point
+        def attn(self, hidden: torch.Tensor) -> torch.Tensor:
+            if not torch.isfinite(hidden).all():
+                raise AssertionError("eager break observed non-finite stale pool data")
+            torch.testing.assert_close(
+                hidden, expected_input[: hidden.shape[0]] + 1.0, rtol=0, atol=0
+            )
+            return hidden + 3.0
+
+    probe = Probe()
+
+    def forward(src: torch.Tensor, *, poison_small_block: bool) -> torch.Tensor:
+        # Large-pool tensor (> 1 MiB) so the follow-up smaller bucket reuses the
+        # exact freed block when Segment 1 writes NaNs before releasing it.
+        hidden = src + 1.0
+        post_attn = probe.attn(hidden)
+        if poison_small_block:
+            poison = torch.full(
+                (rows_small, width),
+                float("nan"),
+                device="cuda",
+                dtype=torch.float32,
+            )
+            hidden.fill_(float("nan"))
+            keep_poison = torch.isnan(poison).any().to(post_attn.dtype) * 0.0
+            return post_attn + keep_poison
+        return post_attn * 2.0
+
+    owner = PrefillGraph.__new__(PrefillGraph)
+    owner.num_warmup = 2
+    owner._pool = None
+    owner._ctx = None
+    owner._handoff_storage = {}
+    owner._encoder_handoff_storage = {}
+    owner._outputs = None
+    owner._narrowing = None
+    owner.capture_buckets = owner.decoder_buckets = [rows_small, rows_large]
+
+    def capture_stage(rows: int):
+        nonlocal expected_input
+        poison = rows == rows_large
+        if stage == "bucket":
+            expected_input = x_static
+            owner._run_inner = lambda bucket, p=poison: (
+                forward(x_static[:bucket], poison_small_block=p),
+                None,
+            )
+            cap, result = owner._capture_bucket(rows, None, contextlib.nullcontext())
+            return cap, result.hidden_states
+        if stage == "encoder":
+            expected_input = x_static
+            owner._run_encoder = lambda bucket, p=poison: forward(
+                x_static[:bucket], poison_small_block=p
+            )
+            result = owner._capture_encoder(rows, None, contextlib.nullcontext())
+            return result.capture, result.state
+        statics = statics_large if poison else statics_small
+        expected_input = statics
+        owner._narrowing = SimpleNamespace(
+            decoder_forward=lambda state, _ctx, p=poison: (
+                forward(state, poison_small_block=p),
+                None,
+            )
+        )
+        result = owner._capture_decoder(
+            statics, lambda: None, None, contextlib.nullcontext()
+        )
+        return result.capture, result.output.hidden_states
+
+    cap_large, out_large = capture_stage(rows_large)
+    assert owner._pool is not None
+    small_buf = statics_small if stage == "decoder" else x_static[:rows_small]
+    small_buf.fill_(3.0)
+    cap_small, out_small = capture_stage(rows_small)
+    assert cap_small.pool is owner._pool
+
+    small_buf.fill_(4.0)
+    expected_input = statics_small if stage == "decoder" else x_static
+    cap_small.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out_small, torch.full_like(out_small, 16.0), rtol=0, atol=0
+    )
+
+    large_buf = statics_large if stage == "decoder" else x_static[:rows_large]
+    large_buf.fill_(2.0)
+    expected_input = statics_large if stage == "decoder" else x_static
+    cap_large.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        out_large, torch.full_like(out_large, 6.0), rtol=0, atol=0
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

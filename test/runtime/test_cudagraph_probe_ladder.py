@@ -359,11 +359,13 @@ def test_every_capture_opens_its_observer_after_the_warmups_and_before_the_pool(
         def replay(self):
             order.append("replay")
 
-    monkeypatch.setattr(
-        prefill_graph,
-        "BreakableCapture",
-        lambda pool, stream, handoff_storage: _Recorder("capture", pool, stream),
-    )
+    def make_capture(
+        pool, stream, handoff_storage, *, run_segments_while_capturing=False
+    ):
+        assert run_segments_while_capturing is True
+        return _Recorder("capture", pool, stream)
+
+    monkeypatch.setattr(prefill_graph, "BreakableCapture", make_capture)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: active_stream)
     monkeypatch.setattr(torch.cuda, "stream", on_stream)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: order.append("synchronize"))
@@ -482,7 +484,15 @@ def test_narrowing_decoders_share_outputs_and_encoders_keep_their_handoffs(
     given = []
 
     class _Capture:
-        def __init__(self, pool, stream, handoff_storage):
+        def __init__(
+            self,
+            pool,
+            stream,
+            handoff_storage,
+            *,
+            run_segments_while_capturing=False,
+        ):
+            assert run_segments_while_capturing is True
             given.append(handoff_storage)
             self.pool = pool or "pool"
             self.stream = SimpleNamespace(wait_stream=lambda _stream: None)

@@ -913,8 +913,14 @@ class PrefillGraph:
         forwards, and what they keep is left to the utilization headroom.
         """
         stream = decode_wrapper.stream if decode_wrapper is not None else None
+        # Execute each captured segment before eager breaks run so breaks read
+        # freshly computed outputs rather than stale self._pool blocks from an
+        # earlier bucket's capture.
         cap = BreakableCapture(
-            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
+            pool=self._pool,
+            stream=stream,
+            handoff_storage=self._handoff_storage,
+            run_segments_while_capturing=True,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -927,7 +933,7 @@ class PrefillGraph:
             output = self._land_output(CapturedForward(*self._run_inner(bucket)))
         if self._pool is None:
             self._pool = cap.pool  # share the pool across all subsequent buckets
-        cap.replay()  # capture records kernels without executing; smoke-test replay
+        cap.replay()  # capture leaves the trailing segment unexecuted; smoke-test replay
         return cap, output
 
     def _capture_encoder(
@@ -942,6 +948,7 @@ class PrefillGraph:
             pool=self._pool,
             stream=stream,
             handoff_storage=self._encoder_handoff_storage,
+            run_segments_while_capturing=True,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
@@ -971,7 +978,10 @@ class PrefillGraph:
         """
         stream = decode_wrapper.stream if decode_wrapper is not None else None
         cap = BreakableCapture(
-            pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
+            pool=self._pool,
+            stream=stream,
+            handoff_storage=self._handoff_storage,
+            run_segments_while_capturing=True,
         )
         cap.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(cap.stream):
