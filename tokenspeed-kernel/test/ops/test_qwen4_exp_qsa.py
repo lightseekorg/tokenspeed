@@ -21,7 +21,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any
 
 import pytest
 import tokenspeed_kernel.ops.attention.qsa as qsa_api
@@ -1668,35 +1667,12 @@ def test_qwen4_exp_qsa_selected_slots_matches_torch(device: str) -> None:
         [[2, 4, 0, 7], [9, 1, 6, 3]], device=device, dtype=torch.int32
     )
 
+    inputs = (selected_blocks, complete_blocks, logical, requests, page_table)
     actual = qwen4_exp_qsa_selected_slots(
-        selected_blocks,
-        complete_blocks,
-        logical,
-        requests,
-        page_table,
-        page_size,
-        ratio,
-        token_topk,
-        enable_pdl=False,
+        *inputs, page_size, ratio, token_topk, enable_pdl=False
     )
 
-    blocks = torch.where(
-        selected_blocks < complete_blocks.unsqueeze(1), selected_blocks, -1
-    )
-    offsets = torch.arange(ratio, device=device)
-    tokens = (blocks.unsqueeze(-1) * ratio + offsets).reshape(2, token_topk)
-    tokens = torch.where(blocks.repeat_interleave(ratio, dim=1) >= 0, tokens, -1)
-    suffix_offsets = torch.arange(ratio - 1, device=device)
-    suffix = complete_blocks.long().unsqueeze(1) * ratio + suffix_offsets
-    suffix = torch.where(suffix <= logical.unsqueeze(1), suffix, -1)
-    selected = torch.cat((tokens, suffix), dim=1)
-    valid = (selected >= 0) & (selected <= logical.unsqueeze(1))
-    safe = selected.clamp_min(0)
-    columns = safe // page_size
-    pages = page_table[requests.unsqueeze(1).expand_as(columns), columns].long()
-    expected = pages * page_size + safe % page_size
-    expected = torch.where(valid & (pages > 0), expected, -1).to(torch.int32)
-
+    expected = _reference_selected_slots(*inputs, page_size, ratio, token_topk)
     torch.testing.assert_close(actual, expected)
 
 
@@ -1711,7 +1687,8 @@ def _selected_slot_inputs(
     seed: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator(device=device).manual_seed(seed)
-    owners = torch.arange(requests, device=device).repeat_interleave(
+    # Block ids and request indices are int32, as the indexer passes them.
+    owners = torch.arange(requests, device=device, dtype=torch.int32).repeat_interleave(
         triton.cdiv(rows, requests)
     )[:rows]
     # Positions start below one compression group so early rows lack whole blocks.
@@ -1724,7 +1701,12 @@ def _selected_slot_inputs(
     complete[5::26] = 0
     # Rows of a wider tensor: a row stride past the block count, unit column stride.
     blocks = torch.randint(
-        -2, 1100, (rows, block_topk + 7), device=device, generator=generator
+        -2,
+        1100,
+        (rows, block_topk + 7),
+        device=device,
+        dtype=torch.int32,
+        generator=generator,
     )[:, :block_topk]
     pages = triton.cdiv(4096, page_size) + 1
     table = torch.randint(
@@ -1771,29 +1753,37 @@ def _reference_selected_slots(
     return torch.where(valid & (pages > 0), slots, -1).to(torch.int32)
 
 
-def _force_slot_layout(monkeypatch: pytest.MonkeyPatch, rows: bool) -> None:
-    monkeypatch.setattr(
-        qsa_ops, "_selected_slot_rows_win", lambda count, width, device: rows
-    )
+def _first_row_program_rows(token_topk: int, ratio: int, device: str) -> int | None:
+    """Fewest rows that expand with row programs, or None when the tile never does."""
+    dev = torch.device(device)
+    low, high = 1, 1 << 22
+    if not qsa_ops._selected_slot_rows_win(high, token_topk, ratio, dev):
+        return None
+    while low < high:
+        middle = (low + high) // 2
+        if qsa_ops._selected_slot_rows_win(middle, token_topk, ratio, dev):
+            high = middle
+        else:
+            low = middle + 1
+    return low
 
 
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize(
-    ("rows", "requests", "block_topk", "ratio", "token_topk", "page_size"),
+    ("requests", "block_topk", "ratio", "token_topk", "page_size"),
     [
-        (5, 2, 512, 4, 2048, 64),
-        (600, 3, 512, 4, 2048, 64),
-        (600, 3, 512, 4, 2048, 1),
-        (37, 1, 8, 4, 32, 8),
-        (37, 2, 8, 3, 23, 5),
-        (400, 4, 64, 4, 254, 16),
-        (300, 2, 2048, 4, 8192, 64),
-        (300, 2, 512, 1, 512, 64),
-        (300, 2, 512, 8, 4096, 64),
+        (2, 512, 4, 2048, 64),
+        (3, 512, 4, 2048, 1),
+        (1, 8, 4, 32, 8),
+        (2, 8, 3, 23, 5),
+        (4, 64, 4, 254, 16),
+        (2, 2048, 4, 8192, 64),
+        (2, 512, 1, 512, 64),
+        (2, 512, 8, 4096, 64),
+        (2, 2048, 8, 16384, 64),
     ],
 )
 def test_qwen4_exp_qsa_selected_slots_match_torch_in_both_layouts(
-    rows: int,
     requests: int,
     block_topk: int,
     ratio: int,
@@ -1801,75 +1791,52 @@ def test_qwen4_exp_qsa_selected_slots_match_torch_in_both_layouts(
     page_size: int,
     enable_pdl: bool,
     device: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Row programs and 256-column programs both write the reference slots."""
-    inputs = _selected_slot_inputs(
-        device,
-        rows=rows,
-        requests=requests,
-        block_topk=block_topk,
-        ratio=ratio,
-        page_size=page_size,
-        seed=rows + ratio + page_size,
-    )
-    expected = _reference_selected_slots(*inputs, page_size, ratio, token_topk)
-    for rows_layout in (True, False):
-        _force_slot_layout(monkeypatch, rows_layout)
+    """Below the switch and at it, column and row programs write the reference slots."""
+    first = _first_row_program_rows(token_topk, ratio, device)
+    for rows in (5, 600 if first is None else first):
+        inputs = _selected_slot_inputs(
+            device,
+            rows=rows,
+            requests=requests,
+            block_topk=block_topk,
+            ratio=ratio,
+            page_size=page_size,
+            seed=rows + ratio + page_size + 1000 * enable_pdl,
+        )
+        expected = _reference_selected_slots(*inputs, page_size, ratio, token_topk)
         actual = qwen4_exp_qsa_selected_slots(
             *inputs, page_size, ratio, token_topk, enable_pdl=enable_pdl
         )
-        assert torch.equal(actual, expected)
-    assert (expected >= 0).any() and (expected == -1).any()
+        assert torch.equal(actual, expected), rows
+        assert (expected >= 0).any() and (expected == -1).any()
 
 
-class _SlotGridRecorder:
-    def __init__(self, kernel: Any) -> None:
-        self.kernel = kernel
-        self.grids: list[tuple[int, ...]] = []
-
-    def __getitem__(self, grid: tuple[int, ...]) -> Any:
-        self.grids.append(tuple(grid))
-        return self.kernel[grid]
+def test_qwen4_exp_qsa_selected_slots_of_no_rows(device: str) -> None:
+    inputs = _selected_slot_inputs(
+        device, rows=0, requests=1, block_topk=512, ratio=4, page_size=64, seed=1
+    )
+    actual = qwen4_exp_qsa_selected_slots(*inputs, 64, 4, 2048, enable_pdl=False)
+    assert actual.shape == (0, 2051) and actual.dtype == torch.int32
 
 
 @pytest.mark.parametrize(
-    ("block_topk", "ratio", "token_topk"),
-    [(512, 4, 2048), (2048, 2, 4096), (512, 1, 512)],
+    ("ratio", "token_topk", "row_programs"),
+    [(4, 2048, True), (1, 512, True), (2, 4096, False), (4, 8192, False)],
 )
 def test_qwen4_exp_qsa_selected_slots_take_row_programs_after_column_waves(
-    block_topk: int,
-    ratio: int,
-    token_topk: int,
-    device: str,
-    monkeypatch: pytest.MonkeyPatch,
+    ratio: int, token_topk: int, row_programs: bool, device: str
 ) -> None:
-    rows_kernel = _SlotGridRecorder(qsa_ops._qwen4_exp_qsa_selected_slot_rows_kernel)
-    columns_kernel = _SlotGridRecorder(qsa_ops._qwen4_exp_qsa_selected_slots_kernel)
-    monkeypatch.setattr(
-        qsa_ops, "_qwen4_exp_qsa_selected_slot_rows_kernel", rows_kernel
-    )
-    monkeypatch.setattr(qsa_ops, "_qwen4_exp_qsa_selected_slots_kernel", columns_kernel)
+    """Row programs take over at four resident waves of column programs, for
+    row tiles up to the measured 2048 entries; wider tiles keep columns."""
     props = torch.cuda.get_device_properties(device)
     threads = qsa_ops._SELECTED_SLOT_COLUMN_WARPS * props.warp_size
     resident = props.max_threads_per_multi_processor // threads
     waves = qsa_ops._SELECTED_SLOT_ROW_PROGRAM_MIN_COLUMN_WAVES
     floor = waves * resident * props.multi_processor_count
-    per_row = triton.cdiv(token_topk + ratio - 1, 256)
-    first = triton.cdiv(floor, per_row)
-    for rows in (1, first - 1, first, 3 * first):
-        inputs = _selected_slot_inputs(
-            device,
-            rows=rows,
-            requests=2,
-            block_topk=block_topk,
-            ratio=ratio,
-            page_size=64,
-            seed=rows,
-        )
-        qwen4_exp_qsa_selected_slots(*inputs, 64, ratio, token_topk, enable_pdl=False)
-    assert columns_kernel.grids == [(1, per_row), (first - 1, per_row)]
-    assert rows_kernel.grids == [(first,), (3 * first,)]
+    first = triton.cdiv(floor, triton.cdiv(token_topk + ratio - 1, 256))
+    expected = first if row_programs else None
+    assert _first_row_program_rows(token_topk, ratio, device) == expected
 
 
 def test_qwen4_exp_qsa_selected_slots_warmup_covers_both_layouts(device: str) -> None:

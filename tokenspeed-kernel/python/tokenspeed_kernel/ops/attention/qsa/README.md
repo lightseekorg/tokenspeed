@@ -359,8 +359,12 @@ a whole row as a block-by-member tile instead: each block id is loaded once and
 a block's slots are stored together, with warps scaled to the tile. Alone on
 the GPU the row programs already win from about two waves, but at decode they
 share the SMs with work on other streams and lose there, so the switch keeps a
-two-fold margin. Each column's arithmetic is the same in both layouts, so the
-slots are identical across the switch. Startup warmup prepares both kernels.
+two-fold margin. The switch was measured with 2048-token top-k at ratio 4
+(width 2051), whose threshold sits above the 512 rows of an overlapped verify;
+row tiles wider than that one (2048 block-by-member entries) keep the column
+programs. Each column's arithmetic is the same in both layouts, so the slots
+are identical across the switch. Startup warmup compiles both kernels without
+launching the one it does not use.
 
 ## Materialized Triton scoring
 

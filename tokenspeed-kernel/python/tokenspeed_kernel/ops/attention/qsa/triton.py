@@ -1948,23 +1948,40 @@ register_kernel(
 )(triton_qsa_block_topk_select)
 
 
-# Warps of each 256-column selected-slot program.
+# Columns and warps of each column program.
+_SELECTED_SLOT_COLUMN_BLOCK = 256
 _SELECTED_SLOT_COLUMN_WARPS = 4
-# One program expands a whole row once the 256-column grid needs this many resident waves.
+# Row programs take over once the column grid needs this many resident waves.
 _SELECTED_SLOT_ROW_PROGRAM_MIN_COLUMN_WAVES = 4
+# Widest row tile measured (2048 tokens at ratio 4); wider tiles keep column programs.
+_SELECTED_SLOT_ROW_PROGRAM_MAX_TILE = 2048
 
 
 @functools.cache
 def _resident_column_programs(device_index: int) -> int:
     props = torch.cuda.get_device_properties(device_index)
     threads = _SELECTED_SLOT_COLUMN_WARPS * props.warp_size
-    per_sm = props.max_threads_per_multi_processor // threads
-    return props.multi_processor_count * per_sm
+    platform = current_platform()
+    return platform.sm_count * (platform.max_threads_per_sm // threads)
 
 
-def _selected_slot_rows_win(rows: int, width: int, device: torch.device) -> bool:
-    """Whether one program per row expands faster than 256-column programs."""
-    columns = rows * triton.cdiv(width, 256)
+def _selected_slot_row_tile(token_topk: int, compress_ratio: int) -> tuple[int, int]:
+    """A row program's ``(blocks, ratio)`` tile extents, each a power of two."""
+    return (
+        triton.next_power_of_2(triton.cdiv(token_topk, compress_ratio)),
+        triton.next_power_of_2(compress_ratio),
+    )
+
+
+def _selected_slot_rows_win(
+    rows: int, token_topk: int, compress_ratio: int, device: torch.device
+) -> bool:
+    """Whether to expand with one program per row instead of column programs."""
+    blocks, ratio_p2 = _selected_slot_row_tile(token_topk, compress_ratio)
+    if blocks * ratio_p2 > _SELECTED_SLOT_ROW_PROGRAM_MAX_TILE:
+        return False
+    width = token_topk + compress_ratio - 1
+    columns = rows * triton.cdiv(width, _SELECTED_SLOT_COLUMN_BLOCK)
     waves = _SELECTED_SLOT_ROW_PROGRAM_MIN_COLUMN_WAVES
     return columns >= waves * _resident_column_programs(device.index)
 
@@ -2148,14 +2165,17 @@ def qwen4_exp_qsa_selected_slots(
         raise ValueError("Qwen4-Exp QSA full page table must be rank two")
     if page_size <= 0:
         raise ValueError("Qwen4-Exp QSA full page size must be positive")
+    if token_topk <= 0 or compress_ratio <= 0:
+        raise ValueError(
+            "Qwen4-Exp QSA token top-k and compress ratio must be positive"
+        )
     width = token_topk + compress_ratio - 1
     # The kernel stores every column including the -1 invalid entries, so
     # the buffer starts uninitialized.
     output = torch.empty(
         (rows, width), dtype=torch.int32, device=selected_blocks.device
     )
-    blocks = triton.next_power_of_2(triton.cdiv(token_topk, compress_ratio))
-    ratio_p2 = triton.next_power_of_2(compress_ratio)
+    blocks, ratio_p2 = _selected_slot_row_tile(token_topk, compress_ratio)
     arguments = (
         selected_blocks,
         complete_blocks,
@@ -2168,43 +2188,49 @@ def qwen4_exp_qsa_selected_slots(
         output.stride(0),
     )
     pdl = {"launch_pdl": True} if enable_pdl else {}
-
-    def launch_rows() -> None:
-        _qwen4_exp_qsa_selected_slot_rows_kernel[(rows,)](
-            *arguments,
-            TOKEN_TOPK=token_topk,
-            COMPRESS_RATIO=compress_ratio,
-            RATIO_P2=ratio_p2,
-            PAGE_SIZE=page_size,
-            BLOCKS=blocks,
-            ENABLE_PDL=enable_pdl,
+    row_layout = (
+        _qwen4_exp_qsa_selected_slot_rows_kernel,
+        (rows,),
+        {
+            "TOKEN_TOPK": token_topk,
+            "COMPRESS_RATIO": compress_ratio,
+            "RATIO_P2": ratio_p2,
+            "PAGE_SIZE": page_size,
+            "BLOCKS": blocks,
+            "ENABLE_PDL": enable_pdl,
             # One warp per 1024 tile entries, between two and eight.
-            num_warps=min(max(blocks * ratio_p2 // 1024, 2), 8),
+            "num_warps": min(max(blocks * ratio_p2 // 1024, 2), 8),
             **pdl,
-        )
-
-    def launch_columns() -> None:
-        _qwen4_exp_qsa_selected_slots_kernel[(rows, triton.cdiv(width, 256))](
-            *arguments,
-            TOKEN_TOPK=token_topk,
-            COMPRESS_RATIO=compress_ratio,
-            PAGE_SIZE=page_size,
-            WIDTH=width,
-            BLOCK=256,
-            ENABLE_PDL=enable_pdl,
-            num_warps=_SELECTED_SLOT_COLUMN_WARPS,
+        },
+    )
+    column_layout = (
+        _qwen4_exp_qsa_selected_slots_kernel,
+        (rows, triton.cdiv(width, _SELECTED_SLOT_COLUMN_BLOCK)),
+        {
+            "TOKEN_TOPK": token_topk,
+            "COMPRESS_RATIO": compress_ratio,
+            "PAGE_SIZE": page_size,
+            "WIDTH": width,
+            "BLOCK": _SELECTED_SLOT_COLUMN_BLOCK,
+            "ENABLE_PDL": enable_pdl,
+            "num_warps": _SELECTED_SLOT_COLUMN_WARPS,
             **pdl,
-        )
-
+        },
+    )
     if rows:
-        use_rows = _selected_slot_rows_win(rows, width, selected_blocks.device)
-        launch, sibling = (
-            (launch_rows, launch_columns) if use_rows else (launch_columns, launch_rows)
+        use_rows = _selected_slot_rows_win(
+            rows, token_topk, compress_ratio, selected_blocks.device
         )
-        if is_warming_up():
-            # Startup prepares the other layout too; both write the same slots.
-            sibling()
-        launch()
+        layout, sibling = (
+            (row_layout, column_layout) if use_rows else (column_layout, row_layout)
+        )
+        row_tile_fits = blocks * ratio_p2 <= _SELECTED_SLOT_ROW_PROGRAM_MAX_TILE
+        if is_warming_up() and row_tile_fits:
+            # Startup compiles the other layout too, without launching it.
+            kernel, _, options = sibling
+            kernel.warmup(*arguments, **options, grid=(1,))._init_handles()
+        kernel, grid, options = layout
+        kernel[grid](*arguments, **options)
     return output
 
 

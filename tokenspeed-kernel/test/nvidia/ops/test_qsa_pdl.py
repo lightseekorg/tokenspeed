@@ -320,14 +320,25 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("rows_layout", [False, True])
 def test_qsa_selected_slots_wait_for_published_inputs(
-    enabled, rows_layout, restore_pdl, monkeypatch
+    enabled, rows_layout, restore_pdl
 ):
     """Both slot layouts must wait for an early-releasing producer of their inputs."""
-    monkeypatch.setattr(
-        qsa_ops, "_selected_slot_rows_win", lambda count, width, device: rows_layout
-    )
     torch.manual_seed(17)
-    rows, block_topk, ratio, page_size = 512, 512, 4, 64
+    block_topk, ratio, page_size = 512, 4, 64
+    # 512 rows take column programs; the first power of two past the switch takes rows.
+    rows = 512
+    if rows_layout:
+        rows = 1
+        while not qsa_ops._selected_slot_rows_win(
+            rows, block_topk * ratio, ratio, torch.device("cuda")
+        ):
+            rows *= 2
+    assert (
+        qsa_ops._selected_slot_rows_win(
+            rows, block_topk * ratio, ratio, torch.device("cuda")
+        )
+        == rows_layout
+    )
     logical = torch.randint(0, 4096, (rows,), device="cuda")
     complete = ((logical + 1) // ratio).to(torch.int32)
     blocks = torch.randint(
