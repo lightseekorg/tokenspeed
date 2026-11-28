@@ -884,6 +884,35 @@ def load_qwen4_exp_weights(
     return loaded
 
 
+def _refuse_live_weight_update(model: Qwen4ExpModel) -> None:
+    """Refuse a live weight update that captured decode would not see.
+
+    Raises before the first tensor is written when:
+
+    - The PLE table is stored in FP8: its scale is a host number that
+      decode graphs and the monokernel capture by value at capture time, so
+      a new checkpoint scale or an online re-quantization would leave them
+      dequantizing the new rows with the old scale.
+    - The backbone is packed for decode monokernels: packing copies weights
+      into the kernels' layouts (tiled BF16 projections, Gemma norm weights)
+      once, after loading, and a weight update does not rebuild them.
+    """
+    if any(
+        isinstance(module, PLELookup) and module.embed_store_dtype is not None
+        for module in model.modules()
+    ):
+        raise RuntimeError(
+            "Qwen4-Exp: live weight updates are not supported with an FP8 PLE "
+            "table: captured decode keeps the table scale from load time"
+        )
+    if model.monokernel_state is not None:
+        raise RuntimeError(
+            "Qwen4-Exp: live weight updates are not supported with "
+            "--decode-monokernel: its packed weight copies are made once, "
+            "after loading, and a weight update does not rebuild them"
+        )
+
+
 class Qwen4ExpForCausalLM(BaseCausalLM):
     """Text-only Qwen4-Exp entry class."""
 
@@ -913,6 +942,10 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
     def post_quant_warmup(self) -> None:
         _warmup_qwen4_kernels(self.model)
         enable_decode_monokernels(self.model)
+
+    def begin_weight_update(self) -> None:
+        _refuse_live_weight_update(self.model)
+        super().begin_weight_update()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -965,6 +998,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     def post_quant_warmup(self) -> None:
         _warmup_qwen4_kernels(self.model)
         enable_decode_monokernels(self.model)
+
+    def begin_weight_update(self) -> None:
+        _refuse_live_weight_update(self.model)
+        super().begin_weight_update()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

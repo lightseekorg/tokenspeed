@@ -36,6 +36,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.qwen4_exp_config import Qwen4ExpTextConfig  # noqa: E402
+from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
 from tokenspeed.runtime.execution.drafter.eagle import (  # noqa: E402
     AcceptedPrefixPublisher,
@@ -49,12 +50,15 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (  #
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig  # noqa: E402
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig  # noqa: E402
+from tokenspeed.runtime.layers.ple_lookup import PLELookup  # noqa: E402
 from tokenspeed.runtime.models.monokernel import (  # noqa: E402
     NoMonokernel,
     unserved_error,
 )
 from tokenspeed.runtime.models.qwen4_exp import (  # noqa: E402
     Qwen4ExpAttentionDecoderLayer,
+    Qwen4ExpForCausalLM,
+    Qwen4ExpForConditionalGeneration,
     Qwen4ExpLinearDecoderLayer,
     Qwen4ExpModel,
     Qwen4ExpMonokernelAttentionDecoderLayer,
@@ -285,6 +289,62 @@ def test_packing_fails_and_names_every_unserved_layer() -> None:
         "_Backbone", {0: [ATTENTION_TP], 2: [ATTENTION_TP, NOT_MXFP4]}
     )
     assert model.monokernel_state is None
+
+
+def _entry_owning(entry, backbone):
+    owner = entry.__new__(entry)
+    torch.nn.Module.__init__(owner)
+    owner.model = backbone
+    return owner
+
+
+@pytest.mark.parametrize(
+    "entry", [Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration]
+)
+def test_a_packed_model_refuses_live_weight_updates(entry) -> None:
+    """Packing copies weights into the kernels' layouts, which a weight
+    update would not rewrite: a packed model refuses to open the session. An
+    unpacked one opens it."""
+    owner = _entry_owning(entry, _Backbone([_PackingDelta(0), _PackingQSA(1)]))
+    owner.begin_weight_update()
+    owner.abort_weight_update()
+    enable_decode_monokernels(owner.model)
+    with pytest.raises(RuntimeError, match="--decode-monokernel"):
+        owner.begin_weight_update()
+    assert not owner._weight_update_active
+
+
+def _ple_lookup(storage_dtype):
+    return PLELookup(
+        Mapping(rank=0, world_size=1),
+        vocab_size=256,
+        ngram_heads=2,
+        head_dim=3,
+        storage_dtype=storage_dtype,
+        output_dtype=torch.bfloat16,
+        offload=False,
+        table_layout="global_sharded",
+        enable_hot_cache=False,
+        prefix="",
+    )
+
+
+@pytest.mark.parametrize(
+    "entry", [Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration]
+)
+def test_an_fp8_ple_table_refuses_live_weight_updates(entry) -> None:
+    """Captured decode keeps an FP8 table's scale from load time, so a model
+    with one refuses to open the session; a table in the output dtype opens
+    it."""
+    backbone = _Backbone([_PackingDelta(0)])
+    backbone.ple = _ple_lookup(None)
+    owner = _entry_owning(entry, backbone)
+    owner.begin_weight_update()
+    owner.abort_weight_update()
+    backbone.ple = _ple_lookup(torch.float8_e4m3fn)
+    with pytest.raises(RuntimeError, match="FP8 PLE table"):
+        owner.begin_weight_update()
+    assert not owner._weight_update_active
 
 
 def test_a_monokernel_layer_runs_other_forwards_with_its_regular_code() -> None:

@@ -1448,6 +1448,8 @@ object:
   format: checkpoints that ship it in FP8,
   such as `Qwen/Qwen3.8-Flash-Next-FP8` and `nvidia/Qwen3.8-Flash-Next-NVFP4`,
   keep it in FP8, and other checkpoints store it in the model's compute dtype.
+  Live weight updates are refused with an FP8 table: captured decode keeps
+  the table scale from load time.
 - `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
   or GPU memory when `false`. When omitted, TokenSpeed enables offloading on
   NVIDIA CUDA and disables it on other platforms.
