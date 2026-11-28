@@ -140,12 +140,16 @@ strides. CUDA keeps one launch. The start row is a runtime argument.
 The common `prepare_prefill_state_inputs` and `store_state_rows` entry points
 use Triton on Ascend as well as CUDA. They honor strided convolution and
 recurrent arena views, preserve shared input snapshots, and mask fresh
-recurrent rows to zero without reading the null page. Stores accept padded
-negative destinations and require contiguous integer destination indices.
+recurrent rows to zero without reading the null page. Stores require
+contiguous integer destination indices and write only destinations in
+`(0, num_blocks)`, where `num_blocks` is the slab's block count: the null
+page `0`, negative padding such as `-1`, and ids at or past `num_blocks` skip
+the row without touching any slab memory.
 Model plugins use these common operations through the state backend.
 
 State scatter tiles each request independently and specializes the fixed state
-shape and inner strides; changing the request count does not recompile it.
+shape and inner strides; changing the request count or the slab's block count
+does not recompile it.
 
 Prefill source/destination index slices are runtime metadata. Both gather and
 scatter kernels ignore their pointer alignment when choosing a specialization,
@@ -158,3 +162,38 @@ so moving a slice within a request-index buffer does not compile another kernel.
 a slot resolves to its page at the field's page stride, then its row at the
 row stride. K and V keep separate pointers and strides so sibling fields
 and padding remain untouched.
+
+## Ascend NPU Host cache transfers
+
+`host_transfer.transfer_cache_blocks` supports compact Host L2 and retraction
+snapshot transfers on Ascend NPU without mapped-Host zero-copy kernels:
+
+* Under `backend="auto"` (`--kvstore-io-backend kernel`, the default), NPU
+  selects `HostTransferMode("staged_dma", layer_ready=False)`. For each active
+  cache group in `(geometry_offset, num_geometry_rows)`, `HostTransferGeometry`
+  merges contiguous Host field intervals into minimal disjoint spans once per
+  slice. On D2H, `stage_cache_blocks` gathers a chunk of scattered Device
+  fields into a bounded HBM `StagingBuffer` (default 32 MiB per stream via
+  `TOKENSPEED_NPU_HOST_STAGING_BYTES`, grown only if a single block exceeds
+  that floor) in the exact compact Host block layout, then submits one batched
+  SDMA copy (`aclrtMemcpyBatchAsync` via `libascendcl.so`, chunked to 4096
+  entries with `aclrtMemcpyAsync` fallback when the batch symbol is absent).
+  H2D reverses the order per chunk.
+* Under `backend="dma"` (`--kvstore-io-backend direct`), NPU submits expanded
+  ranges directly through `ascend_memcpy_batch_async` instead of per-range
+  PyTorch tensor slicing, using zero AI Cores.
+* `stage_cache_blocks` keeps slice bounds, group ids, chunk offsets, block
+  counts, and block strides as runtime `do_not_specialize` arguments with
+  64-bit scalar base offsets plus 32-bit in-tile lanes and a bounded program
+  grid (`TOKENSPEED_NPU_HOST_CACHE_GRID_CAP`, default 32). Only `DIRECTION`,
+  `USE_WORDS`, and `BLOCK_SIZE` (16 KiB for 4-byte aligned word copies, 4 KiB
+  for the unaligned byte fallback) are compile-time constants; alignment is
+  resolved on the host per geometry slice so the hot path has no inner-loop
+  alignment branch and varying batch sizes, layer slices, or cache recipes do
+  not trigger recompilation after startup warmup.
+* In `HostCacheExecutor`, one `StagingBuffer` is shared per transfer stream
+  (`write_stream` and `load_stream`) and allocated inside
+  `memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False)` so
+  colocated RL `pause("kv_cache")` releases staging HBM without CPU backup,
+  while static geometry and block-ID metadata remain in
+  `named_region("cache_transfer")`.

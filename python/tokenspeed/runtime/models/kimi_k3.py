@@ -5672,6 +5672,9 @@ class KimiLinearForCausalLM(BaseCausalLM):
         if self.model.peer_weights is not None:
             self.model.peer_weights.close()
 
+    def peer_weights_controller(self) -> MoEPeerWeights | None:
+        return self.model.peer_weights
+
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         shared_mlps = [
             layer.block_sparse_moe.shared_experts
@@ -6537,6 +6540,11 @@ class KimiK3ForConditionalGeneration(nn.Module):
     def close_peer_weights(self) -> None:
         if self.language_model is not None:
             self.language_model.close_peer_weights()
+
+    def peer_weights_controller(self) -> MoEPeerWeights | None:
+        if self.language_model is None:
+            return None
+        return self.language_model.peer_weights_controller()
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         if self.language_model is None:

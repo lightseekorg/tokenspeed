@@ -2890,6 +2890,123 @@ TEST_F(L3KvEventsSuite, AnL3ReadOfAPrefixNeverPublishedHereIsNotAnEvent) {
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
 
+// End-to-end L3 shared-prefix publication with a sliding-window + sink group:
+// WriteThrough streams page 0's sink block alongside window blocks into Host
+// and queues all of them for L3 StoragePutOperation; GetSharedPrefixPublication
+// stays "pending" until the sink block itself succeeds, then reports "published".
+class L3SwaWithSinkPublicationSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.prefix_granularity = 4;
+        cfg.max_scheduled_tokens = 64;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        CacheGroupConfig full;
+        full.group_id = "full";
+        full.block_granularity = 4;
+        full.total_pages = 32;
+        full.attn_kind = AttnKind::kFull;
+        full.cache_blocks_per_lcm_block = 1;
+
+        CacheGroupConfig swa_sink;
+        swa_sink.group_id = "swa_sink";
+        swa_sink.block_granularity = 2;
+        swa_sink.total_pages = 32;
+        swa_sink.attn_kind = AttnKind::kSlidingWindow;
+        swa_sink.sliding_window_tokens = 4;
+        swa_sink.sink_tokens = 2;
+        swa_sink.cache_blocks_per_lcm_block = 2;
+
+        cfg.cache_groups = {full, swa_sink};
+        cfg.host_allocator.total_pages = 32;
+        cfg.enable_l3_storage = true;
+        cfg.storage_config = StorageConfig{
+            16, 32, 31, 64, 32, 4, 100, 100, StoragePressure{16, 1048576, 1000}, StoragePressure{8, 524288, 500}};
+        return cfg;
+    }
+
+    static std::vector<StoragePutOperation> ExtractPuts(const ExecutionPlan& plan) {
+        std::vector<StoragePutOperation> puts;
+        for (const auto& op : plan.Operations()) {
+            if (const auto* cache = std::get_if<CacheOperation>(&op)) {
+                if (const auto* storage = std::get_if<StorageOperation>(cache)) {
+                    if (const auto* put = std::get_if<StoragePutOperation>(storage)) puts.push_back(*put);
+                }
+            }
+        }
+        return puts;
+    }
+};
+
+TEST_F(L3SwaWithSinkPublicationSuite, WriteThroughPublishesSinkBlockAndGatesSharedPrefixPublication) {
+    // 13-token prompt = 3 complete prefix pages (12 prefix tokens + 1 replay
+    // token; 6 SWA blocks: sink block 0 at page 0, middle blocks 1..3,
+    // sliding-window blocks 4..5 at page 2).
+    const std::vector<std::int32_t> tokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+    const std::vector<std::string> hashes = scheduler_->PrefixHashesForTokens(tokens);
+    ASSERT_EQ(hashes.size(), 3u);
+    const CacheKey sink_key{.group_id = 1, .content_hash = ContentHash{hashes[0]}, .page_offset = 0};
+
+    ExecutionEvent tick;
+    tick.With(cache::StorageTick{1, /*allow_forward=*/true, /*allow_storage=*/true, StoragePressure{0, 0, 0}});
+    scheduler_->Advance(std::move(tick));
+
+    // Request 1 prefills the 12-token prompt; allow_storage=true first issues
+    // an L3 query (all miss), then admits, prefills, and writes through to Host.
+    Submit(RequestSpec{.request_id = "r1", .tokens = tokens});
+    const ExecutionPlan qplan = PlanOnce();
+    const auto qops = ExtractCacheOpsOfKind<StorageOperation>(qplan);
+    ASSERT_EQ(qops.size(), 1u);
+    const auto& query = std::get<StorageQueryOperation>(std::get<StorageOperation>(qops.front()));
+    ExecutionEvent qdone;
+    qdone.With(cache::StorageDone{query.op_id, std::vector<std::uint8_t>(query.keys.size(), 0), true,
+                                  std::vector<std::uint8_t>(query.keys.size(), 0)});
+    scheduler_->Advance(std::move(qdone));
+
+    const ExecutionPlan p1 = PlanOnce();
+    ASSERT_NE(FindForwardBatch(p1), nullptr);
+    SendForwardDone("r1", {99});
+    const ExecutionPlan p2 = PlanOnce();
+    AckWriteBacks(p2);
+
+    // WriteBackDone queued every Host-published key (including SWA sink block 0)
+    // as L3 backups; the next plan emits StoragePutOperation carrying sink_key.
+    const ExecutionPlan put_plan = PlanOnce();
+    const auto puts = ExtractPuts(put_plan);
+    ASSERT_EQ(puts.size(), 1u);
+    const auto& put = puts.front();
+    const auto sink_it = std::ranges::find(put.keys, sink_key);
+    ASSERT_NE(sink_it, put.keys.end()) << "L3 write-through backup must include the SWA sink block";
+    const auto sink_idx = static_cast<std::size_t>(sink_it - put.keys.begin());
+
+    // Fail ONLY the sink key in the first PUT: every Full block and SWA window
+    // block is published, yet GetSharedPrefixPublication must stay "pending".
+    std::vector<std::uint8_t> partial_ok(put.keys.size(), 1);
+    partial_ok[sink_idx] = 0;
+    ExecutionEvent put_partial_done;
+    put_partial_done.With(
+        cache::StorageDone{put.op_id, partial_ok, /*retired=*/true, std::vector<std::uint8_t>(put.keys.size(), 0)});
+    scheduler_->Advance(std::move(put_partial_done));
+    const auto before_sink = scheduler_->GetSharedPrefixPublication(tokens, 12);
+    EXPECT_EQ(before_sink.status, "pending");
+    EXPECT_EQ(before_sink.confirmed_prefix_tokens, 0);
+
+    // Re-queue and succeed the sink key: GetSharedPrefixPublication now flips
+    // to "published" with all 12 prefix tokens confirmed.
+    SchedulerTestAccess::Storage(*scheduler_).QueueBackups(std::span{&sink_key, 1});
+    const ExecutionPlan put_sink_plan = PlanOnce();
+    const auto sink_puts = ExtractPuts(put_sink_plan);
+    ASSERT_EQ(sink_puts.size(), 1u);
+    ASSERT_EQ(sink_puts.front().keys, std::vector<CacheKey>{sink_key});
+    ExecutionEvent put_sink_done;
+    put_sink_done.With(cache::StorageDone{sink_puts.front().op_id, {1}, /*retired=*/true, {0}});
+    scheduler_->Advance(std::move(put_sink_done));
+
+    const auto after_sink = scheduler_->GetSharedPrefixPublication(tokens, 12);
+    EXPECT_EQ(after_sink.status, "published");
+    EXPECT_EQ(after_sink.confirmed_prefix_tokens, 12);
+}
+
 // The session a request names is registered at its first admission for as
 // long as the request lives, so everything it publishes carries it: the
 // prompt pages its first decode publishes and the tail its finish publishes.

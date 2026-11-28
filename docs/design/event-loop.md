@@ -110,25 +110,24 @@ The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
 
-The native frontend's `abort(rid)` only sends the ordinary wire abort. A
-client abort suppresses terminal output in the engine, so callers must not
-wait for a final chunk as its acknowledgment. `EngineClient::cancel` (Python
-`Frontend.cancel`) sends that same abort and then detaches the local stream.
-The stream yields `StreamError::Cancelled`, exposed by `next_outputs` as a
-`(rid, RequestCancelled)` exception value, after any already queued outputs.
-It creates no finish chunk or token/finish metrics. Only that stream and the
-client's in-flight count change; engine-reported load and slot, cache and
-transfer retirement keep their existing owners and fences.
+The native frontend's `abort(rid)` and `cancel(rid)` send the ordinary wire
+abort. After a successful send, the frontend detaches the original local
+stream if it is still attached and releases its in-flight count. After any
+queued outputs, `abort` delivers an empty token chunk with `finish_reason`
+set to `"abort"` and the latest reported token counts and verify rounds.
+Before the first output, it uses the submitted input ID count for prompt
+usage. `cancel` delivers `StreamError::Cancelled`, exposed by Python's
+`next_outputs` as a `(rid, RequestCancelled)` exception value. The engine owns
+its own load reports and releases slots, cache, and transfer resources at
+retirement.
 
-Cancellation returns `true` only when it closes the local stream. If a finish,
-stream error or another cancellation wins, its result is preserved and
-cancellation returns `false`. A failed send or a dropped cancellation future
-does not detach the stream: the caller can retry, even if the engine already
-received the abort. Stream drop and send cleanup compare the original local
-admission's channel before removing an entry. This protects a later local
-owner, but adds no wire identity: new submissions must use fresh request ids
-to avoid delayed output or abort messages reaching a reused id. Local closure
-is never evidence that engine resources are free.
+`abort` returns `true` when it sends the wire abort. `cancel` returns `true`
+when it detaches the local stream. A finish, stream error or another
+cancellation that wins the race keeps its result. A failed send or a dropped
+cancellation future leaves any still-active stream attached for retry, even
+if the engine already received the abort. Stream drop and send cleanup compare
+the original local admission's channel before removing an entry. Fresh request
+ids keep delayed wire output or abort messages from reaching a later request.
 
 On disaggregated engines, `bootstrap_room` carries the same one-active-request
 rule across distinct request IDs. Peer state is keyed by room, so every new
@@ -1872,3 +1871,40 @@ remaining replay ahead of later plans. The control plane tracks retirement
 fences separately from scheduler cache operations. Peer export, cache clear
 and drain wait for replica completion, including releases queued after the
 last forward's results.
+
+### Sharded peer lookups during a forward
+
+A registered TP8/KVP8 replica has a private CPU mesh for peer progress. While the
+control thread waits in forward execution, completion, or attention-DP agreement,
+it can lend the scheduler to the peer worker when device copies are clear. Each
+member reports its scheduler round, wait site and forward sequence on that mesh.
+Only a matching window on every member permits a protocol step. The ordinary
+replica round also advances the same state machine and delivers its events to
+all eight schedulers. During protocol advancement, both paths take the local
+scheduler, protocol control and read-state locks in that order. A worker round
+forwards request attribution even when it has no scheduler events or landings.
+Device submission still requires the local plan fence.
+The reader publishes a landing only after member retirement and holder closure.
+
+Rank zero timestamps lookup dispatch and receipt on its monotonic clock. The
+receipt must precede the deadline, even if admission happens several rounds
+later. The protocol delivers an explicit miss for unanswered and suppressed
+lookups. This keeps the scheduler from expiring a request while a timely reply
+awaits replica agreement.
+
+For a timely offer, the reader leader prices the source pages needed beyond
+its local prefix. The decision travels with the offer in the replica report
+before HBM reservation. Estimates distinguish holder width, node locality and
+each combination of Device, Host and Disk source tiers. Reservation binds the
+feedback bucket to the source pages paired with the actual destination slots.
+The leader records one sample when the request lands or falls back. The sample
+runs from PIN through group read retirement, or through fallback if retirement
+is still unknown. A late close or retirement cannot charge the request again.
+
+The scheduler retains the original offer with a waiting request. At admission
+the reader can reconstruct an expired attempt from that checkpoint. If the
+holder's unpinned offer has expired, its reply permits one fresh lookup of the
+same prefix in the same generation. Only a newer offer with exactly the original
+boundary, prefix and page manifest can be pinned. All holder members revalidate
+their own pages while acquiring references. A partial PIN aborts the group and
+releases acquired references. A live offer takes the original direct PIN path.

@@ -191,7 +191,7 @@ class PeerGeometry:
     into them, and the memory the transfer engine registers for that."""
 
     device: tuple[PeerDeviceField, ...]
-    host: PeerHostPool
+    host: PeerHostPool | None
     regions: tuple[tuple[int, int], ...]
     transfer_contract: bytes = b""
     semantic_id: bytes = b""
@@ -227,52 +227,69 @@ def build_peer_geometry(
     groups: Sequence[CacheGroupLayout],
     field_addresses: Mapping[str, int],
     device_regions: Sequence[tuple[int, int]],
-    host_storage: HostCacheStorage,
+    host_storage: HostCacheStorage | None,
     host_region_planner: PeerHostRegionPlanner | None = None,
     transfer_contract: bytes = b"",
     semantic_id: bytes = b"",
     host_virtual_bounds: tuple[int, ...] = (),
 ) -> PeerGeometry:
-    """This rank's geometry: the fields the Host tier stores (the target's
-    and the draft's), at their Device addresses and their offsets in the
-    Host pool.
+    """Register the target and draft Device fields and any local Host pool.
 
     Args:
         scheduler_group_ids: The cache groups in the scheduler's order, whose
             index the scheduler names a group by.
-        groups: The Host tier's layout groups (``HostCacheResources.groups``).
+        groups: Device transfer layout groups in scheduler order.
         field_addresses: Each field's Device page 0, by field id
             (``CacheArena.field_address``).
         device_regions: The Device ranges the cache lives in
             (``CacheArena.registration_regions``).
-        host_storage: The Host pool.
-        host_region_planner: Optional device plugin supplying consecutive region sizes.
+        host_storage: The Host L2 pool, or None for a Device-only holder.
+        host_region_planner: Optional planner for registering a local Host pool.
+        host_virtual_bounds: Exclusive Host page bounds in scheduler group order.
+            A Device-only holder takes empty bounds and publishes 1 for each
+            group because page 0 is reserved.
 
     Returns:
-        The geometry, registering the Device ranges and the Host pool.
+        The Device geometry and registered ranges, including Host L2 when present.
     """
-    # The scheduler names a group by its index; the Host lists every group,
-    # in the same order.
-    if tuple(host_storage.group_ids) != tuple(scheduler_group_ids):
+    group_ids = tuple(group.group_id for group in groups)
+    if group_ids != tuple(scheduler_group_ids):
         raise ValueError(
-            "peer sharing needs every cache group in the Host layout, in the "
-            f"scheduler's order: {host_storage.group_ids} != "
-            f"{tuple(scheduler_group_ids)}"
+            f"peer Device groups must follow the scheduler's order: "
+            f"{group_ids} != {tuple(scheduler_group_ids)}"
         )
-    device = []
+    device = tuple(
+        PeerDeviceField(
+            group=index,
+            field_id=field.field_id,
+            address=int(field_addresses[field.field_id]),
+            page_stride=int(field.block_stride_bytes),
+            bytes=int(field.payload_bytes),
+        )
+        for index, group in enumerate(groups)
+        for field in group.fields
+    )
+    regions = tuple((int(address), int(length)) for address, length in device_regions)
+    if host_storage is None:
+        if host_virtual_bounds or host_region_planner is not None:
+            raise ValueError("Host page bounds and region planning require a Host pool")
+        # Page 0 is reserved. An exclusive bound of 1 admits no Host page.
+        return PeerGeometry(
+            device=device,
+            host=None,
+            regions=regions,
+            transfer_contract=transfer_contract,
+            semantic_id=semantic_id,
+            host_virtual_bounds=(1,) * len(groups),
+        )
+    if tuple(host_storage.group_ids) != group_ids:
+        raise ValueError(
+            f"peer Host groups must follow the scheduler's order: "
+            f"{tuple(host_storage.group_ids)} != {group_ids}"
+        )
     host_groups = []
     for index, group in enumerate(groups):
         offsets = host_storage.host_field_offsets[index]
-        for field in group.fields:
-            device.append(
-                PeerDeviceField(
-                    group=index,
-                    field_id=field.field_id,
-                    address=int(field_addresses[field.field_id]),
-                    page_stride=int(field.block_stride_bytes),
-                    bytes=int(field.payload_bytes),
-                )
-            )
         host_groups.append(
             PeerHostGroup(
                 parent_bytes=int(host_storage.host_lcm_block_bytes),
@@ -293,15 +310,12 @@ def build_peer_geometry(
         host_region_planner,
     )
     return PeerGeometry(
-        device=tuple(device),
+        device=device,
         host=PeerHostPool(address=host_address, groups=tuple(host_groups)),
         transfer_contract=transfer_contract,
         semantic_id=semantic_id,
         host_virtual_bounds=host_virtual_bounds,
-        regions=(
-            *((int(address), int(length)) for address, length in device_regions),
-            *host_regions,
-        ),
+        regions=regions + host_regions,
     )
 
 
@@ -360,6 +374,8 @@ def peer_semantic_id(
     revision: str | None,
     weight_version: str | None,
     state_abi: dict | None,
+    *,
+    paired_weights: bool = False,
 ) -> bytes:
     """Identify the model generation and the recipe's cross-layout state encoding."""
     revision = (revision or "").lower()
@@ -376,6 +392,11 @@ def peer_semantic_id(
         "weight_version": version,
         "state_abi": state_abi,
     }
+    if paired_weights:
+        # A pinned target revision alone says nothing about the draft weights.
+        if not version:
+            return b""
+        identity["paired_weights"] = True
     payload = json.dumps(
         identity, sort_keys=True, separators=(",", ":"), allow_nan=False
     )

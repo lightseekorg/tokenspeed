@@ -37,10 +37,12 @@
 #include <span>
 #include <string>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 #include "cache/cache_group.h"
 #include "cache/coordinator/admission_types.h"
+#include "cache/coordinator/eviction_policy.h"
 #include "cache/coordinator/group_geometry.h"
 #include "cache/core/active_parents.h"
 #include "cache/core/block_pool.h"
@@ -93,9 +95,57 @@ public:
                BlockPool* disk_pool, BlockPool* snapshot_pool, bool write_back_evictions,
                std::int32_t checkpoint_retention_leaf_distance);
     CacheStore(const CacheStore&) = delete;
+    ~CacheStore() { ClearGroups(); }
     CacheStore& operator=(const CacheStore&) = delete;
     CacheStore(CacheStore&&) = delete;
     CacheStore& operator=(CacheStore&&) = delete;
+
+    void ConfigureEviction(PrefixCacheEvictionConfig config) {
+        _assert(checkpoints_.Size() == 0, "configure eviction before publishing checkpoints");
+        config.Validate();
+        if (config.policy == PrefixCacheEvictionConfig::Policy::kGds &&
+            (disk_pool_ ? config.disk_block_costs.size() != groups_.size() : !config.disk_block_costs.empty()))
+            throw std::invalid_argument("GDS with Disk requires one explicit read cost per cache group");
+        _assert(config.policy != PrefixCacheEvictionConfig::Policy::kGds || NumStateGroups() > 0,
+                "GDS requires at least one State cache group");
+        eviction_config_ = std::move(config);
+        checkpoints_.SetGdsEnabled(UsesGds());
+        checkpoints_.SetRecoveryIndex(UsesGds() ? &recovery_index_ : nullptr);
+    }
+    GdsEvictionStats GdsStats() const {
+        auto stats = gds_stats_;
+        stats.watermark = checkpoints_.Watermark();
+        stats.host_watermark = checkpoints_.HostWatermark();
+        const auto dependencies = recovery_index_.GetStats();
+        stats.ready_units = dependencies.ready;
+        stats.device_ready_units = dependencies.device_ready;
+        stats.pending_units = dependencies.pending;
+        stats.disk_recoverable_units = dependencies.disk_recoverable;
+        stats.disk_route_losses = dependencies.disk_route_losses;
+        stats.broken_units = dependencies.broken;
+        stats.dependency_points = dependencies.points;
+        stats.dependency_ranges = dependencies.ranges;
+        stats.dependency_leaves = dependencies.leaves;
+        return stats;
+    }
+    void CommitGdsStats(const GdsEvictionStats& stats) { gds_stats_.Add(stats); }
+    std::vector<CacheReleaseStats> ReleaseStats() const {
+        std::vector<CacheReleaseStats> result;
+        for (std::size_t group = 0; group < Groups().size(); ++group) {
+            const auto id = static_cast<std::uint32_t>(group);
+            for (const auto tier : {CacheTier::kDevice, CacheTier::kHost}) {
+                const auto* pool = tier == CacheTier::kDevice ? &DevicePool() : HostPool();
+                if (!pool) continue;
+                const auto counts = pool->Released(id);
+                result.push_back({id, tier, counts.child_slots, counts.parents});
+            }
+        }
+        return result;
+    }
+    const PrefixCacheEvictionConfig& EvictionConfig() const { return eviction_config_; }
+    bool WritesBackEvictions() const { return write_back_evictions_; }
+    bool UsesGds() const { return eviction_config_.policy == PrefixCacheEvictionConfig::Policy::kGds; }
+    const RecoveryIndex& RecoveryDependencies() const { return recovery_index_; }
 
     std::vector<CacheGroup>& Groups() { return groups_; }
     const std::vector<CacheGroup>& Groups() const { return groups_; }
@@ -281,9 +331,20 @@ public:
     const CacheMutationSink& MutationSink() const { return mutation_sink_; }
     void SetMutationSink(CacheMutationSink sink);
 
+    // Recorded write-back identities, maintained by PendingHostStore. They
+    // protect a pending recovery route but are never readable Host hits.
+    const std::unordered_set<CacheKey, CacheKeyHash>& PendingHostKeys() const { return pending_host_keys_; }
+
+    bool HasReservedHostKey(const CacheKey& key) const { return reserved_host_keys_.contains(key); }
+
     // Drops every group, and with them the index entries holding the trees'
     // nodes, while whoever their entries point at still exists.
-    void ClearGroups() { groups_.clear(); }
+    void ClearGroups() {
+        // Stop dependency observers before destroying matchers/geometry that
+        // their callbacks read. Entry RAII still releases residency afterward.
+        checkpoints_.Clear();
+        groups_.clear();
+    }
 
 private:
     // Derived once from the group specs; publication never changes this geometry.
@@ -322,6 +383,12 @@ private:
     // its page's chain hash below the full pages, the tail hash from there on.
     CacheKey historyBlockKey(std::size_t group_index, const CompletedPages& completed, std::int32_t block) const;
 
+    friend class CacheEvictor;
+    std::unordered_set<CacheKey, CacheKeyHash> pending_host_keys_;
+    std::unordered_map<CacheKey, std::size_t, CacheKeyHash> reserved_host_keys_;
+    GdsEvictionStats gds_stats_;
+    bool write_back_evictions_;
+    PrefixCacheEvictionConfig eviction_config_{PrefixCacheEvictionConfig::Lru()};
     BlockPool& pool_;
     BlockPool* const host_pool_;
     BlockPool* const disk_pool_;
@@ -329,6 +396,7 @@ private:
     const std::int32_t prefix_granularity_;
     // Built before the groups and dropped after them: their index entries
     // hold the trees' nodes.
+    RecoveryIndex recovery_index_;
     CheckpointTree checkpoints_;
     BoundaryTree boundary_tree_;
     std::vector<CacheGroup> groups_;

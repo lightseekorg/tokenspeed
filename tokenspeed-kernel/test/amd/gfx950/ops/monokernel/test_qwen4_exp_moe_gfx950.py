@@ -106,7 +106,7 @@ def _routing_kernel(scratch, step, experts_out, weights_out, PLAN: gl.constexpr)
     gl.store(weights_out + r * 16 + k, weights, mask=r < R)
 
 
-@pytest.mark.parametrize("rows", [1, 2, 3, 4])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 8])
 def test_routing_picks_top_experts(rows):
     """Every row's top 10 experts in rank order (ties: the lower expert) and
     their renormalized softmax weights, from BF16 logits that include

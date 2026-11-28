@@ -275,6 +275,9 @@ def _disk_scheduler():
     Host tier and a Disk tier."""
     scheduler = ts.Scheduler(
         make_config(
+            prefix_cache_evict_policy="lru",
+            prefix_cache_gds_prefill_cost=None,
+            prefix_cache_gds_disk_block_costs=(),
             num_device_pages=9,
             max_scheduled_tokens=64,
             max_batch_size=8,

@@ -105,6 +105,17 @@ public:
     // tree and at the evictor, so the coordinator stays where it was built,
     // and its destructor drops them before those members go.
     ~CacheCoordinator();
+    bool UsesGds() const { return store_.UsesGds(); }
+    std::size_t NumStateGroups() const { return store_.NumStateGroups(); }
+    void ConfigureEviction(PrefixCacheEvictionConfig config) { store_.ConfigureEviction(std::move(config)); }
+    struct RecoveryMetadata {
+        BoundaryTree::Hold boundary;
+        CheckpointTree::MetadataHold checkpoint;
+    };
+    RecoveryMetadata TrackRecoveryMetadata(const PromptPrefix& prompt, std::int32_t boundary_tokens);
+    GdsEvictionStats GdsStats() const { return store_.GdsStats(); }
+    std::vector<CacheReleaseStats> ReleaseStats() const { return store_.ReleaseStats(); }
+    double GdsWatermark() const { return store_.Checkpoints().Watermark(); }
     CacheCoordinator(const CacheCoordinator&) = delete;
     CacheCoordinator& operator=(const CacheCoordinator&) = delete;
     CacheCoordinator(CacheCoordinator&&) = delete;
@@ -501,7 +512,15 @@ public:
     // transfer holds or one demoted there already. A later hit, touch or
     // republication dates an entry forward again and ends its demotion.
     // Returns the entries demoted.
-    std::int32_t DemoteEntries(std::span<const CacheKey> keys);
+    enum class DemotionCause { kPeerHandoff, kSupersededCheckpoint };
+    struct DemotionEvent {
+        CacheKey key;
+        CacheTier tier;
+        CacheBlockLocation location;
+        DemotionCause cause;
+    };
+    std::vector<DemotionEvent> DemoteEntriesWithEvents(std::span<const CacheKey> keys, DemotionCause cause);
+    std::int32_t DemoteEntries(std::span<const CacheKey> keys, DemotionCause cause);
     // The newest access epoch any acquisition or publication of a State
     // checkpoint under `hash` carried, on either tier, while either tier
     // holds the boundary; 0 when neither does.
@@ -558,6 +577,10 @@ public:
     // each from whichever tier holds it (false for a model without State
     // groups).
     bool HoldsStateCheckpoint(const ContentHash& content_hash) const;
+    // Whether any non-replayable SWA block required at `boundary` resides on
+    // Disk without a Device or Host copy (e.g. partial Host eviction of a
+    // multi-block DFLASH SWA boundary).
+    bool HasDiskOnlySwaEntry(const CacheKey& boundary, std::int32_t tail_tokens) const;
 
     const CheckpointTree& Checkpoints() const { return store_.Checkpoints(); }
 

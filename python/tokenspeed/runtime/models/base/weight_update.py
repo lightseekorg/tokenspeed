@@ -36,13 +36,52 @@ take no hooks in partial mode and are rejected when completeness is required.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 
 import torch.distributed as dist
 from torch import nn
 
+from tokenspeed.runtime.layers.moe.peer_weights import (
+    MoEPeerWeights,
+    peer_weights_controller_for,
+)
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+
+
+def _agree_group_errors(
+    cpu_group: dist.ProcessGroup | None,
+    local_error: BaseException | None,
+    phase: str,
+) -> None:
+    """Agree on local versus peer errors across ``cpu_group`` at ``phase``.
+
+    Every rank joins ``dist.all_gather_object`` even when ``local_error`` is
+    set so healthy peers do not hang in the collective. If ``local_error`` is
+    set, it is re-raised after the gather; otherwise any peer failure raises a
+    ``RuntimeError`` naming ``phase`` and the failing ranks so the caller can
+    abort any opened weight-update sessions.
+    """
+    if cpu_group is not None:
+        errors: list[str | None] = [None] * dist.get_world_size(cpu_group)
+        dist.all_gather_object(
+            errors,
+            (
+                None
+                if local_error is None
+                else f"{type(local_error).__name__}: {local_error}"
+            ),
+            group=cpu_group,
+        )
+        if local_error is None and any(error is not None for error in errors):
+            failures = "; ".join(
+                f"group rank {rank}: {error}"
+                for rank, error in enumerate(errors)
+                if error is not None
+            )
+            raise RuntimeError(f"Weight update aborted {phase}: {failures}")
+    if local_error is not None:
+        raise local_error
 
 
 @contextmanager
@@ -51,6 +90,7 @@ def weight_update_session(
     *,
     require_complete: bool,
     cpu_group: dist.ProcessGroup | None,
+    preflight: Callable[[], None] | None = None,
 ) -> Iterator[None]:
     """Bracket a live weight update of ``models``.
 
@@ -67,11 +107,15 @@ def weight_update_session(
         require_complete: Require every canonical checkpoint source exactly
             once before any model derives post-load state. Discarded weights
             need this contract; ordinary live updates may remain partial.
-        cpu_group: Replica CPU group for agreement before post-load hooks.
-            None explicitly selects a local session without rank agreement.
+        cpu_group: Replica CPU group for agreement before peer quiesce and
+            post-load hooks. None explicitly selects a local session without
+            rank agreement.
+        preflight: Optional local validation callback agreed across
+            ``cpu_group`` before yielding or quiescing peer weight owners.
     """
     opened: list[BaseCausalLM] = []
-    local_error: BaseException | None = None
+    peer_controllers: list[MoEPeerWeights] = []
+    setup_error: BaseException | None = None
     try:
         if require_complete and not models:
             raise ValueError("A complete weight update requires at least one model")
@@ -82,6 +126,9 @@ def weight_update_session(
                         f"{type(model).__name__} cannot validate "
                         "a complete weight update"
                     )
+                controller = peer_weights_controller_for(model)
+                if controller is not None:
+                    peer_controllers.append(controller)
                 continue
             if model._weight_update_active:
                 raise RuntimeError(
@@ -95,6 +142,9 @@ def weight_update_session(
                 model.abort_weight_update()
                 raise
             opened.append(model)
+            controller = peer_weights_controller_for(model)
+            if controller is not None:
+                peer_controllers.append(controller)
             if require_complete:
                 names = model.required_weight_update_names()
                 if not isinstance(names, set) or any(
@@ -109,6 +159,32 @@ def weight_update_session(
                 model.allow_redundant_checkpoint_names(
                     model.weight_discard_redundant_checkpoint_names()
                 )
+        if preflight is not None:
+            preflight()
+    except BaseException as exc:
+        setup_error = exc
+    try:
+        _agree_group_errors(cpu_group, setup_error, "before loading")
+    except BaseException:
+        for model in opened:
+            model.abort_weight_update()
+        raise
+
+    prepare_error: BaseException | None = None
+    try:
+        for controller in peer_controllers:
+            controller.prepare_weight_update()
+    except BaseException as exc:
+        prepare_error = exc
+    try:
+        _agree_group_errors(cpu_group, prepare_error, "during peer preparation")
+    except BaseException:
+        for model in opened:
+            model.abort_weight_update()
+        raise
+
+    local_error: BaseException | None = None
+    try:
         yield
         # Target and draft can share storage. No model may derive from a
         # partially received version merely because it is first in this list.
@@ -117,30 +193,16 @@ def weight_update_session(
     except BaseException as exc:
         local_error = exc
     try:
-        if cpu_group is not None:
-            # Post-load hooks can use collectives. Every rank must finish
-            # receiving and validating before any rank enters those hooks.
-            errors: list[str | None] = [None] * dist.get_world_size(cpu_group)
-            dist.all_gather_object(
-                errors,
-                (
-                    None
-                    if local_error is None
-                    else f"{type(local_error).__name__}: {local_error}"
-                ),
-                group=cpu_group,
-            )
-            if local_error is None and any(error is not None for error in errors):
-                failures = "; ".join(
-                    f"group rank {rank}: {error}"
-                    for rank, error in enumerate(errors)
-                    if error is not None
-                )
-                raise RuntimeError(
-                    f"Weight update aborted before post-load: {failures}"
-                )
-        if local_error is not None:
-            raise local_error
+        # Post-load hooks can use collectives. Every rank must finish
+        # receiving and validating before any rank enters those hooks.
+        _agree_group_errors(cpu_group, local_error, "before post-load")
+    except BaseException:
+        for model in opened:
+            model.abort_weight_update()
+        raise
+    try:
+        for controller in peer_controllers:
+            controller.refresh_weights()
     except BaseException:
         for model in opened:
             model.abort_weight_update()

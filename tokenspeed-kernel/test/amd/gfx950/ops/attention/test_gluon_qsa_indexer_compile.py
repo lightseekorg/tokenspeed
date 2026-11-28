@@ -25,9 +25,12 @@ from tokenspeed_kernel._triton import gluon, triton
 
 
 @pytest.mark.parametrize("metadata_type", ["i32", "i64"])
-@pytest.mark.parametrize("block_q, head_dim", [(4, 16), (4, 128), (16, 128)])
+@pytest.mark.parametrize(
+    "block_q, heads_pad, head_dim, chunk_tiles",
+    [(4, 4, 16, 4), (4, 4, 128, 4), (1, 16, 128, 4), (16, 4, 128, 16)],
+)
 def test_gluon_qsa_scores_compile_with_integer_metadata(
-    metadata_type, block_q, head_dim
+    metadata_type, block_q, heads_pad, head_dim, chunk_tiles
 ):
     indexer = pytest.importorskip(
         "tokenspeed_kernel_amd.ops.gfx950.attention.qsa.indexer"
@@ -35,11 +38,14 @@ def test_gluon_qsa_scores_compile_with_integer_metadata(
     fn = indexer.gluon_qsa_block_scores_gfx950
     constants = {
         "NUM_HEADS": 4,
-        "HEADS_PAD": 4,
+        "HEADS_PAD": heads_pad,
         "HEAD_DIM": head_dim,
         "HEAD_DIM_PAD": max(32, head_dim),
         "BLOCK_Q": block_q,
         "BLOCK_N": 128,
+        "NUM_STAGES": 2,
+        "CHUNK_TILES": chunk_tiles,
+        "NUM_XCDS": 8,
         "num_warps": 4,
     }
     signature = {name: "i32" for name in fn.arg_names if name not in constants}
@@ -51,7 +57,16 @@ def test_gluon_qsa_scores_compile_with_integer_metadata(
         complete_blocks=f"*{metadata_type}",
         logits="*fp32",
     )
-    source = gluon._runtime.GluonASTSource(fn, signature, constexprs=constants)
+    # Tensors are 16-byte aligned at runtime (the launcher checks the key
+    # cache); the key copies need that alignment to vectorize.
+    attrs = {
+        (fn.arg_names.index(name),): [["tt.divisibility", 16]]
+        for name in signature
+        if signature[name].startswith("*")
+    }
+    source = gluon._runtime.GluonASTSource(
+        fn, signature, constexprs=constants, attrs=attrs
+    )
     compiled = triton.compile(
         source,
         target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),

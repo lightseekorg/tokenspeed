@@ -414,6 +414,15 @@ class PLELookup(nn.Module):
             return _all_reduce(embeddings, self.ngram_embedding.tp_group)
         return embeddings
 
+    @property
+    def device_table_scale(self) -> float | None:
+        """The scale of a device table stored in ``embed_store_dtype`` (its
+        rows dequantize as ``row.float() * scale``, see
+        :meth:`gather_device`), or None for a table in the output dtype."""
+        if self.embed_store_dtype is None:
+            return None
+        return self._checkpoint_weight_scale
+
     def gather_device(self, ids: torch.Tensor) -> torch.Tensor:
         """Read this rank's device table without reducing other ranks yet."""
         embeddings = self.ngram_embedding(ids, reduce_results=False)

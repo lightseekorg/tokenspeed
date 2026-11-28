@@ -127,20 +127,18 @@ def prepare_history(
 ):
     """Ready one layer's retained history for its verify, as serving does.
 
-    Serving prepares every layer in one launch pair before the forward; this
-    runs the same batched prepare over a single layer: rows that move to a
-    private live page, or whose records plus the verify's window
-    (draft_token_num) overflow the history capacity, get their source state
-    with accepted records applied in their live page, and their lengths clear.
+    Serving prepares every layer in one launch before the forward; this runs
+    the same batched prepare over a single layer. Rows whose count in
+    history.length exceeds the history capacity minus the verify's window
+    (draft_token_num) get their source state with accepted records applied
+    in their live page, and the verify then applies none; other rows that
+    move to a private live page get their source state copied there. The
+    counts stay as they are.
     """
-    # Only the length and recurrent-state columns are read before verify.
+    # Only the page count and recurrent-state columns are read before verify.
     row = [0] * kda.KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS
-    row[2], row[3], row[6] = (
-        history.length.data_ptr(),
-        state_pool.shape[0],
-        history.length.stride(0),
-    )
-    row[9:14] = state_pool.data_ptr(), *state_pool.stride()
+    row[2] = state_pool.shape[0]
+    row[7:12] = state_pool.data_ptr(), *state_pool.stride()
     # Uploaded on the first, eager call; a CUDA-graph capture reuses it.
     key = (*row, str(state_pool.device))
     if key not in _PREPARED_LAYERS:
@@ -165,6 +163,7 @@ def prepare_history(
         retained_correction=history.correction[:, None],
         retained_key=history.key[:, None],
         retained_decay=history.decay[:, None],
+        replay_length=history.length,
         history_capacity=history.correction.shape[2],
         draft_token_num=draft_token_num,
         num_heads=heads,
@@ -379,16 +378,14 @@ def verify(case):
     )
 
 
-def _commit_descriptor(qkv, conv, history, state):
-    """One layer's 14-column retained commit descriptor."""
+def _commit_descriptor(qkv, conv, state):
+    """One layer's 12-column retained commit descriptor."""
     return [
         qkv.data_ptr(),
         conv.data_ptr(),
-        history.length.data_ptr(),
         conv.shape[0],
         qkv.stride(0),
         conv.stride(0),
-        history.length.stride(0),
         conv.stride(1),
         conv.stride(2),
         state.data_ptr(),
@@ -433,6 +430,7 @@ def _run_commit(
         retained_correction=history.correction[:, None],
         retained_key=history.key[:, None],
         retained_decay=history.decay[:, None],
+        replay_length=history.length,
         request_stopped=request_stopped,
         request_ends=request_ends,
         draft_token_num=width,
@@ -468,7 +466,7 @@ def commit(case, accepted, *, ended_slots):
     ).to(torch.int32)
     _run_commit(
         descriptors=torch.tensor(
-            [_commit_descriptor(qkv, conv, history, state)],
+            [_commit_descriptor(qkv, conv, state)],
             device="cuda",
             dtype=torch.uint64,
         ),
@@ -557,7 +555,7 @@ def publish(
             qkv,
             window,
             torch.tensor(
-                [_commit_descriptor(qkv, window, history, state)],
+                [_commit_descriptor(qkv, window, state)],
                 device=device,
                 dtype=torch.uint64,
             ),

@@ -207,6 +207,7 @@ class _Ple:
             "norm_conv": self.gc,
             "conv_w": self.conv_w,
             "table": self.table,
+            "table_scale": None,
             "multipliers": self.multipliers.cuda(),
             "sizes": self.sizes.cuda(),
             "offsets": self.offsets.cuda(),
@@ -310,7 +311,7 @@ def test_delta_layer_matches_tokenspeed_math(ple_context):
     if with_ple:
         tensors["ple"] = ple_block.tensors
     assert (
-        prepare_qwen4_exp_delta_layer(max_rows=5, tensors=tensors, dense_tiled=False)
+        prepare_qwen4_exp_delta_layer(max_rows=9, tensors=tensors, dense_tiled=False)
         is None
     )
     fused = prepare_qwen4_exp_delta_layer(
@@ -560,6 +561,72 @@ def _delta_tensors(g, with_ple: bool) -> dict:
     return tensors
 
 
+@pytest.mark.parametrize("rows", [1, 4])
+def test_fp8_ple_table_equals_its_dequantized_bf16_table(rows):
+    """A layer whose PLE table is FP8 E4M3 with a scalar scale computes and
+    writes exactly what it does with the BF16 table of the values that
+    TokenSpeed's device lookup dequantizes, ``bf16(float(fp8) * scale)``."""
+    g = torch.Generator().manual_seed(31)
+    dev = "cuda"
+    tensors = _delta_tensors(g, True)
+    scale = 0.0234375
+    fp8 = (tensors["ple"]["table"].float() / scale).to(torch.float8_e4m3fn)
+    dequantized = (fp8.float() * scale).bfloat16()
+    page_in = torch.arange(rows, dtype=torch.int32, device=dev) * 2 + 1
+    page_out = page_in + 1
+    pages = 2 * rows + 1
+    h = (torch.randn(rows, WIDTH, generator=g) * 3).bfloat16().cuda()
+    initial = {
+        "conv": torch.randn(pages, QKV, 3, generator=g).bfloat16().cuda(),
+        "ssm": (torch.randn(pages, 48, HEAD, HEAD, generator=g) * 0.1).cuda(),
+        "ple_state": torch.randn(pages, WIDTH, 9, generator=g).bfloat16().cuda(),
+        "context": torch.randint(10, 9000, (pages, 2), generator=g).cuda(),
+    }
+    tokens = torch.randint(10, 9000, (rows,), generator=g).cuda()
+
+    def run(table, table_scale, step):
+        ple = {**tensors["ple"], "table": table, "table_scale": table_scale}
+        fused = prepare_qwen4_exp_delta_layer(
+            max_rows=rows, tensors={**tensors, "ple": ple}, dense_tiled=False
+        )
+        scratch = torch.zeros(fused.scratch_pairs, dtype=torch.int64, device=dev)
+        state = {k: v.clone() for k, v in initial.items()}
+        state["h_out"] = torch.empty(rows, WIDTH, dtype=torch.bfloat16, device=dev)
+        qwen4_exp_delta_layer_decode(
+            fused,
+            h,
+            state["h_out"],
+            chain=1,
+            conv_state=state["conv"],
+            ssm_state=state["ssm"],
+            state_in=page_in,
+            state_out=page_out,
+            conv_out=state["conv"],
+            conv_out_rows=page_out,
+            replay=None,
+            scratch=scratch,
+            step=torch.full((1,), step, dtype=torch.int32, device=dev),
+            warm=None,
+            layer_index=0,
+            ple={
+                "token": tokens,
+                "context": state["context"],
+                "conv_state": state["ple_state"],
+                "page_in": page_in,
+                "page_out": page_out,
+                "context_out": state["context"],
+                "conv_out": state["ple_state"],
+            },
+        )
+        torch.cuda.synchronize()
+        return state
+
+    quantized = run(fp8, scale, 3)
+    reference = run(dequantized, None, 4)
+    for name in reference:
+        assert torch.equal(quantized[name], reference[name]), name
+
+
 @pytest.mark.parametrize("with_ple", [False, True])
 def test_one_row_input_equals_repeated_streams(with_ple):
     """A layer given one row (stream stride 0, the first layer's embedding)
@@ -617,6 +684,9 @@ def test_one_row_input_equals_repeated_streams(with_ple):
         (2, 2, False),
         (1, 4, True),
         (2, 2, True),
+        # An MTP verify of 2 requests (8 rows).
+        (2, 4, False),
+        (2, 4, True),
     ],
 )
 def test_delta_layer_verify_equals_decode_steps(requests, chain, with_ple):
@@ -795,7 +865,7 @@ def test_delta_layer_verify_equals_decode_steps(requests, chain, with_ple):
     torch.testing.assert_close(replayed[final], ssm[final], rtol=1e-4, atol=1e-5)
 
 
-@pytest.mark.parametrize("rows", [2, 3, 4])
+@pytest.mark.parametrize("rows", [2, 3, 4, 6, 8])
 @pytest.mark.parametrize("with_ple", [False, True])
 def test_delta_layer_rows_equal_one_row_launches(rows, with_ple):
     """Each request row of a multi-row launch computes and writes exactly
@@ -953,6 +1023,8 @@ def _qsa_tensors(g, final: bool, experts: str) -> dict:
         ((2998, 1500, 400), False, "mxfp4"),
         ((999, 2998, 64, 1203), True, "mxfp4"),
         ((999, 2998, 64, 1203), True, "bf16"),
+        ((999, 2998, 64, 1203, 37, 1500, 400, 2050), True, "mxfp4"),
+        ((999, 2998, 64, 1203, 37, 1500, 400, 2050), False, "bf16"),
     ],
 )
 def test_qsa_layer_rows_equal_one_row_launches(lengths, final, experts):
@@ -1052,6 +1124,8 @@ def test_qsa_layer_rows_equal_one_row_launches(lengths, final, experts):
         ((2996,), 4, False),
         ((1001, 38), 2, True),
         ((2998,), 3, False),
+        # Two requests' 4-token verifies (8 rows): an MTP verify of 2 requests.
+        ((997, 2996), 4, True),
     ],
 )
 def test_qsa_layer_verify_equals_decode_steps(starts, chain, final):
@@ -1271,12 +1345,15 @@ def test_qsa_layer_draft_steps_equal_decode_steps(start, experts):
 @pytest.mark.parametrize("final", [False, True])
 @pytest.mark.parametrize("experts", ["mxfp4", "bf16"])
 @pytest.mark.parametrize("accepted", [1, 2, 3, 4])
-def test_qsa_layer_draft_catch_up_writes_accepted_index_keys(accepted, experts, final):
-    """The MTP draft's first step runs the verified rows as a chain. Every row
-    computes and writes K / V as a decode step does. Only the accepted rows
-    write index keys and compressed keys (TokenSpeed's draft write mask).
-    Only the live row, the last accepted one, gives an output (TokenSpeed's
-    draft narrowing): its decode step's output and final mixer output."""
+def test_qsa_layer_draft_first_step_writes_accepted_index_keys(
+    accepted, experts, final
+):
+    """The MTP draft's first step: a prefix launch over the verified rows as
+    a chain, then the live row (the last accepted one, TokenSpeed's draft
+    narrowing) as a one-row decode launch. Every row writes K / V as a
+    decode step does. Only the accepted rows write index keys and
+    compressed keys (TokenSpeed's draft write mask). The live row's output
+    and final mixer output are its decode step's."""
     start, chain, page, max_pos = 997, 4, 256, 4096
     g = torch.Generator().manual_seed(90 + accepted)
     dev = "cuda"
@@ -1314,11 +1391,13 @@ def test_qsa_layer_draft_catch_up_writes_accepted_index_keys(accepted, experts, 
 
     def launch(state, first, n, step, limit):
         L = torch.arange(start + first, start + first + n, device=dev)
-        out_rows = n if limit is None else 1
-        h_out = torch.empty(out_rows, WIDTH, dtype=torch.bfloat16, device=dev)
+        prefix = limit is not None
+        h_out = (
+            None if prefix else torch.empty(n, WIDTH, dtype=torch.bfloat16, device=dev)
+        )
         mixed = (
-            torch.empty(out_rows, HIDDEN, dtype=torch.bfloat16, device=dev)
-            if final
+            torch.empty(n, HIDDEN, dtype=torch.bfloat16, device=dev)
+            if final and not prefix
             else None
         )
         qwen4_exp_qsa_layer_decode(
@@ -1352,13 +1431,14 @@ def test_qsa_layer_draft_catch_up_writes_accepted_index_keys(accepted, experts, 
         return h_out, mixed
 
     caught_up = {k: v.clone() for k, v in initial.items()}
-    out = launch(
+    launch(
         caught_up,
         0,
         chain,
         5,
         torch.full((1,), start + accepted, dtype=torch.int32, device=dev),
     )
+    out = launch(caught_up, accepted - 1, 1, 6, None)
     every_step = {k: v.clone() for k, v in initial.items()}
     accepted_steps = {k: v.clone() for k, v in initial.items()}
     for t in range(chain):

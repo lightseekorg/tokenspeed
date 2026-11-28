@@ -248,6 +248,7 @@ def prepare_gdn_decode_mtp(
         "chunked_chain": False,
         "replay_payload": False,
         "pending_replay": False,
+        "output_norm": False,
     }
     if request.solution != "flashinfer" and per_token:
         # State-writing calls select by state dtype, as the facade does.

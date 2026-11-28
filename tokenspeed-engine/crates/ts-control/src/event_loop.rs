@@ -1358,7 +1358,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // `pages_to_copy` may still be pending on the device; an autonomous
         // single-member peer can safely use the scheduler during the DP
         // collective when no device copy batch is unconfirmed.
-        let dp_unlock = self.peer.as_ref().is_some_and(Peer::autonomous)
+        let dp_unlock = self.peer.as_ref().is_some_and(Peer::lends_scheduler)
             && !has_device_copies
             && self.copies_confirmed_at.is_none();
         let dp = self.dp_round(forward.as_ref(), stop, dp_unlock)?;
@@ -1434,8 +1434,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if device_work {
             let copies_clear = !has_device_copies && self.copies_confirmed_at.is_none();
             let executed = if copies_clear
-                && (idle_forward || self.peer.as_ref().is_some_and(Peer::autonomous))
+                && (idle_forward || self.peer.as_ref().is_some_and(Peer::lends_scheduler))
             {
+                let _window = self.peer.as_ref().and_then(|p| {
+                    p.cache_window(crate::peer::CacheWait::Execute, self.forwards_dispatched)
+                });
                 let data_plane = &mut self.data_plane;
                 ArcMutexGuard::unlocked(&mut self.scheduler, || {
                     data_plane.execute(plan, &dispatch)
@@ -1480,7 +1483,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         capacity_aborts: i64,
     ) -> Option<SchedulerSizes> {
         let mut planned_sizes: Option<SchedulerSizes> = None;
-        if let Some(metrics) = &self.metrics {
+        if let Some(metrics) = &mut self.metrics {
             let _span = profile::span("EventLoop::record_metrics");
             // A retraction victim's image store is the retraction signal.
             let retracted = cache_ops
@@ -1585,6 +1588,57 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 metrics.observe_request_spec_decode_accept_length(accept_length);
             }
             metrics.record_grammar_queue(self.grammar_queue.len() as i64);
+            metrics.record_cache_releases(
+                self.scheduler
+                    .cache_release_stats()
+                    .into_iter()
+                    .map(|stats| ts_metrics::CacheReleaseStats {
+                        group_id: stats.group_id,
+                        host: stats.host,
+                        child_slots: stats.child_slots,
+                        parents: stats.parents,
+                    })
+                    .collect(),
+            );
+            let gds = self.scheduler.gds_stats();
+            metrics.record_gds_evictions(ts_metrics::GdsStats {
+                evicted_units: gds.evicted_units,
+                retention_rejections: gds.retention_rejections,
+                demoted_units: gds.demoted_units,
+                mixed_tier_units: gds.mixed_tier_units,
+                orphan_blocks: gds.orphan_blocks,
+                fallback_blocks: gds.fallback_blocks,
+                fallback_units: gds.fallback_units,
+                watermark: gds.watermark,
+                logical_evictions: gds.logical_evictions,
+                logical_rejections: gds.logical_rejections,
+                device_copies_released: gds.device_copies_released,
+                host_copies_reserved: gds.host_copies_reserved,
+                host_copy_rejections: gds.host_copy_rejections,
+                host_clean_copies_released: gds.host_clean_copies_released,
+                disk_recoverable_units: gds.disk_recoverable_units,
+                disk_route_losses: gds.disk_route_losses,
+                checkpoint_planned: gds.checkpoint_planned,
+                checkpoint_allocated: gds.checkpoint_allocated,
+                checkpoint_materialized: gds.checkpoint_materialized,
+                checkpoint_published: gds.checkpoint_published,
+                checkpoint_cancelled: gds.checkpoint_cancelled,
+                checkpoint_extra_blocks: gds.checkpoint_extra_blocks,
+                checkpoint_chunk_end_fallbacks: gds.checkpoint_chunk_end_fallbacks,
+                checkpoint_fresh_rejected: gds.checkpoint_fresh_rejected,
+                checkpoint_rejected_extra_blocks: gds.checkpoint_rejected_extra_blocks,
+                checkpoint_rejected_unmeasured: gds.checkpoint_rejected_unmeasured,
+                committed_plans: gds.committed_plans,
+                planning_nanoseconds: gds.planning_nanoseconds,
+                ready_units: gds.ready_units,
+                device_ready_units: gds.device_ready_units,
+                pending_units: gds.pending_units,
+                broken_units: gds.broken_units,
+                dependency_points: gds.dependency_points,
+                dependency_ranges: gds.dependency_ranges,
+                dependency_leaves: gds.dependency_leaves,
+                host_watermark: gds.host_watermark,
+            });
             let hits = self.scheduler.prefix_hit_stats();
             let delta = prefix_hit_delta(&mut self.last_prefix_hits, hits);
             if self.outputs.role() == crate::output::Role::Decode {
@@ -1600,6 +1654,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 delta.l3_hit_tokens,
                 delta.peer_hit_tokens,
             );
+            metrics.record_prefix_recovery(delta.host_gain_tokens, delta.unresumable_kv_tokens);
         }
 
         planned_sizes
@@ -3543,8 +3598,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             i64::from(has_decode_work),
         ];
         let rows = if allow_unlock
-            && (self.in_flight.is_empty() || self.peer.as_ref().is_some_and(Peer::autonomous))
+            && (self.in_flight.is_empty() || self.peer.as_ref().is_some_and(Peer::lends_scheduler))
         {
+            let _window = self.peer.as_ref().and_then(|p| {
+                p.cache_window(
+                    crate::peer::CacheWait::DataParallel,
+                    self.forwards_dispatched,
+                )
+            });
             let mesh = &mut self.ranks.mesh;
             ArcMutexGuard::unlocked(&mut self.scheduler, || mesh.all_gather_i64(world, &row))?
         } else {
@@ -3767,8 +3828,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             let _span = profile::span("EventLoop::commit");
             let (batch, input_logprobs, pending) = self.in_flight.pop_front().expect("non-empty");
             let data_plane = &mut self.data_plane;
-            let result =
-                ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.complete(pending))?;
+            let result = {
+                let _window = self
+                    .peer
+                    .as_ref()
+                    .filter(|_| self.copies_confirmed_at.is_none())
+                    .and_then(|p| {
+                        p.cache_window(crate::peer::CacheWait::Complete, self.forwards_completed)
+                    });
+                ArcMutexGuard::unlocked(&mut self.scheduler, || data_plane.complete(pending))?
+            };
             self.forwards_completed += 1;
             if self
                 .copies_confirmed_at
@@ -4086,6 +4155,10 @@ fn prefix_hit_delta(
             .device_hit_tokens
             .saturating_sub(last.device_hit_tokens),
         host_hit_tokens: hits.host_hit_tokens.saturating_sub(last.host_hit_tokens),
+        host_gain_tokens: hits.host_gain_tokens.saturating_sub(last.host_gain_tokens),
+        unresumable_kv_tokens: hits
+            .unresumable_kv_tokens
+            .saturating_sub(last.unresumable_kv_tokens),
         l3_hit_tokens: hits.l3_hit_tokens.saturating_sub(last.l3_hit_tokens),
     }
 }
@@ -4102,6 +4175,8 @@ mod tests {
             device_hit_tokens: 16,
             host_hit_tokens: 8,
             peer_hit_tokens: 12,
+            host_gain_tokens: 12,
+            unresumable_kv_tokens: 4,
             l3_hit_tokens: 4,
         };
         assert_eq!(prefix_hit_delta(&mut previous, hits), hits);

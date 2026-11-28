@@ -48,7 +48,12 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
 _HOST_CACHE_GRID_CAP = int(os.environ.get("TOKENSPEED_HOST_CACHE_GRID_CAP", "64"))
+_NPU_HOST_CACHE_GRID_CAP = int(
+    os.environ.get("TOKENSPEED_NPU_HOST_CACHE_GRID_CAP", "32")
+)
 HOST_CACHE_TRANSFER_CHUNK_BYTES = 4096
+STAGED_TRANSFER_WORD_CHUNK_BYTES = 16384
+STAGED_TRANSFER_BYTE_CHUNK_BYTES = 4096
 
 
 logger = logging.getLogger(__name__)
@@ -79,6 +84,7 @@ __all__ = [
     "store_kv_cache",
     "store_sf_interleaved",
     "store_state_rows",
+    "stage_cache_blocks",
     "transfer_cache_blocks",
     "wait_layer_ready",
     "transfer_kv_all_layer",
@@ -423,6 +429,239 @@ def transfer_cache_blocks(
         BLOCK_SIZE=HOST_CACHE_TRANSFER_CHUNK_BYTES,
         SIGNAL_LAYERS=signal_layers,
         num_warps=8,
+    )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "geometry_offset",
+        "num_geometry_rows",
+        "target_group",
+        "chunk_start",
+        "chunk_blocks",
+        "span_base",
+        "staged_block_bytes",
+    ]
+)
+def _staged_copy_geometry_slice_kernel(
+    device_addresses_ptr,
+    geometry_ptr,
+    block_pairs_ptr,
+    staging_ptr,
+    geometry_offset,
+    num_geometry_rows,
+    target_group,
+    chunk_start,
+    chunk_blocks,
+    span_base,
+    staged_block_bytes,
+    DIRECTION: tl.constexpr,
+    USE_WORDS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Gather or scatter one group's chunk between Device pools and HBM staging."""
+    pid = tl.program_id(0).to(tl.int64)
+    nprogs = tl.num_programs(0).to(tl.int64)
+    target_group_i64 = target_group.to(tl.int64)
+    chunk_start_i64 = chunk_start.to(tl.int64)
+    chunk_blocks_i64 = chunk_blocks.to(tl.int64)
+    span_base_i64 = span_base.to(tl.int64)
+    staged_block_bytes_i64 = staged_block_bytes.to(tl.int64)
+    block_size_i64 = tl.full((), BLOCK_SIZE, tl.int64)
+    word_block_i64 = tl.full((), BLOCK_SIZE // 4, tl.int64)
+
+    for row_delta in tl.range(0, num_geometry_rows):
+        row_offset = (geometry_offset.to(tl.int64) + row_delta.to(tl.int64)) * 8
+        group_index = tl.load(geometry_ptr + row_offset)
+        if group_index == target_group_i64:
+            device_buffer_index = tl.load(geometry_ptr + row_offset + 1)
+            device_zero = tl.load(geometry_ptr + row_offset + 2)
+            device_stride = tl.load(geometry_ptr + row_offset + 3)
+            host_field_offset = tl.load(geometry_ptr + row_offset + 5)
+            payload_bytes = tl.load(geometry_ptr + row_offset + 7)
+
+            num_chunks = (payload_bytes + block_size_i64 - 1) // block_size_i64
+            group_work_items = chunk_blocks_i64 * num_chunks
+            device_address = tl.load(device_addresses_ptr + device_buffer_index)
+            field_staging_offset = host_field_offset - span_base_i64
+
+            if USE_WORDS:
+                word_lane = tl.arange(0, BLOCK_SIZE // 4)
+                word_count = payload_bytes // 4
+                device_words = tl.cast(device_address, tl.pointer_type(tl.int32))
+                for work_id in tl.range(pid, group_work_items, nprogs):
+                    local_block = work_id // num_chunks
+                    chunk_index = work_id % num_chunks
+                    pair_index = chunk_start_i64 + local_block
+                    device_block_id = tl.load(block_pairs_ptr + pair_index * 2)
+                    chunk_word_offset = chunk_index * word_block_i64
+                    device_word_base = (
+                        device_zero + device_block_id * device_stride
+                    ) // 4 + chunk_word_offset
+                    staging_word_base = (
+                        local_block * staged_block_bytes_i64 + field_staging_offset
+                    ) // 4 + chunk_word_offset
+                    tile_words = tl.minimum(
+                        word_count - chunk_word_offset, word_block_i64
+                    ).to(tl.int32)
+                    word_mask = word_lane < tile_words
+                    if DIRECTION == 0:
+                        values = tl.load(
+                            device_words + device_word_base + word_lane,
+                            mask=word_mask,
+                        )
+                        tl.store(
+                            staging_ptr + staging_word_base + word_lane,
+                            values,
+                            mask=word_mask,
+                        )
+                    else:
+                        values = tl.load(
+                            staging_ptr + staging_word_base + word_lane,
+                            mask=word_mask,
+                        )
+                        tl.store(
+                            device_words + device_word_base + word_lane,
+                            values,
+                            mask=word_mask,
+                        )
+            else:
+                byte_lane = tl.arange(0, BLOCK_SIZE)
+                device_bytes = tl.cast(device_address, tl.pointer_type(tl.uint8))
+                for work_id in tl.range(pid, group_work_items, nprogs):
+                    local_block = work_id // num_chunks
+                    chunk_index = work_id % num_chunks
+                    pair_index = chunk_start_i64 + local_block
+                    device_block_id = tl.load(block_pairs_ptr + pair_index * 2)
+                    chunk_byte_offset = chunk_index * block_size_i64
+                    device_byte_base = (
+                        device_zero
+                        + device_block_id * device_stride
+                        + chunk_byte_offset
+                    )
+                    staging_byte_base = (
+                        local_block * staged_block_bytes_i64
+                        + field_staging_offset
+                        + chunk_byte_offset
+                    )
+                    tile_bytes = tl.minimum(
+                        payload_bytes - chunk_byte_offset, block_size_i64
+                    ).to(tl.int32)
+                    byte_mask = byte_lane < tile_bytes
+                    if DIRECTION == 0:
+                        values = tl.load(
+                            device_bytes + device_byte_base + byte_lane,
+                            mask=byte_mask,
+                        )
+                        tl.store(
+                            staging_ptr + staging_byte_base + byte_lane,
+                            values,
+                            mask=byte_mask,
+                        )
+                    else:
+                        values = tl.load(
+                            staging_ptr + staging_byte_base + byte_lane,
+                            mask=byte_mask,
+                        )
+                        tl.store(
+                            device_bytes + device_byte_base + byte_lane,
+                            values,
+                            mask=byte_mask,
+                        )
+
+
+def stage_cache_blocks(
+    device_address_table: torch.Tensor,
+    geometry_table: torch.Tensor,
+    block_pairs: torch.Tensor,
+    staging_buffer: torch.Tensor,
+    direction: int,
+    *,
+    geometry_offset: int,
+    num_geometry_rows: int,
+    target_group: int,
+    chunk_start: int,
+    chunk_blocks: int,
+    span_base: int,
+    staged_block_bytes: int,
+    work_items: int,
+    use_words: bool,
+    grid_cap: int | None,
+) -> None:
+    """Gather or scatter one group's chunk into a contiguous HBM staging buffer.
+
+    Args:
+        device_address_table: Device uint64 base pointers of the cache buffers.
+        geometry_table: Static int64 field rows bound on the execution device.
+        block_pairs: Dynamic int64 ``(device_block_id, host_block_id)`` rows.
+        staging_buffer: Contiguous uint8 Device staging buffer (4-byte aligned
+            base when ``use_words=True``) holding
+            ``chunk_blocks * staged_block_bytes`` bytes.
+        direction: ``0`` to gather Device -> Staging (D2H) or ``1`` to scatter
+            Staging -> Device (H2D).
+        geometry_offset: First static field row in the requested geometry slice.
+        num_geometry_rows: Number of static field rows in the slice.
+        target_group: Cache group index copied by this launch.
+        chunk_start: Starting row index in ``block_pairs`` for this chunk.
+        chunk_blocks: Number of blocks in this chunk.
+        span_base: Minimum ``host_field_offset`` among ``target_group``'s rows
+            in the slice.
+        staged_block_bytes: Packed byte stride between consecutive blocks inside
+            ``staging_buffer``.
+        work_items: Maximum ``chunk_blocks * num_chunks`` across fields of
+            ``target_group`` in the slice.
+        use_words: Whether all field addresses, offsets, strides, and payload
+            lengths in this launch are 4-byte aligned. Selects the 16 KiB
+            ``int32`` fast path instead of the 4 KiB ``uint8`` fallback.
+        grid_cap: Max Triton programs, or None to use
+            ``TOKENSPEED_NPU_HOST_CACHE_GRID_CAP``.
+    """
+    if direction not in (0, 1):
+        raise ValueError("direction must be 0 (D2H gather) or 1 (H2D scatter)")
+    if chunk_blocks <= 0 or num_geometry_rows <= 0 or work_items <= 0:
+        return
+    if staging_buffer.dtype != torch.uint8 or not staging_buffer.is_contiguous():
+        raise ValueError("staging_buffer must be a contiguous uint8 tensor")
+    required_bytes = int(chunk_blocks) * int(staged_block_bytes)
+    if staging_buffer.numel() < required_bytes:
+        raise ValueError(
+            f"staging_buffer holds {staging_buffer.numel()} bytes, "
+            f"need at least {required_bytes}"
+        )
+    cap = _NPU_HOST_CACHE_GRID_CAP if grid_cap is None else int(grid_cap)
+    if cap <= 0:
+        raise ValueError("grid_cap must be positive")
+    if use_words:
+        if staging_buffer.data_ptr() % 4 != 0:
+            raise ValueError(
+                "staging_buffer base address must be 4-byte aligned when use_words=True"
+            )
+        aligned_len = (staging_buffer.numel() // 4) * 4
+        if aligned_len < required_bytes:
+            raise ValueError(
+                "staging_buffer must hold aligned 4-byte words for required_bytes"
+            )
+        staging_view = staging_buffer[:aligned_len].view(torch.int32)
+        block_size = STAGED_TRANSFER_WORD_CHUNK_BYTES
+    else:
+        staging_view = staging_buffer
+        block_size = STAGED_TRANSFER_BYTE_CHUNK_BYTES
+    grid = (max(1, min(cap, int(work_items))),)
+    _staged_copy_geometry_slice_kernel[grid](
+        device_address_table,
+        geometry_table,
+        block_pairs,
+        staging_view,
+        int(geometry_offset),
+        int(num_geometry_rows),
+        int(target_group),
+        int(chunk_start),
+        int(chunk_blocks),
+        int(span_base),
+        int(staged_block_bytes),
+        DIRECTION=direction,
+        USE_WORDS=bool(use_words),
+        BLOCK_SIZE=block_size,
     )
 
 
@@ -934,17 +1173,18 @@ def copy_state_rows_compact(
     )
 
 
+# The slab block count changes with the pool size and the destination vector is
+# often an offset slice of a larger buffer, so neither may key a new
+# specialization.
 @triton.jit(
-    **(
-        {"do_not_specialize_on_alignment": ["blocks"]}
-        if current_platform().is_npu
-        else {}
-    ),
+    do_not_specialize=["num_blocks"],
+    do_not_specialize_on_alignment=["blocks"],
 )
 def _store_state_rows_kernel(
     states,
     slab,
     blocks,
+    num_blocks,
     state_width: tl.constexpr,
     state_dim_2: tl.constexpr,
     state_dim_3: tl.constexpr,
@@ -961,7 +1201,10 @@ def _store_state_rows_kernel(
     row = tl.program_id(0).to(tl.int64)
     feature = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     destination = tl.load(blocks + row).to(tl.int64)
-    live = (feature < state_width) & (destination >= 0)
+    # Block 0 is the null block, and padding (-1) or ids at or past the slab's
+    # block count name no block, so masked lanes of such a row touch no state
+    # or slab memory.
+    live = (feature < state_width) & (destination > 0) & (destination < num_blocks)
     # int64 element offsets: a slab block id times its stride, or a late row of
     # a wide state, exceeds int32 on large pools.
     dim_1_index = feature // (state_dim_2 * state_dim_3)
@@ -997,10 +1240,12 @@ def store_state_rows(
             slab's dtype on store.
         slab: ``[blocks, *state_shape]`` recurrent-state slab, updated in
             place; strides are honoured (page-interleaved arena views).
-        blocks: ``[rows]`` int32/int64 destination block per request. A
-            negative block skips the row: capacity-shaped prefill metadata
-            pads the request dimension with ``-1`` rows whose dummy scan
-            result must reach no block.
+        blocks: ``[rows]`` int32/int64 destination block per request. Only
+            blocks in ``(0, slab.shape[0])`` are written; any other id skips
+            the row and leaves the slab untouched. Block ``0`` is the null
+            block, capacity-shaped prefill metadata pads the request
+            dimension with ``-1`` rows whose dummy scan result must reach no
+            block, and ids at or past the slab's block count name no block.
     """
     if blocks.numel() == 0:
         return
@@ -1015,8 +1260,11 @@ def store_state_rows(
     ):
         raise ValueError("blocks must be a unit-stride int32/int64 vector")
     if states.device.type not in ("cuda", "npu"):
-        live = blocks >= 0
-        slab.index_copy_(0, blocks[live].to(torch.int64), states[live].to(slab.dtype))
+        # Widen first: comparing int32 ids against a block count past INT32_MAX
+        # would narrow the count and reject valid destinations.
+        blocks_i64 = blocks.to(torch.int64)
+        live = (blocks_i64 > 0) & (blocks_i64 < slab.shape[0])
+        slab.index_copy_(0, blocks_i64[live], states[live].to(slab.dtype))
         return
     state_width = states[0].numel()
     block = 512
@@ -1024,6 +1272,7 @@ def store_state_rows(
         states,
         slab,
         blocks,
+        slab.shape[0],
         state_width,
         states.shape[2],
         states.shape[3],

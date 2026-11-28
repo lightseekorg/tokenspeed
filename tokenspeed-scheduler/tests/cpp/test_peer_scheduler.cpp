@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -139,7 +140,7 @@ public:
                                        .max_tokens = request.max_tokens};
         const std::size_t pending_new =
             unsynced_new_leases_.size() - (unsynced_new_leases_.contains(request.lease) ? 1u : 0u);
-        const PeerAnswer answer = holder_.AnswerPeerLookup(lookup, pending_new);
+        const PeerAnswer answer = holder_.AnswerPeerLookup(lookup, pending_new, /*include_disk=*/true);
         if (answer.num_tokens > 0 && !holder_.PeerLeaseCanPin(request.lease) && !holder_.PeerLeaseHeld(request.lease)) {
             unsynced_new_leases_.insert(request.lease);
         }
@@ -258,9 +259,39 @@ protected:
 
 // A holder that computed the prompt itself, on full-history and hybrid group
 // sets.
-class PeerSchedulerTest : public ::testing::TestWithParam<bool>, protected PeerPair {
+struct PeerCacheScenario {
+    const char* name;
+    bool hybrid;
+    bool gds;
+    SchedulerConfig::HostWritePolicy reader_write_policy;
+};
+
+constexpr PeerCacheScenario kPeerCacheScenarios[] = {
+    {"Full", false, false, SchedulerConfig::HostWritePolicy::kWriteThrough},
+    {"Hybrid", true, false, SchedulerConfig::HostWritePolicy::kWriteThrough},
+    {"HybridGdsWriteThrough", true, true, SchedulerConfig::HostWritePolicy::kWriteThrough},
+    {"HybridGdsWriteBackReader", true, true, SchedulerConfig::HostWritePolicy::kWriteBack},
+};
+
+SchedulerConfig PeerPolicyConfig(SchedulerConfig config, const PeerCacheScenario& scenario,
+                                 SchedulerConfig::HostWritePolicy write_policy) {
+    config.host_write_policy = write_policy;
+    if (scenario.gds) {
+        config.prefix_cache_evict_policy = "gds";
+        config.prefix_cache_gds_prefill_cost = std::array{1.0, 0.5};
+    }
+    return config;
+}
+
+// The holder writes through so the H2D-before-PIN case has completed Host
+// copies. The reader exercises both policies and both landing tiers.
+class PeerSchedulerTest : public ::testing::TestWithParam<PeerCacheScenario>, protected PeerPair {
 protected:
-    PeerSchedulerTest() : PeerPair(PeerConfigFor("holder", GetParam()), PeerConfigFor("reader", GetParam())) {}
+    PeerSchedulerTest()
+        : PeerPair(PeerPolicyConfig(PeerConfigFor("holder", GetParam().hybrid), GetParam(),
+                                    SchedulerConfig::HostWritePolicy::kWriteThrough),
+                   PeerPolicyConfig(PeerConfigFor("reader", GetParam().hybrid), GetParam(),
+                                    GetParam().reader_write_policy)) {}
 
     // The holder prefills `tokens` and finishes, publishing them.
     ExecutionPlan HolderComputes(const std::vector<std::int32_t>& tokens) {
@@ -273,8 +304,8 @@ protected:
     }
 };
 
-INSTANTIATE_TEST_SUITE_P(Groups, PeerSchedulerTest, ::testing::Bool(),
-                         [](const ::testing::TestParamInfo<bool>& info) { return info.param ? "Hybrid" : "Full"; });
+INSTANTIATE_TEST_SUITE_P(Groups, PeerSchedulerTest, ::testing::ValuesIn(kPeerCacheScenarios),
+                         [](const ::testing::TestParamInfo<PeerCacheScenario>& info) { return info.param.name; });
 
 TEST_P(PeerSchedulerTest, RenewedPinRequiresExactCheckpointAndEveryOriginalBlock) {
     const auto tokens = MakeAlignedTokens(8, kP);
@@ -290,7 +321,7 @@ TEST_P(PeerSchedulerTest, RenewedPinRequiresExactCheckpointAndEveryOriginalBlock
                                  .prefix_hashes = request.prefix_hashes,
                                  .tokens = request.tokens,
                                  .max_tokens = request.max_tokens};
-    const auto answer = holder_.AnswerPeerLookup(checkpoint, /*pending_new_leases=*/0);
+    const auto answer = holder_.AnswerPeerLookup(checkpoint, /*pending_new_leases=*/0, /*include_disk=*/true);
     ASSERT_GT(answer.num_tokens, 0);
     checkpoint.max_tokens = answer.num_tokens;
     checkpoint.prefix_hashes.resize(answer.num_tokens / kP);
@@ -374,6 +405,97 @@ TEST(VersionedPeerLanding, MatchingRetirementReturnsFrozenPagesToTheDevicePool) 
         }
         EXPECT_EQ(reader.CacheGroupAvailablePages("full_attention"), available);
     }
+}
+
+TEST(VersionedPeerLanding, FrozenTransfersStopNewReadsUntilEveryTargetRetires) {
+    for (const bool hybrid : {false, true}) {
+        auto cfg = PeerConfigFor("reader", hybrid);
+        cfg.peer_config->versioned_shards = true;
+        Scheduler reader{cfg};
+        const auto available = reader.CacheGroupAvailablePages("full_attention");
+        reader.SubmitRequests({
+            RequestSpec{.request_id = "frozen-a", .peer_holder = "holder-a", .tokens = MakeAlignedTokens(8, kP)},
+            RequestSpec{.request_id = "frozen-b", .peer_holder = "holder-b", .tokens = MakeAlignedTokens(8, kP, 100)},
+        });
+        Plan(reader);
+        const auto lookups = reader.TakePeerLookups();
+        ASSERT_EQ(lookups.size(), 2u);
+        for (const auto& lookup : lookups) {
+            Send(reader, cache::PeerLookupAnswered{.lease = lookup.lease, .num_tokens = 4 * kP});
+        }
+        ASSERT_EQ(Plan(reader).peer_fetches.size(), 2u);
+        for (const auto& lookup : lookups) {
+            Send(reader, cache::PeerFetchDone{.request_id = lookup.request_id, .lease = lookup.lease, .frozen = true});
+            Send(reader, forward::Abort{.request_id = lookup.request_id});
+        }
+        Plan(reader);
+        const auto held_available = reader.CacheGroupAvailablePages("full_attention");
+        ASSERT_LT(held_available, available);
+        ASSERT_EQ(reader.GetPeerStats().frozen_targets, 2u);
+        ASSERT_EQ(reader.GetPeerStats().landing_requests, 0u);
+
+        // A business timeout, request abort, or an unrelated retirement cannot
+        // free DMA destinations or let new reads consume the remaining pool.
+        Send(reader, cache::PeerTick{.now_us = 1'000'000'000});
+        auto unrelated = lookups.front().lease;
+        unrelated.id += 100;
+        Send(reader, cache::PeerTargetRetired{.lease = unrelated});
+        for (std::size_t remaining = 2; remaining > 0; --remaining) {
+            reader.SubmitRequests({RequestSpec{
+                .request_id = "local", .peer_holder = "another-holder", .tokens = MakeAlignedTokens(4, kP, 300)}});
+            const auto plan = Plan(reader);
+            EXPECT_TRUE(reader.TakePeerLookups().empty());
+            EXPECT_TRUE(plan.peer_fetches.empty());
+            EXPECT_EQ(PrefillRows(plan), (std::vector<std::pair<std::string, std::int32_t>>{{"local", 0}}));
+            EXPECT_EQ(reader.GetPeerStats().frozen_targets, remaining);
+            Send(reader, forward::Abort{.request_id = "local"});
+            // The local forward was dispatched: abort retains its pages until
+            // that forward reports completion, independently of peer DMA.
+            Send(reader, forward::ExtendResult{.request_id = "local", .tokens = {1}});
+            Plan(reader);
+            Send(reader, cache::PeerTargetRetired{.lease = lookups[remaining - 1].lease});
+        }
+        EXPECT_EQ(reader.GetPeerStats().frozen_targets, 0u);
+        EXPECT_EQ(reader.CacheGroupAvailablePages("full_attention"), available);
+
+        reader.SubmitRequests({RequestSpec{
+            .request_id = "recovered", .peer_holder = "holder-a", .tokens = MakeAlignedTokens(8, kP, 500)}});
+        Plan(reader);
+        const auto recovered = reader.TakePeerLookups();
+        ASSERT_EQ(recovered.size(), 1u);
+        Send(reader, cache::PeerLookupAnswered{.lease = recovered.front().lease, .num_tokens = 4 * kP});
+        EXPECT_EQ(Plan(reader).peer_fetches.size(), 1u);
+    }
+}
+
+TEST(VersionedPeerLanding, AnOfferAlreadyQueuedBeforeFreezeFallsBackWithoutAnotherLanding) {
+    auto cfg = PeerConfigFor("reader");
+    cfg.peer_config->versioned_shards = true;
+    Scheduler reader{cfg};
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "frozen", .peer_holder = "holder", .tokens = MakeAlignedTokens(8, kP)}});
+    Plan(reader);
+    const auto first = reader.TakePeerLookups();
+    ASSERT_EQ(first.size(), 1u);
+    Send(reader, cache::PeerLookupAnswered{.lease = first.front().lease, .num_tokens = 4 * kP});
+    ASSERT_EQ(Plan(reader).peer_fetches.size(), 1u);
+
+    // Healthy reads still permit concurrent lookups. The second offer has
+    // already passed lookup when the first read loses its retirement fence.
+    reader.SubmitRequests(
+        {RequestSpec{.request_id = "queued", .peer_holder = "holder", .tokens = MakeAlignedTokens(8, kP, 100)}});
+    Plan(reader);
+    const auto queued = reader.TakePeerLookups();
+    ASSERT_EQ(queued.size(), 1u);
+    Send(reader, cache::PeerLookupAnswered{.lease = queued.front().lease, .num_tokens = 4 * kP});
+    Send(reader, cache::PeerFetchDone{.request_id = "frozen", .lease = first.front().lease, .frozen = true});
+    Send(reader, forward::Abort{.request_id = "frozen"});
+    const auto plan = Plan(reader);
+    EXPECT_TRUE(plan.peer_fetches.empty());
+    EXPECT_TRUE(reader.TakePeerLookups().empty());
+    EXPECT_EQ(PrefillRows(plan), (std::vector<std::pair<std::string, std::int32_t>>{{"queued", 0}}));
+    EXPECT_EQ(reader.GetPeerStats().frozen_targets, 1u);
+    EXPECT_EQ(reader.GetPeerStats().landing_requests, 0u);
 }
 
 TEST(DevicePeerChoice, TimelyLongHitAfterFourSecondRoundUsesReaderDevicePages) {
@@ -546,7 +668,7 @@ TEST_P(PeerSchedulerTest, AReaderLandsTheHoldersPrefixAndComputesTheRest) {
                                      [group](const PeerPage& page) { return page.group_id == group; });
     };
     EXPECT_EQ(destinations_of(0), static_cast<std::ptrdiff_t>(tokens.size() / kP)) << "every full page";
-    if (GetParam()) {
+    if (GetParam().hybrid) {
         EXPECT_EQ(destinations_of(1), 2) << "the window behind the landing's end";
         EXPECT_EQ(destinations_of(2), 1) << "the State group's live slot";
         EXPECT_TRUE(std::ranges::any_of(fetch.destinations, [](const PeerPage& page) {
@@ -999,9 +1121,13 @@ SchedulerConfig HostLandingConfigFor(const std::string& name, bool hybrid) {
     return cfg;
 }
 
-class PeerHostLandingTest : public ::testing::TestWithParam<bool>, protected PeerPair {
+class PeerHostLandingTest : public ::testing::TestWithParam<PeerCacheScenario>, protected PeerPair {
 protected:
-    PeerHostLandingTest() : PeerPair(PeerConfigFor("holder", GetParam()), HostLandingConfigFor("reader", GetParam())) {}
+    PeerHostLandingTest()
+        : PeerPair(PeerPolicyConfig(PeerConfigFor("holder", GetParam().hybrid), GetParam(),
+                                    SchedulerConfig::HostWritePolicy::kWriteThrough),
+                   PeerPolicyConfig(HostLandingConfigFor("reader", GetParam().hybrid), GetParam(),
+                                    GetParam().reader_write_policy)) {}
 
     void HolderComputes(const std::vector<std::int32_t>& tokens) {
         holder_.SubmitRequests({RequestSpec{.request_id = "h", .tokens = tokens, .max_new_tokens = 1}});
@@ -1024,8 +1150,8 @@ protected:
     }
 };
 
-INSTANTIATE_TEST_SUITE_P(Groups, PeerHostLandingTest, ::testing::Bool(),
-                         [](const ::testing::TestParamInfo<bool>& info) { return info.param ? "Hybrid" : "Full"; });
+INSTANTIATE_TEST_SUITE_P(Groups, PeerHostLandingTest, ::testing::ValuesIn(kPeerCacheScenarios),
+                         [](const ::testing::TestParamInfo<PeerCacheScenario>& info) { return info.param.name; });
 
 TEST_P(PeerHostLandingTest, ALandingIntoHostIsAdmittedAsAHostHit) {
     const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
@@ -1042,7 +1168,7 @@ TEST_P(PeerHostLandingTest, ALandingIntoHostIsAdmittedAsAHostHit) {
                                      [group](const PeerPage& page) { return page.group_id == group; });
     };
     EXPECT_EQ(destinations_of(0), static_cast<std::ptrdiff_t>(tokens.size() / kP)) << "every full page";
-    if (GetParam()) {
+    if (GetParam().hybrid) {
         EXPECT_EQ(destinations_of(1), 2) << "the window behind the landing's end";
         EXPECT_TRUE(std::ranges::any_of(fetch.destinations, [](const PeerPage& page) {
             return page.group_id == 2 && page.slot == kPeerStateSlot;
