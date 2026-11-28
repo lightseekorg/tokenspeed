@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     _index_k_layernorm_fp8_scatter_row,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 _is_nvidia = current_platform().is_nvidia
 
@@ -607,7 +608,10 @@ def quantize_index_query_weights(
     if tokens:
         # One head per program while the grid is small, eight once rows fill the GPU.
         per_program = 1 if tokens * heads <= 4096 else 8
-        _quantize_index_query_weights_kernel[(tokens, triton.cdiv(heads, per_program))](
+        kernel_launcher(
+            _quantize_index_query_weights_kernel,
+            (tokens, triton.cdiv(heads, per_program)),
+        )(
             *args,
             DIM=q.shape[2],
             HEADS_PER_PROGRAM=per_program,
@@ -615,6 +619,16 @@ def quantize_index_query_weights(
             num_stages=1,
         )
     return q_fp8, folded
+
+
+# Batch size selects (HEADS_PER_PROGRAM, num_warps) from (1, 1) or (8, 4).
+register_triton_warmup(
+    _quantize_index_query_weights_kernel,
+    variants=(
+        {"HEADS_PER_PROGRAM": (1,), "num_warps": (1,)},
+        {"HEADS_PER_PROGRAM": (8,), "num_warps": (4,)},
+    ),
+)
 
 
 @triton.jit

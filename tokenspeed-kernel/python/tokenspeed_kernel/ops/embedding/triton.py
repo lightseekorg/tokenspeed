@@ -203,18 +203,18 @@ def _mla_rope_set_kv_buffer_token(
     q_nope_ptr,
     write_mask_ptr,
     loc_stride: tl.constexpr,
-    q_rope_stride_t: tl.constexpr,
-    q_rope_stride_h: tl.constexpr,
-    k_nope_stride_t: tl.constexpr,
-    k_rope_stride_t: tl.constexpr,
-    q_out_rope_stride_t: tl.constexpr,
-    q_out_rope_stride_h: tl.constexpr,
+    q_rope_stride_t,
+    q_rope_stride_h,
+    k_nope_stride_t,
+    k_rope_stride_t,
+    q_out_rope_stride_t,
+    q_out_rope_stride_h,
     kv_buffer_stride_t,
     kv_buffer_stride_p,
     PAGE_SIZE: tl.constexpr,
     cos_sin_stride_p: tl.constexpr,
-    q_nope_stride_t: tl.constexpr,
-    q_nope_stride_h: tl.constexpr,
+    q_nope_stride_t,
+    q_nope_stride_h,
     num_q_heads: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
@@ -321,8 +321,21 @@ def _mla_rope_set_kv_buffer_token(
         tl.store(kv_base + nope_dim + pair_hi, k2_out, mask=half_store)
 
 
-# num_tokens is unspecialized so counts of 1 or multiples of 16 share one binary.
-@triton.jit(do_not_specialize=["num_tokens"])
+# num_tokens and tensor strides are unspecialized so counts of 1 or multiples
+# of 16 and views sliced from different projection layouts share one binary.
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "q_rope_stride_t",
+        "q_rope_stride_h",
+        "k_nope_stride_t",
+        "k_rope_stride_t",
+        "q_out_rope_stride_t",
+        "q_out_rope_stride_h",
+        "q_nope_stride_t",
+        "q_nope_stride_h",
+    ]
+)
 def _mla_rope_set_kv_buffer_kernel(
     q_rope_ptr,
     k_nope_ptr,
@@ -336,18 +349,18 @@ def _mla_rope_set_kv_buffer_kernel(
     num_tokens,
     write_mask_ptr,
     loc_stride: tl.constexpr,
-    q_rope_stride_t: tl.constexpr,
-    q_rope_stride_h: tl.constexpr,
-    k_nope_stride_t: tl.constexpr,
-    k_rope_stride_t: tl.constexpr,
-    q_out_rope_stride_t: tl.constexpr,
-    q_out_rope_stride_h: tl.constexpr,
+    q_rope_stride_t,
+    q_rope_stride_h,
+    k_nope_stride_t,
+    k_rope_stride_t,
+    q_out_rope_stride_t,
+    q_out_rope_stride_h,
     kv_buffer_stride_t,
     kv_buffer_stride_p,
     PAGE_SIZE: tl.constexpr,
     cos_sin_stride_p: tl.constexpr,
-    q_nope_stride_t: tl.constexpr,
-    q_nope_stride_h: tl.constexpr,
+    q_nope_stride_t,
+    q_nope_stride_h,
     num_q_heads: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,

@@ -202,6 +202,50 @@ def test_sigmoid_mul_compiles_once_per_tile_width(device: str) -> None:
             run(tokens)
 
 
+def test_sigmoid_mul_warmup_and_gate_strides_reuse_binaries(device: str) -> None:
+    """One warmup covers both tile widths, and varying gate pitches reuse them."""
+    heads, head_dim = 12, 128
+    hidden_dim = heads * head_dim
+    x = torch.randn(600, hidden_dim, device=device, dtype=torch.bfloat16)
+
+    def run(tokens: int, extra_cols: int, head_pad: int) -> None:
+        packed = torch.randn(
+            tokens,
+            heads * (head_dim + head_pad) + extra_cols,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        if head_pad == 0:
+            gate = packed[:, :hidden_dim]
+        else:
+            gate = packed[:, : heads * (head_dim + head_pad)].view(
+                tokens, heads, head_dim + head_pad
+            )[:, :, :head_dim]
+        ref = torch_sigmoid_mul(x[:tokens], gate, None)
+        out = sigmoid_mul(x[:tokens].clone(), gate)
+        tol = 1e-2
+        torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
+
+    def warm() -> None:
+        with kernel_warmup(enabled=True):
+            run(1, 0, 0)
+
+    assert_warmup_covers(
+        (activation_triton._sigmoid_mul_kernel,),
+        warm,
+        lambda case: run(*case),
+        (
+            (1, 0, 0),
+            (16, 2112, 0),
+            (37, 13, 0),
+            (511, 0, 128),
+            (512, 0, 0),
+            (600, 2112, 0),
+            (600, 7, 3),
+        ),
+    )
+
+
 @pytest.mark.parametrize("head_bias", [False, True])
 @pytest.mark.parametrize("layout", ["2d", "3d", "strided"])
 def test_sigmoid_mul_launch_arguments(

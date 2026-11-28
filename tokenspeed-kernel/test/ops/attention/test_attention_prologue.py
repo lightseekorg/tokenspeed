@@ -2677,6 +2677,67 @@ def test_mla_token_count_needs_one_binary_per_token_tile():
     assert_warmup_covers((_mla_rope_set_kv_buffer_kernel,), warm, run, sweep)
 
 
+def test_mla_rope_set_kv_buffer_reuses_binary_across_row_strides():
+    """Views sliced from different projection layouts share one binary."""
+    from tokenspeed_kernel.ops.embedding.triton import _mla_rope_set_kv_buffer_kernel
+    from utils import assert_no_triton_compile
+
+    heads, rank, rope = 4, 512, 64
+    tokens = 16
+    table = cos_sin_cache(rope)
+    positions = torch.arange(tokens, device="cuda")
+    q_nope, q_pe, latent = mla_inputs(tokens, heads, rank, rope, seed=205)
+
+    ref_cache = poisoned_latent(64, rank + rope, BF16)
+    ref = mla_prologue(
+        mla_query(q_nope, rope),
+        q_pe,
+        latent,
+        expanded=None,
+        rotary=Rotary(table, positions, RopeStyle.NEOX, None),
+        cache=latent_target(ref_cache, positions),
+        solution="triton",
+        override=None,
+    )
+
+    def run_with_pads(q_row_pad: int, q_head_pad: int, kv_row_pad: int) -> None:
+        packed_q = torch.zeros(
+            tokens, heads * (rope + q_head_pad) + q_row_pad, device="cuda", dtype=BF16
+        )
+        q_pe_view = packed_q[:, : heads * (rope + q_head_pad)].view(
+            tokens, heads, rope + q_head_pad
+        )[:, :, :rope]
+        q_pe_view.copy_(q_pe)
+        packed_kv = torch.zeros(
+            tokens, rank + rope + kv_row_pad, device="cuda", dtype=BF16
+        )
+        latent_view = packed_kv[:, : rank + rope]
+        latent_view.copy_(latent)
+        cache = poisoned_latent(64, rank + rope, BF16)
+        out = mla_prologue(
+            mla_query(q_nope, rope),
+            q_pe_view,
+            latent_view,
+            expanded=None,
+            rotary=Rotary(table, positions, RopeStyle.NEOX, None),
+            cache=latent_target(cache, positions),
+            solution="triton",
+            override=None,
+        )
+        assert bytes_equal(out.query, ref.query)
+        assert bytes_equal(cache[:tokens], ref_cache[:tokens])
+
+    with assert_no_triton_compile(_mla_rope_set_kv_buffer_kernel):
+        # 8 BF16 elements = 16 bytes (row-aligned for check_mla_request), while
+        # not a multiple of 16 elements (exercises unspecialized element strides).
+        for q_row_pad, q_head_pad, kv_row_pad in (
+            (512, 0, 0),
+            (0, 128, 64),
+            (8, 8, 8),
+        ):
+            run_with_pads(q_row_pad, q_head_pad, kv_row_pad)
+
+
 @pytest.mark.parametrize("fused", ["composite", "triton"])
 @pytest.mark.parametrize("masked", [False, True])
 def test_the_storeless_prologue_and_latent_store_write_the_fused_bytes(masked, fused):

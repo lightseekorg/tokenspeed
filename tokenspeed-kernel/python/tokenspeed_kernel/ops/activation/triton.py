@@ -329,15 +329,17 @@ register_triton_warmup(
 )
 
 
-@triton.jit
+# Gate strides follow the caller's packed projection layout; keep them runtime
+# and unspecialized so views with different row or head pitches share one binary.
+@triton.jit(do_not_specialize=["gate_row_stride", "gate_head_stride"])
 def _sigmoid_mul_kernel(
     x_ptr,
     gate_ptr,
     bias_ptr,
     hidden_dim: tl.constexpr,
     head_dim: tl.constexpr,
-    gate_row_stride: tl.constexpr,
-    gate_head_stride: tl.constexpr,
+    gate_row_stride,
+    gate_head_stride,
     BLOCK_SIZE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
@@ -456,7 +458,7 @@ def sigmoid_mul(
     grid = (num_tokens, triton.cdiv(hidden_dim, BLOCK_SIZE))
     enable_pdl = pdl_enabled()
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
-    _sigmoid_mul_kernel[grid](
+    kernel_launcher(_sigmoid_mul_kernel, grid)(
         x,
         gate,
         head_bias,
@@ -469,6 +471,19 @@ def sigmoid_mul(
         **pdl_kwargs,
     )
     return x
+
+
+def _sigmoid_mul_warmup_variants(
+    args: Mapping[str, Any],
+) -> tuple[dict[str, tuple[int, ...]], ...]:
+    # Decode (< 512 tokens) takes 512-column tiles; prefill takes 2048-column tiles.
+    width_pow2 = triton.next_power_of_2(args["hidden_dim"])
+    return (
+        {"BLOCK_SIZE": tuple(sorted({min(512, width_pow2), min(2048, width_pow2)}))},
+    )
+
+
+register_triton_warmup(_sigmoid_mul_kernel, variants=_sigmoid_mul_warmup_variants)
 
 
 @triton.jit

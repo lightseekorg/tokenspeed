@@ -25,7 +25,10 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.kvcache import host_transfer
-from tokenspeed_kernel.ops.kvcache.triton import _transfer_cache_blocks_kernel
+from tokenspeed_kernel.ops.kvcache.triton import (
+    _transfer_cache_blocks_kernel,
+    _wait_layer_ready_kernel,
+)
 from utils import assert_no_triton_compile
 
 
@@ -242,3 +245,19 @@ def test_each_layers_transfer_reuses_one_binary():
         span = slice(layer * width, (layer + 1) * width)
         expected[2 * stride :][span] = device[2 * stride :][span]
     assert torch.equal(host, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_wait_layer_ready_reuses_one_binary():
+    """Waiting on any layer index or 4-byte-shifted flag slice shares one binary."""
+    if not host_transfer.layer_ready_ptx_supported():
+        pytest.skip("layer-ready flags require NVIDIA PTX")
+    flags = torch.ones(40, dtype=torch.int32, device="cuda")
+    host_transfer.wait_layer_ready(flags, 0)
+    torch.cuda.synchronize()
+    with assert_no_triton_compile(_wait_layer_ready_kernel):
+        for offset in (0, 1, 2, 3):
+            view = flags[offset:]
+            for layer_index in (0, 1, 2, 15, 16, 17):
+                host_transfer.wait_layer_ready(view, layer_index)
+        torch.cuda.synchronize()
