@@ -120,8 +120,23 @@ def resolve_dtype(kv_cache_dtype_str: str) -> torch.dtype:
     elif kv_cache_dtype_str == "mxfp8":
         # fp8-e4m3 data; the UE8M0 scale sidecar lives in the pool's scale buffers (kv_cache_mxfp8)
         return torch.float8_e4m3fn
+    elif kv_cache_dtype_str == "mxfp4":
+        # Packed E2M1 bytes with the UE8M0 scales in the same page (kv_cache_mxfp4)
+        return torch.uint8
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {kv_cache_dtype_str!r}")
+
+
+MXFP4_KV_BLOCK = 32
+
+
+def mxfp4_row_bytes(head_dim: int) -> int:
+    """Bytes of one MXFP4 head row: head_dim/2 E2M1 bytes plus one scale per 32."""
+    if head_dim % MXFP4_KV_BLOCK:
+        raise ValueError(
+            f"mxfp4 KV cache needs head_dim a multiple of {MXFP4_KV_BLOCK}, got {head_dim}"
+        )
+    return head_dim // 2 + head_dim // MXFP4_KV_BLOCK
 
 
 @dataclass(kw_only=True)
@@ -194,6 +209,8 @@ class AttnConfig:
     kv_cache_quant_method: str
     # MXFP8 KV: UE8M0 vec-32 scale sidecar in pool buffers; kv_cache_dtype alone can't express it
     kv_cache_mxfp8: bool = False
+    # MXFP4 KV: each page holds packed E2M1 rows then their UE8M0 scales (uint8 pool)
+    kv_cache_mxfp4: bool = False
     # Tokens covered by one attention-kernel page. None picks the backend's
     # per-kernel default (flexible kernels use their group's block
     # granularity; fixed-page kernels use their own constant). For the
@@ -360,6 +377,7 @@ def model_wide_kwargs(
     *,
     kv_cache_dtype: torch.dtype,
     kv_cache_mxfp8: bool = False,
+    kv_cache_mxfp4: bool = False,
     draft_block_decode: bool = False,
     draft_block_causal: bool = False,
     speculative_num_draft_tokens: int | None = None,
@@ -390,6 +408,7 @@ def model_wide_kwargs(
         dtype=model_config.dtype,
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_mxfp8=kv_cache_mxfp8,
+        kv_cache_mxfp4=kv_cache_mxfp4,
         kv_cache_quant_method=server_args.kv_cache_quant_method,
         context_len=model_config.context_len + server_args.spec_context_pad,
         max_bs=max_bs,

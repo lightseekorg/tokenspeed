@@ -183,6 +183,7 @@ class MHAAttnBackend(PagedAttentionBackend):
         self.qkv_dtype = config.dtype
         self.kv_cache_dtype = config.kv_cache_dtype
         self.is_mxfp8 = bool(config.kv_cache_mxfp8)
+        self.is_mxfp4 = bool(config.kv_cache_mxfp4)
         # mxfp8 shares the fp8 storage dtype but uses block scales; keep it off
         # the per-tensor casts
         self.is_fp8 = (
@@ -522,6 +523,111 @@ class MHAAttnBackend(PagedAttentionBackend):
         # or runs the separate op after where none here can.
         return True
 
+    # ------------------------------------------------------------------
+    # MXFP4 KV
+    # ------------------------------------------------------------------
+
+    def _mxfp4_decode(self, q, layer, token_to_kv_pool, gate):
+        """The prologue stored this step's rows; attend and gate in one launch."""
+        from tokenspeed_kernel.ops.attention.mxfp4_kv import mxfp4_decode
+
+        if layer.logit_cap or layer.sliding_window_sink or self.draft_block_decode:
+            raise NotImplementedError(
+                "mxfp4 KV decode: no logit cap, sinks or block drafts"
+            )
+        k_planes, v_planes = token_to_kv_pool.kernel_planes(layer.layer_id)
+        metadata = self.forward_decode_metadata
+        output = mxfp4_decode(
+            q,
+            k_planes,
+            v_planes,
+            metadata.page_table,
+            metadata.seq_lens,
+            window_left=layer.sliding_window_size,
+            qlen=q.shape[0] // metadata.seq_lens.shape[0],
+            softmax_scale=layer.scaling,
+            gate=None if gate is None else gate.gate,
+            gate_eps=0.0 if gate is None else gate.eps,
+        )
+        return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _mxfp4_extend(self, q, k, v, layer, token_to_kv_pool, sinks):
+        from tokenspeed_kernel.ops.attention.mxfp4_kv import mxfp4_extend
+
+        if layer.logit_cap or layer.sliding_window_sink or sinks is not None:
+            raise NotImplementedError("mxfp4 KV extend: no logit cap or sinks")
+        metadata = self.forward_extend_metadata
+        if not metadata.is_mixed and metadata.max_extend_prefix_len == 0:
+            # A fresh prefill attends its own BF16 rows, as an FP8 cache does.
+            return self._forward_prefill(q, k, v, layer, metadata, sinks)
+        k_planes, v_planes = token_to_kv_pool.kernel_planes(layer.layer_id)
+        (q,) = _slice_extend_inputs(metadata, q)
+        # A full layer reads the whole prefix, which the BF16 kernel does
+        # ~2x faster even after dequantizing it; a sliding layer reads one
+        # window, too little to repay the dequant.
+        if not metadata.is_mixed and layer.sliding_window_size < 0:
+            return self._mxfp4_extend_dequant(q, layer, k_planes, v_planes, metadata)
+        output = mxfp4_extend(
+            q,
+            k_planes,
+            v_planes,
+            metadata.page_table,
+            metadata.seq_lens,
+            metadata.cu_extend_seq_lens,
+            metadata.max_extend_seq_len,
+            window_left=layer.sliding_window_size,
+            softmax_scale=layer.scaling,
+        )
+        return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _mxfp4_extend_dequant(self, q, layer, k_planes, v_planes, metadata):
+        """w4a16 extend: dequantize the pages this batch can see to BF16 and
+        run the BF16 cached-prefix kernel on them.
+
+        A sliding layer would see only the pages from ``prefix - window`` on;
+        the rest map to a zeroed page 0 the kernel masks out."""
+        from tokenspeed_kernel.ops.attention.mxfp4_kv import mxfp4_dequant_pages
+
+        page = self.kernel_page_size
+        page_table = metadata.page_table
+        cols = torch.arange(page_table.shape[1], device=page_table.device)
+        end_page = (metadata.seq_lens + page - 1) // page
+        visible = cols[None, :] < end_page[:, None]
+        if layer.sliding_window_size >= 0:
+            first = (metadata.extend_prefix_lens - layer.sliding_window_size).clamp_(
+                min=0
+            ) // page
+            visible &= cols[None, :] >= first[:, None]
+        flat = visible.reshape(-1)
+        order = flat.cumsum(0, dtype=torch.int32)
+        n = int(order[-1])
+        dense_table = torch.where(visible, order.view_as(visible), 0)
+        shape = (n + 1, page, layer.tp_k_head_num, layer.qk_head_dim)
+        k_pages = torch.empty(shape, dtype=q.dtype, device=q.device)
+        v_pages = torch.empty(shape, dtype=q.dtype, device=q.device)
+        k_pages[0].zero_()
+        v_pages[0].zero_()
+        mxfp4_dequant_pages(
+            k_planes, v_planes, page_table.reshape(-1)[flat], k_pages[1:], v_pages[1:]
+        )
+        output = mha_extend_with_kvcache(
+            q=q,
+            cu_seqlens_q=metadata.cu_extend_seq_lens,
+            cu_seqlens_kv=metadata.cu_seqlens_kv,
+            k_cache=k_pages,
+            v_cache=v_pages,
+            page_table=dense_table.to(page_table.dtype),
+            cache_seqlens=metadata.seq_lens,
+            max_seqlen_q=metadata.max_extend_seq_len,
+            max_seqlen_k=metadata.max_seqlen_k,
+            is_causal=True,
+            window_left=layer.sliding_window_size,
+            logit_cap=layer.logit_cap,
+            sinks=None,
+            solution=self.kernel_solution,
+        )
+        return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -538,6 +644,8 @@ class MHAAttnBackend(PagedAttentionBackend):
         assert layer.qk_head_dim == layer.v_head_dim
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        if self.is_mxfp4:
+            return self._mxfp4_decode(q, layer, token_to_kv_pool, rmsnorm_output_gate)
         metadata = self.forward_decode_metadata
         max_seqlen_q = q.shape[0] // metadata.seq_lens.shape[0]
 
@@ -752,6 +860,8 @@ class MHAAttnBackend(PagedAttentionBackend):
 
         metadata = self.forward_extend_metadata
         sinks = kwargs.get("sinks")
+        if self.is_mxfp4:
+            return self._mxfp4_extend(q, k, v, layer, token_to_kv_pool, sinks)
         plan = self.plan(
             window_left=layer.sliding_window_size,
             logit_cap=layer.logit_cap,

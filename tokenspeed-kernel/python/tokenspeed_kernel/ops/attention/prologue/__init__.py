@@ -62,6 +62,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     MLAExpandedKV,
     MLAPrologueOutput,
     MRope,
+    MXFP4Scales,
     MXFP8Scales,
     PerTokenHeadPlanes,
     RelativeHeadNorm,
@@ -171,7 +172,7 @@ def gqa_prologue(
             f"not {query_dtype}"
         )
     num_tokens = q.shape[0]
-    num_kv_heads, head_dim = cache.k_cache.shape[-2:]
+    num_kv_heads, head_dim = cache.geometry
     num_q_heads = q.shape[1:].numel() // head_dim
 
     traits = {
@@ -473,6 +474,7 @@ __all__ = [
     "MLAExpandedKV",
     "MLAPrologueOutput",
     "MRope",
+    "MXFP4Scales",
     "MXFP8Scales",
     "PerTokenHeadPlanes",
     "RelativeHeadNorm",

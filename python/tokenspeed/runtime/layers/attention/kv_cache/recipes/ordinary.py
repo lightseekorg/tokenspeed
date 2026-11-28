@@ -37,6 +37,7 @@ from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
+    mxfp4_row_bytes,
 )
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     DSAConfig,
@@ -354,6 +355,20 @@ def mha_layer_fields(config, rows: int, layer_id: int, occurrence: int):
     head_dim = spec.head_dim
     if rows <= 0 or kv_heads <= 0 or head_dim <= 0:
         raise ValueError("MHA full-attention geometry must be positive")
+    if config.kv_cache_mxfp4:
+        # One page: [rows, heads, head_dim/2] E2M1 bytes, then [rows, heads,
+        # head_dim/32] UE8M0 scales; the [rows, heads, row_bytes] field shape
+        # carries the same bytes.
+        shape = (rows, kv_heads, mxfp4_row_bytes(head_dim))
+        kv_dtype = cache_dtype_name(torch.uint8)
+        return (
+            CacheFieldSpec(
+                f"layer.{layer_id}.k", f"unit.{occurrence}.k", shape, kv_dtype
+            ),
+            CacheFieldSpec(
+                f"layer.{layer_id}.v", f"unit.{occurrence}.v", shape, kv_dtype
+            ),
+        )
     shape = (rows, kv_heads, head_dim)
     kv_dtype = (
         # MXFP8 writes go through dtype-aware kernels, so the arena keeps the

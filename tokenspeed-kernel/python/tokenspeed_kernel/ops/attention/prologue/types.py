@@ -52,6 +52,7 @@ class KVCacheFormat(Enum):
     MXFP8 = "mxfp8"
     FP8_PER_TENSOR = "fp8_per_tensor"
     FP8_PER_TOKEN_HEAD = "fp8_per_token_head"
+    MXFP4 = "mxfp4"
 
 
 @dataclass(frozen=True)
@@ -231,6 +232,21 @@ class MXFP8Scales:
 
 
 @dataclass(frozen=True)
+class MXFP4Scales:
+    """UE8M0 scale planes of an MXFP4 cache, one biased exponent per 32
+    channels: ``[pages, rows, heads, head_dim // 32]`` uint8 views whose page
+    stride is that of the packed E2M1 planes they pair with.
+
+    Attributes:
+        k: Key scale plane.
+        v: Value scale plane.
+    """
+
+    k: torch.Tensor
+    v: torch.Tensor
+
+
+@dataclass(frozen=True)
 class FP8TensorScales:
     """Per-tensor scales of an FP8 cache: its rows hold ``K / k`` and ``V / v``.
 
@@ -254,28 +270,39 @@ class HeadKVCache:
     Attributes:
         k_cache: ``[slots, heads, dim]`` or ``[pages, rows, heads, dim]``;
             native and unit-scale FP8 writes preserve the field's actual
-            page stride.
+            page stride. An MXFP4 cache holds ``[pages, rows, heads,
+            dim // 2]`` packed E2M1 bytes, the even channel in the low nibble.
         v_cache: Same geometry and dtype as ``k_cache``.
-        scales: The scale planes of an MXFP8 cache, the per-tensor scales of
-            an FP8 one, or ``None`` for a unit-scale cache.
+        scales: The scale planes of an MXFP8 or MXFP4 cache, the per-tensor
+            scales of an FP8 one, or ``None`` for a unit-scale cache.
         slots: Dense 1-D destination slot of each written row; rows past its
             length (graph padding) are not written.
     """
 
     k_cache: torch.Tensor
     v_cache: torch.Tensor
-    scales: MXFP8Scales | FP8TensorScales | None
+    scales: MXFP8Scales | MXFP4Scales | FP8TensorScales | None
     slots: torch.Tensor
 
     @property
     def format(self) -> KVCacheFormat:
         if isinstance(self.scales, MXFP8Scales):
             return KVCacheFormat.MXFP8
+        if isinstance(self.scales, MXFP4Scales):
+            return KVCacheFormat.MXFP4
         if isinstance(self.scales, FP8TensorScales):
             return KVCacheFormat.FP8_PER_TENSOR
         if self.k_cache.dtype == torch.float8_e4m3fn:
             return KVCacheFormat.FP8
         return KVCacheFormat.NATIVE
+
+    @property
+    def geometry(self) -> tuple[int, int]:
+        """``(kv_heads, head_dim)`` of the rows this cache holds."""
+        heads, width = self.k_cache.shape[-2:]
+        if isinstance(self.scales, MXFP4Scales):
+            return heads, 2 * width
+        return heads, width
 
 
 @dataclass(frozen=True)

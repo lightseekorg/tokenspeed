@@ -23,8 +23,13 @@ from __future__ import annotations
 from typing import ClassVar
 
 import torch
+from tokenspeed_kernel.ops.attention.mxfp4_kv import (
+    mxfp4_cache_planes,
+    mxfp4_store_kv,
+)
 from tokenspeed_kernel.ops.attention.prologue import (
     HeadKVCache,
+    MXFP4Scales,
     MXFP8Scales,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -450,3 +455,85 @@ class MHATokenToKVPoolMXFP8(MHATokenToKVPool):
         }.values():
             v_size += sf.numel() * sf.element_size()
         return k_size, v_size
+
+
+class MHATokenToKVPoolMXFP4(MHATokenToKVPool):
+    """MHA KV pool storing OCP MXFP4 head rows.
+
+    A layer's K (or V) field is ``[rows, heads, head_dim // 2 + head_dim //
+    32]`` uint8, so the arena sizes it exactly, and its bytes are kernel
+    pages: each holds ``[page, heads, head_dim // 2]`` packed E2M1 rows (even
+    channel in the low nibble), then their ``[page, heads, head_dim // 32]``
+    UE8M0 exponents (``tokenspeed_kernel.ops.attention.mxfp4_kv``).
+
+    The layout depends on the attention kernel's page size, which the
+    attention backend states when it sizes its page tables
+    (``atom_pages_per_block``); the planes are defined from then on.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if self._layer_kv_head_counts is not None:
+            raise NotImplementedError("mxfp4 KV cache needs uniform K/V head counts")
+        self._kernel_page_size: dict[str, int] = {}
+        self._planes: dict[int, tuple[tuple, tuple]] = {}
+
+    @override
+    def atom_pages_per_block(
+        self, group_id: str, kernel_page_size: int, *, write_slot_dtype: torch.dtype
+    ) -> int:
+        bound = self._kernel_page_size.setdefault(group_id, kernel_page_size)
+        if bound != kernel_page_size:
+            raise ValueError(
+                f"cache group {group_id!r} holds MXFP4 pages of {bound} rows; "
+                f"a kernel reads them as {kernel_page_size}"
+            )
+        return super().atom_pages_per_block(
+            group_id, kernel_page_size, write_slot_dtype=write_slot_dtype
+        )
+
+    def kernel_planes(self, layer_id: int) -> tuple[tuple, tuple]:
+        """``((k_data, k_scales), (v_data, v_scales))`` of one layer
+        (``mxfp4_cache_planes``), after its layer-wise load."""
+        k_buffer, v_buffer = self.get_kv_buffer(layer_id)
+        planes = self._planes.get(layer_id)
+        if planes is None:
+            group = self.history_group_by_layer()[layer_id]
+            page_size = self._kernel_page_size.get(group)
+            if page_size is None:
+                raise RuntimeError(
+                    f"layer {layer_id}: no attention kernel has bound the "
+                    f"MXFP4 page size of cache group {group!r}"
+                )
+            planes = (
+                mxfp4_cache_planes(k_buffer, page_size, self.head_dim),
+                mxfp4_cache_planes(v_buffer, page_size, self.head_dim),
+            )
+            self._planes[layer_id] = planes
+        return planes
+
+    @override
+    def kv_write_target(
+        self, layer_id: int, slots: torch.Tensor, write_mask: torch.Tensor | None
+    ) -> HeadKVCache:
+        """The data planes, with the scale planes as the cache's scales: the
+        prologue quantizes the rows as it writes them."""
+        _head_rows_are_never_masked(write_mask)
+        (k_data, k_scales), (v_data, v_scales) = self.kernel_planes(layer_id)
+        return HeadKVCache(
+            k_cache=k_data,
+            v_cache=v_data,
+            scales=MXFP4Scales(k=k_scales, v=v_scales),
+            slots=slots,
+        )
+
+    @override
+    def set_kv_buffer(self, layer, loc, cache_k, cache_v):
+        k_planes, v_planes = self.kernel_planes(layer.layer_id)
+        mxfp4_store_kv(
+            cache_k.view(-1, self.head_num, self.head_dim),
+            cache_v.view(-1, self.head_num, self.head_dim),
+            loc,
+            k_planes,
+            v_planes,
+        )
