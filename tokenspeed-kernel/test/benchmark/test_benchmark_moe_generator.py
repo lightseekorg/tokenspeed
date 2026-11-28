@@ -1130,8 +1130,15 @@ def test_softmax_topk_generator_selection_matches_operation_api(
     assert captured[0] == captured[1]
 
 
+@pytest.mark.parametrize(
+    "model_profile, tp_size, intermediate_per_partition",
+    [("qwen38_flash_tp1", 1, 640), ("qwen38_flash_tp2", 2, 320)],
+)
 def test_moe_apply_generator_plans_dynamic_mxfp4_activations(
     monkeypatch: pytest.MonkeyPatch,
+    model_profile: str,
+    tp_size: int,
+    intermediate_per_partition: int,
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -1143,13 +1150,14 @@ def test_moe_apply_generator_plans_dynamic_mxfp4_activations(
     monkeypatch.setattr(moe_ops, "moe_plan", capture_plan)
     request = _qwen38_request(
         "apply",
+        model_profile=model_profile,
         tokens=64,
         hidden_size=2560,
         intermediate_size=640,
         num_experts=512,
         num_local_experts=512,
         topk=10,
-        tp_size=2,
+        tp_size=tp_size,
         ep_size=1,
         ep_rank=0,
         input_dtype="bfloat16",
@@ -1169,7 +1177,7 @@ def test_moe_apply_generator_plans_dynamic_mxfp4_activations(
 
     assert captured["weight_dtype"] == "mxfp4"
     assert captured["internal_activation_dtype"] == "mxfp4"
-    assert captured["ispp"] == 320
+    assert captured["ispp"] == intermediate_per_partition
 
 
 def _muse_apply_request(**overrides: object) -> BenchmarkRequest:

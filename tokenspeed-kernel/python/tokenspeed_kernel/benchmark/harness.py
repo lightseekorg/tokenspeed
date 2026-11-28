@@ -176,7 +176,12 @@ def set_benchmark_generator(
 def _load_builtin_generators() -> None:
     from tokenspeed_kernel.benchmark.generators.dsa import (
         prepare_dsa_decode,
+        prepare_dsa_decode_dcp_records,
+        prepare_dsa_decode_projected_value,
+        prepare_dsa_decode_topk,
+        prepare_dsa_index_candidates,
         prepare_dsa_prefill,
+        prepare_dsa_select_owned_candidates,
         prepare_kpool_decode_append,
         prepare_kpool_decode_topk,
         prepare_kpool_prefill_topk,
@@ -281,6 +286,23 @@ def _load_builtin_generators() -> None:
         ("attention", "kpool_decode_topk"), prepare_kpool_decode_topk
     )
     _BENCHMARK_GENERATORS.setdefault(("attention", "dsa_decode"), prepare_dsa_decode)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "dsa_decode_topk"), prepare_dsa_decode_topk
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "dsa_decode_projected_value"),
+        prepare_dsa_decode_projected_value,
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "dsa_index_candidates"), prepare_dsa_index_candidates
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "dsa_select_owned_candidates"),
+        prepare_dsa_select_owned_candidates,
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "dsa_decode_dcp_records"), prepare_dsa_decode_dcp_records
+    )
     _BENCHMARK_GENERATORS.setdefault(
         ("attention", "mha_decode_with_kvcache"), prepare_mha_decode
     )

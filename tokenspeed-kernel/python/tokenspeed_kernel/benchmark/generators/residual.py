@@ -56,7 +56,9 @@ __all__ = [
 _IMPLEMENTED_MODEL_PROFILES = frozenset({"kimi_k3_tp8"})
 _IMPLEMENTED_MHC_MODEL_PROFILES = frozenset({"dsv41_flash_tp4"})
 _IMPLEMENTED_GLM_MHC_MODEL_PROFILES = frozenset({"glm53_flash_tp4"})
-_IMPLEMENTED_HC_MIX_MODEL_PROFILES = frozenset({"qwen38_flash_tp2"})
+# The streams and their projections are replicated, so the mix is the same
+# at every TP size.
+_IMPLEMENTED_HC_MIX_MODEL_PROFILES = frozenset({"qwen38_flash_tp1", "qwen38_flash_tp2"})
 _IMPLEMENTED_GATED_BOUNDARY_MODEL_PROFILES = frozenset({"muse_spark_tp8"})
 _GATED_BOUNDARY_OUTPUTS = frozenset({"fp32_and_bf16", "bf16"})
 

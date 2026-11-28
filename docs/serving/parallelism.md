@@ -1017,12 +1017,12 @@ fused all-reduce, or an `--all2all-backend` transport.
 
 ## Headless plugin registration
 
-A compatible headless launcher can register a plugin's numerical profiles
+A compatible headless launcher can register a plugin's typed server arguments and numerical profiles
 before parsing, start the engine ranks, and finish the supervisor's plugin
 registration while the ranks initialize. The full registration must finish
-before the supervisor reports readiness. Compatibility requires the plugin's
-`register_cli_options()` hook and a supported set of enabled plugins. Other
-installations use eager plugin loading.
+before the supervisor reports readiness. Every enabled runtime plugin must provide a
+`register_extra_server_args()` hook that registers its complete argument policy
+without execution dependencies. Otherwise all plugins use eager loading.
 
 ## Runtime notes
 

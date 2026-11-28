@@ -33,7 +33,7 @@ mixer's inject logits: ``h_b + bf16(out) * 2 sigmoid(inject_b)``.
 Every task serves every row of the launch:
 
 * router (M3), 65 blocks of 8 router rows (BF16); the last block is the
-  shared expert gate. Past 2 rows, two tasks per block split the rows
+  shared expert gate. Past 2 rows, the tasks of a block split the rows
   (:func:`router_rows`). M3 publishes the 512 logits as BF16.
 * expert up (M4), 200 routed tasks: rank ``r`` (0-9) x 32 intermediate
   columns, then the shared expert's tasks (:func:`shared_blocks` blocks of
@@ -86,8 +86,12 @@ REGIONS = (
 
 def shared_blocks(rows: int) -> int:
     """32-column blocks of the shared expert per M4 task. Past one row, a
-    task reads its weights once for every row, so it takes more blocks."""
-    return {1: 1, 2: 2}.get(rows, 4)
+    task reads its weights once for every row, so it takes more blocks, as
+    many as the MFMA's 16 rows hold (a block per ``next_power_of_2(rows)``
+    rows, at most 4)."""
+    if rows <= 2:
+        return rows
+    return min(4, 16 // triton.next_power_of_2(rows))
 
 
 def up_tasks(rows: int) -> int:
@@ -97,8 +101,9 @@ def up_tasks(rows: int) -> int:
 
 def router_rows(rows: int) -> int:
     """Rows of one router task. Past two rows, two: the tasks of a block of
-    experts split the rows, so a task's per-row work stays short."""
-    return 2 if rows > 2 else rows
+    experts split the rows, so a task's per-row work stays short. Past four
+    rows, four, so the stage fits the grid in one round."""
+    return rows if rows <= 2 else (2 if rows <= 4 else 4)
 
 
 def stages(
@@ -233,8 +238,10 @@ def router_stage(mb, task, weights, X: gl.constexpr, STAGE: gl.constexpr):
 
 @gluon.constexpr_function
 def _task_rows(plan):
-    """:func:`router_rows` of a launch's plan."""
-    return 2 if plan.plan.rows > 2 else plan.plan.rows
+    """:func:`router_rows` of a launch's plan (a copy: a compile-time
+    function reads no plain Python function)."""
+    rows = plan.plan.rows
+    return rows if rows <= 2 else (2 if rows <= 4 else 4)
 
 
 @gluon.jit
@@ -245,7 +252,8 @@ def _up_tiles(
     (``routes`` from :func:`routing`): blocks ``4 q .. 4 q + 3`` (gate, up,
     gate, up rows of columns ``32 q ..``) of an expert. A routed rank's
     unit is a row: the row's expert, block ``q = task % 20``. A shared expert
-    task's unit is its block ``q = C (task - 200) + unit``.
+    task's unit is its block ``q = C (task - 200) + unit`` (its last block
+    for the units past its ``C`` blocks).
 
     The shared expert's blocks alternate like the banks'. Thus every unit is
     one load sequence with a scalar base. A branch per rank would join two
@@ -259,7 +267,9 @@ def _up_tiles(
     expert = wave_uniform_i32(_pick(row, rank)).to(gl.int64)
     q = task % 20
     if C > 1:
-        q = gl.where(routed, q, (task - TOP_K * 20) * C + unit)
+        # A shared task's units past its C blocks (more rows than blocks)
+        # read its last block again, from L2: they keep the loads in range.
+        q = gl.where(routed, q, (task - TOP_K * 20) * C + _last_row(unit, C))
     if routed:
         tiles, scales = mx.load_weight_tiles(
             weights.w13 + expert * (2 * INTER * HIDDEN // 2),
@@ -877,7 +887,7 @@ def down_stage(
     """
     mb.stamp("m5", trace.START)
     routes = routing(mb)
-    head = _down_issue(task, routes, weights, schedule.rows(mb.plan))
+    head = _down_issue(task, routes, weights, mb.plan)
     _down_finish(mb, task, routes, head, weights, out, M, W, OUT)
 
 
@@ -955,7 +965,7 @@ def _up_finish(
         loaded += (_up_tiles(task, u, routes, weights, R, C),)
     head = ()
     if (U == 1) & DOWN:
-        head = _down_issue(down_task, routes, weights, R)
+        head = _down_issue(down_task, routes, weights, mb.plan)
     RP: gl.constexpr = xs_smem.shape[0]
     acc = mx.gemv_zero(2, 4)
     m = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(2, acc.type.layout)))
@@ -969,7 +979,7 @@ def _up_finish(
             loaded += (_up_tiles(task, u + 2, routes, weights, R, C),)
         elif (u + 2 == U) & DOWN:
             # M5's first chains stream while M4's last unit computes.
-            head = _down_issue(down_task, routes, weights, R)
+            head = _down_issue(down_task, routes, weights, mb.plan)
         # MFMA row m keeps row m % RP of unit u: a routed task's row u, or
         # every row of a shared task's block m // RP. A shared task publishes
         # its blocks after its last load.
@@ -999,8 +1009,12 @@ def _last_row(unit, rows):
 
 @gluon.constexpr_function
 def _shared_blocks(plan):
-    """:func:`shared_blocks` of a launch's plan."""
-    return {1: 1, 2: 2}.get(plan.plan.rows, 4)
+    """:func:`shared_blocks` of a launch's plan (a copy: a compile-time
+    function reads no plain Python function)."""
+    rows = plan.plan.rows
+    if rows <= 2:
+        return rows
+    return min(4, 16 // triton.next_power_of_2(rows))
 
 
 @gluon.constexpr_function
@@ -1014,14 +1028,74 @@ def _before_poll(groups):
     return max(1, groups - 1)
 
 
+# M5 runs the rows in passes of at most this many rows: a pass's chains,
+# LDS and registers are those of a launch of that many rows, and the passes
+# run one after another (a row's chains and epilogue do not depend on the
+# other rows of its pass).
+DOWN_PASS_ROWS = gl.constexpr(4)
+
+
+@gluon.constexpr_function
+def down_passes(plan):
+    """M5's passes of :data:`DOWN_PASS_ROWS` rows of a launch's plan."""
+    return -(-plan.plan.rows // DOWN_PASS_ROWS.value)
+
+
+@gluon.constexpr_function
+def pass_plan(plan, p):
+    """The plan of M5's pass ``p``: ``plan`` itself for one pass, else the
+    plan of the pass's rows. A mailbox of it at the pass's first row
+    (:func:`pass_mailbox`) addresses those rows' regions."""
+    first = p * DOWN_PASS_ROWS.value
+    if plan.plan.rows <= DOWN_PASS_ROWS.value:
+        return plan
+    rows = min(DOWN_PASS_ROWS.value, plan.plan.rows - first)
+    return plan.plan.with_rows(rows).key
+
+
 @gluon.jit
-def _down_issue(task, routes, weights, R: gl.constexpr):
-    """Issue M5 task ``task``'s weight and scale loads of its first chain
-    group."""
+def pass_mailbox(mb, p: gl.constexpr):
+    """The mailbox of M5's pass ``p`` (:func:`pass_plan`)."""
+    return mailbox.Mailbox(
+        mb.row(p * DOWN_PASS_ROWS).scratch,
+        mb.tag,
+        pass_plan(mb.plan, p),
+        mb.trace,
+        mb.peers,
+        mb.stuck,
+    )
+
+
+@gluon.jit
+def pass_routes(routes, p: gl.constexpr, PLAN: gl.constexpr):
+    """The rows of M5's pass ``p`` of :func:`routing`'s ``routes``, in its
+    layout for the pass's rows (through LDS). ``PLAN`` is the launch's."""
+    experts, weights = routes
+    if down_passes(PLAN) > 1:
+        RP: gl.constexpr = experts.shape[0]
+        NP: gl.constexpr = triton.next_power_of_2(schedule.rows(pass_plan(PLAN, p)))
+        flat: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+        e_smem = gl.allocate_shared_memory(gl.int32, [RP, 16], flat, experts)
+        w_smem = gl.allocate_shared_memory(gl.float32, [RP, 16], flat, weights)
+        gl.barrier()
+        rl: gl.constexpr = gl.BlockedLayout(
+            [NP, 1], [1, 64], [gl.num_warps(), 1], [1, 0]
+        )
+        experts = e_smem.slice(p * DOWN_PASS_ROWS, NP, 0).load(rl)
+        weights = w_smem.slice(p * DOWN_PASS_ROWS, NP, 0).load(rl)
+    return experts, weights
+
+
+@gluon.jit
+def _down_issue(task, routes, weights, PLAN: gl.constexpr):
+    """Issue M5 task ``task``'s weight and scale loads of the first chain
+    group of its first pass (``PLAN``: the launch's plan)."""
+    R: gl.constexpr = schedule.rows(pass_plan(PLAN, 0))
+    first = pass_routes(routes, 0, PLAN)
     return (
         (
-            _down_tiles(task, 0, routes[0], weights, R),
-            _down_scale_words(task, 0, routes[0], weights, R),
+            _down_tiles(task, 0, first[0], weights, R),
+            _down_scale_words(task, 0, first[0], weights, R),
         ),
     )
 
@@ -1039,10 +1113,43 @@ def _down_finish(
     OUT: gl.constexpr,
 ):
     """M5 task ``task`` for every row, with the first chain groups' loads
-    (``head``) already issued. The task issues every other group's loads,
-    then polls every row's inputs. A poll waits for the loads, which land
-    while the slowest M4 task finishes. Then the groups' chains run, and one
-    epilogue serves every row.
+    of the first pass (``head``) already issued. Each pass
+    (:func:`pass_plan`) serves its rows as :func:`_down_pass`.
+    """
+    for p in gl.static_range(down_passes(mb.plan)):
+        first = ()
+        if p == 0:
+            first = head
+        _down_pass(
+            pass_mailbox(mb, p),
+            task,
+            pass_routes(routes, p, mb.plan),
+            first,
+            weights,
+            out + p * DOWN_PASS_ROWS * (4 * HIDDEN),
+            M,
+            W,
+            OUT,
+        )
+
+
+@gluon.jit
+def _down_pass(
+    mb,
+    task,
+    routes,
+    head,
+    weights,
+    out,
+    M: gl.constexpr,
+    W: gl.constexpr,
+    OUT: gl.constexpr,
+):
+    """M5 task ``task`` for every row of ``mb`` (a pass's mailbox), with
+    the first chain groups' loads (``head``) already issued. The task issues
+    every other group's loads, then polls every row's inputs. A poll waits
+    for the loads, which land while the slowest M4 task finishes. Then the
+    groups' chains run, and one epilogue serves every row.
     """
     R: gl.constexpr = schedule.rows(mb.plan)
     G: gl.constexpr = _chain_groups(R)

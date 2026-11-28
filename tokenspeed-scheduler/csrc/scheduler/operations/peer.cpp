@@ -507,6 +507,16 @@ void Scheduler::preparePeer(Request& request) {
     if (submitted == nullptr) {
         return;
     }
+    if (!peer_frozen_targets_.empty() && !request.PeerHolder().empty()) {
+        // A failed read still owns Device pages and may occupy the reader's
+        // transport workers. Do not add landings, including previously answered
+        // offers, until TargetRetired releases every frozen target. Normal local
+        // admission can use the remaining cache capacity (cache-concepts.md).
+        submitted->admission.peer_hit.reset();
+        submitted->admission.peer_prepared = true;
+        request.peer_local_reason = "reader_retirement_pending";
+        return;
+    }
     // A prompt its holder answered lands into Host before its admission; not
     // while frozen, so a flush or a weight update waits for no new landing.
     if (peer_host_landings_ && submitted->admission.peer_hit && forward_allowed_) {
