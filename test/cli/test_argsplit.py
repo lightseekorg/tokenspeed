@@ -135,6 +135,33 @@ def test_multi_value_capture_sizes_route_to_engine():
         assert r.gateway == []
 
 
+@pytest.mark.parametrize(
+    "flag,values",
+    [
+        ("--disk-tier-paths", ["/mnt/nvme0/ts", "/mnt/nvme1/ts"]),
+        ("--cudagraph-capture-sizes", ["288", "320"]),
+    ],
+)
+def test_multi_value_engine_flag_is_derived_from_server_args(flag, values):
+    """The splitter reads nargs from ServerArgs instead of a copied list.
+
+    A multi-value engine flag that the splitter does not know is parsed as a
+    scalar, so every value after the first is rejected as a stray positional
+    argument and `ts serve` refuses to start.
+    """
+    r = _split([flag, *values, "--disk-tier-io", "psync"])
+    assert r.engine == [flag, *values, "--disk-tier-io", "psync"]
+    assert r.gateway == []
+
+
+def test_every_multi_value_server_arg_flag_is_repeating():
+    """No ServerArgs nargs='+'/'*' flag may be classified as scalar."""
+    from tokenspeed.cli import _argsplit
+
+    _, multi_value = _argsplit._engine_flag_groups()
+    assert "--disk-tier-paths" in multi_value
+
+
 def test_unknown_flag_falls_through_to_gateway():
     """smg's clap is the final authority on these."""
     r = _split(["--policy", "cache_aware"])
