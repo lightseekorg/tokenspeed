@@ -12,17 +12,35 @@
   },
   "cases": [
     {
-      "id": "muse_spark.residual.post_norm_residual_pre_norm/ffn-decode-bfloat16",
+      "id": "muse_spark.residual.post_norm_residual_pre_norm/tp8-attention-decode-bfloat16",
       "comparison_epoch": 1,
       "measurement_blocks": 50,
       "definition": {
         "family": "residual",
         "mode": "post_norm_residual_pre_norm",
         "parameters": {
-          "tokens": [
-            1,
-            16
-          ],
+          "tokens": [32, 64],
+          "post_weighted": false,
+          "pre_weighted": true,
+          "outputs": "fp32_and_bf16"
+        },
+        "cold_cache": true,
+        "seed": 5733
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.residual.post_norm_residual_pre_norm/tp8-ffn-decode-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "residual",
+        "mode": "post_norm_residual_pre_norm",
+        "parameters": {
+          "tokens": [24, 40, 64],
           "post_weighted": true,
           "pre_weighted": true,
           "outputs": "bf16"
@@ -36,15 +54,35 @@
       }
     },
     {
-      "id": "muse_spark.residual.post_norm_residual_pre_norm/ffn-prefill-bfloat16",
+      "id": "muse_spark.residual.post_norm_residual_pre_norm/tp8-attention-owned-bfloat16",
       "comparison_epoch": 1,
+      "measurement_blocks": 30,
       "definition": {
         "family": "residual",
         "mode": "post_norm_residual_pre_norm",
         "parameters": {
-          "tokens": [
-            1024
-          ],
+          "tokens": [200, 1024],
+          "post_weighted": false,
+          "pre_weighted": true,
+          "outputs": "fp32_and_bf16"
+        },
+        "cold_cache": true,
+        "seed": 5732
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 2.0
+      }
+    },
+    {
+      "id": "muse_spark.residual.post_norm_residual_pre_norm/tp8-ffn-owned-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "residual",
+        "mode": "post_norm_residual_pre_norm",
+        "parameters": {
+          "tokens": [200, 1024],
           "post_weighted": true,
           "pre_weighted": true,
           "outputs": "bf16"
@@ -58,25 +96,91 @@
       }
     },
     {
-      "id": "muse_spark.residual.post_norm_residual_pre_norm/attention-prefill-bfloat16",
+      "id": "muse_spark.residual.post_norm_residual_pre_norm/tp4-attention-decode-bfloat16",
       "comparison_epoch": 1,
+      "measurement_blocks": 50,
       "definition": {
         "family": "residual",
         "mode": "post_norm_residual_pre_norm",
         "parameters": {
-          "tokens": [
-            1024
-          ],
+          "model_profile": "muse_spark_tp4",
+          "tokens": [80, 104, 160],
           "post_weighted": false,
           "pre_weighted": true,
           "outputs": "fp32_and_bf16"
         },
         "cold_cache": true,
-        "seed": 5732
+        "seed": 5734
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.residual.post_norm_residual_pre_norm/tp4-ffn-decode-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 50,
+      "definition": {
+        "family": "residual",
+        "mode": "post_norm_residual_pre_norm",
+        "parameters": {
+          "model_profile": "muse_spark_tp4",
+          "tokens": [80, 160],
+          "post_weighted": true,
+          "pre_weighted": true,
+          "outputs": "bf16"
+        },
+        "cold_cache": true,
+        "seed": 5735
+      },
+      "policy": {
+        "max_regression_relative": 0.08,
+        "max_regression_absolute_us": 1.0
+      }
+    },
+    {
+      "id": "muse_spark.residual.post_norm_residual_pre_norm/tp4-attention-owned-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "residual",
+        "mode": "post_norm_residual_pre_norm",
+        "parameters": {
+          "model_profile": "muse_spark_tp4",
+          "tokens": [400, 6144],
+          "post_weighted": false,
+          "pre_weighted": true,
+          "outputs": "fp32_and_bf16"
+        },
+        "cold_cache": true,
+        "seed": 5736
       },
       "policy": {
         "max_regression_relative": 0.05,
-        "max_regression_absolute_us": 2.0
+        "max_regression_absolute_us": 3.0
+      }
+    },
+    {
+      "id": "muse_spark.residual.post_norm_residual_pre_norm/tp4-ffn-owned-bfloat16",
+      "comparison_epoch": 1,
+      "measurement_blocks": 30,
+      "definition": {
+        "family": "residual",
+        "mode": "post_norm_residual_pre_norm",
+        "parameters": {
+          "model_profile": "muse_spark_tp4",
+          "tokens": [400, 6144],
+          "post_weighted": true,
+          "pre_weighted": true,
+          "outputs": "bf16"
+        },
+        "cold_cache": true,
+        "seed": 5737
+      },
+      "policy": {
+        "max_regression_relative": 0.05,
+        "max_regression_absolute_us": 3.0
       }
     }
   ]

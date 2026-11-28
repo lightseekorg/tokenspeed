@@ -35,7 +35,11 @@ from tokenspeed_kernel.benchmark.harness import (
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    FormatSignature,
+    dense_tensor_format,
+    format_signature,
+)
 
 __all__ = [
     "prepare_gqa_prologue",
@@ -45,6 +49,16 @@ __all__ = [
 ]
 
 _ROPE_STYLES = frozenset({"gptj", "neox", "none"})
+# KV cache storage: the model dtype, or FP8 E4M3 at unit scale, as
+# ``--kv-cache-dtype fp8_e4m3`` stores it for a checkpoint without KV-cache
+# scales. Attention reads an FP8 cache with FP8 queries, as the serving
+# backend converts them.
+_KV_CACHE_DTYPES = {"bfloat16": torch.bfloat16, "float8_e4m3fn": torch.float8_e4m3fn}
+# The GQA prologue returns the query in the model dtype, or in FP8 for a
+# decode that reads an FP8 cache.
+_QUERY_DTYPES = _KV_CACHE_DTYPES
+# The decode output gate's RMSNorm epsilon; it does not affect timing.
+_OUTPUT_GATE_EPS = 1e-5
 
 
 def _invalid(message: str) -> BenchmarkCaseError:
@@ -56,6 +70,26 @@ def _positive(parameters: dict[str, Any], name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise _invalid(f"Attention {name} must be a positive integer")
     return value
+
+
+def _non_negative(parameters: dict[str, Any], name: str) -> int:
+    value = parameters[name]
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise _invalid(f"Attention {name} must be a non-negative integer")
+    return value
+
+
+def _dtype(
+    parameters: dict[str, Any], name: str, choices: dict[str, torch.dtype]
+) -> torch.dtype:
+    value = parameters[name]
+    if value not in choices:
+        raise _invalid(f"Attention {name} must be one of: {', '.join(choices)}")
+    return choices[value]
+
+
+def _dense_signature(roles: tuple[str, ...], dtype: torch.dtype) -> FormatSignature:
+    return format_signature(**{role: dense_tensor_format(dtype) for role in roles})
 
 
 def _flag(parameters: dict[str, Any], name: str) -> bool:
@@ -92,24 +126,36 @@ def _common(request: BenchmarkRequest) -> tuple[int, int, int, int]:
 def _selected_spec(
     request: BenchmarkRequest,
     platform: PlatformInfo,
-    roles: tuple[str, ...],
+    signature: FormatSignature,
     traits: dict[str, object],
+    feature_choices: tuple[frozenset[str] | None, ...],
 ) -> KernelSpec:
-    """Name the registration the operation's own selection resolves to."""
+    """Name the registration the operation's own selection resolves to.
+
+    ``feature_choices`` lists the feature sets the operation tries, most
+    preferred first (``(None,)`` for an operation that asks for none); the
+    first one a registration serves selects it.
+    """
     load_builtin_kernels()
-    try:
-        selected = select_kernel(
-            request.family,
-            request.mode,
-            format_signature(
-                **{role: dense_tensor_format(torch.bfloat16) for role in roles}
-            ),
-            platform=platform,
-            traits=traits,
-            solution=request.solution,
-            override=request.registration,
-        )
-    except NoKernelFoundError as error:
+    error: NoKernelFoundError | None = None
+    for features in feature_choices:
+        try:
+            selected = select_kernel(
+                request.family,
+                request.mode,
+                signature,
+                features=features,
+                platform=platform,
+                traits=traits,
+                solution=request.solution,
+                override=request.registration,
+            )
+        except NoKernelFoundError as miss:
+            error = miss
+            continue
+        break
+    else:
+        assert error is not None
         raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(error)) from error
     spec = KernelRegistry.get().get_by_name(selected.name)
     if spec is None:
@@ -129,9 +175,11 @@ def _paged_cache(
     page_size: int,
     num_kv_heads: int,
     head_dim: int,
+    kv_cache_dtype: torch.dtype,
     generator: torch.Generator,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return K/V page pools and a page table scattering each sequence's pages.
+    """Return K/V page pools in ``kv_cache_dtype`` and a page table scattering
+    each sequence's pages.
 
     Pages are assigned in a seeded random order, so consecutive pages of one
     sequence are not adjacent in memory, as after a serving cache has churned.
@@ -150,7 +198,9 @@ def _paged_cache(
         page_table[row, :pages] = order[start : start + pages]
         start += pages
     k_cache, v_cache = (
-        _randn((num_pages, page_size, num_kv_heads, head_dim), generator)
+        _randn((num_pages, page_size, num_kv_heads, head_dim), generator).to(
+            kv_cache_dtype
+        )
         for _ in range(2)
     )
     return k_cache, v_cache, page_table
@@ -165,6 +215,13 @@ def prepare_mha_decode(
     ``batch`` requests each attend ``q_len`` new query rows to a cache of
     ``context_tokens`` tokens (including the new rows). ``max_seqlen_k`` is the
     server's context limit, which kernels may use to size their KV splits.
+    ``kv_cache_dtype`` stores the cache (an FP8 cache is read with FP8
+    queries). ``output_gate`` passes a gate for the RMSNorm-sigmoid output
+    gate, which a kernel with the ``rmsnorm_output_gate`` feature applies
+    where it stores the output; with any other kernel the timed call also runs
+    the separate gate op. ``split_schedule`` passes the split schedule that
+    serving computes once a step, outside this call, for a target's
+    full-attention verify decode; it is computed before timing.
     """
 
     window_left, num_q_heads, num_kv_heads, head_dim = _common(request)
@@ -174,13 +231,52 @@ def prepare_mha_decode(
     context = _positive(parameters, "context_tokens")
     page_size = _positive(parameters, "page_size")
     max_seqlen_k = _positive(parameters, "max_seqlen_k")
+    kv_cache_dtype = _dtype(parameters, "kv_cache_dtype", _KV_CACHE_DTYPES)
+    output_gate = _flag(parameters, "output_gate")
+    split_schedule = _flag(parameters, "split_schedule")
     if not q_len <= context <= max_seqlen_k:
         raise _invalid("Attention needs q_len <= context_tokens <= max_seqlen_k")
+    if split_schedule and window_left >= 0:
+        raise _invalid("Attention split_schedule serves full attention only")
 
+    from tokenspeed_kernel.ops.attention.mha import (
+        mha_decode_schedule,
+        mha_decode_takes_schedule,
+        mha_decode_with_kvcache,
+    )
+
+    rows = batch * q_len
+    if split_schedule and not mha_decode_takes_schedule(
+        # Only the tensors' dtypes and shapes are read.
+        q=torch.empty(
+            (rows, num_q_heads, head_dim), dtype=kv_cache_dtype, device="meta"
+        ),
+        k_cache=torch.empty(
+            (1, page_size, num_kv_heads, head_dim), dtype=kv_cache_dtype, device="meta"
+        ),
+        v_cache=torch.empty(
+            (1, page_size, num_kv_heads, head_dim), dtype=kv_cache_dtype, device="meta"
+        ),
+        max_seqlen_q=q_len,
+        block_draft=False,
+        solution=request.solution,
+    ):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.NOT_APPLICABLE,
+            "No schedule-reading decode kernel serves these calls",
+        )
+    features = frozenset({"split_schedule"}) if split_schedule else frozenset()
+    # mha_decode_with_kvcache prefers a kernel that gates where it stores the
+    # output, for 64-wide heads; otherwise it runs the separate gate op after.
+    feature_choices = (
+        (features | {"rmsnorm_output_gate"}, features or None)
+        if output_gate and head_dim == 64
+        else (features or None,)
+    )
     spec = _selected_spec(
         request,
         platform,
-        ("q", "k_cache", "v_cache"),
+        _dense_signature(("q", "k_cache", "v_cache"), kv_cache_dtype),
         {
             "block_draft": False,
             "q_len": q_len,
@@ -190,16 +286,30 @@ def prepare_mha_decode(
             "return_lse": False,
             "sinks": False,
             "sliding_window": window_left >= 0,
+            "window_sink": False,
         },
+        feature_choices,
     )
     generator = torch.Generator(device="cuda").manual_seed(request.seed)
     k_cache, v_cache, page_table = _paged_cache(
-        [context] * batch, page_size, num_kv_heads, head_dim, generator
+        [context] * batch, page_size, num_kv_heads, head_dim, kv_cache_dtype, generator
     )
-    q = _randn((batch * q_len, num_q_heads, head_dim), generator)
+    q = _randn((rows, num_q_heads, head_dim), generator).to(kv_cache_dtype)
+    gate = _randn((rows, num_q_heads * head_dim), generator) if output_gate else None
     cache_seqlens = torch.full((batch,), context, dtype=torch.int32, device="cuda")
-
-    from tokenspeed_kernel.ops.attention.mha import mha_decode_with_kvcache
+    schedule = (
+        mha_decode_schedule(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_q=q_len,
+            block_draft=False,
+            solution=request.solution,
+        )
+        if split_schedule
+        else None
+    )
 
     def invoke() -> object:
         return mha_decode_with_kvcache(
@@ -211,9 +321,12 @@ def prepare_mha_decode(
             max_seqlen_k=max_seqlen_k,
             max_seqlen_q=q_len,
             window_left=window_left,
+            schedule=schedule,
             solution=request.solution,
             override=request.registration,
             block_draft=False,
+            output_gate=gate,
+            output_gate_eps=_OUTPUT_GATE_EPS if output_gate else None,
         )
 
     return PreparedBenchmark(
@@ -230,7 +343,9 @@ def prepare_mha_decode(
             "page_size": page_size,
             "window_left": window_left,
             "dtype": "bfloat16",
-            "kv_dtype": "bfloat16",
+            "kv_cache_dtype": parameters["kv_cache_dtype"],
+            "output_gate": output_gate,
+            "split_schedule": split_schedule,
         },
         validation=None,
     )
@@ -256,7 +371,7 @@ def prepare_mha_prefill(
     spec = _selected_spec(
         request,
         platform,
-        ("q", "k", "v"),
+        _dense_signature(("q", "k", "v"), torch.bfloat16),
         {
             "head_dim": head_dim,
             "logit_cap": False,
@@ -265,6 +380,7 @@ def prepare_mha_prefill(
             "skip_softmax": False,
             "sliding_window": window_left >= 0,
         },
+        (None,),
     )
     generator = torch.Generator(device="cuda").manual_seed(request.seed)
     q = _randn((total, num_q_heads, head_dim), generator)
@@ -311,25 +427,32 @@ def prepare_mha_extend(
     """Prepare one causal extend over a paged KV cache.
 
     ``sequences`` requests each append ``extend_tokens`` query rows after
-    ``prefix_tokens`` cached ones, as a later chunk of a chunked prefill does;
-    the cache already holds the new rows' K/V.
+    ``prefix_tokens`` cached ones (none for a prompt's first chunk), as a
+    chunk of a chunked prefill does; the cache already holds the new rows'
+    K/V. ``kv_cache_dtype`` stores the cache; an FP8 cache is read with FP8
+    queries. ``max_seqlen_k`` is the requests' length, as serving passes the
+    longest request's length: kernels read the cached prefix as
+    ``max_seqlen_k - max_seqlen_q``.
     """
 
     window_left, num_q_heads, num_kv_heads, head_dim = _common(request)
     parameters = request.parameters
     sequences = _positive(parameters, "sequences")
     extend_tokens = _positive(parameters, "extend_tokens")
-    prefix_tokens = _positive(parameters, "prefix_tokens")
+    prefix_tokens = _non_negative(parameters, "prefix_tokens")
     page_size = _positive(parameters, "page_size")
-    max_seqlen_k = _positive(parameters, "max_seqlen_k")
+    kv_cache_dtype = _dtype(parameters, "kv_cache_dtype", _KV_CACHE_DTYPES)
+    if "max_seqlen_k" in parameters:
+        raise _invalid(
+            "Attention extend takes max_seqlen_k from prefix_tokens and "
+            "extend_tokens, as serving passes the longest request's length"
+        )
     seq_len = prefix_tokens + extend_tokens
-    if seq_len > max_seqlen_k:
-        raise _invalid("Attention prefix and extend tokens exceed max_seqlen_k")
 
     spec = _selected_spec(
         request,
         platform,
-        ("q", "k_cache", "v_cache"),
+        _dense_signature(("q", "k_cache", "v_cache"), kv_cache_dtype),
         {
             "head_dim": head_dim,
             "page_size": page_size,
@@ -339,12 +462,20 @@ def prepare_mha_extend(
             "sinks": False,
             "sliding_window": window_left >= 0,
         },
+        (None,),
     )
     generator = torch.Generator(device="cuda").manual_seed(request.seed)
     k_cache, v_cache, page_table = _paged_cache(
-        [seq_len] * sequences, page_size, num_kv_heads, head_dim, generator
+        [seq_len] * sequences,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        kv_cache_dtype,
+        generator,
     )
-    q = _randn((sequences * extend_tokens, num_q_heads, head_dim), generator)
+    q = _randn((sequences * extend_tokens, num_q_heads, head_dim), generator).to(
+        kv_cache_dtype
+    )
     cu_seqlens_q = torch.arange(
         0,
         sequences * extend_tokens + 1,
@@ -369,7 +500,7 @@ def prepare_mha_extend(
             page_table=page_table,
             cache_seqlens=cache_seqlens,
             max_seqlen_q=extend_tokens,
-            max_seqlen_k=max_seqlen_k,
+            max_seqlen_k=seq_len,
             is_causal=True,
             window_left=window_left,
             solution=request.solution,
@@ -383,14 +514,14 @@ def prepare_mha_extend(
             "sequences": sequences,
             "extend_tokens": extend_tokens,
             "prefix_tokens": prefix_tokens,
-            "max_seqlen_k": max_seqlen_k,
+            "max_seqlen_k": seq_len,
             "num_q_heads": num_q_heads,
             "num_kv_heads": num_kv_heads,
             "head_dim": head_dim,
             "page_size": page_size,
             "window_left": window_left,
             "dtype": "bfloat16",
-            "kv_dtype": "bfloat16",
+            "kv_cache_dtype": parameters["kv_cache_dtype"],
         },
         validation=None,
     )
@@ -407,7 +538,10 @@ def prepare_gqa_prologue(
     applies the per-head RMSNorm and ``rope`` the rotary pairing (``"none"``
     for NoPE). Without either, the call only writes K/V rows that a producer
     already prepared. Rows go to distinct random slots of a ``cache_slots``
-    pool; positions are random below ``max_position``.
+    pool in ``kv_cache_dtype`` (the write converts BF16 rows to an FP8
+    cache); positions are random below ``max_position``. ``query_dtype`` is
+    the returned query's dtype: serving asks for FP8 in a decode that reads
+    an FP8 cache, and the model dtype otherwise.
     """
 
     if request.registration is not None and request.solution is not None:
@@ -426,6 +560,8 @@ def prepare_gqa_prologue(
     max_position = _positive(parameters, "max_position")
     has_norm = _flag(parameters, "has_norm")
     return_kv = _flag(parameters, "return_kv")
+    kv_cache_dtype = _dtype(parameters, "kv_cache_dtype", _KV_CACHE_DTYPES)
+    query_dtype = _dtype(parameters, "query_dtype", _QUERY_DTYPES)
     rope = parameters["rope"]
     if rope not in _ROPE_STYLES:
         raise _invalid(
@@ -449,18 +585,22 @@ def prepare_gqa_prologue(
     spec = _selected_spec(
         request,
         platform,
-        ("q",),
+        _dense_signature(("q",), torch.bfloat16),
         {
             "head_dim": head_dim,
             "token_heads": tokens * num_q_heads,
             "has_norm": has_norm,
-            "kv_format": "native",
+            "relative_norm": False,
+            "kv_conv": "none",
+            # An unscaled E4M3 cache is the FP8 format (HeadKVCache.format).
+            "kv_format": "fp8" if kv_cache_dtype is torch.float8_e4m3fn else "native",
             "kv_convert": False,
             "mrope": False,
             "partial_rotary": False,
             "return_kv": return_kv,
             "rope_style": rope,
         },
+        (None,),
     )
     generator = torch.Generator(device="cuda").manual_seed(request.seed)
     packed = _randn((tokens, qkv_row_stride), generator)
@@ -469,7 +609,7 @@ def prepare_gqa_prologue(
     v = packed[:, q_width + kv_width : q_width + 2 * kv_width]
     k_cache, v_cache = (
         torch.zeros(
-            (cache_slots, num_kv_heads, head_dim), dtype=torch.bfloat16, device="cuda"
+            (cache_slots, num_kv_heads, head_dim), dtype=kv_cache_dtype, device="cuda"
         )
         for _ in range(2)
     )
@@ -511,7 +651,7 @@ def prepare_gqa_prologue(
             norm=norm,
             rotary=rotary,
             cache=cache,
-            query_dtype=q.dtype,
+            query_dtype=query_dtype,
             return_kv=return_kv,
             solution=request.solution,
             override=request.registration,
@@ -532,7 +672,8 @@ def prepare_gqa_prologue(
             "rope": rope,
             "return_kv": return_kv,
             "dtype": "bfloat16",
-            "kv_dtype": "bfloat16",
+            "kv_cache_dtype": parameters["kv_cache_dtype"],
+            "query_dtype": parameters["query_dtype"],
         },
         validation=None,
     )

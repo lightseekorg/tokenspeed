@@ -63,6 +63,7 @@ __all__ = [
     "prepare_mv",
     "prepare_dense_bmm",
     "prepare_dense_mm",
+    "prepare_fp8_mm",
     "prepare_grouped_bf16_projection",
     "prepare_linear_attnres_partials",
     "prepare_mm",
@@ -95,6 +96,13 @@ _FP32_BLOCK_SCALE = ScaleFormat(
 _FP32_BLOCK_SIGNATURE = format_signature(
     a=tensor_format("mxfp8", _MXFP8_DTYPE, scale=_FP32_BLOCK_SCALE),
     b=tensor_format("mxfp8", _MXFP8_DTYPE, scale=_FP32_BLOCK_SCALE),
+)
+# E4M3 activations with one FP32 scale per row and weights with one per output
+# channel, as the dense FP8 projections (--dense-fp8-small-m) store them.
+_FP8_CHANNEL_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="channel")
+_FP8_CHANNEL_SIGNATURE = format_signature(
+    a=tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=_FP8_CHANNEL_SCALE),
+    b=tensor_format("scaled-fp8", torch.float8_e4m3fn, scale=_FP8_CHANNEL_SCALE),
 )
 
 
@@ -720,7 +728,101 @@ def prepare_mxfp8_mm(
     )
 
 
+def prepare_fp8_mm(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare an E4M3 GEMM with per-row activation and per-channel weight scales.
+
+    The case computes ``A @ B.T`` into a BF16 ``out[M, N]`` from E4M3 ``A[M,
+    K]`` with FP32 ``[M, 1]`` row scales and the KN view of a contiguous E4M3
+    ``B[N, K]`` with FP32 ``[N]`` channel scales, the operands a dense FP8
+    projection (``--dense-fp8-small-m``) hands ``mm(quant="fp8")``.
+    Selection uses ``mm``'s own traits for these operands.
+    """
+
+    _reject_unknown_parameters(request, {"M", "N", "K", "quant", "out_dtype"})
+    M = _positive_int(request.parameters.get("M"), "M")
+    N = _positive_int(request.parameters.get("N"), "N")
+    K = _positive_int(request.parameters.get("K"), "K")
+    if request.parameters.get("quant") != "fp8":
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "FP8 gemm.mm requires quant='fp8'",
+        )
+    out_dtype = _parse_dtype(request.parameters.get("out_dtype"))
+
+    from tokenspeed_kernel.ops import gemm as gemm_ops
+
+    generator = torch.Generator(device="cuda").manual_seed(request.seed)
+    A = torch.randn(
+        (M, K), device="cuda", dtype=torch.bfloat16, generator=generator
+    ).to(torch.float8_e4m3fn)
+    A_scales = torch.rand(
+        (M, 1), device="cuda", dtype=torch.float32, generator=generator
+    ).add_(0.5)
+    weight = torch.randn(
+        (N, K), device="cuda", dtype=torch.bfloat16, generator=generator
+    ).to(torch.float8_e4m3fn)
+    B = weight.t()
+    B_scales = torch.rand(
+        (N,), device="cuda", dtype=torch.float32, generator=generator
+    ).add_(0.5)
+    out = torch.empty((M, N), dtype=out_dtype, device="cuda")
+    # The traits mm selects with, read from these operands.
+    traits = gemm_ops._mm_traits(
+        A,
+        B,
+        A_scales,
+        B_scales,
+        M=M,
+        N=N,
+        K=K,
+        b_layout="KN",
+        out=out,
+        out_dtype=out_dtype,
+        alpha=None,
+        quant="fp8",
+        block_size=None,
+        enable_pdl=False,
+    )
+    load_builtin_kernels()
+    spec, selected = _select_registration(
+        request,
+        platform,
+        _FP8_CHANNEL_SIGNATURE,
+        traits,
+        {"M": M, "N": N, "K": K},
+    )
+
+    def invoke() -> torch.Tensor:
+        # mm's own call of the selected kernel.
+        return selected(
+            A, B, A_scales, B_scales, out_dtype, alpha=None, block_size=None, out=out
+        )
+
+    return _prepared_timing(
+        spec,
+        invoke,
+        {
+            "M": M,
+            "N": N,
+            "K": K,
+            "quant": "fp8",
+            "value_dtype": "float8_e4m3fn",
+            "scale_dtype": "float32",
+            "out_dtype": "bfloat16",
+            "a_layout": "MK",
+            "a_scales": "row",
+            "b_layout": "KN",
+            "b_scales": "channel",
+            "out_layout": "MN",
+        },
+    )
+
+
 _MM_GENERATORS: dict[str, Callable[..., PreparedBenchmark]] = {
+    "fp8": prepare_fp8_mm,
     "mxfp8": prepare_mxfp8_mm,
     "none": prepare_dense_mm,
 }
@@ -732,9 +834,10 @@ def prepare_mm(
 ) -> PreparedBenchmark:
     """Prepare a ``gemm.mm`` benchmark for the requested quantization.
 
-    ``quant`` is required: ``"none"`` selects dense GEMM and ``"mxfp8"``
+    ``quant`` is required: ``"none"`` selects dense GEMM, ``"mxfp8"``
     selects canonical E4M3 GEMM, with the explicit ``block_size`` choosing
-    E8M0 K32 or FP32 block128 scales.
+    E8M0 K32 or FP32 block128 scales, and ``"fp8"`` selects E4M3 GEMM with
+    per-row activation and per-channel weight scales.
     """
 
     quant = request.parameters.get("quant")

@@ -82,6 +82,91 @@ def test_mxfp8_mm_rejects_invalid_generator_parameters(
     assert raised.value.status is BenchmarkStatus.INVALID_CASE
 
 
+def _fp8_parameters(**updates):
+    # Muse Spark's TP4 QKV projection, run in FP8 at 33-128 decode rows.
+    parameters = {
+        "M": 64,
+        "N": 4608,
+        "K": 8192,
+        "quant": "fp8",
+        "out_dtype": "bfloat16",
+    }
+    parameters.update(updates)
+    return parameters
+
+
+@pytest.mark.parametrize(
+    ("parameters", "match"),
+    [
+        (_fp8_parameters(extra=1), "Unknown"),
+        (_fp8_parameters(quant="mxfp8"), "quant"),
+        (_fp8_parameters(out_dtype="float16"), "dtype"),
+        (_fp8_parameters(M=0), "M"),
+    ],
+)
+def test_fp8_mm_rejects_invalid_generator_parameters(mi350_platform, parameters, match):
+    request = BenchmarkRequest(
+        family="gemm",
+        mode="mm",
+        parameters=parameters,
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+    with pytest.raises(BenchmarkCaseError, match=match) as raised:
+        gemm_generator.prepare_fp8_mm(request, mi350_platform)
+
+    assert raised.value.status is BenchmarkStatus.INVALID_CASE
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU is required")
+def test_fp8_mm_times_the_registration_mm_dispatches():
+    from tokenspeed_kernel.ops.gemm import mm
+    from tokenspeed_kernel.profiling import ShapeCapture
+
+    request = _gemm_mm_request(_fp8_parameters())
+    try:
+        prepared = gemm_generator.prepare_mm(request, current_platform())
+    except BenchmarkCaseError as error:
+        if error.status is not BenchmarkStatus.NOT_APPLICABLE:
+            raise
+        pytest.skip(f"no FP8 channel-scaled GEMM serves this case here: {error}")
+
+    # The operands a dense FP8 projection hands mm: row-scaled E4M3 rows and
+    # the KN view of a channel-scaled E4M3 [N, K] weight.
+    rows = torch.randn((64, 8192), device="cuda").to(torch.float8_e4m3fn)
+    weight = torch.randn((4608, 8192), device="cuda").to(torch.float8_e4m3fn)
+    capture = ShapeCapture.get()
+    capture.clear()
+    capture.enabled = True
+    try:
+        mm(
+            rows,
+            weight.t(),
+            A_scales=torch.ones((64, 1), device="cuda"),
+            B_scales=torch.ones(4608, device="cuda"),
+            out_dtype=torch.bfloat16,
+            quant="fp8",
+        )
+        torch.cuda.synchronize()
+        dispatched = [record.kernel_name for record in capture._records]
+    finally:
+        capture.enabled = False
+        capture.clear()
+    assert dispatched == [prepared.registration.name]
+
+    result = KernelBenchmarkHarness(
+        GraphTimer(
+            GraphBenchmarkConfig(eager_warmup_iterations=1, replay_warmup_iterations=1)
+        ),
+        platform_provider=current_platform,
+    ).run(request, measurement_blocks=3)
+    assert result.status is BenchmarkStatus.SUCCESS, result.to_dict()
+    assert result.registration_name == prepared.registration.name
+
+
 def _gemm_mm_request(parameters, *, registration=None) -> BenchmarkRequest:
     return BenchmarkRequest(
         family="gemm",
