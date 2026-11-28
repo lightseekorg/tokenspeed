@@ -61,6 +61,23 @@ from tokenspeed.runtime.metrics.service import metrics_service
 # How long the relay waits for a message before checking for a stop.
 _POLL_MS = 100
 
+# Restore the launcher's sys.path before importing tokenspeed or replaying
+# reporter plugins so runtime sys.path additions survive subprocess isolation.
+_RELAY_BOOTSTRAP = (
+    "import sys\n"
+    "from multiprocessing.connection import Connection\n"
+    "with Connection(int(sys.argv[1])) as ready:\n"
+    "    sys.path[:] = ready.recv()\n"
+    "    from tokenspeed.runtime.metrics.relay import _serve_connection\n"
+    "    _serve_connection(ready)\n"
+)
+
+
+def _relay_sys_path() -> list[str]:
+    """Snapshot the launcher's import path, resolving '' to the working directory."""
+    cwd = os.getcwd() if "" in sys.path else ""
+    return [cwd if entry == "" else entry for entry in sys.path]
+
 
 def _reporter_entry_points(names: dict[str, MetricConfig]) -> list[str]:
     """Select successful launcher registrations, preserving override order."""
@@ -150,6 +167,7 @@ class MetricsRelay:
             f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
         )
         entry_points = _reporter_entry_points(producer_configs)
+        sys_path = _relay_sys_path()
         reader, writer = mp.Pipe()
         try:
             # A fresh module entry avoids multiprocessing.spawn re-importing
@@ -157,8 +175,9 @@ class MetricsRelay:
             self._process = subprocess.Popen(
                 [
                     sys.executable,
+                    "-P",
                     "-c",
-                    "from tokenspeed.runtime.metrics.relay import main; main()",
+                    _RELAY_BOOTSTRAP,
                     str(writer.fileno()),
                 ],
                 pass_fds=(writer.fileno(),),
@@ -169,6 +188,7 @@ class MetricsRelay:
         finally:
             writer.close()
         try:
+            reader.send(sys_path)
             reader.send((self.endpoint, producer_configs, entry_points))
             reader.recv()
         except (EOFError, BrokenPipeError, ConnectionResetError):
@@ -195,11 +215,17 @@ class MetricsRelay:
             self._process.wait(timeout=1.0)
 
 
+def _serve_connection(ready: Connection) -> None:
+    """Receive relay settings over ``ready`` and run until stopped."""
+    endpoint, configs, entry_points = ready.recv()
+    _relay_main(endpoint, configs, ready, entry_points)
+
+
 def main() -> None:
     """Start only the launcher's selected metric plugins in a fresh interpreter."""
     with Connection(int(sys.argv[1])) as ready:
-        endpoint, configs, entry_points = ready.recv()
-        _relay_main(endpoint, configs, ready, entry_points)
+        sys.path[:] = ready.recv()
+        _serve_connection(ready)
 
 
 if __name__ == "__main__":
