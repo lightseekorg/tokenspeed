@@ -9,6 +9,29 @@ pages. The logical endpoint is the base followed by
 `--mamba-ssm-dtype` (FP32 or BF16). Accumulation and history remain FP32.
 Materialization casts the result to the dense base dtype.
 
+Each slot also keeps, per layer, a ring of the request's raw pre-convolution
+QKV rows (`KdaPreconvRing`): R = T + 3 rows for a verify window T, in the
+convolution state's dtype. Positions count from the slot's last seed, not from
+the request's sequence position: seeding fills rows 0..2 with the three inputs
+before the next window, so a reseeded slot's first candidate goes to row 3
+whatever the request's length, and each later input takes the next row mod R.
+The three rows before a request's ring head are the convolution's history and
+its next window goes from the head on; the reads and writes of one verify
+never overlap. Every (slot, row, channel) of a ring is its own memory:
+`KdaPreconvRing` rejects expanded or overlapping row and slot strides, while
+strided views such as one layer of a `[slots, layers, R, channels]` ring stay
+valid. Beside the count, the slot's INT32
+ring state is 0 while the ring holds no rows (the page's convolution state is
+current), else the ring head plus one. The two form the replay state, INT32
+`[slots, 2]`, and every reset clears both. Between materializations a seeded
+ring, not the page, holds the request's convolution window: decode rounds
+write no page's convolution state, and a request's end, a retraction fold
+and a prefill continuation write the ring's last three inputs into the page
+before anything else reads it. At T = 4 on a Kimi-K3 TP8 rank
+(69 layers, 4608 channels) the ring is 7 rows of 0.6064 MiB: 4.245 MiB
+(4,451,328 bytes) a slot, beside 19.41 MiB of FP32 records at the default
+capacity of 16.
+
 ## CuTe prefill (`cutedsl_kda`)
 
 The backend selects FlashInfer's ordinary or persistent CuTe KDA scan, reading
@@ -30,13 +53,42 @@ persistent GPU scratch.
 
 ## Verify and publication
 
-`KdaRetainedRecords` supplies original pre-convolution QKV, the retained history,
-packed request boundaries, and generation/position stamps. For each batch row,
-`live_state_indices` selects the private physical page and `record_slots` selects
-the record storage and the count (`history.length`). Record slot zero is
+`KdaRetainedRecords` supplies the layer's pre-convolution ring, the retained
+history, packed request boundaries, and generation/position stamps. For each
+batch row, `live_state_indices` selects the private physical page and
+`record_slots` selects the record storage, the ring rows and the count
+(`history.length`, the count column of the replay state). Record slot zero is
 valid. Shared source pages hold dense checkpoints; the slot of a request
 starting from one holds no accepted records. Each live destination may alias
 only its own source.
+
+Every verify producer (the CuTe fused step and window kernels, the Triton
+split convolution producer, the AMD Gluon kernels) reads a request's three
+convolution taps from ring rows `(head - 3 + i) mod R` and writes candidate t's
+raw row to `(head + t) mod R`; `head` is the prepare's per-row snapshot
+(`KdaPreconvRing.heads`), loaded beside the record slot, so the tap loads wait
+on one round trip as the page-tap loads did. R is a compile-time value, so a
+compare and an add or subtract replace the modulo. The row index stays below
+R, so its INT32 math cannot wrap. A runtime row stride multiplies an INT64
+row offset; the CuTe kernels compile the pitch of a ring whose rows are
+contiguous (3 P channels) where that measured faster, and keep that offset,
+below R * 3 P, in INT32. A request takes part as in the retained prepare: its
+source and live pages lie in the pool and its record slot is resident.
+Padding rows read a zero history and write no row, and touch no slot's rows
+(slot 0 and empty rings included): the Triton producer and the one-token
+kernel predicate their tap loads and row stores off, and the window kernel,
+where predicated loads cost 10 to 35 us a round, points a padding row's tap
+loads at the layer's convolution weights, which no launch writes during a
+verify, and discards the values. A split verify runs
+the producer (which takes the live pages for that predicate) on the ring and
+then takes records without it (`preconv=None`). The producer runs one
+program per request, channel block and token tile (one tile for windows up to
+16 tokens at the default channel block), which loads its taps and inputs before it stores any ring or output
+row. The one-token kernel stores its ring rows with an L2 `evict_last` hint to
+ask L2 to retain them longer across surrounding state traffic. The ring must not share
+storage with the verify's projection inputs or outputs; the Triton producer,
+the fused CuTe entry points and the AMD launchers all reject such a ring
+before any launch.
 
 With a verify window T and a history capacity C, a count H overflows when it
 lies outside [0, C - T]. Verify applies `eff` records to the live base: H, or
@@ -46,27 +98,42 @@ compile-time capacity and window. It writes candidate U/K/decay into the
 request slot after `eff` records and never changes the base or the count.
 Rejected candidate suffixes need no clearing.
 
-Commit validates candidate stamps, updates convolution from original QKV, then
-publishes the request's count. Its UINT64 `[layers, 12]` descriptors contain
-the QKV and conv pointers, the page count, four strides, then the v-major
-recurrent-state pointer and its page, head, value and key strides; they carry
-no raw key/gate pointers. The count is not a layer's: the commit takes it as
-an INT32 `[slots, 1]` tensor, and `record_slots` selects each request's. The
-convolution launch reads the count in every `(layer, row)` program and never
-writes it; a second, one-dimensional launch then writes each carried row's
-count once, to `eff` plus the acceptance, with no scratch and no cross-program
-reduction. A row is carried when its source and live pages lie in the pool in
-a State group a launched layer lists, its record slot is resident and its
-window is non-empty; a row no layer carries (graph padding, a masked overlap
-row, a row paged only in groups no launched layer lists) keeps its count. A
-request whose slot is set in `request_stopped` ended in this forward: the
-convolution launch also folds its records, through this round's acceptance,
-into its live page (each program of a row takes some heads), and the count
-launch clears its count instead of advancing it. Other commits read no record
-and write no dense state. Stamp-ring capacity is independent of
-retained-history capacity.
+Commit is one launch per verify round. It publishes each request's count
+and ring state and, only for a request that ended in the forward, folds its
+records and writes the ring's window into its live page; a request that keeps
+decoding has no page written (the verify wrote candidate t to ring row
+`(head + t) mod R`, and the ring keeps the window). Its UINT64 `[layers, 13]`
+descriptors contain the ring and conv pointers, the page count, the ring row
+and three conv strides, the v-major recurrent-state pointer and its page, head,
+value and key strides, then the ring's record-slot stride; they carry no raw
+key/gate pointers. The replay state is not a layer's: the commit takes it as an
+INT32 `[slots, 2]` tensor, and `record_slots` selects each request's. Every
+program reads the round's `eff` and ring head from the prepare's snapshot
+(`replay_snapshot`, INT32 `[requests, 2]`), never the replay state the
+launch publishes. The launch's first `cdiv(batch, 256)` programs publish: each
+writes the count of up to 256 carried rows once, to `eff` plus the
+acceptance, and their ring states, to the row after the last accepted
+candidate plus one, with no scratch and no cross-program reduction. A row is
+carried when its source and live pages lie in the pool in a State group a
+launched layer lists, its record slot is resident and its window is
+non-empty; a row no layer carries (graph padding, a masked overlap row, a
+row paged only in groups no launched layer lists) keeps its count. The other
+`layers x min(heads, 16)` programs are end programs, one per layer and head
+split, so the grid does not grow with the batch times the channel blocks.
+Each loads the stop flags of up to 256 rows at once and visits only the rows
+whose request ended (whose slot is set in `request_stopped`): a request that
+keeps decoding costs its lane of those loads. For an ended row a layer
+carries, the program checks every accepted stamp, then folds the records,
+through this round's acceptance, into its heads of the live page and writes
+its slice of the channels of the ring's last three accepted inputs, rows
+`(head + take - 3 + i) mod R`, as the page's convolution taps; the publish
+programs clear the row's count and ring state instead of advancing them. End
+programs read only the snapshot, stamps, records and ring, and publish
+programs write only the replay state, so no program of the launch reads what
+another writes. Other commits read no record and write no dense state.
+Stamp-ring capacity is independent of retained-history capacity.
 Padding rows (a page at or below 0, or one past the checkpoint pool) leave all
-pages and counts untouched.
+pages, rings and replay states untouched.
 
 ## NVIDIA verification
 
@@ -101,19 +168,25 @@ records. Each history warp computes both products for up to four keys. It
 combines the even and odd U contributions in FP32. Empty histories use only
 the checkpoint products.
 Longer histories replay in record order into a private FP32 state tile.
-Convolution and count publication use the common retained commit ABI. A
-request that ended in the forward has its records folded into its live page by
-the commit; if a layer that carries it rejects its commit (stale stamps), that
-layer's convolution program raises the row's `request_ends` entry from
-`REQUEST_ENDED` to `REQUEST_ENDED_INCOMPLETE` (a compare-and-swap) instead, so
-the control plane never publishes a page that lacks accepted tokens.
+Count publication and end materialization use the common retained commit
+ABI. A request that ended in the forward has its records folded and its ring
+window written into its live page by the commit; if a layer that carries it
+rejects its commit (stale stamps), that layer's first end program raises the
+row's `request_ends` entry from `REQUEST_ENDED` to
+`REQUEST_ENDED_INCOMPLETE` (a compare-and-swap) instead, so the control plane
+never publishes a page that lacks accepted tokens or inputs.
 
 ## Retained preparation
 
-Verify reads each request's live page as its dense base and never writes a page
-or a count. Before a verify forward, the caller runs
+Verify reads each request's live page as its dense base and never writes a page,
+a count or a ring state. Before a verify forward, the caller runs
 `resolve_kda_batched_retained_prepare` once for every layer, in one launch,
-which reads the count H and never writes it. In each layer, a request whose H
+which reads the count H and the ring state and never writes them. A request
+whose ring state is 0 gets ring rows 0..2 of every layer it takes part in
+seeded from its source page's three convolution taps, the history the verify
+would otherwise have read there; its verify starts at ring head 3. The launch
+writes each row's snapshot: the count its verify applies (`eff`) and its ring
+head. Records overflow and page moves leave the ring alone. In each layer, a request whose H
 overflows (lies outside [0, C - T], with T the verify's window,
 `draft_token_num`) gets the source state with records [0, H) applied in its
 live page, in place where the pages did not move; an H past C applies none.
@@ -163,20 +236,35 @@ output. The norm's FP32 math and rounding order follow `rmsnorm_gated_sigmoid`.
 
 Prefill keeps the capacity-aware scan, native state layout, prepared CuTe plans,
 and cuDNN graph paths. Each layer's retained source is gathered and
-reconstructed in FP32 from the rows' counts before its scan. Every layer
-reads the same counts, so `kda_reset_retained_length` clears them once, in a
-launch ordered after the last KDA layer's gather; it skips padding rows (a
-live page at or below 0, or at or past the pool's `page_count`) as the gather
-does. Final/checkpoint dense stores use the selected base dtype. Before a retraction stores its image or anything
-reads the endpoint it published, `kda_materialize_retained_pages` folds each
-victim's records into the live page the scheduler lists, layer by layer, and
-`kda_reset_retained_length` then clears the slots' counts once.
+reconstructed in FP32 from the rows' counts before its scan, by
+`kda_materialize_retained_state`, which also writes a seeded ring's last
+three inputs over the taps the gather copied into the live page, before the
+prefill convolution reads them (an unseeded slot's page keeps the gathered
+taps). Every layer reads the same counts and ring states, so
+`kda_reset_retained_length` clears them once in a launch ordered after the
+last KDA layer's gather; it skips padding rows (a live page at or below 0, or
+at or past the pool's `page_count`) as the gather does. The next verify
+reseeds the ring from the page the prefill wrote. Final/checkpoint dense
+stores use the selected base dtype. Before a retraction stores its image or
+anything reads the endpoint it published, `kda_materialize_retained_pages`
+folds each victim's records into the live page the scheduler lists, layer by
+layer, and writes a seeded ring's last three inputs as that page's
+convolution state; `kda_reset_retained_length` then clears the slots' counts
+and ring states once. Records overflow (the prepare's fold) and page moves
+leave the ring as it is, so these, with a request's end in the commit, are
+the only points that write a page's convolution state from the ring.
 
 Retained numerical tests cover accepted-prefix rounds, boundary materialization,
-the fold at a request's end, private/shared pages, stale stamps, graph
-metadata refresh, strided arenas, FP32/BF16 base, norm fusion and scalar
-compile reuse. AMD uses the same retained
-contract through its registered Gluon kernels and the shared prepare.
+the fold and ring window at a request's end, the single commit launch over
+one and several stop-flag blocks and strided stop flags, retraction (into the
+listed page, whatever the history's live pages) and prefill materialization
+with and without a seeded ring, private/shared pages, stale stamps, graph metadata
+refresh, strided arenas, FP32/BF16 base, norm fusion, ring seeding, ring
+wrap, ring slots past 2**31 elements and scalar compile reuse. AMD uses the same retained
+contract through its registered Gluon kernels and the shared prepare. The
+runtime's `test/runtime/test_kda_preconv_ring.py` drives the ring's lifecycle
+through the backend: each decode round must give the same bits as a run whose
+ring is materialized and reseeded every round.
 
 The `kda_fused_paged_verify` and `kda_retained_commit` benchmarks accept
 `history_capacity` (default 16, at least `draft_token_num`).

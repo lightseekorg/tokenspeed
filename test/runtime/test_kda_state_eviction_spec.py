@@ -95,6 +95,27 @@ def _checkpoint_components(pool, pages_by_layer):
     }
 
 
+def _logical_window(backend, layer, page, request_slot):
+    """The convolution window the request's next verify reads.
+
+    While the request slot's pre-convolution ring holds rows (ring state
+    above 0), the three ring rows before its head are the window and the
+    page's convolution state is stale; otherwise the page holds it.
+    """
+    conv = backend.kv_pool.get_component(layer, "conv_state")[page].clone()
+    if backend._preconv_ring is None:
+        # No decode has allocated the request-slot workspace yet.
+        return conv
+    ring_state = int(backend._replay_state[request_slot, 1].item())
+    if ring_state:
+        ring = backend._preconv_ring[
+            request_slot, backend._descriptor_row_by_layer[layer]
+        ]
+        head, rows = ring_state - 1, ring.shape[0]
+        conv = ring[[(head - 3 + i) % rows for i in range(3)]].T.clone()
+    return conv
+
+
 class _KDA:
     def __init__(self, *, width: int, pool=None):
         if pool is None:
@@ -229,9 +250,18 @@ class _KDA:
                     self.backend, layer, tables[group][0][STATE_LIVE_SLOT], request_slot
                 )
                 if component == "recurrent_state" and request_slot is not None
-                else self.pool.get_component(layer, component)[
-                    tables[group][0][STATE_LIVE_SLOT]
-                ].clone()
+                else (
+                    _logical_window(
+                        self.backend,
+                        layer,
+                        tables[group][0][STATE_LIVE_SLOT],
+                        request_slot,
+                    )
+                    if request_slot is not None
+                    else self.pool.get_component(layer, component)[
+                        tables[group][0][STATE_LIVE_SLOT]
+                    ].clone()
+                )
             )
             for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True)
             for component in _COMPONENTS

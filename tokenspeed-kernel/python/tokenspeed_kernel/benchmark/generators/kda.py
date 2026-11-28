@@ -597,14 +597,28 @@ def _history_capacity(parameters: Mapping[str, Any], window: int) -> int:
 
 
 def _retained_benchmark_layer(
-    common, window, capacity, generator, reads, live, metadata, stamps, count, verified
+    common,
+    window,
+    capacity,
+    generator,
+    reads,
+    live,
+    metadata,
+    stamps,
+    replay,
+    verified,
+    heads,
 ):
-    """One layer's verify inputs over the request slots' shared counts.
+    """One layer's verify inputs over the request slots' shared replay state.
 
-    ``count`` is the INT32 [slots, 1] accepted count every layer shares and
-    ``verified`` the count its verify reads: the same tensor when no commit
-    follows, else a copy of the round's starting count, which the timed
-    commits leave as it is.
+    ``replay`` is the INT32 [slots, 2] count and ring state every layer
+    shares and ``verified`` the [slots, 1] count its verify reads: replay's
+    count column when no commit follows, else a copy of the round's starting
+    count, which the timed commits leave as it is. ``heads`` is the INT32
+    [requests] ring head of each request (the prepare's snapshot). Each
+    request's pre-convolution ring holds its page's convolution taps in rows
+    0..2, as the prepare seeds a slot's first round, and the heads start the
+    candidates at row 3.
     """
     from tokenspeed_kernel.ops.attention import kda as kda_ops
 
@@ -623,6 +637,10 @@ def _retained_benchmark_layer(
         common["conv_kernel_size"],
     )
     _fill_state_pages(conv, state, reads.long(), generator=generator)
+    ring = torch.zeros(
+        reads.numel(), window + 3, conv.shape[1], dtype=conv.dtype, device="cuda"
+    )
+    ring[:, :3] = conv[reads.long()].transpose(1, 2)
     shape = (reads.numel(), profile.heads, capacity, profile.head_dim)
     history = kda_ops.KdaRetainedHistory(
         torch.zeros(shape, device="cuda"),
@@ -633,7 +651,7 @@ def _retained_benchmark_layer(
         metadata[:, 0],
     )
     records = kda_ops.KdaRetainedRecords(
-        torch.empty_like(projection.mixed_qkv),
+        kda_ops.KdaPreconvRing(ring, heads),
         history,
         metadata,
         stamps,
@@ -645,7 +663,7 @@ def _retained_benchmark_layer(
         conv=conv,
         state=state,
         records=records,
-        count=count,
+        replay=replay,
         reads=reads,
         window=window,
     )
@@ -673,25 +691,26 @@ def _invoke_retained_layer(layer, common, *, override, solution):
         producers["g_raw"] = torch.nn.functional.linear(
             projection.f_a_out, weights.f_b_weight
         )
-        # As in serving, the convolution keeps the pre-convolution rows, so
-        # the split verify has none to copy.
+        # As in serving, the convolution reads and keeps the pre-convolution
+        # rows in the ring, so the split verify takes none.
         producers["conv_qkv"] = kda_ops.kda_verify_conv_update(
             projection.mixed_qkv,
             weights.conv_weights,
-            layer["conv"],
             layer["reads"],
+            live_indices=records.history.live_state_indices,
+            preconv=records.preconv,
+            record_slots=records.history.record_slots,
+            page_count=layer["state"].shape[0],
             num_heads=profile.heads,
             head_dim=profile.head_dim,
             draft_token_num=layer["window"],
             query_start_loc=records.query_start_loc,
-            original_qkv=records.original_qkv,
             recurrent_layout=common["recurrent_layout"],
         )
-        records = replace(records, original_qkv=None)
+        records = replace(records, preconv=None)
     return kda_ops.kda_fused_paged_verify(
         projection.mixed_qkv,
         weights.conv_weights,
-        layer["conv"],
         projection.f_a_out,
         weights.f_b_weight,
         projection.beta_logits,
@@ -748,7 +767,8 @@ def prepare_kda_fused_paged_verify(
     stamps = torch.full((batch, window, 2), -1, device="cuda", dtype=torch.int64)
     generator = _generator(request.seed)
     # No commit follows, so the verify reads the count itself.
-    count = torch.zeros(batch, 1, device="cuda", dtype=torch.int32)
+    replay = torch.zeros(batch, 2, device="cuda", dtype=torch.int32)
+    heads = torch.full((batch,), 3, device="cuda", dtype=torch.int32)
     layer = _retained_benchmark_layer(
         common,
         window,
@@ -758,8 +778,9 @@ def prepare_kda_fused_paged_verify(
         reads.clone(),
         metadata,
         stamps,
-        count,
-        count,
+        replay,
+        replay[:, :1],
+        heads,
     )
     initial_conv, initial_state = layer["conv"].clone(), layer["state"].clone()
     history = layer["records"].history
@@ -802,7 +823,11 @@ def prepare_kda_fused_paged_verify(
 def prepare_kda_retained_commit(
     request: BenchmarkRequest, platform: PlatformInfo
 ) -> PreparedBenchmark:
-    """Time all-layer retained commit from fresh verify-derived records each replay."""
+    """Time the all-layer retained commit of a round in which no request ends.
+
+    The commit is one launch: it publishes each request's count and ring
+    state, and its end programs find no ended request, so it writes no page.
+    """
     common = _fused_common(request)
     profile, batch = common["profile"], common["batch"]
     window = _positive_parameter(request.parameters, "draft_token_num")
@@ -837,10 +862,14 @@ def prepare_kda_retained_commit(
         (layers, batch, window, 2), -1, device="cuda", dtype=torch.int64
     )
     generator = _generator(request.seed)
-    # Every layer shares a request's count; its verify read the round's start.
-    replay_length = torch.zeros(batch, 1, device="cuda", dtype=torch.int32)
-    verified = replay_length.clone()
-    layer_inputs, descriptors, before = [], [], []
+    # Every layer shares a request's count and ring state; its verify read
+    # the round's start, and the prepare's snapshot holds the applied count
+    # and the ring head of a first round.
+    replay_state = torch.zeros(batch, 2, device="cuda", dtype=torch.int32)
+    verified = replay_state[:, :1].clone()
+    snapshot = torch.zeros(batch, 2, device="cuda", dtype=torch.int32)
+    snapshot[:, 1] = 3
+    layer_inputs, descriptors = [], []
     for layer_idx in range(layers):
         layer = _retained_benchmark_layer(
             common,
@@ -851,29 +880,30 @@ def prepare_kda_retained_commit(
             live,
             metadata,
             stamps[layer_idx],
-            replay_length,
+            replay_state,
             verified,
+            snapshot[:, 1],
         )
         _invoke_retained_layer(layer, common, override=None, solution=None)
         conv = layer["conv"]
-        qkv, state = layer["records"].original_qkv, layer["state"]
+        ring, state = layer["records"].preconv.rows, layer["state"]
         descriptors.append(
             [
-                qkv.data_ptr(),
+                ring.data_ptr(),
                 conv.data_ptr(),
                 conv.shape[0],
-                qkv.stride(0),
+                ring.stride(1),
                 conv.stride(0),
                 conv.stride(1),
                 conv.stride(2),
                 state.data_ptr(),
                 *state.stride(),
+                ring.stride(0),
             ]
         )
         layer_inputs.append(layer)
-        before.append(conv.clone())
     descriptors = torch.tensor(descriptors, device="cuda", dtype=torch.uint64)
-    initial_count = replay_length.clone()
+    initial_state = replay_state.clone()
     group_indices = torch.arange(layers, device="cuda", dtype=torch.int32) // (
         layers // groups
     )
@@ -892,9 +922,9 @@ def prepare_kda_retained_commit(
     request_ends = torch.zeros(batch, device="cuda", dtype=torch.int32)
 
     def reset():
-        for layer, conv in zip(layer_inputs, before):
-            layer["conv"].copy_(conv)
-        replay_length.copy_(initial_count)
+        # Only the counts and ring states change: the ring keeps the requests'
+        # convolution inputs, so no page is written.
+        replay_state.copy_(initial_state)
 
     def invoke():
         # Keep the layers' tensors alive while descriptors contain their addresses.
@@ -913,7 +943,8 @@ def prepare_kda_retained_commit(
             retained_correction=records[0],
             retained_key=records[1],
             retained_decay=records[2],
-            replay_length=replay_length,
+            replay_state=replay_state,
+            replay_snapshot=snapshot,
             request_stopped=request_stopped,
             request_ends=request_ends,
             draft_token_num=window,
@@ -921,7 +952,6 @@ def prepare_kda_retained_commit(
             num_heads=profile.heads,
             head_dim=profile.head_dim,
             conv_width=common["conv_kernel_size"],
-            activation_dtype=common["dtype"],
             conv_state_dtype=layer_inputs[0]["conv"].dtype,
             recurrent_state_dtype=layer_inputs[0]["state"].dtype,
         )

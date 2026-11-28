@@ -23,9 +23,9 @@
 Contract: the split producers (the gate projection ``f_a @ f_b.T`` and
 ``kda_verify_conv_update``) followed by ``kda_recoverssm_verify`` for windows
 of 2 to 16 tokens, in one launch, and with the layer's output norm the gated
-RMSNorm after it. Outputs and records match theirs, the pre-convolution rows
-are retained for commit, and the checkpoint and the convolution state are
-read only.
+RMSNorm after it. Outputs and records match theirs: the convolution reads
+each request's three previous inputs from its pre-convolution ring and
+retains the window's rows there for commit, and the checkpoint is read only.
 
 The window math and its shared-memory layout are RecoverSsmVerify's: one CTA
 per (value tile, request, head). The C = 128 / VT tiles of a head form a
@@ -40,8 +40,9 @@ the receiving CTA's mbarrier counts, so a CTA waits only for its own rows.
 
 Before the programmatic dependency wait a CTA reads only what the previous
 launch does not write: the batch layout, its checkpoint tile and f_b rows
-(bulk copies into shared memory), the convolution taps and history, and the
-gate and norm parameters. Those loads are first used after the wait, and
+(bulk copies into shared memory), the convolution taps, the ring rows of the
+convolution history (written by earlier forwards or the round's prepare),
+and the gate and norm parameters. Those loads are first used after the wait, and
 every read of the projection rows is issued right after it.
 """
 
@@ -55,11 +56,16 @@ from cuda.bindings.driver import CUstream
 from cutlass import BFloat16, Float32, Int32, Int64, const_expr, cute
 from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.compile_utils import make_fake_tensor
-from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm, KdaRetainedHistory
+from tokenspeed_kernel.ops.attention.kda import (
+    KdaOutputNorm,
+    KdaPreconvRing,
+    KdaRetainedHistory,
+)
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.fused_verify_step import (
     _DTYPES,
     CONV_TAPS,
     _bf16,
+    _check_output,
     _check_output_norm,
     _check_records,
     _silu,
@@ -110,6 +116,24 @@ def _store_shared_bf16(byte_addr: Int32, value: Float32, *, loc=None, ip=None):
         [Int32(byte_addr), Float32(value)],
         "{ .reg .b16 x; cvt.rn.bf16.f32 x, $1; st.shared.b16 [$0], x; }",
         "r,f,~{memory}",
+        True,
+        loc,
+        ip,
+    )
+
+
+@dsl_user_op
+def _copy_shared_to_global_b128(
+    live: Int32, src_byte_addr: Int32, dst_byte_addr: Int64, *, loc=None, ip=None
+):
+    """Copy 16 bytes from shared to global memory when live."""
+    _asm(
+        None,
+        [Int32(live), Int32(src_byte_addr), Int64(dst_byte_addr)],
+        "{ .reg .pred p; .reg .b32 a, b, c, d; setp.ne.b32 p, $0, 0; "
+        "@p ld.shared.v4.b32 {a, b, c, d}, [$1]; "
+        "@p st.global.v4.b32 [$2], {a, b, c, d}; }",
+        "r,r,l,~{memory}",
         True,
         loc,
         ip,
@@ -223,6 +247,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
         gated_norm: bool,
         smem_floor: int,
         copy_records: bool,
+        compile_row_pitch: bool = False,
     ) -> None:
         super().__init__(
             DIM,
@@ -236,6 +261,27 @@ class FusedVerifyWindow(RecoverSsmVerify):
         )
         self.heads = heads
         self.width = heads * DIM
+        # A ring whose rows of a slot are contiguous (the runtime's layout)
+        # compiles their pitch, 3 P channels, in 32-row tiles and in 64-row
+        # tiles that copy their records: a row offset then stays below
+        # R * 3 P, so INT32 math cannot wrap, and no runtime stride feeds the
+        # tap addresses (GB300, Kimi-K3 TP8 rank, T 4: batch-1 and batch-4
+        # rounds 5 to 6 us faster). Other tiles and row pitches take an
+        # INT64 runtime stride: compiled, a 64-row tile that loads its
+        # records itself made a batch-16 round 28 us slower.
+        self.row_pitch = 3 * self.width if compile_row_pitch else None
+        # 64- and 128-row tiles stage their ring rows in shared memory and
+        # write them in 16-byte copies after the gate projection's barrier:
+        # whole lines per copy, instead of 2-byte stores per thread and token
+        # (a batch-16 T 4 round 2% faster on GB300). 32-row tiles store per
+        # thread; staged, a batch-1 round was 0.5% slower. Candidate t's
+        # 3 VT inputs lie at ``token_ring + t * 3 VT``.
+        self.stage_ring = value_tile_rows >= 64
+        if self.stage_ring:
+            self.token_ring = _round_up(self.token_elems, 64)
+            staged = self.token_ring + 3 * value_tile_rows * window
+            self.smem_bytes += 2 * (staged - self.token_elems)
+            self.token_elems = staged
         self.cluster = DIM // value_tile_rows
         self.gated_norm = gated_norm
         # Channel c < 3 VT of a CTA: q, k, then v channels value_start + c % VT.
@@ -279,6 +325,12 @@ class FusedVerifyWindow(RecoverSsmVerify):
             self.norm_words = _round_up(NORM_GROUPS * window, 4)
             self.smem_bytes += 4 * self.norm_words + 16
 
+    def _ring_row_offset(self, row: Int32, ring_row_stride: Int64):
+        """Elements from a slot's first ring row to its row ``row``."""
+        if self.row_pitch is not None:
+            return row * Int32(self.row_pitch)
+        return Int64(row) * ring_row_stride
+
     @cute.jit
     def _publish_pairs(self, row_addr: Int32, values, lane: Int32, barrier_addr: Int32):
         """Publish a lane pair's BF16 values of each token to every CTA of the cluster.
@@ -316,7 +368,8 @@ class FusedVerifyWindow(RecoverSsmVerify):
         self,
         qkv: cute.Tensor,
         conv_weights: cute.Tensor,
-        conv_states: cute.Tensor,
+        ring: cute.Tensor,
+        ring_heads: cute.Tensor,
         f_a: cute.Tensor,
         f_b: cute.Tensor,
         beta: cute.Tensor,
@@ -324,8 +377,8 @@ class FusedVerifyWindow(RecoverSsmVerify):
         dt_bias: cute.Tensor,
         retained: tuple,
         ring_capacity: Int64,
+        stamp_slots: Int64,
         correction: cute.Tensor,
-        original: cute.Tensor,
         out: cute.Tensor,
         query_start_loc: cute.Tensor,
         state_indices: cute.Tensor,
@@ -352,7 +405,8 @@ class FusedVerifyWindow(RecoverSsmVerify):
         self.kernel(
             qkv.iterator,
             conv_weights.iterator,
-            conv_states.iterator,
+            ring.iterator,
+            ring_heads,
             f_a.iterator,
             f_b.iterator,
             beta.iterator,
@@ -360,8 +414,8 @@ class FusedVerifyWindow(RecoverSsmVerify):
             dt_bias.iterator,
             retained,
             ring_capacity,
+            stamp_slots,
             correction.iterator,
-            original.iterator,
             out.iterator,
             query_start_loc.iterator,
             state_indices.iterator,
@@ -372,13 +426,13 @@ class FusedVerifyWindow(RecoverSsmVerify):
             lower_bound,
             norm_eps,
             qkv.stride[0],
-            conv_states.stride[0],
+            ring.stride[0],
+            ring.stride[1],
             f_a.stride[0],
             beta.stride[0],
             correction.stride[0],
             correction.stride[1],
             correction.stride[2],
-            original.stride[0],
             out.stride[0],
             gate_token_stride,
         ).launch(
@@ -395,7 +449,8 @@ class FusedVerifyWindow(RecoverSsmVerify):
         self,
         qkv,
         conv_weights,
-        conv_states,
+        ring,
+        ring_heads,
         f_a,
         f_b,
         beta,
@@ -403,8 +458,8 @@ class FusedVerifyWindow(RecoverSsmVerify):
         dt_bias,
         retained: tuple,
         ring_capacity: Int64,
+        stamp_slots: Int64,
         correction,
-        original,
         out,
         query_start_loc,
         state_indices,
@@ -415,13 +470,13 @@ class FusedVerifyWindow(RecoverSsmVerify):
         lower_bound: Float32,
         norm_eps: Float32,
         qkv_token_stride: Int64,
-        conv_page_stride: Int64,
+        ring_slot_stride: Int64,
+        ring_row_stride: Int64,
         f_a_token_stride: Int64,
         beta_token_stride: Int64,
         correction_slot_stride: Int64,
         correction_head_stride: Int64,
         correction_position_stride: Int64,
-        original_token_stride: Int64,
         out_token_stride: Int64,
         gate_token_stride: Int64,
     ):
@@ -443,6 +498,8 @@ class FusedVerifyWindow(RecoverSsmVerify):
         valid_tokens = Int32(Int64(_load(query_start_loc, request + 1)) - token_start)
         page = Int64(_load(state_indices, request))
         live_page, slot = retained_row(retained, request)
+        # The prepare's snapshot: the ring row of this request's first candidate.
+        ring_head = Int32(ring_heads[Int64(request)])
         # A page past the checkpoint pool is padding, like a nonpositive one.
         live = (
             (page > 0)
@@ -517,11 +574,39 @@ class FusedVerifyWindow(RecoverSsmVerify):
         channels = []
         tap_words = []
         past_values = []
-        # Padding pages see a zero history, as the split producer's do; a page
-        # past the pool is padding too, and its address is never formed.
-        in_pool = (page >= 0) & (page < retained[0].shape[0])
-        has_history = (valid_tokens > 0) & in_pool
-        history = conv_states + Int64(in_pool) * page * conv_page_stride
+        # The slot's ring keeps the 3 inputs before the window at rows
+        # (head - 3 + i) mod R, R = W + 3, and takes candidate t at row
+        # (head + t) mod R. The row index stays below R, so its INT32 math
+        # cannot wrap (``_ring_row_offset`` scales it).
+        # Padding rows see a zero history, as the split producer's do, and
+        # touch no ring: their tap loads read channel c of this layer's
+        # convolution weights (4 * channels BF16 values, which no launch
+        # writes while it verifies) at row pitch 0, and the values are
+        # discarded. So a padding row never reads a live request's rows
+        # (slot 0 included) or an empty ring. The loads themselves stay
+        # plain: in this kernel predicated loads measured 10 to 35 us a
+        # round slower.
+        R = W + CONV_TAPS - 1
+        has_history = live
+        history = ring + slot * ring_slot_stride
+        taps_base = cute.make_ptr(
+            BFloat16,
+            history.toint() if live else conv_weights.toint(),
+            cute.AddressSpace.gmem,
+            assumed_align=2,
+        )
+        live_pitch = self._ring_row_offset(Int32(live), ring_row_stride)
+        # A live head already lies in the ring; the clamp only bounds padding.
+        # Scaling the head by ``live`` instead would make the live branch copy
+        # it, and that copy waits for its load ahead of the bulk copies.
+        first_row = cutlass.min(cutlass.max(ring_head, Int32(0)), Int32(R - 1))
+        past_offsets = []
+        for i in cutlass.range_constexpr(CONV_TAPS - 1):
+            past_row = first_row + Int32(i - (CONV_TAPS - 1))
+            past_row = past_row + Int32(R) * Int32(past_row < 0)
+            if const_expr(self.row_pitch is None):
+                past_row = Int64(past_row)
+            past_offsets.append(past_row * live_pitch)
         for item in cutlass.range_constexpr(self.conv_items):
             c = cutlass.min(item * THREADS + tidx, 3 * VT - 1)
             kind = c // VT
@@ -529,7 +614,7 @@ class FusedVerifyWindow(RecoverSsmVerify):
             channels.append(channel)
             tap_words.append(_ldg_b32x2((conv_weights + channel * CONV_TAPS).toint()))
             for i in cutlass.range_constexpr(CONV_TAPS - 1):
-                past_values.append(_load(history, channel * 3 + i))
+                past_values.append(_load(taps_base, past_offsets[i] + channel))
         a_log_value = _load(a_log, head)
         gate_bias_value = _load(dt_bias, head * K + tidx)
         channel = cutlass.min(tidx, VT - 1)
@@ -615,9 +700,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
             ]
             self._convolve(
                 shared,
-                original,
-                original_token_stride,
-                token_start,
+                history,
+                first_row,
+                ring_row_stride,
                 valid_tokens,
                 live,
                 tidx,
@@ -639,17 +724,35 @@ class FusedVerifyWindow(RecoverSsmVerify):
                     cute.arch.mbarrier_wait(shared.token_barrier, 0)
                     # The v tile is this CTA's own plain stores.
                     cute.arch.barrier()
+                if const_expr(self.stage_ring):
+                    self._store_ring_rows(
+                        shared,
+                        history,
+                        first_row,
+                        ring_row_stride,
+                        valid_tokens,
+                        head,
+                        value_start,
+                        tidx,
+                    )
                 if tidx < W:
                     shared.sums[self.sums.beta + tidx] = _div(
                         Float32(1.0), Float32(1.0) + _exp(-raw_beta.to(Float32))
                     )
                 if const_expr(self.has_metadata):
-                    # One CTA per request stamps the positions this window records.
+                    # One CTA per request stamps the positions this window
+                    # records, only in a slot row the table holds, as the
+                    # Triton and AMD verifies do: padding (slot -1) and slots
+                    # past a short table store nothing.
                     if (
                         (value_tile == 0)
                         & (head == 0)
                         & (tidx < W)
                         & (tidx < valid_tokens)
+                        & (stamp_slot >= Int64(0))
+                        & (stamp_slot < stamp_slots)
+                        & (generation >= Int64(0))
+                        & (start >= Int64(0))
                     ):
                         self._stamp_position(
                             stamps, stamp_slot, ring_capacity, start, generation, tidx
@@ -863,9 +966,9 @@ class FusedVerifyWindow(RecoverSsmVerify):
     def _convolve(
         self,
         shared,
-        original,
-        original_token_stride: Int64,
-        token_start: Int64,
+        history,
+        first_row: Int32,
+        ring_row_stride: Int64,
         valid_tokens: Int32,
         live,
         tidx: Int32,
@@ -877,9 +980,11 @@ class FusedVerifyWindow(RecoverSsmVerify):
     ):
         """Retain this CTA's pre-convolution channels and publish their convolved rows.
 
-        ``window_rows`` holds each item's W pre-convolution values. The q and k
-        channels go to every CTA of the cluster, the v tile to this one; the
-        window's last valid row stands in for the rows past it.
+        ``window_rows`` holds each item's W pre-convolution values; a live
+        request's token t goes to ring row ``(first_row + t) mod R`` of its
+        slot's ``history``. The q and k channels go to every CTA of the
+        cluster, the v tile to this one; the window's last valid row stands in
+        for the rows past it.
         """
         K = self.key_dim
         W = self.window
@@ -890,14 +995,26 @@ class FusedVerifyWindow(RecoverSsmVerify):
             kind = cutlass.min(c, 3 * VT - 1) // VT
             within = cutlass.min(c, 3 * VT - 1) % VT
             raws = [x.to(Float32) for x in window_rows[item * W : (item + 1) * W]]
-            kept = original + (token_start * original_token_stride + channels[item])
+            kept = history + channels[item]
             for t in cutlass.range_constexpr(W):
-                _store_if(
-                    in_range & Int32(t < valid_tokens),
-                    (kept + t * original_token_stride).toint(),
-                    raws[t],
-                    True,
+                kept_row = first_row + Int32(t)
+                kept_row = kept_row - Int32(W + CONV_TAPS - 1) * Int32(
+                    kept_row >= W + CONV_TAPS - 1
                 )
+                if const_expr(self.stage_ring):
+                    # ``_store_ring_rows`` writes the live rows.
+                    if in_range != 0:
+                        staged = self.token_ring + t * 3 * VT + item * THREADS + tidx
+                        _store_shared_bf16(shared.tokens_addr + staged * 2, raws[t])
+                else:
+                    _store_if(
+                        Int32(live) & in_range & Int32(t < valid_tokens),
+                        (
+                            kept + self._ring_row_offset(kept_row, ring_row_stride)
+                        ).toint(),
+                        raws[t],
+                        True,
+                    )
             if live & (in_range != 0):
                 convolved = []
                 for t in cutlass.range_constexpr(W):
@@ -930,6 +1047,46 @@ class FusedVerifyWindow(RecoverSsmVerify):
                         _store_shared_bf16(
                             shared.tokens_addr + offset * 2, convolved[t]
                         )
+
+    @cute.jit
+    def _store_ring_rows(
+        self,
+        shared,
+        history,
+        first_row: Int32,
+        ring_row_stride: Int64,
+        valid_tokens: Int32,
+        head: Int32,
+        value_start: Int32,
+        tidx: Int32,
+    ):
+        """Write a live request's staged candidates to their ring rows.
+
+        Candidate t goes to ring row ``(first_row + t) mod R``. Each thread
+        copies 8 channels of one candidate and kind (q, k or v); the CTA's
+        channels of a kind are contiguous in a ring row.
+        """
+        W = self.window
+        VT = self.value_tile_rows
+        R = W + CONV_TAPS - 1
+        chunks_per_kind = VT // 8
+        chunks = W * 3 * chunks_per_kind
+        for j in cutlass.range_constexpr((chunks + THREADS - 1) // THREADS):
+            chunk = cutlass.min(j * THREADS + tidx, chunks - 1)
+            t = chunk // (3 * chunks_per_kind)
+            kind = chunk % (3 * chunks_per_kind) // chunks_per_kind
+            element = chunk % chunks_per_kind * 8
+            row = first_row + t
+            row = row - Int32(R) * Int32(row >= R)
+            channel = kind * self.width + head * self.key_dim + value_start + element
+            staged = self.token_ring + t * 3 * VT + kind * VT + element
+            _copy_shared_to_global_b128(
+                Int32(j * THREADS + tidx < chunks) & Int32(t < valid_tokens),
+                shared.tokens_addr + staged * 2,
+                (
+                    history + (self._ring_row_offset(row, ring_row_stride) + channel)
+                ).toint(),
+            )
 
     @cute.jit
     def _project_gate(
@@ -1076,6 +1233,7 @@ def _compile(
     start_dtype: torch.dtype,
     index_dtype: torch.dtype,
     smem_floor: int,
+    compile_row_pitch: bool,
     copy_records: bool,
 ):
     tokens = cute.sym_int()
@@ -1084,9 +1242,10 @@ def _compile(
     width = heads * DIM
     qkv = make_fake_tensor(BFloat16, (tokens, 3 * width), divisibility=8)
     conv_weights = make_fake_tensor(BFloat16, (3 * width, 4), divisibility=4)
-    conv_states = make_fake_tensor(
-        BFloat16, (cute.sym_int(), cute.sym_int(), 3), divisibility=1
+    ring = make_fake_tensor(
+        BFloat16, (slots, window + CONV_TAPS - 1, 3 * width), divisibility=1
     )
+    ring_heads = make_fake_tensor(Int32, (batch,), leading_dim=None)
     f_a = make_fake_tensor(BFloat16, (tokens, GATE_RANK), divisibility=8)
     f_b = make_fake_tensor(BFloat16, (width, GATE_RANK), divisibility=8)
     beta = make_fake_tensor(_DTYPES[beta_dtype], (tokens, heads))
@@ -1099,7 +1258,6 @@ def _compile(
     normalized_key = make_fake_tensor(
         Float32, (slots, heads, capacity, DIM), leading_dim=None
     )
-    original = make_fake_tensor(BFloat16, (tokens, 3 * width))
     out = make_fake_tensor(BFloat16, (tokens, width))
     query_start_loc = make_fake_tensor(_DTYPES[start_dtype], (cute.sym_int(),))
     state_indices = make_fake_tensor(_DTYPES[index_dtype], (batch,))
@@ -1130,12 +1288,14 @@ def _compile(
         norm_dtype is not None,
         smem_floor,
         copy_records,
+        compile_row_pitch,
     )
     return cute.compile(
         kernel,
         qkv,
         conv_weights,
-        conv_states,
+        ring,
+        ring_heads,
         f_a,
         f_b,
         beta,
@@ -1143,8 +1303,8 @@ def _compile(
         dt_bias,
         retained,
         Int64(0),
+        Int64(0),
         correction,
-        original,
         out,
         query_start_loc,
         state_indices,
@@ -1245,7 +1405,7 @@ def _smem_floor(ctas: int, device: torch.device) -> int:
 def fused_verify_window_supported(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
+    preconv: KdaPreconvRing,
     f_a_out: torch.Tensor,
     f_b_weight: torch.Tensor,
     beta_logits: torch.Tensor,
@@ -1266,7 +1426,8 @@ def fused_verify_window_supported(
         mixed_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16 q|k|v rows
             before the convolution.
         conv_weights: ``[3 * num_heads * head_dim, 4]`` BF16 convolution taps.
-        conv_states: ``[pages, channels, 3]`` BF16 convolution history.
+        preconv: ``[slots, window + 3, 3 * num_heads * head_dim]`` BF16
+            pre-convolution ring and each request's ring head.
         f_a_out: ``[tokens, rank]`` BF16 gate projection input.
         f_b_weight: ``[num_heads * head_dim, rank]`` BF16 gate projection.
         beta_logits: ``[tokens, num_heads]`` beta logits.
@@ -1276,40 +1437,50 @@ def fused_verify_window_supported(
             checkpoint in value-major layout.
         retained_history: Accepted records and per-request live pages.
         query_start_loc: ``[batch + 1]`` token offset of each request.
-        state_indices: ``[batch]`` checkpoint and convolution page of each
-            request.
+        state_indices: ``[batch]`` source checkpoint page of each request.
         num_heads: Per-rank head count.
         head_dim: Head width.
         window: Tokens per request window.
         lower_bound: Bounded-gate lower bound, or None for the softplus gate.
 
     Returns:
-        True when the one-token kernel's layout conditions hold and the window
-        has 2 to 16 tokens.
+        True when the one-token kernel's layout conditions hold, the window
+        has 2 to 16 tokens and fits the record capacity, the ring keeps
+        window + 3 rows and its rows take 16-byte copies.
     """
-    return 2 <= window <= MAX_WINDOW and fused_verify_step_supported(
-        mixed_qkv,
-        conv_weights,
-        conv_states,
-        f_a_out,
-        f_b_weight,
-        beta_logits,
-        A_log,
-        dt_bias,
-        checkpoint_state,
-        retained_history,
-        query_start_loc,
-        state_indices,
-        num_heads,
-        head_dim,
-        lower_bound,
+    rows = preconv.rows
+    return (
+        2 <= window <= MAX_WINDOW
+        and preconv.window == window
+        and retained_history.correction.shape[2] >= window
+        and rows.stride(-1) == 1
+        and rows.stride(0) % 8 == 0
+        and rows.stride(1) % 8 == 0
+        and rows.data_ptr() % 16 == 0
+        and fused_verify_step_supported(
+            mixed_qkv,
+            conv_weights,
+            preconv,
+            f_a_out,
+            f_b_weight,
+            beta_logits,
+            A_log,
+            dt_bias,
+            checkpoint_state,
+            retained_history,
+            query_start_loc,
+            state_indices,
+            num_heads,
+            head_dim,
+            lower_bound,
+        )
     )
 
 
 def fused_verify_window(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
+    preconv: KdaPreconvRing,
     f_a_out: torch.Tensor,
     f_b_weight: torch.Tensor,
     beta_logits: torch.Tensor,
@@ -1318,7 +1489,6 @@ def fused_verify_window(
     lower_bound: float | None,
     checkpoint_state: torch.Tensor,
     retained_history,
-    original_qkv: torch.Tensor,
     query_start_loc: torch.Tensor,
     state_indices: torch.Tensor,
     num_heads: int,
@@ -1328,6 +1498,8 @@ def fused_verify_window(
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
     output_norm: KdaOutputNorm | None,
+    *,
+    _validated: bool = False,
 ) -> torch.Tensor:
     """Run multi-token record verify with the gate and convolution producers fused.
 
@@ -1335,8 +1507,11 @@ def fused_verify_window(
         mixed_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16 q|k|v rows
             before the convolution, request after request.
         conv_weights: ``[3 * num_heads * head_dim, 4]`` BF16 convolution taps.
-        conv_states: ``[pages, channels, 3]`` BF16 committed convolution
-            history; read only.
+        preconv: ``[slots, window + 3, 3 * num_heads * head_dim]`` BF16
+            pre-convolution ring of the layer and each request's ring head
+            (the prepare's snapshot). A request's 3 previous inputs are rows
+            ``(head - 3 + i) mod (window + 3)``; its token t is written to row
+            ``(head + t) mod (window + 3)`` for commit.
         f_a_out: ``[tokens, 128]`` BF16 gate projection input.
         f_b_weight: ``[num_heads * head_dim, 128]`` BF16 gate projection.
         beta_logits: ``[tokens, num_heads]`` beta logits.
@@ -1347,14 +1522,11 @@ def fused_verify_window(
             committed checkpoint in value-major layout; read only.
         retained_history: Request-slot FP32 U/normalized-K/decay and accepted
             lengths. Candidates append after each slot's accepted prefix.
-        original_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16; receives
-            the pre-convolution rows for commit.
         query_start_loc: ``[batch + 1]`` token offset of each request; a
             request has at most ``window`` tokens.
-        state_indices: ``[batch]`` checkpoint and convolution page of each
-            request. Pages at or below 0, or past the checkpoint pool, are
-            padding: zero outputs and no records, though their
-            pre-convolution rows are still retained.
+        state_indices: ``[batch]`` source checkpoint page of each request.
+            Pages at or below 0, or past the checkpoint pool, are padding:
+            zero outputs, no records and no ring rows.
         num_heads: Per-rank head count.
         head_dim: Head width; 128.
         window: Tokens per request window, 2 to 16.
@@ -1367,6 +1539,11 @@ def fused_verify_window(
             each record position, written with ``record_metadata``; else None.
         output_norm: The layer's gated output RMSNorm to apply before the
             store, or None to store the verify output.
+        _validated: Internal. The registered wrapper, which has just found
+            ``fused_verify_window_supported`` true for these operands (with the
+            whole state pool and boundary vector this entry gets slices
+            of), sets it so the predicate is not evaluated twice. Every
+            other check here still runs. Direct callers leave it False.
 
     Returns:
         ``out``.
@@ -1374,16 +1551,17 @@ def fused_verify_window(
     Raises:
         ValueError: If ``fused_verify_window_supported`` rejects the inputs,
             the record metadata and stamps are not dense INT64 views of the
-            record layout, or the output norm's gate or weight are laid out
-            otherwise.
+            record layout (with a slot row and room for the window), the
+            output norm's gate or weight are laid out otherwise, or the ring
+            shares storage with another operand.
     """
     correction_cache = retained_history.correction
     if mixed_qkv.shape[0] == 0:
         return out
-    if not fused_verify_window_supported(
+    if not _validated and not fused_verify_window_supported(
         mixed_qkv,
         conv_weights,
-        conv_states,
+        preconv,
         f_a_out,
         f_b_weight,
         beta_logits,
@@ -1400,9 +1578,33 @@ def fused_verify_window(
     ):
         raise ValueError("CuTe DSL fused KDA verify window cannot address these inputs")
     _check_records(
-        record_metadata, record_stamps, state_indices.shape[0], correction_cache
+        record_metadata,
+        record_stamps,
+        state_indices.shape[0],
+        correction_cache,
+        window,
     )
+    _check_output(out, mixed_qkv.shape[0], num_heads * head_dim, mixed_qkv.device)
     _check_output_norm(output_norm, out, head_dim)
+    # The kernel stores candidate rows into the ring while it reads every
+    # other operand and writes out.
+    preconv.check_verify_storage(
+        mixed_qkv,
+        conv_weights,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        checkpoint_state,
+        query_start_loc,
+        state_indices,
+        out,
+        record_metadata,
+        record_stamps,
+        history=retained_history,
+        output_norm=output_norm,
+    )
     bounded = lower_bound is not None
     value_tile_rows = _value_tile_rows(
         state_indices.shape[0], num_heads, window, head_dim
@@ -1442,12 +1644,15 @@ def fused_verify_window(
         query_start_loc.dtype,
         state_indices.dtype,
         _smem_floor(ctas, mixed_qkv.device),
+        preconv.rows.stride(1) == preconv.rows.shape[2]
+        and (value_tile_rows == 32 or copy_records),
         copy_records,
     )
     kernel(
         mixed_qkv,
         conv_weights,
-        conv_states,
+        preconv.rows,
+        preconv.heads,
         f_a_out,
         f_b_weight,
         beta_logits,
@@ -1459,8 +1664,8 @@ def fused_verify_window(
             if record_stamps is not None
             else correction_cache.shape[2]
         ),
+        0 if record_stamps is None else record_stamps.shape[0],
         correction_cache,
-        original_qkv,
         out,
         query_start_loc,
         state_indices,

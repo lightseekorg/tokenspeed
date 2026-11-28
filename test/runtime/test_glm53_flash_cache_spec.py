@@ -404,16 +404,22 @@ def test_glm_workspace_reserves_retained_verify_and_kpool_tail(
     layers, groups, batch, heads, dim = 34, 3, 16, 8, 128
     conv_channels = 3 * heads * dim
     # 24 resident requests plus the two reserved request slots each hold FP32
-    # U/K/decay records per layer, plus one INT32 accepted count every layer
-    # shares.
+    # U/K/decay records and a width + 3 row BF16 pre-convolution ring per
+    # layer, plus one INT32 accepted count and ring state every layer shares.
+    # Each batch row keeps the prepare's (count, ring head) snapshot.
     slots = 26
     expected = (
-        layers * batch * width * conv_channels * 2
-        + slots * (layers * 3 * heads * capacity * dim * 4 + 4)
-        + layers * (12 * 8 + 4)
+        slots
+        * (
+            layers * 3 * heads * capacity * dim * 4
+            + layers * (width + 3) * conv_channels * 2
+            + 2 * 4
+        )
+        + layers * (13 * 8 + 4)
         + groups * 4 * 8
         + (2 * groups + 1) * batch * 4
         + batch * 4 * 8
+        + batch * 2 * 4
         + layers * batch * width * 2 * 8
     )
     assert recipe.workspace_bytes() == recipe.pool_options().workspace_bytes + expected

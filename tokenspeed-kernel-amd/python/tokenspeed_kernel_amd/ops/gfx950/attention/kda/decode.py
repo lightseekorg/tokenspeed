@@ -112,8 +112,8 @@ def _kda_value_panels(vectors, D: gl.constexpr, VALUE_LAYOUT: gl.constexpr):
     launch_metadata=kda_records_launch_metadata,
     do_not_specialize=[
         "MIXED_ROW_STRIDE",
-        "ORIGINAL_QKV_ROW_STRIDE",
-        "CONV_POOL_PAGE_STRIDE",
+        "RING_SLOT_STRIDE",
+        "RING_HEAD_STRIDE",
         "GATE_ROW_STRIDE",
         "F_A_ROW_STRIDE",
         "BETA_ROW_STRIDE",
@@ -143,9 +143,9 @@ def _kda_value_panels(vectors, D: gl.constexpr, VALUE_LAYOUT: gl.constexpr):
 )
 def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     mixed_qkv: tl.const,
-    original_qkv,
+    ring,
     conv_weights: tl.const,
-    conv_pool: tl.const,
+    ring_heads: tl.const,
     raw_g: tl.const,
     f_a_out: tl.const,
     f_b_weight: tl.const,
@@ -191,12 +191,11 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     BATCH_TOKENS: gl.constexpr,
     VALUE_SPLITS: gl.constexpr,
     MIXED_ROW_STRIDE,
-    ORIGINAL_QKV_ROW_STRIDE,
+    RING_SLOT_STRIDE,
     CONV_WEIGHT_ROW_STRIDE: gl.constexpr,
     CONV_WEIGHT_COL_STRIDE: gl.constexpr,
-    CONV_POOL_PAGE_STRIDE,
-    CONV_POOL_CHANNEL_STRIDE: gl.constexpr,
-    CONV_POOL_HISTORY_STRIDE: gl.constexpr,
+    RING_HEAD_STRIDE,
+    RING_ROW_STRIDE: gl.constexpr,
     GATE_ROW_STRIDE,
     F_A_ROW_STRIDE,
     BETA_ROW_STRIDE,
@@ -292,6 +291,10 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
         gl.int64
     )
     slot = gl.load(record_slots + sequence_idx.to(gl.int64) * slot_stride).to(gl.int64)
+    # The prepare's snapshot: the ring row of this request's first candidate.
+    ring_head = gl.load(ring_heads + sequence_idx.to(gl.int64) * RING_HEAD_STRIDE).to(
+        gl.int64
+    )
     # Candidates append after the request slot's accepted records. Every
     # layer shares the slot's count; one outside
     # [0, CAPACITY - TOKENS_PER_SEQUENCE] overflowed, and the prepare folded
@@ -340,7 +343,6 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     # masked stores consume those rows.
     last_row = token_base + token_count - 1
 
-    read_page_offset = read_idx.to(gl.int64)
     read_base = recurrent_idx * STATE_POOL_PAGE_STRIDE + head_idx * D * D
     # Widen bounded one-token panels while keeping the same prefetch window.
     panel_rows: gl.constexpr = (
@@ -374,23 +376,25 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     # Decay lanes use Q as an in-bounds dummy address and skip state writes.
     qkv_channel, slot_id, local_offset, is_decay = _kda_qkvd_indices(head_idx, H, D)
 
-    qkv_history0 = gl.load(
-        conv_pool
-        + read_page_offset * CONV_POOL_PAGE_STRIDE
-        + qkv_channel * CONV_POOL_CHANNEL_STRIDE
-    ).to(gl.float32)
-    qkv_history1 = gl.load(
-        conv_pool
-        + read_page_offset * CONV_POOL_PAGE_STRIDE
-        + qkv_channel * CONV_POOL_CHANNEL_STRIDE
-        + CONV_POOL_HISTORY_STRIDE
-    ).to(gl.float32)
-    qkv_history2 = gl.load(
-        conv_pool
-        + read_page_offset * CONV_POOL_PAGE_STRIDE
-        + qkv_channel * CONV_POOL_CHANNEL_STRIDE
-        + 2 * CONV_POOL_HISTORY_STRIDE
-    ).to(gl.float32)
+    # The slot's ring keeps the 3 inputs before the window at rows
+    # (head - 3 + i) mod RING, and takes candidate t at row (head + t) mod RING.
+    RING: gl.constexpr = TOKENS_PER_SEQUENCE + 3
+    ring_rows = ring + slot * RING_SLOT_STRIDE
+    history_row0 = ring_head - 3
+    history_row0 = gl.where(history_row0 < 0, history_row0 + RING, history_row0)
+    history_row1 = ring_head - 2
+    history_row1 = gl.where(history_row1 < 0, history_row1 + RING, history_row1)
+    history_row2 = ring_head - 1
+    history_row2 = gl.where(history_row2 < 0, history_row2 + RING, history_row2)
+    qkv_history0 = gl.load(ring_rows + history_row0 * RING_ROW_STRIDE + qkv_channel).to(
+        gl.float32
+    )
+    qkv_history1 = gl.load(ring_rows + history_row1 * RING_ROW_STRIDE + qkv_channel).to(
+        gl.float32
+    )
+    qkv_history2 = gl.load(ring_rows + history_row2 * RING_ROW_STRIDE + qkv_channel).to(
+        gl.float32
+    )
     qkv_weight_base = conv_weights + qkv_channel * CONV_WEIGHT_ROW_STRIDE
     weight0 = gl.load(qkv_weight_base)
     weight1 = gl.load(qkv_weight_base + CONV_WEIGHT_COL_STRIDE)
@@ -443,17 +447,16 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
         )
 
     for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
-        token_idx = token_base + token_offset
         qkv_input_raw = qkv_inputs[token_offset]
-        if original_qkv is not None:
-            # One value split retains the pre-convolution bytes for commit.
-            gl.store(
-                original_qkv + token_idx * ORIGINAL_QKV_ROW_STRIDE + qkv_channel,
-                qkv_input_raw,
-                mask=(value_split_idx == 0)
-                & (slot_id != 3)
-                & (token_offset < token_count),
-            )
+        # One value split retains the pre-convolution bytes for commit, in
+        # the candidate's ring row.
+        kept_row = ring_head + token_offset
+        kept_row = gl.where(kept_row >= RING, kept_row - RING, kept_row)
+        gl.store(
+            ring_rows + kept_row * RING_ROW_STRIDE + qkv_channel,
+            qkv_input_raw.to(ring.dtype.element_ty),
+            mask=(value_split_idx == 0) & (slot_id != 3) & (token_offset < token_count),
+        )
         qkv_input = qkv_input_raw.to(gl.float32)
         qkv_value = _kda_conv_step(
             qkv_history0,
@@ -699,9 +702,9 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
 def _launch_kda_verify_gfx950(
     *,
     mixed_qkv: torch.Tensor,
-    original_qkv: torch.Tensor | None,
+    ring: torch.Tensor,
+    ring_heads: torch.Tensor,
     conv_weights: torch.Tensor,
-    conv_pool: torch.Tensor,
     raw_g: torch.Tensor | None,
     f_a_out: torch.Tensor | None,
     f_b_weight: torch.Tensor | None,
@@ -734,14 +737,14 @@ def _launch_kda_verify_gfx950(
         return output
     if (
         conv_weights.shape != (3 * num_heads * head_dim, 4)
-        or conv_pool.ndim != 3
-        or conv_pool.shape[1] < 3 * num_heads * head_dim
-        or conv_pool.shape[2] != 3
-        or conv_pool.stride()[1:] != (3, 1)
+        or ring.ndim != 3
+        or ring.shape[1:] != (draft_token_num + 3, 3 * num_heads * head_dim)
+        or ring.stride(2) != 1
         or state_pool.stride()[1:] != (head_dim * head_dim, head_dim, 1)
     ):
         raise ValueError(
-            "fused KDA verify requires four-tap convolution and V-major state"
+            "fused KDA verify requires four-tap convolution, a window + 3 row "
+            "pre-convolution ring and V-major state"
         )
     if raw_g is None and mixed_qkv.shape[0] > _INLINE_GATE_MAX_ROWS:
         raw_g = torch.nn.functional.linear(f_a_out, f_b_weight)
@@ -752,9 +755,9 @@ def _launch_kda_verify_gfx950(
         (num_heads * value_splits, batch)
     ](
         mixed_qkv,
-        original_qkv,
+        ring,
         conv_weights,
-        conv_pool,
+        ring_heads,
         raw_g,
         f_a_out,
         f_b_weight,
@@ -801,12 +804,11 @@ def _launch_kda_verify_gfx950(
         BATCH_TOKENS=4 <= draft_token_num <= 16,
         VALUE_SPLITS=value_splits,
         MIXED_ROW_STRIDE=mixed_qkv.stride(0),
-        ORIGINAL_QKV_ROW_STRIDE=(0 if original_qkv is None else original_qkv.stride(0)),
+        RING_SLOT_STRIDE=ring.stride(0),
         CONV_WEIGHT_ROW_STRIDE=conv_weights.stride(0),
         CONV_WEIGHT_COL_STRIDE=conv_weights.stride(1),
-        CONV_POOL_PAGE_STRIDE=conv_pool.stride(0),
-        CONV_POOL_CHANNEL_STRIDE=conv_pool.stride(1),
-        CONV_POOL_HISTORY_STRIDE=conv_pool.stride(2),
+        RING_HEAD_STRIDE=ring_heads.stride(0),
+        RING_ROW_STRIDE=ring.stride(1),
         GATE_ROW_STRIDE=0 if raw_g is None else raw_g.stride(0),
         F_A_ROW_STRIDE=0 if f_a_out is None else f_a_out.stride(0),
         BETA_ROW_STRIDE=beta_logits.stride(0),
@@ -834,9 +836,9 @@ __all__ = [
 def launch_gluon_kda_retained_verify_gfx950(
     *,
     mixed_qkv,
-    original_qkv,
+    ring,
+    ring_heads,
     conv_weights,
-    conv_pool,
     raw_g,
     f_a_out,
     f_b_weight,
@@ -859,12 +861,12 @@ def launch_gluon_kda_retained_verify_gfx950(
     draft_token_num,
     lower_bound,
 ):
-    """Verify from prepared live history while reading convolution at source."""
+    """Verify from prepared live history, convolving from the pre-convolution ring."""
     validate_kda_retained_verify(
         mixed_qkv,
-        original_qkv,
+        ring,
+        ring_heads,
         conv_weights,
-        conv_pool,
         raw_g,
         f_a_out,
         f_b_weight,
@@ -888,9 +890,9 @@ def launch_gluon_kda_retained_verify_gfx950(
     )
     return _launch_kda_verify_gfx950(
         mixed_qkv=mixed_qkv,
-        original_qkv=original_qkv,
+        ring=ring,
+        ring_heads=ring_heads,
         conv_weights=conv_weights,
-        conv_pool=conv_pool,
         raw_g=raw_g,
         f_a_out=f_a_out,
         f_b_weight=f_b_weight,

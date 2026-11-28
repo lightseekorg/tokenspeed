@@ -22,7 +22,17 @@
 
 import pytest
 import torch
-from kda_retained_reference import check_prefix, commit, make_case, reference, verify
+from kda_retained_reference import (
+    check_prefix,
+    commit,
+    endpoint,
+    make_case,
+    materialize,
+    reference,
+    replay_state,
+    ring_taps,
+    verify,
+)
 from tokenspeed_kernel.ops.metadata import REQUEST_ENDED
 
 if not torch.cuda.is_available():
@@ -52,10 +62,11 @@ def test_retained_commit_matches_every_accepted_prefix(width, cross_page):
 @pytest.mark.parametrize("width", [1, 4])
 @pytest.mark.parametrize("cross_page", [False, True])
 def test_ended_request_commit_leaves_a_dense_endpoint(width, cross_page):
-    """The forward that ends a request folds its records into its live page.
+    """The forward that ends a request folds its records and ring into its live page.
 
-    Rows 0 and 2 end: their pages alone hold the accepted endpoint and their
-    slots count no record. Row 1 keeps its records.
+    Rows 0 and 2 end: their pages alone hold the accepted endpoint, recurrent
+    and convolution state, and their slots count no record and hold no ring
+    rows. Row 1 keeps its records and its window in its ring.
     """
     case = make_case(3, width, cross_page=cross_page, strided=True)
     expected = reference(case)
@@ -68,8 +79,44 @@ def test_ended_request_commit_leaves_a_dense_endpoint(width, cross_page):
     # Before a cross-page verify, the prepare copied row 1's dense base to its
     # new live page; its two accepted records stay valid on top of it.
     assert history.length[:, 0].tolist() == [0, 2 + 1, 0]
+    assert replay_state(history)[:, 1].tolist() == [0, (3 + 1) % (width + 3) + 1, 0]
     # Each live page plus its slot's remaining records is the endpoint.
-    check_prefix(case, accepted, expected)
+    check_prefix(case, accepted, expected, ended_slots=(0, 2))
+
+
+@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize("cross_page", [False, True])
+def test_retraction_writes_the_rings_window_into_the_live_page(width, cross_page):
+    """Decode commits leave the pages' convolution state; a retraction fold writes it.
+
+    After two rounds, each live page plus its slot's records is the
+    endpoint and the ring holds the window. Materialization folds both into
+    the live page, which then alone is the endpoint, and clears the slot.
+    """
+    case = make_case(4, width, cross_page=cross_page, strided=True)
+    for round_index, take in enumerate((width, max(1, width - 1))):
+        expected = reference(case)
+        verify(case)
+        accepted = torch.full((4,), take, device="cuda", dtype=torch.int32)
+        accepted[round_index] = 1
+        commit(case, accepted, ended_slots=())
+        check_prefix(case, accepted, expected)
+        case["raw"].mul_(0.9)
+    history = case["records"].history
+    endpoints = [
+        endpoint(case["state"][page], history, row)
+        for row, page in enumerate(history.live_state_indices.tolist())
+    ]
+    taps = [
+        ring_taps(history, case["records"].preconv, row).clone() for row in range(4)
+    ]
+    materialize(case)
+    assert replay_state(history).tolist() == [[0, 0]] * 4
+    for row, page in enumerate(history.live_state_indices.tolist()):
+        torch.testing.assert_close(case["conv"][page], taps[row], atol=0, rtol=0)
+        torch.testing.assert_close(
+            case["state"][page].float(), endpoints[row], atol=2e-6, rtol=2e-5
+        )
 
 
 @pytest.mark.parametrize("accepted_history,width", [(12, 4), (13, 4), (15, 1)])

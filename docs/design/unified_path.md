@@ -377,8 +377,9 @@ from one first bound to that pool:
   pool's specs, page counts, and request-slot capacity), `init_cuda_graph_state`,
   `init_prefill_graph_state` and `preallocate_verify_workspace` again after
   a rebind, as after a first bind. A probe pool must still hold `max_bs`
-  state rows for live dense checkpoints. KDA stores its FP32 records and one
-  accepted count per request slot in a separate allocation. The backend tree
+  state rows for live dense checkpoints. KDA stores its FP32 records,
+  pre-convolution rings and replay state (one accepted count and one ring
+  state) per request slot in a separate allocation. The backend tree
   covers only itself: the executor's own pool references
   (`token_to_kv_pool`, its cache runtime contract, the drafter's
   pool) and the layer-to-group stamps `bind_cache_groups` writes on the
@@ -644,10 +645,17 @@ reads those buffers before the next refresh rewrites them. KDA's refresh then
 readies every layer's retained history in one launch, outside the graph and
 ahead of the replay, the eager forward or a mixed forward's decode rows: a
 request whose accepted count would overflow the history capacity folds its
-records into its live blocks, and one that moves to a live block gets its
-dense base copied there, so verify only reads live blocks
-(`KdaAttnBackend._prepare_retained_history`). An extend clears its rows'
-counts once, after the last KDA layer's gather, eager or replayed.
+records into its live blocks, one that moves to a live block gets its
+dense base copied there, and one whose pre-convolution ring holds no rows
+gets every layer's ring seeded from its input block's convolution taps, so
+verify only reads live blocks and rings
+(`KdaAttnBackend._prepare_retained_history`). The launch snapshots each
+row's applied count and ring head. Verify, replayed or eager, reads only the
+snapshotted ring head and derives the applied count from the slot's count,
+which only the commit writes; the commit reads both snapshotted fields. An
+extend writes a seeded ring's window into its live blocks before its
+convolution and clears its rows' counts and ring states once, after the last
+KDA layer's gather, eager or replayed.
 
 After verification, GDN, KDA, and PLE resolve the accepted state's destination
 with `commit_state_pages`, once per state group and only for live requests:
@@ -1792,12 +1800,16 @@ the arena. Replay capability determines this reservation even without a drafter;
 prefill-only engines do not reserve decode records. NVIDIA target verification and
 commit use saved corrections for both BF16 and FP16 activations; the same
 batched recovery also handles a layer subset. AMD uses its registered
-batched recovery over saved records. Fused convolution verification retains
-original QKV in its records workspace. The registered backend owns the gate
+batched recovery over saved records. Fused convolution verification reads
+its convolution history from, and writes its candidates' raw QKV rows to, the
+request slot's pre-convolution ring. The registered backend owns the gate
 projection when the model does not supply a gate. Split convolution producers
-retain original QKV in the same launch that computes convolved rows. Both
-arrangements write the existing replay workspace; commit reads that workspace
-after acceptance. A missing batched binding is an error,
+do both in the same launch that computes convolved rows. After acceptance a
+KDA round launches the shared page planner (`commit_state_groups`) and one
+retained commit over every layer, and no convolution commit: the commit
+publishes each carried request's count and ring head and, only for a request
+that ended in the forward, folds its records and writes the ring's last three
+accepted inputs into its live block. A missing batched binding is an error,
 not a reason to recompute each layer through a second commit path. Since forward
 mode is derived from the extend count, zero means decode at this entry. Hybrid
 delegates to the recurrent child.

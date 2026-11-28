@@ -419,10 +419,14 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name, 
     correction.copy_((0.01 * torch.arange(1, 11, device="cuda")).view(10, 1, 1, 1))
     key.fill_(0.02)
     decay.fill_(0.9)
-    # The accepted count every layer shares; this forward's only KDA layer
-    # gathers with it and then clears it.
-    length = torch.zeros(10, 1, device="cuda", dtype=torch.int32)
-    backend._replay_length = length
+    # The accepted count and ring state every layer shares; this forward's
+    # only KDA layer gathers with the count and then clears both.
+    backend._replay_state = torch.zeros(10, 2, device="cuda", dtype=torch.int32)
+    length = backend._replay_length = backend._replay_state[:, :1]
+    # Each slot's pre-convolution ring, unseeded: the pages hold the windows.
+    backend._preconv_ring = torch.zeros(
+        10, 1, 4, 3 * channels, device="cuda", dtype=torch.bfloat16
+    )
     backend._state_layer_ids = lambda: [0]
     backend.__dict__.update(
         is_draft=False,
@@ -760,7 +764,8 @@ def test_plain_metadata_norms_the_zero_padded_bucket():
     )
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
-    backend._replay_length = torch.zeros(4, 1, device="cuda", dtype=torch.int32)
+    backend._replay_state = torch.zeros(4, 2, device="cuda", dtype=torch.int32)
+    backend._replay_length = backend._replay_state[:, :1]
     backend.__dict__.update(
         is_draft=False,
         cache_pool=object(),

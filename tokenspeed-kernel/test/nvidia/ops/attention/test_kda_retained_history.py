@@ -30,7 +30,7 @@ if not is_nvidia():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
 
 import tokenspeed_kernel.ops.attention.kda as kda_ops
-from kda_retained_reference import prepare_history, publish
+from kda_retained_reference import prepare_history, publish, replay_length
 from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
     vllm_triton_kda_recoverssm_verify,
 )
@@ -141,7 +141,9 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
     u = torch.randn(3, heads, capacity, dim, device="cuda") * 0.02
     key = torch.nn.functional.normalize(torch.randn_like(u), dim=-1)
     decay = torch.rand_like(key) * 0.2 + 0.7
-    length = torch.full((3, 1), initial_length, device="cuda", dtype=torch.int32)
+    # Each count sits beside its slot's ring state, as the kernels keep them.
+    length = replay_length(3)
+    length.fill_(initial_length)
     if strided:
         fields = []
         for value in (u, key, decay):
@@ -151,7 +153,7 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
             view.copy_(value)
             fields.append(view)
         u, key, decay = fields
-        length_view = torch.empty(6, 3, device="cuda", dtype=torch.int32)[::2, 1:2]
+        length_view = torch.zeros(6, 3, device="cuda", dtype=torch.int32)[::2, 1:2]
         length_view.copy_(length)
         length = length_view
     indices = torch.tensor([1], device="cuda", dtype=torch.int32)
@@ -275,9 +277,8 @@ def test_retained_history_keeps_accepted_prefix_and_publishes_only_length(
 def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
     """Catch source mutation, writes by empty/null rows, and stale GPU metadata."""
     from tokenspeed_kernel.ops.attention.kda._triton.retained import (
-        retained_batched_conv_kernel,
+        retained_batched_commit_kernel,
         retained_batched_prepare_kernel,
-        retained_batched_publish_kernel,
     )
     from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
         _kda_recoverssm_verify_kernel,
@@ -292,9 +293,8 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
     decay = torch.rand_like(key) * 0.2 + 0.7
     # Counts belong to request slots: rows 0 and 1 start from the shared dense
     # source; the empty row 2, null row 3 and unused slots keep stale counts.
-    length = torch.tensor(
-        [[0], [0], [6], [5], [4], [2]], device="cuda", dtype=torch.int32
-    )
+    length = replay_length(6)
+    length.copy_(torch.tensor([[0], [0], [6], [5], [4], [2]], device="cuda"))
     sources = torch.tensor([1, 1, 1, 0], device="cuda", dtype=torch.int32)
     live = torch.tensor([2, 3, 4, 5], device="cuda", dtype=torch.int32)
     starts = torch.tensor([0, 4, 5, 5, 6], device="cuda", dtype=torch.int32)
@@ -404,8 +404,7 @@ def test_shared_source_ragged_live_pages_and_gpu_metadata_refresh(captured):
         else:
             with assert_no_triton_compile(
                 retained_batched_prepare_kernel,
-                retained_batched_conv_kernel,
-                retained_batched_publish_kernel,
+                retained_batched_commit_kernel,
                 _kda_recoverssm_verify_kernel.fn,
             ):
                 run()
@@ -472,7 +471,8 @@ def test_retained_history_large_value_tile_and_acceptance_clamping():
     u = torch.randn(batch + 1, heads, capacity, dim, device="cuda") * 0.02
     key = torch.nn.functional.normalize(torch.randn_like(u), dim=-1)
     decay = torch.rand_like(key) * 0.2 + 0.7
-    length = torch.full((batch + 1, 1), 2, device="cuda", dtype=torch.int32)
+    length = replay_length(batch + 1)
+    length.fill_(2)
     indices = torch.arange(1, batch + 1, device="cuda", dtype=torch.int32)
     starts = torch.tensor(offsets, device="cuda", dtype=torch.int32)
     counts = torch.tensor(requested, device="cuda", dtype=torch.int32)
@@ -564,7 +564,8 @@ def test_rows_outside_the_page_pool_are_skipped_by_verify_and_commit():
     u = torch.randn(2, heads, capacity, dim, device="cuda") * 0.02
     key = torch.nn.functional.normalize(torch.randn_like(u), dim=-1)
     decay = torch.rand_like(key) * 0.2 + 0.7
-    length = torch.tensor([[3], [3]], device="cuda", dtype=torch.int32)
+    length = replay_length(2)
+    length.fill_(3)
     # Row 0's source and row 1's live page are one past the pool.
     sources = torch.tensor([pages, 1], device="cuda", dtype=torch.int32)
     live = torch.tensor([2, pages], device="cuda", dtype=torch.int32)

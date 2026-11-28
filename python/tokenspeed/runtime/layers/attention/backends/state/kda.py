@@ -31,10 +31,13 @@ import torch
 from tokenspeed_kernel.ops.attention.gdn import GdnStateCheckpoints
 from tokenspeed_kernel.ops.attention.kda import (
     KDA_RETAINED_COMMIT_DESCRIPTOR_COLUMNS,
+    KdaFusesProducersMemo,
     KdaOutputNorm,
+    KdaPreconvRing,
     KdaPrefillCapacity,
     KdaRetainedHistory,
     KdaRetainedRecords,
+    check_kda_split_verify_extents,
     kda_fused_paged_verify,
     kda_fused_paged_verify_fuses_producers,
     kda_fused_paged_verify_uses_split_producers,
@@ -78,6 +81,11 @@ if TYPE_CHECKING:
         SoftmaxAttnConfig,
     )
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
+
+
+# The probe imported above. _fuses_producers remembers its answers only while
+# this module still calls it; a replacement (a test's patch) is asked each time.
+_DEFAULT_FUSES_PRODUCERS_PROBE = kda_fused_paged_verify_fuses_producers
 
 
 KDA_PREFILL_BACKENDS = ("auto", "fla", "flashkda", "cutedsl_kda", "cudnn")
@@ -162,15 +170,22 @@ class KdaAttnBackend(CapacityPrefillBackend):
     is inherited. Decode and speculative verify share deferred commitment.
     Active requests keep FP32 replay records in their own request slots,
     outside the cache arena, and one accepted count per slot that every layer
-    shares; cache pages hold only dense checkpoints. A decode commit only
-    advances the count, except in the forward that ends a request, where it
-    folds the records into the live State block; a retraction folds them
-    before imaging. Before each verify round, one launch over every layer
-    readies each request's live block: a request whose count would overflow
-    the history capacity has its records folded into it, and a request that
-    moves to a private live block has its dense base copied there
-    (``_prepare_retained_history``). Standard decode is a one-token window
-    with one accepted token.
+    shares; cache pages hold only dense checkpoints. Each slot also keeps a
+    ring of its request's last raw pre-convolution QKV rows per layer (window
+    + 3 rows): verify reads its convolution history there and writes its
+    candidates' rows there. A decode commit only publishes each continuing
+    request's accepted count and next ring head; it writes no block. In the
+    forward that ends a request, the same launch materializes both states
+    instead: it folds the accepted records into the live State block, writes
+    the ring's last three accepted inputs as its convolution state, and
+    clears the count and ring head. A retraction (before imaging) and a
+    prefill continuation materialize them too. Before each verify round, one
+    launch over every layer readies each request's live block and ring: a request whose count
+    would overflow the history capacity has its records folded into it, a
+    request that moves to a private live block has its dense base copied
+    there, and a ring that holds no rows yet is seeded from the source
+    block's convolution state (``_prepare_retained_history``). Standard
+    decode is a one-token window with one accepted token.
     KDA also replaces the scan seams: its decay gate is
     per-channel (a low-rank ``f_a``/``f_b`` projection plus raw beta logits)
     where GDN's is scalar per head, and its decode/verify kernels can fuse
@@ -178,12 +193,18 @@ class KdaAttnBackend(CapacityPrefillBackend):
     """
 
     _prefill_needs_request_slots = True
-    # Retraction folds accepted records into the dense page before slot reuse
-    # (fold_deferred_state). A recycled or restored slot starts with an
-    # accepted count of zero.
+    # Between materializations a decoding request's accepted records and its
+    # last convolution inputs live in its slot, not in its page. Retraction
+    # (fold_deferred_state), a prefill continuation and the decode commit of
+    # an ended request write both into the dense page before another reader
+    # sees it. A recycled or restored slot starts with an accepted count of
+    # zero and an unseeded ring, so its first verify reseeds the ring from
+    # its page.
     workspace_slot_state = (
         "_retained_records",
+        "_replay_state",
         "_replay_length",
+        "_preconv_ring",
     )
     _verify_reads_committed_recurrent_state = True
     _verify_packed_qkv_views = True
@@ -222,6 +243,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._batched_replay_kernel = None
         self._batched_prepare_kernel = None
         self._verify_split_producers = False
+        # kda_fused_paged_verify_fuses_producers by geometry (_fuses_producers).
+        self._verify_fused_producers = KdaFusesProducersMemo()
         # RuntimeStates.stopped and the executor's per-row request_ends, bound
         # by the executor (bind_request_stop_flags).
         self._request_stopped: torch.Tensor | None = None
@@ -256,18 +279,32 @@ class KdaAttnBackend(CapacityPrefillBackend):
         self._verify_producer_stream: torch.cuda.Stream | None = None
         self._verify_producer_forks: dict[int, StreamFork] = {}
         self._replay_workspace_ready = False
-        self._retained_qkv: torch.Tensor | None = None
+        # [request slots, layers, window + 3, conv channels] in the convolution
+        # state's dtype: each request's last raw pre-convolution QKV rows per
+        # layer; row r holds the input at position p with p mod (window + 3)
+        # == r.
+        self._preconv_ring: torch.Tensor | None = None
         self._retained_records: torch.Tensor | None = None
-        # INT32 [request slots, 1]: records accepted since the dense base of
-        # each request's live page, one count every layer shares. The decode
-        # commit writes it; prefill and retraction folds clear it once, after
-        # every layer has read it. A verify round applies it only within
+        # INT32 [request slots, 2]: per slot, the records accepted since the
+        # dense base of its request's live page (one count every layer
+        # shares) and the ring state (0: the ring holds no rows and the page's
+        # convolution state is current; else the ring row of the next
+        # candidate plus one). The decode commit writes both; prefill and
+        # retraction folds and slot resets clear both at once, after every
+        # layer has read them. A verify round applies the count only within
         # [0, capacity - window]; past that its prepare folds the records.
+        self._replay_state: torch.Tensor | None = None
+        # The count column of _replay_state, as the records' readers take it.
         self._replay_length: torch.Tensor | None = None
+        # INT32 [max_bs, 2]: the prepare's per-row snapshot of the applied
+        # count and the ring row of the first candidate, which the round's
+        # verify and commit read.
+        self._replay_snapshot: torch.Tensor | None = None
         self._record_slots: torch.Tensor | None = None
         # The recurrent state dtype every layer shares (validate_cache_pool).
         self._retained_state_dtype: torch.dtype | None = None
         self._retained_histories: dict[tuple[int, int], KdaRetainedHistory] = {}
+        self._preconv_rings: dict[tuple[int, int], KdaPreconvRing] = {}
         self._replay_descriptors: torch.Tensor | None = None
         self._replay_group_indices: torch.Tensor | None = None
         self._descriptor_row_by_layer: dict[int, int] = {}
@@ -376,6 +413,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def _reset_graph_state(self) -> None:
         super()._reset_graph_state()
         self._retained_histories: dict[tuple[int, int], KdaRetainedHistory] = {}
+        self._preconv_rings: dict[tuple[int, int], KdaPreconvRing] = {}
 
     def _history_for_rows(self, layer_id, live_indices, record_slots):
         row = self._descriptor_row_by_layer[layer_id]
@@ -399,6 +437,22 @@ class KdaAttnBackend(CapacityPrefillBackend):
             self._retained_histories[key] = history
         return history
 
+    def _layer_preconv_ring(self, layer_id: int) -> torch.Tensor:
+        """The layer's [record slots, window + 3, channels] pre-convolution ring rows."""
+        return self._preconv_ring[:, self._descriptor_row_by_layer[layer_id]]
+
+    def _preconv_ring_rows(self, layer_id: int, batch_size: int) -> KdaPreconvRing:
+        """The layer's pre-convolution ring with the first batch_size rows' heads."""
+        key = (layer_id, batch_size)
+        ring = self._preconv_rings.get(key)
+        if ring is None:
+            ring = KdaPreconvRing(
+                self._layer_preconv_ring(layer_id),
+                self._replay_snapshot[:batch_size, 1],
+            )
+            self._preconv_rings[key] = ring
+        return ring
+
     @override
     def deferred_decode_state_groups(self) -> frozenset[str]:
         # Accepted records stay in request slots until a request ends or is
@@ -420,15 +474,19 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def fold_deferred_state(
         self, state_folds: Mapping[str, torch.Tensor], *, stream: torch.Stream
     ) -> None:
-        """Fold each listed slot's accepted records into its listed State block.
+        """Fold each listed slot's accepted records and ring inputs into its listed State block.
 
         The scheduler lists a retraction victim's live block per group, the
-        block its decode commits wrote in place; a slot without records --
-        restored and not yet decoding -- leaves its block unchanged. Every
-        layer reads the slots' shared counts, which one launch clears once
-        every layer has folded. A group the plan does not list for a victim
-        (its publication swapped in an equal, complete entry) needs none of
-        the victim's records, which the retracted slot no longer keeps.
+        block its decode rounds kept as their dense base. Each layer folds the slot's
+        records into the block's recurrent state and, when the slot's ring
+        is seeded, writes the ring's last three inputs as the block's
+        convolution state; a slot without records or ring rows -- restored
+        and not yet decoding -- leaves its block unchanged. Every layer reads
+        the slots' shared counts and ring states, which one launch clears
+        once every layer has folded. A group the plan does not list for a
+        victim (its publication swapped in an equal, complete entry) needs
+        none of the victim's records or inputs, which the retracted slot no
+        longer keeps.
         """
         if self._retained_records is None or not state_folds:
             return
@@ -448,15 +506,18 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 if fold is None:
                     continue
                 group_pages, group_slots = fold
-                _, recurrent = self._state_components(layer_id)
+                conv, recurrent = self._state_components(layer_id)
                 kda_materialize_retained_pages(
                     recurrent,
                     history=self._history_for_rows(layer_id, group_pages, group_slots),
                     source_indices=group_pages,
                     recurrent_layout=self.kda_recurrent_layout,
+                    conv_pool=conv,
+                    preconv=self._layer_preconv_ring(layer_id),
+                    ring_state=self._replay_state[:, 1:],
                 )
             kda_reset_retained_length(
-                self._replay_length,
+                self._replay_state,
                 write_indices=pages,
                 record_slots=slots,
                 page_count=self._state_page_count(),
@@ -483,20 +544,29 @@ class KdaAttnBackend(CapacityPrefillBackend):
         if self._retained_records is not None:
             slots = self.forward_metadata.req_pool_indices
             history = self._history_for_rows(layer_id, live_indices, slots)
+            # A continued request's slot may hold accepted records and, in a
+            # seeded ring, the convolution inputs its page lacks: the records
+            # go into the gathered state and the ring's last three inputs
+            # over the taps the gather copied into the live page, before the
+            # prefill convolution reads them.
             kda_materialize_retained_state(
                 recurrent,
                 history=history,
                 source_indices=source_indices,
                 recurrent_layout=self.kda_recurrent_layout,
+                conv_pool=conv_states,
+                preconv=self._layer_preconv_ring(layer_id),
+                ring_state=self._replay_state[:, 1:],
             )
             # The scan starts from the gathered logical state and stores a
             # dense one into the live page, so these rows' slots hold no
-            # accepted records any more. Every layer's gather reads the count
-            # they share, so it clears once, after the last layer's gather,
-            # in a launch ordered behind it.
+            # accepted records any more, and their rings no rows the page's
+            # convolution state lacks. Every layer's gather reads the count
+            # and ring state they share, so they clear once, after the last
+            # layer's gather, in a launch ordered behind it.
             if layer_id == self._state_layer_ids()[-1]:
                 kda_reset_retained_length(
-                    self._replay_length,
+                    self._replay_state,
                     write_indices=live_indices,
                     record_slots=slots,
                     page_count=recurrent_states.shape[0],
@@ -511,41 +581,42 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def reset_request_workspace(
         self, request_slots: torch.Tensor, *, stream: torch.Stream
     ) -> None:
-        """Clear the accepted count a reused slot keeps for its previous owner.
+        """Clear the accepted count and ring state a reused slot keeps for its previous owner.
 
         An owner whose end the device did not see (an abort, a finish decided
-        on the host) leaves its records counted. The reset is ordered on
-        ``stream`` ahead of the new owner's first forward, or of a fold of
-        the slot that a retraction before it would run.
+        on the host) leaves its records counted and its ring seeded. The
+        reset is ordered on ``stream`` ahead of the new owner's first
+        forward, or of a fold of the slot that a retraction before it would
+        run.
         """
         super().reset_request_workspace(request_slots, stream=stream)
-        if self._replay_length is not None and request_slots.numel():
+        if self._replay_state is not None and request_slots.numel():
             with stream_scope(stream):
                 slots = request_slots.to(device=self.device, dtype=torch.int64)
-                self._replay_length.index_fill_(0, slots, 0)
+                self._replay_state.index_fill_(0, slots, 0)
 
     @override
     def import_slot_state(
         self, slot: int, src: torch.Tensor, stream, *, admission_id: int
     ) -> None:
-        """Start a restored request with no accepted records.
+        """Start a restored request with no accepted records and an unseeded ring.
 
-        Retraction folded the request's records into the page it imaged; the
-        restored slot may still count records of another owner.
+        Retraction folded the request's records into the page it imaged,
+        whose convolution state is current; the restored slot may still count
+        records and hold ring rows of another owner.
         """
         super().import_slot_state(slot, src, stream, admission_id=admission_id)
-        if self._replay_length is not None:
+        if self._replay_state is not None:
             with stream_scope(stream):
-                self._replay_length[slot].zero_()
+                self._replay_state[slot].zero_()
 
     def _allocate_replay_workspace(self) -> None:
-        """Allocate max_bs * T original QKV rows before eager or graph execution.
+        """Allocate the request-slot records and rings before eager or graph execution.
 
         Batch refreshes reuse these buffers; binding a pool resets them.
         """
         if self._replay_workspace_ready:
             return
-        rows = self.max_bs * self.speculative_num_draft_tokens
         layer_ids = tuple(self._state_layer_ids())
         self._descriptor_row_by_layer = {
             layer_id: row for row, layer_id in enumerate(layer_ids)
@@ -587,8 +658,12 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 dtype=torch.float32,
                 device=self.device,
             )
-            self._replay_length = torch.zeros(
-                (self._record_slot_count, 1), dtype=torch.int32, device=self.device
+            self._replay_state = torch.zeros(
+                (self._record_slot_count, 2), dtype=torch.int32, device=self.device
+            )
+            self._replay_length = self._replay_state[:, :1]
+            self._replay_snapshot = torch.zeros(
+                (self.max_bs, 2), dtype=torch.int32, device=self.device
             )
             self._record_slots = torch.zeros(
                 self.max_bs, dtype=torch.int64, device=self.device
@@ -601,27 +676,35 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     layer_id: StreamFork(self._verify_producer_stream)
                     for layer_id in layer_ids
                 }
-            payload_shape = (len(layer_ids), rows)
-            self._retained_qkv = torch.empty(
-                (*payload_shape, first_conv.shape[1]),
-                dtype=self.dtype,
+            # The convolution's 3 past inputs and one window per slot and
+            # layer, in the convolution state's dtype: verify reads the same
+            # values the page holds.
+            self._preconv_ring = torch.zeros(
+                (
+                    self._record_slot_count,
+                    len(layer_ids),
+                    self.speculative_num_draft_tokens + 3,
+                    first_conv.shape[1],
+                ),
+                dtype=first_conv.dtype,
                 device=self.device,
             )
             descriptors = []
             for row, layer in enumerate(layer_ids):
                 conv, recurrent = self._state_components(layer)
-                qkv = self._retained_qkv[row]
+                ring = self._preconv_ring[:, row]
                 descriptors.append(
                     [
-                        qkv.data_ptr(),
+                        ring.data_ptr(),
                         conv.data_ptr(),
                         conv.shape[0],
-                        qkv.stride(0),
+                        ring.stride(1),
                         conv.stride(0),
                         conv.stride(1),
                         conv.stride(2),
                         recurrent.data_ptr(),
                         *recurrent.stride(),
+                        ring.stride(0),
                     ]
                 )
             addresses.copy_(
@@ -800,9 +883,13 @@ class KdaAttnBackend(CapacityPrefillBackend):
         with the records applied in its live block, and the verify and the
         commit apply none. Otherwise a request that moves to a private live
         block gets its source state copied there in that group's layers, and
-        its records stay valid on top of it. The launch only reads the count;
-        the commit is its only writer in a decode round. Verify then reads
-        only live blocks, and never writes a block or a count.
+        its records stay valid on top of it. A request whose ring holds no
+        rows gets every layer's ring seeded from its source block's
+        convolution state. The launch writes each row's applied count and
+        ring head into the snapshot the verify and the commit read; it only
+        reads the counts and ring states, which the commit alone writes in a
+        decode round. Verify then reads only live blocks and rings, and never
+        writes a block, a count or a ring state.
         """
         if not self._replay_descriptors.is_cuda:
             # CPU-only metadata tests run no kernels, as in the record refresh.
@@ -824,6 +911,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         """Launch the batched prepare over [groups, rows] source and live pages."""
         correction, key, decay = self._retained_records.unbind(2)
         _, _, heads, capacity, dim = correction.shape
+        conv, _ = self._state_components(self._state_layer_ids()[0])
         self._batched_prepare_kernel(
             descriptors=self._replay_descriptors,
             group_indices=self._replay_group_indices,
@@ -835,11 +923,13 @@ class KdaAttnBackend(CapacityPrefillBackend):
             retained_correction=correction,
             retained_key=key,
             retained_decay=decay,
-            replay_length=self._replay_length,
+            replay_state=self._replay_state,
+            replay_snapshot=self._replay_snapshot[: record_slots.numel()],
             history_capacity=capacity,
             draft_token_num=self.speculative_num_draft_tokens,
             num_heads=heads,
             head_dim=dim,
+            conv_state_dtype=conv.dtype,
             recurrent_state_dtype=self._retained_state_dtype,
         )
 
@@ -896,9 +986,9 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         self._ensure_verify_scratch(max_bs, draft_token_num)
         payload_bytes = (
-            self._retained_qkv.nbytes
+            self._preconv_ring.nbytes
             + self._retained_records.nbytes
-            + self._replay_length.nbytes
+            + self._replay_state.nbytes
         )
         metadata_bytes = sum(
             tensor.nbytes
@@ -911,6 +1001,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 self._replay_commit_steps,
                 self._replay_record_metadata,
                 self._replay_record_stamps,
+                self._replay_snapshot,
                 self._record_slots,
             )
             if tensor is not None
@@ -940,6 +1031,28 @@ class KdaAttnBackend(CapacityPrefillBackend):
             return torch.nn.functional.linear(f_a_out, f_b_weight)
         else:
             return g_raw
+
+    def _fuses_producers(
+        self, heads: int, head_dim: int, draft_token_num: int, batch_size: int
+    ) -> bool:
+        """``kda_fused_paged_verify_fuses_producers`` for this backend's dtype and layout.
+
+        ``KdaFusesProducersMemo`` reuses an answer only while kernel selection
+        would still pick the kernel it was read from (no active override, same
+        platform, unchanged registry and policy), so it always equals a fresh
+        call. A replaced module-level probe is called directly every time.
+        """
+        probe = kda_fused_paged_verify_fuses_producers
+        if probe is _DEFAULT_FUSES_PRODUCERS_PROBE:
+            probe = self._verify_fused_producers
+        return probe(
+            self.dtype,
+            recurrent_layout=self.kda_recurrent_layout,
+            num_heads=heads,
+            head_dim=head_dim,
+            draft_token_num=draft_token_num,
+            batch_size=batch_size,
+        )
 
     @override
     def tree_support(self) -> TreeSupport:
@@ -971,80 +1084,151 @@ class KdaAttnBackend(CapacityPrefillBackend):
         lower_bound: float | None,
         output_norm: KdaOutputNorm | None,
     ) -> torch.Tensor:
-        """Write private candidates; acceptance publishes the selected prefix."""
-        qkv = self._retained_qkv[self._descriptor_row_by_layer[layer_id]]
+        """Write private candidates; acceptance publishes the selected prefix.
+
+        The convolution reads each request's history from its slot's
+        pre-convolution ring, not from ``conv_comp``: the prepare seeded the
+        ring from the source block where it held no rows.
+        """
+        preconv = self._preconv_ring_rows(layer_id, batch_size)
         rows = batch_size * draft_token_num
         heads = value_dim // attn_tp_size // head_v_dim
         # Preserve main's small-batch fused producers within the retained path.
         split = self._verify_split_producers and not (
             g_raw is None
             and bias is None
-            and kda_fused_paged_verify_fuses_producers(
-                self.dtype,
-                recurrent_layout=self.kda_recurrent_layout,
-                num_heads=heads,
-                head_dim=head_v_dim,
-                draft_token_num=draft_token_num,
-                batch_size=batch_size,
-            )
+            and self._fuses_producers(heads, head_v_dim, draft_token_num, batch_size)
         )
+        live_indices = self.forward_metadata.state_out_blocks_by_group[
+            self._state_group_for(layer_id)
+        ]
+        history = self._retained_history(layer_id, live_indices)
+        query_start_loc = self.forward_metadata.query_start_loc[: batch_size + 1]
+        # FP32 records belong to request slots. Generation stamps index batch rows.
+        assert self._replay_record_metadata is not None
+        assert self._replay_record_stamps is not None
+        record_metadata = self._replay_record_metadata[:batch_size]
+        record_stamps = self._replay_record_stamps[
+            self._descriptor_row_by_layer[layer_id]
+        ]
+        read_indices = state_in_blocks[:batch_size]
         split_producers = {}
         if split:
+            verify_rows = mixed_qkv[:rows]
+            # The convolution producer writes candidate rows to the ring
+            # before the verify reads the checkpoint, records, gate and norm,
+            # and neither launch's own check sees the other's operands: check
+            # them all, every operand the verify and norm read, and the
+            # convolution bias, before either producer (the gate projection
+            # included) starts. Both launches below then skip their repeat
+            # of these checks (_validated).
+            check_kda_split_verify_extents(
+                verify_rows.shape[0],
+                heads,
+                head_v_dim,
+                g_raw=None if g_raw is None else g_raw[:rows],
+                f_a_out=None if f_a_out is None else f_a_out[:rows],
+                f_b_weight=f_b_weight,
+                beta_logits=beta_raw,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                state_pool=ssm_comp,
+                read_indices=read_indices,
+                history=history,
+                query_start_loc=query_start_loc,
+                record_metadata=record_metadata,
+                record_stamps=record_stamps,
+                draft_token_num=draft_token_num,
+                device=mixed_qkv.device,
+                conv_bias=bias,
+                output_norm=output_norm,
+                mixed_qkv=verify_rows,
+                conv_weights=conv_weights,
+                preconv=preconv,
+            )
+            preconv.check_verify_storage(
+                mixed_qkv,
+                conv_weights,
+                bias,
+                g_raw,
+                f_a_out,
+                f_b_weight,
+                beta_raw,
+                A_log,
+                dt_bias,
+                ssm_comp,
+                read_indices,
+                query_start_loc,
+                record_metadata,
+                record_stamps,
+                history=history,
+                output_norm=output_norm,
+            )
+            if live_indices.shape[0] == batch_size:
+                # The history's own vectors are these rows already: its
+                # record slots are self._record_slots[:batch_size].
+                live_rows, slot_rows = live_indices, history.record_slots
+            else:
+                live_rows = live_indices[:batch_size]
+                slot_rows = self._record_slots[:batch_size]
             fork = self._verify_producer_forks[layer_id]
             with fork.scope(enable=True) as producer_fork:
                 with producer_fork.branch():
+                    # The preflight required f_a_out[:rows] to have two or
+                    # more dimensions, so [:rows] slices a leading axis and
+                    # the projection's rows are those of the f_a_out[:rows]
+                    # it checked, never a cut of the channels.
                     g_raw = self._kda_gate(g_raw, f_a_out, f_b_weight)[:rows]
                 conv_qkv = kda_verify_conv_update(
-                    mixed_qkv[:rows],
+                    verify_rows,
                     conv_weights,
-                    conv_comp,
-                    state_in_blocks[:batch_size],
+                    read_indices,
+                    live_indices=live_rows,
+                    preconv=preconv,
+                    record_slots=slot_rows,
+                    page_count=ssm_comp.shape[0],
                     num_heads=heads,
                     head_dim=head_v_dim,
                     draft_token_num=draft_token_num,
                     recurrent_layout=self.kda_recurrent_layout,
                     bias=bias,
-                    original_qkv=qkv[:rows, : mixed_qkv.shape[-1]],
-                    query_start_loc=self.forward_metadata.query_start_loc[
-                        : batch_size + 1
-                    ],
+                    query_start_loc=query_start_loc,
+                    _validated=True,
                 )
             # Eager allocations on the producer stream stay live through
             # the consumer's verify. Graph capture owns its allocations.
             if not torch.cuda.is_current_stream_capturing():
                 consumer_stream = torch.cuda.current_stream()
                 g_raw.record_stream(consumer_stream)
-            split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
+            split_producers = {
+                "g_raw": g_raw,
+                "conv_qkv": conv_qkv,
+                "_validated": True,
+            }
         else:
             if bias is not None:
                 raise ValueError("fused KDA convolution does not support a bias")
             # The registered kernel owns an absent gate's projection.
             split_producers = {"g_raw": None if g_raw is None else g_raw[:rows]}
-        # FP32 records belong to request slots. Generation stamps index batch rows.
-        assert self._replay_record_metadata is not None
-        assert self._replay_record_stamps is not None
-        live_indices = self.forward_metadata.state_out_blocks_by_group[
-            self._state_group_for(layer_id)
-        ]
         retained_records = KdaRetainedRecords(
-            history=self._retained_history(layer_id, live_indices),
-            original_qkv=None if split else qkv[:rows, : mixed_qkv.shape[-1]],
-            metadata=self._replay_record_metadata[:batch_size],
-            stamps=self._replay_record_stamps[self._descriptor_row_by_layer[layer_id]],
-            query_start_loc=self.forward_metadata.query_start_loc[: batch_size + 1],
+            history=history,
+            # The split convolution producer already read and wrote the ring.
+            preconv=None if split else preconv,
+            metadata=record_metadata,
+            stamps=record_stamps,
+            query_start_loc=query_start_loc,
         )
         num_value_heads = value_dim // attn_tp_size // head_v_dim
         fused_out = kda_fused_paged_verify(
             mixed_qkv,
             conv_weights,
-            conv_comp,
             f_a_out,
             f_b_weight,
             beta_raw,
             A_log,
             dt_bias,
             state_pool=ssm_comp,
-            read_indices=state_in_blocks[:batch_size],
+            read_indices=read_indices,
             num_heads=num_value_heads,
             head_dim=head_v_dim,
             draft_token_num=draft_token_num,
@@ -1062,8 +1246,13 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def commit_verified_state(
         self, accepted_length: torch.Tensor, *, accepted_path: torch.Tensor | None
     ) -> None:
-        """Replay and eagerly commit this round's accepted KDA prefix (a chain:
-        KDA refuses draft trees)."""
+        """Publish this round's accepted KDA prefix (a chain: KDA refuses draft trees).
+
+        One launch advances each continuing request's accepted count and ring
+        head without writing a block, and materializes each request that
+        ended in this forward: its accepted records and the ring's last three
+        inputs go into its live block.
+        """
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
@@ -1094,11 +1283,15 @@ class KdaAttnBackend(CapacityPrefillBackend):
             )
         correction, key, decay = self._retained_records.unbind(2)
         # The planner clamps each active interval to at least one accepted
-        # token. Every layer of a request shares its count, which the second
-        # launch writes once from the round's acceptance. A request that
-        # ended in this forward has its records folded into its live block,
-        # which its finish publishes; if a layer that carried it rejects its
-        # commit, its row in request_ends says the block is incomplete.
+        # token. Every layer of a request shares its count and ring head,
+        # which one launch writes once from the round's acceptance and the
+        # prepare's snapshot; the ring keeps the request's convolution inputs,
+        # so no block's convolution state is written while it decodes. A
+        # request that ended in this forward has, in the same launch, its
+        # records folded into its live block and the ring's last three inputs
+        # written as the block's convolution state, which its finish
+        # publishes; if a layer that carried it rejects its commit, its row
+        # in request_ends says the block is incomplete.
         self._batched_replay_kernel(
             descriptors=self._replay_descriptors,
             group_indices=self._replay_group_indices,
@@ -1115,7 +1308,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
             retained_correction=correction,
             retained_key=key,
             retained_decay=decay,
-            replay_length=self._replay_length,
+            replay_state=self._replay_state,
+            replay_snapshot=self._replay_snapshot[:bs],
             request_stopped=self._request_stopped,
             request_ends=self._request_ends[first_row : first_row + bs],
             draft_token_num=draft_token_num,
@@ -1123,7 +1317,6 @@ class KdaAttnBackend(CapacityPrefillBackend):
             num_heads=state.shape[1],
             head_dim=state.shape[2],
             conv_width=conv.shape[-1] + 1,
-            activation_dtype=self.dtype,
             conv_state_dtype=conv.dtype,
             recurrent_state_dtype=state.dtype,
         )

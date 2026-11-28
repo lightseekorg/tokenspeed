@@ -22,9 +22,10 @@
 
 Contract: the split producers (the gate projection ``f_a @ f_b.T`` and
 ``kda_verify_conv_update``) followed by ``kda_recoverssm_verify`` for windows
-of one token, in one launch. Outputs and records match theirs, the
-pre-convolution rows are retained for commit, and the checkpoint and the
-convolution state are read only.
+of one token, in one launch. Outputs and records match theirs: the
+convolution reads each request's three previous inputs from its
+pre-convolution ring and retains the incoming row there for commit, and the
+checkpoint is read only.
 
 For one request and head, let S0 be the [V, K] state after the accepted prefix:
 
@@ -66,7 +67,11 @@ from cutlass import BFloat16, Boolean, Float16, Float32, Int32, Int64, const_exp
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.compile_utils import make_fake_tensor
-from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm, KdaRetainedHistory
+from tokenspeed_kernel.ops.attention.kda import (
+    KdaOutputNorm,
+    KdaPreconvRing,
+    KdaRetainedHistory,
+)
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.recoverssm_verify import (
     GATE_FLOOR,
     _asm,
@@ -87,6 +92,9 @@ __all__ = ["fused_verify_step", "fused_verify_step_supported"]
 THREADS = 128
 WARPS = THREADS // 32
 CONV_TAPS = 4
+# Ring rows a slot keeps per layer: the 3 previous inputs and the one-token
+# window.
+RING_ROWS = CONV_TAPS
 _MAX_PROJECTED_HISTORY = 16
 _DTYPES = {
     torch.bfloat16: BFloat16,
@@ -141,9 +149,50 @@ def _prefetch_l2(byte_addr: Int64, size: int, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def _store_bf16_if(live: Int32, byte_addr: Int64, value: Float32, *, loc=None, ip=None):
-    """Store an FP32 value that is already a BF16 number as BF16, when live."""
-    _store_if(live, byte_addr, value, True, loc=loc, ip=ip)
+def _ldg_bf16_if(present: Int32, byte_addr: Int64, *, loc=None, ip=None) -> Float32:
+    """A BF16 global load as FP32 when present, else zero; a predicate keeps it branch-free.
+
+    Nothing is read when absent, so the address need not lie in any allocation.
+    """
+    return Float32(
+        _asm(
+            T.f32(),
+            [Int32(present), Int64(byte_addr)],
+            "{ .reg .pred p; .reg .b16 x, z; setp.ne.b32 p, $1, 0; "
+            "mov.b16 x, 0; mov.b16 z, 0; @p ld.global.b16 x, [$2]; "
+            "mov.b32 $0, {z, x}; }",
+            "=f,r,l",
+            True,
+            loc,
+            ip,
+        )
+    )
+
+
+@dsl_user_op
+def _store_ring_bf16_if(
+    live: Int32, byte_addr: Int64, value: Float32, *, loc=None, ip=None
+):
+    """Store an FP32 value that is already a BF16 number as a BF16 ring element, when live.
+
+    The store asks L2 to keep the line (``evict_last``): the layer's next
+    verify reads it as convolution history after a round of state traffic
+    (GB300, Kimi-K3 TP8 rank, one-token rounds: 2 to 4 us faster at batches
+    1 and 16, 9 us slower at batch 64, which still saves far more than its
+    old convolution commit cost).
+    """
+    _asm(
+        None,
+        [Int32(live), Int64(byte_addr), Float32(value)],
+        "{ .reg .pred p; .reg .b16 x; .reg .b64 q; setp.ne.b32 p, $0, 0; "
+        "cvt.rn.bf16.f32 x, $2; "
+        "createpolicy.fractional.L2::evict_last.b64 q, 1.0; "
+        "@p st.global.L2::cache_hint.b16 [$1], x, q; }",
+        "r,l,f",
+        True,
+        loc,
+        ip,
+    )
 
 
 @cute.jit
@@ -198,6 +247,7 @@ class FusedVerifyStep:
         gated_norm: bool,
         fp32_checkpoint: bool,
         packed_history: bool,
+        contiguous_rows: bool = False,
     ) -> None:
         self.key_dim = self.value_dim = self.gate_rank = THREADS
         self.heads = heads
@@ -208,6 +258,11 @@ class FusedVerifyStep:
         self.fp32_checkpoint = fp32_checkpoint
         self.packed_history = packed_history
         self.width = heads * THREADS
+        # A ring whose rows of a slot are contiguous (the runtime's layout)
+        # compiles their pitch, 3 P channels: a row offset then stays below
+        # RING_ROWS * 3 P, so INT32 math cannot wrap, and no runtime stride
+        # feeds the tap addresses. Other row pitches are INT64 runtime values.
+        self.row_pitch = 3 * self.width if contiguous_rows else None
         # Checkpoint, convolution and gate vectors, reduction partials and copy barriers.
         self.smem_bytes = 4 * (THREADS * THREADS + 4 * THREADS + 4 * WARPS) + 128
         # U, K and decay prefixes, cumulative decay, and the two dot products
@@ -224,12 +279,19 @@ class FusedVerifyStep:
             + 384
         )
 
+    def _ring_row_offset(self, row: Int32, ring_row_stride: Int64):
+        """Elements from a slot's first ring row to its row ``row``."""
+        if self.row_pitch is not None:
+            return row * Int32(self.row_pitch)
+        return Int64(row) * ring_row_stride
+
     @cute.jit
     def __call__(
         self,
         qkv: cute.Tensor,
         conv_weights: cute.Tensor,
-        conv_states: cute.Tensor,
+        ring: cute.Tensor,
+        ring_heads: cute.Tensor,
         f_a: cute.Tensor,
         f_b: cute.Tensor,
         beta: cute.Tensor,
@@ -238,8 +300,8 @@ class FusedVerifyStep:
         state: cute.Tensor,
         retained: tuple,
         ring_capacity: Int64,
+        stamp_slots: Int64,
         correction: cute.Tensor,
-        original: cute.Tensor,
         out: cute.Tensor,
         query_start_loc: cute.Tensor,
         state_indices: cute.Tensor,
@@ -266,7 +328,8 @@ class FusedVerifyStep:
         self.kernel(
             qkv.iterator,
             conv_weights.iterator,
-            conv_states.iterator,
+            ring.iterator,
+            ring_heads,
             f_a.iterator,
             f_b.iterator,
             beta.iterator,
@@ -275,8 +338,8 @@ class FusedVerifyStep:
             state.iterator,
             retained,
             ring_capacity,
+            stamp_slots,
             correction.iterator,
-            original.iterator,
             out.iterator,
             query_start_loc.iterator,
             state_indices.iterator,
@@ -287,7 +350,8 @@ class FusedVerifyStep:
             lower_bound,
             norm_eps,
             qkv.stride[0],
-            conv_states.stride[0],
+            ring.stride[0],
+            ring.stride[1],
             f_a.stride[0],
             beta.stride[0],
             state.stride[0],
@@ -295,7 +359,6 @@ class FusedVerifyStep:
             correction.stride[0],
             correction.stride[1],
             correction.stride[2],
-            original.stride[0],
             out.stride[0],
             gate_token_stride,
         ).launch(
@@ -313,7 +376,8 @@ class FusedVerifyStep:
         self,
         qkv,
         conv_weights,
-        conv_states,
+        ring,
+        ring_heads,
         f_a,
         f_b,
         beta,
@@ -322,8 +386,8 @@ class FusedVerifyStep:
         state,
         retained: tuple,
         ring_capacity: Int64,
+        stamp_slots: Int64,
         correction,
-        original,
         out,
         query_start_loc,
         state_indices,
@@ -334,7 +398,8 @@ class FusedVerifyStep:
         lower_bound: Float32,
         norm_eps: Float32,
         qkv_token_stride: Int64,
-        conv_page_stride: Int64,
+        ring_slot_stride: Int64,
+        ring_row_stride: Int64,
         f_a_token_stride: Int64,
         beta_token_stride: Int64,
         state_page_stride: Int64,
@@ -342,7 +407,6 @@ class FusedVerifyStep:
         correction_slot_stride: Int64,
         correction_head_stride: Int64,
         correction_position_stride: Int64,
-        original_token_stride: Int64,
         out_token_stride: Int64,
         gate_token_stride: Int64,
     ):
@@ -428,6 +492,8 @@ class FusedVerifyStep:
         valid = Int32(Int64(_load(query_start_loc, request + 1)) - token_start)
         page = Int64(_load(state_indices, request))
         live_page, slot = retained_row(retained, request)
+        # The prepare's snapshot: the ring row of this request's candidate.
+        ring_head = Int32(ring_heads[Int64(request)])
         # A page past the checkpoint pool is padding, like a nonpositive one.
         live = (
             (page > 0)
@@ -579,16 +645,40 @@ class FusedVerifyStep:
                 q_taps = _ldg_bf16x4((conv_weights + q_channel * CONV_TAPS).toint())
                 k_taps = _ldg_bf16x4((conv_weights + k_channel * CONV_TAPS).toint())
                 v_taps = _ldg_bf16x4((conv_weights + v_channel * CONV_TAPS).toint())
-                history = conv_states + page * conv_page_stride
+                # The slot's ring: the 3 previous inputs are rows
+                # (head - 3 + i) mod RING_ROWS. The row index stays below
+                # RING_ROWS, so its INT32 math cannot wrap; the row pitch is
+                # compiled for contiguous rows, else an INT64 runtime stride
+                # (``_ring_row_offset``). Only a live request touches
+                # its slot: padding rows read a zero history and write no row,
+                # so they never reach a live request's rows (slot 0 included)
+                # or an empty ring. The loads are predicated rather than under
+                # a branch on the request-uniform ``live``, which would split
+                # them from the weight and row loads into dependent memory
+                # round trips. A live head already lies in the ring; the clamp
+                # keeps any head's addresses inside the slot.
+                history = ring + Int64(slot) * ring_slot_stride
+                first_row = cutlass.min(
+                    cutlass.max(ring_head, Int32(0)), Int32(RING_ROWS - 1)
+                )
+                past_offsets = []
+                for i in cutlass.range_constexpr(CONV_TAPS - 1):
+                    past_row = first_row + Int32(i - (CONV_TAPS - 1))
+                    past_row = past_row + Int32(RING_ROWS) * Int32(past_row < 0)
+                    past_offsets.append(
+                        self._ring_row_offset(past_row, ring_row_stride)
+                    )
                 channels = [q_channel, k_channel, v_channel]
                 pasts = []
                 for c in cutlass.range_constexpr(3):
                     for i in cutlass.range_constexpr(CONV_TAPS - 1):
-                        past = Float32(0.0)
-                        if (valid > 0) & (page >= 0) & (page < retained[0].shape[0]):
-                            past = _load(history, channels[c] * 3 + i).to(Float32)
-                        pasts.append(past)
-                # Convolution over the committed window and this row.
+                        pasts.append(
+                            _ldg_bf16_if(
+                                Int32(live),
+                                (history + (past_offsets[i] + channels[c])).toint(),
+                            )
+                        )
+                # Convolution over the ring's history and this row.
                 row = qkv + token_start * qkv_token_stride
                 raw = [_load(row, channel) for channel in channels]
                 taps = [q_taps, k_taps, v_taps]
@@ -600,10 +690,11 @@ class FusedVerifyStep:
                     acc = acc + raw[c].to(Float32) * taps[c][CONV_TAPS - 1]
                     convolved.append(_bf16(_silu(acc)))
                 query, key_value, value = convolved
-                kept = original + token_start * original_token_stride
+                # The candidate's ring row: head itself, the window being one row.
+                kept = history + self._ring_row_offset(first_row, ring_row_stride)
                 for c in cutlass.range_constexpr(3):
-                    _store_bf16_if(
-                        Int32(1), (kept + channels[c]).toint(), raw[c].to(Float32)
+                    _store_ring_bf16_if(
+                        Int32(live), (kept + channels[c]).toint(), raw[c].to(Float32)
                     )
                 if live:
                     raw_keys[tidx] = key_value
@@ -646,17 +737,26 @@ class FusedVerifyStep:
                         stamp_slot = Int64(_load(meta, 0))
                         generation = Int64(_load(meta, 1))
                         start = Int64(_load(meta, 2))
-                        position = Int64(0)
-                        if ring_capacity == self.capacity:
-                            position = start % Int64(self.capacity)
-                        else:
-                            position = start % ring_capacity
-                        tag = cute.make_tensor(
-                            stamps + (stamp_slot * ring_capacity + position) * 2,
-                            cute.make_layout((2,)),
-                        )
-                        tag[0] = start
-                        tag[1] = generation
+                        # Stamp only a slot row the table holds, as the
+                        # Triton and AMD verifies do: padding (slot -1) and
+                        # slots past a short table store nothing.
+                        if (
+                            (stamp_slot >= Int64(0))
+                            & (stamp_slot < stamp_slots)
+                            & (generation >= Int64(0))
+                            & (start >= Int64(0))
+                        ):
+                            position = Int64(0)
+                            if ring_capacity == self.capacity:
+                                position = start % Int64(self.capacity)
+                            else:
+                                position = start % ring_capacity
+                            tag = cute.make_tensor(
+                                stamps + (stamp_slot * ring_capacity + position) * 2,
+                                cute.make_layout((2,)),
+                            )
+                            tag[0] = start
+                            tag[1] = generation
                 projected_history = (accepted > 0) & (
                     accepted <= _MAX_PROJECTED_HISTORY
                 )
@@ -1040,6 +1140,7 @@ def _compile(
     bias_dtype: torch.dtype,
     start_dtype: torch.dtype,
     index_dtype: torch.dtype,
+    contiguous_rows: bool,
 ):
     key_dim = value_dim = gate_rank = THREADS
     tokens = cute.sym_int()
@@ -1048,9 +1149,8 @@ def _compile(
     width = heads * key_dim
     qkv = make_fake_tensor(BFloat16, (tokens, 3 * width), divisibility=8)
     conv_weights = make_fake_tensor(BFloat16, (3 * width, 4), divisibility=4)
-    conv_states = make_fake_tensor(
-        BFloat16, (cute.sym_int(), cute.sym_int(), 3), divisibility=1
-    )
+    ring = make_fake_tensor(BFloat16, (slots, RING_ROWS, 3 * width), divisibility=1)
+    ring_heads = make_fake_tensor(Int32, (batch,), leading_dim=None)
     f_a = make_fake_tensor(BFloat16, (tokens, gate_rank), divisibility=8)
     f_b = make_fake_tensor(BFloat16, (width, gate_rank), divisibility=8)
     beta = make_fake_tensor(_DTYPES[beta_dtype], (tokens, heads))
@@ -1065,7 +1165,6 @@ def _compile(
     normalized_key = make_fake_tensor(
         Float32, (slots, heads, capacity, key_dim), leading_dim=None
     )
-    original = make_fake_tensor(BFloat16, (tokens, 3 * width))
     out = make_fake_tensor(BFloat16, (tokens, heads * value_dim))
     query_start_loc = make_fake_tensor(_DTYPES[start_dtype], (cute.sym_int(),))
     state_indices = make_fake_tensor(_DTYPES[index_dtype], (batch,))
@@ -1093,12 +1192,14 @@ def _compile(
         norm_dtype is not None,
         state_dtype == torch.float32,
         packed_history,
+        contiguous_rows,
     )
     return cute.compile(
         kernel,
         qkv,
         conv_weights,
-        conv_states,
+        ring,
+        ring_heads,
         f_a,
         f_b,
         beta,
@@ -1107,8 +1208,8 @@ def _compile(
         state,
         retained,
         Int64(0),
+        Int64(0),
         correction,
-        original,
         out,
         query_start_loc,
         state_indices,
@@ -1123,10 +1224,13 @@ def _compile(
     )
 
 
+_INDEX_DTYPES = (torch.int32, torch.int64)
+
+
 def fused_verify_step_supported(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
+    preconv: KdaPreconvRing,
     f_a_out: torch.Tensor,
     f_b_weight: torch.Tensor,
     beta_logits: torch.Tensor,
@@ -1146,7 +1250,9 @@ def fused_verify_step_supported(
         mixed_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16 q|k|v rows
             before the convolution.
         conv_weights: ``[3 * num_heads * head_dim, 4]`` BF16 convolution taps.
-        conv_states: ``[pages, channels, 3]`` BF16 convolution history.
+        preconv: ``[slots, window + 3, 3 * num_heads * head_dim]`` BF16
+            pre-convolution ring and each request's ring head; the caller
+            checks the window.
         f_a_out: ``[tokens, rank]`` BF16 gate projection input.
         f_b_weight: ``[num_heads * head_dim, rank]`` BF16 gate projection.
         beta_logits: ``[tokens, num_heads]`` beta logits.
@@ -1165,23 +1271,34 @@ def fused_verify_step_supported(
     Returns:
         True when the shapes, dtypes, strides and base alignments fit the
         kernel: head width and gate rank 128, BF16 activations, 16-byte aligned
-        projection rows, dense request vectors and unit-stride correction channels.
+        projection rows, dense request vectors and unit-stride correction
+        channels, with a gate input and beta logit row for every token, the
+        ``[num_heads]`` A_log and ``num_heads * head_dim`` dt_bias values the
+        gate loads, a boundary at ``request`` and ``request + 1`` for every
+        request, and every operand on the projection's device.
     """
     width = num_heads * head_dim
+    tokens = mixed_qkv.shape[0]
     rank = f_a_out.shape[-1]
     return (
         head_dim == THREADS
+        # The kernel reads a gate input and num_heads beta logits per token.
+        and mixed_qkv.ndim == f_a_out.ndim == beta_logits.ndim == 2
+        and f_a_out.shape[0] == tokens
+        and beta_logits.shape[0] == tokens
+        and beta_logits.shape[1] >= num_heads
         and mixed_qkv.dtype == torch.bfloat16
         and conv_weights.dtype == torch.bfloat16
-        and conv_states.dtype == torch.bfloat16
+        and preconv.rows.dtype == torch.bfloat16
         and f_a_out.dtype == f_b_weight.dtype == torch.bfloat16
         and checkpoint_state.dtype in (torch.float32, torch.bfloat16)
         and mixed_qkv.shape[-1] == 3 * width
         and conv_weights.shape == (3 * width, CONV_TAPS)
         and conv_weights.is_contiguous()
-        and conv_states.ndim == 3
-        and conv_states.shape[1] >= 3 * width
-        and conv_states.stride()[1:] == (3, 1)
+        and preconv.rows.shape[2] == 3 * width
+        # The kernel bounds ring slots by the records' slot count.
+        and preconv.rows.shape[0] == retained_history.correction.shape[0]
+        and preconv.heads.shape == state_indices.shape
         and f_b_weight.shape == (width, rank)
         and f_b_weight.is_contiguous()
         and rank == 128
@@ -1194,11 +1311,12 @@ def fused_verify_step_supported(
         and f_a_out.data_ptr() % 16 == 0
         and f_b_weight.data_ptr() % 16 == 0
         and beta_logits.stride(-1) == 1
+        # The kernel loads A_log[head] and dt_bias[head * head_dim + k].
+        and A_log.shape == (num_heads,)
         and A_log.stride(0) == 1
+        and dt_bias.numel() == width
         and dt_bias.is_contiguous()
         and checkpoint_state.shape[1:] == (num_heads, head_dim, head_dim)
-        # The kernel bounds convolution pages by the checkpoint pool's count.
-        and conv_states.shape[0] == checkpoint_state.shape[0]
         and retained_history.correction.shape[1] == num_heads
         and retained_history.correction.shape[3]
         == retained_history.key.shape[3]
@@ -1209,15 +1327,39 @@ def fused_verify_step_supported(
         and checkpoint_state.stride(1) % 4 == 0
         and checkpoint_state.data_ptr() % 16 == 0
         and retained_history.correction.stride(-1) == 1
-        and all(
-            x.ndim == 1 and x.dtype in (torch.int32, torch.int64) and x.stride(0) == 1
-            for x in (
-                query_start_loc,
-                state_indices,
-                retained_history.live_state_indices,
-            )
+        and _dense_index_vector(query_start_loc)
+        and _dense_index_vector(state_indices)
+        and _dense_index_vector(retained_history.live_state_indices)
+        # Request r reads boundaries r and r + 1.
+        and query_start_loc.shape[0] >= state_indices.shape[0] + 1
+        and _on_device(
+            mixed_qkv.device,
+            conv_weights,
+            preconv.rows,
+            f_a_out,
+            f_b_weight,
+            beta_logits,
+            A_log,
+            dt_bias,
+            checkpoint_state,
+            retained_history.correction,
+            query_start_loc,
+            state_indices,
         )
     )
+
+
+def _dense_index_vector(x: torch.Tensor) -> bool:
+    """Whether ``x`` is a unit-stride INT32 or INT64 vector."""
+    return x.ndim == 1 and x.dtype in _INDEX_DTYPES and x.stride(0) == 1
+
+
+def _on_device(device: torch.device, *tensors: torch.Tensor) -> bool:
+    """Whether every one of ``tensors`` is on ``device``."""
+    for tensor in tensors:
+        if tensor.device != device:
+            return False
+    return True
 
 
 def _check_records(
@@ -1225,11 +1367,15 @@ def _check_records(
     record_stamps: torch.Tensor | None,
     batch: int,
     correction_cache: torch.Tensor,
+    window: int = 1,
 ) -> None:
     """Raise ValueError unless the replay records are laid out as the kernel reads them.
 
     The metadata must be dense INT64 ``[batch, 3]`` and the stamps dense INT64
-    ``[slots, capacity, 2]``, both on the cache's device.
+    ``[slots, capacity, 2]``, both on the cache's device. A live request
+    stores its stamp pairs in the slot row its metadata names, at positions
+    modulo the stamp capacity, so a non-empty batch needs a slot row and
+    the capacity must hold the ``window``.
     """
     if (record_metadata is None) != (record_stamps is None):
         raise ValueError("record metadata and stamps must be supplied together")
@@ -1239,6 +1385,8 @@ def _check_records(
         record_metadata.shape != (batch, 3)
         or record_stamps.ndim != 3
         or record_stamps.shape[-1] != 2
+        or (batch > 0 and record_stamps.shape[0] == 0)
+        or record_stamps.shape[1] < window
     ):
         raise ValueError(
             "retained metadata needs [batch,3] and stamps [slots,capacity,2]"
@@ -1251,6 +1399,37 @@ def _check_records(
     ):
         raise ValueError(
             "replay metadata and stamps must be contiguous INT64 on the input device"
+        )
+
+
+def _check_output(
+    out: torch.Tensor, tokens: int, width: int, device: torch.device
+) -> None:
+    """Raise ValueError unless ``out`` has a row of its own of ``width`` channels per token.
+
+    The kernels store token t's channel c at ``out + t * stride(0) + c`` in
+    BF16, so an active output needs unit channel stride on the input
+    ``device`` and, past one token, a row pitch of at least ``width``: an
+    expanded (pitch 0) or overlapping (pitch below ``width``) output would
+    let distinct tokens overwrite one another. Pitched rows (pitch above
+    ``width``) pass. With zero tokens nothing is stored, so only the rank
+    and width are checked.
+    """
+    if out.ndim != 2 or out.shape[0] < tokens or out.shape[1] != width:
+        raise ValueError(
+            "the verify output needs a [tokens, num_heads * head_dim] row per token"
+        )
+    if tokens == 0:
+        return
+    if (
+        out.dtype != torch.bfloat16
+        or out.device != device
+        or out.stride(1) != 1
+        or (tokens > 1 and out.stride(0) < width)
+    ):
+        raise ValueError(
+            "the verify output needs BF16 rows on the input device with unit "
+            "channel stride, no two tokens sharing an element"
         )
 
 
@@ -1285,7 +1464,7 @@ def _check_output_norm(
 def fused_verify_step(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
+    preconv: KdaPreconvRing,
     f_a_out: torch.Tensor,
     f_b_weight: torch.Tensor,
     beta_logits: torch.Tensor,
@@ -1294,7 +1473,6 @@ def fused_verify_step(
     lower_bound: float | None,
     checkpoint_state: torch.Tensor,
     retained_history,
-    original_qkv: torch.Tensor,
     query_start_loc: torch.Tensor,
     state_indices: torch.Tensor,
     num_heads: int,
@@ -1303,6 +1481,8 @@ def fused_verify_step(
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
     output_norm: KdaOutputNorm | None,
+    *,
+    _validated: bool = False,
 ) -> torch.Tensor:
     """Run one-token record verify with the gate and convolution producers fused.
 
@@ -1310,8 +1490,11 @@ def fused_verify_step(
         mixed_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16 q|k|v rows
             before the convolution, one token per request.
         conv_weights: ``[3 * num_heads * head_dim, 4]`` BF16 convolution taps.
-        conv_states: ``[pages, channels, 3]`` BF16 committed convolution
-            history; read only.
+        preconv: ``[slots, 4, 3 * num_heads * head_dim]`` BF16
+            pre-convolution ring of the layer and each request's ring head
+            (the prepare's snapshot). A request's 3 previous inputs are rows
+            ``(head - 3 + i) mod 4``; its incoming row is written to row
+            ``head`` for commit.
         f_a_out: ``[tokens, 128]`` BF16 gate projection input.
         f_b_weight: ``[num_heads * head_dim, 128]`` BF16 gate projection.
         beta_logits: ``[tokens, num_heads]`` beta logits.
@@ -1322,13 +1505,10 @@ def fused_verify_step(
             committed checkpoint in value-major layout; read only.
         retained_history: Request-slot FP32 U/normalized-K/decay and accepted
             lengths. Candidates append after each slot's accepted prefix.
-        original_qkv: ``[tokens, 3 * num_heads * head_dim]`` BF16; receives
-            the pre-convolution rows for commit.
         query_start_loc: ``[batch + 1]`` token offset of each request.
-        state_indices: ``[batch]`` checkpoint and convolution page of each
-            request. Pages at or below 0, or past the checkpoint pool, are
-            padding: zero outputs and no records, though their
-            pre-convolution rows are still retained.
+        state_indices: ``[batch]`` source checkpoint page of each request.
+            Pages at or below 0, or past the checkpoint pool, are padding:
+            zero outputs, no records and no ring row.
         num_heads: Per-rank head count.
         head_dim: Head width; 128.
         out: ``[tokens, num_heads * head_dim]`` BF16 verify output, or with
@@ -1340,6 +1520,11 @@ def fused_verify_step(
             each record position, written with ``record_metadata``; else None.
         output_norm: The layer's gated output RMSNorm to apply before the
             store, or None to store the verify output.
+        _validated: Internal. The registered wrapper, which has just found
+            ``fused_verify_step_supported`` true for these operands (with the
+            whole state pool and boundary vector this entry gets slices
+            of), sets it so the predicate is not evaluated twice. Every
+            other check here still runs. Direct callers leave it False.
 
     Returns:
         ``out``.
@@ -1347,15 +1532,17 @@ def fused_verify_step(
     Raises:
         ValueError: If ``fused_verify_step_supported`` rejects the inputs, the
             record metadata and stamps are not dense INT64 views of the record
-            layout, or the output norm's gate or weight are laid out otherwise.
+            layout (with a slot row), the output norm's gate or weight are
+            laid out otherwise, or the ring shares storage with another
+            operand.
     """
     correction_cache = retained_history.correction
     if mixed_qkv.shape[0] == 0:
         return out
-    if not fused_verify_step_supported(
+    if not _validated and not fused_verify_step_supported(
         mixed_qkv,
         conv_weights,
-        conv_states,
+        preconv,
         f_a_out,
         f_b_weight,
         beta_logits,
@@ -1370,10 +1557,34 @@ def fused_verify_step(
         lower_bound,
     ):
         raise ValueError("CuTe DSL fused KDA verify step cannot address these inputs")
+    if preconv.rows.shape[1] != RING_ROWS:
+        raise ValueError(
+            f"the one-token verify needs a {RING_ROWS}-row pre-convolution ring"
+        )
     _check_records(
         record_metadata, record_stamps, state_indices.shape[0], correction_cache
     )
+    _check_output(out, mixed_qkv.shape[0], num_heads * head_dim, mixed_qkv.device)
     _check_output_norm(output_norm, out, head_dim)
+    # The kernel stores candidate rows into the ring while it reads every
+    # other operand and writes out.
+    preconv.check_verify_storage(
+        mixed_qkv,
+        conv_weights,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        checkpoint_state,
+        query_start_loc,
+        state_indices,
+        out,
+        record_metadata,
+        record_stamps,
+        history=retained_history,
+        output_norm=output_norm,
+    )
     bounded = lower_bound is not None
     kernel = _compile(
         num_heads,
@@ -1390,11 +1601,13 @@ def fused_verify_step(
         dt_bias.dtype,
         query_start_loc.dtype,
         state_indices.dtype,
+        preconv.rows.stride(1) == preconv.rows.shape[2],
     )
     kernel(
         mixed_qkv,
         conv_weights,
-        conv_states,
+        preconv.rows,
+        preconv.heads,
         f_a_out,
         f_b_weight,
         beta_logits,
@@ -1407,8 +1620,8 @@ def fused_verify_step(
             if record_stamps is not None
             else correction_cache.shape[2]
         ),
+        0 if record_stamps is None else record_stamps.shape[0],
         correction_cache,
-        original_qkv,
         out,
         query_start_loc,
         state_indices,

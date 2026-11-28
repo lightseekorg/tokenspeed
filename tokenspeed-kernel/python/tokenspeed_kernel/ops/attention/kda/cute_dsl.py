@@ -26,6 +26,8 @@ plan uses live sequence boundaries for eager execution and capacity replay.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.kda import (
@@ -34,6 +36,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillResult,
     KdaRetainedHistory,
     KdaRetainedRecords,
+    check_kda_split_verify_extents,
     kda_verify_conv_update,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import (
@@ -151,6 +154,117 @@ def cutedsl_kda_chunk_prefill(
         lower_bound=lower_bound,
     )
     return out.view(batch, tokens, heads, dim), final_state
+
+
+def _split_producer_verify(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    f_a_out: torch.Tensor | None,
+    f_b_weight: torch.Tensor,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    *,
+    g_raw: torch.Tensor | None,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+    retained_records: KdaRetainedRecords,
+    output_norm: KdaOutputNorm | None,
+) -> torch.Tensor:
+    """Run the split gate and convolution producers, then the split verify.
+
+    The convolution producer reads and writes the pre-convolution ring, so
+    the verify that follows takes the records without it. The ring is
+    checked against every operand of both launches first, and every
+    operand the verify and the norm read against the producer's tokens
+    (check_kda_split_verify_extents): the producer's own check cannot see
+    the checkpoint, records, gate, beta, gate parameters or norm its
+    consumer reads.
+    """
+    records = retained_records
+    check_kda_split_verify_extents(
+        mixed_qkv.shape[0],
+        num_heads,
+        head_dim,
+        g_raw=g_raw,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        history=records.history,
+        query_start_loc=records.query_start_loc,
+        record_metadata=records.metadata,
+        record_stamps=records.stamps,
+        draft_token_num=draft_token_num,
+        device=mixed_qkv.device,
+        output_norm=output_norm,
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        preconv=records.preconv,
+    )
+    retained_records.preconv.check_verify_storage(
+        mixed_qkv,
+        conv_weights,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        g_raw,
+        state_pool,
+        read_indices,
+        retained_records.metadata,
+        retained_records.stamps,
+        retained_records.query_start_loc,
+        history=retained_records.history,
+        output_norm=output_norm,
+    )
+    if g_raw is None:
+        g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
+    conv_qkv = kda_verify_conv_update(
+        mixed_qkv,
+        conv_weights,
+        read_indices,
+        live_indices=retained_records.history.live_state_indices,
+        preconv=retained_records.preconv,
+        record_slots=retained_records.history.record_slots,
+        page_count=state_pool.shape[0],
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        recurrent_layout="v_major",
+        query_start_loc=retained_records.query_start_loc,
+        # Both checks above covered the producer's operands.
+        _validated=True,
+    )
+    return triton_nvidia_kda_fused_paged_verify_split(
+        mixed_qkv,
+        conv_weights,
+        f_a_out,
+        f_b_weight,
+        beta_logits,
+        A_log,
+        dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+        retained_records=replace(retained_records, preconv=None),
+        output_norm=output_norm,
+        g_raw=g_raw,
+        conv_qkv=conv_qkv,
+        # Its operands are the ones checked above, the gate from them.
+        _validated=True,
+    )
 
 
 if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
@@ -303,7 +417,6 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
     def cute_dsl_kda_fused_paged_verify_step(
         mixed_qkv: torch.Tensor,
         conv_weights: torch.Tensor,
-        conv_states: torch.Tensor,
         f_a_out: torch.Tensor,
         f_b_weight: torch.Tensor,
         beta_logits: torch.Tensor,
@@ -325,10 +438,12 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         Same results as the split producers (``f_a_out @ f_b_weight.T`` and
         ``kda_verify_conv_update``) followed by ``kda_recoverssm_verify``:
         outputs, correction and key/gate records, stamps, and the
-        pre-convolution rows in ``retained_records.original_qkv``. The recurrent
-        and convolution states are read only. Inputs the CuTe DSL kernel
-        cannot address run those split producers instead. ``output_norm``
-        is applied before the store.
+        pre-convolution rows in the ring of ``retained_records.preconv``,
+        whose rows before each request's head give the convolution history.
+        The recurrent state is read only. Inputs the CuTe DSL kernel cannot
+        address run those split producers instead. ``output_norm`` is
+        applied before the store. Either route raises ValueError before
+        any launch when the ring shares storage with another operand.
 
         Returns the verify output as ``[1, tokens, num_heads, head_dim]``, or
         with ``output_norm`` the normed ``[tokens, num_heads * head_dim]``.
@@ -338,8 +453,10 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             fused_verify_step_supported,
         )
 
-        if retained_records is None or retained_records.original_qkv is None:
-            raise ValueError("fused verify step requires records with original rows")
+        if retained_records is None or retained_records.preconv is None:
+            raise ValueError(
+                "fused verify step requires records with a pre-convolution ring"
+            )
         if draft_token_num != 1:
             raise ValueError(
                 f"fused verify step takes one-token windows, got {draft_token_num}"
@@ -353,7 +470,7 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         if g_raw is not None or not fused_verify_step_supported(
             mixed_qkv,
             conv_weights,
-            conv_states,
+            retained_records.preconv,
             f_a_out,
             f_b_weight,
             beta_logits,
@@ -367,28 +484,15 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             head_dim,
             lower_bound,
         ):
-            if g_raw is None:
-                g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
-            conv_qkv = kda_verify_conv_update(
+            return _split_producer_verify(
                 mixed_qkv,
                 conv_weights,
-                conv_states,
-                read_indices,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                draft_token_num=draft_token_num,
-                recurrent_layout="v_major",
-                query_start_loc=query_start_loc,
-            )
-            return triton_nvidia_kda_fused_paged_verify_split(
-                mixed_qkv,
-                conv_weights,
-                conv_states,
                 f_a_out,
                 f_b_weight,
                 beta_logits,
                 A_log,
                 dt_bias,
+                g_raw=g_raw,
                 state_pool=state_pool,
                 read_indices=read_indices,
                 num_heads=num_heads,
@@ -397,8 +501,6 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
                 lower_bound=lower_bound,
                 retained_records=retained_records,
                 output_norm=output_norm,
-                g_raw=g_raw,
-                conv_qkv=conv_qkv,
             )
         out = torch.empty(
             1, rows, num_heads, head_dim, dtype=mixed_qkv.dtype, device=mixed_qkv.device
@@ -406,7 +508,7 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         fused_verify_step(
             mixed_qkv,
             conv_weights,
-            conv_states,
+            retained_records.preconv,
             f_a_out,
             f_b_weight,
             beta_logits,
@@ -415,7 +517,6 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             lower_bound,
             state_pool[:, :num_heads],
             retained_records.history,
-            retained_records.original_qkv,
             query_start_loc[: batch + 1],
             read_indices,
             num_heads,
@@ -424,6 +525,8 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             retained_records.metadata,
             retained_records.stamps,
             output_norm,
+            # fused_verify_step_supported held above for these operands.
+            _validated=True,
         )
         return out if output_norm is None else out.view(rows, num_heads * head_dim)
 
@@ -456,7 +559,6 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
     def cute_dsl_kda_fused_paged_verify_window(
         mixed_qkv: torch.Tensor,
         conv_weights: torch.Tensor,
-        conv_states: torch.Tensor,
         f_a_out: torch.Tensor,
         f_b_weight: torch.Tensor,
         beta_logits: torch.Tensor,
@@ -478,10 +580,13 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         Same results as the split producers (``f_a_out @ f_b_weight.T`` and
         ``kda_verify_conv_update``) followed by ``kda_recoverssm_verify`` for
         windows of 2 to 16 tokens: outputs, correction and key/gate records,
-        stamps, and the pre-convolution rows in ``retained_records.original_qkv``.
-        The recurrent and convolution states are read only. Inputs the CuTe
-        DSL kernel cannot address run those split producers instead.
-        ``output_norm`` is applied before the store.
+        stamps, and the pre-convolution rows in the ring of
+        ``retained_records.preconv``, whose rows before each request's head
+        give the convolution history. The recurrent state is read only.
+        Inputs the CuTe DSL kernel cannot address run those split producers
+        instead. ``output_norm`` is applied before the store. Either route
+        raises ValueError before any launch when the ring shares storage
+        with another operand.
 
         Returns the verify output as ``[1, tokens, num_heads, head_dim]``, or
         with ``output_norm`` the normed ``[tokens, num_heads * head_dim]``.
@@ -491,8 +596,10 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             fused_verify_window_supported,
         )
 
-        if retained_records is None or retained_records.original_qkv is None:
-            raise ValueError("fused verify window requires records with original rows")
+        if retained_records is None or retained_records.preconv is None:
+            raise ValueError(
+                "fused verify window requires records with a pre-convolution ring"
+            )
         batch = read_indices.shape[0]
         rows = batch * draft_token_num
         mixed_qkv = mixed_qkv[:rows]
@@ -502,7 +609,7 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         if g_raw is not None or not fused_verify_window_supported(
             mixed_qkv,
             conv_weights,
-            conv_states,
+            retained_records.preconv,
             f_a_out,
             f_b_weight,
             beta_logits,
@@ -517,38 +624,25 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             draft_token_num,
             lower_bound,
         ):
-            if g_raw is None:
-                g_raw = torch.nn.functional.linear(f_a_out, f_b_weight)
-            conv_qkv = kda_verify_conv_update(
+            return _split_producer_verify(
                 mixed_qkv,
                 conv_weights,
-                conv_states,
-                read_indices,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                draft_token_num=draft_token_num,
-                recurrent_layout="v_major",
-                query_start_loc=query_start_loc,
-            )
-            return triton_nvidia_kda_fused_paged_verify_split(
-                mixed_qkv,
-                conv_weights,
-                conv_states,
                 f_a_out,
                 f_b_weight,
                 beta_logits,
                 A_log,
                 dt_bias,
+                g_raw=g_raw,
                 state_pool=state_pool,
                 read_indices=read_indices,
                 num_heads=num_heads,
                 head_dim=head_dim,
                 draft_token_num=draft_token_num,
                 lower_bound=lower_bound,
-                retained_records=retained_records,
+                retained_records=replace(
+                    retained_records, query_start_loc=query_start_loc
+                ),
                 output_norm=output_norm,
-                g_raw=g_raw,
-                conv_qkv=conv_qkv,
             )
         out = torch.empty(
             1, rows, num_heads, head_dim, dtype=mixed_qkv.dtype, device=mixed_qkv.device
@@ -556,7 +650,7 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
         fused_verify_window(
             mixed_qkv,
             conv_weights,
-            conv_states,
+            retained_records.preconv,
             f_a_out,
             f_b_weight,
             beta_logits,
@@ -565,7 +659,6 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             lower_bound,
             state_pool[:, :num_heads],
             retained_records.history,
-            retained_records.original_qkv,
             query_start_loc,
             read_indices,
             num_heads,
@@ -575,5 +668,7 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             retained_records.metadata,
             retained_records.stamps,
             output_norm,
+            # fused_verify_window_supported held above for these operands.
+            _validated=True,
         )
         return out if output_norm is None else out.view(rows, num_heads * head_dim)
