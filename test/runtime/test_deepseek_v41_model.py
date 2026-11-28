@@ -5274,12 +5274,28 @@ def test_mhc_boundary_gpu_layer_and_prefill_graph_matches_fallback(
             mp.setattr(v41, "is_mega_mhc_capture_safe", lambda: False)
             guarded_cap = BreakableCapture()
             with active_forward(ctx):
+                guarded_cap.stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(guarded_cap.stream):
+                    for _ in range(2):
+                        _complete_layer(*args)
+                guarded_cap.stream.synchronize()
                 mega_calls.reset_mock()
                 boundary_calls.reset_mock()
                 with guarded_cap:
                     guarded_out = _complete_layer(*args)
                 assert mega_calls.call_count == 0
                 assert boundary_calls.call_count == 1
+                saved_residual, saved_pre = residual.clone(), pre.clone()
+                for _ in range(2):
+                    residual.normal_()
+                    pre.uniform_()
+                    guarded_cap.replay()
+                    eager = _complete_layer(*args)
+                    for got, ref in zip(guarded_out[:2], eager[:2], strict=True):
+                        torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
+                residual.copy_(saved_residual)
+                pre.copy_(saved_pre)
+                guarded_cap.replay()
                 for got, ref in zip(guarded_out[:2], expected[:2], strict=True):
                     torch.testing.assert_close(got, ref, atol=0.03, rtol=0.02)
 
