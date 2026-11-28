@@ -108,6 +108,7 @@ import tokenspeed_kernel.ops.residual.triton as _residual_triton
 import tokenspeed_kernel.ops.sampling as _sampling_pkg
 import tokenspeed_kernel.ops.sampling.cute_dsl as _sampling_cute_dsl
 import tokenspeed_kernel.ops.sampling.gluon as _sampling_gluon
+import tokenspeed_kernel.ops.sampling.triton.dspark_markov as _sampling_triton_dspark_markov
 import tokenspeed_kernel.ops.transform as _transform_pkg
 import tokenspeed_kernel.ops.transform.gluon as _transform_gluon
 import tokenspeed_kernel.ops.transform.triton as _transform_triton
@@ -228,6 +229,7 @@ _RELOAD_MODULES = [
     # Sampling registration modules.
     _sampling_cute_dsl,
     _sampling_gluon,
+    _sampling_triton_dspark_markov,
     _sampling_pkg,
     # Transform registration modules.
     _transform_gluon,

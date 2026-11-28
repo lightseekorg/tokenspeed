@@ -28,16 +28,29 @@ from __future__ import annotations
 import functools
 
 import torch as _torch
+from tokenspeed_kernel.ops.sampling._constants import (
+    SELECTED_LOGPROBS_BLOCK,
+    VOCAB_SHARD_DRAFT_BLOCK,
+    VOCAB_SHARD_DRAFT_FIELDS,
+)
 from tokenspeed_kernel.ops.sampling.logprob import blockwise_logprobs
 from tokenspeed_kernel.ops.sampling.positions import prepare_sampling_offsets
 from tokenspeed_kernel.ops.sampling.synthetic import write_synthetic_verify_outputs
+from tokenspeed_kernel.ops.sampling.triton.dspark_markov import (
+    DsparkMarkovSampleWorkspace,
+    dspark_markov_sample_workspace,
+)
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
+    "DsparkMarkovSampleWorkspace",
     "SELECTED_LOGPROBS_BLOCK",
     "argmax",
+    "dspark_markov_sample_workspace",
+    "dspark_markov_softmax",
+    "dspark_probs_scatter_and_sample",
     "eagle4_candidate_supports",
     "eagle4_candidate_tail",
     "eagle4_shard_topk",
@@ -456,11 +469,6 @@ def vocab_topk_merge(
     kernel(pairs, k, softcap, ids_out, values_out)
 
 
-# Columns of a shard each draft-stats block reduces, and the fp32 partials it writes.
-VOCAB_SHARD_DRAFT_BLOCK = 2048
-VOCAB_SHARD_DRAFT_FIELDS = 8
-
-
 def vocab_shard_draft_stats_width(shard_columns: int) -> int:
     """The fp32 columns per row of ``vocab_shard_draft_stats``' output for a shard of ``shard_columns``.
 
@@ -594,10 +602,6 @@ def vocab_shard_draft_record(
     )
 
 
-# Columns of one block of ``selected_token_logprobs``'s softmax denominator:
-# a row's denominator adds its block sums in order, which the shard form
-# (:func:`vocab_shard_logprob_blocks`) keeps.
-SELECTED_LOGPROBS_BLOCK = 1024
 # The row's block sums sit in one program's registers.
 _VOCAB_LOGPROBS_MAX_BLOCKS = 1 << 12
 
@@ -717,11 +721,134 @@ def vocab_shard_logprobs(
     kernel(partials, rows, tokens, row_max, shard_columns, vocab_size, out)
 
 
+def dspark_markov_softmax(
+    base_logits: _torch.Tensor,
+    step: int,
+    anchor_ids: _torch.Tensor,
+    embedding: _torch.Tensor,
+    projection: _torch.Tensor,
+    slots: _torch.Tensor,
+    temperature_pool: _torch.Tensor,
+    top_k_pool: _torch.Tensor,
+    top_p_pool: _torch.Tensor,
+    seed_pool: _torch.Tensor,
+    workspace: DsparkMarkovSampleWorkspace,
+    vocab_size: int,
+    *,
+    prepare_step_inputs: bool,
+) -> _torch.Tensor:
+    """Compute normalized probabilities for one sampled DSpark Markov step.
+
+    Args:
+        base_logits: ``[rows, block, local_vocab]`` precomputed step logits.
+        step: Block step in ``[0, block)``.
+        anchor_ids: ``[rows]`` anchor tokens preceding ``step == 0``.
+        embedding: ``[embed_vocab, rank]`` bigram embedding weights.
+        projection: ``[proj_vocab, rank]`` bigram projection weights.
+        slots: ``[rows]`` request pool indices selecting sampling metadata.
+        temperature_pool: Pool-indexed FP32 sampling temperatures.
+        top_k_pool: Pool-indexed int32 Top-K cutoffs (``1`` denotes greedy).
+        top_p_pool: Pool-indexed FP32 Top-P cutoffs.
+        seed_pool: Pool-indexed int64 Philox seeds.
+        workspace: Static batch-sized workspace from
+            :func:`dspark_markov_sample_workspace`.
+        vocab_size: Valid vocabulary width (``<= local_vocab``).
+        prepare_step_inputs: Whether to gather per-row scalars and anchor
+            embeddings before running the step (required on ``step == 0``).
+
+    Returns:
+        Normalized ``[rows, vocab_size]`` FP32 probabilities inside
+        ``workspace.probs[:rows]``.
+    """
+    kernel = select_kernel(
+        "sampling",
+        "dspark_markov_softmax",
+        format_signature(base_logits=dense_tensor_format(base_logits.dtype)),
+    )
+    return kernel(
+        base_logits,
+        step,
+        anchor_ids,
+        embedding,
+        projection,
+        slots,
+        temperature_pool,
+        top_k_pool,
+        top_p_pool,
+        seed_pool,
+        workspace,
+        vocab_size,
+        prepare_step_inputs=prepare_step_inputs,
+    )
+
+
+def dspark_probs_scatter_and_sample(
+    probs: _torch.Tensor,
+    write_slots: _torch.Tensor,
+    draft_probs: _torch.Tensor,
+    step: int,
+    seeds: _torch.Tensor,
+    base_positions: _torch.Tensor,
+    position_delta: int,
+    rng_tag: int,
+    embedding: _torch.Tensor,
+    next_tokens_out: _torch.Tensor,
+    workspace: DsparkMarkovSampleWorkspace,
+    vocab_size: int,
+    *,
+    gather_next_embed: bool,
+) -> None:
+    """Record proposal laws in ``draft_probs`` and draw one DSpark Markov token.
+
+    Args:
+        probs: ``[rows, vocab_size]`` normalized FP32 probabilities.
+        write_slots: ``[rows]`` target pool rows in ``draft_probs``.
+        draft_probs: ``[pool_rows, width, >= vocab_size]`` verifier proposal table.
+        step: Block step column written in ``draft_probs`` and ``next_tokens_out``.
+        seeds: ``[rows]`` int64 Philox seeds.
+        base_positions: ``[rows]`` int64 per-row base positions.
+        position_delta: Additive step offset applied modulo ``2**64``.
+        rng_tag: Philox counter namespace tag.
+        embedding: ``[embed_vocab, rank]`` bigram embedding weights.
+        next_tokens_out: ``[rows, > step]`` int32 destination token table.
+        workspace: Static batch-sized workspace holding partial buffers and
+            ``markov_embed``.
+        vocab_size: Normalized distribution width.
+        gather_next_embed: Whether to prefetch sampled tokens' embeddings into
+            ``workspace.markov_embed`` for ``step + 1``.
+
+    Returns:
+        None. Updates ``draft_probs``, ``next_tokens_out``, and optionally
+        ``workspace.markov_embed`` in place.
+    """
+    kernel = select_kernel(
+        "sampling",
+        "dspark_probs_scatter_and_sample",
+        format_signature(probs=dense_tensor_format(probs.dtype)),
+    )
+    kernel(
+        probs,
+        write_slots,
+        draft_probs,
+        step,
+        seeds,
+        base_positions,
+        position_delta,
+        rng_tag,
+        embedding,
+        next_tokens_out,
+        workspace,
+        vocab_size,
+        gather_next_embed=gather_next_embed,
+    )
+
+
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.sampling.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.dspark_markov  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.verify_coins  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_logprobs  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_shard_draft  # noqa: E402,F401

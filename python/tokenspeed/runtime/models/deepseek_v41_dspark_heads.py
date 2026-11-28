@@ -12,7 +12,20 @@ bias of a shard column lands on the rank that owns that column's base logit.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
+
 import torch
+from tokenspeed_kernel.ops.sampling import (
+    DsparkMarkovSampleWorkspace,
+    dspark_markov_sample_workspace,
+    dspark_markov_softmax,
+    dspark_probs_scatter_and_sample,
+)
+from tokenspeed_kernel.ops.sampling.packed_verify import (
+    DRAFT_POS_HASH_MUL,
+    RNG_TAG_DRAFT,
+)
 from tokenspeed_kernel.ops.sampling.triton import (
     dspark_block_candidate_tiles,
     dspark_block_greedy_resolve,
@@ -25,6 +38,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 
 
 class DSparkVanillaMarkov(nn.Module):
@@ -150,4 +164,123 @@ def sample_dspark_block_greedy(
         if partials is not None:
             all_gather_single(current.view(-1), scored.view(-1), tp_group)
     dspark_block_greedy_resolve(slots[(block - 1) % 2], output, block - 1)
+    return output
+
+
+@dataclass(frozen=True)
+class DsparkSampledWorkspace:
+    """Static CUDA-graph-safe workspace for fused sampled DSpark Markov walks."""
+
+    kernel_ws: DsparkMarkovSampleWorkspace
+    topk_topp_ws: torch.Tensor | None
+    pools: SpeculativeSamplingPools
+    renorm_probs: Callable[..., torch.Tensor]
+
+
+def dspark_sampled_workspace(
+    *,
+    max_rows: int,
+    vocab_size: int,
+    rank: int,
+    embed_dtype: torch.dtype,
+    pools: SpeculativeSamplingPools,
+    topk_topp_workspace_bytes: int,
+    renorm_probs: Callable[..., torch.Tensor],
+    device: torch.device | str,
+) -> DsparkSampledWorkspace:
+    """Allocate static scratch buffers for :func:`sample_dspark_block_sampled`."""
+    kernel_ws = dspark_markov_sample_workspace(
+        max_rows=max_rows,
+        vocab_size=vocab_size,
+        rank=rank,
+        embed_dtype=embed_dtype,
+        device=device,
+    )
+    topk_topp_ws = (
+        torch.empty((topk_topp_workspace_bytes,), dtype=torch.uint8, device=device)
+        if topk_topp_workspace_bytes > 0
+        else None
+    )
+    return DsparkSampledWorkspace(
+        kernel_ws=kernel_ws,
+        topk_topp_ws=topk_topp_ws,
+        pools=pools,
+        renorm_probs=renorm_probs,
+    )
+
+
+def sample_dspark_block_sampled(
+    local_base_logits: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    markov_head: DSparkVanillaMarkov,
+    slots: torch.Tensor,
+    write_slots: torch.Tensor,
+    start_pos: torch.Tensor,
+    draft_probs: torch.Tensor,
+    workspace: DsparkSampledWorkspace,
+    vocab_size: int,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Sample a block of DSpark proposals and record normalized draft laws in ``draft_probs``.
+
+    Args:
+        local_base_logits: ``[rows, block, local_vocab]`` FP32 base logits on rank.
+        bonus_token_ids: ``[rows]`` anchor tokens preceding step 0.
+        markov_head: Bigram table and unsharded projection (TP1).
+        slots: ``[rows]`` request pool indices reading scalars and Philox seeds.
+        write_slots: ``[rows]`` destination pool rows in ``draft_probs``.
+        start_pos: ``[rows]`` base token positions for Philox proposal keying.
+        draft_probs: ``[pool_rows, width, vocab_size]`` verifier proposal table.
+        workspace: Static sampled workspace from :func:`dspark_sampled_workspace`.
+        vocab_size: Real vocabulary width clipped from ``local_base_logits``.
+        output: ``[rows, block]`` int32 destination filled in place.
+
+    Returns:
+        ``output``, filled in place.
+    """
+    rows, block, _ = local_base_logits.shape
+    if rows == 0:
+        return output
+    embedding_weight = markov_head.embedding.weight
+    projection_weight = markov_head.projection.weight
+    pools = workspace.pools
+    kernel_ws = workspace.kernel_ws
+    base_positions = start_pos.to(torch.int64)
+    for step in range(block):
+        probs = dspark_markov_softmax(
+            local_base_logits,
+            step,
+            bonus_token_ids,
+            embedding_weight,
+            projection_weight,
+            slots,
+            pools.temperature,
+            pools.top_k,
+            pools.top_p,
+            pools.seed,
+            kernel_ws,
+            vocab_size,
+            prepare_step_inputs=(step == 0),
+        )
+        filtered = workspace.renorm_probs(
+            probs,
+            kernel_ws.top_ks[:rows],
+            kernel_ws.top_ps[:rows],
+            workspace=workspace.topk_topp_ws,
+        )
+        dspark_probs_scatter_and_sample(
+            filtered,
+            write_slots,
+            draft_probs,
+            step,
+            kernel_ws.seeds[:rows],
+            base_positions,
+            1 + (step + 1) * DRAFT_POS_HASH_MUL,
+            RNG_TAG_DRAFT,
+            embedding_weight,
+            output,
+            kernel_ws,
+            vocab_size,
+            gather_next_embed=(step + 1 < block),
+        )
     return output

@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.sampling.cuda import (
 from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_prepare,
     fused_topk_topp_renorm,
+    fused_topk_topp_workspace_size,
 )
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     softmax,
@@ -1049,6 +1050,77 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         return predict, accept_length
 
+    def dspark_topk_topp_workspace_size(self, max_rows: int, vocab_size: int) -> int:
+        """Byte size of static scratch for in-place DSpark Top-K/Top-P renorm."""
+        if (
+            not _FUSED_TOPK_TOPP_AVAILABLE
+            or vocab_size < 1024
+            or self._temperature_pool.device.type != "cuda"
+        ):
+            return 0
+        return fused_topk_topp_workspace_size(max_rows, vocab_size)
+
+    def renorm_dspark_probabilities(
+        self,
+        probs: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        *,
+        workspace: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply request Top-K / Top-P filtering to normalized DSpark probabilities.
+
+        Callers must pass probabilities whose ``top_k == 1`` rows are already
+        canonical one-hot argmax (lowest-index tie-broken):
+        ``fused_topk_topp_renorm(..., in_place_skip=True)`` and the
+        sub-1024-vocab fallback both leave ``top_k == 1`` rows untouched rather
+        than recomputing ``argmax`` from ``logits``.
+        """
+        if _FUSED_TOPK_TOPP_AVAILABLE and probs.shape[1] >= 1024:
+            return fused_topk_topp_renorm(
+                probs,
+                top_ks,
+                top_ps,
+                workspace=workspace,
+                out=probs,
+                in_place_skip=True,
+            )
+        return self._apply_small_vocab_topk_topp(
+            probs,
+            top_ks,
+            top_ps,
+            greedy_one_hot=probs,
+            in_place=True,
+        )
+
+    @staticmethod
+    def _apply_small_vocab_topk_topp(
+        probabilities: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        *,
+        greedy_one_hot: torch.Tensor | None,
+        logits: torch.Tensor | None = None,
+        in_place: bool,
+    ) -> torch.Tensor:
+        """Apply generic Top-K/Top-P renorm and pin greedy rows to one-hot argmax."""
+        filtered = top_p_renorm_prob(
+            top_k_renorm_prob(probabilities, top_ks), top_ps, is_deterministic=True
+        )
+        greedy = top_ks == 1
+        if greedy_one_hot is not None:
+            result = torch.where(greedy[:, None], greedy_one_hot, filtered)
+            if in_place and result.is_cuda:
+                probabilities.copy_(result)
+                return probabilities
+            return result
+        maximum = sampling_argmax(logits).view(-1, 1)
+        values = filtered.gather(1, maximum)
+        values = torch.where(greedy[:, None], 1.0, values)
+        filtered.mul_((~greedy)[:, None])
+        filtered.scatter_(1, maximum, values)
+        return filtered
+
     def _dspark_probabilities(self, logits, pool_indices):
         """Normalize the target and proposal with the same request filters."""
         temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
@@ -1065,18 +1137,14 @@ class FlashInferSamplingBackend(SamplingBackend):
             return fused_topk_topp_renorm(
                 probabilities, top_ks, top_ps, in_place_skip=False
             )
-        probabilities = top_p_renorm_prob(
-            top_k_renorm_prob(probabilities, top_ks), top_ps, is_deterministic=True
+        return self._apply_small_vocab_topk_topp(
+            probabilities,
+            top_ks,
+            top_ps,
+            greedy_one_hot=None,
+            logits=logits,
+            in_place=False,
         )
-        # Generic threshold filtering can retain tied maxima. A top-k=1
-        # request has the same canonical point mass as the fused filter.
-        greedy = top_ks == 1
-        maximum = sampling_argmax(logits).view(-1, 1)
-        values = probabilities.gather(1, maximum)
-        values = torch.where(greedy[:, None], 1.0, values)
-        probabilities.mul_((~greedy)[:, None])
-        probabilities.scatter_(1, maximum, values)
-        return probabilities
 
     def sample_dspark_proposals(
         self,
