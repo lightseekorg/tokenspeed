@@ -134,6 +134,8 @@ struct PeerLookupRequest {
     std::vector<std::int32_t> tokens;
     std::int32_t max_tokens{0};
 
+    std::int32_t local_tokens{0};
+
     bool operator==(const PeerLookupRequest&) const = default;
 };
 
@@ -222,6 +224,9 @@ struct PeerFetchDone {
     std::int64_t terminal_us{0};
     PeerLeaseId lease;
     bool frozen{false};
+};
+struct PeerTargetRetired {
+    PeerLeaseId lease;
 };
 
 }  // namespace cache

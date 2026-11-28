@@ -1875,3 +1875,40 @@ remaining replay ahead of later plans. The control plane tracks retirement
 fences separately from scheduler cache operations. Peer export, cache clear
 and drain wait for replica completion, including releases queued after the
 last forward's results.
+
+### Sharded peer lookups during a forward
+
+A registered TP8/KVP8 replica has a private CPU mesh for peer progress. While the
+control thread waits in forward execution, completion, or attention-DP agreement,
+it can lend the scheduler to the peer worker when device copies are clear. Each
+member reports its scheduler round, wait site and forward sequence on that mesh.
+Only a matching window on every member permits a protocol step. The ordinary
+replica round also advances the same state machine and delivers its events to
+all eight schedulers. During protocol advancement, both paths take the local
+scheduler, protocol control and read-state locks in that order. A worker round
+forwards request attribution even when it has no scheduler events or landings.
+Device submission still requires the local plan fence.
+The reader publishes a landing only after member retirement and holder closure.
+
+Rank zero timestamps lookup dispatch and receipt on its monotonic clock. The
+receipt must precede the deadline, even if admission happens several rounds
+later. The protocol delivers an explicit miss for unanswered and suppressed
+lookups. This keeps the scheduler from expiring a request while a timely reply
+awaits replica agreement.
+
+For a timely offer, the reader leader prices the source pages needed beyond
+its local prefix. The decision travels with the offer in the replica report
+before HBM reservation. Estimates distinguish holder width, node locality and
+each combination of Device, Host and Disk source tiers. Reservation binds the
+feedback bucket to the source pages paired with the actual destination slots.
+The leader records one sample when the request lands or falls back. The sample
+runs from PIN through group read retirement, or through fallback if retirement
+is still unknown. A late close or retirement cannot charge the request again.
+
+The scheduler retains the original offer with a waiting request. At admission
+the reader can reconstruct an expired attempt from that checkpoint. If the
+holder's unpinned offer has expired, its reply permits one fresh lookup of the
+same prefix in the same generation. Only a newer offer with exactly the original
+boundary, prefix and page manifest can be pinned. All holder members revalidate
+their own pages while acquiring references. A partial PIN aborts the group and
+releases acquired references. A live offer takes the original direct PIN path.

@@ -79,13 +79,14 @@ PromptPrefix PromptUpTo(const cache::PeerLookup& lookup, std::int32_t num_tokens
                   std::span{lookup.tokens}.first(static_cast<std::size_t>(num_tokens)), num_tokens);
 }
 
-// What a holder lists for `prompt`: its Device and Host hit, or, when its
-// Disk tier extends that, the Disk-extended listing, whose Disk pages the
-// holder pushes (docs/rfcs/0006-disk-tier.md).
-PrefixProber::PrefixListing ListPeerPrefix(const CacheCoordinator& coordinator, const PromptPrefix& prompt) {
+// What a holder lists for `prompt`: its Device and Host hit, or, when
+// `include_disk` is set and its Disk tier extends that, the Disk-extended
+// listing, whose Disk pages the holder pushes (docs/rfcs/0006-disk-tier.md).
+PrefixProber::PrefixListing ListPeerPrefix(const CacheCoordinator& coordinator, const PromptPrefix& prompt,
+                                           bool include_disk) {
     PrefixProber::PrefixListing listing =
         coordinator.Prober().ListPrefix(coordinator.Prober().ProbePromptPrefix(prompt));
-    if (coordinator.Disk().HasPool()) {
+    if (include_disk && coordinator.Disk().HasPool()) {
         PrefixProber::PrefixListing with_disk =
             coordinator.Storage().ListWithDisk(prompt, coordinator.Disk().PrefixHits(prompt));
         if (with_disk.num_tokens > listing.num_tokens) return with_disk;
@@ -96,7 +97,7 @@ PrefixProber::PrefixListing ListPeerPrefix(const CacheCoordinator& coordinator, 
 // The listing's blocks, held and refreshed (CacheCoordinator::ExportPrefix).
 CacheCoordinator::PrefixExport ExportPeerPrefix(CacheCoordinator& coordinator, const PromptPrefix& prompt) {
     if (coordinator.Disk().HasPool()) {
-        const PrefixProber::PrefixListing listing = ListPeerPrefix(coordinator, prompt);
+        const PrefixProber::PrefixListing listing = ListPeerPrefix(coordinator, prompt, /*include_disk=*/true);
         if (std::ranges::any_of(listing.pages,
                                 [](const PrefixProber::ListedPage& page) { return page.tier == CacheTier::kDisk; })) {
             return coordinator.ExportListing(listing);
@@ -117,7 +118,8 @@ std::vector<PeerPage> Pages(const PrefixProber::PrefixListing& listing) {
 
 }  // namespace
 
-PeerAnswer PeerExports::AnswerLookup(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup) {
+PeerAnswer PeerExports::AnswerLookup(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup,
+                                     bool include_disk) {
     PeerAnswer answer{.lease = lookup.lease, .kind = PeerAnswerKind::kLookup};
     if (!WellFormed(lookup, coordinator.PrefixGranularity())) {
         spdlog::warn("[Peer] lookup {}#{} does not cover its bound; answered as a miss", lookup.lease.reader,
@@ -125,7 +127,7 @@ PeerAnswer PeerExports::AnswerLookup(const CacheCoordinator& coordinator, const 
         return answer;
     }
     const PrefixProber::PrefixListing listing =
-        ListPeerPrefix(coordinator, Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens));
+        ListPeerPrefix(coordinator, Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens), include_disk);
     answer.num_tokens = listing.num_tokens;
     answer.pages = Pages(listing);
     return answer;
@@ -136,8 +138,8 @@ bool PeerExports::Matches(const CacheCoordinator& coordinator, const cache::Peer
     if (!WellFormed(lookup, coordinator.PrefixGranularity()) || num_tokens <= 0 || num_tokens > lookup.max_tokens) {
         return false;
     }
-    const PrefixProber::PrefixListing listing =
-        ListPeerPrefix(coordinator, PromptUpTo(lookup, num_tokens, coordinator.PrefixGranularity()));
+    const PrefixProber::PrefixListing listing = ListPeerPrefix(
+        coordinator, PromptUpTo(lookup, num_tokens, coordinator.PrefixGranularity()), /*include_disk=*/true);
     return listing.num_tokens == num_tokens && std::ranges::equal(Pages(listing), pages);
 }
 
