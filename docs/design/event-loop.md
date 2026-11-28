@@ -933,8 +933,10 @@ discardable under the separate `cuda_graph` tag.
 When deterministic RS/AG is forced and communication fusion is disabled,
 startup does not allocate unused TRTLLM IPC or MNNVL workspaces. These would
 otherwise retain ordinary allocator segments across sleep even though the
-selected collective route never consumes them. Explicit communication fusion
-still prepares its workspace before serving.
+selected collective route never consumes them. Fusion that is enabled, either
+explicitly or by topology-dependent defaults, still prepares its workspace
+before serving. The skip therefore requires fusion to resolve to disabled;
+forcing deterministic RS/AG alone does not guarantee this.
 
 A resume containing NCCL uses the same-round operation gate: it waits until
 every attention-DP engine holds its resume before entering device collectives.

@@ -263,7 +263,7 @@ class DistributedInitializer:
             discover_iris_world()
 
         # Deterministic collectives do not consume the TRTLLM workspaces.
-        # Explicit fused operations still need them even with that override.
+        # Enabled fusion (explicit or auto-enabled) still needs those workspaces.
         if config.hidden_size > 0 and (
             not config.force_deterministic_rsag or config.comm_fusion_token_capacity > 0
         ):
