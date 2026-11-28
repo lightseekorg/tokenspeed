@@ -691,7 +691,13 @@ impl Attempt {
                         Ok(ReadRetirement::Complete) => Some(1),
                         Ok(ReadRetirement::Aborted) => Some(0),
                         Ok(ReadRetirement::Unknown(e)) => {
-                            tracing::error!(%e, "peer DMA retirement unknown; keeping landing and source pinned");
+                            tracing::error!(
+                                %e,
+                                request_id = %self.lookup.request_id,
+                                holder = %self.lookup.holder,
+                                lease = self.lookup.lease.id,
+                                "peer DMA retirement unknown; keeping landing and source pinned"
+                            );
                             Some(2)
                         }
                         Err(mpsc::TryRecvError::Disconnected) => Some(2),
