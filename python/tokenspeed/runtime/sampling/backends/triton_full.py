@@ -40,7 +40,6 @@ from tokenspeed_kernel.ops.sampling.triton import (
     gumbel_sample_min_p_from_pools_parallel,
     gumbel_sample_top_k_top_p_from_pools,
     gumbel_sample_top_k_top_p_qrita_from_pools,
-    gumbel_sample_top_p_parallel_from_pools,
     verify_chain_target_sampled,
 )
 
@@ -58,9 +57,6 @@ from tokenspeed.runtime.sampling.backends.triton import (
     _SAMPLE_ROUTE_GUMBEL_TOP_P,
     _TOP_K_TOP_P_PAD,
     _TOP_K_TOP_P_SMALL_BLOCK_SIZE,
-    _TOP_P_PARALLEL_SAMPLE_ATTEMPTS,
-    _TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE,
-    _TOP_P_PARALLEL_VERIFY_ATTEMPTS,
     TritonSamplingBackend,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
@@ -411,32 +407,24 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
                     num_tokens_per_req=num_tokens_per_req,
                 )
             if self._sample_route == _SAMPLE_ROUTE_GUMBEL_TOP_P:
-                return gumbel_sample_top_p_parallel_from_pools(
+                local_ids = (
+                    self._gumbel_local_ids
+                    if num_tokens_per_req == 1
+                    else self._gumbel_verify_local_ids
+                )
+                local_scores = (
+                    self._gumbel_local_scores
+                    if num_tokens_per_req == 1
+                    else self._gumbel_verify_local_scores
+                )
+                return self._sample_top_p_exact(
                     logits,
                     req_pool_indices,
-                    self._temperature_pool,
-                    self._top_p_pool,
-                    self._seed_pool,
+                    (self._temperature_pool, self._top_p_pool, self._seed_pool),
                     offsets_pool,
-                    self._top_p_local_max[:rows],
-                    self._top_p_local_sum[:rows],
-                    self._top_p_local_argmax[:rows],
-                    self._top_p_local_scores[:rows],
-                    self._top_p_local_logits[:rows],
-                    self._top_p_local_ids[:rows],
-                    self._top_p_row_max[:rows],
-                    self._top_p_row_total[:rows],
-                    self._top_p_row_argmax[:rows],
-                    self._top_p_row_candidate_logits[:rows],
-                    self._top_p_row_candidate_ids[:rows],
-                    self._top_p_accepted[:rows],
+                    local_ids[:rows],
+                    local_scores[:rows],
                     out[:rows],
-                    block_size=_TOP_P_PARALLEL_SAMPLE_BLOCK_SIZE,
-                    num_attempts=(
-                        _TOP_P_PARALLEL_SAMPLE_ATTEMPTS
-                        if num_tokens_per_req == 1
-                        else _TOP_P_PARALLEL_VERIFY_ATTEMPTS
-                    ),
                     num_tokens_per_req=num_tokens_per_req,
                 )
 

@@ -66,12 +66,16 @@ def _gumbel_sample_pool_stage1_kernel(
     offsets_pool_ptr,
     local_ids_ptr,
     local_scores_ptr,
+    threshold_ptr,
+    limit_ptr,
     logits_row_stride: tl.constexpr,
     local_row_stride: tl.constexpr,
     vocab_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     NUM_TOKENS_PER_REQ: tl.constexpr,
 ):
+    """Each block's best Gumbel score; with ``threshold_ptr``, over the
+    tokens of the row's top-p nucleus only (``top_p_thresholds_from_pools``)."""
     row = tl.program_id(0)
     req_row = row // NUM_TOKENS_PER_REQ
     spec_pos = row - req_row * NUM_TOKENS_PER_REQ
@@ -94,7 +98,15 @@ def _gumbel_sample_pool_stage1_kernel(
     gumbel_seed = tl.randint(seed, offset)
     uniform = tl.maximum(tl.rand(gumbel_seed, token_offsets), 1.0e-7)
     gumbel = -tl.log(-tl.log(uniform))
-    scores = tl.where(mask, logits / temperature + gumbel, float("-inf"))
+    scaled = logits / temperature
+    kept = mask
+    if threshold_ptr is not None:
+        threshold = tl.load(threshold_ptr + row)
+        limit = tl.load(limit_ptr + row)
+        kept = mask & (
+            (scaled > threshold) | ((scaled == threshold) & (token_offsets <= limit))
+        )
+    scores = tl.where(kept, scaled + gumbel, float("-inf"))
 
     max_score = tl.max(scores, axis=0)
     token_id = tl.min(
@@ -279,6 +291,90 @@ def gumbel_sample_from_pools(
     num_tokens_per_req: int = 1,
 ) -> torch.Tensor:
     """Sample token ids from logits with Gumbel-Max and pool-indexed scalars."""
+    return _gumbel_sample(
+        logits,
+        req_pool_indices,
+        temperature_pool,
+        seed_pool,
+        offsets_pool,
+        local_ids,
+        local_scores,
+        out,
+        None,
+        fn_name="gumbel_sample_from_pools",
+        num_tokens_per_req=num_tokens_per_req,
+    )
+
+
+def gumbel_sample_from_pools_in_nucleus(
+    logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    temperature_pool: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    local_ids: torch.Tensor,
+    local_scores: torch.Tensor,
+    out: torch.Tensor,
+    nucleus: tuple[torch.Tensor, torch.Tensor],
+    *,
+    num_tokens_per_req: int,
+) -> torch.Tensor:
+    """Gumbel-Max over each row's top-p nucleus: an exact top-p sample.
+
+    The same noise as ``gumbel_sample_from_pools``, with the tokens outside
+    the nucleus dropped, so a row that keeps every token draws what that
+    sampler draws.
+
+    Args:
+        logits, req_pool_indices, temperature_pool, seed_pool, offsets_pool,
+        local_ids, local_scores, out: As for ``gumbel_sample_from_pools``.
+        nucleus: Each row's ``([rows] fp32 threshold, [rows] int32 limit)``
+            from ``top_p_thresholds_from_pools``.
+        num_tokens_per_req: Rows per request.
+
+    Returns:
+        ``out[:rows]``, the sampled token ids.
+    """
+    threshold, limit = nucleus
+    rows = logits.shape[0]
+    for name, tensor, dtype in (
+        ("threshold", threshold, torch.float32),
+        ("limit", limit, torch.int32),
+    ):
+        if tensor.dtype != dtype or tensor.ndim != 1 or tensor.shape[0] < rows:
+            raise ValueError(
+                f"nucleus {name} must be {dtype} [>= {rows}], got "
+                f"{tensor.dtype} {tuple(tensor.shape)}"
+            )
+    return _gumbel_sample(
+        logits,
+        req_pool_indices,
+        temperature_pool,
+        seed_pool,
+        offsets_pool,
+        local_ids,
+        local_scores,
+        out,
+        nucleus,
+        fn_name="gumbel_sample_from_pools_in_nucleus",
+        num_tokens_per_req=num_tokens_per_req,
+    )
+
+
+def _gumbel_sample(
+    logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    temperature_pool: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    local_ids: torch.Tensor,
+    local_scores: torch.Tensor,
+    out: torch.Tensor,
+    nucleus: tuple[torch.Tensor, torch.Tensor] | None,
+    *,
+    fn_name: str,
+    num_tokens_per_req: int,
+) -> torch.Tensor:
     rows, vocab_size, num_blocks = _check_gumbel_pool_inputs(
         logits,
         req_pool_indices,
@@ -288,12 +384,13 @@ def gumbel_sample_from_pools(
         local_ids,
         local_scores,
         out,
-        fn_name="gumbel_sample_from_pools",
+        fn_name=fn_name,
         block_size=_GUMBEL_BLOCK_SIZE,
         num_tokens_per_req=num_tokens_per_req,
     )
     if rows == 0:
         return out[:0]
+    threshold, limit = (None, None) if nucleus is None else nucleus
 
     _gumbel_sample_pool_stage1_kernel[(rows, num_blocks)](
         logits,
@@ -303,6 +400,8 @@ def gumbel_sample_from_pools(
         offsets_pool,
         local_ids,
         local_scores,
+        threshold,
+        limit,
         logits_row_stride=logits.stride(0),
         local_row_stride=local_ids.stride(0),
         vocab_size=vocab_size,
