@@ -46,7 +46,7 @@ shares the CTAs of A1, which finish long before the MLP half starts.
 from __future__ import annotations
 
 import functools
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel_amd._extern import extern_compile_options
@@ -57,7 +57,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
     trace,
     warm,
 )
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan, Stage
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import LAYER_SLOTS, Plan, Stage
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.qwen4_exp import (
     gdn,
     hc,
@@ -176,34 +176,29 @@ def delta_plan(with_ple: bool, rows: int, chain: int, experts: str) -> Plan:
 
 
 @functools.cache
-def qsa_plan(final: bool, rows: int, chain: int, experts: str, catch_up: bool) -> Plan:
+def qsa_plan(final: bool, rows: int, chain: int, experts: str, prefix: bool) -> Plan:
     """The plan of a QSA full-attention layer for ``rows`` token rows,
     ``chain`` per request (``Plan.chain``), with ``experts`` in the format
     :data:`EXPERTS` names. With ``final``, the final mixer of the model runs
     after the layer (see :func:`_tail`).
 
-    With ``catch_up`` (an MTP draft catch-up step, one request), every row
-    runs up to Q2, which writes its K / V and index key. The stages from Q3
-    on run for the request's live row only (:func:`live_plan`), as
-    TokenSpeed's draft narrowing does.
+    With ``prefix`` (the prefix launch of an MTP draft's first step), the
+    plan runs the stages up to Q2 only: every row writes its K / V and, when
+    accepted, its index key (``launch_gluon_qwen4_exp_qsa_layer_gfx950``).
     """
-    if catch_up and rows != chain:
-        raise ValueError(f"a catch-up plan serves one request, got {rows} / {chain}")
-    attended = 1 if catch_up else rows
     # Q6 takes the CTAs before C1's (at most qsa.MERGE_ROWS rows of tasks):
     # C1's weights then stream while Q6 runs.
     assert int(qsa.MERGE_TASKS) * qsa.MERGE_ROWS <= C1_BASE
     attention = qsa.stages(
         {"q1": 28, "q2": 200, "q3": 0, "q4": 20, "q4f": 255, "q5": 68, "q6": 0},
         rows,
-        attended,
         "a_",
     )
-    stages = (
-        *hc.stages("a_", {"a1": 0, "a2": 176}, rows, (), False),
-        *attention,
-        *_tail((), final, attended, experts, False),
-    )
+    mixer = hc.stages("a_", {"a1": 0, "a2": 176}, rows, (), False)
+    if prefix:
+        stages = (*mixer, *attention[:2])
+    else:
+        stages = (*mixer, *attention, *_tail((), final, rows, experts, False))
     return Plan(
         grid=GRID,
         stages=stages,
@@ -213,19 +208,17 @@ def qsa_plan(final: bool, rows: int, chain: int, experts: str, catch_up: bool) -
     )
 
 
-def live_plan(plan: Plan, catch_up: bool) -> Plan:
-    """The plan of the stages from Q3 on: ``plan``, or for a catch-up plan
-    (:func:`qsa_plan`) one row, the request's live row. The stages and
-    regions stay the same, so a mailbox of this plan at the live row
-    (``Mailbox.row``) addresses that row's regions."""
-    return replace(plan, rows=1, chain=1) if catch_up else plan
-
-
 @gluon.constexpr_function
 def _stream_src(plan):
     """Where the attention half reads the layer's streams: the PLE stages'
     region ``ph``, or "" for the global input."""
     return "ph" if plan.plan.has_stage("p1") else ""
+
+
+@gluon.constexpr_function
+def _max_rounds(plan, name):
+    """The most rounds a CTA runs of stage ``name``."""
+    return -(-plan.plan.stage(name).tasks // plan.plan.grid)
 
 
 @gluon.constexpr_function
@@ -381,23 +374,39 @@ def _ple_stages(mb, h_in, h_stride, weights, step, PLAN: gl.constexpr):
 @gluon.jit
 def _delta_stages(mb, weights, state, PLAN: gl.constexpr):
     b1_task, b1_active = schedule.stage_task(PLAN, "b1")
-    b3_task, b3_active = schedule.stage_task(PLAN, "b3")
-    # B3 runs one task per (request, value head).
-    b3_request = b3_task // gdn.VALUE_HEADS
-    b3_head = b3_task % gdn.VALUE_HEADS
-    # A CTA with a B1 and a B3 task loads the recurrent state with B1's
-    # weights (projection_recurrence_stage). Past two rows the state's
-    # registers next to B1's would spill, so B3 then loads its own state.
-    fused = b3_active & (schedule.rows(PLAN) <= 2)
+    # B3 runs one task per (request, value head), in rounds past the grid
+    # (decode steps of more than 5 rows).
+    b3_first, b3_rounds = schedule.stage_rounds(PLAN, "b3")
+    # A CTA with a B1 and a B3 task loads the recurrent state of its first
+    # B3 task with B1's weights (projection_recurrence_stage). Past two rows
+    # the state's registers next to B1's would spill, so B3 then loads its
+    # own state.
+    fused = (b3_rounds > 0) & (schedule.rows(PLAN) <= 2)
     if b1_active:
         if fused:
             gdn.projection_recurrence_stage(
-                mb, b1_task, b3_request, b3_head, weights, state, "a_"
+                mb,
+                b1_task,
+                b3_first // gdn.VALUE_HEADS,
+                b3_first % gdn.VALUE_HEADS,
+                weights,
+                state,
+                "a_",
             )
         else:
             gdn.projection_stage(mb, b1_task, weights, state, "a_", "b1")
-    if b3_active & ~(b1_active & fused):
-        gdn.recurrence_stage(mb, b3_request, b3_head, weights, state, "b3")
+    # The rounds unroll, as Q5's (see _attention_stages).
+    for i in gl.static_range(_max_rounds(PLAN, "b3")):
+        b3_task = b3_first + i * schedule.grid(PLAN)
+        if (i < b3_rounds) & ((i > 0) | ~(b1_active & fused)):
+            gdn.recurrence_stage(
+                mb,
+                b3_task // gdn.VALUE_HEADS,
+                b3_task % gdn.VALUE_HEADS,
+                weights,
+                state,
+                "b3",
+            )
 
 
 # The warm word counts differ between the next layers' kinds (and are 0 for the last
@@ -481,17 +490,14 @@ def _prologue(mb, weights, cache, PLAN: gl.constexpr):
 
 
 @gluon.jit
-def _attention_stages(mb, cache, TOK0, CHAIN0: gl.constexpr, PLAN: gl.constexpr):
-    """Q3-Q6, one row per task, on the operands of that row. In a catch-up
-    step, ``mb`` and ``cache`` are the views of the live row, ``TOK0`` is its
-    token and ``CHAIN0`` the launch's chain. Else they are 0 and
-    ``Plan.chain``."""
+def _attention_stages(mb, cache, PLAN: gl.constexpr):
+    """Q3-Q6, one row per task, on the operands of that row."""
     G: gl.constexpr = schedule.grid(PLAN)
     CHAIN: gl.constexpr = schedule.chain(PLAN)
     first, rounds = schedule.stage_rounds(PLAN, "q3")
     for i in range(rounds):
         row, task, tok = schedule.row_task(PLAN, first + i * G, qsa.SCORE_TASKS)
-        qsa.score_stage(mb.row(row), task, tok + TOK0, cache.row(row, CHAIN), "q3")
+        qsa.score_stage(mb.row(row), task, tok, cache.row(row, CHAIN), "q3")
     task, active = schedule.stage_task(PLAN, "q4")
     if active:
         row, chunk, _ = schedule.row_task(PLAN, task, qsa.SELECT_CHUNKS)
@@ -499,18 +505,24 @@ def _attention_stages(mb, cache, TOK0, CHAIN0: gl.constexpr, PLAN: gl.constexpr)
     task, active = schedule.stage_task(PLAN, "q4f")
     if active:
         qsa.topk_final_stage(mb.row(task), 0, cache.row(task, CHAIN).length(), "q4f")
-    task, active = schedule.stage_task(PLAN, "q5")
-    if active:
-        # The tasks are split-major: the used splits (the low ones) of every
-        # row take the first CTAs of Q5, whose Q1 tasks end early.
-        PAIRS: gl.constexpr = schedule.stage_tasks(PLAN, "q5") // qsa.SPLITS
-        pair = task % PAIRS
-        row = pair // qsa.KV_HEADS
-        split = (pair % qsa.KV_HEADS) * qsa.SPLITS + task // PAIRS
-        tok = row % CHAIN
-        qsa.attention_stage(
-            mb.row(row), split, tok + TOK0, cache.row(row, CHAIN), CHAIN0, "q5"
-        )
+    # The tasks are split-major: the used splits (the low ones) of every
+    # row take the first CTAs of Q5, whose Q1 tasks end early. Past 4 rows,
+    # the tasks run in rounds; the later rounds hold the high splits, which
+    # attend tokens only for the longest top-k selections.
+    # The rounds unroll: a loop keeps the values that later stages read live
+    # across Q5's registers, and they spilled.
+    PAIRS: gl.constexpr = schedule.stage_tasks(PLAN, "q5") // qsa.SPLITS
+    first, rounds = schedule.stage_rounds(PLAN, "q5")
+    for i in gl.static_range(_max_rounds(PLAN, "q5")):
+        if i < rounds:
+            task = first + i * G
+            pair = task % PAIRS
+            row = pair // qsa.KV_HEADS
+            split = (pair % qsa.KV_HEADS) * qsa.SPLITS + task // PAIRS
+            tok = row % CHAIN
+            qsa.attention_stage(
+                mb.row(row), split, tok, cache.row(row, CHAIN), CHAIN, "q5"
+            )
     task, active = schedule.stage_task(PLAN, "q6")
     if active:
         # Task t merges tasks t, t + TASKS, ... of the attended rows.
@@ -543,7 +555,6 @@ def gluon_qwen4_exp_qsa_layer_gfx950(
     mixed_out,
     trace_buf,
     PLAN: gl.constexpr,
-    LIVE: gl.constexpr,
     ADVANCE: gl.constexpr,
 ):
     """One step of a QSA attention layer (see the module docstring).
@@ -551,9 +562,9 @@ def gluon_qwen4_exp_qsa_layer_gfx950(
     The tuple operands hold the fields of ``hc.Mixer`` (``attn_mixer``,
     ``mlp_mixer``, ``final_mixer``), ``qsa.Weights``, ``qsa.Cache`` and
     ``moe.Weights`` (``experts``). ``final_mixer`` and ``mixed_out`` are
-    ``None`` unless ``PLAN`` has the final mixer of the model. ``LIVE`` is
-    the plan of the stages from Q3 on (:func:`live_plan`). With
-    ``ADVANCE``, the launch moves the step on (:func:`_advance_step`).
+    ``None`` unless ``PLAN`` has the final mixer of the model. A prefix
+    plan (:func:`qsa_plan`) ends after Q2. With ``ADVANCE``, the launch
+    moves the step on (:func:`_advance_step`).
     """
     table = trace.allocate(trace_buf)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, layer), PLAN, table)
@@ -566,32 +577,8 @@ def gluon_qwen4_exp_qsa_layer_gfx950(
     if active:
         qsa.projection_stage(mb, task, weights, "a_", "q1")
     _prologue(mb, weights, cache, PLAN)
-    if _catch_up(PLAN, LIVE):
-        # The stages from Q3 on see the live row as their row 0.
-        live = _live_row(cache, schedule.chain(PLAN))
-        live_mb = mailbox.Mailbox(mb.row(live).scratch, mb.tag, LIVE, table)
-        _attention_stages(
-            live_mb,
-            cache.row(live, schedule.chain(PLAN)),
-            live,
-            schedule.chain(PLAN),
-            LIVE,
-        )
-        _tail_stages(
-            live_mb,
-            streams.row(live),
-            h_out,
-            out_w,
-            hc.Mixer(*mlp_mixer),
-            _expert_weights(experts, LIVE),
-            final_mixer,
-            mixed_out,
-            None,
-            0,
-            LIVE,
-        )
-    else:
-        _attention_stages(mb, cache, 0, schedule.chain(PLAN), PLAN)
+    if schedule.has_stage(PLAN, "q3"):
+        _attention_stages(mb, cache, PLAN)
         _tail_stages(
             mb,
             streams,
@@ -608,21 +595,6 @@ def gluon_qwen4_exp_qsa_layer_gfx950(
     trace.flush(table, trace_buf)
     if ADVANCE:
         _advance_step(step, schedule.grid(PLAN))
-
-
-@gluon.constexpr_function
-def _catch_up(plan, live):
-    """Whether the launch is a catch-up step (:func:`live_plan`)."""
-    return plan.plan.rows != live.plan.rows
-
-
-@gluon.jit
-def _live_row(cache, CHAIN: gl.constexpr):
-    """The live row of a catch-up step: the row of the request's last
-    accepted token, which TokenSpeed's draft gathers. Token ``t`` sits at
-    ``seq_len - CHAIN + t``, the last accepted one at ``accepted - 1``."""
-    t = gl.load(cache.accepted) - gl.load(cache.seq_len) + CHAIN - 1
-    return gl.minimum(gl.maximum(t, 0), CHAIN - 1)
 
 
 @gluon.jit
@@ -665,9 +637,11 @@ def late_weights(weights: DeltaLayerWeights | QsaLayerWeights) -> torch.Tensor:
     return w[tasks[0] * rows : (tasks[-1] + 1) * rows].reshape(-1).view(torch.int32)
 
 
-# Rows one launch serves: the GEMVs carry the rows in the MFMA rows,
-# and the per-row stages' tasks fit the grid in a few rounds.
-MAX_ROWS = 4
+# Rows one launch serves: the GEMVs carry the rows in the MFMA rows (at
+# most 16), and the per-row stages' tasks fit the grid in a few rounds. The
+# MoE routing takes one wave per row (moe.routing), which bounds it at the
+# CTA's waves.
+MAX_ROWS = 8
 
 
 def _rows(h: torch.Tensor) -> int:
@@ -679,17 +653,18 @@ def _rows(h: torch.Tensor) -> int:
 
 def _check_streams(
     h: torch.Tensor,
-    h_out: torch.Tensor,
+    h_out: torch.Tensor | None,
     scratch: torch.Tensor,
     plan: Plan,
     out_rows: int,
 ) -> None:
-    """``h`` has the plan's rows, ``h_out`` ``out_rows`` rows."""
+    """``h`` has the plan's rows, ``h_out`` (None: a launch without
+    output) ``out_rows`` rows."""
     width, hidden = int(hc.WIDTH), int(hc.HIDDEN)
-    for name, t, n, widths in (
-        ("h", h, plan.rows, (width, hidden)),
-        ("h_out", h_out, out_rows, (width,)),
-    ):
+    tensors = (("h", h, plan.rows, (width, hidden)),)
+    if h_out is not None:
+        tensors += (("h_out", h_out, out_rows, (width,)),)
+    for name, t, n, widths in tensors:
         if (
             t.dtype != torch.bfloat16
             or t.dim() != 2
@@ -698,10 +673,17 @@ def _check_streams(
             or (not t.is_contiguous())
         ):
             raise ValueError(f"{name} must be contiguous BF16 [{n}, {widths}]")
-    if h.data_ptr() == h_out.data_ptr():
+    if h_out is not None and h.data_ptr() == h_out.data_ptr():
         raise ValueError("h_out must not alias h: late stages still read h")
     if scratch.dtype != torch.int64 or scratch.numel() < plan.scratch_pairs:
         raise ValueError(f"scratch needs {plan.scratch_pairs} int64 pairs")
+
+
+def _check_layer(layer: int) -> None:
+    """A launch tag's layer slot (``plan.launch_tag``): a launch of another
+    slot never matches it."""
+    if not 0 <= layer < LAYER_SLOTS:
+        raise ValueError(f"layer slot {layer} is not in [0, {LAYER_SLOTS})")
 
 
 def _check_rows(plan: Plan, **operands: torch.Tensor) -> None:
@@ -828,6 +810,7 @@ def launch_gluon_qwen4_exp_delta_layer_gfx950(
         or warm.numel() % 4
     ):
         raise ValueError("warm must be contiguous int32 words, 4 at a time")
+    _check_layer(layer)
     plan = delta_plan(weights.ple is not None, _rows(h), chain, experts_format(weights))
     _check_streams(h, h_out, scratch, plan, plan.rows)
     _check_rows(plan, conv_out_rows=conv_out_rows)
@@ -957,16 +940,19 @@ def launch_gluon_qwen4_exp_qsa_layer_gfx950(
             IDX_DIM] BF16, group-start positions [rows, 3] int64, position
             tags [rows, 4] int64)``, which the launch writes instead of the
             ring. Compression reads a member from it where its tag matches.
-        accepted: None, or in an MTP draft catch-up step (the draft's first
-            step: one request's ``chain`` verified tokens, no staging) the
-            request's int32 accepted length ``[1]``. A row at or past it is a
-            rejected token: it writes its K / V but no index or compressed
-            key. As TokenSpeed's draft narrowing, only the live row (the
-            last accepted token's) runs the attention and the rest of the
-            layer: ``h_out`` and ``mixed_out`` then hold that one row.
-        mixed_out: The model's final mixer output, BF16 ``[out rows, HIDDEN]``
-            (the rows of ``h_out``), when ``weights`` has the final mixer
-            (the last layer). Else ``None``.
+        accepted: None, or for the prefix launch of an MTP draft's first
+            step (the requests' ``chain`` verified tokens each, no staging)
+            the requests' int32 accepted lengths ``[requests]``. The launch
+            then runs the layer up to Q2 only (:func:`qsa_plan`): every row
+            writes its K / V, and a row before its request's accepted length
+            also its index key and the compressed key it completes. A row at
+            or past it is a rejected token. The step then runs each
+            request's live row (the last accepted token's) as an ordinary
+            one-row decode launch, which reads the other rows' entries from
+            the caches. ``h_out`` and ``mixed_out`` are then ``None``.
+        mixed_out: The model's final mixer output, BF16 ``[rows, HIDDEN]``,
+            when ``weights`` has the final mixer (the last layer) and the
+            launch is no prefix launch. Else ``None``.
         advance_step: Whether the launch moves the step on when it ends (the
             last launch of a forward): ``step`` is then int32 ``[2]``, the
             step and a count that is 0 between launches.
@@ -977,19 +963,21 @@ def launch_gluon_qwen4_exp_qsa_layer_gfx950(
     ):
         raise ValueError("advance_step needs step as int32 [step, count]")
     rows = _rows(h)
-    catch_up = accepted is not None
-    out_rows = rows // chain if catch_up else rows
-    if final != (mixed_out is not None):
-        raise ValueError("mixed_out must be given exactly when the final mixer is")
-    if final and (
+    prefix = accepted is not None
+    if prefix and (h_out is not None or mixed_out is not None or advance_step):
+        raise ValueError("a prefix launch has no output and moves no step")
+    if (final and not prefix) != (mixed_out is not None):
+        raise ValueError("mixed_out must be given exactly when the final mixer runs")
+    if mixed_out is not None and (
         mixed_out.dtype != torch.bfloat16
-        or tuple(mixed_out.shape) != (out_rows, int(hc.HIDDEN))
+        or tuple(mixed_out.shape) != (rows, int(hc.HIDDEN))
         or not mixed_out.is_contiguous()
     ):
         raise ValueError(
-            f"mixed_out must be contiguous BF16 [{out_rows}, {int(hc.HIDDEN)}]"
+            f"mixed_out must be contiguous BF16 [{rows}, {int(hc.HIDDEN)}]"
         )
-    plan = qsa_plan(final, rows, chain, experts_format(weights), catch_up)
+    _check_layer(layer)
+    plan = qsa_plan(final, rows, chain, experts_format(weights), prefix)
     if staging is not None:
         token_k, staged_positions, logical, recent = staging
         if (
@@ -1022,7 +1010,7 @@ def launch_gluon_qwen4_exp_qsa_layer_gfx950(
         or tuple(accepted.shape) != (rows // chain,)
     ):
         raise ValueError("accepted needs int32 [requests], without staging or draft")
-    _check_streams(h, h_out, scratch, plan, out_rows)
+    _check_streams(h, h_out, scratch, plan, rows)
     _check_rows(plan, positions=positions.T)
     _check_requests(
         plan,
@@ -1075,7 +1063,8 @@ def launch_gluon_qwen4_exp_qsa_layer_gfx950(
         layer,
         h,
         _stream_stride(h),
-        h_out,
+        # A prefix launch writes no streams: any BF16 pointer stands for them.
+        h if h_out is None else h_out,
         weights.attn_mixer.kernel_args(),
         weights.qsa_args(),
         cache,
@@ -1086,7 +1075,6 @@ def launch_gluon_qwen4_exp_qsa_layer_gfx950(
         mixed_out,
         trace_buf,
         plan.key,
-        live_plan(plan, catch_up).key,
         advance_step,
         num_warps=NUM_WARPS,
         # The device library of _extern.wave_uniform_i32 (moe.py).
@@ -1105,6 +1093,5 @@ __all__ = [
     "gluon_qwen4_exp_qsa_layer_gfx950",
     "launch_gluon_qwen4_exp_delta_layer_gfx950",
     "launch_gluon_qwen4_exp_qsa_layer_gfx950",
-    "live_plan",
     "qsa_plan",
 ]

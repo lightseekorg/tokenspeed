@@ -188,7 +188,7 @@ def test_moe_bf16_matches_tokenspeed_math(rows):
         )
 
 
-@pytest.mark.parametrize("rows", [2, 3, 4])
+@pytest.mark.parametrize("rows", [2, 3, 4, 6, 8])
 def test_moe_bf16_rows_equal_one_row_launches(rows):
     """Each row of a multi-row launch is bitwise its own one-row launch."""
     x, residual, inject = _inputs(rows, 10 + rows)

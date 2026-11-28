@@ -42,7 +42,7 @@ accept `strided_state=True` within their existing execution contracts. The
 operator derives this trait from both state pools, and runtime capability
 queries include the bound input pool's layout. Decode benchmark generators
 allocate contiguous state rows and select with `strided_state=False`, matching
-the operator's dispatch for those inputs. FlashInfer 0.7.5 uses native
+the operator's dispatch for those inputs. FlashInfer uses native
 4D pool indexing for padded FP32 state, including final-state writeback and
 per-token scatter; its BF16 MTP path also preserves padded pool strides.
 The CuTe DSL WY leaf remains output-only, and FlashInfer MTP still writes
@@ -161,7 +161,7 @@ for decode, MTP, BF16 state, and prefill.
 
 ## Rubin FlashInfer
 
-The audited FlashInfer Python/cubin release for these adapters is `0.7.5`.
+The audited FlashInfer Python/cubin release for these adapters is `0.7.6`.
 Registrations live in `flashinfer.py`; the explicit `flashinfer_rubin` decode
 solution requires the audited release.
 

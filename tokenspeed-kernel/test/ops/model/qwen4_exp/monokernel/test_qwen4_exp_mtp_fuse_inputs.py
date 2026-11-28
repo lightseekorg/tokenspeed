@@ -82,9 +82,9 @@ def _run(kernel, ops) -> torch.Tensor:
     return out
 
 
-@pytest.mark.parametrize("rows", [1, 2, 3, 4])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 6, 8])
 def test_mtp_fuse_inputs_matches_the_model_math(rows):
-    kernel = select_qwen4_exp_mtp_fuse_inputs_kernel(4)
+    kernel = select_qwen4_exp_mtp_fuse_inputs_kernel(8)
     ops = _operands(rows, rows)
     got, ref = _run(kernel, ops), _reference(ops)
     # Only the linears' FP32 summation order differs. A linear's output can
@@ -96,19 +96,22 @@ def test_mtp_fuse_inputs_matches_the_model_math(rows):
     assert (got != ref).float().mean().item() < 1e-3
 
 
-def test_rows_equal_one_row_launches():
-    kernel = select_qwen4_exp_mtp_fuse_inputs_kernel(4)
-    ops = _operands(4, 7)
+@pytest.mark.parametrize("rows", [4, 8])
+def test_rows_equal_one_row_launches(rows):
+    kernel = select_qwen4_exp_mtp_fuse_inputs_kernel(8)
+    ops = _operands(rows, 7)
     together = _run(kernel, ops)
-    for r in range(4):
+    for r in range(rows):
         one = dict(ops, input_ids=ops["input_ids"][r : r + 1])
         one["hidden"] = ops["hidden"][r : r + 1]
         assert torch.equal(_run(kernel, one)[0], together[r])
 
 
 def test_row_count_does_not_recompile():
-    kernel = select_qwen4_exp_mtp_fuse_inputs_kernel(4)
+    """Row counts compile once per bucket of 4-row tiles (1-4, 5-8)."""
+    kernel = select_qwen4_exp_mtp_fuse_inputs_kernel(8)
     _run(kernel, _operands(1, 0))
+    _run(kernel, _operands(5, 5))
     with assert_no_triton_compile(_qwen4_exp_mtp_fuse_inputs_kernel):
-        for rows in (2, 3, 4, 1):
+        for rows in (2, 3, 4, 1, 6, 7, 8):
             _run(kernel, _operands(rows, rows))
